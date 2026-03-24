@@ -26,6 +26,16 @@ pub fn parse(allocator: std.mem.Allocator, input: []const u8) !Value {
     return value;
 }
 
+pub fn dictGet(dict: []const Value.Entry, key: []const u8) ?Value {
+    for (dict) |entry| {
+        if (std.mem.eql(u8, entry.key, key)) {
+            return entry.value;
+        }
+    }
+
+    return null;
+}
+
 const Parser = struct {
     allocator: std.mem.Allocator,
     input: []const u8,
