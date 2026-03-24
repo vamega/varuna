@@ -1,5 +1,7 @@
 /reference-codebases/
 /.zig-cache/
 /zig-out/
+/node_modules/
 /perf/output/*
 !/perf/output/.gitkeep
+/.tools/
