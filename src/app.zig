@@ -11,6 +11,20 @@ pub fn writeStartupBanner(writer: *std.Io.Writer) !void {
         runtime.requirements.preferred_supported.major,
         runtime.requirements.preferred_supported.minor,
     });
+
+    var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+    defer arena.deinit();
+
+    const summary = runtime.probe.detectCurrent(arena.allocator()) catch |err| {
+        try writer.print("kernel probe: unavailable ({s})\n", .{@errorName(err)});
+        return;
+    };
+
+    try writer.print("current kernel: {s} ({s})\n", .{ summary.release, summary.machine });
+    try writer.print("kernel support: {s}\n", .{@tagName(summary.support)});
+    if (summary.is_wsl) {
+        try writer.print("environment: wsl\n", .{});
+    }
 }
 
 test "startup banner mentions kernel floors" {

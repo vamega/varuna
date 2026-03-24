@@ -6,15 +6,13 @@ pub const Version = struct {
     patch: u32,
 
     pub fn order(lhs: Version, rhs: Version) std.math.Order {
-        return std.math.order(std.meta.Tuple(&.{ u32, u32, u32 }), .{
-            lhs.major,
-            lhs.minor,
-            lhs.patch,
-        }, .{
-            rhs.major,
-            rhs.minor,
-            rhs.patch,
-        });
+        if (lhs.major != rhs.major) {
+            return std.math.order(lhs.major, rhs.major);
+        }
+        if (lhs.minor != rhs.minor) {
+            return std.math.order(lhs.minor, rhs.minor);
+        }
+        return std.math.order(lhs.patch, rhs.patch);
     }
 };
 
