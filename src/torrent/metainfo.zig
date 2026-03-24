@@ -15,6 +15,31 @@ pub const Metainfo = struct {
         length: u64,
         path: []const []const u8,
     };
+
+    pub fn pieceCount(self: Metainfo) u32 {
+        return std.math.cast(u32, self.pieces.len / 20) orelse @panic("piece count overflow");
+    }
+
+    pub fn pieceHash(self: Metainfo, piece_index: u32) ![]const u8 {
+        if (piece_index >= self.pieceCount()) {
+            return error.InvalidPieceIndex;
+        }
+
+        const start = @as(usize, piece_index) * 20;
+        return self.pieces[start .. start + 20];
+    }
+
+    pub fn totalSize(self: Metainfo) u64 {
+        var total: u64 = 0;
+        for (self.files) |file| {
+            total +%= file.length;
+        }
+        return total;
+    }
+
+    pub fn isMultiFile(self: Metainfo) bool {
+        return self.files.len > 1;
+    }
 };
 
 pub fn parse(allocator: std.mem.Allocator, input: []const u8) !Metainfo {
@@ -196,4 +221,19 @@ test "reject invalid pieces length" {
         "d4:infod6:lengthi5e4:name8:test.bin12:piece lengthi16384e6:pieces3:abcee";
 
     try std.testing.expectError(error.InvalidPiecesField, parse(std.testing.allocator, input));
+}
+
+test "piece hash accessors expose torrent piece metadata" {
+    const input =
+        "d4:infod6:lengthi10e4:name8:test.bin12:piece lengthi4e6:pieces60:abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ12345678ee";
+
+    const info = try parse(std.testing.allocator, input);
+    defer freeMetainfo(std.testing.allocator, info);
+
+    try std.testing.expectEqual(@as(u32, 3), info.pieceCount());
+    try std.testing.expectEqualStrings("abcdefghijklmnopqrst", try info.pieceHash(0));
+    try std.testing.expectEqualStrings("UVWXYZ12345678", (try info.pieceHash(2))[6..]);
+    try std.testing.expectEqual(@as(u64, 10), info.totalSize());
+    try std.testing.expect(!info.isMultiFile());
+    try std.testing.expectError(error.InvalidPieceIndex, info.pieceHash(3));
 }

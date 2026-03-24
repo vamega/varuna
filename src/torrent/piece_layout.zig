@@ -63,15 +63,35 @@ pub const Layout = struct {
 
         return spans.toOwnedSlice(allocator);
     }
+
+    pub fn renderRelativePath(
+        self: Layout,
+        allocator: std.mem.Allocator,
+        root_name: []const u8,
+        file_index: u32,
+    ) ![]u8 {
+        if (file_index >= self.files.len) {
+            return error.InvalidFileIndex;
+        }
+
+        const file = self.files[file_index];
+        var path = std.ArrayList(u8).empty;
+        defer path.deinit(allocator);
+
+        try path.appendSlice(allocator, root_name);
+        for (file.path) |component| {
+            try path.append(allocator, std.fs.path.sep);
+            try path.appendSlice(allocator, component);
+        }
+
+        return path.toOwnedSlice(allocator);
+    }
 };
 
 pub fn build(allocator: std.mem.Allocator, info: metainfo.Metainfo) !Layout {
-    var total_size: u64 = 0;
-    for (info.files) |file| {
-        total_size = try std.math.add(u64, total_size, file.length);
-    }
+    const total_size = info.totalSize();
 
-    const piece_count = std.math.cast(u32, info.pieces.len / 20) orelse return error.TooManyPieces;
+    const piece_count = info.pieceCount();
     if (piece_count == 0) {
         return error.EmptyTorrent;
     }
@@ -185,4 +205,23 @@ test "reject mismatched piece count" {
     defer metainfo.freeMetainfo(std.testing.allocator, info);
 
     try std.testing.expectError(error.PieceCountMismatch, build(std.testing.allocator, info));
+}
+
+test "render relative path for multi file torrent" {
+    const input =
+        "d4:infod5:filesl" ++ "d6:lengthi3e4:pathl5:alphaee" ++ "d6:lengthi7e4:pathl4:beta5:gammaeee" ++ "4:name4:root" ++ "12:piece lengthi4e" ++ "6:pieces60:abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ12345678eee";
+
+    const info = try metainfo.parse(std.testing.allocator, input);
+    defer metainfo.freeMetainfo(std.testing.allocator, info);
+
+    const layout = try build(std.testing.allocator, info);
+    defer freeLayout(std.testing.allocator, layout);
+
+    const first = try layout.renderRelativePath(std.testing.allocator, info.name, 0);
+    defer std.testing.allocator.free(first);
+    try std.testing.expectEqualStrings("root/alpha", first);
+
+    const second = try layout.renderRelativePath(std.testing.allocator, info.name, 1);
+    defer std.testing.allocator.free(second);
+    try std.testing.expectEqualStrings("root/beta/gamma", second);
 }
