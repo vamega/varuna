@@ -1,6 +1,6 @@
 const std = @import("std");
 const metainfo = @import("../torrent/metainfo.zig");
-const piece_layout = @import("../torrent/piece_layout.zig");
+const torrent_layout = @import("../torrent/layout.zig");
 
 pub const Manifest = struct {
     root: []const u8,
@@ -18,7 +18,7 @@ pub fn build(
     allocator: std.mem.Allocator,
     target_root: []const u8,
     info: metainfo.Metainfo,
-    layout: piece_layout.Layout,
+    layout: torrent_layout.Layout,
 ) !Manifest {
     if (layout.files.len != info.files.len) {
         return error.LayoutFileCountMismatch;
@@ -37,10 +37,12 @@ pub fn build(
     }
 
     for (layout.files, info.files, 0..) |layout_file, info_file, index| {
-        const relative_path = if (info.isMultiFile())
-            try joinValidatedPath(allocator, info.name, info_file.path)
-        else
-            try joinValidatedPathWithoutRoot(allocator, info_file.path);
+        const relative_path = if (info.isMultiFile()) blk: {
+            const path = try layout.renderRelativePath(allocator, info.name, @intCast(index));
+            errdefer allocator.free(path);
+            try validatePath(path);
+            break :blk path;
+        } else try joinValidatedPathWithoutRoot(allocator, info_file.path);
         errdefer allocator.free(relative_path);
 
         const full_path = try std.fs.path.join(allocator, &.{ target_root, relative_path });
@@ -50,7 +52,7 @@ pub fn build(
             .length = layout_file.length,
             .relative_path = relative_path,
             .full_path = full_path,
-            .offset = layout_file.offset,
+            .offset = layout_file.torrent_offset,
         };
     }
 
@@ -87,6 +89,13 @@ fn joinValidatedPath(
     }
 
     return path.toOwnedSlice(allocator);
+}
+
+fn validatePath(path: []const u8) !void {
+    var iterator = std.mem.splitScalar(u8, path, std.fs.path.sep);
+    while (iterator.next()) |component| {
+        try validateComponent(component);
+    }
 }
 
 fn joinValidatedPathWithoutRoot(
@@ -140,8 +149,8 @@ test "build manifest for single file torrent" {
     const info = try metainfo.parse(std.testing.allocator, input);
     defer metainfo.freeMetainfo(std.testing.allocator, info);
 
-    const layout = try piece_layout.build(std.testing.allocator, info);
-    defer piece_layout.freeLayout(std.testing.allocator, layout);
+    const layout = try torrent_layout.build(std.testing.allocator, &info);
+    defer torrent_layout.freeLayout(std.testing.allocator, layout);
 
     const manifest = try build(std.testing.allocator, "/srv/torrents", info, layout);
     defer freeManifest(std.testing.allocator, manifest);
@@ -160,8 +169,8 @@ test "build manifest for multi file torrent" {
     const info = try metainfo.parse(std.testing.allocator, input);
     defer metainfo.freeMetainfo(std.testing.allocator, info);
 
-    const layout = try piece_layout.build(std.testing.allocator, info);
-    defer piece_layout.freeLayout(std.testing.allocator, layout);
+    const layout = try torrent_layout.build(std.testing.allocator, &info);
+    defer torrent_layout.freeLayout(std.testing.allocator, layout);
 
     const manifest = try build(std.testing.allocator, "/srv/torrents", info, layout);
     defer freeManifest(std.testing.allocator, manifest);
@@ -179,8 +188,8 @@ test "reject path traversal components in torrent paths" {
     const info = try metainfo.parse(std.testing.allocator, input);
     defer metainfo.freeMetainfo(std.testing.allocator, info);
 
-    const layout = try piece_layout.build(std.testing.allocator, info);
-    defer piece_layout.freeLayout(std.testing.allocator, layout);
+    const layout = try torrent_layout.build(std.testing.allocator, &info);
+    defer torrent_layout.freeLayout(std.testing.allocator, layout);
 
     try std.testing.expectError(error.InvalidPathComponent, build(std.testing.allocator, "/srv/torrents", info, layout));
 }

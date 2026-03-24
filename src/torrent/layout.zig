@@ -37,6 +37,11 @@ pub const Layout = struct {
         return @intCast(self.total_size - consumed);
     }
 
+    pub fn pieceOffset(self: Layout, piece_index: u32) !u64 {
+        _ = try self.pieceSize(piece_index);
+        return @as(u64, piece_index) * self.piece_length;
+    }
+
     pub fn pieceHash(self: Layout, piece_index: u32) ![]const u8 {
         if (piece_index >= self.piece_count) {
             return error.InvalidPieceIndex;
@@ -93,16 +98,40 @@ pub const Layout = struct {
 
         return buffer[0..next];
     }
+
+    pub fn renderRelativePath(
+        self: Layout,
+        allocator: std.mem.Allocator,
+        root_name: []const u8,
+        file_index: u32,
+    ) ![]u8 {
+        if (file_index >= self.files.len) {
+            return error.InvalidFileIndex;
+        }
+
+        const file = self.files[file_index];
+        var path = std.ArrayList(u8).empty;
+        defer path.deinit(allocator);
+
+        try path.appendSlice(allocator, root_name);
+        for (file.path) |component| {
+            try path.append(allocator, std.fs.path.sep);
+            try path.appendSlice(allocator, component);
+        }
+
+        return path.toOwnedSlice(allocator);
+    }
 };
 
 pub fn build(allocator: std.mem.Allocator, source: *const metainfo.Metainfo) !Layout {
-    var total_size: u64 = 0;
-    for (source.files) |file| {
-        total_size += file.length;
+    const total_size = source.totalSize();
+    const piece_count = source.pieceCount();
+    if (piece_count == 0) {
+        return error.EmptyTorrentData;
     }
 
-    const piece_count = try computePieceCount(total_size, source.piece_length);
-    if (source.pieces.len != @as(usize, piece_count) * 20) {
+    const expected_piece_count = try computePieceCount(total_size, source.piece_length);
+    if (piece_count != expected_piece_count) {
         return error.PieceHashCountMismatch;
     }
 
@@ -172,6 +201,7 @@ test "build layout for single file torrent" {
     try std.testing.expectEqual(@as(u32, 3), built.piece_count);
     try std.testing.expectEqual(@as(u32, 4), try built.pieceSize(0));
     try std.testing.expectEqual(@as(u32, 2), try built.pieceSize(2));
+    try std.testing.expectEqual(@as(u64, 8), try built.pieceOffset(2));
     try std.testing.expectEqualStrings("aaaaaaaaaaaaaaaaaaaa", try built.pieceHash(0));
 }
 
@@ -237,4 +267,34 @@ test "reject mismatched piece hash count" {
     };
 
     try std.testing.expectError(error.PieceHashCountMismatch, build(std.testing.allocator, &source));
+}
+
+test "render relative path for multi file torrent" {
+    const path0 = [_][]const u8{"alpha"};
+    const path1 = [_][]const u8{ "beta", "gamma" };
+    const files = [_]metainfo.Metainfo.File{
+        .{ .length = 3, .path = path0[0..] },
+        .{ .length = 7, .path = path1[0..] },
+    };
+    const hashes = "aaaaaaaaaaaaaaaaaaaabbbbbbbbbbbbbbbbbbbbcccccccccccccccccccc";
+    const source = metainfo.Metainfo{
+        .info_hash = [_]u8{0} ** 20,
+        .announce = null,
+        .created_by = null,
+        .name = "root",
+        .piece_length = 4,
+        .pieces = hashes,
+        .files = files[0..],
+    };
+
+    const built = try build(std.testing.allocator, &source);
+    defer freeLayout(std.testing.allocator, built);
+
+    const first = try built.renderRelativePath(std.testing.allocator, source.name, 0);
+    defer std.testing.allocator.free(first);
+    try std.testing.expectEqualStrings("root/alpha", first);
+
+    const second = try built.renderRelativePath(std.testing.allocator, source.name, 1);
+    defer std.testing.allocator.free(second);
+    try std.testing.expectEqualStrings("root/beta/gamma", second);
 }
