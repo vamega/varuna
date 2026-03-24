@@ -1,7 +1,9 @@
 const std = @import("std");
 const bencode = @import("bencode.zig");
+const info_hash = @import("info_hash.zig");
 
 pub const Metainfo = struct {
+    info_hash: [20]u8,
     announce: ?[]const u8,
     created_by: ?[]const u8,
     name: []const u8,
@@ -16,6 +18,7 @@ pub const Metainfo = struct {
 };
 
 pub fn parse(allocator: std.mem.Allocator, input: []const u8) !Metainfo {
+    const digest = try info_hash.compute(input);
     const root = try bencode.parse(allocator, input);
     defer bencode.freeValue(allocator, root);
 
@@ -35,6 +38,7 @@ pub fn parse(allocator: std.mem.Allocator, input: []const u8) !Metainfo {
         try parseSingleFileList(allocator, expectPositiveU64(try getRequired(info, "length")), name);
 
     return .{
+        .info_hash = digest,
         .announce = if (bencode.dictGet(root_dict, "announce")) |value| expectBytes(value) else null,
         .created_by = if (bencode.dictGet(root_dict, "created by")) |value| expectBytes(value) else null,
         .name = name,
@@ -158,6 +162,7 @@ test "parse single file torrent metainfo" {
     const metainfo = try parse(std.testing.allocator, input);
     defer freeMetainfo(std.testing.allocator, metainfo);
 
+    try std.testing.expectEqual(try info_hash.compute(input), metainfo.info_hash);
     try std.testing.expectEqualStrings("http://tracker", metainfo.announce.?);
     try std.testing.expectEqualStrings("varuna", metainfo.created_by.?);
     try std.testing.expectEqualStrings("test.bin", metainfo.name);
@@ -176,6 +181,7 @@ test "parse multi file torrent metainfo" {
     const metainfo = try parse(std.testing.allocator, input);
     defer freeMetainfo(std.testing.allocator, metainfo);
 
+    try std.testing.expectEqual(try info_hash.compute(input), metainfo.info_hash);
     try std.testing.expectEqualStrings("root", metainfo.name);
     try std.testing.expectEqual(@as(usize, 2), metainfo.files.len);
     try std.testing.expectEqual(@as(u64, 3), metainfo.files[0].length);
