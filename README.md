@@ -10,22 +10,42 @@ The repository now includes a minimal end-to-end download path:
 - Recheck existing on-disk data and reuse pieces that already verify.
 - Connect to a peer over the BitTorrent wire protocol.
 - Download pieces sequentially, verify SHA-1 hashes, and write data to disk.
+- Seed verified on-disk data back to one inbound peer.
 
 Current CLI:
 
 ```bash
-zig build run -- download /path/to/file.torrent /path/to/download-root
+zig build run -- download /path/to/file.torrent /path/to/download-root --port 6882
+zig build run -- seed /path/to/file.torrent /path/to/data-root --port 6881
+zig build run -- inspect /path/to/file.torrent
 ```
 
 Current scope limits:
 
 - HTTP trackers only.
-- Single-peer sequential download flow.
+- Compact peer lists only.
+- One active peer at a time.
+- Sequential piece download and a single inbound seed connection.
 - `.torrent` files only; no magnet support yet.
-- Download-only; no serving or listening socket yet.
 - Resume is currently based on full piece recheck at startup, not persisted resume metadata.
 
 The living scope and architecture record lives in [DECISIONS.md](DECISIONS.md). Keep that file updated as constraints and design choices change.
+
+## Local Swarm Demo
+The repository includes a reproducible local smoke test that uses an off-the-shelf tracker:
+
+```bash
+./scripts/demo_swarm.sh
+```
+
+That script:
+
+- Creates a small `.torrent` file with the Node helper in `scripts/create_torrent.mjs`.
+- Uses `varuna inspect` to derive the torrent info hash.
+- Starts `scripts/tracker.sh`, which wraps the Ubuntu `opentracker` package.
+- Whitelists the torrent info hash because the packaged `opentracker` build rejects unlisted torrents.
+- Runs one `varuna seed` instance and one `varuna download` instance against the tracker.
+- Verifies the downloaded payload with `cmp`.
 
 ## Project Direction
 Varuna is intended for local Linux storage only. SSDs, HDDs, mergerfs, ext4, xfs, btrfs, bcachefs, and zfs matter; network filesystems such as NFS and CIFS do not. The initial focus is private-tracker functionality and operational reliability, not broad feature coverage or plugin systems.

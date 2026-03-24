@@ -6,6 +6,7 @@ TOOLS_DIR="$ROOT_DIR/.tools/opentracker"
 RUNTIME_DIR="$TOOLS_DIR/runtime"
 HOST="127.0.0.1"
 PORT="6969"
+WHITELIST_HASHES=()
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
@@ -15,6 +16,10 @@ while [[ $# -gt 0 ]]; do
       ;;
     --port)
       PORT="$2"
+      shift 2
+      ;;
+    --whitelist-hash)
+      WHITELIST_HASHES+=("$2")
       shift 2
       ;;
     *)
@@ -51,14 +56,31 @@ ensure_package() {
 ensure_package "libowfat0t64"
 ensure_package "opentracker"
 
-cat >"$RUNTIME_DIR/opentracker.conf" <<EOF
+WHITELIST_FILE="$RUNTIME_DIR/whitelist.txt"
+CONFIG_PATH="$RUNTIME_DIR/opentracker.conf"
+
+{
+  cat <<EOF
 listen.tcp $HOST:$PORT
 tracker.rootdir $RUNTIME_DIR
 tracker.user $(id -un)
 EOF
+  if [[ "${#WHITELIST_HASHES[@]}" -gt 0 ]]; then
+    printf 'access.whitelist %s\n' "$WHITELIST_FILE"
+  fi
+} >"$CONFIG_PATH"
+
+if [[ "${#WHITELIST_HASHES[@]}" -gt 0 ]]; then
+  printf '%s\n' "${WHITELIST_HASHES[@]}" >"$WHITELIST_FILE"
+fi
 
 echo "HTTP tracker: http://$HOST:$PORT/announce"
+if [[ "${#WHITELIST_HASHES[@]}" -gt 0 ]]; then
+  echo "whitelist hashes: ${#WHITELIST_HASHES[@]}"
+else
+  echo "warning: no whitelist hashes configured; this opentracker build will reject announces"
+fi
 exec env \
   LD_LIBRARY_PATH="$TOOLS_DIR/usr/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}" \
   "$TOOLS_DIR/usr/bin/opentracker" \
-  -f "$RUNTIME_DIR/opentracker.conf"
+  -f "$CONFIG_PATH"

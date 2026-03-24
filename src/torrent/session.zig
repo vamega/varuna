@@ -99,7 +99,8 @@ test "load multi file torrent session" {
 }
 
 test "session owns torrent bytes after load" {
-    const torrent_bytes = try std.testing.allocator.dupe(u8,
+    const torrent_bytes = try std.testing.allocator.dupe(
+        u8,
         "d4:infod6:lengthi4e4:name8:test.bin12:piece lengthi4e6:pieces20:abcdefghijklmnopqrstee",
     );
     defer std.testing.allocator.free(torrent_bytes);

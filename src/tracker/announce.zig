@@ -260,7 +260,8 @@ test "build announce url percent encodes binary fields" {
 }
 
 test "parse compact tracker response" {
-    const response = try parseResponse(std.testing.allocator,
+    const response = try parseResponse(
+        std.testing.allocator,
         "d8:completei1e10:incompletei0e8:intervali30e5:peers6:\x7f\x00\x00\x01\x1a\xe1e",
     );
     defer freeResponse(std.testing.allocator, response);
@@ -271,7 +272,8 @@ test "parse compact tracker response" {
 }
 
 test "parse dictionary tracker peers" {
-    const response = try parseResponse(std.testing.allocator,
+    const response = try parseResponse(
+        std.testing.allocator,
         "d8:intervali60e5:peersld2:ip9:127.0.0.14:porti7000eeee",
     );
     defer freeResponse(std.testing.allocator, response);

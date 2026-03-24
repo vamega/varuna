@@ -10,6 +10,12 @@ pub const DownloadOptions = struct {
     status_writer: ?*std.Io.Writer = null,
 };
 
+pub const SeedOptions = struct {
+    peer_id: [20]u8,
+    port: u16 = 6881,
+    status_writer: ?*std.Io.Writer = null,
+};
+
 pub const DownloadResult = struct {
     info_hash: [20]u8,
     peer: ?tracker.announce.Peer,
@@ -18,6 +24,87 @@ pub const DownloadResult = struct {
     bytes_reused: u64,
     bytes_complete: u64,
 };
+
+pub const SeedResult = struct {
+    info_hash: [20]u8,
+    piece_count: u32,
+    bytes_seeded: u64,
+    bytes_complete: u64,
+    peer: ?std.net.Address,
+};
+
+pub fn seed(
+    allocator: std.mem.Allocator,
+    torrent_bytes: []const u8,
+    target_root: []const u8,
+    options: SeedOptions,
+) !SeedResult {
+    const session = try session_mod.Session.load(allocator, torrent_bytes, target_root);
+    defer session.deinit(allocator);
+
+    var store = try storage.writer.PieceStore.init(allocator, &session);
+    defer store.deinit();
+
+    var recheck = try storage.verify.recheckExistingData(allocator, &session, &store);
+    defer recheck.deinit(allocator);
+
+    const bytes_left = session.totalSize() - recheck.bytes_complete;
+    try logStatus(
+        options.status_writer,
+        "seed torrent: {s}, pieces={}, complete={} bytes, left={} bytes\n",
+        .{ session.metainfo.name, session.pieceCount(), recheck.bytes_complete, bytes_left },
+    );
+
+    if (bytes_left != 0) {
+        return error.IncompleteSeedData;
+    }
+
+    var server = try std.net.Address.initIp4(.{ 0, 0, 0, 0 }, options.port).listen(.{
+        .reuse_address = true,
+    });
+    defer server.deinit();
+
+    try logStatus(options.status_writer, "listening for peers on port {}\n", .{options.port});
+
+    var http_client = std.http.Client{ .allocator = allocator };
+    defer http_client.deinit();
+
+    const announce_url = session.metainfo.announce orelse return error.MissingAnnounceUrl;
+    const announce_response = try tracker.announce.fetch(allocator, &http_client, .{
+        .announce_url = announce_url,
+        .info_hash = session.metainfo.info_hash,
+        .peer_id = options.peer_id,
+        .port = options.port,
+        .left = 0,
+    });
+    defer tracker.announce.freeResponse(allocator, announce_response);
+
+    try logStatus(options.status_writer, "seed announce accepted, peers={}\n", .{announce_response.peers.len});
+
+    const connection = try server.accept();
+    defer connection.stream.close();
+
+    try logStatus(options.status_writer, "incoming peer: {f}\n", .{connection.address});
+
+    const bytes_seeded = try seedPeer(
+        allocator,
+        &session,
+        &store,
+        &recheck.complete_pieces,
+        connection.stream,
+        options.peer_id,
+    );
+
+    try logStatus(options.status_writer, "seed complete: {s}\n", .{session.metainfo.name});
+
+    return .{
+        .info_hash = session.metainfo.info_hash,
+        .piece_count = session.pieceCount(),
+        .bytes_seeded = bytes_seeded,
+        .bytes_complete = recheck.bytes_complete,
+        .peer = connection.address,
+    };
+}
 
 pub fn download(
     allocator: std.mem.Allocator,
@@ -219,6 +306,83 @@ fn downloadFromPeer(
     return bytes_downloaded;
 }
 
+fn seedPeer(
+    allocator: std.mem.Allocator,
+    session: *const session_mod.Session,
+    store: *storage.writer.PieceStore,
+    complete_pieces: *const storage.verify.PieceSet,
+    stream: std.net.Stream,
+    peer_id: [20]u8,
+) !u64 {
+    const remote_handshake = try peer_wire.readHandshake(stream);
+    if (!std.mem.eql(u8, remote_handshake.info_hash[0..], session.metainfo.info_hash[0..])) {
+        return error.WrongTorrentPeer;
+    }
+
+    try peer_wire.writeHandshake(stream, session.metainfo.info_hash, peer_id);
+    try peer_wire.writeBitfield(stream, complete_pieces.bits);
+
+    const piece_buffer = try allocator.alloc(u8, session.layout.piece_length);
+    defer allocator.free(piece_buffer);
+
+    var peer_unchoked = false;
+    var cached_piece_index: ?u32 = null;
+    var cached_piece_length: usize = 0;
+    var bytes_seeded: u64 = 0;
+
+    while (true) {
+        const message = peer_wire.readMessageAlloc(allocator, stream) catch |err| switch (err) {
+            error.EndOfStream => break,
+            else => return err,
+        };
+        defer peer_wire.freeMessage(allocator, message);
+
+        switch (message) {
+            .keep_alive, .not_interested, .have, .bitfield, .cancel, .port, .choke, .unchoke => {},
+            .interested => {
+                if (!peer_unchoked) {
+                    try peer_wire.writeUnchoke(stream);
+                    peer_unchoked = true;
+                }
+            },
+            .request => |request| {
+                if (!peer_unchoked) {
+                    return error.PeerRequestedWhileChoked;
+                }
+                if (!complete_pieces.has(request.piece_index)) {
+                    return error.RequestedMissingPiece;
+                }
+
+                if (cached_piece_index == null or cached_piece_index.? != request.piece_index) {
+                    const plan = try storage.verify.planPieceVerification(allocator, session, request.piece_index);
+                    defer storage.verify.freePiecePlan(allocator, plan);
+
+                    try store.readPiece(plan.spans, piece_buffer[0..plan.piece_length]);
+                    cached_piece_index = request.piece_index;
+                    cached_piece_length = plan.piece_length;
+                }
+
+                const block_start: usize = @intCast(request.block_offset);
+                const block_end = block_start + @as(usize, @intCast(request.length));
+                if (block_end < block_start or block_end > cached_piece_length) {
+                    return error.InvalidRequestRange;
+                }
+
+                try peer_wire.writePiece(
+                    stream,
+                    request.piece_index,
+                    request.block_offset,
+                    piece_buffer[block_start..block_end],
+                );
+                bytes_seeded += request.length;
+            },
+            .piece => return error.UnexpectedPieceBlock,
+        }
+    }
+
+    return bytes_seeded;
+}
+
 fn logStatus(writer: ?*std.Io.Writer, comptime format: []const u8, args: anytype) !void {
     if (writer) |output| {
         try output.print(format, args);
@@ -330,16 +494,49 @@ const FakeTrackerContext = struct {
         try std.testing.expect(std.mem.indexOf(u8, request, "compact=1") != null);
         try std.testing.expect(std.mem.indexOf(u8, request, "peer_id=") != null);
         try std.testing.expect(std.mem.indexOf(u8, request, "info_hash=") != null);
+        try writeHttpOk(connection.stream, self.response_body);
+    }
+};
 
-        var head = std.ArrayList(u8).empty;
-        defer head.deinit(std.testing.allocator);
-        try head.print(std.testing.allocator,
-            "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
-            .{self.response_body.len},
-        );
+const SwarmTrackerContext = struct {
+    server: std.net.Server,
+    download_response_body: []const u8,
+    expected_download_left: u64,
+    requests_served: std.atomic.Value(u32) = std.atomic.Value(u32).init(0),
 
-        try connection.stream.writeAll(head.items);
-        try connection.stream.writeAll(self.response_body);
+    fn run(self: *SwarmTrackerContext) void {
+        self.handleMany() catch |err| @panic(@errorName(err));
+    }
+
+    fn handleMany(self: *SwarmTrackerContext) !void {
+        defer self.server.deinit();
+
+        var request_index: u32 = 0;
+        while (request_index < 2) : (request_index += 1) {
+            const connection = try self.server.accept();
+            defer connection.stream.close();
+
+            var request_buffer: [4096]u8 = undefined;
+            const request = try readHttpHead(connection.stream, &request_buffer);
+            try std.testing.expect(std.mem.startsWith(u8, request, "GET /announce?"));
+            try std.testing.expect(std.mem.indexOf(u8, request, "compact=1") != null);
+            try std.testing.expect(std.mem.indexOf(u8, request, "peer_id=") != null);
+            try std.testing.expect(std.mem.indexOf(u8, request, "info_hash=") != null);
+            try std.testing.expect(std.mem.indexOf(u8, request, "event=started") != null);
+
+            const response_body = if (request_index == 0) blk: {
+                try std.testing.expect(std.mem.indexOf(u8, request, "left=0") != null);
+                break :blk "d8:intervali30e5:peers0:e";
+            } else blk: {
+                const left_fragment = try std.fmt.allocPrint(std.testing.allocator, "left={}", .{self.expected_download_left});
+                defer std.testing.allocator.free(left_fragment);
+                try std.testing.expect(std.mem.indexOf(u8, request, left_fragment) != null);
+                break :blk self.download_response_body;
+            };
+
+            _ = self.requests_served.fetchAdd(1, .seq_cst);
+            try writeHttpOk(connection.stream, response_body);
+        }
     }
 };
 
@@ -402,6 +599,24 @@ const FakePeerContext = struct {
     }
 };
 
+const SeedThreadContext = struct {
+    torrent_bytes: []const u8,
+    target_root: []const u8,
+    port: u16,
+    result: ?SeedResult = null,
+    err: ?anyerror = null,
+
+    fn run(self: *SeedThreadContext) void {
+        self.result = seed(std.heap.page_allocator, self.torrent_bytes, self.target_root, .{
+            .peer_id = "SEEDER-PEER-ID-00001".*,
+            .port = self.port,
+        }) catch |err| {
+            self.err = err;
+            return;
+        };
+    }
+};
+
 fn readHttpHead(stream: std.net.Stream, buffer: []u8) ![]u8 {
     var used: usize = 0;
     while (used < buffer.len) {
@@ -414,6 +629,19 @@ fn readHttpHead(stream: std.net.Stream, buffer: []u8) ![]u8 {
     }
 
     return error.HttpHeadersOversize;
+}
+
+fn writeHttpOk(stream: std.net.Stream, body: []const u8) !void {
+    var head = std.ArrayList(u8).empty;
+    defer head.deinit(std.testing.allocator);
+    try head.print(
+        std.testing.allocator,
+        "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+        .{body.len},
+    );
+
+    try stream.writeAll(head.items);
+    try stream.writeAll(body);
 }
 
 fn buildTrackerBody(
@@ -480,6 +708,16 @@ fn buildPieceHashes(
 
 fn computePieceCount(total_size: usize, piece_length: u32) u32 {
     return @intCast((total_size + @as(usize, piece_length) - 1) / @as(usize, piece_length));
+}
+
+fn waitForTrackerRequests(requests_served: *std.atomic.Value(u32), count: u32) !void {
+    const deadline = std.time.milliTimestamp() + 5_000;
+    while (requests_served.load(.seq_cst) < count) {
+        if (std.time.milliTimestamp() >= deadline) {
+            return error.TestTimeout;
+        }
+        std.time.sleep(10 * std.time.ns_per_ms);
+    }
 }
 
 test "download torrent from local tracker and peer" {
@@ -662,4 +900,98 @@ test "already complete torrent skips tracker and peer work" {
     try std.testing.expectEqual(@as(u64, 0), result.bytes_downloaded);
     try std.testing.expectEqual(@as(u64, payload.len), result.bytes_reused);
     try std.testing.expectEqual(@as(u64, payload.len), result.bytes_complete);
+}
+
+test "seed and download between two varuna instances through a tracker" {
+    const allocator = std.testing.allocator;
+    const payload = "hello world";
+    const piece_length: u32 = 4;
+
+    const seed_port: u16 = 6881;
+    const download_port: u16 = 6882;
+
+    const tracker_response = try buildTrackerBody(allocator, seed_port);
+    defer allocator.free(tracker_response);
+
+    var tracker_context = SwarmTrackerContext{
+        .server = try std.net.Address.initIp4(.{ 127, 0, 0, 1 }, 0).listen(.{ .reuse_address = true }),
+        .download_response_body = tracker_response,
+        .expected_download_left = payload.len,
+    };
+    const tracker_thread = try std.Thread.spawn(.{}, SwarmTrackerContext.run, .{&tracker_context});
+    var tracker_joined = false;
+    defer if (!tracker_joined) tracker_thread.join();
+
+    var announce_url_storage = std.ArrayList(u8).empty;
+    defer announce_url_storage.deinit(allocator);
+    try announce_url_storage.print(allocator, "http://127.0.0.1:{}/announce", .{tracker_context.server.listen_address.getPort()});
+
+    const torrent_bytes = try buildSingleFileTorrent(
+        allocator,
+        announce_url_storage.items,
+        "fixture.bin",
+        payload,
+        piece_length,
+    );
+    defer allocator.free(torrent_bytes);
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const seed_root = try std.fs.path.join(allocator, &.{
+        ".zig-cache",
+        "tmp",
+        tmp.sub_path[0..],
+        "seed",
+    });
+    defer allocator.free(seed_root);
+
+    const download_root = try std.fs.path.join(allocator, &.{
+        ".zig-cache",
+        "tmp",
+        tmp.sub_path[0..],
+        "download",
+    });
+    defer allocator.free(download_root);
+
+    try tmp.dir.makePath("seed");
+    {
+        const file = try tmp.dir.createFile("seed/fixture.bin", .{ .read = true, .truncate = true });
+        defer file.close();
+        try file.writeAll(payload);
+    }
+
+    var seed_context = SeedThreadContext{
+        .torrent_bytes = torrent_bytes,
+        .target_root = seed_root,
+        .port = seed_port,
+    };
+    const seed_thread = try std.Thread.spawn(.{}, SeedThreadContext.run, .{&seed_context});
+    var seed_joined = false;
+    defer if (!seed_joined) seed_thread.join();
+
+    try waitForTrackerRequests(&tracker_context.requests_served, 1);
+
+    const result = try download(allocator, torrent_bytes, download_root, .{
+        .peer_id = "DOWNLOADER-PEER-0001".*,
+        .port = download_port,
+    });
+
+    seed_thread.join();
+    seed_joined = true;
+    try std.testing.expect(seed_context.err == null);
+    try std.testing.expect(seed_context.result != null);
+
+    try tracker_thread.join();
+    tracker_joined = true;
+
+    try std.testing.expectEqual(@as(u64, payload.len), result.bytes_downloaded);
+    try std.testing.expectEqual(@as(u64, 0), result.bytes_reused);
+    try std.testing.expectEqual(@as(u64, payload.len), result.bytes_complete);
+    try std.testing.expectEqual(@as(u64, payload.len), seed_context.result.?.bytes_seeded);
+    try std.testing.expectEqual(@as(u64, payload.len), seed_context.result.?.bytes_complete);
+
+    const written = try tmp.dir.readFileAlloc(allocator, "download/fixture.bin", 64);
+    defer allocator.free(written);
+    try std.testing.expectEqualStrings(payload, written);
 }

@@ -7,8 +7,8 @@ Update it whenever scope changes, constraints are widened or tightened, profilin
 
 - Minimal client ingestion is `.torrent` files only. Magnet, DHT, PEX, LSD, and uTP are not in scope yet.
 - The currently verified tracker path is HTTP announce with compact peer lists.
-- The current peer strategy is one active peer and sequential piece download.
-- The current transfer path is download-only. Varuna does not yet listen for inbound peers or seed data back out.
+- The current peer strategy is one active peer at a time, sequential piece download, and a single inbound seed connection.
+- Seeder behavior is minimal: announce as complete, accept one inbound peer, serve requests sequentially, and exit after that peer disconnects.
 - Pieces are SHA-1 verified before being committed to disk.
 
 ## Decision Entries
@@ -77,6 +77,30 @@ Current behavior:
 - Existing files are opened and extended to the target sizes if needed.
 - Every piece is re-read and hash-checked before download starts.
 - Only missing or invalid pieces are requested from the peer.
+
+### 2026-03-24: Minimal Seeding And Local Swarm Verification
+
+Context:
+The next milestone after resume support was proving that two `varuna` instances could transfer a torrent through a real tracker, without building tracker logic into the client yet.
+
+Decision:
+- Add a minimal seed mode that only runs when all torrent data already verifies on disk.
+- Keep the seeding contract narrow: one listening socket, one inbound peer, sequential block serving, and exit after the downloader disconnects.
+- Add `varuna inspect` so scripts can read the torrent info hash without duplicating metainfo parsing logic.
+- Use the Ubuntu-packaged `opentracker` binary as the current external tracker helper, wrapped by `scripts/tracker.sh`.
+- Whitelist torrent info hashes explicitly when starting that tracker, because the packaged `opentracker` build rejects unlisted torrents.
+- Keep `scripts/demo_swarm.sh` as the reproducible local proof path for one seed and one downloader.
+
+Reasoning:
+- This gets the project to a real swarm milestone quickly while keeping peer-state and lifetime rules simple.
+- Requiring a full recheck before seeding avoids serving corrupt or partial data.
+- `varuna inspect` keeps tracker bootstrapping and future debugging workflows inside the project instead of pushing them into ad hoc parsing scripts.
+- Using a packaged tracker is faster than building tracker support in Zig before peer/storage behavior is settled.
+
+Current behavior:
+- `varuna seed` listens on one configured TCP port and announces with `left=0`.
+- `varuna download` and `varuna seed` can run concurrently against the local tracker helper.
+- The current external tracker demo has been verified with `scripts/demo_swarm.sh`.
 
 ### 2026-03-24: Performance Inspection Workflow
 

@@ -39,8 +39,11 @@ git clone https://github.com/Nehliin/vortex.git reference-codebases/vortex
 - `zig build perf-stat -- ...`: run `varuna` under `perf stat` and write `perf/output/perf-stat.txt`.
 - `zig build perf-record -- ...`: run `varuna` under `perf record` and write `perf/output/perf.data`.
 - `zig fmt .`: format all Zig sources.
+- `./scripts/demo_swarm.sh`: build a local `.torrent`, start the packaged `opentracker`, run one `varuna seed` and one `varuna download`, and verify the payload transfer.
 
 Add new commands to `build.zig` instead of ad hoc shell scripts when practical.
+
+For local tracker validation, prefer `scripts/tracker.sh` plus `varuna inspect` or `scripts/demo_swarm.sh` instead of inventing new one-off workflows. The Ubuntu `opentracker` package in this repository is built in whitelist mode, so agents must pass `--whitelist-hash <info-hash>` to `scripts/tracker.sh` for any torrent they expect the tracker to authorize.
 
 ## Coding Style & Naming Conventions
 Use `zig fmt` as the formatting authority. Prefer small modules, explicit ownership, and low-allocation designs. Default to arena or slab-backed allocation where dynamic memory is unavoidable. Use `snake_case` for files, functions, and local variables; `PascalCase` for types; and descriptive subsystem names like `piece_picker.zig` or `disk_scheduler.zig`. Keep Linux- and io_uring-specific code explicit rather than hidden behind generic abstractions.
