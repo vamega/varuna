@@ -1,5 +1,62 @@
 const std = @import("std");
 const torrent = @import("../torrent/root.zig");
+const writer = @import("writer.zig");
+
+pub const PieceSet = struct {
+    bits: []u8,
+    piece_count: u32,
+    count: u32 = 0,
+
+    pub fn init(allocator: std.mem.Allocator, piece_count: u32) !PieceSet {
+        const bits = try allocator.alloc(u8, byteCount(piece_count));
+        @memset(bits, 0);
+        return .{
+            .bits = bits,
+            .piece_count = piece_count,
+        };
+    }
+
+    pub fn deinit(self: *PieceSet, allocator: std.mem.Allocator) void {
+        allocator.free(self.bits);
+        self.* = undefined;
+    }
+
+    pub fn has(self: PieceSet, piece_index: u32) bool {
+        if (piece_index >= self.piece_count) return false;
+
+        const byte_index: usize = @intCast(piece_index / 8);
+        const bit_index: u3 = @intCast(7 - (piece_index % 8));
+        return (self.bits[byte_index] & (@as(u8, 1) << bit_index)) != 0;
+    }
+
+    pub fn set(self: *PieceSet, piece_index: u32) !void {
+        if (piece_index >= self.piece_count) {
+            return error.InvalidPieceIndex;
+        }
+        if (self.has(piece_index)) {
+            return;
+        }
+
+        const byte_index: usize = @intCast(piece_index / 8);
+        const bit_index: u3 = @intCast(7 - (piece_index % 8));
+        self.bits[byte_index] |= @as(u8, 1) << bit_index;
+        self.count += 1;
+    }
+
+    fn byteCount(piece_count: u32) usize {
+        return @intCast((piece_count + 7) / 8);
+    }
+};
+
+pub const RecheckState = struct {
+    complete_pieces: PieceSet,
+    bytes_complete: u64,
+
+    pub fn deinit(self: *RecheckState, allocator: std.mem.Allocator) void {
+        self.complete_pieces.deinit(allocator);
+        self.* = undefined;
+    }
+};
 
 pub const PiecePlan = struct {
     piece_index: u32,
@@ -45,6 +102,37 @@ pub fn verifyPieceBuffer(plan: PiecePlan, piece_data: []const u8) !bool {
     return std.mem.eql(u8, actual[0..], plan.expected_hash[0..]);
 }
 
+pub fn recheckExistingData(
+    allocator: std.mem.Allocator,
+    session: *const torrent.session.Session,
+    store: *writer.PieceStore,
+) !RecheckState {
+    var complete_pieces = try PieceSet.init(allocator, session.pieceCount());
+    errdefer complete_pieces.deinit(allocator);
+
+    const scratch = try allocator.alloc(u8, session.layout.piece_length);
+    defer allocator.free(scratch);
+
+    var bytes_complete: u64 = 0;
+    var piece_index: u32 = 0;
+    while (piece_index < session.pieceCount()) : (piece_index += 1) {
+        const plan = try planPieceVerification(allocator, session, piece_index);
+        defer freePiecePlan(allocator, plan);
+
+        const piece_data = scratch[0..plan.piece_length];
+        try store.readPiece(plan.spans, piece_data);
+        if (try verifyPieceBuffer(plan, piece_data)) {
+            try complete_pieces.set(piece_index);
+            bytes_complete += plan.piece_length;
+        }
+    }
+
+    return .{
+        .complete_pieces = complete_pieces,
+        .bytes_complete = bytes_complete,
+    };
+}
+
 test "plan verification for multi file piece" {
     const input =
         "d4:infod5:filesl" ++ "d6:lengthi3e4:pathl5:alphaee" ++ "d6:lengthi7e4:pathl4:beta5:gammaeee" ++ "4:name4:root" ++ "12:piece lengthi4e" ++ "6:pieces60:abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ12345678eee";
@@ -77,4 +165,49 @@ test "verify piece buffer against expected hash" {
     try std.testing.expect(try verifyPieceBuffer(plan, "spam"));
     try std.testing.expect(!(try verifyPieceBuffer(plan, "eggs")));
     try std.testing.expectError(error.InvalidPieceDataLength, verifyPieceBuffer(plan, "sp"));
+}
+
+test "recheck existing on-disk pieces" {
+    var hash0: [20]u8 = undefined;
+    std.crypto.hash.Sha1.hash("spam", &hash0, .{});
+
+    var hash1: [20]u8 = undefined;
+    std.crypto.hash.Sha1.hash("eggs", &hash1, .{});
+
+    const hashes = hash0 ++ hash1;
+    const input = try std.fmt.allocPrint(
+        std.testing.allocator,
+        "d4:infod6:lengthi8e4:name8:test.bin12:piece lengthi4e6:pieces40:{s}ee",
+        .{hashes},
+    );
+    defer std.testing.allocator.free(input);
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const target_root = try std.fs.path.join(std.testing.allocator, &.{
+        ".zig-cache",
+        "tmp",
+        &tmp.sub_path,
+        "download",
+    });
+    defer std.testing.allocator.free(target_root);
+
+    const session = try torrent.session.Session.load(std.testing.allocator, input, target_root);
+    defer session.deinit(std.testing.allocator);
+
+    var store = try writer.PieceStore.init(std.testing.allocator, &session);
+    defer store.deinit();
+
+    const piece0 = try planPieceVerification(std.testing.allocator, &session, 0);
+    defer freePiecePlan(std.testing.allocator, piece0);
+    try store.writePiece(piece0.spans, "spam");
+
+    var state = try recheckExistingData(std.testing.allocator, &session, &store);
+    defer state.deinit(std.testing.allocator);
+
+    try std.testing.expect(state.complete_pieces.has(0));
+    try std.testing.expect(!state.complete_pieces.has(1));
+    try std.testing.expectEqual(@as(u32, 1), state.complete_pieces.count);
+    try std.testing.expectEqual(@as(u64, 4), state.bytes_complete);
 }

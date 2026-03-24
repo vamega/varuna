@@ -1,3 +1,5 @@
 /reference-codebases/
 /.zig-cache/
 /zig-out/
+/perf/output/*
+!/perf/output/.gitkeep

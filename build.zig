@@ -59,4 +59,54 @@ pub fn build(b: *std.Build) void {
     const bench_step = b.step("bench", "Run bootstrap microbenchmarks");
     const run_bench = b.addRunArtifact(bench_exe);
     bench_step.dependOn(&run_bench.step);
+
+    const installed_exe_path = b.getInstallPath(.bin, "varuna");
+
+    const trace_step = b.step("trace-syscalls", "Run varuna under strace and write perf/output/strace.log");
+    const trace_cmd = b.addSystemCommand(&.{
+        "strace",
+        "-f",
+        "-yy",
+        "-s",
+        "256",
+        "-o",
+        "perf/output/strace.log",
+        installed_exe_path,
+    });
+    trace_cmd.step.dependOn(b.getInstallStep());
+    if (b.args) |args| {
+        trace_cmd.addArgs(args);
+    }
+    trace_step.dependOn(&trace_cmd.step);
+
+    const perf_stat_step = b.step("perf-stat", "Run varuna under perf stat and write perf/output/perf-stat.txt");
+    const perf_stat_cmd = b.addSystemCommand(&.{
+        "perf",
+        "stat",
+        "-d",
+        "--output",
+        "perf/output/perf-stat.txt",
+        installed_exe_path,
+    });
+    perf_stat_cmd.step.dependOn(b.getInstallStep());
+    if (b.args) |args| {
+        perf_stat_cmd.addArgs(args);
+    }
+    perf_stat_step.dependOn(&perf_stat_cmd.step);
+
+    const perf_record_step = b.step("perf-record", "Run varuna under perf record and write perf/output/perf.data");
+    const perf_record_cmd = b.addSystemCommand(&.{
+        "perf",
+        "record",
+        "-o",
+        "perf/output/perf.data",
+        "--call-graph",
+        "dwarf",
+        installed_exe_path,
+    });
+    perf_record_cmd.step.dependOn(b.getInstallStep());
+    if (b.args) |args| {
+        perf_record_cmd.addArgs(args);
+    }
+    perf_record_step.dependOn(&perf_record_cmd.step);
 }

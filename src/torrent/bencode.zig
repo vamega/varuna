@@ -12,7 +12,16 @@ pub const Value = union(enum) {
     };
 };
 
-pub fn parse(allocator: std.mem.Allocator, input: []const u8) !Value {
+pub const ParseError = std.mem.Allocator.Error || std.fmt.ParseIntError || error{
+    TrailingData,
+    UnexpectedEndOfStream,
+    InvalidPrefix,
+    InvalidInteger,
+    InvalidByteStringLength,
+    UnexpectedByte,
+};
+
+pub fn parse(allocator: std.mem.Allocator, input: []const u8) ParseError!Value {
     var parser = Parser{
         .allocator = allocator,
         .input = input,
@@ -41,7 +50,7 @@ const Parser = struct {
     input: []const u8,
     index: usize = 0,
 
-    fn parseValue(self: *Parser) !Value {
+    fn parseValue(self: *Parser) ParseError!Value {
         const next = self.peek() orelse return error.UnexpectedEndOfStream;
         return switch (next) {
             'i' => .{ .integer = try self.parseInteger() },
@@ -52,7 +61,7 @@ const Parser = struct {
         };
     }
 
-    fn parseInteger(self: *Parser) !i64 {
+    fn parseInteger(self: *Parser) ParseError!i64 {
         try self.expectByte('i');
         const start = self.index;
         while (self.peek()) |byte| {
@@ -73,7 +82,7 @@ const Parser = struct {
         return std.fmt.parseInt(i64, digits, 10);
     }
 
-    fn parseBytes(self: *Parser) ![]const u8 {
+    fn parseBytes(self: *Parser) ParseError![]const u8 {
         const length_start = self.index;
         while (self.peek()) |byte| {
             if (byte == ':') break;
@@ -102,7 +111,7 @@ const Parser = struct {
         return self.input[self.index..end];
     }
 
-    fn parseList(self: *Parser) ![]Value {
+    fn parseList(self: *Parser) ParseError![]Value {
         try self.expectByte('l');
 
         var values: std.ArrayListUnmanaged(Value) = .empty;
@@ -119,7 +128,7 @@ const Parser = struct {
         }
     }
 
-    fn parseDict(self: *Parser) ![]Value.Entry {
+    fn parseDict(self: *Parser) ParseError![]Value.Entry {
         try self.expectByte('d');
 
         var entries: std.ArrayListUnmanaged(Value.Entry) = .empty;
@@ -146,7 +155,7 @@ const Parser = struct {
         }
     }
 
-    fn expectByte(self: *Parser, byte: u8) !void {
+    fn expectByte(self: *Parser, byte: u8) ParseError!void {
         if (self.peek() != byte) {
             return error.UnexpectedByte;
         }

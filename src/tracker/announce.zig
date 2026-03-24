@@ -1,0 +1,281 @@
+const std = @import("std");
+const bencode = @import("../torrent/bencode.zig");
+
+pub const Request = struct {
+    announce_url: []const u8,
+    info_hash: [20]u8,
+    peer_id: [20]u8,
+    port: u16,
+    uploaded: u64 = 0,
+    downloaded: u64 = 0,
+    left: u64,
+    event: ?Event = .started,
+
+    pub const Event = enum {
+        started,
+        completed,
+        stopped,
+    };
+};
+
+pub const Peer = struct {
+    address: std.net.Address,
+};
+
+pub const Response = struct {
+    interval: u32,
+    peers: []Peer,
+    complete: ?u32 = null,
+    incomplete: ?u32 = null,
+};
+
+pub fn fetch(
+    allocator: std.mem.Allocator,
+    client: *std.http.Client,
+    request: Request,
+) !Response {
+    const url = try buildUrl(allocator, request);
+    defer allocator.free(url);
+
+    var body = std.Io.Writer.Allocating.init(allocator);
+    defer body.deinit();
+
+    const result = try client.fetch(.{
+        .location = .{ .url = url },
+        .response_writer = &body.writer,
+    });
+    if (result.status != .ok) {
+        return error.UnexpectedTrackerStatus;
+    }
+
+    return parseResponse(allocator, body.writer.buffer[0..body.writer.end]);
+}
+
+pub fn freeResponse(allocator: std.mem.Allocator, response: Response) void {
+    allocator.free(response.peers);
+}
+
+fn buildUrl(allocator: std.mem.Allocator, request: Request) ![]u8 {
+    var url = std.ArrayList(u8).empty;
+    defer url.deinit(allocator);
+
+    try url.appendSlice(allocator, request.announce_url);
+    try url.append(allocator, if (std.mem.indexOfScalar(u8, request.announce_url, '?') == null) '?' else '&');
+
+    try appendQueryBytes(allocator, &url, "info_hash", request.info_hash[0..]);
+    try appendQueryBytes(allocator, &url, "peer_id", request.peer_id[0..]);
+    try appendQueryInt(allocator, &url, "port", request.port);
+    try appendQueryInt(allocator, &url, "uploaded", request.uploaded);
+    try appendQueryInt(allocator, &url, "downloaded", request.downloaded);
+    try appendQueryInt(allocator, &url, "left", request.left);
+    try appendQueryInt(allocator, &url, "compact", 1);
+    if (request.event) |event| {
+        try appendQueryString(allocator, &url, "event", @tagName(event));
+    }
+
+    return url.toOwnedSlice(allocator);
+}
+
+fn parseResponse(allocator: std.mem.Allocator, input: []const u8) !Response {
+    const root = try bencode.parse(allocator, input);
+    defer bencode.freeValue(allocator, root);
+
+    const dict = expectDict(root);
+    if (bencode.dictGet(dict, "failure reason")) |_| {
+        return error.TrackerFailure;
+    }
+
+    const peers = try parsePeers(allocator, try getRequired(dict, "peers"));
+    errdefer allocator.free(peers);
+
+    return .{
+        .interval = if (bencode.dictGet(dict, "interval")) |value| expectPositiveU32(value) else 1800,
+        .peers = peers,
+        .complete = if (bencode.dictGet(dict, "complete")) |value| expectPositiveU32(value) else null,
+        .incomplete = if (bencode.dictGet(dict, "incomplete")) |value| expectPositiveU32(value) else null,
+    };
+}
+
+fn parsePeers(allocator: std.mem.Allocator, value: bencode.Value) ![]Peer {
+    return switch (value) {
+        .bytes => |bytes| parseCompactPeers(allocator, bytes),
+        .list => |list| parsePeerList(allocator, list),
+        else => error.InvalidPeersField,
+    };
+}
+
+fn parseCompactPeers(allocator: std.mem.Allocator, bytes: []const u8) ![]Peer {
+    if (bytes.len % 6 != 0) {
+        return error.InvalidPeersField;
+    }
+
+    const count = bytes.len / 6;
+    const peers = try allocator.alloc(Peer, count);
+    errdefer allocator.free(peers);
+
+    for (peers, 0..) |*peer, index| {
+        const chunk = bytes[index * 6 ..][0..6];
+        const port = std.mem.readInt(u16, chunk[4..6], .big);
+        peer.* = .{
+            .address = std.net.Address.initIp4(.{ chunk[0], chunk[1], chunk[2], chunk[3] }, port),
+        };
+    }
+
+    return peers;
+}
+
+fn parsePeerList(allocator: std.mem.Allocator, values: []const bencode.Value) ![]Peer {
+    var peers = try allocator.alloc(Peer, values.len);
+    errdefer allocator.free(peers);
+
+    for (values, 0..) |value, index| {
+        const dict = expectDict(value);
+        const ip = expectBytes(try getRequired(dict, "ip"));
+        const port = expectPositiveU16(try getRequired(dict, "port"));
+
+        peers[index] = .{
+            .address = try std.net.Address.parseIp(ip, port),
+        };
+    }
+
+    return peers;
+}
+
+fn appendQueryBytes(
+    allocator: std.mem.Allocator,
+    url: *std.ArrayList(u8),
+    key: []const u8,
+    value: []const u8,
+) !void {
+    if (url.items[url.items.len - 1] != '?' and url.items[url.items.len - 1] != '&') {
+        try url.append(allocator, '&');
+    }
+
+    try url.appendSlice(allocator, key);
+    try url.append(allocator, '=');
+    try appendPercentEncoded(allocator, url, value);
+}
+
+fn appendQueryInt(
+    allocator: std.mem.Allocator,
+    url: *std.ArrayList(u8),
+    key: []const u8,
+    value: anytype,
+) !void {
+    var buffer: [32]u8 = undefined;
+    const rendered = try std.fmt.bufPrint(&buffer, "{}", .{value});
+    try appendQueryString(allocator, url, key, rendered);
+}
+
+fn appendQueryString(
+    allocator: std.mem.Allocator,
+    url: *std.ArrayList(u8),
+    key: []const u8,
+    value: []const u8,
+) !void {
+    if (url.items[url.items.len - 1] != '?' and url.items[url.items.len - 1] != '&') {
+        try url.append(allocator, '&');
+    }
+
+    try url.appendSlice(allocator, key);
+    try url.append(allocator, '=');
+    try appendPercentEncoded(allocator, url, value);
+}
+
+fn appendPercentEncoded(
+    allocator: std.mem.Allocator,
+    url: *std.ArrayList(u8),
+    bytes: []const u8,
+) !void {
+    const hex = "0123456789ABCDEF";
+
+    for (bytes) |byte| {
+        if (isUnreserved(byte)) {
+            try url.append(allocator, byte);
+        } else {
+            try url.append(allocator, '%');
+            try url.append(allocator, hex[byte >> 4]);
+            try url.append(allocator, hex[byte & 0x0f]);
+        }
+    }
+}
+
+fn isUnreserved(byte: u8) bool {
+    return switch (byte) {
+        'A'...'Z', 'a'...'z', '0'...'9', '-', '.', '_', '~' => true,
+        else => false,
+    };
+}
+
+fn getRequired(dict: []const bencode.Value.Entry, key: []const u8) !bencode.Value {
+    return bencode.dictGet(dict, key) orelse error.MissingRequiredField;
+}
+
+fn expectDict(value: bencode.Value) []const bencode.Value.Entry {
+    return switch (value) {
+        .dict => |dict| dict,
+        else => @panic("expected bencode dictionary"),
+    };
+}
+
+fn expectBytes(value: bencode.Value) []const u8 {
+    return switch (value) {
+        .bytes => |bytes| bytes,
+        else => @panic("expected bencode bytes"),
+    };
+}
+
+fn expectPositiveU16(value: bencode.Value) u16 {
+    return std.math.cast(u16, expectPositiveU64(value)) orelse @panic("integer overflow");
+}
+
+fn expectPositiveU32(value: bencode.Value) u32 {
+    return std.math.cast(u32, expectPositiveU64(value)) orelse @panic("integer overflow");
+}
+
+fn expectPositiveU64(value: bencode.Value) u64 {
+    return switch (value) {
+        .integer => |integer| {
+            if (integer < 0) @panic("expected non-negative integer");
+            return @intCast(integer);
+        },
+        else => @panic("expected bencode integer"),
+    };
+}
+
+test "build announce url percent encodes binary fields" {
+    const url = try buildUrl(std.testing.allocator, .{
+        .announce_url = "http://tracker.example/announce",
+        .info_hash = [_]u8{ 0x00, 0xff } ++ ([_]u8{1} ** 18),
+        .peer_id = "ABCDEFGHIJKLMNOPQRST".*,
+        .port = 6881,
+        .left = 42,
+    });
+    defer std.testing.allocator.free(url);
+
+    try std.testing.expect(std.mem.indexOf(u8, url, "info_hash=%00%FF") != null);
+    try std.testing.expect(std.mem.indexOf(u8, url, "peer_id=ABCDEFGHIJKLMNOPQRST") != null);
+    try std.testing.expect(std.mem.indexOf(u8, url, "compact=1") != null);
+    try std.testing.expect(std.mem.indexOf(u8, url, "event=started") != null);
+}
+
+test "parse compact tracker response" {
+    const response = try parseResponse(std.testing.allocator,
+        "d8:completei1e10:incompletei0e8:intervali30e5:peers6:\x7f\x00\x00\x01\x1a\xe1e",
+    );
+    defer freeResponse(std.testing.allocator, response);
+
+    try std.testing.expectEqual(@as(u32, 30), response.interval);
+    try std.testing.expectEqual(@as(usize, 1), response.peers.len);
+    try std.testing.expectEqual(@as(u16, 6881), response.peers[0].address.getPort());
+}
+
+test "parse dictionary tracker peers" {
+    const response = try parseResponse(std.testing.allocator,
+        "d8:intervali60e5:peersld2:ip9:127.0.0.14:porti7000eeee",
+    );
+    defer freeResponse(std.testing.allocator, response);
+
+    try std.testing.expectEqual(@as(usize, 1), response.peers.len);
+    try std.testing.expectEqual(@as(u16, 7000), response.peers[0].address.getPort());
+}

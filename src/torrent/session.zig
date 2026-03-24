@@ -5,6 +5,7 @@ const metainfo = @import("metainfo.zig");
 const manifest = @import("../storage/manifest.zig");
 
 pub const Session = struct {
+    torrent_bytes: []const u8,
     metainfo: metainfo.Metainfo,
     layout: layout.Layout,
     manifest: manifest.Manifest,
@@ -15,7 +16,10 @@ pub const Session = struct {
         torrent_bytes: []const u8,
         target_root: []const u8,
     ) !Session {
-        const parsed = try metainfo.parse(allocator, torrent_bytes);
+        const owned_torrent_bytes = try allocator.dupe(u8, torrent_bytes);
+        errdefer allocator.free(owned_torrent_bytes);
+
+        const parsed = try metainfo.parse(allocator, owned_torrent_bytes);
         errdefer metainfo.freeMetainfo(allocator, parsed);
 
         const built_layout = try layout.build(allocator, &parsed);
@@ -25,6 +29,7 @@ pub const Session = struct {
         errdefer manifest.freeManifest(allocator, built_manifest);
 
         return .{
+            .torrent_bytes = owned_torrent_bytes,
             .metainfo = parsed,
             .layout = built_layout,
             .manifest = built_manifest,
@@ -35,6 +40,7 @@ pub const Session = struct {
         manifest.freeManifest(allocator, self.manifest);
         layout.freeLayout(allocator, self.layout);
         metainfo.freeMetainfo(allocator, self.metainfo);
+        allocator.free(self.torrent_bytes);
     }
 
     pub fn geometry(self: *const Session) blocks.Geometry {
@@ -90,4 +96,17 @@ test "load multi file torrent session" {
     try std.testing.expectEqual(@as(usize, 2), mapped.len);
     try std.testing.expectEqual(@as(u32, 3), mapped[0].length);
     try std.testing.expectEqual(@as(u32, 1), mapped[1].length);
+}
+
+test "session owns torrent bytes after load" {
+    const torrent_bytes = try std.testing.allocator.dupe(u8,
+        "d4:infod6:lengthi4e4:name8:test.bin12:piece lengthi4e6:pieces20:abcdefghijklmnopqrstee",
+    );
+    defer std.testing.allocator.free(torrent_bytes);
+
+    const loaded = try Session.load(std.testing.allocator, torrent_bytes, "/srv/torrents");
+    defer loaded.deinit(std.testing.allocator);
+
+    @memset(torrent_bytes, 'x');
+    try std.testing.expectEqualStrings("test.bin", loaded.metainfo.name);
 }

@@ -1,6 +1,31 @@
 # Varuna
 
-Varuna is a planned headless BitTorrent client in Zig for Linux. The project is named after the Hindu god of water and also ties back to the author’s name. The design target is a high-performance daemon that leans heavily on `io_uring`, keeps allocations tightly controlled, and scales to thousands or tens of thousands of torrents.
+Varuna is a headless BitTorrent client in Zig for Linux, currently at an early minimal-client stage. The project is named after the Hindu god of water and also ties back to the author’s name. The design target is still a high-performance daemon that leans heavily on `io_uring`, keeps allocations tightly controlled, and scales to thousands or tens of thousands of torrents.
+
+## Current Status
+The repository now includes a minimal end-to-end download path:
+
+- Load a `.torrent` file and derive its file layout.
+- Announce to an HTTP tracker with compact peer support.
+- Recheck existing on-disk data and reuse pieces that already verify.
+- Connect to a peer over the BitTorrent wire protocol.
+- Download pieces sequentially, verify SHA-1 hashes, and write data to disk.
+
+Current CLI:
+
+```bash
+zig build run -- download /path/to/file.torrent /path/to/download-root
+```
+
+Current scope limits:
+
+- HTTP trackers only.
+- Single-peer sequential download flow.
+- `.torrent` files only; no magnet support yet.
+- Download-only; no serving or listening socket yet.
+- Resume is currently based on full piece recheck at startup, not persisted resume metadata.
+
+The living scope and architecture record lives in [DECISIONS.md](DECISIONS.md). Keep that file updated as constraints and design choices change.
 
 ## Project Direction
 Varuna is intended for local Linux storage only. SSDs, HDDs, mergerfs, ext4, xfs, btrfs, bcachefs, and zfs matter; network filesystems such as NFS and CIFS do not. The initial focus is private-tracker functionality and operational reliability, not broad feature coverage or plugin systems.
@@ -40,6 +65,15 @@ mise install
 - Use SQLite for initial resume-state persistence, then revisit if a more `io_uring`-friendly approach is justified by measurements.
 - Select a storage target per torrent at add time; do not build application-level multi-disk placement when the filesystem can already provide that behavior.
 - Let memory targets follow measurement. Optimize for compact state, but do not pick an arbitrary hard RAM ceiling before benchmark data exists.
+
+## Performance Tooling
+Use [perf/README.md](perf/README.md) as the operational playbook for syscall and CPU inspection.
+
+Available helper commands:
+
+- `zig build trace-syscalls -- ...`
+- `zig build perf-stat -- ...`
+- `zig build perf-record -- ...`
 
 ## Open Design Questions
 The next high-value decision is how aggressively startup should trade initialization work for steady-state performance.

@@ -1,0 +1,94 @@
+# Performance Tooling
+
+Varuna is expected to move toward aggressive `io_uring` usage over time. This directory holds the profiling and syscall-inspection playbook used to measure what the binary actually does today.
+
+Generated artifacts should go under `perf/output/`.
+
+## Prerequisites
+
+These tools are external Linux packages, not Zig dependencies. The helper steps in `build.zig` expect the following binaries to be present on the host:
+
+- `strace`
+- `perf`
+- `bpftrace`
+
+On many distributions this means packages similar to `strace`, `linux-perf` or `perf`, and `bpftrace`.
+On WSL kernels, `perf` may additionally require a kernel-matched `linux-tools-<kernel>` package before `perf stat` or `perf record` will run successfully.
+
+## Goals
+
+- Confirm which syscalls are still used directly instead of through `io_uring`.
+- Find CPU hotspots and call stacks before optimizing blindly.
+- Keep a repeatable workflow for comparing changes across iterations.
+
+## Build-Step Helpers
+
+These commands build `varuna` first and then run it under the selected tool. Pass normal `varuna` CLI arguments after `--`.
+
+- `zig build trace-syscalls -- banner`
+  Writes a full syscall trace to `perf/output/strace.log`.
+- `zig build perf-stat -- banner`
+  Writes `perf stat` counters to `perf/output/perf-stat.txt`.
+- `zig build perf-record -- banner`
+  Writes sampled profiling data to `perf/output/perf.data`.
+
+## Direct Tool Usage
+
+Fast syscall summary:
+
+```bash
+strace -f -yy -c ./zig-out/bin/varuna banner
+```
+
+Full syscall trace:
+
+```bash
+strace -f -yy -s 256 -o perf/output/strace.log ./zig-out/bin/varuna banner
+```
+
+CPU counters:
+
+```bash
+perf stat -d --output perf/output/perf-stat.txt ./zig-out/bin/varuna banner
+```
+
+Sampled profile:
+
+```bash
+perf record -o perf/output/perf.data --call-graph dwarf ./zig-out/bin/varuna banner
+perf report -i perf/output/perf.data
+```
+
+## eBPF / bpftrace Strategy
+
+Use `bpftrace` when you need targeted kernel-level visibility rather than a full `strace` log.
+This generally requires running as root.
+
+Count all syscall entry tracepoints for the running process:
+
+```bash
+sudo bpftrace -e 'tracepoint:syscalls:sys_enter_* /comm == "varuna"/ { @[probe] = count(); }'
+```
+
+Check whether `io_uring` entry is happening at all:
+
+```bash
+sudo bpftrace -e 'tracepoint:syscalls:sys_enter_io_uring_enter /comm == "varuna"/ { @io_uring_enter = count(); }'
+```
+
+Look for fallback blocking I/O syscalls:
+
+```bash
+sudo bpftrace -e '
+tracepoint:syscalls:sys_enter_read /comm == "varuna"/ { @read = count(); }
+tracepoint:syscalls:sys_enter_write /comm == "varuna"/ { @write = count(); }
+tracepoint:syscalls:sys_enter_recvfrom /comm == "varuna"/ { @recvfrom = count(); }
+tracepoint:syscalls:sys_enter_sendto /comm == "varuna"/ { @sendto = count(); }
+'
+```
+
+## Interpretation Notes
+
+- A minimal-client build that still shows `read`, `write`, `connect`, `recvfrom`, or `sendto` is expected until the networking and storage paths are moved to `io_uring`.
+- Treat unexpected `openat`, `statx`, `futex`, or timer-heavy behavior as prompts to inspect startup, buffering, and lock behavior.
+- Record which command was run and what changed in [DECISIONS.md](../DECISIONS.md) when a profiling pass leads to a design choice.
