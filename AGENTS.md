@@ -3,7 +3,7 @@
 ## Project Structure & Module Organization
 Keep the root minimal and move implementation under `src/` as the codebase forms. Use `src/main.zig` for the entrypoint, and split major subsystems into focused directories such as `src/core/`, `src/net/`, `src/storage/`, `src/tracker/`, and `src/rpc/`. Put reusable test fixtures in `testdata/`. Keep benchmarking and profiling helpers in `perf/` or `scripts/`. Use `reference-codebases/` for local study of `rtorrent`, both `libtorrent` codebases, `qbittorrent`, and `vortex` when validating protocol behavior, startup strategies, storage design, or API compatibility.
 
-Keep [DECISIONS.md](DECISIONS.md) updated whenever scope, constraints, architecture choices, or profiling strategy change. Keep [perf/README.md](perf/README.md) aligned with the actual profiling workflow and available build steps.
+Keep [DECISIONS.md](DECISIONS.md) updated whenever scope, constraints, architecture choices, or profiling strategy change. Keep [STATUS.md](STATUS.md) updated with completed work, next work, and known issues. Keep [perf/README.md](perf/README.md) aligned with the actual profiling workflow and available build steps.
 
 ## Build, Test, and Development Commands
 Use Zig stable only: Zig `0.15.2` or the latest stable release, never nightly.

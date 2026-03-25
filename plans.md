@@ -50,7 +50,7 @@ Varuna is a headless Linux BitTorrent client written in Zig, optimized for high 
 ## Performance Notes
 Startup behavior is important enough to track separately. See `startup-performance-considerations.md` for known causes of slow startup in torrent clients, recent rTorrent optimization work, and the resulting design rules for Varuna.
 
-Use [DECISIONS.md](DECISIONS.md) as the living record of scope and architecture decisions, and [perf/README.md](perf/README.md) as the profiling playbook for `strace`, `perf`, and eBPF/bpftrace-based syscall inspection.
+Use [DECISIONS.md](DECISIONS.md) as the living record of scope and architecture decisions, [STATUS.md](STATUS.md) as the implementation and issue ledger, and [perf/README.md](perf/README.md) as the profiling playbook for `strace`, `perf`, and eBPF/bpftrace-based syscall inspection.
 Use `scripts/demo_swarm.sh` as the current end-to-end local swarm smoke test while the client is still in its minimal single-peer stage.
 
 ## Questions To Answer Next

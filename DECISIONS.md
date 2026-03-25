@@ -2,6 +2,7 @@
 
 This file is the living record of product, architecture, and workflow decisions for Varuna.
 Update it whenever scope changes, constraints are widened or tightened, profiling strategy changes, or a notable implementation tradeoff is chosen.
+Use [STATUS.md](STATUS.md) for the running list of completed work, next work, and currently known issues.
 
 ## Active Constraints
 

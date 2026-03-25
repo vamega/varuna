@@ -30,6 +30,7 @@ Current scope limits:
 - Resume is currently based on full piece recheck at startup, not persisted resume metadata.
 
 The living scope and architecture record lives in [DECISIONS.md](DECISIONS.md). Keep that file updated as constraints and design choices change.
+Use [STATUS.md](STATUS.md) as the current ledger for what is already implemented, what is next, and which issues are still open.
 
 ## Local Swarm Demo
 The repository includes a reproducible local smoke test that uses an off-the-shelf tracker:
