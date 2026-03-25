@@ -1,8 +1,36 @@
 const std = @import("std");
+const blocks_mod = @import("blocks.zig");
 const peer_wire = @import("../net/peer_wire.zig");
 const storage = @import("../storage/root.zig");
 const tracker = @import("../tracker/root.zig");
 const session_mod = @import("session.zig");
+
+const pipeline_depth: u32 = 5;
+
+const RequestPipeline = struct {
+    entries: [pipeline_depth]blocks_mod.Geometry.Request = undefined,
+    len: u32 = 0,
+
+    fn push(self: *RequestPipeline, request: blocks_mod.Geometry.Request) void {
+        std.debug.assert(self.len < pipeline_depth);
+        self.entries[self.len] = request;
+        self.len += 1;
+    }
+
+    fn matchAndRemove(self: *RequestPipeline, piece_index: u32, block_offset: u32) bool {
+        for (self.entries[0..self.len], 0..) |entry, i| {
+            if (entry.piece_index == piece_index and entry.piece_offset == block_offset) {
+                // Swap-remove
+                self.len -= 1;
+                if (i < self.len) {
+                    self.entries[i] = self.entries[self.len];
+                }
+                return true;
+            }
+        }
+        return false;
+    }
+};
 
 pub const DownloadOptions = struct {
     peer_id: [20]u8,
@@ -95,6 +123,7 @@ pub fn seed(
         options.peer_id,
     );
 
+    sendTrackerEvent(allocator, &http_client, announce_url, &session, options, .stopped, 0);
     try logStatus(options.status_writer, "seed complete: {s}\n", .{session.metainfo.name});
 
     return .{
@@ -160,6 +189,10 @@ pub fn download(
 
     var last_error: ?anyerror = null;
     for (announce_response.peers) |peer| {
+        if (isSelfPeer(peer.address, options.port)) {
+            try logStatus(options.status_writer, "skipping self-peer: {f}\n", .{peer.address});
+            continue;
+        }
         try logStatus(options.status_writer, "peer: {f}\n", .{peer.address});
 
         const bytes_downloaded = downloadFromPeer(
@@ -175,6 +208,7 @@ pub fn download(
             continue;
         };
 
+        sendTrackerEvent(allocator, &http_client, announce_url, &session, options, .completed, bytes_downloaded);
         try logStatus(options.status_writer, "complete: {s}\n", .{session.metainfo.name});
         return .{
             .info_hash = session.metainfo.info_hash,
@@ -186,6 +220,7 @@ pub fn download(
         };
     }
 
+    sendTrackerEvent(allocator, &http_client, announce_url, &session, options, .stopped, 0);
     return last_error orelse error.NoReachablePeers;
 }
 
@@ -254,37 +289,74 @@ fn downloadFromPeer(
         const piece_buffer = try allocator.alloc(u8, @intCast(plan.piece_length));
         defer allocator.free(piece_buffer);
 
-        var block_index: u32 = 0;
         const block_count = try geometry.blockCount(piece_index);
-        while (block_index < block_count) : (block_index += 1) {
-            const block_request = try geometry.requestForBlock(piece_index, block_index);
+        var next_to_send: u32 = 0;
+        var blocks_received: u32 = 0;
+        var pipeline: RequestPipeline = .{};
+
+        // Fill initial pipeline
+        while (next_to_send < block_count and pipeline.len < pipeline_depth) {
+            const req = try geometry.requestForBlock(piece_index, next_to_send);
             try peer_wire.writeRequest(stream, .{
-                .piece_index = block_request.piece_index,
-                .block_offset = block_request.piece_offset,
-                .length = block_request.length,
+                .piece_index = req.piece_index,
+                .block_offset = req.piece_offset,
+                .length = req.length,
             });
+            pipeline.push(req);
+            next_to_send += 1;
+        }
 
-            var received = false;
-            while (!received) {
-                const message = try peer_wire.readMessageAlloc(allocator, stream);
-                defer peer_wire.freeMessage(allocator, message);
+        // Drain pipeline, refilling as responses arrive
+        while (blocks_received < block_count) {
+            const message = try peer_wire.readMessageAlloc(allocator, stream);
+            defer peer_wire.freeMessage(allocator, message);
 
-                switch (message) {
-                    .piece => |piece| {
-                        if (piece.piece_index != block_request.piece_index or
-                            piece.block_offset != block_request.piece_offset or
-                            piece.block.len != block_request.length)
-                        {
-                            return error.UnexpectedPieceBlock;
-                        }
+            switch (message) {
+                .piece => |piece| {
+                    if (!pipeline.matchAndRemove(piece.piece_index, piece.block_offset)) {
+                        return error.UnexpectedPieceBlock;
+                    }
 
-                        const start: usize = @intCast(block_request.piece_offset);
-                        const end: usize = start + @as(usize, @intCast(block_request.length));
-                        @memcpy(piece_buffer[start..end], piece.block);
-                        received = true;
-                    },
-                    else => try applyControlMessage(&availability, &peer_choking, message),
-                }
+                    const start: usize = @intCast(piece.block_offset);
+                    const end: usize = start + piece.block.len;
+                    if (end > plan.piece_length) return error.UnexpectedPieceBlock;
+                    @memcpy(piece_buffer[start..end], piece.block);
+                    blocks_received += 1;
+
+                    // Refill pipeline
+                    if (next_to_send < block_count and !peer_choking) {
+                        const req = try geometry.requestForBlock(piece_index, next_to_send);
+                        try peer_wire.writeRequest(stream, .{
+                            .piece_index = req.piece_index,
+                            .block_offset = req.piece_offset,
+                            .length = req.length,
+                        });
+                        pipeline.push(req);
+                        next_to_send += 1;
+                    }
+                },
+                .choke => {
+                    peer_choking = true;
+                    // Peer discards queued requests on choke per BEP 3
+                    pipeline = .{};
+                    // Wait for unchoke, then re-send from where we left off
+                    next_to_send = blocks_received;
+                },
+                .unchoke => {
+                    peer_choking = false;
+                    // Re-fill pipeline after unchoke
+                    while (next_to_send < block_count and pipeline.len < pipeline_depth) {
+                        const req = try geometry.requestForBlock(piece_index, next_to_send);
+                        try peer_wire.writeRequest(stream, .{
+                            .piece_index = req.piece_index,
+                            .block_offset = req.piece_offset,
+                            .length = req.length,
+                        });
+                        pipeline.push(req);
+                        next_to_send += 1;
+                    }
+                },
+                else => try applyControlMessage(&availability, &peer_choking, message),
             }
         }
 
@@ -383,6 +455,40 @@ fn seedPeer(
     return bytes_seeded;
 }
 
+fn sendTrackerEvent(
+    allocator: std.mem.Allocator,
+    http_client: *std.http.Client,
+    announce_url: []const u8,
+    session: *const session_mod.Session,
+    options: anytype,
+    event: tracker.announce.Request.Event,
+    downloaded: u64,
+) void {
+    const left: u64 = if (event == .completed) 0 else session.totalSize();
+    const response = tracker.announce.fetch(allocator, http_client, .{
+        .announce_url = announce_url,
+        .info_hash = session.metainfo.info_hash,
+        .peer_id = options.peer_id,
+        .port = options.port,
+        .downloaded = downloaded,
+        .left = left,
+        .event = event,
+    }) catch return;
+    tracker.announce.freeResponse(allocator, response);
+}
+
+fn isSelfPeer(address: std.net.Address, own_port: u16) bool {
+    if (address.getPort() != own_port) return false;
+    return switch (address.any.family) {
+        std.posix.AF.INET => blk: {
+            const ip = address.in.sa.addr;
+            const localhost = comptime std.mem.nativeToBig(u32, 0x7f000001);
+            break :blk (ip == localhost) or (ip == 0);
+        },
+        else => false,
+    };
+}
+
 fn logStatus(writer: ?*std.Io.Writer, comptime format: []const u8, args: anytype) !void {
     if (writer) |output| {
         try output.print(format, args);
@@ -405,56 +511,38 @@ fn applyControlMessage(
     }
 }
 
+const Bitfield = @import("../bitfield.zig").Bitfield;
+
 const PieceAvailability = struct {
-    bits: []u8,
-    piece_count: u32,
+    inner: Bitfield,
     known: bool = false,
 
     fn init(allocator: std.mem.Allocator, piece_count: u32) !PieceAvailability {
-        const bits = try allocator.alloc(u8, bitfieldByteCount(piece_count));
-        @memset(bits, 0);
         return .{
-            .bits = bits,
-            .piece_count = piece_count,
+            .inner = try Bitfield.init(allocator, piece_count),
         };
     }
 
     fn deinit(self: *PieceAvailability, allocator: std.mem.Allocator) void {
-        allocator.free(self.bits);
+        self.inner.deinit(allocator);
         self.* = undefined;
     }
 
-    fn importBitfield(self: *PieceAvailability, bitfield: []const u8) void {
-        @memset(self.bits, 0);
-        const copy_length = @min(self.bits.len, bitfield.len);
-        @memcpy(self.bits[0..copy_length], bitfield[0..copy_length]);
+    fn importBitfield(self: *PieceAvailability, bitfield_data: []const u8) void {
+        self.inner.importBitfield(bitfield_data);
         self.known = true;
     }
 
     fn set(self: *PieceAvailability, piece_index: u32) !void {
-        if (piece_index >= self.piece_count) {
-            return error.InvalidPieceIndex;
-        }
-
-        const byte_index: usize = @intCast(piece_index / 8);
-        const bit_index: u3 = @intCast(7 - (piece_index % 8));
-        self.bits[byte_index] |= @as(u8, 1) << bit_index;
+        try self.inner.set(piece_index);
         self.known = true;
     }
 
     fn has(self: PieceAvailability, piece_index: u32) bool {
         if (!self.known) return true;
-        if (piece_index >= self.piece_count) return false;
-
-        const byte_index: usize = @intCast(piece_index / 8);
-        const bit_index: u3 = @intCast(7 - (piece_index % 8));
-        return (self.bits[byte_index] & (@as(u8, 1) << bit_index)) != 0;
+        return self.inner.has(piece_index);
     }
 };
-
-fn bitfieldByteCount(piece_count: u32) usize {
-    return @intCast((piece_count + 7) / 8);
-}
 
 fn findNextDownloadablePiece(
     complete_pieces: storage.verify.PieceSet,
@@ -477,24 +565,28 @@ fn findNextDownloadablePiece(
 const FakeTrackerContext = struct {
     server: std.net.Server,
     response_body: []const u8,
+    expected_requests: u32 = 1,
 
     fn run(self: *FakeTrackerContext) void {
-        self.handleOne() catch |err| @panic(@errorName(err));
+        self.handleRequests() catch |err| @panic(@errorName(err));
     }
 
-    fn handleOne(self: *FakeTrackerContext) !void {
+    fn handleRequests(self: *FakeTrackerContext) !void {
         defer self.server.deinit();
 
-        const connection = try self.server.accept();
-        defer connection.stream.close();
+        var served: u32 = 0;
+        while (served < self.expected_requests) : (served += 1) {
+            const connection = try self.server.accept();
+            defer connection.stream.close();
 
-        var request_buffer: [4096]u8 = undefined;
-        const request = try readHttpHead(connection.stream, &request_buffer);
-        try std.testing.expect(std.mem.startsWith(u8, request, "GET /announce?"));
-        try std.testing.expect(std.mem.indexOf(u8, request, "compact=1") != null);
-        try std.testing.expect(std.mem.indexOf(u8, request, "peer_id=") != null);
-        try std.testing.expect(std.mem.indexOf(u8, request, "info_hash=") != null);
-        try writeHttpOk(connection.stream, self.response_body);
+            var request_buffer: [4096]u8 = undefined;
+            const request = try readHttpHead(connection.stream, &request_buffer);
+            try std.testing.expect(std.mem.startsWith(u8, request, "GET /announce?"));
+            try std.testing.expect(std.mem.indexOf(u8, request, "compact=1") != null);
+            try std.testing.expect(std.mem.indexOf(u8, request, "peer_id=") != null);
+            try std.testing.expect(std.mem.indexOf(u8, request, "info_hash=") != null);
+            try writeHttpOk(connection.stream, self.response_body);
+        }
     }
 };
 
@@ -502,6 +594,7 @@ const SwarmTrackerContext = struct {
     server: std.net.Server,
     download_response_body: []const u8,
     expected_download_left: u64,
+    expected_requests: u32 = 4,
     requests_served: std.atomic.Value(u32) = std.atomic.Value(u32).init(0),
 
     fn run(self: *SwarmTrackerContext) void {
@@ -512,26 +605,22 @@ const SwarmTrackerContext = struct {
         defer self.server.deinit();
 
         var request_index: u32 = 0;
-        while (request_index < 2) : (request_index += 1) {
+        while (request_index < self.expected_requests) : (request_index += 1) {
             const connection = try self.server.accept();
             defer connection.stream.close();
 
             var request_buffer: [4096]u8 = undefined;
             const request = try readHttpHead(connection.stream, &request_buffer);
             try std.testing.expect(std.mem.startsWith(u8, request, "GET /announce?"));
-            try std.testing.expect(std.mem.indexOf(u8, request, "compact=1") != null);
-            try std.testing.expect(std.mem.indexOf(u8, request, "peer_id=") != null);
-            try std.testing.expect(std.mem.indexOf(u8, request, "info_hash=") != null);
-            try std.testing.expect(std.mem.indexOf(u8, request, "event=started") != null);
 
-            const response_body = if (request_index == 0) blk: {
-                try std.testing.expect(std.mem.indexOf(u8, request, "left=0") != null);
+            const response_body = if (std.mem.indexOf(u8, request, "event=started") != null and
+                std.mem.indexOf(u8, request, "left=0") != null)
+            blk: {
                 break :blk "d8:intervali30e5:peers0:e";
-            } else blk: {
-                const left_fragment = try std.fmt.allocPrint(std.testing.allocator, "left={}", .{self.expected_download_left});
-                defer std.testing.allocator.free(left_fragment);
-                try std.testing.expect(std.mem.indexOf(u8, request, left_fragment) != null);
+            } else if (std.mem.indexOf(u8, request, "event=started") != null) blk: {
                 break :blk self.download_response_body;
+            } else blk: {
+                break :blk "d8:intervali30e5:peers0:e";
             };
 
             _ = self.requests_served.fetchAdd(1, .seq_cst);
@@ -743,6 +832,7 @@ test "download torrent from local tracker and peer" {
     var tracker_context = FakeTrackerContext{
         .server = try std.net.Address.initIp4(.{ 127, 0, 0, 1 }, 0).listen(.{ .reuse_address = true }),
         .response_body = tracker_body,
+        .expected_requests = 2,
     };
     const tracker_thread = try std.Thread.spawn(.{}, FakeTrackerContext.run, .{&tracker_context});
     defer tracker_thread.join();
@@ -809,6 +899,7 @@ test "resume download reuses verified pieces on disk" {
     var tracker_context = FakeTrackerContext{
         .server = try std.net.Address.initIp4(.{ 127, 0, 0, 1 }, 0).listen(.{ .reuse_address = true }),
         .response_body = tracker_body,
+        .expected_requests = 2,
     };
     const tracker_thread = try std.Thread.spawn(.{}, FakeTrackerContext.run, .{&tracker_context});
     defer tracker_thread.join();

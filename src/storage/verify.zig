@@ -2,51 +2,7 @@ const std = @import("std");
 const torrent = @import("../torrent/root.zig");
 const writer = @import("writer.zig");
 
-pub const PieceSet = struct {
-    bits: []u8,
-    piece_count: u32,
-    count: u32 = 0,
-
-    pub fn init(allocator: std.mem.Allocator, piece_count: u32) !PieceSet {
-        const bits = try allocator.alloc(u8, byteCount(piece_count));
-        @memset(bits, 0);
-        return .{
-            .bits = bits,
-            .piece_count = piece_count,
-        };
-    }
-
-    pub fn deinit(self: *PieceSet, allocator: std.mem.Allocator) void {
-        allocator.free(self.bits);
-        self.* = undefined;
-    }
-
-    pub fn has(self: PieceSet, piece_index: u32) bool {
-        if (piece_index >= self.piece_count) return false;
-
-        const byte_index: usize = @intCast(piece_index / 8);
-        const bit_index: u3 = @intCast(7 - (piece_index % 8));
-        return (self.bits[byte_index] & (@as(u8, 1) << bit_index)) != 0;
-    }
-
-    pub fn set(self: *PieceSet, piece_index: u32) !void {
-        if (piece_index >= self.piece_count) {
-            return error.InvalidPieceIndex;
-        }
-        if (self.has(piece_index)) {
-            return;
-        }
-
-        const byte_index: usize = @intCast(piece_index / 8);
-        const bit_index: u3 = @intCast(7 - (piece_index % 8));
-        self.bits[byte_index] |= @as(u8, 1) << bit_index;
-        self.count += 1;
-    }
-
-    fn byteCount(piece_count: u32) usize {
-        return @intCast((piece_count + 7) / 8);
-    }
-};
+pub const PieceSet = @import("../bitfield.zig").Bitfield;
 
 pub const RecheckState = struct {
     complete_pieces: PieceSet,
