@@ -125,7 +125,7 @@ pub const Layout = struct {
 
 pub fn build(allocator: std.mem.Allocator, source: *const metainfo.Metainfo) !Layout {
     const total_size = source.totalSize();
-    const piece_count = source.pieceCount();
+    const piece_count = try source.pieceCount();
     if (piece_count == 0) {
         return error.EmptyTorrentData;
     }
@@ -146,7 +146,7 @@ pub fn build(allocator: std.mem.Allocator, source: *const metainfo.Metainfo) !La
         files[index] = .{
             .length = file.length,
             .torrent_offset = file_start,
-            .first_piece = if (file.length == 0) @intCast(file_start / source.piece_length) else @intCast(file_start / source.piece_length),
+            .first_piece = @intCast(file_start / source.piece_length),
             .end_piece_exclusive = if (file.length == 0)
                 @intCast(file_start / source.piece_length)
             else

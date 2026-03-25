@@ -184,7 +184,7 @@ fn runInspect(
     try writer.print("info_hash={s}\n", .{info_hash_hex[0..]});
     try writer.print("announce={s}\n", .{metainfo.announce orelse ""});
     try writer.print("piece_length={}\n", .{metainfo.piece_length});
-    try writer.print("pieces={}\n", .{metainfo.pieceCount()});
+    try writer.print("pieces={}\n", .{try metainfo.pieceCount()});
     try writer.print("total_size={}\n", .{metainfo.totalSize()});
     try writer.print("mode={s}\n", .{if (metainfo.isMultiFile()) "multi-file" else "single-file"});
     try writer.flush();

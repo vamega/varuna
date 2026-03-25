@@ -80,7 +80,7 @@ fn parseResponse(allocator: std.mem.Allocator, input: []const u8) !Response {
     const root = try bencode.parse(allocator, input);
     defer bencode.freeValue(allocator, root);
 
-    const dict = expectDict(root);
+    const dict = try expectDict(root);
     if (bencode.dictGet(dict, "failure reason")) |_| {
         return error.TrackerFailure;
     }
@@ -89,10 +89,10 @@ fn parseResponse(allocator: std.mem.Allocator, input: []const u8) !Response {
     errdefer allocator.free(peers);
 
     return .{
-        .interval = if (bencode.dictGet(dict, "interval")) |value| expectPositiveU32(value) else 1800,
+        .interval = if (bencode.dictGet(dict, "interval")) |value| try expectPositiveU32(value) else 1800,
         .peers = peers,
-        .complete = if (bencode.dictGet(dict, "complete")) |value| expectPositiveU32(value) else null,
-        .incomplete = if (bencode.dictGet(dict, "incomplete")) |value| expectPositiveU32(value) else null,
+        .complete = if (bencode.dictGet(dict, "complete")) |value| try expectPositiveU32(value) else null,
+        .incomplete = if (bencode.dictGet(dict, "incomplete")) |value| try expectPositiveU32(value) else null,
     };
 }
 
@@ -129,9 +129,9 @@ fn parsePeerList(allocator: std.mem.Allocator, values: []const bencode.Value) ![
     errdefer allocator.free(peers);
 
     for (values, 0..) |value, index| {
-        const dict = expectDict(value);
-        const ip = expectBytes(try getRequired(dict, "ip"));
-        const port = expectPositiveU16(try getRequired(dict, "port"));
+        const dict = try expectDict(value);
+        const ip = try expectBytes(try getRequired(dict, "ip"));
+        const port = try expectPositiveU16(try getRequired(dict, "port"));
 
         peers[index] = .{
             .address = try std.net.Address.parseIp(ip, port),
@@ -211,35 +211,41 @@ fn getRequired(dict: []const bencode.Value.Entry, key: []const u8) !bencode.Valu
     return bencode.dictGet(dict, key) orelse error.MissingRequiredField;
 }
 
-fn expectDict(value: bencode.Value) []const bencode.Value.Entry {
+const BencodeTypeError = error{
+    UnexpectedBencodeType,
+    NegativeInteger,
+    IntegerOverflow,
+};
+
+fn expectDict(value: bencode.Value) BencodeTypeError![]const bencode.Value.Entry {
     return switch (value) {
         .dict => |dict| dict,
-        else => @panic("expected bencode dictionary"),
+        else => error.UnexpectedBencodeType,
     };
 }
 
-fn expectBytes(value: bencode.Value) []const u8 {
+fn expectBytes(value: bencode.Value) BencodeTypeError![]const u8 {
     return switch (value) {
         .bytes => |bytes| bytes,
-        else => @panic("expected bencode bytes"),
+        else => error.UnexpectedBencodeType,
     };
 }
 
-fn expectPositiveU16(value: bencode.Value) u16 {
-    return std.math.cast(u16, expectPositiveU64(value)) orelse @panic("integer overflow");
+fn expectPositiveU16(value: bencode.Value) BencodeTypeError!u16 {
+    return std.math.cast(u16, try expectPositiveU64(value)) orelse error.IntegerOverflow;
 }
 
-fn expectPositiveU32(value: bencode.Value) u32 {
-    return std.math.cast(u32, expectPositiveU64(value)) orelse @panic("integer overflow");
+fn expectPositiveU32(value: bencode.Value) BencodeTypeError!u32 {
+    return std.math.cast(u32, try expectPositiveU64(value)) orelse error.IntegerOverflow;
 }
 
-fn expectPositiveU64(value: bencode.Value) u64 {
+fn expectPositiveU64(value: bencode.Value) BencodeTypeError!u64 {
     return switch (value) {
         .integer => |integer| {
-            if (integer < 0) @panic("expected non-negative integer");
+            if (integer < 0) return error.NegativeInteger;
             return @intCast(integer);
         },
-        else => @panic("expected bencode integer"),
+        else => error.UnexpectedBencodeType,
     };
 }
 
@@ -280,4 +286,18 @@ test "parse dictionary tracker peers" {
 
     try std.testing.expectEqual(@as(usize, 1), response.peers.len);
     try std.testing.expectEqual(@as(u16, 7000), response.peers[0].address.getPort());
+}
+
+test "reject non-dictionary tracker response" {
+    try std.testing.expectError(
+        error.UnexpectedBencodeType,
+        parseResponse(std.testing.allocator, "li1ee"),
+    );
+}
+
+test "reject non-integer interval in tracker response" {
+    try std.testing.expectError(
+        error.UnexpectedBencodeType,
+        parseResponse(std.testing.allocator, "d8:interval3:foo5:peers0:e"),
+    );
 }

@@ -16,12 +16,12 @@ pub const Metainfo = struct {
         path: []const []const u8,
     };
 
-    pub fn pieceCount(self: Metainfo) u32 {
-        return std.math.cast(u32, self.pieces.len / 20) orelse @panic("piece count overflow");
+    pub fn pieceCount(self: Metainfo) !u32 {
+        return std.math.cast(u32, self.pieces.len / 20) orelse error.PieceCountOverflow;
     }
 
     pub fn pieceHash(self: Metainfo, piece_index: u32) ![]const u8 {
-        if (piece_index >= self.pieceCount()) {
+        if (piece_index >= try self.pieceCount()) {
             return error.InvalidPieceIndex;
         }
 
@@ -47,25 +47,25 @@ pub fn parse(allocator: std.mem.Allocator, input: []const u8) !Metainfo {
     const root = try bencode.parse(allocator, input);
     defer bencode.freeValue(allocator, root);
 
-    const root_dict = expectDict(root);
-    const info = expectDict(try getRequired(root_dict, "info"));
+    const root_dict = try expectDict(root);
+    const info = try expectDict(try getRequired(root_dict, "info"));
 
-    const name = expectBytes(try getRequired(info, "name"));
-    const pieces = expectBytes(try getRequired(info, "pieces"));
+    const name = try expectBytes(try getRequired(info, "name"));
+    const pieces = try expectBytes(try getRequired(info, "pieces"));
     if (pieces.len == 0 or pieces.len % 20 != 0) {
         return error.InvalidPiecesField;
     }
 
-    const piece_length = expectPositiveU32(try getRequired(info, "piece length"));
+    const piece_length = try expectPositiveU32(try getRequired(info, "piece length"));
     const files = if (bencode.dictGet(info, "files")) |value|
-        try parseMultiFileList(allocator, expectList(value))
+        try parseMultiFileList(allocator, try expectList(value))
     else
-        try parseSingleFileList(allocator, expectPositiveU64(try getRequired(info, "length")), name);
+        try parseSingleFileList(allocator, try expectPositiveU64(try getRequired(info, "length")), name);
 
     return .{
         .info_hash = digest,
-        .announce = if (bencode.dictGet(root_dict, "announce")) |value| expectBytes(value) else null,
-        .created_by = if (bencode.dictGet(root_dict, "created by")) |value| expectBytes(value) else null,
+        .announce = if (bencode.dictGet(root_dict, "announce")) |value| try expectBytes(value) else null,
+        .created_by = if (bencode.dictGet(root_dict, "created by")) |value| try expectBytes(value) else null,
         .name = name,
         .piece_length = piece_length,
         .pieces = pieces,
@@ -110,9 +110,9 @@ fn parseMultiFileList(
     }
 
     for (values, 0..) |value, index| {
-        const entry = expectDict(value);
-        const length = expectPositiveU64(try getRequired(entry, "length"));
-        const path = try parsePath(allocator, expectList(try getRequired(entry, "path")));
+        const entry = try expectDict(value);
+        const length = try expectPositiveU64(try getRequired(entry, "length"));
+        const path = try parsePath(allocator, try expectList(try getRequired(entry, "path")));
         files[index] = .{
             .length = length,
             .path = path,
@@ -134,7 +134,7 @@ fn parsePath(
     errdefer allocator.free(path);
 
     for (components, 0..) |component, index| {
-        path[index] = expectBytes(component);
+        path[index] = try expectBytes(component);
     }
 
     return path;
@@ -144,39 +144,45 @@ fn getRequired(dict: []const bencode.Value.Entry, key: []const u8) !bencode.Valu
     return bencode.dictGet(dict, key) orelse error.MissingRequiredField;
 }
 
-fn expectDict(value: bencode.Value) []const bencode.Value.Entry {
+const BencodeTypeError = error{
+    UnexpectedBencodeType,
+    NegativeInteger,
+    IntegerOverflow,
+};
+
+fn expectDict(value: bencode.Value) BencodeTypeError![]const bencode.Value.Entry {
     return switch (value) {
         .dict => |dict| dict,
-        else => @panic("expected bencode dictionary"),
+        else => error.UnexpectedBencodeType,
     };
 }
 
-fn expectList(value: bencode.Value) []const bencode.Value {
+fn expectList(value: bencode.Value) BencodeTypeError![]const bencode.Value {
     return switch (value) {
         .list => |list| list,
-        else => @panic("expected bencode list"),
+        else => error.UnexpectedBencodeType,
     };
 }
 
-fn expectBytes(value: bencode.Value) []const u8 {
+fn expectBytes(value: bencode.Value) BencodeTypeError![]const u8 {
     return switch (value) {
         .bytes => |bytes| bytes,
-        else => @panic("expected bencode bytes"),
+        else => error.UnexpectedBencodeType,
     };
 }
 
-fn expectPositiveU32(value: bencode.Value) u32 {
-    const integer = expectPositiveU64(value);
-    return std.math.cast(u32, integer) orelse @panic("integer overflow");
+fn expectPositiveU32(value: bencode.Value) BencodeTypeError!u32 {
+    const integer = try expectPositiveU64(value);
+    return std.math.cast(u32, integer) orelse error.IntegerOverflow;
 }
 
-fn expectPositiveU64(value: bencode.Value) u64 {
+fn expectPositiveU64(value: bencode.Value) BencodeTypeError!u64 {
     return switch (value) {
         .integer => |integer| {
-            if (integer < 0) @panic("expected non-negative integer");
+            if (integer < 0) return error.NegativeInteger;
             return @intCast(integer);
         },
-        else => @panic("expected bencode integer"),
+        else => error.UnexpectedBencodeType,
     };
 }
 
@@ -230,10 +236,35 @@ test "piece hash accessors expose torrent piece metadata" {
     const info = try parse(std.testing.allocator, input);
     defer freeMetainfo(std.testing.allocator, info);
 
-    try std.testing.expectEqual(@as(u32, 3), info.pieceCount());
+    try std.testing.expectEqual(@as(u32, 3), try info.pieceCount());
     try std.testing.expectEqualStrings("abcdefghijklmnopqrst", try info.pieceHash(0));
     try std.testing.expectEqualStrings("UVWXYZ12345678", (try info.pieceHash(2))[6..]);
     try std.testing.expectEqual(@as(u64, 10), info.totalSize());
     try std.testing.expect(!info.isMultiFile());
     try std.testing.expectError(error.InvalidPieceIndex, info.pieceHash(3));
+}
+
+test "reject non-dictionary torrent root" {
+    try std.testing.expectError(
+        error.UnexpectedBencodeType,
+        parse(std.testing.allocator, "li1ei2ee"),
+    );
+}
+
+test "reject non-integer piece length" {
+    const input =
+        "d4:infod6:lengthi5e4:name8:test.bin12:piece length3:foo6:pieces20:abcdefghijklmnopqrstee";
+    try std.testing.expectError(
+        error.UnexpectedBencodeType,
+        parse(std.testing.allocator, input),
+    );
+}
+
+test "reject negative file length" {
+    const input =
+        "d4:infod6:lengthi-1e4:name8:test.bin12:piece lengthi4e6:pieces20:abcdefghijklmnopqrstee";
+    try std.testing.expectError(
+        error.NegativeInteger,
+        parse(std.testing.allocator, input),
+    );
 }
