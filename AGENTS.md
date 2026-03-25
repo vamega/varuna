@@ -45,6 +45,24 @@ Add new commands to `build.zig` instead of ad hoc shell scripts when practical.
 
 For local tracker validation, prefer `scripts/tracker.sh` plus `varuna inspect` or `scripts/demo_swarm.sh` instead of inventing new one-off workflows. The Ubuntu `opentracker` package in this repository is built in whitelist mode, so agents must pass `--whitelist-hash <info-hash>` to `scripts/tracker.sh` for any torrent they expect the tracker to authorize.
 
+## io_uring Policy (IMPORTANT)
+All hot-path I/O in this project MUST go through `io_uring` via `src/io/ring.zig`. Do NOT use `std.fs.File` read/write/sync methods or `std.net.Stream` read/write methods for production file or network I/O. These generate conventional `read`/`write`/`pread64`/`pwrite64`/`sendto`/`recvfrom` syscalls instead of `io_uring_enter`.
+
+**Use the Ring wrapper** (`src/io/ring.zig`) for:
+- Piece storage reads and writes (`PieceStore` in `src/storage/writer.zig`)
+- Peer wire protocol send and receive (`src/net/peer_wire.zig`)
+- TCP connect and accept for peer connections (`src/net/transport.zig`)
+- File fsync operations
+
+**Acceptable exceptions** (not hot path):
+- File creation, directory setup, and truncation during `PieceStore.init` (one-time setup)
+- HTTP tracker requests via `std.http.Client` (until a ring-based HTTP client is built)
+- Stdout logging via `std.Io.Writer` (infrequent status messages)
+- Test helpers that simulate peers/trackers (not production code)
+- The `uname` syscall in runtime probing
+
+When adding new I/O paths, always use the Ring. Verify with `strace -f -yy -c` that new code routes through `io_uring_enter` and does not introduce conventional I/O syscalls on the hot path.
+
 ## Coding Style & Naming Conventions
 Use `zig fmt` as the formatting authority. Prefer small modules, explicit ownership, and low-allocation designs. Default to arena or slab-backed allocation where dynamic memory is unavoidable. Use `snake_case` for files, functions, and local variables; `PascalCase` for types; and descriptive subsystem names like `piece_picker.zig` or `disk_scheduler.zig`. Keep Linux- and io_uring-specific code explicit rather than hidden behind generic abstractions.
 

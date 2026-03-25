@@ -23,6 +23,12 @@ Update it whenever a milestone lands, the near-term backlog changes, or a new op
 - Tracker lifecycle events: `completed` sent after download, `stopped` sent on seed exit and download failure.
 - Block request pipelining (depth 5) reduces per-block RTT overhead.
 - Benchmark suite covers kernel parsing, bencode parsing, SHA-1 hashing, and metainfo parsing.
+- io_uring is the I/O path for all hot-path file and network operations:
+  - `src/io/ring.zig` wraps `std.os.linux.IoUring` with blocking convenience methods.
+  - `PieceStore` read/write/sync routes through `Ring.pread_all`/`pwrite_all`/`fsync`.
+  - Peer wire protocol send/recv routes through `Ring.send_all`/`recv_exact`.
+  - TCP connect and accept use `Ring.connect`/`Ring.accept` via `src/net/transport.zig`.
+  - Startup banner reports io_uring availability.
 
 ## Next
 
@@ -37,7 +43,8 @@ Update it whenever a milestone lands, the near-term backlog changes, or a new op
   - stronger peer/session state handling
   - ~~pipeline block requests~~ Done: pipeline depth of 5 outstanding requests per piece
 - Replace full startup-only resume with persisted resume state.
-- Begin the actual `io_uring` transition for storage and networking, then re-run syscall profiling to confirm fallback syscalls are disappearing.
+- ~~Begin the actual `io_uring` transition for storage and networking.~~ Done: file I/O, peer wire, connect, and accept all use io_uring.
+- Transition remaining I/O to io_uring: HTTP tracker, file open/close, batched event loop for multi-peer.
 - Add broader integration coverage around CLI workflows and tracker compatibility.
 
 ## Known Issues
@@ -46,7 +53,7 @@ Update it whenever a milestone lands, the near-term backlog changes, or a new op
 - The packaged Ubuntu `opentracker` build used by `scripts/tracker.sh` is not open-by-default for arbitrary torrents. It requires explicit info-hash whitelisting, so tracker demos must pass `--whitelist-hash`.
 - Seeder behavior is intentionally narrow: one listening socket, one inbound peer, sequential serving, and exit after disconnect.
 - Resume currently depends on full piece recheck, which is correct but can become expensive on large datasets.
-- The runtime still uses conventional syscalls. `io_uring` is a project goal, not current behavior.
+- ~~The runtime still uses conventional syscalls.~~ Resolved: hot-path file and network I/O now routes through io_uring. HTTP tracker requests still use conventional I/O via `std.http.Client`.
 - Some restricted or sandboxed environments can interfere with local tracker startup and socket behavior. Validate the swarm demo in a normal host shell when tracker setup looks suspect.
 
 ## Last Verified Milestone

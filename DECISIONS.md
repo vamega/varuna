@@ -157,3 +157,27 @@ Reasoning:
 - Self-peer filtering eliminates wasted connection attempts in local tracker workflows.
 - Tracker events are required for private tracker compatibility and proper peer list hygiene.
 - Request pipelining is the single largest throughput improvement for the single-peer model. With 50ms RTT, serial requests cap throughput at ~320KB/s; pipelining 5 raises it to ~1.6MB/s.
+
+### 2026-03-25: io_uring Transition For Hot-Path I/O
+
+Context:
+The project targets io_uring for all performance-critical I/O. The codebase was using conventional blocking syscalls (`pread64`, `pwrite64`, `read`, `write`, `sendto`, `recvfrom`) for file and network operations.
+
+Decision:
+- Create `src/io/ring.zig` wrapping `std.os.linux.IoUring` with blocking convenience methods (submit one SQE, wait for one CQE per call).
+- Route all hot-path file I/O (`PieceStore.readPiece`, `writePiece`, `sync`) through `Ring.pread_all`, `pwrite_all`, `fsync`.
+- Route all peer wire protocol I/O through `Ring.send_all` and `Ring.recv_exact`.
+- Add `src/net/transport.zig` with `tcpConnect` and `tcpAccept` that create sockets conventionally but connect/accept via io_uring.
+- Keep file creation/setup, HTTP tracker, and stdout logging as conventional I/O (not hot path).
+- Add io_uring availability probe to startup banner.
+
+Reasoning:
+- Blocking wrappers maintain the current synchronous code structure while routing all I/O through `io_uring_enter` instead of individual syscalls.
+- This is the correct foundation before a full async event loop (which requires multi-peer concurrency to justify).
+- Vortex (reference codebase) also keeps file open, HTTP tracker, and logging as conventional I/O.
+- The Ring entry count (16) is sufficient for blocking mode; it will increase when batched event loop lands.
+
+Follow-up triggers:
+- Convert to batched event loop when multi-peer concurrency is implemented.
+- Replace `std.http.Client` with ring-based HTTP when tracker round-trip time becomes a bottleneck.
+- Consider registered file descriptors and buffer rings for further kernel overhead reduction.
