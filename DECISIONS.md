@@ -137,3 +137,23 @@ Findings:
 Implication:
 - Keep `strace` as the default unprivileged syscall audit path.
 - Treat `perf` and `bpftrace` as environment-dependent tools whose availability must be verified per machine.
+
+### 2026-03-25: Safety, Quality, And Throughput Improvements
+
+Context:
+Code review revealed safety bugs, duplicated logic, missing protocol events, and a serial block download path that paid one full RTT per 16KB block.
+
+Decisions:
+- Replace all `@panic` calls in bencode type-checking helpers (`expectDict`, `expectBytes`, `expectPositiveU64`, etc.) with proper error returns. These helpers process untrusted input from `.torrent` files and tracker responses.
+- Unify `PieceSet` (verify.zig) and `PieceAvailability` (client.zig) into a shared `Bitfield` type in `src/bitfield.zig`.
+- Filter self-peers (127.0.0.1 and 0.0.0.0 on the client's own port) from tracker responses before attempting connections.
+- Send best-effort `completed` tracker event after successful download and `stopped` event on seed exit and download failure. Errors from these announces are silently ignored.
+- Pipeline up to 5 block requests per piece instead of the previous send-one-wait-one pattern. Handle choke during pipeline by clearing outstanding requests and re-requesting after unchoke.
+- Expand the benchmark suite to cover bencode parsing, SHA-1 piece hashing, and metainfo parsing throughput.
+
+Reasoning:
+- The `@panic` on untrusted input was a crasher bug; malformed `.torrent` files or bad tracker responses would kill the process.
+- Shared `Bitfield` eliminates ~50 lines of duplicated bit-manipulation logic and creates a reusable primitive for future multi-peer work.
+- Self-peer filtering eliminates wasted connection attempts in local tracker workflows.
+- Tracker events are required for private tracker compatibility and proper peer list hygiene.
+- Request pipelining is the single largest throughput improvement for the single-peer model. With 50ms RTT, serial requests cap throughput at ~320KB/s; pipelining 5 raises it to ~1.6MB/s.

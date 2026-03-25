@@ -17,25 +17,32 @@ Update it whenever a milestone lands, the near-term backlog changes, or a new op
   - `scripts/tracker.sh` wraps the Ubuntu `opentracker` package.
   - `scripts/demo_swarm.sh` verifies one `varuna seed` instance and one `varuna download` instance against that tracker.
 - Profiling workflow exists through `strace`, `perf`, and `bpftrace` documentation and build helpers.
+- Bencode/metainfo parsing returns errors instead of panicking on malformed untrusted input.
+- Shared `Bitfield` type unifies `PieceSet` and `PieceAvailability`.
+- Self-peers are filtered from tracker responses before connection attempts.
+- Tracker lifecycle events: `completed` sent after download, `stopped` sent on seed exit and download failure.
+- Block request pipelining (depth 5) reduces per-block RTT overhead.
+- Benchmark suite covers kernel parsing, bencode parsing, SHA-1 hashing, and metainfo parsing.
 
 ## Next
 
-- Filter or otherwise handle self-peers more cleanly so the downloader does not first attempt its own advertised endpoint in the local tracker workflow.
+- ~~Filter or otherwise handle self-peers more cleanly~~ Done: `isSelfPeer` skips `127.0.0.1` and `0.0.0.0` on the client's own port.
+- ~~Send `completed`/`stopped` tracker events~~ Done: best-effort `completed` after download, `stopped` on seed exit and download failure.
 - Improve tracker lifecycle behavior:
-  - send `completed`/`stopped` events where appropriate
   - handle stale peers and tracker edge cases more deliberately
   - validate behavior against more private-tracker expectations
 - Widen peer behavior past the current minimal contract:
   - more than one active peer
   - better piece selection than strict sequential download
   - stronger peer/session state handling
+  - ~~pipeline block requests~~ Done: pipeline depth of 5 outstanding requests per piece
 - Replace full startup-only resume with persisted resume state.
 - Begin the actual `io_uring` transition for storage and networking, then re-run syscall profiling to confirm fallback syscalls are disappearing.
 - Add broader integration coverage around CLI workflows and tracker compatibility.
 
 ## Known Issues
 
-- In the verified local `opentracker` swarm demo, the downloader can receive its own announced `127.0.0.1:<download-port>` endpoint back in the compact peer list. The current client tolerates this by failing that self-connection and then trying the next peer.
+- ~~In the verified local `opentracker` swarm demo, the downloader could receive its own announced endpoint back.~~ Resolved: self-peers are now filtered before connection attempts.
 - The packaged Ubuntu `opentracker` build used by `scripts/tracker.sh` is not open-by-default for arbitrary torrents. It requires explicit info-hash whitelisting, so tracker demos must pass `--whitelist-hash`.
 - Seeder behavior is intentionally narrow: one listening socket, one inbound peer, sequential serving, and exit after disconnect.
 - Resume currently depends on full piece recheck, which is correct but can become expensive on large datasets.
