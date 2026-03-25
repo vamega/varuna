@@ -2,6 +2,8 @@ const std = @import("std");
 const kernel = @import("kernel.zig");
 const requirements = @import("requirements.zig");
 
+const Ring = @import("../io/ring.zig").Ring;
+
 pub const Summary = struct {
     release: []const u8,
     version_text: []const u8,
@@ -9,6 +11,7 @@ pub const Summary = struct {
     kernel_version: kernel.Version,
     support: @TypeOf(requirements.classify(requirements.minimum_supported)),
     is_wsl: bool,
+    io_uring_available: bool,
 };
 
 pub fn detectCurrent(allocator: std.mem.Allocator) !Summary {
@@ -44,6 +47,7 @@ pub fn fromStrings(
         .kernel_version = parsed,
         .support = requirements.classify(parsed),
         .is_wsl = containsInsensitive(release, "microsoft") or containsInsensitive(version_text, "microsoft"),
+        .io_uring_available = Ring.probe(),
     };
 }
 

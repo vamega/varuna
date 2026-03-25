@@ -4,6 +4,7 @@ const peer_wire = @import("../net/peer_wire.zig");
 const storage = @import("../storage/root.zig");
 const tracker = @import("../tracker/root.zig");
 const session_mod = @import("session.zig");
+const Ring = @import("../io/ring.zig").Ring;
 
 const pipeline_depth: u32 = 5;
 
@@ -67,10 +68,13 @@ pub fn seed(
     target_root: []const u8,
     options: SeedOptions,
 ) !SeedResult {
+    var ring = try Ring.init(16);
+    defer ring.deinit();
+
     const session = try session_mod.Session.load(allocator, torrent_bytes, target_root);
     defer session.deinit(allocator);
 
-    var store = try storage.writer.PieceStore.init(allocator, &session);
+    var store = try storage.writer.PieceStore.init(allocator, &session, &ring);
     defer store.deinit();
 
     var recheck = try storage.verify.recheckExistingData(allocator, &session, &store);
@@ -109,17 +113,19 @@ pub fn seed(
 
     try logStatus(options.status_writer, "seed announce accepted, peers={}\n", .{announce_response.peers.len});
 
-    const connection = try server.accept();
-    defer connection.stream.close();
+    const transport = @import("../net/transport.zig");
+    const accept_result = try transport.tcpAccept(&ring, server.stream.handle);
+    defer std.posix.close(accept_result.fd);
 
-    try logStatus(options.status_writer, "incoming peer: {f}\n", .{connection.address});
+    try logStatus(options.status_writer, "incoming peer: {f}\n", .{accept_result.address});
 
     const bytes_seeded = try seedPeer(
         allocator,
         &session,
         &store,
         &recheck.complete_pieces,
-        connection.stream,
+        &ring,
+        accept_result.fd,
         options.peer_id,
     );
 
@@ -131,7 +137,7 @@ pub fn seed(
         .piece_count = session.pieceCount(),
         .bytes_seeded = bytes_seeded,
         .bytes_complete = recheck.bytes_complete,
-        .peer = connection.address,
+        .peer = accept_result.address,
     };
 }
 
@@ -141,10 +147,13 @@ pub fn download(
     target_root: []const u8,
     options: DownloadOptions,
 ) !DownloadResult {
+    var ring = try Ring.init(16);
+    defer ring.deinit();
+
     const session = try session_mod.Session.load(allocator, torrent_bytes, target_root);
     defer session.deinit(allocator);
 
-    var store = try storage.writer.PieceStore.init(allocator, &session);
+    var store = try storage.writer.PieceStore.init(allocator, &session, &ring);
     defer store.deinit();
 
     var recheck = try storage.verify.recheckExistingData(allocator, &session, &store);
@@ -201,6 +210,7 @@ pub fn download(
             &store,
             &recheck.complete_pieces,
             peer,
+            &ring,
             options,
         ) catch |err| {
             last_error = err;
@@ -230,18 +240,20 @@ fn downloadFromPeer(
     store: *storage.writer.PieceStore,
     complete_pieces: *storage.verify.PieceSet,
     peer: tracker.announce.Peer,
+    ring: *Ring,
     options: DownloadOptions,
 ) !u64 {
-    const stream = try std.net.tcpConnectToAddress(peer.address);
-    defer stream.close();
+    const transport = @import("../net/transport.zig");
+    const fd = try transport.tcpConnect(ring, peer.address);
+    defer std.posix.close(fd);
 
-    try peer_wire.writeHandshake(stream, session.metainfo.info_hash, options.peer_id);
-    const remote_handshake = try peer_wire.readHandshake(stream);
+    try peer_wire.writeHandshake(ring, fd, session.metainfo.info_hash, options.peer_id);
+    const remote_handshake = try peer_wire.readHandshake(ring, fd);
     if (!std.mem.eql(u8, remote_handshake.info_hash[0..], session.metainfo.info_hash[0..])) {
         return error.WrongTorrentPeer;
     }
 
-    try peer_wire.writeInterested(stream);
+    try peer_wire.writeInterested(ring, fd);
 
     var availability = try PieceAvailability.init(allocator, session.pieceCount());
     defer availability.deinit(allocator);
@@ -262,7 +274,7 @@ fn downloadFromPeer(
                 }
             }
 
-            const message = try peer_wire.readMessageAlloc(allocator, stream);
+            const message = try peer_wire.readMessageAlloc(allocator, ring, fd);
             defer peer_wire.freeMessage(allocator, message);
             try applyControlMessage(&availability, &peer_choking, message);
         };
@@ -278,7 +290,7 @@ fn downloadFromPeer(
                 return error.PeerMissingNeededPieces;
             }
 
-            const message = try peer_wire.readMessageAlloc(allocator, stream);
+            const message = try peer_wire.readMessageAlloc(allocator, ring, fd);
             defer peer_wire.freeMessage(allocator, message);
             try applyControlMessage(&availability, &peer_choking, message);
         }
@@ -297,7 +309,7 @@ fn downloadFromPeer(
         // Fill initial pipeline
         while (next_to_send < block_count and pipeline.len < pipeline_depth) {
             const req = try geometry.requestForBlock(piece_index, next_to_send);
-            try peer_wire.writeRequest(stream, .{
+            try peer_wire.writeRequest(ring, fd, .{
                 .piece_index = req.piece_index,
                 .block_offset = req.piece_offset,
                 .length = req.length,
@@ -308,7 +320,7 @@ fn downloadFromPeer(
 
         // Drain pipeline, refilling as responses arrive
         while (blocks_received < block_count) {
-            const message = try peer_wire.readMessageAlloc(allocator, stream);
+            const message = try peer_wire.readMessageAlloc(allocator, ring, fd);
             defer peer_wire.freeMessage(allocator, message);
 
             switch (message) {
@@ -326,7 +338,7 @@ fn downloadFromPeer(
                     // Refill pipeline
                     if (next_to_send < block_count and !peer_choking) {
                         const req = try geometry.requestForBlock(piece_index, next_to_send);
-                        try peer_wire.writeRequest(stream, .{
+                        try peer_wire.writeRequest(ring, fd, .{
                             .piece_index = req.piece_index,
                             .block_offset = req.piece_offset,
                             .length = req.length,
@@ -347,7 +359,7 @@ fn downloadFromPeer(
                     // Re-fill pipeline after unchoke
                     while (next_to_send < block_count and pipeline.len < pipeline_depth) {
                         const req = try geometry.requestForBlock(piece_index, next_to_send);
-                        try peer_wire.writeRequest(stream, .{
+                        try peer_wire.writeRequest(ring, fd, .{
                             .piece_index = req.piece_index,
                             .block_offset = req.piece_offset,
                             .length = req.length,
@@ -383,16 +395,17 @@ fn seedPeer(
     session: *const session_mod.Session,
     store: *storage.writer.PieceStore,
     complete_pieces: *const storage.verify.PieceSet,
-    stream: std.net.Stream,
+    ring: *Ring,
+    fd: std.posix.fd_t,
     peer_id: [20]u8,
 ) !u64 {
-    const remote_handshake = try peer_wire.readHandshake(stream);
+    const remote_handshake = try peer_wire.readHandshake(ring, fd);
     if (!std.mem.eql(u8, remote_handshake.info_hash[0..], session.metainfo.info_hash[0..])) {
         return error.WrongTorrentPeer;
     }
 
-    try peer_wire.writeHandshake(stream, session.metainfo.info_hash, peer_id);
-    try peer_wire.writeBitfield(stream, complete_pieces.bits);
+    try peer_wire.writeHandshake(ring, fd, session.metainfo.info_hash, peer_id);
+    try peer_wire.writeBitfield(ring, fd, complete_pieces.bits);
 
     const piece_buffer = try allocator.alloc(u8, session.layout.piece_length);
     defer allocator.free(piece_buffer);
@@ -403,7 +416,7 @@ fn seedPeer(
     var bytes_seeded: u64 = 0;
 
     while (true) {
-        const message = peer_wire.readMessageAlloc(allocator, stream) catch |err| switch (err) {
+        const message = peer_wire.readMessageAlloc(allocator, ring, fd) catch |err| switch (err) {
             error.EndOfStream => break,
             else => return err,
         };
@@ -413,7 +426,7 @@ fn seedPeer(
             .keep_alive, .not_interested, .have, .bitfield, .cancel, .port, .choke, .unchoke => {},
             .interested => {
                 if (!peer_unchoked) {
-                    try peer_wire.writeUnchoke(stream);
+                    try peer_wire.writeUnchoke(ring, fd);
                     peer_unchoked = true;
                 }
             },
@@ -441,7 +454,8 @@ fn seedPeer(
                 }
 
                 try peer_wire.writePiece(
-                    stream,
+                    ring,
+                    fd,
                     request.piece_index,
                     request.block_offset,
                     piece_buffer[block_start..block_end],
@@ -644,25 +658,29 @@ const FakePeerContext = struct {
     fn handleOne(self: *FakePeerContext) !void {
         defer self.server.deinit();
 
+        var ring = try Ring.init(16);
+        defer ring.deinit();
+
         const connection = try self.server.accept();
+        const peer_fd = connection.stream.handle;
         defer connection.stream.close();
 
-        const handshake = try peer_wire.readHandshake(connection.stream);
+        const handshake = try peer_wire.readHandshake(&ring, peer_fd);
         try std.testing.expectEqualDeep(self.info_hash, handshake.info_hash);
 
-        try peer_wire.writeHandshake(connection.stream, self.info_hash, self.peer_id);
+        try peer_wire.writeHandshake(&ring, peer_fd, self.info_hash, self.peer_id);
 
-        const interested = try peer_wire.readMessageAlloc(std.testing.allocator, connection.stream);
+        const interested = try peer_wire.readMessageAlloc(std.testing.allocator, &ring, peer_fd);
         defer peer_wire.freeMessage(std.testing.allocator, interested);
         try std.testing.expectEqual(peer_wire.InboundMessage.interested, interested);
 
         const bitfield = [_]u8{0b1110_0000};
-        try peer_wire.writeBitfield(connection.stream, &bitfield);
-        try peer_wire.writeUnchoke(connection.stream);
+        try peer_wire.writeBitfield(&ring, peer_fd, &bitfield);
+        try peer_wire.writeUnchoke(&ring, peer_fd);
 
         var requests_served: u32 = 0;
         while (requests_served < self.expected_requests) {
-            const message = try peer_wire.readMessageAlloc(std.testing.allocator, connection.stream);
+            const message = try peer_wire.readMessageAlloc(std.testing.allocator, &ring, peer_fd);
             defer peer_wire.freeMessage(std.testing.allocator, message);
 
             switch (message) {
@@ -675,7 +693,8 @@ const FakePeerContext = struct {
                     try std.testing.expect(block_end <= piece_data.len);
 
                     try peer_wire.writePiece(
-                        connection.stream,
+                        &ring,
+                        peer_fd,
                         request.piece_index,
                         request.block_offset,
                         piece_data[block_start..block_end],

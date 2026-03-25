@@ -124,6 +124,10 @@ test "verify piece buffer against expected hash" {
 }
 
 test "recheck existing on-disk pieces" {
+    const Ring = @import("../io/ring.zig").Ring;
+    var ring = Ring.init(16) catch return error.SkipZigTest;
+    defer ring.deinit();
+
     var hash0: [20]u8 = undefined;
     std.crypto.hash.Sha1.hash("spam", &hash0, .{});
 
@@ -152,7 +156,7 @@ test "recheck existing on-disk pieces" {
     const session = try torrent.session.Session.load(std.testing.allocator, input, target_root);
     defer session.deinit(std.testing.allocator);
 
-    var store = try writer.PieceStore.init(std.testing.allocator, &session);
+    var store = try writer.PieceStore.init(std.testing.allocator, &session, &ring);
     defer store.deinit();
 
     const piece0 = try planPieceVerification(std.testing.allocator, &session, 0);

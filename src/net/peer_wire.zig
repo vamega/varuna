@@ -1,4 +1,6 @@
 const std = @import("std");
+const posix = std.posix;
+const Ring = @import("../io/ring.zig").Ring;
 
 pub const protocol_string = "BitTorrent protocol";
 pub const protocol_length: u8 = protocol_string.len;
@@ -38,7 +40,8 @@ pub const InboundMessage = union(enum) {
 };
 
 pub fn writeHandshake(
-    stream: std.net.Stream,
+    ring: *Ring,
+    fd: posix.fd_t,
     info_hash: [20]u8,
     peer_id: [20]u8,
 ) !void {
@@ -48,18 +51,18 @@ pub fn writeHandshake(
     @memset(buffer[20..28], 0);
     @memcpy(buffer[28..48], info_hash[0..]);
     @memcpy(buffer[48..68], peer_id[0..]);
-    try stream.writeAll(&buffer);
+    try ring.send_all(fd, &buffer);
 }
 
-pub fn readHandshake(stream: std.net.Stream) !Handshake {
+pub fn readHandshake(ring: *Ring, fd: posix.fd_t) !Handshake {
     var length_buffer: [1]u8 = undefined;
-    try readExact(stream, &length_buffer);
+    try ring.recv_exact(fd, &length_buffer);
     if (length_buffer[0] != protocol_length) {
         return error.InvalidHandshakeProtocol;
     }
 
     var buffer: [67]u8 = undefined;
-    try readExact(stream, &buffer);
+    try ring.recv_exact(fd, &buffer);
 
     if (!std.mem.eql(u8, buffer[0..protocol_string.len], protocol_string)) {
         return error.InvalidHandshakeProtocol;
@@ -81,10 +84,11 @@ pub fn readHandshake(stream: std.net.Stream) !Handshake {
 
 pub fn readMessageAlloc(
     allocator: std.mem.Allocator,
-    stream: std.net.Stream,
+    ring: *Ring,
+    fd: posix.fd_t,
 ) !InboundMessage {
     var length_buffer: [4]u8 = undefined;
-    try readExact(stream, &length_buffer);
+    try ring.recv_exact(fd, &length_buffer);
     const length = std.mem.readInt(u32, &length_buffer, .big);
     if (length == 0) {
         return .keep_alive;
@@ -94,7 +98,7 @@ pub fn readMessageAlloc(
     }
 
     var id_buffer: [1]u8 = undefined;
-    try readExact(stream, &id_buffer);
+    try ring.recv_exact(fd, &id_buffer);
     const id = id_buffer[0];
     const payload_length = length - 1;
 
@@ -103,14 +107,14 @@ pub fn readMessageAlloc(
         1 => expectEmptyPayload(payload_length, .unchoke),
         2 => expectEmptyPayload(payload_length, .interested),
         3 => expectEmptyPayload(payload_length, .not_interested),
-        4 => .{ .have = try readU32Payload(stream, payload_length) },
-        5 => .{ .bitfield = try readAllocatedPayload(allocator, stream, payload_length) },
-        6 => .{ .request = try readRequest(stream, payload_length) },
-        7 => .{ .piece = try readPiece(allocator, stream, payload_length) },
-        8 => .{ .cancel = try readRequest(stream, payload_length) },
-        9 => .{ .port = try readU16Payload(stream, payload_length) },
+        4 => .{ .have = try readU32Payload(ring, fd, payload_length) },
+        5 => .{ .bitfield = try readAllocatedPayload(allocator, ring, fd, payload_length) },
+        6 => .{ .request = try readRequest(ring, fd, payload_length) },
+        7 => .{ .piece = try readPiece(allocator, ring, fd, payload_length) },
+        8 => .{ .cancel = try readRequest(ring, fd, payload_length) },
+        9 => .{ .port = try readU16Payload(ring, fd, payload_length) },
         else => {
-            try discardPayload(stream, payload_length);
+            try discardPayload(ring, fd, payload_length);
             return error.UnsupportedPeerMessage;
         },
     };
@@ -124,34 +128,35 @@ pub fn freeMessage(allocator: std.mem.Allocator, message: InboundMessage) void {
     }
 }
 
-pub fn writeInterested(stream: std.net.Stream) !void {
-    try writeMessageWithPayload(stream, 2, &.{});
+pub fn writeInterested(ring: *Ring, fd: posix.fd_t) !void {
+    try writeMessageWithPayload(ring, fd, 2, &.{});
 }
 
-pub fn writeUnchoke(stream: std.net.Stream) !void {
-    try writeMessageWithPayload(stream, 1, &.{});
+pub fn writeUnchoke(ring: *Ring, fd: posix.fd_t) !void {
+    try writeMessageWithPayload(ring, fd, 1, &.{});
 }
 
-pub fn writeBitfield(stream: std.net.Stream, bitfield: []const u8) !void {
-    try writeMessageWithPayload(stream, 5, bitfield);
+pub fn writeBitfield(ring: *Ring, fd: posix.fd_t, bitfield: []const u8) !void {
+    try writeMessageWithPayload(ring, fd, 5, bitfield);
 }
 
-pub fn writeHave(stream: std.net.Stream, piece_index: u32) !void {
+pub fn writeHave(ring: *Ring, fd: posix.fd_t, piece_index: u32) !void {
     var payload: [4]u8 = undefined;
     std.mem.writeInt(u32, &payload, piece_index, .big);
-    try writeMessageWithPayload(stream, 4, &payload);
+    try writeMessageWithPayload(ring, fd, 4, &payload);
 }
 
-pub fn writeRequest(stream: std.net.Stream, request: Request) !void {
+pub fn writeRequest(ring: *Ring, fd: posix.fd_t, request: Request) !void {
     var payload: [12]u8 = undefined;
     std.mem.writeInt(u32, payload[0..4], request.piece_index, .big);
     std.mem.writeInt(u32, payload[4..8], request.block_offset, .big);
     std.mem.writeInt(u32, payload[8..12], request.length, .big);
-    try writeMessageWithPayload(stream, 6, &payload);
+    try writeMessageWithPayload(ring, fd, 6, &payload);
 }
 
 pub fn writePiece(
-    stream: std.net.Stream,
+    ring: *Ring,
+    fd: posix.fd_t,
     piece_index: u32,
     block_offset: u32,
     block: []const u8,
@@ -165,8 +170,8 @@ pub fn writePiece(
     std.mem.writeInt(u32, header[5..9], piece_index, .big);
     std.mem.writeInt(u32, header[9..13], block_offset, .big);
 
-    try stream.writeAll(&header);
-    try stream.writeAll(block);
+    try ring.send_all(fd, &header);
+    try ring.send_all(fd, block);
 }
 
 fn expectEmptyPayload(payload_length: u32, message: InboundMessage) !InboundMessage {
@@ -176,13 +181,13 @@ fn expectEmptyPayload(payload_length: u32, message: InboundMessage) !InboundMess
     return message;
 }
 
-fn readRequest(stream: std.net.Stream, payload_length: u32) !Request {
+fn readRequest(ring: *Ring, fd: posix.fd_t, payload_length: u32) !Request {
     if (payload_length != 12) {
         return error.InvalidMessageLength;
     }
 
     var payload: [12]u8 = undefined;
-    try readExact(stream, &payload);
+    try ring.recv_exact(fd, &payload);
     return .{
         .piece_index = std.mem.readInt(u32, payload[0..4], .big),
         .block_offset = std.mem.readInt(u32, payload[4..8], .big),
@@ -192,14 +197,15 @@ fn readRequest(stream: std.net.Stream, payload_length: u32) !Request {
 
 fn readPiece(
     allocator: std.mem.Allocator,
-    stream: std.net.Stream,
+    ring: *Ring,
+    fd: posix.fd_t,
     payload_length: u32,
 ) !Piece {
     if (payload_length < 8) {
         return error.InvalidMessageLength;
     }
 
-    const payload = try readAllocatedPayload(allocator, stream, payload_length);
+    const payload = try readAllocatedPayload(allocator, ring, fd, payload_length);
     errdefer allocator.free(payload);
 
     return .{
@@ -210,50 +216,52 @@ fn readPiece(
     };
 }
 
-fn readU32Payload(stream: std.net.Stream, payload_length: u32) !u32 {
+fn readU32Payload(ring: *Ring, fd: posix.fd_t, payload_length: u32) !u32 {
     if (payload_length != 4) {
         return error.InvalidMessageLength;
     }
 
     var payload: [4]u8 = undefined;
-    try readExact(stream, &payload);
+    try ring.recv_exact(fd, &payload);
     return std.mem.readInt(u32, &payload, .big);
 }
 
-fn readU16Payload(stream: std.net.Stream, payload_length: u32) !u16 {
+fn readU16Payload(ring: *Ring, fd: posix.fd_t, payload_length: u32) !u16 {
     if (payload_length != 2) {
         return error.InvalidMessageLength;
     }
 
     var payload: [2]u8 = undefined;
-    try readExact(stream, &payload);
+    try ring.recv_exact(fd, &payload);
     return std.mem.readInt(u16, &payload, .big);
 }
 
 fn readAllocatedPayload(
     allocator: std.mem.Allocator,
-    stream: std.net.Stream,
+    ring: *Ring,
+    fd: posix.fd_t,
     payload_length: u32,
 ) ![]u8 {
     const payload = try allocator.alloc(u8, payload_length);
     errdefer allocator.free(payload);
-    try readExact(stream, payload);
+    try ring.recv_exact(fd, payload);
     return payload;
 }
 
-fn discardPayload(stream: std.net.Stream, payload_length: u32) !void {
+fn discardPayload(ring: *Ring, fd: posix.fd_t, payload_length: u32) !void {
     var remaining = payload_length;
     var buffer: [256]u8 = undefined;
 
     while (remaining > 0) {
         const chunk_length = @min(buffer.len, remaining);
-        try readExact(stream, buffer[0..chunk_length]);
+        try ring.recv_exact(fd, buffer[0..chunk_length]);
         remaining -= @intCast(chunk_length);
     }
 }
 
 fn writeMessageWithPayload(
-    stream: std.net.Stream,
+    ring: *Ring,
+    fd: posix.fd_t,
     id: u8,
     payload: []const u8,
 ) !void {
@@ -262,13 +270,6 @@ fn writeMessageWithPayload(
     std.mem.writeInt(u32, header[0..4], payload_with_id, .big);
     header[4] = id;
 
-    try stream.writeAll(&header);
-    try stream.writeAll(payload);
-}
-
-fn readExact(stream: std.net.Stream, buffer: []u8) !void {
-    const received = try stream.readAtLeast(buffer, buffer.len);
-    if (received != buffer.len) {
-        return error.EndOfStream;
-    }
+    try ring.send_all(fd, &header);
+    try ring.send_all(fd, payload);
 }

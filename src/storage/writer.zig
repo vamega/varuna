@@ -1,14 +1,18 @@
 const std = @import("std");
+const posix = std.posix;
 const torrent = @import("../torrent/root.zig");
+const Ring = @import("../io/ring.zig").Ring;
 
 pub const PieceStore = struct {
     allocator: std.mem.Allocator,
     session: *const torrent.session.Session,
     files: []std.fs.File,
+    ring: *Ring,
 
     pub fn init(
         allocator: std.mem.Allocator,
         session: *const torrent.session.Session,
+        ring: *Ring,
     ) !PieceStore {
         const files = try allocator.alloc(std.fs.File, session.manifest.files.len);
         errdefer allocator.free(files);
@@ -32,6 +36,7 @@ pub const PieceStore = struct {
             .allocator = allocator,
             .session = session,
             .files = files,
+            .ring = ring,
         };
     }
 
@@ -51,7 +56,7 @@ pub const PieceStore = struct {
         for (spans) |span| {
             const file = self.files[span.file_index];
             const block = piece_data[span.piece_offset .. span.piece_offset + span.length];
-            try file.pwriteAll(block, span.file_offset);
+            try self.ring.pwrite_all(file.handle, block, span.file_offset);
         }
     }
 
@@ -63,7 +68,7 @@ pub const PieceStore = struct {
         for (spans) |span| {
             const file = self.files[span.file_index];
             const block = piece_data[span.piece_offset .. span.piece_offset + span.length];
-            const read_count = try file.preadAll(block, span.file_offset);
+            const read_count = try self.ring.pread_all(file.handle, block, span.file_offset);
             if (read_count != block.len) {
                 return error.UnexpectedEndOfFile;
             }
@@ -72,12 +77,15 @@ pub const PieceStore = struct {
 
     pub fn sync(self: *PieceStore) !void {
         for (self.files) |file| {
-            try file.sync();
+            try self.ring.fsync(file.handle);
         }
     }
 };
 
 test "write piece data across multiple files" {
+    var ring = Ring.init(16) catch return error.SkipZigTest;
+    defer ring.deinit();
+
     const input =
         "d4:infod5:filesl" ++ "d6:lengthi3e4:pathl5:alphaee" ++ "d6:lengthi7e4:pathl4:beta5:gammaeee" ++ "4:name4:root" ++ "12:piece lengthi4e" ++ "6:pieces60:abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ12345678eee";
 
@@ -95,7 +103,7 @@ test "write piece data across multiple files" {
     const session = try torrent.session.Session.load(std.testing.allocator, input, target_root);
     defer session.deinit(std.testing.allocator);
 
-    var store = try PieceStore.init(std.testing.allocator, &session);
+    var store = try PieceStore.init(std.testing.allocator, &session, &ring);
     defer store.deinit();
 
     const plan = try @import("verify.zig").planPieceVerification(std.testing.allocator, &session, 0);
@@ -114,6 +122,9 @@ test "write piece data across multiple files" {
 }
 
 test "read piece data across multiple files" {
+    var ring = Ring.init(16) catch return error.SkipZigTest;
+    defer ring.deinit();
+
     const input =
         "d4:infod5:filesl" ++ "d6:lengthi3e4:pathl5:alphaee" ++ "d6:lengthi7e4:pathl4:beta5:gammaeee" ++ "4:name4:root" ++ "12:piece lengthi4e" ++ "6:pieces60:abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ12345678eee";
 
@@ -131,7 +142,7 @@ test "read piece data across multiple files" {
     const session = try torrent.session.Session.load(std.testing.allocator, input, target_root);
     defer session.deinit(std.testing.allocator);
 
-    var store = try PieceStore.init(std.testing.allocator, &session);
+    var store = try PieceStore.init(std.testing.allocator, &session, &ring);
     defer store.deinit();
 
     const plan = try @import("verify.zig").planPieceVerification(std.testing.allocator, &session, 0);

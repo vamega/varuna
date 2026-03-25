@@ -26,6 +26,7 @@ pub fn writeStartupBanner(writer: *std.Io.Writer) !void {
     if (summary.is_wsl) {
         try writer.print("environment: wsl\n", .{});
     }
+    try writer.print("io_uring: {s}\n", .{if (summary.io_uring_available) "available" else "unavailable"});
 }
 
 pub fn run(
