@@ -47,6 +47,9 @@ Update it whenever a milestone lands, the near-term backlog changes, or a new op
 - IPv6 peer support: compact peers6 (BEP 7), IPv6 self-peer detection, IPv6-aware connect.
 - Upload while downloading: download workers serve piece requests from peers (tit-for-tat).
 - `writeKeepAlive`, `writeNotInterested`, `writeHave` protocol messages.
+- `std.http.Client` eliminated: tracker HTTP now routes through io_uring HTTP client (`src/io/http.zig`).
+- Event loop skeleton (`src/io/event_loop.zig`): single-threaded io_uring event loop with user_data encoding, peer state machine, message framing, and piece download. Ready to replace thread-per-peer.
+- SQLite resume state (`src/storage/resume.zig`): persists completed pieces to SQLite (WAL mode, prepared statements). Integrated into download flow with periodic flush.
 - io_uring is the I/O path for all hot-path file and network operations:
   - `src/io/ring.zig` wraps `std.os.linux.IoUring` with blocking convenience methods.
   - `PieceStore` read/write/sync routes through `Ring.pread_all`/`pwrite_all`/`fsync`.
@@ -66,7 +69,7 @@ Update it whenever a milestone lands, the near-term backlog changes, or a new op
   - better piece selection than strict sequential download (rarest-first -- Cycle 2)
   - stronger peer/session state handling
   - ~~pipeline block requests~~ Done: pipeline depth of 5 outstanding requests per piece
-- Replace full startup-only resume with persisted resume state (SQLite, background thread -- see [docs/io-uring-syscalls.md](docs/io-uring-syscalls.md) for constraints).
+- ~~Replace full startup-only resume with persisted resume state~~ Done: SQLite resume DB persists completed pieces. Full recheck still runs but results are cached.
 - ~~Begin the actual `io_uring` transition for storage and networking.~~ Done: file I/O, peer wire, connect, and accept all use io_uring.
 - Transition remaining I/O to io_uring: HTTP tracker, file open/close, batched event loop for multi-peer.
 - Add broader integration coverage around CLI workflows and tracker compatibility.
