@@ -197,21 +197,6 @@ pub fn download(
     }
     try logStatus(options.status_writer, "peers={}\n", .{announce_response.peers.len});
 
-    // Filter peers and cap at max_peers
-    var eligible_peers = std.ArrayList(tracker.announce.Peer).empty;
-    defer eligible_peers.deinit(allocator);
-    for (announce_response.peers) |peer| {
-        if (isSelfPeer(peer.address, options.port)) continue;
-        try eligible_peers.append(allocator, peer);
-        if (eligible_peers.items.len >= options.max_peers) break;
-    }
-
-    if (eligible_peers.items.len == 0) {
-        sendTrackerEvent(allocator, &http_client, announce_url, &session, options, .stopped, 0);
-        return error.NoReachablePeers;
-    }
-
-    // Create shared piece tracker
     const peer_worker = @import("peer_worker.zig");
     const PieceTracker = @import("piece_tracker.zig").PieceTracker;
 
@@ -225,34 +210,79 @@ pub fn download(
     );
     defer piece_tracker.deinit(allocator);
 
-    // Spawn worker threads
-    const workers = try allocator.alloc(peer_worker.WorkerContext, eligible_peers.items.len);
-    defer allocator.free(workers);
-    const threads = try allocator.alloc(std.Thread, eligible_peers.items.len);
-    defer allocator.free(threads);
+    // Track connected peer addresses to avoid duplicates across re-announces
+    var known_peers = std.ArrayList(std.net.Address).empty;
+    defer known_peers.deinit(allocator);
 
-    var spawned: usize = 0;
-    for (eligible_peers.items, 0..) |peer, i| {
-        try logStatus(options.status_writer, "connecting to peer: {f}\n", .{peer.address});
-        workers[i] = .{
-            .allocator = allocator,
-            .session = &session,
-            .tracker = &piece_tracker,
-            .peer_address = peer.address,
-            .peer_id = options.peer_id,
-        };
-        threads[i] = std.Thread.spawn(.{}, peer_worker.WorkerContext.run, .{&workers[i]}) catch continue;
-        spawned += 1;
+    var workers = std.ArrayList(peer_worker.WorkerContext).empty;
+    defer workers.deinit(allocator);
+    var threads = std.ArrayList(std.Thread).empty;
+    defer threads.deinit(allocator);
+
+    const announce_interval: u32 = announce_response.interval;
+
+    // Spawn initial workers
+    try spawnWorkersForPeers(
+        allocator,
+        &workers,
+        &threads,
+        &known_peers,
+        announce_response.peers,
+        options,
+        &session,
+        &piece_tracker,
+    );
+
+    if (threads.items.len == 0) {
+        sendTrackerEvent(allocator, &http_client, announce_url, &session, options, .stopped, 0);
+        return error.NoReachablePeers;
+    }
+
+    // Re-announce loop: wait for workers, periodically re-announce for more peers
+    while (!piece_tracker.isComplete()) {
+        // Sleep for re-announce interval (or shorter to check completion)
+        const sleep_secs: u64 = @min(announce_interval, 30);
+        const sleep_ns: u64 = sleep_secs * std.time.ns_per_s;
+        std.Thread.sleep(sleep_ns);
+
+        if (piece_tracker.isComplete()) break;
+
+        // If all workers have finished and tracker is incomplete, we need more peers
+        // (checked implicitly by the re-announce below)
+
+        // Re-announce to discover new peers
+        if (known_peers.items.len < options.max_peers) {
+            const re_response = tracker.announce.fetch(allocator, &http_client, .{
+                .announce_url = announce_url,
+                .info_hash = session.metainfo.info_hash,
+                .peer_id = options.peer_id,
+                .port = options.port,
+                .left = piece_tracker.bytesRemaining(),
+                .event = null,
+            }) catch continue;
+            defer tracker.announce.freeResponse(allocator, re_response);
+
+            try spawnWorkersForPeers(
+                allocator,
+                &workers,
+                &threads,
+                &known_peers,
+                re_response.peers,
+                options,
+                &session,
+                &piece_tracker,
+            );
+        }
     }
 
     // Join all workers
-    for (threads[0..spawned]) |thread| {
+    for (threads.items) |thread| {
         thread.join();
     }
 
     // Aggregate results
     var total_downloaded: u64 = 0;
-    for (workers[0..spawned]) |worker| {
+    for (workers.items) |worker| {
         total_downloaded += worker.bytes_downloaded;
     }
 
@@ -264,7 +294,7 @@ pub fn download(
         try logStatus(options.status_writer, "complete: {s}\n", .{session.metainfo.name});
         return .{
             .info_hash = session.metainfo.info_hash,
-            .peer = if (eligible_peers.items.len > 0) eligible_peers.items[0] else null,
+            .peer = if (known_peers.items.len > 0) .{ .address = known_peers.items[0] } else null,
             .piece_count = session.pieceCount(),
             .bytes_downloaded = total_downloaded,
             .bytes_reused = recheck.bytes_complete,
@@ -274,6 +304,50 @@ pub fn download(
 
     sendTrackerEvent(allocator, &http_client, announce_url, &session, options, .stopped, 0);
     return error.NoReachablePeers;
+}
+
+fn spawnWorkersForPeers(
+    allocator: std.mem.Allocator,
+    workers: *std.ArrayList(@import("peer_worker.zig").WorkerContext),
+    threads: *std.ArrayList(std.Thread),
+    known_peers: *std.ArrayList(std.net.Address),
+    peers: []const tracker.announce.Peer,
+    options: DownloadOptions,
+    session: *const session_mod.Session,
+    piece_tracker: *@import("piece_tracker.zig").PieceTracker,
+) !void {
+    for (peers) |peer| {
+        if (isSelfPeer(peer.address, options.port)) continue;
+        if (known_peers.items.len >= options.max_peers) break;
+
+        // Check if we already know this peer
+        var already_known = false;
+        for (known_peers.items) |known| {
+            if (addressesEqual(known, peer.address)) {
+                already_known = true;
+                break;
+            }
+        }
+        if (already_known) continue;
+
+        try known_peers.append(allocator, peer.address);
+
+        const worker_index = workers.items.len;
+        try workers.append(allocator, .{
+            .allocator = allocator,
+            .session = session,
+            .tracker = piece_tracker,
+            .peer_address = peer.address,
+            .peer_id = options.peer_id,
+        });
+
+        const thread = std.Thread.spawn(
+            .{},
+            @import("peer_worker.zig").WorkerContext.run,
+            .{&workers.items[worker_index]},
+        ) catch continue;
+        try threads.append(allocator, thread);
+    }
 }
 
 fn downloadFromPeer(
@@ -531,6 +605,16 @@ fn sendTrackerEvent(
         .event = event,
     }) catch return;
     tracker.announce.freeResponse(allocator, response);
+}
+
+fn addressesEqual(a: std.net.Address, b: std.net.Address) bool {
+    if (a.any.family != b.any.family) return false;
+    if (a.getPort() != b.getPort()) return false;
+    return switch (a.any.family) {
+        std.posix.AF.INET => a.in.sa.addr == b.in.sa.addr,
+        std.posix.AF.INET6 => std.mem.eql(u8, &a.in6.sa.addr, &b.in6.sa.addr),
+        else => false,
+    };
 }
 
 fn isSelfPeer(address: std.net.Address, own_port: u16) bool {
