@@ -105,7 +105,12 @@ pub const WorkerContext = struct {
                 piece_index,
             ) catch |err| {
                 self.tracker.releasePiece(piece_index);
-                return err;
+                // Piece-level errors (hash mismatch, unexpected block): try another piece
+                // Connection-level errors: propagate to exit the worker
+                switch (err) {
+                    error.PieceHashMismatch, error.UnexpectedPieceBlock => continue,
+                    else => return err,
+                }
             };
 
             self.bytes_downloaded += downloaded;
