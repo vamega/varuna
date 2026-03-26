@@ -35,7 +35,8 @@ This document tracks which syscalls varuna uses, which are routed through io_uri
 | `openat+read+close` | `app.zig` -- `.torrent` file read | Once at startup | Low value |
 | `openat+write+close` | `app.zig` -- `.torrent` file creation | Once per `varuna create` | Low value |
 | `uname` | `probe.zig` -- kernel detection | Once at startup | No equivalent |
-| HTTP stack (multiple) | `announce.zig` via `std.http.Client` | A few times per session | Replace when ring-based HTTP client is built |
+| HTTP stack (multiple) | `announce.zig` via `std.http.Client` | Initial + re-announce | **Biggest remaining blocker**: DNS + TCP + HTTP blocks main thread. Replace with async HTTP or dedicated tracker thread in event loop cycle. |
+| `std.Thread.sleep` | ~~`client.zig` progress loop~~ | ~~2s polling~~ | **Resolved**: replaced with condvar + timedWait |
 
 ### Not yet implemented
 
