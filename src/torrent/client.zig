@@ -36,6 +36,7 @@ const RequestPipeline = struct {
 pub const DownloadOptions = struct {
     peer_id: [20]u8,
     port: u16 = 6881,
+    max_peers: u32 = 5,
     status_writer: ?*std.Io.Writer = null,
 };
 
@@ -196,42 +197,83 @@ pub fn download(
     }
     try logStatus(options.status_writer, "peers={}\n", .{announce_response.peers.len});
 
-    var last_error: ?anyerror = null;
+    // Filter peers and cap at max_peers
+    var eligible_peers = std.ArrayList(tracker.announce.Peer).empty;
+    defer eligible_peers.deinit(allocator);
     for (announce_response.peers) |peer| {
-        if (isSelfPeer(peer.address, options.port)) {
-            try logStatus(options.status_writer, "skipping self-peer: {f}\n", .{peer.address});
-            continue;
-        }
-        try logStatus(options.status_writer, "peer: {f}\n", .{peer.address});
+        if (isSelfPeer(peer.address, options.port)) continue;
+        try eligible_peers.append(allocator, peer);
+        if (eligible_peers.items.len >= options.max_peers) break;
+    }
 
-        const bytes_downloaded = downloadFromPeer(
-            allocator,
-            &session,
-            &store,
-            &recheck.complete_pieces,
-            peer,
-            &ring,
-            options,
-        ) catch |err| {
-            last_error = err;
-            try logStatus(options.status_writer, "peer failed: {s}\n", .{@errorName(err)});
-            continue;
+    if (eligible_peers.items.len == 0) {
+        sendTrackerEvent(allocator, &http_client, announce_url, &session, options, .stopped, 0);
+        return error.NoReachablePeers;
+    }
+
+    // Create shared piece tracker
+    const peer_worker = @import("peer_worker.zig");
+    const PieceTracker = @import("piece_tracker.zig").PieceTracker;
+
+    var piece_tracker = try PieceTracker.init(
+        allocator,
+        session.pieceCount(),
+        session.layout.piece_length,
+        session.totalSize(),
+        &recheck.complete_pieces,
+        recheck.bytes_complete,
+    );
+    defer piece_tracker.deinit(allocator);
+
+    // Spawn worker threads
+    const workers = try allocator.alloc(peer_worker.WorkerContext, eligible_peers.items.len);
+    defer allocator.free(workers);
+    const threads = try allocator.alloc(std.Thread, eligible_peers.items.len);
+    defer allocator.free(threads);
+
+    var spawned: usize = 0;
+    for (eligible_peers.items, 0..) |peer, i| {
+        try logStatus(options.status_writer, "connecting to peer: {f}\n", .{peer.address});
+        workers[i] = .{
+            .allocator = allocator,
+            .session = &session,
+            .tracker = &piece_tracker,
+            .peer_address = peer.address,
+            .peer_id = options.peer_id,
         };
+        threads[i] = std.Thread.spawn(.{}, peer_worker.WorkerContext.run, .{&workers[i]}) catch continue;
+        spawned += 1;
+    }
 
-        sendTrackerEvent(allocator, &http_client, announce_url, &session, options, .completed, bytes_downloaded);
+    // Join all workers
+    for (threads[0..spawned]) |thread| {
+        thread.join();
+    }
+
+    // Aggregate results
+    var total_downloaded: u64 = 0;
+    for (workers[0..spawned]) |worker| {
+        total_downloaded += worker.bytes_downloaded;
+    }
+
+    // Sync files
+    store.sync() catch {};
+
+    if (piece_tracker.isComplete()) {
+        sendTrackerEvent(allocator, &http_client, announce_url, &session, options, .completed, total_downloaded);
         try logStatus(options.status_writer, "complete: {s}\n", .{session.metainfo.name});
         return .{
             .info_hash = session.metainfo.info_hash,
-            .peer = peer,
+            .peer = if (eligible_peers.items.len > 0) eligible_peers.items[0] else null,
             .piece_count = session.pieceCount(),
-            .bytes_downloaded = bytes_downloaded,
+            .bytes_downloaded = total_downloaded,
             .bytes_reused = recheck.bytes_complete,
             .bytes_complete = session.totalSize(),
         };
     }
 
     sendTrackerEvent(allocator, &http_client, announce_url, &session, options, .stopped, 0);
-    return last_error orelse error.NoReachablePeers;
+    return error.NoReachablePeers;
 }
 
 fn downloadFromPeer(
@@ -1104,4 +1146,167 @@ test "seed and download between two varuna instances through a tracker" {
     const written = try tmp.dir.readFileAlloc(allocator, "download/fixture.bin", 64);
     defer allocator.free(written);
     try std.testing.expectEqualStrings(payload, written);
+}
+
+const PartialFakePeerContext = struct {
+    server: std.net.Server,
+    info_hash: [20]u8,
+    peer_id: [20]u8,
+    payload: []const u8,
+    piece_length: u32,
+    bitfield_bytes: []const u8,
+    expected_requests: u32,
+
+    fn run(self: *PartialFakePeerContext) void {
+        self.handleOne() catch |err| @panic(@errorName(err));
+    }
+
+    fn handleOne(self: *PartialFakePeerContext) !void {
+        defer self.server.deinit();
+
+        var ring = try Ring.init(16);
+        defer ring.deinit();
+
+        const connection = try self.server.accept();
+        const peer_fd = connection.stream.handle;
+        defer connection.stream.close();
+
+        const handshake = try peer_wire.readHandshake(&ring, peer_fd);
+        try std.testing.expectEqualDeep(self.info_hash, handshake.info_hash);
+
+        try peer_wire.writeHandshake(&ring, peer_fd, self.info_hash, self.peer_id);
+        try peer_wire.writeBitfield(&ring, peer_fd, self.bitfield_bytes);
+        try peer_wire.writeUnchoke(&ring, peer_fd);
+
+        var requests_served: u32 = 0;
+        while (requests_served < self.expected_requests) {
+            const message = try peer_wire.readMessageAlloc(std.testing.allocator, &ring, peer_fd);
+            defer peer_wire.freeMessage(std.testing.allocator, message);
+
+            switch (message) {
+                .request => |request| {
+                    const piece_start: usize = @intCast(request.piece_index * self.piece_length);
+                    const piece_end = @min(piece_start + @as(usize, self.piece_length), self.payload.len);
+                    const piece_data = self.payload[piece_start..piece_end];
+                    const block_start: usize = @intCast(request.block_offset);
+                    const block_end = block_start + @as(usize, @intCast(request.length));
+
+                    try peer_wire.writePiece(
+                        &ring,
+                        peer_fd,
+                        request.piece_index,
+                        request.block_offset,
+                        piece_data[block_start..block_end],
+                    );
+                    requests_served += 1;
+                },
+                else => {},
+            }
+        }
+    }
+};
+
+fn buildTwoTrackerBody(
+    allocator: std.mem.Allocator,
+    peer1_port: u16,
+    peer2_port: u16,
+) ![]u8 {
+    const peer1_bytes = [_]u8{ 127, 0, 0, 1 } ++ std.mem.toBytes(std.mem.nativeToBig(u16, peer1_port));
+    const peer2_bytes = [_]u8{ 127, 0, 0, 1 } ++ std.mem.toBytes(std.mem.nativeToBig(u16, peer2_port));
+
+    var body = std.ArrayList(u8).empty;
+    defer body.deinit(allocator);
+
+    try body.appendSlice(allocator, "d8:intervali30e5:peers12:");
+    try body.appendSlice(allocator, &peer1_bytes);
+    try body.appendSlice(allocator, &peer2_bytes);
+    try body.append(allocator, 'e');
+
+    return body.toOwnedSlice(allocator);
+}
+
+test "download from two peers with disjoint pieces" {
+    const allocator = std.testing.allocator;
+    const payload = "hello world!";
+    const piece_length: u32 = 4;
+
+    const bitfield1 = [_]u8{0b1010_0000};
+    const bitfield2 = [_]u8{0b0100_0000};
+
+    var peer1_context = PartialFakePeerContext{
+        .server = try std.net.Address.initIp4(.{ 127, 0, 0, 1 }, 0).listen(.{ .reuse_address = true }),
+        .info_hash = undefined,
+        .peer_id = "-FAKE01-PEER1D123456".*,
+        .payload = payload,
+        .piece_length = piece_length,
+        .bitfield_bytes = &bitfield1,
+        .expected_requests = 2,
+    };
+    var peer2_context = PartialFakePeerContext{
+        .server = try std.net.Address.initIp4(.{ 127, 0, 0, 1 }, 0).listen(.{ .reuse_address = true }),
+        .info_hash = undefined,
+        .peer_id = "-FAKE02-PEER2D123456".*,
+        .payload = payload,
+        .piece_length = piece_length,
+        .bitfield_bytes = &bitfield2,
+        .expected_requests = 1,
+    };
+
+    const peer1_thread = try std.Thread.spawn(.{}, PartialFakePeerContext.run, .{&peer1_context});
+    defer peer1_thread.join();
+    const peer2_thread = try std.Thread.spawn(.{}, PartialFakePeerContext.run, .{&peer2_context});
+    defer peer2_thread.join();
+
+    const tracker_body = try buildTwoTrackerBody(
+        allocator,
+        peer1_context.server.listen_address.getPort(),
+        peer2_context.server.listen_address.getPort(),
+    );
+    defer allocator.free(tracker_body);
+
+    var tracker_context = FakeTrackerContext{
+        .server = try std.net.Address.initIp4(.{ 127, 0, 0, 1 }, 0).listen(.{ .reuse_address = true }),
+        .response_body = tracker_body,
+        .expected_requests = 2,
+    };
+    const tracker_thread = try std.Thread.spawn(.{}, FakeTrackerContext.run, .{&tracker_context});
+    defer tracker_thread.join();
+
+    var announce_url_storage = std.ArrayList(u8).empty;
+    defer announce_url_storage.deinit(allocator);
+    try announce_url_storage.print(allocator, "http://127.0.0.1:{}/announce", .{tracker_context.server.listen_address.getPort()});
+
+    const torrent_bytes = try buildSingleFileTorrent(
+        allocator,
+        announce_url_storage.items,
+        "fixture.bin",
+        payload,
+        piece_length,
+    );
+    defer allocator.free(torrent_bytes);
+
+    peer1_context.info_hash = try @import("info_hash.zig").compute(torrent_bytes);
+    peer2_context.info_hash = peer1_context.info_hash;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const target_root = try std.fs.path.join(allocator, &.{
+        ".zig-cache",
+        "tmp",
+        tmp.sub_path[0..],
+        "download",
+    });
+    defer allocator.free(target_root);
+
+    const result = try download(allocator, torrent_bytes, target_root, .{
+        .peer_id = "MULTI-PEER-DL-000001".*,
+        .max_peers = 2,
+    });
+
+    try std.testing.expectEqual(@as(u64, payload.len), result.bytes_downloaded);
+    try std.testing.expectEqual(@as(u64, payload.len), result.bytes_complete);
+    const written_mp = try tmp.dir.readFileAlloc(allocator, "download/fixture.bin", 64);
+    defer allocator.free(written_mp);
+    try std.testing.expectEqualStrings(payload, written_mp);
 }

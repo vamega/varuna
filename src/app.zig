@@ -72,6 +72,7 @@ const TransferOptions = struct {
     torrent_path: []const u8,
     target_root: []const u8,
     port: u16 = 6881,
+    max_peers: u32 = 5,
 };
 
 fn parseTransferOptions(args: []const []const u8) !TransferOptions {
@@ -93,6 +94,18 @@ fn parseTransferOptions(args: []const []const u8) !TransferOptions {
                 return error.InvalidArguments;
             }
             options.port = try parsePort(args[index]);
+            index += 1;
+            continue;
+        }
+
+        if (std.mem.eql(u8, arg, "--max-peers")) {
+            index += 1;
+            if (index >= args.len) {
+                return error.InvalidArguments;
+            }
+            const parsed = try std.fmt.parseInt(u32, args[index], 10);
+            if (parsed == 0) return error.InvalidArguments;
+            options.max_peers = parsed;
             index += 1;
             continue;
         }
@@ -124,6 +137,7 @@ fn runDownload(
     const result = try torrent.client.download(allocator, torrent_bytes, options.target_root, .{
         .peer_id = peer_id,
         .port = options.port,
+        .max_peers = options.max_peers,
         .status_writer = writer,
     });
     const info_hash_hex = std.fmt.bytesToHex(result.info_hash, .lower);
