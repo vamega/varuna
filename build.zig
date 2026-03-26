@@ -16,6 +16,7 @@ pub fn build(b: *std.Build) void {
     });
     const toml_mod = toml_dep.module("toml");
 
+    // ── Shared library module ─────────────────────────────
     const varuna_mod = b.addModule("varuna", .{
         .root_source_file = b.path("src/root.zig"),
         .target = target,
@@ -47,57 +48,78 @@ pub fn build(b: *std.Build) void {
         },
     }
 
-    const exe = b.addExecutable(.{
+    const varuna_import = [_]std.Build.Module.Import{
+        .{ .name = "varuna", .module = varuna_mod },
+    };
+
+    // ── varuna (daemon) ───────────────────────────────────
+    const daemon_exe = b.addExecutable(.{
         .name = "varuna",
         .root_module = b.createModule(.{
             .root_source_file = b.path("src/main.zig"),
             .target = target,
             .optimize = optimize,
-            .imports = &.{
-                .{ .name = "varuna", .module = varuna_mod },
-            },
+            .imports = &varuna_import,
         }),
     });
-    b.installArtifact(exe);
+    b.installArtifact(daemon_exe);
 
+    // ── varuna-ctl (CLI client) ───────────────────────────
+    const ctl_exe = b.addExecutable(.{
+        .name = "varuna-ctl",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/ctl/main.zig"),
+            .target = target,
+            .optimize = optimize,
+            .imports = &varuna_import,
+        }),
+    });
+    b.installArtifact(ctl_exe);
+
+    // ── varuna-tools (standalone utilities) ────────────────
+    const tools_exe = b.addExecutable(.{
+        .name = "varuna-tools",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/tools/main.zig"),
+            .target = target,
+            .optimize = optimize,
+            .imports = &varuna_import,
+        }),
+    });
+    b.installArtifact(tools_exe);
+
+    // ── Run targets ───────────────────────────────────────
     const run_step = b.step("run", "Run the varuna daemon");
-    const run_cmd = b.addRunArtifact(exe);
+    const run_cmd = b.addRunArtifact(daemon_exe);
     run_cmd.step.dependOn(b.getInstallStep());
-    if (b.args) |args| {
-        run_cmd.addArgs(args);
-    }
+    if (b.args) |args| run_cmd.addArgs(args);
     run_step.dependOn(&run_cmd.step);
 
-    const mod_tests = b.addTest(.{
-        .root_module = varuna_mod,
-    });
+    // ── Tests ─────────────────────────────────────────────
+    const mod_tests = b.addTest(.{ .root_module = varuna_mod });
     const run_mod_tests = b.addRunArtifact(mod_tests);
 
-    const exe_tests = b.addTest(.{
-        .root_module = exe.root_module,
-    });
-    const run_exe_tests = b.addRunArtifact(exe_tests);
+    const daemon_tests = b.addTest(.{ .root_module = daemon_exe.root_module });
+    const run_daemon_tests = b.addRunArtifact(daemon_tests);
 
     const test_step = b.step("test", "Run the full test suite");
     test_step.dependOn(&run_mod_tests.step);
-    test_step.dependOn(&run_exe_tests.step);
+    test_step.dependOn(&run_daemon_tests.step);
 
+    // ── Benchmarks ────────────────────────────────────────
     const bench_exe = b.addExecutable(.{
         .name = "varuna-bench",
         .root_module = b.createModule(.{
             .root_source_file = b.path("src/bench/main.zig"),
             .target = target,
             .optimize = optimize,
-            .imports = &.{
-                .{ .name = "varuna", .module = varuna_mod },
-            },
+            .imports = &varuna_import,
         }),
     });
-
     const bench_step = b.step("bench", "Run bootstrap microbenchmarks");
-    const run_bench = b.addRunArtifact(bench_exe);
-    bench_step.dependOn(&run_bench.step);
+    bench_step.dependOn(&b.addRunArtifact(bench_exe).step);
 
+    // ── Profiling helpers ─────────────────────────────────
     const installed_exe_path = b.getInstallPath(.bin, "varuna");
 
     const trace_step = b.step("trace-syscalls", "Run varuna under strace and write perf/output/strace.log");

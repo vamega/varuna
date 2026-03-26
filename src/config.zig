@@ -2,9 +2,15 @@ const std = @import("std");
 const toml = @import("toml");
 
 pub const Config = struct {
+    daemon: Daemon = .{},
     storage: Storage = .{},
     network: Network = .{},
     performance: Performance = .{},
+
+    pub const Daemon = struct {
+        api_port: u16 = 8080,
+        api_bind: []const u8 = "127.0.0.1",
+    };
 
     pub const Storage = struct {
         resume_db: ?[]const u8 = null,
