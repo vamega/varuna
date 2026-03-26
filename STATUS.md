@@ -28,6 +28,12 @@ Update it whenever a milestone lands, the near-term backlog changes, or a new op
 - Connection timeout: 10-second default via io_uring linked timeout (IOSQE_IO_LINK + LINK_TIMEOUT).
 - Tracker re-announce: periodic re-announce on tracker interval to discover new peers; address deduplication.
 - Performance baselines (ReleaseFast): SHA-1 1,096 MB/s, bencode 32 MB/s, metainfo 37 MB/s.
+- Multi-peer seeding: accept up to `--max-peers` inbound connections, each served on a dedicated thread.
+- Endgame mode: when all remaining pieces are in-progress, multiple workers race to finish the last pieces.
+- Download progress reporting: periodic piece count, percentage, and peer count.
+- Worker error resilience: hash mismatch releases piece back to pool instead of killing the worker.
+- fdatasync instead of fsync for faster piece persistence (skips metadata flush).
+- fallocate for file pre-allocation via io_uring (avoids fragmentation, catches disk-full early).
 - io_uring is the I/O path for all hot-path file and network operations:
   - `src/io/ring.zig` wraps `std.os.linux.IoUring` with blocking convenience methods.
   - `PieceStore` read/write/sync routes through `Ring.pread_all`/`pwrite_all`/`fsync`.
@@ -56,7 +62,7 @@ Update it whenever a milestone lands, the near-term backlog changes, or a new op
 
 - ~~In the verified local `opentracker` swarm demo, the downloader could receive its own announced endpoint back.~~ Resolved: self-peers are now filtered before connection attempts.
 - The packaged Ubuntu `opentracker` build used by `scripts/tracker.sh` is not open-by-default for arbitrary torrents. It requires explicit info-hash whitelisting, so tracker demos must pass `--whitelist-hash`.
-- Seeder behavior is intentionally narrow: one listening socket, one inbound peer, sequential serving, and exit after disconnect.
+- ~~Seeder behavior was narrow.~~ Resolved: multi-peer seeding with `--max-peers`, per-peer worker threads.
 - Resume currently depends on full piece recheck, which is correct but can become expensive on large datasets.
 - ~~The runtime still uses conventional syscalls.~~ Resolved: hot-path file and network I/O now routes through io_uring. HTTP tracker requests still use conventional I/O via `std.http.Client`.
 - Some restricted or sandboxed environments can interfere with local tracker startup and socket behavior. Validate the swarm demo in a normal host shell when tracker setup looks suspect.
