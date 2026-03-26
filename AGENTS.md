@@ -63,6 +63,8 @@ All hot-path I/O in this project MUST go through `io_uring` via `src/io/ring.zig
 
 When adding new I/O paths, always use the Ring. Verify with `strace -f -yy -c` that new code routes through `io_uring_enter` and does not introduce conventional I/O syscalls on the hot path.
 
+See [docs/io-uring-syscalls.md](docs/io-uring-syscalls.md) for the full syscall reference, current io_uring coverage, and notes on DNS resolution, SHA hardware acceleration, and SQLite resume state.
+
 ## Coding Style & Naming Conventions
 Use `zig fmt` as the formatting authority. Prefer small modules, explicit ownership, and low-allocation designs. Default to arena or slab-backed allocation where dynamic memory is unavoidable. Use `snake_case` for files, functions, and local variables; `PascalCase` for types; and descriptive subsystem names like `piece_picker.zig` or `disk_scheduler.zig`. Keep Linux- and io_uring-specific code explicit rather than hidden behind generic abstractions.
 

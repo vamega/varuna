@@ -42,7 +42,7 @@ Update it whenever a milestone lands, the near-term backlog changes, or a new op
   - better piece selection than strict sequential download
   - stronger peer/session state handling
   - ~~pipeline block requests~~ Done: pipeline depth of 5 outstanding requests per piece
-- Replace full startup-only resume with persisted resume state.
+- Replace full startup-only resume with persisted resume state (SQLite, background thread -- see [docs/io-uring-syscalls.md](docs/io-uring-syscalls.md) for constraints).
 - ~~Begin the actual `io_uring` transition for storage and networking.~~ Done: file I/O, peer wire, connect, and accept all use io_uring.
 - Transition remaining I/O to io_uring: HTTP tracker, file open/close, batched event loop for multi-peer.
 - Add broader integration coverage around CLI workflows and tracker compatibility.

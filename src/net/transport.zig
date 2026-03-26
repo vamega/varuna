@@ -8,7 +8,7 @@ pub const AcceptResult = struct {
 };
 
 pub fn tcpConnect(ring: *Ring, address: std.net.Address) !posix.fd_t {
-    const fd = try posix.socket(
+    const fd = try ring.socket(
         address.any.family,
         posix.SOCK.STREAM | posix.SOCK.CLOEXEC,
         posix.IPPROTO.TCP,

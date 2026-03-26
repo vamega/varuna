@@ -113,6 +113,14 @@ pub const Ring = struct {
         return @intCast(cqe.res);
     }
 
+    pub fn socket(self: *Ring, domain: u32, socket_type: u32, protocol: u32) !posix.fd_t {
+        _ = try self.inner.socket(0, domain, socket_type, protocol, 0);
+        _ = try self.inner.submit();
+        const cqe = try self.inner.copy_cqe();
+        try checkCqe(cqe);
+        return @intCast(cqe.res);
+    }
+
     // ── Probing ───────────────────────────────────────────────
 
     pub fn probe() bool {
