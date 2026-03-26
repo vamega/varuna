@@ -28,7 +28,12 @@ pub const PieceStore = struct {
             });
             errdefer file.close();
 
-            try file.setEndPos(file_entry.length);
+            // Pre-allocate disk space to avoid fragmentation and late "disk full" errors.
+            // fallocate extends the file without zeroing, which is fast.
+            // Fall back to ftruncate if fallocate is not supported (e.g., some filesystems).
+            ring.fallocate(file.handle, 0, file_entry.length) catch {
+                try file.setEndPos(file_entry.length);
+            };
             files[index] = file;
         }
 

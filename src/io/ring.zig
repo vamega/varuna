@@ -59,6 +59,13 @@ pub const Ring = struct {
         try checkCqe(cqe);
     }
 
+    pub fn fallocate(self: *Ring, fd: posix.fd_t, offset: u64, len: u64) !void {
+        _ = try self.inner.fallocate(0, fd, 0, offset, len);
+        _ = try self.inner.submit();
+        const cqe = try self.inner.copy_cqe();
+        try checkCqe(cqe);
+    }
+
     pub fn fdatasync(self: *Ring, fd: posix.fd_t) !void {
         _ = try self.inner.fsync(0, fd, linux.IORING_FSYNC_DATASYNC);
         _ = try self.inner.submit();
