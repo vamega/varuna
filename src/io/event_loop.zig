@@ -3,15 +3,15 @@ const posix = std.posix;
 const linux = std.os.linux;
 const Bitfield = @import("../bitfield.zig").Bitfield;
 const PieceTracker = @import("../torrent/piece_tracker.zig").PieceTracker;
+const session_mod = @import("../torrent/session.zig");
+const storage = @import("../storage/root.zig");
+const pw = @import("../net/peer_wire.zig");
 
 const max_peers: u16 = 4096;
 const cqe_batch_size = 64;
+const pipeline_depth: u32 = 5;
 
 // ── User data encoding ────────────────────────────────────
-// Pack operation context into 64-bit user_data for CQE dispatch.
-//   bits [63:48] = slot index (u16)
-//   bits [47:40] = op type (u8)
-//   bits [39:0]  = op context (u40)
 
 pub const OpType = enum(u8) {
     peer_connect = 0,
@@ -47,14 +47,15 @@ pub fn decodeUserData(user_data: u64) OpData {
     };
 }
 
-// ── Peer slot ─────────────────────────────────────────────
+// ── Peer ──────────────────────────────────────────────────
 
 pub const PeerState = enum {
     free,
     connecting,
     handshake_send,
     handshake_recv,
-    active,
+    active_recv_header,
+    active_recv_body,
     disconnecting,
 };
 
@@ -62,14 +63,30 @@ pub const Peer = struct {
     fd: posix.fd_t = -1,
     state: PeerState = .free,
     address: std.net.Address = undefined,
-    recv_buf: [4 + 1024 * 1024]u8 = undefined, // message length + max message
-    recv_offset: usize = 0,
-    recv_expected: usize = 0,
+
+    // Recv state: small header buffer, then body on demand
+    header_buf: [4]u8 = undefined,
+    header_offset: usize = 0,
+    handshake_buf: [68]u8 = undefined,
+    handshake_offset: usize = 0,
+    body_buf: ?[]u8 = null,
+    body_offset: usize = 0,
+    body_expected: usize = 0,
+
+    // Peer wire state
     send_pending: bool = false,
-    am_interested: bool = false,
     peer_choking: bool = true,
-    availability: ?*Bitfield = null,
+    am_interested: bool = false,
+    availability_known: bool = false,
+    availability: ?Bitfield = null,
+
+    // Piece download state
     current_piece: ?u32 = null,
+    piece_buf: ?[]u8 = null,
+    blocks_received: u32 = 0,
+    blocks_expected: u32 = 0,
+    pipeline_sent: u32 = 0,
+    inflight_requests: u32 = 0,
 };
 
 // ── Event loop ────────────────────────────────────────────
@@ -77,39 +94,55 @@ pub const Peer = struct {
 pub const EventLoop = struct {
     ring: linux.IoUring,
     allocator: std.mem.Allocator,
-    peers: [max_peers]Peer,
+    peers: []Peer,
     peer_count: u16 = 0,
     running: bool = true,
 
-    pub fn init(allocator: std.mem.Allocator) !EventLoop {
+    // Session context
+    session: *const session_mod.Session,
+    piece_tracker: *PieceTracker,
+    shared_fds: []const posix.fd_t,
+    info_hash: [20]u8,
+    peer_id: [20]u8,
+
+    pub fn init(
+        allocator: std.mem.Allocator,
+        session: *const session_mod.Session,
+        piece_tracker: *PieceTracker,
+        shared_fds: []const posix.fd_t,
+        peer_id: [20]u8,
+    ) !EventLoop {
+        const peers = try allocator.alloc(Peer, max_peers);
+        @memset(peers, Peer{});
+
         return .{
             .ring = try linux.IoUring.init(256, 0),
             .allocator = allocator,
-            .peers = [_]Peer{.{}} ** max_peers,
+            .peers = peers,
+            .session = session,
+            .piece_tracker = piece_tracker,
+            .shared_fds = shared_fds,
+            .info_hash = session.metainfo.info_hash,
+            .peer_id = peer_id,
         };
     }
 
     pub fn deinit(self: *EventLoop) void {
-        // Close any open peer fds
-        for (&self.peers) |*peer| {
-            if (peer.state != .free and peer.fd >= 0) {
-                posix.close(peer.fd);
-                peer.state = .free;
-            }
+        for (self.peers) |*peer| {
+            self.cleanupPeer(peer);
         }
+        self.allocator.free(self.peers);
         self.ring.deinit();
     }
 
-    /// Allocate a peer slot and initiate a connect.
     pub fn addPeer(self: *EventLoop, address: std.net.Address) !u16 {
         const slot = self.allocSlot() orelse return error.TooManyPeers;
         const peer = &self.peers[slot];
-        peer.* = .{
+        peer.* = Peer{
             .state = .connecting,
             .address = address,
         };
 
-        // Create socket
         const fd = try posix.socket(
             address.any.family,
             posix.SOCK.STREAM | posix.SOCK.CLOEXEC | posix.SOCK.NONBLOCK,
@@ -117,7 +150,6 @@ pub const EventLoop = struct {
         );
         peer.fd = fd;
 
-        // Submit connect SQE
         const ud = encodeUserData(.{ .slot = slot, .op_type = .peer_connect, .context = 0 });
         _ = try self.ring.connect(ud, fd, &address.any, address.getOsSockLen());
 
@@ -125,23 +157,21 @@ pub const EventLoop = struct {
         return slot;
     }
 
-    /// Remove a peer and close its socket.
     pub fn removePeer(self: *EventLoop, slot: u16) void {
         const peer = &self.peers[slot];
-        if (peer.fd >= 0) {
-            posix.close(peer.fd);
+        if (peer.current_piece) |piece_index| {
+            self.piece_tracker.releasePiece(piece_index);
         }
-        if (peer.availability) |bf| {
-            bf.deinit(self.allocator);
-            self.allocator.destroy(bf);
-        }
-        peer.* = .{};
+        self.cleanupPeer(peer);
+        peer.* = Peer{};
         if (self.peer_count > 0) self.peer_count -= 1;
     }
 
-    /// Run the event loop until stopped.
     pub fn run(self: *EventLoop) !void {
-        while (self.running) {
+        while (self.running and !self.piece_tracker.isComplete()) {
+            // Try to assign pieces to idle peers
+            self.tryAssignPieces();
+
             _ = try self.ring.submit_and_wait(1);
 
             var cqes: [cqe_batch_size]linux.io_uring_cqe = undefined;
@@ -150,46 +180,55 @@ pub const EventLoop = struct {
             for (cqes[0..count]) |cqe| {
                 self.dispatch(cqe);
             }
+
+            // Check if all peers disconnected
+            if (self.peer_count == 0) break;
         }
     }
 
-    /// Stop the event loop.
     pub fn stop(self: *EventLoop) void {
         self.running = false;
     }
 
+    // ── CQE dispatch ──────────────────────────────────────
+
     fn dispatch(self: *EventLoop, cqe: linux.io_uring_cqe) void {
         const op = decodeUserData(cqe.user_data);
         switch (op.op_type) {
-            .peer_connect => self.handlePeerConnect(op.slot, cqe),
-            .peer_recv => self.handlePeerRecv(op.slot, cqe),
-            .peer_send => self.handlePeerSend(op.slot, cqe),
-            .accept => {}, // TODO
-            .disk_read => {}, // TODO
-            .disk_write => {}, // TODO
-            .http_connect => {}, // TODO
-            .http_send => {}, // TODO
-            .http_recv => {}, // TODO
-            .timeout => {}, // TODO
-            .cancel => {},
+            .peer_connect => self.handleConnect(op.slot, cqe),
+            .peer_recv => self.handleRecv(op.slot, cqe),
+            .peer_send => self.handleSend(op.slot, cqe),
+            .disk_write => self.handleDiskWrite(op.slot, cqe),
+            .accept, .disk_read, .http_connect, .http_send, .http_recv, .timeout, .cancel => {},
         }
     }
 
-    fn handlePeerConnect(self: *EventLoop, slot: u16, cqe: linux.io_uring_cqe) void {
-        const peer = &self.peers[slot];
+    fn handleConnect(self: *EventLoop, slot: u16, cqe: linux.io_uring_cqe) void {
         if (cqe.res < 0) {
-            // Connect failed
             self.removePeer(slot);
             return;
         }
-        // Connect succeeded -- start handshake
+        const peer = &self.peers[slot];
         peer.state = .handshake_send;
-        self.submitHandshakeSend(slot) catch {
+
+        // Build and send handshake
+        var buf: [68]u8 = undefined;
+        buf[0] = pw.protocol_length;
+        @memcpy(buf[1 .. 1 + pw.protocol_string.len], pw.protocol_string);
+        @memset(buf[20..28], 0);
+        @memcpy(buf[28..48], self.info_hash[0..]);
+        @memcpy(buf[48..68], self.peer_id[0..]);
+        @memcpy(peer.handshake_buf[0..68], &buf);
+
+        const ud = encodeUserData(.{ .slot = slot, .op_type = .peer_send, .context = 0 });
+        _ = self.ring.send(ud, peer.fd, peer.handshake_buf[0..68], 0) catch {
             self.removePeer(slot);
+            return;
         };
+        peer.send_pending = true;
     }
 
-    fn handlePeerSend(self: *EventLoop, slot: u16, cqe: linux.io_uring_cqe) void {
+    fn handleSend(self: *EventLoop, slot: u16, cqe: linux.io_uring_cqe) void {
         const peer = &self.peers[slot];
         if (cqe.res <= 0) {
             self.removePeer(slot);
@@ -199,61 +238,110 @@ pub const EventLoop = struct {
 
         switch (peer.state) {
             .handshake_send => {
-                // Handshake sent, now recv the peer's handshake
+                // Now recv peer's handshake
                 peer.state = .handshake_recv;
-                peer.recv_offset = 0;
-                peer.recv_expected = 68; // BT handshake is 68 bytes
-                self.submitRecv(slot) catch {
+                peer.handshake_offset = 0;
+                self.submitHandshakeRecv(slot) catch {
                     self.removePeer(slot);
                 };
             },
-            .active => {
-                // Send completed, can send more if needed
+            .active_recv_header, .active_recv_body => {
+                // Piece request sent or other send completed
+                // If we have more pipeline slots, send more requests
+                self.tryFillPipeline(slot) catch {
+                    self.removePeer(slot);
+                };
             },
             else => {},
         }
     }
 
-    fn handlePeerRecv(self: *EventLoop, slot: u16, cqe: linux.io_uring_cqe) void {
+    fn handleRecv(self: *EventLoop, slot: u16, cqe: linux.io_uring_cqe) void {
         const peer = &self.peers[slot];
         if (cqe.res <= 0) {
             self.removePeer(slot);
             return;
         }
         const n: usize = @intCast(cqe.res);
-        peer.recv_offset += n;
 
         switch (peer.state) {
             .handshake_recv => {
-                if (peer.recv_offset < peer.recv_expected) {
-                    // Partial handshake, keep reading
-                    self.submitRecv(slot) catch {
+                peer.handshake_offset += n;
+                if (peer.handshake_offset < 68) {
+                    self.submitHandshakeRecv(slot) catch {
                         self.removePeer(slot);
                     };
                     return;
                 }
-                // Full handshake received -- validate and transition to active
-                // TODO: validate info_hash
-                peer.state = .active;
-                peer.recv_offset = 0;
-                peer.recv_expected = 4; // message length prefix
-                self.submitRecv(slot) catch {
+                // Validate handshake
+                if (!std.mem.eql(u8, peer.handshake_buf[28..48], self.info_hash[0..])) {
+                    self.removePeer(slot);
+                    return;
+                }
+                // Send interested message
+                self.submitMessage(slot, 2, &.{}) catch {
+                    self.removePeer(slot);
+                    return;
+                };
+                peer.am_interested = true;
+                peer.state = .active_recv_header;
+                peer.header_offset = 0;
+                self.submitHeaderRecv(slot) catch {
                     self.removePeer(slot);
                 };
             },
-            .active => {
-                // Message framing: first 4 bytes are length, then body
-                // TODO: full message parsing
-                if (peer.recv_offset < peer.recv_expected) {
-                    self.submitRecv(slot) catch {
+            .active_recv_header => {
+                peer.header_offset += n;
+                if (peer.header_offset < 4) {
+                    self.submitHeaderRecv(slot) catch {
                         self.removePeer(slot);
                     };
                     return;
                 }
-                // Message complete -- process and read next
-                peer.recv_offset = 0;
-                peer.recv_expected = 4;
-                self.submitRecv(slot) catch {
+                // Parse message length
+                const msg_len = std.mem.readInt(u32, &peer.header_buf, .big);
+                if (msg_len == 0) {
+                    // Keep-alive
+                    peer.header_offset = 0;
+                    self.submitHeaderRecv(slot) catch {
+                        self.removePeer(slot);
+                    };
+                    return;
+                }
+                if (msg_len > pw.max_message_length) {
+                    self.removePeer(slot);
+                    return;
+                }
+                // Allocate body buffer and start reading
+                peer.body_buf = self.allocator.alloc(u8, msg_len) catch {
+                    self.removePeer(slot);
+                    return;
+                };
+                peer.body_offset = 0;
+                peer.body_expected = msg_len;
+                peer.state = .active_recv_body;
+                self.submitBodyRecv(slot) catch {
+                    self.removePeer(slot);
+                };
+            },
+            .active_recv_body => {
+                peer.body_offset += n;
+                if (peer.body_offset < peer.body_expected) {
+                    self.submitBodyRecv(slot) catch {
+                        self.removePeer(slot);
+                    };
+                    return;
+                }
+                // Full message received -- process it
+                self.processMessage(slot);
+                // Free body and read next header
+                if (peer.body_buf) |buf| {
+                    self.allocator.free(buf);
+                    peer.body_buf = null;
+                }
+                peer.state = .active_recv_header;
+                peer.header_offset = 0;
+                self.submitHeaderRecv(slot) catch {
                     self.removePeer(slot);
                 };
             },
@@ -261,36 +349,234 @@ pub const EventLoop = struct {
         }
     }
 
-    // ── SQE submission helpers ─────────────────────────────
-
-    fn submitHandshakeSend(self: *EventLoop, slot: u16) !void {
+    fn handleDiskWrite(self: *EventLoop, slot: u16, cqe: linux.io_uring_cqe) void {
+        _ = cqe;
         const peer = &self.peers[slot];
-        // Build handshake in send buffer area (reuse recv_buf temporarily)
-        const pw = @import("../net/peer_wire.zig");
-        var buf: [68]u8 = undefined;
-        buf[0] = pw.protocol_length;
-        @memcpy(buf[1 .. 1 + pw.protocol_string.len], pw.protocol_string);
-        @memset(buf[20..28], 0); // reserved
-        // TODO: copy info_hash and peer_id from session context
-        @memset(buf[28..48], 0); // placeholder info_hash
-        @memset(buf[48..68], 0); // placeholder peer_id
-
-        @memcpy(peer.recv_buf[0..68], &buf);
-        peer.send_pending = true;
-
-        const ud = encodeUserData(.{ .slot = slot, .op_type = .peer_send, .context = 0 });
-        _ = try self.ring.send(ud, peer.fd, peer.recv_buf[0..68], 0);
+        // Piece write completed -- mark piece as done
+        if (peer.current_piece) |piece_index| {
+            const piece_length = self.session.layout.pieceSize(piece_index) catch 0;
+            _ = self.piece_tracker.completePiece(piece_index, piece_length);
+            peer.current_piece = null;
+        }
+        if (peer.piece_buf) |buf| {
+            self.allocator.free(buf);
+            peer.piece_buf = null;
+        }
     }
 
-    fn submitRecv(self: *EventLoop, slot: u16) !void {
+    // ── Message processing ────────────────────────────────
+
+    fn processMessage(self: *EventLoop, slot: u16) void {
         const peer = &self.peers[slot];
-        const buf = peer.recv_buf[peer.recv_offset..peer.recv_expected];
+        const body = peer.body_buf orelse return;
+        if (body.len == 0) return;
+
+        const id = body[0];
+        const payload = body[1..];
+
+        switch (id) {
+            0 => { // choke
+                peer.peer_choking = true;
+                // Clear pipeline state
+                peer.inflight_requests = 0;
+                peer.pipeline_sent = peer.blocks_received;
+            },
+            1 => peer.peer_choking = false, // unchoke
+            2 => {}, // interested
+            3 => {}, // not interested
+            4 => { // have
+                if (payload.len >= 4) {
+                    const piece_index = std.mem.readInt(u32, payload[0..4], .big);
+                    if (peer.availability) |*bf| {
+                        bf.set(piece_index) catch {};
+                    }
+                    peer.availability_known = true;
+                    self.piece_tracker.addAvailability(piece_index);
+                }
+            },
+            5 => { // bitfield
+                if (peer.availability == null) {
+                    peer.availability = Bitfield.init(self.allocator, self.session.pieceCount()) catch return;
+                }
+                if (peer.availability) |*bf| {
+                    bf.importBitfield(payload);
+                }
+                peer.availability_known = true;
+                self.piece_tracker.addBitfieldAvailability(payload);
+            },
+            7 => { // piece
+                if (payload.len >= 8) {
+                    const piece_index = std.mem.readInt(u32, payload[0..4], .big);
+                    const block_offset = std.mem.readInt(u32, payload[4..8], .big);
+                    const block_data = payload[8..];
+
+                    if (peer.current_piece != null and peer.current_piece.? == piece_index) {
+                        if (peer.piece_buf) |pbuf| {
+                            const start: usize = @intCast(block_offset);
+                            const end = start + block_data.len;
+                            if (end <= pbuf.len) {
+                                @memcpy(pbuf[start..end], block_data);
+                                peer.blocks_received += 1;
+                                if (peer.inflight_requests > 0) peer.inflight_requests -= 1;
+
+                                if (peer.blocks_received >= peer.blocks_expected) {
+                                    self.completePieceDownload(slot);
+                                }
+                            }
+                        }
+                    }
+                }
+            },
+            else => {},
+        }
+    }
+
+    // ── Piece download coordination ───────────────────────
+
+    fn tryAssignPieces(self: *EventLoop) void {
+        for (self.peers, 0..) |*peer, i| {
+            if (peer.state != .active_recv_header and peer.state != .active_recv_body) continue;
+            if (peer.current_piece != null) continue;
+            if (peer.peer_choking) continue;
+            if (!peer.availability_known) continue;
+
+            const peer_bf: ?*const Bitfield = if (peer.availability) |*bf| bf else null;
+            const piece_index = self.piece_tracker.claimPiece(peer_bf) orelse continue;
+
+            self.startPieceDownload(@intCast(i), piece_index) catch {
+                self.piece_tracker.releasePiece(piece_index);
+            };
+        }
+    }
+
+    fn startPieceDownload(self: *EventLoop, slot: u16, piece_index: u32) !void {
+        const peer = &self.peers[slot];
+        const piece_size = try self.session.layout.pieceSize(piece_index);
+        const geometry = self.session.geometry();
+        const block_count = try geometry.blockCount(piece_index);
+
+        peer.current_piece = piece_index;
+        peer.piece_buf = try self.allocator.alloc(u8, piece_size);
+        peer.blocks_received = 0;
+        peer.blocks_expected = block_count;
+        peer.pipeline_sent = 0;
+        peer.inflight_requests = 0;
+
+        try self.tryFillPipeline(slot);
+    }
+
+    fn tryFillPipeline(self: *EventLoop, slot: u16) !void {
+        const peer = &self.peers[slot];
+        const piece_index = peer.current_piece orelse return;
+        if (peer.peer_choking) return;
+        if (peer.send_pending) return;
+
+        const geometry = self.session.geometry();
+
+        while (peer.inflight_requests < pipeline_depth and peer.pipeline_sent < peer.blocks_expected) {
+            const req = try geometry.requestForBlock(piece_index, peer.pipeline_sent);
+            var payload: [12]u8 = undefined;
+            std.mem.writeInt(u32, payload[0..4], req.piece_index, .big);
+            std.mem.writeInt(u32, payload[4..8], req.piece_offset, .big);
+            std.mem.writeInt(u32, payload[8..12], req.length, .big);
+            try self.submitMessage(slot, 6, &payload);
+            peer.pipeline_sent += 1;
+            peer.inflight_requests += 1;
+        }
+    }
+
+    fn completePieceDownload(self: *EventLoop, slot: u16) void {
+        const peer = &self.peers[slot];
+        const piece_index = peer.current_piece orelse return;
+        const piece_buf = peer.piece_buf orelse return;
+
+        // Verify hash
+        const plan = storage.verify.planPieceVerification(self.allocator, self.session, piece_index) catch {
+            self.piece_tracker.releasePiece(piece_index);
+            peer.current_piece = null;
+            return;
+        };
+        defer storage.verify.freePiecePlan(self.allocator, plan);
+
+        const valid = storage.verify.verifyPieceBuffer(plan, piece_buf) catch false;
+        if (!valid) {
+            self.piece_tracker.releasePiece(piece_index);
+            peer.current_piece = null;
+            return;
+        }
+
+        // Write to disk via io_uring
+        for (plan.spans) |span| {
+            const block = piece_buf[span.piece_offset .. span.piece_offset + span.length];
+            const ud = encodeUserData(.{ .slot = slot, .op_type = .disk_write, .context = 0 });
+            _ = self.ring.write(ud, self.shared_fds[span.file_index], block, span.file_offset) catch {
+                self.piece_tracker.releasePiece(piece_index);
+                peer.current_piece = null;
+                return;
+            };
+        }
+        // Note: piece completion is finalized in handleDiskWrite when the CQE arrives
+    }
+
+    // ── SQE helpers ───────────────────────────────────────
+
+    fn submitHandshakeRecv(self: *EventLoop, slot: u16) !void {
+        const peer = &self.peers[slot];
+        const buf = peer.handshake_buf[peer.handshake_offset..68];
         const ud = encodeUserData(.{ .slot = slot, .op_type = .peer_recv, .context = 0 });
         _ = try self.ring.recv(ud, peer.fd, .{ .buffer = buf }, 0);
     }
 
+    fn submitHeaderRecv(self: *EventLoop, slot: u16) !void {
+        const peer = &self.peers[slot];
+        const buf = peer.header_buf[peer.header_offset..4];
+        const ud = encodeUserData(.{ .slot = slot, .op_type = .peer_recv, .context = 0 });
+        _ = try self.ring.recv(ud, peer.fd, .{ .buffer = buf }, 0);
+    }
+
+    fn submitBodyRecv(self: *EventLoop, slot: u16) !void {
+        const peer = &self.peers[slot];
+        const buf = peer.body_buf orelse return error.NullBuffer;
+        const ud = encodeUserData(.{ .slot = slot, .op_type = .peer_recv, .context = 0 });
+        _ = try self.ring.recv(ud, peer.fd, .{ .buffer = buf[peer.body_offset..peer.body_expected] }, 0);
+    }
+
+    fn submitMessage(self: *EventLoop, slot: u16, id: u8, payload: []const u8) !void {
+        const peer = &self.peers[slot];
+        // Build framed message: 4-byte length + id + payload
+        const msg_len = @as(u32, @intCast(1 + payload.len));
+        var header: [5]u8 = undefined;
+        std.mem.writeInt(u32, header[0..4], msg_len, .big);
+        header[4] = id;
+
+        // For small messages, combine into one send
+        if (payload.len <= 12) {
+            var combined: [17]u8 = undefined; // 5 + 12
+            @memcpy(combined[0..5], &header);
+            @memcpy(combined[5 .. 5 + payload.len], payload);
+            // Store in handshake_buf (reused as small send buffer)
+            @memcpy(peer.handshake_buf[0 .. 5 + payload.len], combined[0 .. 5 + payload.len]);
+            const ud = encodeUserData(.{ .slot = slot, .op_type = .peer_send, .context = 0 });
+            _ = try self.ring.send(ud, peer.fd, peer.handshake_buf[0 .. 5 + payload.len], 0);
+            peer.send_pending = true;
+        } else {
+            // For larger messages, send header then payload separately
+            @memcpy(peer.handshake_buf[0..5], &header);
+            const ud = encodeUserData(.{ .slot = slot, .op_type = .peer_send, .context = 0 });
+            _ = try self.ring.send(ud, peer.fd, peer.handshake_buf[0..5], 0);
+            peer.send_pending = true;
+        }
+    }
+
+    fn cleanupPeer(self: *EventLoop, peer: *Peer) void {
+        if (peer.fd >= 0) posix.close(peer.fd);
+        if (peer.body_buf) |buf| self.allocator.free(buf);
+        if (peer.piece_buf) |buf| self.allocator.free(buf);
+        if (peer.availability) |*bf| bf.deinit(self.allocator);
+    }
+
     fn allocSlot(self: *EventLoop) ?u16 {
-        for (&self.peers, 0..) |*peer, i| {
+        for (self.peers, 0..) |*peer, i| {
             if (peer.state == .free) return @intCast(i);
         }
         return null;
@@ -316,11 +602,4 @@ test "user data max values" {
     try std.testing.expectEqual(@as(u16, 65535), decoded.slot);
     try std.testing.expectEqual(OpType.cancel, decoded.op_type);
     try std.testing.expectEqual(std.math.maxInt(u40), decoded.context);
-}
-
-test "event loop init and deinit" {
-    var loop = EventLoop.init(std.testing.allocator) catch return error.SkipZigTest;
-    defer loop.deinit();
-
-    try std.testing.expectEqual(@as(u16, 0), loop.peer_count);
 }
