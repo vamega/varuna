@@ -128,6 +128,11 @@ pub fn freeMessage(allocator: std.mem.Allocator, message: InboundMessage) void {
     }
 }
 
+pub fn writeKeepAlive(ring: *Ring, fd: posix.fd_t) !void {
+    const header = [_]u8{ 0, 0, 0, 0 };
+    try ring.send_all(fd, &header);
+}
+
 pub fn writeInterested(ring: *Ring, fd: posix.fd_t) !void {
     try writeMessageWithPayload(ring, fd, 2, &.{});
 }

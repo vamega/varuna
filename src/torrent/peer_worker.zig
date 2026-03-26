@@ -210,6 +210,11 @@ pub const WorkerContext = struct {
         try store.writePiece(plan.spans, piece_buffer);
         const is_new = self.tracker.completePiece(piece_index, plan.piece_length);
 
+        // Announce to peer that we have this piece
+        if (is_new) {
+            peer_wire.writeHave(ring, fd, piece_index) catch {};
+        }
+
         return if (is_new) plan.piece_length else 0;
     }
 };
