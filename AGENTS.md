@@ -9,6 +9,8 @@ Keep [DECISIONS.md](DECISIONS.md) updated whenever scope, constraints, architect
 Use Zig stable only: Zig `0.15.2` or the latest stable release, never nightly.
 Use `mise` to install project tools locally, and keep tool versions pinned in `mise.toml`.
 
+SQLite3 is required for resume state persistence. Install `libsqlite3-dev` on Ubuntu/Debian. If the `-dev` package is not available, the `lib/libsqlite3.so` symlink in the project root points to the system shared library. SQLite operations MUST run on a background thread, never on the io_uring event loop thread (see `docs/io-uring-syscalls.md`).
+
 Ensure local developer documentation is available before doing substantial Linux or `io_uring` work. On Ubuntu 24.04 this means keeping `man-db`, `manpages`, `manpages-dev`, `manpages-posix`, `manpages-posix-dev`, and `liburing-dev` installed so syscall, POSIX, and `io_uring` man pages are locally searchable. `liburing-dev` specifically provides the `io_uring_*` man pages and the `io_uring_setup(2)` / `io_uring_enter(2)` / `io_uring_register(2)` pages.
 
 Ensure the repositories under `reference-codebases/` remain checked out and readable before relying on them for protocol, tracker, storage, or startup-behavior comparisons.
