@@ -9,6 +9,7 @@ pub const SeedWorkerContext = struct {
     allocator: std.mem.Allocator,
     session: *const session_mod.Session,
     complete_pieces: *const storage.verify.PieceSet,
+    shared_fds: []const posix.fd_t,
     fd: posix.fd_t,
     peer_id: [20]u8,
 
@@ -27,8 +28,10 @@ pub const SeedWorkerContext = struct {
         var ring = try Ring.init(16);
         defer ring.deinit();
 
-        var store = try storage.writer.PieceStore.init(self.allocator, self.session, &ring);
-        defer store.deinit();
+        var store = storage.writer.PieceIO{
+            .fds = self.shared_fds,
+            .ring = &ring,
+        };
 
         const remote_handshake = try peer_wire.readHandshake(&ring, self.fd);
         if (!std.mem.eql(u8, remote_handshake.info_hash[0..], self.session.metainfo.info_hash[0..])) {

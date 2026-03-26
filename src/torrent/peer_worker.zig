@@ -39,6 +39,7 @@ pub const WorkerContext = struct {
     allocator: std.mem.Allocator,
     session: *const session_mod.Session,
     tracker: *PieceTracker,
+    shared_fds: []const std.posix.fd_t,
     peer_address: std.net.Address,
     peer_id: [20]u8,
     status_writer: ?*std.Io.Writer = null,
@@ -56,8 +57,10 @@ pub const WorkerContext = struct {
         var ring = try Ring.init(16);
         defer ring.deinit();
 
-        var store = try storage.writer.PieceStore.init(self.allocator, self.session, &ring);
-        defer store.deinit();
+        var io = storage.writer.PieceIO{
+            .fds = self.shared_fds,
+            .ring = &ring,
+        };
 
         const fd = try transport.tcpConnect(&ring, self.peer_address);
         defer posix.close(fd);
@@ -94,7 +97,7 @@ pub const WorkerContext = struct {
                             upload.unchoked = true;
                         }
                     },
-                    .request => |request| handleUploadRequest(self, &ring, fd, &store, &upload, request),
+                    .request => |request| handleUploadRequest(self, &ring, fd, &io, &upload, request),
                     else => applyPeerMessage(&availability, &availability_known, &peer_choking, self.tracker, message),
                 }
             }
@@ -111,7 +114,7 @@ pub const WorkerContext = struct {
                             upload.unchoked = true;
                         }
                     },
-                    .request => |request| handleUploadRequest(self, &ring, fd, &store, &upload, request),
+                    .request => |request| handleUploadRequest(self, &ring, fd, &io, &upload, request),
                     else => applyPeerMessage(&availability, &availability_known, &peer_choking, self.tracker, message),
                 }
                 continue;
@@ -120,7 +123,7 @@ pub const WorkerContext = struct {
             const downloaded = self.downloadPiece(
                 &ring,
                 fd,
-                &store,
+                &io,
                 &availability,
                 &availability_known,
                 &peer_choking,
@@ -144,7 +147,7 @@ pub const WorkerContext = struct {
         self: *WorkerContext,
         ring: *Ring,
         fd: posix.fd_t,
-        store: *storage.writer.PieceStore,
+        store: *storage.writer.PieceIO,
         availability: *Bitfield,
         availability_known: *bool,
         peer_choking: *bool,
@@ -253,7 +256,7 @@ fn handleUploadRequest(
     self: *WorkerContext,
     ring: *Ring,
     fd: posix.fd_t,
-    store: *storage.writer.PieceStore,
+    store: *storage.writer.PieceIO,
     upload: *UploadState,
     request: peer_wire.Request,
 ) void {

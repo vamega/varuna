@@ -90,6 +90,9 @@ pub fn seed(
     const transport = @import("../net/transport.zig");
     const seed_worker_mod = @import("seed_worker.zig");
 
+    const shared_fds = try store.fileHandles(allocator);
+    defer allocator.free(shared_fds);
+
     var workers = std.ArrayList(seed_worker_mod.SeedWorkerContext).empty;
     defer workers.deinit(allocator);
     var threads = std.ArrayList(std.Thread).empty;
@@ -107,6 +110,7 @@ pub fn seed(
             .allocator = allocator,
             .session = &session,
             .complete_pieces = &recheck.complete_pieces,
+            .shared_fds = shared_fds,
             .fd = accept_result.fd,
             .peer_id = options.peer_id,
         });
@@ -242,6 +246,10 @@ pub fn download(
     );
     defer piece_tracker.deinit(allocator);
 
+    // Get shared file descriptors for worker threads
+    const shared_fds = try store.fileHandles(allocator);
+    defer allocator.free(shared_fds);
+
     // Track connected peer addresses to avoid duplicates across re-announces
     var known_peers = std.ArrayList(std.net.Address).empty;
     defer known_peers.deinit(allocator);
@@ -263,6 +271,7 @@ pub fn download(
         options,
         &session,
         &piece_tracker,
+        shared_fds,
     );
 
     if (threads.items.len == 0) {
@@ -315,6 +324,7 @@ pub fn download(
                 options,
                 &session,
                 &piece_tracker,
+                shared_fds,
             );
         }
     }
@@ -359,6 +369,7 @@ fn spawnWorkersForPeers(
     options: DownloadOptions,
     session: *const session_mod.Session,
     piece_tracker: *@import("piece_tracker.zig").PieceTracker,
+    shared_fds: []const std.posix.fd_t,
 ) !void {
     for (peers) |peer| {
         if (isSelfPeer(peer.address, options.port)) continue;
@@ -381,6 +392,7 @@ fn spawnWorkersForPeers(
             .allocator = allocator,
             .session = session,
             .tracker = piece_tracker,
+            .shared_fds = shared_fds,
             .peer_address = peer.address,
             .peer_id = options.peer_id,
         });

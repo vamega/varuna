@@ -85,6 +85,48 @@ pub const PieceStore = struct {
             try self.ring.fdatasync(file.handle);
         }
     }
+
+    /// Return the raw fd_t values for sharing with other threads.
+    /// The PieceStore retains ownership; callers must not close these.
+    pub fn fileHandles(self: *const PieceStore, allocator: std.mem.Allocator) ![]posix.fd_t {
+        const fds = try allocator.alloc(posix.fd_t, self.files.len);
+        for (self.files, 0..) |file, i| {
+            fds[i] = file.handle;
+        }
+        return fds;
+    }
+};
+
+/// Lightweight piece I/O using pre-opened file descriptors and a Ring.
+/// Does not own the fds -- the originating PieceStore must outlive this.
+pub const PieceIO = struct {
+    fds: []const posix.fd_t,
+    ring: *Ring,
+
+    pub fn writePiece(
+        self: *PieceIO,
+        spans: []const torrent.layout.Layout.Span,
+        piece_data: []const u8,
+    ) !void {
+        for (spans) |span| {
+            const block = piece_data[span.piece_offset .. span.piece_offset + span.length];
+            try self.ring.pwrite_all(self.fds[span.file_index], block, span.file_offset);
+        }
+    }
+
+    pub fn readPiece(
+        self: *PieceIO,
+        spans: []const torrent.layout.Layout.Span,
+        piece_data: []u8,
+    ) !void {
+        for (spans) |span| {
+            const block = piece_data[span.piece_offset .. span.piece_offset + span.length];
+            const read_count = try self.ring.pread_all(self.fds[span.file_index], block, span.file_offset);
+            if (read_count != block.len) {
+                return error.UnexpectedEndOfFile;
+            }
+        }
+    }
 };
 
 test "write piece data across multiple files" {
