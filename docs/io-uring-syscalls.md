@@ -1,6 +1,6 @@
 # System Calls for a Torrent Client vs io_uring
 
-This document tracks which syscalls varuna uses, which are routed through io_uring, and which remain conventional. Update it as the io_uring transition progresses.
+This document tracks which syscalls the `varuna` **daemon** uses, which are routed through io_uring, and which remain conventional. The io_uring policy applies to the daemon only -- `varuna-ctl` and `varuna-tools` are short-lived CLI tools where standard library I/O is acceptable.
 
 ## Current Varuna Status
 

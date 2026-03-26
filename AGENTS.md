@@ -47,23 +47,28 @@ Add new commands to `build.zig` instead of ad hoc shell scripts when practical.
 
 For local tracker validation, prefer `scripts/tracker.sh` plus `varuna inspect` or `scripts/demo_swarm.sh` instead of inventing new one-off workflows. The Ubuntu `opentracker` package in this repository is built in whitelist mode, so agents must pass `--whitelist-hash <info-hash>` to `scripts/tracker.sh` for any torrent they expect the tracker to authorize.
 
-## io_uring Policy (IMPORTANT)
-All hot-path I/O in this project MUST go through `io_uring` via `src/io/ring.zig`. Do NOT use `std.fs.File` read/write/sync methods or `std.net.Stream` read/write methods for production file or network I/O. These generate conventional `read`/`write`/`pread64`/`pwrite64`/`sendto`/`recvfrom` syscalls instead of `io_uring_enter`.
+## io_uring Policy (IMPORTANT -- applies to `varuna` daemon only)
+The `varuna` daemon is the performance-critical binary. All hot-path I/O in the daemon MUST go through `io_uring` via `src/io/ring.zig`. Do NOT use `std.fs.File` read/write/sync methods or `std.net.Stream` read/write methods for daemon I/O. These generate conventional syscalls instead of `io_uring_enter`.
 
-**Use the Ring wrapper** (`src/io/ring.zig`) for:
+**Daemon I/O (`varuna`) -- must use io_uring:**
 - Piece storage reads and writes (`PieceStore` in `src/storage/writer.zig`)
-- Peer wire protocol send and receive (`src/net/peer_wire.zig`)
-- TCP connect and accept for peer connections (`src/net/transport.zig`)
-- File fsync operations
+- Peer wire protocol send and receive (event loop in `src/io/event_loop.zig`)
+- TCP connect, accept, and socket creation for peer connections
+- HTTP API server accept, recv, send (`src/rpc/server.zig`)
+- HTTP tracker client connect, send, recv (`src/io/http.zig`)
+- File fsync/fdatasync, fallocate
 
-**Acceptable exceptions** (not hot path):
+**`varuna-ctl` and `varuna-tools` -- no io_uring requirement:**
+These are short-lived CLI tools, not performance-critical. They MAY use io_uring if convenient (and currently do for HTTP), but standard library I/O (`std.net`, `std.fs`, `std.http`) is perfectly acceptable. Simplicity and correctness matter more than syscall efficiency for these binaries.
+
+**Acceptable exceptions in the daemon** (not hot path):
 - File creation, directory setup, and truncation during `PieceStore.init` (one-time setup)
-- HTTP tracker requests via `std.http.Client` (until a ring-based HTTP client is built)
 - Stdout logging via `std.Io.Writer` (infrequent status messages)
 - Test helpers that simulate peers/trackers (not production code)
 - The `uname` syscall in runtime probing
+- SQLite operations (run on a background thread, not the event loop)
 
-When adding new I/O paths, always use the Ring. Verify with `strace -f -yy -c` that new code routes through `io_uring_enter` and does not introduce conventional I/O syscalls on the hot path.
+When adding new I/O paths to the daemon, always use the Ring or event loop. Verify with `strace -f -yy -c` that daemon hot paths route through `io_uring_enter`.
 
 See [docs/io-uring-syscalls.md](docs/io-uring-syscalls.md) for the full syscall reference, current io_uring coverage, and notes on DNS resolution, SHA hardware acceleration, and SQLite resume state.
 
