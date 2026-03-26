@@ -5,6 +5,7 @@ const info_hash = @import("info_hash.zig");
 pub const Metainfo = struct {
     info_hash: [20]u8,
     announce: ?[]const u8,
+    announce_list: []const []const u8,
     created_by: ?[]const u8,
     name: []const u8,
     piece_length: u32,
@@ -62,9 +63,15 @@ pub fn parse(allocator: std.mem.Allocator, input: []const u8) !Metainfo {
     else
         try parseSingleFileList(allocator, try expectPositiveU64(try getRequired(info, "length")), name);
 
+    const announce_list = if (bencode.dictGet(root_dict, "announce-list")) |value|
+        try parseAnnounceList(allocator, value)
+    else
+        try allocator.alloc([]const u8, 0);
+
     return .{
         .info_hash = digest,
         .announce = if (bencode.dictGet(root_dict, "announce")) |value| try expectBytes(value) else null,
+        .announce_list = announce_list,
         .created_by = if (bencode.dictGet(root_dict, "created by")) |value| try expectBytes(value) else null,
         .name = name,
         .piece_length = piece_length,
@@ -73,11 +80,28 @@ pub fn parse(allocator: std.mem.Allocator, input: []const u8) !Metainfo {
     };
 }
 
-pub fn freeMetainfo(allocator: std.mem.Allocator, metainfo: Metainfo) void {
-    for (metainfo.files) |file| {
+fn parseAnnounceList(allocator: std.mem.Allocator, value: bencode.Value) ![]const []const u8 {
+    const tiers = try expectList(value);
+    var urls = std.ArrayList([]const u8).empty;
+    defer urls.deinit(allocator);
+
+    for (tiers) |tier| {
+        const tier_list = try expectList(tier);
+        for (tier_list) |url_value| {
+            const url = try expectBytes(url_value);
+            try urls.append(allocator, url);
+        }
+    }
+
+    return urls.toOwnedSlice(allocator);
+}
+
+pub fn freeMetainfo(allocator: std.mem.Allocator, meta: Metainfo) void {
+    allocator.free(meta.announce_list);
+    for (meta.files) |file| {
         allocator.free(file.path);
     }
-    allocator.free(metainfo.files);
+    allocator.free(meta.files);
 }
 
 fn parseSingleFileList(

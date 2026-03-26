@@ -185,20 +185,49 @@ pub fn download(
     var http_client = std.http.Client{ .allocator = allocator };
     defer http_client.deinit();
 
-    const announce_url = session.metainfo.announce orelse return error.MissingAnnounceUrl;
-    const announce_response = try tracker.announce.fetch(allocator, &http_client, .{
-        .announce_url = announce_url,
-        .info_hash = session.metainfo.info_hash,
-        .peer_id = options.peer_id,
-        .port = options.port,
-        .left = bytes_left,
-    });
-    defer tracker.announce.freeResponse(allocator, announce_response);
-
-    if (announce_response.peers.len == 0) {
-        return error.NoPeersAvailable;
+    // Build tracker URL list: primary announce URL + announce-list URLs
+    var tracker_urls = std.ArrayList([]const u8).empty;
+    defer tracker_urls.deinit(allocator);
+    if (session.metainfo.announce) |url| {
+        try tracker_urls.append(allocator, url);
     }
-    try logStatus(options.status_writer, "peers={}\n", .{announce_response.peers.len});
+    for (session.metainfo.announce_list) |url| {
+        // Deduplicate against primary announce
+        var already_added = false;
+        for (tracker_urls.items) |existing| {
+            if (std.mem.eql(u8, existing, url)) {
+                already_added = true;
+                break;
+            }
+        }
+        if (!already_added) try tracker_urls.append(allocator, url);
+    }
+    if (tracker_urls.items.len == 0) return error.MissingAnnounceUrl;
+
+    // Try each tracker until one returns peers
+    var announce_url: []const u8 = tracker_urls.items[0];
+    var announce_response: ?tracker.announce.Response = null;
+    for (tracker_urls.items) |url| {
+        const response = tracker.announce.fetch(allocator, &http_client, .{
+            .announce_url = url,
+            .info_hash = session.metainfo.info_hash,
+            .peer_id = options.peer_id,
+            .port = options.port,
+            .left = bytes_left,
+        }) catch continue;
+
+        if (response.peers.len > 0) {
+            announce_url = url;
+            announce_response = response;
+            break;
+        }
+        tracker.announce.freeResponse(allocator, response);
+    }
+
+    const response = announce_response orelse return error.NoPeersAvailable;
+    defer tracker.announce.freeResponse(allocator, response);
+
+    try logStatus(options.status_writer, "peers={}\n", .{response.peers.len});
 
     const peer_worker = @import("peer_worker.zig");
     const PieceTracker = @import("piece_tracker.zig").PieceTracker;
@@ -222,7 +251,7 @@ pub fn download(
     var threads = std.ArrayList(std.Thread).empty;
     defer threads.deinit(allocator);
 
-    const announce_interval: u32 = announce_response.interval;
+    const announce_interval: u32 = response.interval;
 
     // Spawn initial workers
     try spawnWorkersForPeers(
@@ -230,7 +259,7 @@ pub fn download(
         &workers,
         &threads,
         &known_peers,
-        announce_response.peers,
+        response.peers,
         options,
         &session,
         &piece_tracker,
