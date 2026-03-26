@@ -1,4 +1,5 @@
 pub const bencode = @import("bencode.zig");
+pub const bencode_encode = @import("bencode_encode.zig");
 pub const blocks = @import("blocks.zig");
 pub const client = @import("client.zig");
 pub const info_hash = @import("info_hash.zig");
