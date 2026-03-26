@@ -82,7 +82,7 @@ pub const WorkerContext = struct {
             while (peer_choking or !availability_known) {
                 const message = try peer_wire.readMessageAlloc(self.allocator, &ring, fd);
                 defer peer_wire.freeMessage(self.allocator, message);
-                applyPeerMessage(&availability, &availability_known, &peer_choking, message);
+                applyPeerMessage(&availability, &availability_known, &peer_choking, self.tracker, message);
             }
 
             const peer_bf: ?*const Bitfield = if (availability_known) &availability else null;
@@ -90,7 +90,7 @@ pub const WorkerContext = struct {
                 // No pieces available from this peer, wait for have messages
                 const message = try peer_wire.readMessageAlloc(self.allocator, &ring, fd);
                 defer peer_wire.freeMessage(self.allocator, message);
-                applyPeerMessage(&availability, &availability_known, &peer_choking, message);
+                applyPeerMessage(&availability, &availability_known, &peer_choking, self.tracker, message);
                 continue;
             };
 
@@ -191,7 +191,7 @@ pub const WorkerContext = struct {
                         next_to_send += 1;
                     }
                 },
-                else => applyPeerMessage(availability, availability_known, peer_choking, message),
+                else => applyPeerMessage(availability, availability_known, peer_choking, self.tracker, message),
             }
         }
 
@@ -210,6 +210,7 @@ fn applyPeerMessage(
     availability: *Bitfield,
     availability_known: *bool,
     peer_choking: *bool,
+    tracker: *PieceTracker,
     message: peer_wire.InboundMessage,
 ) void {
     switch (message) {
@@ -219,10 +220,12 @@ fn applyPeerMessage(
         .have => |piece_index| {
             availability.set(piece_index) catch {};
             availability_known.* = true;
+            tracker.addAvailability(piece_index);
         },
         .bitfield => |bitfield_data| {
             availability.importBitfield(bitfield_data);
             availability_known.* = true;
+            tracker.addBitfieldAvailability(bitfield_data);
         },
     }
 }
