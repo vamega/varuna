@@ -5,3 +5,6 @@
 /perf/output/*
 !/perf/output/.gitkeep
 /.tools/
+/vendor/sqlite/sqlite3.c
+/vendor/sqlite/sqlite3.h
+*.deb
