@@ -239,9 +239,21 @@ fn runCreate(
     output_path: ?[]const u8,
     writer: *std.Io.Writer,
 ) !void {
-    const torrent_bytes = try torrent.create.createSingleFile(allocator, file_path, .{
-        .announce_url = announce_url,
-    });
+    const is_dir = blk: {
+        _ = std.fs.cwd().statFile(file_path) catch |err| {
+            break :blk err == error.IsDir;
+        };
+        break :blk false;
+    };
+
+    const torrent_bytes = if (is_dir)
+        try torrent.create.createDirectory(allocator, file_path, .{
+            .announce_url = announce_url,
+        })
+    else
+        try torrent.create.createSingleFile(allocator, file_path, .{
+            .announce_url = announce_url,
+        });
     defer allocator.free(torrent_bytes);
 
     const dest = output_path orelse blk: {
