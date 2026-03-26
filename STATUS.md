@@ -58,6 +58,11 @@ Update it whenever a milestone lands, the near-term backlog changes, or a new op
 - **peer_worker.zig and seed_worker.zig deleted**: all I/O through single-threaded event loop.
 - SHA-1 verification threadpool (configurable thread count via config).
 - Graceful SIGINT/SIGTERM shutdown: flushes resume DB, sends tracker stopped event, closes connections.
+- **3-binary architecture**: `varuna` (daemon), `varuna-ctl` (CLI client), `varuna-tools` (standalone utilities).
+- **qBittorrent-compatible HTTP API over io_uring**: all API I/O (accept, recv, send) via io_uring. Endpoints: webapiVersion, preferences, transfer/info, torrents/info, torrents/add, torrents/delete, torrents/pause, torrents/resume.
+- **TorrentSession + SessionManager**: multi-torrent state management with lifecycle (checking, downloading, seeding, paused, stopped, error).
+- **varuna-ctl**: CLI client that talks to daemon via HTTP over io_uring. Commands: list, add, pause, resume, delete, version, stats.
+- TOML config file with `[daemon]` section (api_port, api_bind).
 - io_uring is the I/O path for all hot-path file and network operations:
   - `src/io/ring.zig` wraps `std.os.linux.IoUring` with blocking convenience methods.
   - `PieceStore` read/write/sync routes through `Ring.pread_all`/`pwrite_all`/`fsync`.
