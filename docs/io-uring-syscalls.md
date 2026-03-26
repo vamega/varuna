@@ -16,6 +16,8 @@ This document tracks which syscalls varuna uses, which are routed through io_uri
 | `connect()` | `IORING_OP_CONNECT` | `transport.tcpConnect` via `Ring.connect` | Done |
 | `accept()` | `IORING_OP_ACCEPT` | `transport.tcpAccept` via `Ring.accept` | Done |
 | `socket()` | `IORING_OP_SOCKET` | `transport.tcpConnect` via `Ring.socket` | Done |
+| `fdatasync()` | `IORING_OP_FSYNC` + `DATASYNC` | `PieceStore.sync` via `Ring.fdatasync` | Done |
+| `fallocate()` | `IORING_OP_FALLOCATE` | `PieceStore.init` via `Ring.fallocate` | Done |
 
 ### Remaining conventional I/O (not hot path)
 
