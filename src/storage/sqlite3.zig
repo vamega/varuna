@@ -25,7 +25,7 @@ pub extern "sqlite3" fn sqlite3_close(db: *Db) c_int;
 pub extern "sqlite3" fn sqlite3_exec(
     db: *Db,
     sql: [*:0]const u8,
-    callback: ?*const fn (?*anyopaque, c_int, [*c][*c]u8, [*c][*c]u8) callconv(.C) c_int,
+    callback: ?*const fn (?*anyopaque, c_int, [*c][*c]u8, [*c][*c]u8) callconv(.c) c_int,
     arg: ?*anyopaque,
     errmsg: ?*?[*:0]u8,
 ) c_int;
@@ -47,7 +47,7 @@ pub extern "sqlite3" fn sqlite3_bind_blob(
     col: c_int,
     value: [*]const u8,
     n: c_int,
-    destructor: ?*const fn (?*anyopaque) callconv(.C) void,
+    destructor: ?*const fn (?*anyopaque) callconv(.c) void,
 ) c_int;
 
 pub extern "sqlite3" fn sqlite3_bind_int(stmt: *Stmt, col: c_int, value: c_int) c_int;
@@ -61,4 +61,4 @@ pub extern "sqlite3" fn sqlite3_column_bytes(stmt: *Stmt, col: c_int) c_int;
 pub extern "sqlite3" fn sqlite3_errmsg(db: *Db) [*:0]const u8;
 pub extern "sqlite3" fn sqlite3_free(ptr: ?*anyopaque) void;
 
-pub const SQLITE_TRANSIENT: ?*const fn (?*anyopaque) callconv(.C) void = @ptrFromInt(@as(usize, std.math.maxInt(usize)));
+pub const SQLITE_TRANSIENT: ?*const fn (?*anyopaque) callconv(.c) void = @ptrFromInt(@as(usize, std.math.maxInt(usize)));

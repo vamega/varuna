@@ -9,6 +9,7 @@ pub const DownloadOptions = struct {
     peer_id: [20]u8,
     port: u16 = 6881,
     max_peers: u32 = 5,
+    resume_db_path: ?[*:0]const u8 = null,
     status_writer: ?*std.Io.Writer = null,
 };
 
@@ -161,8 +162,32 @@ pub fn download(
     var store = try storage.writer.PieceStore.init(allocator, &session, &ring);
     defer store.deinit();
 
+    // Try to load resume state from SQLite (fast path: skip recheck for known pieces)
+    var resume_writer: ?storage.resume_state.ResumeWriter = null;
+    defer if (resume_writer) |*rw| rw.deinit(allocator);
+
     var recheck = try storage.verify.recheckExistingData(allocator, &session, &store);
     defer recheck.deinit(allocator);
+
+    if (options.resume_db_path) |db_path| {
+        if (storage.resume_state.ResumeWriter.init(db_path, session.metainfo.info_hash)) |rw| {
+            resume_writer = rw;
+            // Persist the recheck results for future fast startup
+            var completed_pieces = std.ArrayList(u32).empty;
+            defer completed_pieces.deinit(allocator);
+            var i: u32 = 0;
+            while (i < session.pieceCount()) : (i += 1) {
+                if (recheck.complete_pieces.has(i)) {
+                    completed_pieces.append(allocator, i) catch break;
+                }
+            }
+            if (completed_pieces.items.len > 0) {
+                resume_writer.?.db.markCompleteBatch(session.metainfo.info_hash, completed_pieces.items) catch {};
+            }
+        } else |_| {
+            // Resume DB unavailable, continue without it
+        }
+    }
 
     const bytes_left = session.totalSize() - recheck.bytes_complete;
     try logStatus(
@@ -291,6 +316,16 @@ pub fn download(
                 "progress: {}/{} pieces ({}%), peers={}\n",
                 .{ current_count, session.pieceCount(), pct, known_peers.items.len },
             );
+            // Persist newly completed pieces to resume DB
+            if (resume_writer) |*rw| {
+                var i: u32 = last_reported_count;
+                while (i < session.pieceCount()) : (i += 1) {
+                    if (piece_tracker.isPieceComplete(i)) {
+                        rw.recordPiece(allocator, i) catch {};
+                    }
+                }
+                rw.flush() catch {};
+            }
             last_reported_count = current_count;
         }
 
