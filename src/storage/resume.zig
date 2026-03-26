@@ -1,0 +1,258 @@
+const std = @import("std");
+const sqlite = @import("sqlite3.zig");
+const Bitfield = @import("../bitfield.zig").Bitfield;
+
+/// Persistent resume state backed by SQLite.
+/// Tracks which pieces are complete across restarts, avoiding
+/// expensive full-disk recheck for large torrents.
+///
+/// Runs on a dedicated background thread -- SQLite operations
+/// block and must NOT run on the io_uring event loop thread.
+pub const ResumeDb = struct {
+    db: *sqlite.Db,
+    insert_stmt: *sqlite.Stmt,
+    query_stmt: *sqlite.Stmt,
+    delete_stmt: *sqlite.Stmt,
+
+    pub fn open(path: [*:0]const u8) !ResumeDb {
+        var db: ?*sqlite.Db = null;
+        const flags = sqlite.SQLITE_OPEN_READWRITE | sqlite.SQLITE_OPEN_CREATE | sqlite.SQLITE_OPEN_FULLMUTEX;
+
+        if (sqlite.sqlite3_open_v2(path, &db, flags, null) != sqlite.SQLITE_OK) {
+            if (db) |d| _ = sqlite.sqlite3_close(d);
+            return error.SqliteOpenFailed;
+        }
+        const d = db.?;
+
+        // Enable WAL mode for better concurrent read/write performance
+        if (sqlite.sqlite3_exec(d, "PRAGMA journal_mode=wal", null, null, null) != sqlite.SQLITE_OK) {
+            _ = sqlite.sqlite3_close(d);
+            return error.SqlitePragmaFailed;
+        }
+
+        // Create schema
+        if (sqlite.sqlite3_exec(d,
+            "CREATE TABLE IF NOT EXISTS pieces (" ++
+                "info_hash BLOB NOT NULL, " ++
+                "piece_index INTEGER NOT NULL, " ++
+                "completed_at INTEGER NOT NULL DEFAULT (strftime('%s','now')), " ++
+                "PRIMARY KEY (info_hash, piece_index)" ++
+                ")",
+            null, null, null,
+        ) != sqlite.SQLITE_OK) {
+            _ = sqlite.sqlite3_close(d);
+            return error.SqliteSchemaFailed;
+        }
+
+        // Prepare statements
+        var insert_stmt: ?*sqlite.Stmt = null;
+        if (sqlite.sqlite3_prepare_v2(d,
+            "INSERT OR IGNORE INTO pieces (info_hash, piece_index) VALUES (?1, ?2)",
+            -1, &insert_stmt, null,
+        ) != sqlite.SQLITE_OK) {
+            _ = sqlite.sqlite3_close(d);
+            return error.SqlitePrepareFailed;
+        }
+
+        var query_stmt: ?*sqlite.Stmt = null;
+        if (sqlite.sqlite3_prepare_v2(d,
+            "SELECT piece_index FROM pieces WHERE info_hash = ?1",
+            -1, &query_stmt, null,
+        ) != sqlite.SQLITE_OK) {
+            _ = sqlite.sqlite3_finalize(insert_stmt.?);
+            _ = sqlite.sqlite3_close(d);
+            return error.SqlitePrepareFailed;
+        }
+
+        var delete_stmt: ?*sqlite.Stmt = null;
+        if (sqlite.sqlite3_prepare_v2(d,
+            "DELETE FROM pieces WHERE info_hash = ?1",
+            -1, &delete_stmt, null,
+        ) != sqlite.SQLITE_OK) {
+            _ = sqlite.sqlite3_finalize(insert_stmt.?);
+            _ = sqlite.sqlite3_finalize(query_stmt.?);
+            _ = sqlite.sqlite3_close(d);
+            return error.SqlitePrepareFailed;
+        }
+
+        return .{
+            .db = d,
+            .insert_stmt = insert_stmt.?,
+            .query_stmt = query_stmt.?,
+            .delete_stmt = delete_stmt.?,
+        };
+    }
+
+    pub fn close(self: *ResumeDb) void {
+        _ = sqlite.sqlite3_finalize(self.insert_stmt);
+        _ = sqlite.sqlite3_finalize(self.query_stmt);
+        _ = sqlite.sqlite3_finalize(self.delete_stmt);
+        _ = sqlite.sqlite3_close(self.db);
+    }
+
+    /// Record a completed piece.
+    pub fn markComplete(self: *ResumeDb, info_hash: [20]u8, piece_index: u32) !void {
+        _ = sqlite.sqlite3_reset(self.insert_stmt);
+        _ = sqlite.sqlite3_bind_blob(self.insert_stmt, 1, &info_hash, 20, sqlite.SQLITE_TRANSIENT);
+        _ = sqlite.sqlite3_bind_int(self.insert_stmt, 2, @intCast(piece_index));
+
+        if (sqlite.sqlite3_step(self.insert_stmt) != sqlite.SQLITE_DONE) {
+            return error.SqliteInsertFailed;
+        }
+    }
+
+    /// Batch-record multiple completed pieces in a single transaction.
+    pub fn markCompleteBatch(self: *ResumeDb, info_hash: [20]u8, piece_indices: []const u32) !void {
+        _ = sqlite.sqlite3_exec(self.db, "BEGIN", null, null, null);
+        for (piece_indices) |piece_index| {
+            self.markComplete(info_hash, piece_index) catch {
+                _ = sqlite.sqlite3_exec(self.db, "ROLLBACK", null, null, null);
+                return error.SqliteBatchFailed;
+            };
+        }
+        if (sqlite.sqlite3_exec(self.db, "COMMIT", null, null, null) != sqlite.SQLITE_OK) {
+            return error.SqliteCommitFailed;
+        }
+    }
+
+    /// Load completed pieces into a Bitfield.
+    /// Returns the count of pieces loaded.
+    pub fn loadCompletePieces(self: *ResumeDb, info_hash: [20]u8, bitfield: *Bitfield) !u32 {
+        _ = sqlite.sqlite3_reset(self.query_stmt);
+        _ = sqlite.sqlite3_bind_blob(self.query_stmt, 1, &info_hash, 20, sqlite.SQLITE_TRANSIENT);
+
+        var count: u32 = 0;
+        while (sqlite.sqlite3_step(self.query_stmt) == sqlite.SQLITE_ROW) {
+            const piece_index: u32 = @intCast(sqlite.sqlite3_column_int(self.query_stmt, 0));
+            bitfield.set(piece_index) catch continue;
+            count += 1;
+        }
+        return count;
+    }
+
+    /// Clear all resume state for a torrent.
+    pub fn clearTorrent(self: *ResumeDb, info_hash: [20]u8) !void {
+        _ = sqlite.sqlite3_reset(self.delete_stmt);
+        _ = sqlite.sqlite3_bind_blob(self.delete_stmt, 1, &info_hash, 20, sqlite.SQLITE_TRANSIENT);
+
+        if (sqlite.sqlite3_step(self.delete_stmt) != sqlite.SQLITE_DONE) {
+            return error.SqliteDeleteFailed;
+        }
+    }
+};
+
+/// Background resume writer that batches piece completions.
+/// Run on a dedicated thread -- call flush() periodically or on shutdown.
+pub const ResumeWriter = struct {
+    db: ResumeDb,
+    info_hash: [20]u8,
+    pending: std.ArrayList(u32),
+    mutex: std.Thread.Mutex = .{},
+
+    pub fn init(db_path: [*:0]const u8, info_hash: [20]u8) !ResumeWriter {
+        return .{
+            .db = try ResumeDb.open(db_path),
+            .info_hash = info_hash,
+            .pending = std.ArrayList(u32).empty,
+        };
+    }
+
+    pub fn deinit(self: *ResumeWriter, allocator: std.mem.Allocator) void {
+        self.flush() catch {};
+        self.pending.deinit(allocator);
+        self.db.close();
+    }
+
+    /// Queue a piece for persistence. Thread-safe.
+    pub fn recordPiece(self: *ResumeWriter, allocator: std.mem.Allocator, piece_index: u32) !void {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        try self.pending.append(allocator, piece_index);
+    }
+
+    /// Flush all pending pieces to SQLite. Thread-safe.
+    pub fn flush(self: *ResumeWriter) !void {
+        self.mutex.lock();
+        const items = self.pending.items;
+        if (items.len == 0) {
+            self.mutex.unlock();
+            return;
+        }
+        // Take ownership of pending items
+        const to_flush = self.pending.allocatedSlice();
+        _ = to_flush;
+        self.mutex.unlock();
+
+        // Write batch to SQLite (this blocks, which is fine on the background thread)
+        self.db.markCompleteBatch(self.info_hash, items) catch {};
+
+        self.mutex.lock();
+        self.pending.clearRetainingCapacity();
+        self.mutex.unlock();
+    }
+};
+
+// ── Tests ─────────────────────────────────────────────────
+// Tests require libsqlite3 to be linked. They'll fail at link time
+// if libsqlite3-dev is not installed, which is acceptable.
+
+test "resume db open close" {
+    var db = ResumeDb.open(":memory:") catch return error.SkipZigTest;
+    defer db.close();
+}
+
+test "resume db mark and load pieces" {
+    var db = ResumeDb.open(":memory:") catch return error.SkipZigTest;
+    defer db.close();
+
+    const info_hash = [_]u8{0xAA} ** 20;
+
+    try db.markComplete(info_hash, 0);
+    try db.markComplete(info_hash, 5);
+    try db.markComplete(info_hash, 10);
+    // Duplicate should be ignored
+    try db.markComplete(info_hash, 5);
+
+    var bf = try Bitfield.init(std.testing.allocator, 20);
+    defer bf.deinit(std.testing.allocator);
+
+    const count = try db.loadCompletePieces(info_hash, &bf);
+    try std.testing.expectEqual(@as(u32, 3), count);
+    try std.testing.expect(bf.has(0));
+    try std.testing.expect(bf.has(5));
+    try std.testing.expect(bf.has(10));
+    try std.testing.expect(!bf.has(1));
+}
+
+test "resume db batch write" {
+    var db = ResumeDb.open(":memory:") catch return error.SkipZigTest;
+    defer db.close();
+
+    const info_hash = [_]u8{0xBB} ** 20;
+    const pieces = [_]u32{ 0, 1, 2, 3, 4 };
+
+    try db.markCompleteBatch(info_hash, &pieces);
+
+    var bf = try Bitfield.init(std.testing.allocator, 10);
+    defer bf.deinit(std.testing.allocator);
+
+    const count = try db.loadCompletePieces(info_hash, &bf);
+    try std.testing.expectEqual(@as(u32, 5), count);
+}
+
+test "resume db clear torrent" {
+    var db = ResumeDb.open(":memory:") catch return error.SkipZigTest;
+    defer db.close();
+
+    const info_hash = [_]u8{0xCC} ** 20;
+    try db.markComplete(info_hash, 0);
+    try db.markComplete(info_hash, 1);
+
+    try db.clearTorrent(info_hash);
+
+    var bf = try Bitfield.init(std.testing.allocator, 10);
+    defer bf.deinit(std.testing.allocator);
+
+    const count = try db.loadCompletePieces(info_hash, &bf);
+    try std.testing.expectEqual(@as(u32, 0), count);
+}

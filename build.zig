@@ -7,7 +7,10 @@ pub fn build(b: *std.Build) void {
     const varuna_mod = b.addModule("varuna", .{
         .root_source_file = b.path("src/root.zig"),
         .target = target,
+        .link_libc = true,
     });
+    varuna_mod.addLibraryPath(b.path("lib"));
+    varuna_mod.linkSystemLibrary("sqlite3", .{});
 
     const exe = b.addExecutable(.{
         .name = "varuna",
