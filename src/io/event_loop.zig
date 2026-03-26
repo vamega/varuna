@@ -119,7 +119,7 @@ pub const EventLoop = struct {
         const peers = try allocator.alloc(Peer, max_peers);
         @memset(peers, Peer{});
 
-        const hasher = Hasher.init(allocator, session) catch null;
+        const hasher = Hasher.init(allocator, null) catch null;
 
         return .{
             .ring = try linux.IoUring.init(256, 0),

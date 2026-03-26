@@ -1,27 +1,25 @@
 const std = @import("std");
 const posix = std.posix;
 const linux = std.os.linux;
-const storage = @import("../storage/root.zig");
-const session_mod = @import("../torrent/session.zig");
 
-/// Async piece hasher that runs on a background thread.
-/// The event loop submits pieces for verification; the hasher thread
-/// computes SHA-1 and writes results to an eventfd that the event loop
-/// polls via io_uring.
+const default_thread_count = 4;
+
+/// Threadpool-based piece hasher for parallel SHA-1 verification.
+/// The event loop submits pieces; the pool processes them concurrently;
+/// results are collected via drainResults().
 pub const Hasher = struct {
     allocator: std.mem.Allocator,
-    session: *const session_mod.Session,
-    thread: ?std.Thread = null,
-    running: bool = true,
+    threads: []std.Thread,
+    running: std.atomic.Value(bool) = std.atomic.Value(bool).init(true),
 
-    // Job queue: event loop pushes, hasher thread pops
+    // Job queue: event loop pushes, worker threads pop
     queue_mutex: std.Thread.Mutex = .{},
     queue_cond: std.Thread.Condition = .{},
-    pending_jobs: std.ArrayList(Job) = std.ArrayList(Job).empty,
+    pending_jobs: std.ArrayList(Job),
 
-    // Result queue: hasher thread pushes, event loop pops
+    // Result queue: worker threads push, event loop pops
     result_mutex: std.Thread.Mutex = .{},
-    completed_results: std.ArrayList(Result) = std.ArrayList(Result).empty,
+    completed_results: std.ArrayList(Result),
 
     // eventfd for waking the event loop when results are ready
     event_fd: posix.fd_t = -1,
@@ -41,30 +39,42 @@ pub const Hasher = struct {
         valid: bool,
     };
 
-    pub fn init(allocator: std.mem.Allocator, session: *const session_mod.Session) !Hasher {
-        // Create eventfd for signaling the event loop
-        const efd = try std.posix.eventfd(0, linux.EFD.NONBLOCK | linux.EFD.CLOEXEC);
+    pub fn init(allocator: std.mem.Allocator, thread_count: ?u32) !Hasher {
+        const count = thread_count orelse default_thread_count;
+        const efd = try posix.eventfd(0, linux.EFD.NONBLOCK | linux.EFD.CLOEXEC);
+        errdefer posix.close(efd);
 
         var self = Hasher{
             .allocator = allocator,
-            .session = session,
+            .threads = try allocator.alloc(std.Thread, count),
+            .pending_jobs = std.ArrayList(Job).empty,
+            .completed_results = std.ArrayList(Result).empty,
             .event_fd = efd,
         };
 
-        self.thread = try std.Thread.spawn(.{}, workerLoop, .{&self});
+        var spawned: usize = 0;
+        errdefer {
+            self.running.store(false, .release);
+            self.queue_cond.broadcast();
+            for (self.threads[0..spawned]) |t| t.join();
+            allocator.free(self.threads);
+        }
+
+        for (self.threads) |*t| {
+            t.* = try std.Thread.spawn(.{}, workerFn, .{&self});
+            spawned += 1;
+        }
+
         return self;
     }
 
     pub fn deinit(self: *Hasher) void {
-        // Signal thread to stop
-        self.queue_mutex.lock();
-        self.running = false;
-        self.queue_cond.signal();
-        self.queue_mutex.unlock();
+        self.running.store(false, .release);
+        self.queue_cond.broadcast();
 
-        if (self.thread) |t| t.join();
+        for (self.threads) |t| t.join();
+        self.allocator.free(self.threads);
 
-        // Clean up remaining jobs
         for (self.pending_jobs.items) |job| {
             self.allocator.free(job.piece_buf);
         }
@@ -101,7 +111,6 @@ pub const Hasher = struct {
     }
 
     /// Drain completed results. Called from the event loop thread.
-    /// Returns a slice of results (caller should process and then call clearResults).
     pub fn drainResults(self: *Hasher) []const Result {
         self.result_mutex.lock();
         defer self.result_mutex.unlock();
@@ -121,29 +130,31 @@ pub const Hasher = struct {
         self.completed_results.clearRetainingCapacity();
     }
 
-    /// Return the eventfd for the event loop to poll via io_uring.
     pub fn getEventFd(self: *Hasher) posix.fd_t {
         return self.event_fd;
     }
 
-    fn workerLoop(self: *Hasher) void {
-        while (true) {
+    pub fn threadCount(self: *const Hasher) usize {
+        return self.threads.len;
+    }
+
+    fn workerFn(self: *Hasher) void {
+        while (self.running.load(.acquire)) {
             // Wait for a job
             self.queue_mutex.lock();
-            while (self.pending_jobs.items.len == 0 and self.running) {
+            while (self.pending_jobs.items.len == 0 and self.running.load(.acquire)) {
                 self.queue_cond.timedWait(&self.queue_mutex, 100 * std.time.ns_per_ms) catch {};
             }
 
-            if (!self.running and self.pending_jobs.items.len == 0) {
+            if (self.pending_jobs.items.len == 0) {
                 self.queue_mutex.unlock();
-                return;
+                continue;
             }
 
-            // Pop a job
             const job = self.pending_jobs.orderedRemove(0);
             self.queue_mutex.unlock();
 
-            // Hash the piece
+            // Hash the piece (CPU-intensive, runs in parallel across pool)
             var actual: [20]u8 = undefined;
             std.crypto.hash.Sha1.hash(job.piece_buf[0..job.piece_length], &actual, .{});
             const valid = std.mem.eql(u8, actual[0..], job.expected_hash[0..]);
@@ -158,7 +169,7 @@ pub const Hasher = struct {
             }) catch {};
             self.result_mutex.unlock();
 
-            // Wake the event loop via eventfd
+            // Wake the event loop
             if (self.event_fd >= 0) {
                 const val: u64 = 1;
                 _ = posix.write(self.event_fd, std.mem.asBytes(&val)) catch {};
@@ -166,3 +177,60 @@ pub const Hasher = struct {
         }
     }
 };
+
+test "hasher pool verifies pieces correctly" {
+    var hasher = Hasher.init(std.testing.allocator, 2) catch return error.SkipZigTest;
+    defer hasher.deinit();
+
+    // Submit a valid piece
+    const data1 = try std.testing.allocator.alloc(u8, 4);
+    @memcpy(data1, "spam");
+    var expected1: [20]u8 = undefined;
+    std.crypto.hash.Sha1.hash("spam", &expected1, .{});
+    try hasher.submitVerify(0, 0, data1, expected1);
+
+    // Submit an invalid piece
+    const data2 = try std.testing.allocator.alloc(u8, 4);
+    @memcpy(data2, "eggs");
+    var expected2: [20]u8 = undefined;
+    std.crypto.hash.Sha1.hash("spam", &expected2, .{}); // wrong hash for "eggs"
+    try hasher.submitVerify(1, 1, data2, expected2);
+
+    // Wait for results
+    var attempts: u32 = 0;
+    while (attempts < 100) : (attempts += 1) {
+        std.Thread.sleep(10 * std.time.ns_per_ms);
+        const results = hasher.drainResults();
+        if (results.len >= 2) {
+            var valid_count: u32 = 0;
+            var invalid_count: u32 = 0;
+            for (results) |r| {
+                if (r.valid) {
+                    valid_count += 1;
+                } else {
+                    invalid_count += 1;
+                    std.testing.allocator.free(r.piece_buf);
+                }
+            }
+            try std.testing.expectEqual(@as(u32, 1), valid_count);
+            try std.testing.expectEqual(@as(u32, 1), invalid_count);
+            hasher.clearResults();
+            // Free valid piece buf
+            for (hasher.drainResults()) |r| {
+                std.testing.allocator.free(r.piece_buf);
+            }
+            // Free the valid result's buf from the first drain
+            std.testing.allocator.free(data1);
+            return;
+        }
+        hasher.clearResults();
+    }
+    return error.TestTimeout;
+}
+
+test "hasher pool thread count" {
+    var hasher = Hasher.init(std.testing.allocator, 8) catch return error.SkipZigTest;
+    defer hasher.deinit();
+
+    try std.testing.expectEqual(@as(usize, 8), hasher.threadCount());
+}
