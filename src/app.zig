@@ -60,6 +60,14 @@ pub fn run(
         return;
     }
 
+    if (std.mem.eql(u8, args[1], "verify")) {
+        if (args.len < 4) {
+            return error.InvalidArguments;
+        }
+        try runVerify(allocator, args[2], args[3], writer);
+        return;
+    }
+
     if (std.mem.eql(u8, args[1], "banner")) {
         try writeStartupBanner(writer);
         return;
@@ -205,12 +213,50 @@ fn runInspect(
     try writer.flush();
 }
 
+fn runVerify(
+    allocator: std.mem.Allocator,
+    torrent_path: []const u8,
+    target_root: []const u8,
+    writer: *std.Io.Writer,
+) !void {
+    const Ring = @import("io/ring.zig").Ring;
+    var ring = try Ring.init(16);
+    defer ring.deinit();
+
+    const torrent_bytes = try std.fs.cwd().readFileAlloc(allocator, torrent_path, 16 * 1024 * 1024);
+    defer allocator.free(torrent_bytes);
+
+    const session = try torrent.session.Session.load(allocator, torrent_bytes, target_root);
+    defer session.deinit(allocator);
+
+    var store = try @import("storage/root.zig").writer.PieceStore.init(allocator, &session, &ring);
+    defer store.deinit();
+
+    var recheck = try @import("storage/root.zig").verify.recheckExistingData(allocator, &session, &store);
+    defer recheck.deinit(allocator);
+
+    const piece_count = session.pieceCount();
+    const pct = if (piece_count > 0) (recheck.complete_pieces.count * 100) / piece_count else 0;
+
+    try writer.print("name={s}\n", .{session.metainfo.name});
+    try writer.print("pieces={}/{} ({}%)\n", .{ recheck.complete_pieces.count, piece_count, pct });
+    try writer.print("complete={} bytes\n", .{recheck.bytes_complete});
+    try writer.print("remaining={} bytes\n", .{session.totalSize() - recheck.bytes_complete});
+    if (recheck.complete_pieces.count == piece_count) {
+        try writer.print("status=complete\n", .{});
+    } else {
+        try writer.print("status=incomplete\n", .{});
+    }
+    try writer.flush();
+}
+
 fn writeUsage(writer: *std.Io.Writer) !void {
     try writer.writeAll(
         "usage:\n" ++
-            "  varuna download <torrent-file> <target-root> [--port <port>]\n" ++
-            "  varuna seed <torrent-file> <target-root> [--port <port>]\n" ++
+            "  varuna download <torrent-file> <target-root> [--port <port>] [--max-peers <n>]\n" ++
+            "  varuna seed <torrent-file> <target-root> [--port <port>] [--max-peers <n>]\n" ++
             "  varuna inspect <torrent-file>\n" ++
+            "  varuna verify <torrent-file> <target-root>\n" ++
             "  varuna banner\n",
     );
 }
