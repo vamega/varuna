@@ -50,6 +50,9 @@ Update it whenever a milestone lands, the near-term backlog changes, or a new op
 - `std.http.Client` eliminated: tracker HTTP now routes through io_uring HTTP client (`src/io/http.zig`).
 - Event loop skeleton (`src/io/event_loop.zig`): single-threaded io_uring event loop with user_data encoding, peer state machine, message framing, and piece download. Ready to replace thread-per-peer.
 - SQLite resume state (`src/storage/resume.zig`): persists completed pieces to SQLite (WAL mode, prepared statements). Integrated into download flow with periodic flush.
+- Bundled SQLite build option: `-Dsqlite=bundled` compiles amalgamation for self-contained binary, `-Dsqlite=system` (default) links libsqlite3.
+- **Event loop replaces thread-per-peer**: `client.download()` now uses single-threaded io_uring `EventLoop` for all peer I/O. Scales to thousands of peers on one thread.
+- Resume fast path: on startup with `--resume-db`, loads known-complete pieces from SQLite and skips SHA-1 rehashing them. Only unknown pieces are verified.
 - io_uring is the I/O path for all hot-path file and network operations:
   - `src/io/ring.zig` wraps `std.os.linux.IoUring` with blocking convenience methods.
   - `PieceStore` read/write/sync routes through `Ring.pread_all`/`pwrite_all`/`fsync`.
