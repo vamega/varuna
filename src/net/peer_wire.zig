@@ -137,6 +137,10 @@ pub fn writeInterested(ring: *Ring, fd: posix.fd_t) !void {
     try writeMessageWithPayload(ring, fd, 2, &.{});
 }
 
+pub fn writeNotInterested(ring: *Ring, fd: posix.fd_t) !void {
+    try writeMessageWithPayload(ring, fd, 3, &.{});
+}
+
 pub fn writeUnchoke(ring: *Ring, fd: posix.fd_t) !void {
     try writeMessageWithPayload(ring, fd, 1, &.{});
 }
