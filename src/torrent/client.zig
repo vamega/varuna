@@ -8,7 +8,8 @@ const Ring = @import("../io/ring.zig").Ring;
 pub const DownloadOptions = struct {
     peer_id: [20]u8,
     port: u16 = 6881,
-    max_peers: u32 = 5,
+    max_peers: u32 = 50,
+    hasher_threads: u32 = 4,
     resume_db_path: ?[*:0]const u8 = null,
     status_writer: ?*std.Io.Writer = null,
 };
@@ -291,6 +292,7 @@ pub fn download(
         &piece_tracker,
         shared_fds,
         options.peer_id,
+        options.hasher_threads,
     );
     defer event_loop.deinit();
 

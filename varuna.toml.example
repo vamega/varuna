@@ -1,0 +1,31 @@
+# Varuna configuration
+# Copy to varuna.toml, ~/.config/varuna/config.toml, or /etc/varuna/config.toml
+
+[storage]
+# Path to SQLite database for resume state (persistent piece tracking).
+# Enables fast restart without full disk recheck.
+# resume_db = "~/.varuna/resume.db"
+
+# Default directory for downloaded data.
+# data_dir = "~/Downloads"
+
+[network]
+# Listen port for incoming peer connections.
+port = 6881
+
+# Maximum number of simultaneous peer connections.
+max_peers = 50
+
+# TCP connect timeout in seconds.
+connect_timeout_secs = 10
+
+[performance]
+# Number of threads in the SHA-1 piece verification threadpool.
+# Higher values help when downloading from many fast peers.
+hasher_threads = 4
+
+# Number of block requests to pipeline per peer.
+pipeline_depth = 5
+
+# io_uring submission queue size (must be power of two).
+ring_entries = 256

@@ -10,10 +10,19 @@ pub fn build(b: *std.Build) void {
         "SQLite linking strategy: 'system' links libsqlite3, 'bundled' compiles the amalgamation from vendor/sqlite/",
     ) orelse .system;
 
+    const toml_dep = b.dependency("toml", .{
+        .target = target,
+        .optimize = optimize,
+    });
+    const toml_mod = toml_dep.module("toml");
+
     const varuna_mod = b.addModule("varuna", .{
         .root_source_file = b.path("src/root.zig"),
         .target = target,
         .link_libc = true,
+        .imports = &.{
+            .{ .name = "toml", .module = toml_mod },
+        },
     });
 
     switch (sqlite_mode) {

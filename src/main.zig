@@ -13,6 +13,7 @@ pub fn main() !void {
     var stdout_writer = std.fs.File.stdout().writer(&stdout_buffer);
     const stdout = &stdout_writer.interface;
 
-    try varuna.app.run(allocator, args, stdout);
+    const cfg = varuna.config.loadDefault(allocator);
+    try varuna.app.run(allocator, args, stdout, cfg);
     try stdout.flush();
 }

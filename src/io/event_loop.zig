@@ -115,11 +115,12 @@ pub const EventLoop = struct {
         piece_tracker: *PieceTracker,
         shared_fds: []const posix.fd_t,
         peer_id: [20]u8,
+        hasher_threads: u32,
     ) !EventLoop {
         const peers = try allocator.alloc(Peer, max_peers);
         @memset(peers, Peer{});
 
-        const hasher = Hasher.init(allocator, null) catch null;
+        const hasher = Hasher.init(allocator, hasher_threads) catch null;
 
         return .{
             .ring = try linux.IoUring.init(256, 0),

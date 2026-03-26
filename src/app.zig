@@ -1,6 +1,7 @@
 const std = @import("std");
 const runtime = @import("runtime/root.zig");
 const torrent = @import("torrent/root.zig");
+const Config = @import("config.zig").Config;
 
 pub fn writeStartupBanner(writer: *std.Io.Writer) !void {
     try writer.print("varuna bootstrap\n", .{});
@@ -33,6 +34,7 @@ pub fn run(
     allocator: std.mem.Allocator,
     args: []const []const u8,
     writer: *std.Io.Writer,
+    cfg: Config,
 ) !void {
     if (args.len <= 1) {
         try writeStartupBanner(writer);
@@ -41,13 +43,13 @@ pub fn run(
     }
 
     if (std.mem.eql(u8, args[1], "download")) {
-        const options = try parseTransferOptions(args[2..]);
-        try runDownload(allocator, options, writer);
+        const options = try parseTransferOptions(args[2..], cfg);
+        try runDownload(allocator, options, writer, cfg);
         return;
     }
 
     if (std.mem.eql(u8, args[1], "seed")) {
-        const options = try parseTransferOptions(args[2..]);
+        const options = try parseTransferOptions(args[2..], cfg);
         try runSeed(allocator, options, writer);
         return;
     }
@@ -88,11 +90,10 @@ const TransferOptions = struct {
     torrent_path: []const u8,
     target_root: []const u8,
     port: u16 = 6881,
-    max_peers: u32 = 5,
-    resume_db: ?[]const u8 = null,
+    max_peers: u32 = 50,
 };
 
-fn parseTransferOptions(args: []const []const u8) !TransferOptions {
+fn parseTransferOptions(args: []const []const u8, cfg: Config) !TransferOptions {
     if (args.len < 2) {
         return error.InvalidArguments;
     }
@@ -100,6 +101,8 @@ fn parseTransferOptions(args: []const []const u8) !TransferOptions {
     var options = TransferOptions{
         .torrent_path = args[0],
         .target_root = args[1],
+        .port = cfg.network.port,
+        .max_peers = cfg.network.max_peers,
     };
 
     var index: usize = 2;
@@ -111,16 +114,6 @@ fn parseTransferOptions(args: []const []const u8) !TransferOptions {
                 return error.InvalidArguments;
             }
             options.port = try parsePort(args[index]);
-            index += 1;
-            continue;
-        }
-
-        if (std.mem.eql(u8, arg, "--resume-db")) {
-            index += 1;
-            if (index >= args.len) {
-                return error.InvalidArguments;
-            }
-            options.resume_db = args[index];
             index += 1;
             continue;
         }
@@ -156,12 +149,13 @@ fn runDownload(
     allocator: std.mem.Allocator,
     options: TransferOptions,
     writer: *std.Io.Writer,
+    cfg: Config,
 ) !void {
     const torrent_bytes = try std.fs.cwd().readFileAlloc(allocator, options.torrent_path, 16 * 1024 * 1024);
     defer allocator.free(torrent_bytes);
 
     const peer_id = torrent.peer_id.generate();
-    const resume_db_z: ?[*:0]const u8 = if (options.resume_db) |path| blk: {
+    const resume_db_z: ?[*:0]const u8 = if (cfg.storage.resume_db) |path| blk: {
         break :blk (try allocator.dupeZ(u8, path)).ptr;
     } else null;
     defer if (resume_db_z) |z| allocator.free(std.mem.span(z));
@@ -171,6 +165,7 @@ fn runDownload(
         .port = options.port,
         .max_peers = options.max_peers,
         .resume_db_path = resume_db_z,
+        .hasher_threads = cfg.performance.hasher_threads,
         .status_writer = writer,
     });
     const info_hash_hex = std.fmt.bytesToHex(result.info_hash, .lower);
@@ -337,7 +332,9 @@ fn writeUsage(writer: *std.Io.Writer) !void {
             "  varuna create <file> <announce-url> [output.torrent]\n" ++
             "  varuna inspect <torrent-file>\n" ++
             "  varuna verify <torrent-file> <target-root>\n" ++
-            "  varuna banner\n",
+            "  varuna banner\n" ++
+            "\n" ++
+            "config: varuna.toml, ~/.config/varuna/config.toml, or /etc/varuna/config.toml\n",
     );
 }
 
@@ -357,7 +354,7 @@ test "usage shows download command" {
     defer output.deinit(std.testing.allocator);
 
     var writer = output.writer(std.testing.allocator);
-    try run(std.testing.allocator, &.{"varuna"}, &writer.interface);
+    try run(std.testing.allocator, &.{"varuna"}, &writer.interface, Config{});
 
     try std.testing.expect(std.mem.indexOf(u8, output.items, "varuna download") != null);
     try std.testing.expect(std.mem.indexOf(u8, output.items, "varuna seed") != null);
@@ -365,7 +362,7 @@ test "usage shows download command" {
 }
 
 test "parse transfer options accepts explicit port" {
-    const options = try parseTransferOptions(&.{ "fixture.torrent", "/tmp/download", "--port", "6882" });
+    const options = try parseTransferOptions(&.{ "fixture.torrent", "/tmp/download", "--port", "6882" }, Config{});
 
     try std.testing.expectEqualStrings("fixture.torrent", options.torrent_path);
     try std.testing.expectEqualStrings("/tmp/download", options.target_root);
