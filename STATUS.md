@@ -24,6 +24,10 @@ Update it whenever a milestone lands, the near-term backlog changes, or a new op
 - Block request pipelining (depth 5) reduces per-block RTT overhead.
 - Benchmark suite covers kernel parsing, bencode parsing, SHA-1 hashing, and metainfo parsing.
 - Multi-peer download: thread-per-peer workers with PieceTracker coordination, `--max-peers` option (default 5).
+- Rarest-first piece selection: PieceTracker tracks per-piece availability counts from have/bitfield messages.
+- Connection timeout: 10-second default via io_uring linked timeout (IOSQE_IO_LINK + LINK_TIMEOUT).
+- Tracker re-announce: periodic re-announce on tracker interval to discover new peers; address deduplication.
+- Performance baselines (ReleaseFast): SHA-1 1,096 MB/s, bencode 32 MB/s, metainfo 37 MB/s.
 - io_uring is the I/O path for all hot-path file and network operations:
   - `src/io/ring.zig` wraps `std.os.linux.IoUring` with blocking convenience methods.
   - `PieceStore` read/write/sync routes through `Ring.pread_all`/`pwrite_all`/`fsync`.
@@ -59,8 +63,8 @@ Update it whenever a milestone lands, the near-term backlog changes, or a new op
 
 ## Last Verified Milestone
 
-- `torrent: add seeding and local swarm demo` (`2497989`)
+- `torrent: add tracker re-announce and peer deduplication` (`65035d5`)
 - Verified with:
-  - `mise exec -- zig build test`
-  - `mise exec -- zig build`
-  - `./scripts/demo_swarm.sh`
+  - `mise exec -- zig build test` (all tests pass including multi-peer download)
+  - `mise exec -- zig build` (clean build)
+  - `mise exec -- zig build bench -Doptimize=ReleaseFast` (baseline metrics)
