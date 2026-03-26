@@ -29,6 +29,7 @@ pub const Response = struct {
     peers: []Peer,
     complete: ?u32 = null,
     incomplete: ?u32 = null,
+    warning_message: ?[]const u8 = null,
 };
 
 pub fn fetch(
@@ -93,14 +94,28 @@ fn parseResponse(allocator: std.mem.Allocator, input: []const u8) !Response {
         return error.TrackerFailure;
     }
 
-    const peers = try parsePeers(allocator, try getRequired(dict, "peers"));
+    var peers = try parsePeers(allocator, try getRequired(dict, "peers"));
     errdefer allocator.free(peers);
+
+    // Merge IPv6 compact peers (BEP 7) if present
+    if (bencode.dictGet(dict, "peers6")) |peers6_value| {
+        const peers6 = try parseCompactPeers6(allocator, try expectBytes(peers6_value));
+        defer allocator.free(peers6);
+        if (peers6.len > 0) {
+            const merged = try allocator.alloc(Peer, peers.len + peers6.len);
+            @memcpy(merged[0..peers.len], peers);
+            @memcpy(merged[peers.len..], peers6);
+            allocator.free(peers);
+            peers = merged;
+        }
+    }
 
     return .{
         .interval = if (bencode.dictGet(dict, "interval")) |value| try expectPositiveU32(value) else 1800,
         .peers = peers,
         .complete = if (bencode.dictGet(dict, "complete")) |value| try expectPositiveU32(value) else null,
         .incomplete = if (bencode.dictGet(dict, "incomplete")) |value| try expectPositiveU32(value) else null,
+        .warning_message = if (bencode.dictGet(dict, "warning message")) |v| try expectBytes(v) else null,
     };
 }
 
@@ -110,6 +125,26 @@ fn parsePeers(allocator: std.mem.Allocator, value: bencode.Value) ![]Peer {
         .list => |list| parsePeerList(allocator, list),
         else => error.InvalidPeersField,
     };
+}
+
+fn parseCompactPeers6(allocator: std.mem.Allocator, bytes: []const u8) ![]Peer {
+    if (bytes.len % 18 != 0) {
+        return error.InvalidPeersField;
+    }
+
+    const count = bytes.len / 18;
+    const peers = try allocator.alloc(Peer, count);
+    errdefer allocator.free(peers);
+
+    for (peers, 0..) |*peer, index| {
+        const chunk = bytes[index * 18 ..][0..18];
+        const port = std.mem.readInt(u16, chunk[16..18], .big);
+        peer.* = .{
+            .address = std.net.Address.initIp6(chunk[0..16].*, port, 0, 0),
+        };
+    }
+
+    return peers;
 }
 
 fn parseCompactPeers(allocator: std.mem.Allocator, bytes: []const u8) ![]Peer {
