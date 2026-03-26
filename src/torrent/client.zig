@@ -269,20 +269,32 @@ pub fn download(
         return error.NoReachablePeers;
     }
 
-    // Re-announce loop: wait for workers, periodically re-announce for more peers
+    // Progress + re-announce loop
+    var last_announce = std.time.milliTimestamp();
+    var last_reported_count: u32 = piece_tracker.completedCount();
+
     while (!piece_tracker.isComplete()) {
-        // Sleep for re-announce interval (or shorter to check completion)
-        const sleep_secs: u64 = @min(announce_interval, 30);
-        const sleep_ns: u64 = sleep_secs * std.time.ns_per_s;
-        std.Thread.sleep(sleep_ns);
+        std.Thread.sleep(2 * std.time.ns_per_s);
 
         if (piece_tracker.isComplete()) break;
 
-        // If all workers have finished and tracker is incomplete, we need more peers
-        // (checked implicitly by the re-announce below)
+        // Report progress if pieces changed
+        const current_count = piece_tracker.completedCount();
+        if (current_count != last_reported_count) {
+            const pct = (current_count * 100) / session.pieceCount();
+            try logStatus(
+                options.status_writer,
+                "progress: {}/{} pieces ({}%), peers={}\n",
+                .{ current_count, session.pieceCount(), pct, known_peers.items.len },
+            );
+            last_reported_count = current_count;
+        }
 
-        // Re-announce to discover new peers
-        if (known_peers.items.len < options.max_peers) {
+        // Re-announce on interval
+        const now = std.time.milliTimestamp();
+        const elapsed_ms = now - last_announce;
+        if (elapsed_ms >= @as(i64, announce_interval) * 1000 and known_peers.items.len < options.max_peers) {
+            last_announce = now;
             const re_response = tracker.announce.fetch(allocator, &http_client, .{
                 .announce_url = announce_url,
                 .info_hash = session.metainfo.info_hash,
