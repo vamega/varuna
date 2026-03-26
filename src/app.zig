@@ -68,6 +68,14 @@ pub fn run(
         return;
     }
 
+    if (std.mem.eql(u8, args[1], "create")) {
+        if (args.len < 4) {
+            return error.InvalidArguments;
+        }
+        try runCreate(allocator, args[2], args[3], if (args.len > 4) args[4] else null, writer);
+        return;
+    }
+
     if (std.mem.eql(u8, args[1], "banner")) {
         try writeStartupBanner(writer);
         return;
@@ -213,6 +221,37 @@ fn runInspect(
     try writer.flush();
 }
 
+fn runCreate(
+    allocator: std.mem.Allocator,
+    file_path: []const u8,
+    announce_url: []const u8,
+    output_path: ?[]const u8,
+    writer: *std.Io.Writer,
+) !void {
+    const torrent_bytes = try torrent.create.createSingleFile(allocator, file_path, .{
+        .announce_url = announce_url,
+    });
+    defer allocator.free(torrent_bytes);
+
+    const dest = output_path orelse blk: {
+        var buf = std.ArrayList(u8).empty;
+        defer buf.deinit(allocator);
+        try buf.appendSlice(allocator, std.fs.path.basename(file_path));
+        try buf.appendSlice(allocator, ".torrent");
+        const owned = try buf.toOwnedSlice(allocator);
+        break :blk owned;
+    };
+    const should_free_dest = output_path == null;
+    defer if (should_free_dest) allocator.free(dest);
+
+    try std.fs.cwd().writeFile(.{ .sub_path = dest, .data = torrent_bytes });
+
+    const info_hash = try torrent.info_hash.compute(torrent_bytes);
+    const hex = std.fmt.bytesToHex(info_hash, .lower);
+    try writer.print("created {s} ({} bytes), info_hash={s}\n", .{ dest, torrent_bytes.len, hex[0..] });
+    try writer.flush();
+}
+
 fn runVerify(
     allocator: std.mem.Allocator,
     torrent_path: []const u8,
@@ -255,6 +294,7 @@ fn writeUsage(writer: *std.Io.Writer) !void {
         "usage:\n" ++
             "  varuna download <torrent-file> <target-root> [--port <port>] [--max-peers <n>]\n" ++
             "  varuna seed <torrent-file> <target-root> [--port <port>] [--max-peers <n>]\n" ++
+            "  varuna create <file> <announce-url> [output.torrent]\n" ++
             "  varuna inspect <torrent-file>\n" ++
             "  varuna verify <torrent-file> <target-root>\n" ++
             "  varuna banner\n",
