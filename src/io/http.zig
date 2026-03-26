@@ -171,10 +171,7 @@ fn resolveDns(allocator: std.mem.Allocator, host: []const u8, port: u16) !std.ne
 }
 
 fn dnsWorker(host: [:0]const u8, port: u16, result: *DnsResult) void {
-    const list = std.net.getAddressList(.{}, .{
-        .name = host,
-        .port = port,
-    }) catch |err| {
+    const list = std.net.getAddressList(std.heap.page_allocator, host, port) catch |err| {
         result.err = err;
         result.done.set();
         return;

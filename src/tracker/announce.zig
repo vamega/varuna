@@ -54,6 +54,27 @@ pub fn fetch(
     return parseResponse(allocator, body.writer.buffer[0..body.writer.end]);
 }
 
+/// Fetch tracker announce using our io_uring-based HTTP client.
+/// This replaces the std.http.Client path -- all I/O goes through io_uring.
+pub fn fetchViaRing(
+    allocator: std.mem.Allocator,
+    ring: *@import("../io/ring.zig").Ring,
+    request: Request,
+) !Response {
+    const url = try buildUrl(allocator, request);
+    defer allocator.free(url);
+
+    var http_client = @import("../io/http.zig").HttpClient.init(allocator, ring);
+    var http_response = try http_client.get(url);
+    defer http_response.deinit();
+
+    if (http_response.status != 200) {
+        return error.UnexpectedTrackerStatus;
+    }
+
+    return parseResponse(allocator, http_response.body);
+}
+
 pub fn freeResponse(allocator: std.mem.Allocator, response: Response) void {
     allocator.free(response.peers);
 }

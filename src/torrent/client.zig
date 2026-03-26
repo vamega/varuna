@@ -72,11 +72,8 @@ pub fn seed(
 
     try logStatus(options.status_writer, "listening for peers on port {}\n", .{options.port});
 
-    var http_client = std.http.Client{ .allocator = allocator };
-    defer http_client.deinit();
-
     const announce_url = session.metainfo.announce orelse return error.MissingAnnounceUrl;
-    const announce_response = try tracker.announce.fetch(allocator, &http_client, .{
+    const announce_response = try tracker.announce.fetchViaRing(allocator, &ring, .{
         .announce_url = announce_url,
         .info_hash = session.metainfo.info_hash,
         .peer_id = options.peer_id,
@@ -137,7 +134,7 @@ pub fn seed(
         total_seeded += worker.bytes_seeded;
     }
 
-    sendTrackerEvent(allocator, &http_client, announce_url, &session, options, .stopped, 0);
+    sendTrackerEvent(allocator, &ring, announce_url, &session, options, .stopped, 0);
     try logStatus(options.status_writer, "seed complete: {s}\n", .{session.metainfo.name});
 
     return .{
@@ -186,9 +183,6 @@ pub fn download(
         };
     }
 
-    var http_client = std.http.Client{ .allocator = allocator };
-    defer http_client.deinit();
-
     // Build tracker URL list: primary announce URL + announce-list URLs
     var tracker_urls = std.ArrayList([]const u8).empty;
     defer tracker_urls.deinit(allocator);
@@ -196,7 +190,6 @@ pub fn download(
         try tracker_urls.append(allocator, url);
     }
     for (session.metainfo.announce_list) |url| {
-        // Deduplicate against primary announce
         var already_added = false;
         for (tracker_urls.items) |existing| {
             if (std.mem.eql(u8, existing, url)) {
@@ -208,11 +201,11 @@ pub fn download(
     }
     if (tracker_urls.items.len == 0) return error.MissingAnnounceUrl;
 
-    // Try each tracker until one returns peers
+    // Try each tracker until one returns peers (using io_uring HTTP client)
     var announce_url: []const u8 = tracker_urls.items[0];
     var announce_response: ?tracker.announce.Response = null;
     for (tracker_urls.items) |url| {
-        const response = tracker.announce.fetch(allocator, &http_client, .{
+        const resp = tracker.announce.fetchViaRing(allocator, &ring, .{
             .announce_url = url,
             .info_hash = session.metainfo.info_hash,
             .peer_id = options.peer_id,
@@ -220,12 +213,12 @@ pub fn download(
             .left = bytes_left,
         }) catch continue;
 
-        if (response.peers.len > 0) {
+        if (resp.peers.len > 0) {
             announce_url = url;
-            announce_response = response;
+            announce_response = resp;
             break;
         }
-        tracker.announce.freeResponse(allocator, response);
+        tracker.announce.freeResponse(allocator, resp);
     }
 
     const response = announce_response orelse return error.NoPeersAvailable;
@@ -275,7 +268,7 @@ pub fn download(
     );
 
     if (threads.items.len == 0) {
-        sendTrackerEvent(allocator, &http_client, announce_url, &session, options, .stopped, 0);
+        sendTrackerEvent(allocator, &ring, announce_url, &session, options, .stopped, 0);
         return error.NoReachablePeers;
     }
 
@@ -306,7 +299,7 @@ pub fn download(
         const elapsed_ms = now - last_announce;
         if (elapsed_ms >= @as(i64, announce_interval) * 1000 and known_peers.items.len < options.max_peers) {
             last_announce = now;
-            const re_response = tracker.announce.fetch(allocator, &http_client, .{
+            const re_response = tracker.announce.fetchViaRing(allocator, &ring, .{
                 .announce_url = announce_url,
                 .info_hash = session.metainfo.info_hash,
                 .peer_id = options.peer_id,
@@ -345,7 +338,7 @@ pub fn download(
     store.sync() catch {};
 
     if (piece_tracker.isComplete()) {
-        sendTrackerEvent(allocator, &http_client, announce_url, &session, options, .completed, total_downloaded);
+        sendTrackerEvent(allocator, &ring, announce_url, &session, options, .completed, total_downloaded);
         try logStatus(options.status_writer, "complete: {s}\n", .{session.metainfo.name});
         return .{
             .info_hash = session.metainfo.info_hash,
@@ -357,7 +350,7 @@ pub fn download(
         };
     }
 
-    sendTrackerEvent(allocator, &http_client, announce_url, &session, options, .stopped, 0);
+    sendTrackerEvent(allocator, &ring, announce_url, &session, options, .stopped, 0);
     return error.NoReachablePeers;
 }
 
@@ -409,7 +402,7 @@ fn spawnWorkersForPeers(
 
 fn sendTrackerEvent(
     allocator: std.mem.Allocator,
-    http_client: *std.http.Client,
+    ring: *Ring,
     announce_url: []const u8,
     session: *const session_mod.Session,
     options: anytype,
@@ -417,7 +410,7 @@ fn sendTrackerEvent(
     downloaded: u64,
 ) void {
     const left: u64 = if (event == .completed) 0 else session.totalSize();
-    const response = tracker.announce.fetch(allocator, http_client, .{
+    const response = tracker.announce.fetchViaRing(allocator, ring, .{
         .announce_url = announce_url,
         .info_hash = session.metainfo.info_hash,
         .peer_id = options.peer_id,
