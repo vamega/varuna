@@ -34,6 +34,11 @@ Update it whenever a milestone lands, the near-term backlog changes, or a new op
 - Worker error resilience: hash mismatch releases piece back to pool instead of killing the worker.
 - fdatasync instead of fsync for faster piece persistence (skips metadata flush).
 - fallocate for file pre-allocation via io_uring (avoids fragmentation, catches disk-full early).
+- `have` message broadcast after piece completion in download workers.
+- `varuna verify` command for integrity checking without starting a transfer.
+- `varuna create` command for native .torrent file creation (single-file).
+- Bencode encoder with parse-encode roundtrip verification.
+- Dead single-peer code removed from client.zig (-330 lines).
 - io_uring is the I/O path for all hot-path file and network operations:
   - `src/io/ring.zig` wraps `std.os.linux.IoUring` with blocking convenience methods.
   - `PieceStore` read/write/sync routes through `Ring.pread_all`/`pwrite_all`/`fsync`.
@@ -69,8 +74,8 @@ Update it whenever a milestone lands, the near-term backlog changes, or a new op
 
 ## Last Verified Milestone
 
-- `torrent: add tracker re-announce and peer deduplication` (`65035d5`)
+- `torrent: add native .torrent file creation` (`51b19a2`)
 - Verified with:
-  - `mise exec -- zig build test` (all tests pass including multi-peer download)
+  - `mise exec -- zig build test` (all tests pass including multi-peer download/seed)
   - `mise exec -- zig build` (clean build)
   - `mise exec -- zig build bench -Doptimize=ReleaseFast` (baseline metrics)
