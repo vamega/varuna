@@ -52,7 +52,12 @@ Update it whenever a milestone lands, the near-term backlog changes, or a new op
 - SQLite resume state (`src/storage/resume.zig`): persists completed pieces to SQLite (WAL mode, prepared statements). Integrated into download flow with periodic flush.
 - Bundled SQLite build option: `-Dsqlite=bundled` compiles amalgamation for self-contained binary, `-Dsqlite=system` (default) links libsqlite3.
 - **Event loop replaces thread-per-peer**: `client.download()` now uses single-threaded io_uring `EventLoop` for all peer I/O. Scales to thousands of peers on one thread.
-- Resume fast path: on startup with `--resume-db`, loads known-complete pieces from SQLite and skips SHA-1 rehashing them. Only unknown pieces are verified.
+- Resume fast path: loads known-complete pieces from SQLite config `resume_db` and skips SHA-1 rehashing them.
+- TOML config file (`varuna.toml`): configurable port, max_peers, hasher_threads, pipeline_depth, resume_db path.
+- **Seeding uses event loop**: thread-per-peer seed workers deleted. Accept + serve via io_uring event loop.
+- **peer_worker.zig and seed_worker.zig deleted**: all I/O through single-threaded event loop.
+- SHA-1 verification threadpool (configurable thread count via config).
+- Graceful SIGINT/SIGTERM shutdown: flushes resume DB, sends tracker stopped event, closes connections.
 - io_uring is the I/O path for all hot-path file and network operations:
   - `src/io/ring.zig` wraps `std.os.linux.IoUring` with blocking convenience methods.
   - `PieceStore` read/write/sync routes through `Ring.pread_all`/`pwrite_all`/`fsync`.
