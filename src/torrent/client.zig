@@ -52,7 +52,7 @@ pub fn seed(
     var store = try storage.writer.PieceStore.init(allocator, &session, &ring);
     defer store.deinit();
 
-    var recheck = try storage.verify.recheckExistingData(allocator, &session, &store);
+    var recheck = try storage.verify.recheckExistingData(allocator, &session, &store, null);
     defer recheck.deinit(allocator);
 
     const bytes_left = session.totalSize() - recheck.bytes_complete;
@@ -188,7 +188,7 @@ pub fn download(
 
     // Recheck with resume fast path (skips hashing known-complete pieces)
     const known_ptr: ?*const storage.verify.PieceSet = if (resume_pieces) |*rp| rp else null;
-    var recheck = try storage.verify.recheckWithKnownPieces(allocator, &session, &store, known_ptr);
+    var recheck = try storage.verify.recheckExistingData(allocator, &session, &store, known_ptr);
     defer recheck.deinit(allocator);
 
     // Persist recheck results to resume DB for next startup

@@ -311,7 +311,7 @@ fn runVerify(
     var store = try @import("storage/root.zig").writer.PieceStore.init(allocator, &session, &ring);
     defer store.deinit();
 
-    var recheck = try @import("storage/root.zig").verify.recheckExistingData(allocator, &session, &store);
+    var recheck = try @import("storage/root.zig").verify.recheckExistingData(allocator, &session, &store, null);
     defer recheck.deinit(allocator);
 
     const piece_count = session.pieceCount();

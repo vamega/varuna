@@ -58,18 +58,10 @@ pub fn verifyPieceBuffer(plan: PiecePlan, piece_data: []const u8) !bool {
     return std.mem.eql(u8, actual[0..], plan.expected_hash[0..]);
 }
 
+/// Recheck existing data on disk, optionally skipping known-complete pieces.
+/// Pass `known_complete` from resume state to avoid re-hashing verified pieces.
+/// Pass `null` to force a full recheck (e.g. `varuna verify`).
 pub fn recheckExistingData(
-    allocator: std.mem.Allocator,
-    session: *const torrent.session.Session,
-    store: *writer.PieceStore,
-) !RecheckState {
-    return recheckWithKnownPieces(allocator, session, store, null);
-}
-
-/// Recheck with an optional set of already-known-complete pieces.
-/// Pieces in `known_complete` are trusted and skipped (not re-hashed).
-/// This is the fast path when resume state is available.
-pub fn recheckWithKnownPieces(
     allocator: std.mem.Allocator,
     session: *const torrent.session.Session,
     store: *writer.PieceStore,
@@ -188,7 +180,7 @@ test "recheck existing on-disk pieces" {
     defer freePiecePlan(std.testing.allocator, piece0);
     try store.writePiece(piece0.spans, "spam");
 
-    var state = try recheckExistingData(std.testing.allocator, &session, &store);
+    var state = try recheckExistingData(std.testing.allocator, &session, &store, null);
     defer state.deinit(std.testing.allocator);
 
     try std.testing.expect(state.complete_pieces.has(0));
