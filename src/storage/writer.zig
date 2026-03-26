@@ -77,7 +77,7 @@ pub const PieceStore = struct {
 
     pub fn sync(self: *PieceStore) !void {
         for (self.files) |file| {
-            try self.ring.fsync(file.handle);
+            try self.ring.fdatasync(file.handle);
         }
     }
 };
