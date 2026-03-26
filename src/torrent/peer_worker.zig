@@ -77,12 +77,26 @@ pub const WorkerContext = struct {
         var peer_choking = true;
         const geometry = self.session.geometry();
 
+        // Upload state: serve requests from peer while downloading
+        var upload = UploadState{};
+        upload.piece_buffer = self.allocator.alloc(u8, self.session.layout.piece_length) catch null;
+        defer if (upload.piece_buffer) |buf| self.allocator.free(buf);
+
         while (!self.tracker.isComplete()) {
             // Wait for unchoke and bitfield before claiming
             while (peer_choking or !availability_known) {
                 const message = try peer_wire.readMessageAlloc(self.allocator, &ring, fd);
                 defer peer_wire.freeMessage(self.allocator, message);
-                applyPeerMessage(&availability, &availability_known, &peer_choking, self.tracker, message);
+                switch (message) {
+                    .interested => {
+                        if (!upload.unchoked) {
+                            peer_wire.writeUnchoke(&ring, fd) catch {};
+                            upload.unchoked = true;
+                        }
+                    },
+                    .request => |request| handleUploadRequest(self, &ring, fd, &store, &upload, request),
+                    else => applyPeerMessage(&availability, &availability_known, &peer_choking, self.tracker, message),
+                }
             }
 
             const peer_bf: ?*const Bitfield = if (availability_known) &availability else null;
@@ -90,7 +104,16 @@ pub const WorkerContext = struct {
                 // No pieces available from this peer, wait for have messages
                 const message = try peer_wire.readMessageAlloc(self.allocator, &ring, fd);
                 defer peer_wire.freeMessage(self.allocator, message);
-                applyPeerMessage(&availability, &availability_known, &peer_choking, self.tracker, message);
+                switch (message) {
+                    .interested => {
+                        if (!upload.unchoked) {
+                            peer_wire.writeUnchoke(&ring, fd) catch {};
+                            upload.unchoked = true;
+                        }
+                    },
+                    .request => |request| handleUploadRequest(self, &ring, fd, &store, &upload, request),
+                    else => applyPeerMessage(&availability, &availability_known, &peer_choking, self.tracker, message),
+                }
                 continue;
             };
 
@@ -219,26 +242,63 @@ pub const WorkerContext = struct {
     }
 };
 
+const UploadState = struct {
+    unchoked: bool = false,
+    piece_buffer: ?[]u8 = null,
+    cached_piece_index: ?u32 = null,
+    cached_piece_length: usize = 0,
+};
+
+fn handleUploadRequest(
+    self: *WorkerContext,
+    ring: *Ring,
+    fd: posix.fd_t,
+    store: *storage.writer.PieceStore,
+    upload: *UploadState,
+    request: peer_wire.Request,
+) void {
+    if (!upload.unchoked) return;
+    if (!self.tracker.isPieceComplete(request.piece_index)) return;
+
+    const buf = upload.piece_buffer orelse return;
+
+    // Cache piece data
+    if (upload.cached_piece_index == null or upload.cached_piece_index.? != request.piece_index) {
+        const plan = storage.verify.planPieceVerification(self.allocator, self.session, request.piece_index) catch return;
+        defer storage.verify.freePiecePlan(self.allocator, plan);
+        store.readPiece(plan.spans, buf[0..plan.piece_length]) catch return;
+        upload.cached_piece_index = request.piece_index;
+        upload.cached_piece_length = plan.piece_length;
+    }
+
+    const block_start: usize = @intCast(request.block_offset);
+    const block_end = block_start + @as(usize, @intCast(request.length));
+    if (block_end > upload.cached_piece_length) return;
+
+    peer_wire.writePiece(ring, fd, request.piece_index, request.block_offset, buf[block_start..block_end]) catch {};
+}
+
 fn applyPeerMessage(
     availability: *Bitfield,
     availability_known: *bool,
     peer_choking: *bool,
-    tracker: *PieceTracker,
+    tracker_ref: *PieceTracker,
     message: peer_wire.InboundMessage,
 ) void {
     switch (message) {
-        .keep_alive, .interested, .not_interested, .request, .cancel, .port, .piece => {},
+        .keep_alive, .not_interested, .request, .cancel, .port, .piece => {},
+        .interested => {},
         .choke => peer_choking.* = true,
         .unchoke => peer_choking.* = false,
         .have => |piece_index| {
             availability.set(piece_index) catch {};
             availability_known.* = true;
-            tracker.addAvailability(piece_index);
+            tracker_ref.addAvailability(piece_index);
         },
         .bitfield => |bitfield_data| {
             availability.importBitfield(bitfield_data);
             availability_known.* = true;
-            tracker.addBitfieldAvailability(bitfield_data);
+            tracker_ref.addBitfieldAvailability(bitfield_data);
         },
     }
 }
