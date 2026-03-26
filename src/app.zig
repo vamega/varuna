@@ -89,6 +89,7 @@ const TransferOptions = struct {
     target_root: []const u8,
     port: u16 = 6881,
     max_peers: u32 = 5,
+    resume_db: ?[]const u8 = null,
 };
 
 fn parseTransferOptions(args: []const []const u8) !TransferOptions {
@@ -110,6 +111,16 @@ fn parseTransferOptions(args: []const []const u8) !TransferOptions {
                 return error.InvalidArguments;
             }
             options.port = try parsePort(args[index]);
+            index += 1;
+            continue;
+        }
+
+        if (std.mem.eql(u8, arg, "--resume-db")) {
+            index += 1;
+            if (index >= args.len) {
+                return error.InvalidArguments;
+            }
+            options.resume_db = args[index];
             index += 1;
             continue;
         }
@@ -150,10 +161,16 @@ fn runDownload(
     defer allocator.free(torrent_bytes);
 
     const peer_id = torrent.peer_id.generate();
+    const resume_db_z: ?[*:0]const u8 = if (options.resume_db) |path| blk: {
+        break :blk (try allocator.dupeZ(u8, path)).ptr;
+    } else null;
+    defer if (resume_db_z) |z| allocator.free(std.mem.span(z));
+
     const result = try torrent.client.download(allocator, torrent_bytes, options.target_root, .{
         .peer_id = peer_id,
         .port = options.port,
         .max_peers = options.max_peers,
+        .resume_db_path = resume_db_z,
         .status_writer = writer,
     });
     const info_hash_hex = std.fmt.bytesToHex(result.info_hash, .lower);
