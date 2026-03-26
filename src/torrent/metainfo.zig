@@ -11,6 +11,7 @@ pub const Metainfo = struct {
     name: []const u8,
     piece_length: u32,
     pieces: []const u8,
+    private: bool,
     files: []File,
 
     pub const File = struct {
@@ -41,6 +42,10 @@ pub const Metainfo = struct {
 
     pub fn isMultiFile(self: Metainfo) bool {
         return self.files.len > 1;
+    }
+
+    pub fn isPrivate(self: Metainfo) bool {
+        return self.private;
     }
 };
 
@@ -78,6 +83,7 @@ pub fn parse(allocator: std.mem.Allocator, input: []const u8) !Metainfo {
         .name = name,
         .piece_length = piece_length,
         .pieces = pieces,
+        .private = if (bencode.dictGet(info, "private")) |v| (try expectPositiveU64(v)) == 1 else false,
         .files = files,
     };
 }

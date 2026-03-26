@@ -10,6 +10,8 @@ pub const Request = struct {
     downloaded: u64 = 0,
     left: u64,
     event: ?Event = .started,
+    key: ?[]const u8 = null,
+    numwant: ?u32 = null,
 
     pub const Event = enum {
         started,
@@ -71,6 +73,12 @@ fn buildUrl(allocator: std.mem.Allocator, request: Request) ![]u8 {
     try appendQueryInt(allocator, &url, "compact", 1);
     if (request.event) |event| {
         try appendQueryString(allocator, &url, "event", @tagName(event));
+    }
+    if (request.key) |key| {
+        try appendQueryString(allocator, &url, "key", key);
+    }
+    if (request.numwant) |numwant| {
+        try appendQueryInt(allocator, &url, "numwant", numwant);
     }
 
     return url.toOwnedSlice(allocator);
