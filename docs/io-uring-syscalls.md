@@ -31,8 +31,11 @@ This document tracks which syscalls varuna uses, which are routed through io_uri
 | ~~`socket()`~~ | ~~`transport.tcpConnect`~~ | ~~Moved to io_uring~~ | Done via `Ring.socket` |
 | `socket+bind+listen` | `client.zig` seed mode -- listen socket | Once at startup | Low value |
 | HTTP stack | `std.http.Client` in `announce.zig` | Tracker announce | See notes below |
-| `pwritev` | stdout logging | Infrequent status | Low value |
+| `pwritev` | stdout logging via `std.Io.Writer` | Infrequent status messages | Low value -- not hot path |
+| `openat+read+close` | `app.zig` -- `.torrent` file read | Once at startup | Low value |
+| `openat+write+close` | `app.zig` -- `.torrent` file creation | Once per `varuna create` | Low value |
 | `uname` | `probe.zig` -- kernel detection | Once at startup | No equivalent |
+| HTTP stack (multiple) | `announce.zig` via `std.http.Client` | A few times per session | Replace when ring-based HTTP client is built |
 
 ### Not yet implemented
 
