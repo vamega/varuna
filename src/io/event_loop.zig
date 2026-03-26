@@ -205,7 +205,12 @@ pub const EventLoop = struct {
     }
 
     pub fn run(self: *EventLoop) !void {
+        const signal = @import("signal.zig");
         while (self.running and !self.piece_tracker.isComplete()) {
+            if (signal.isShutdownRequested()) {
+                self.running = false;
+                break;
+            }
             try self.tick();
             if (self.peer_count == 0) break;
         }

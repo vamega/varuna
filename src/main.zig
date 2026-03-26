@@ -13,7 +13,15 @@ pub fn main() !void {
     var stdout_writer = std.fs.File.stdout().writer(&stdout_buffer);
     const stdout = &stdout_writer.interface;
 
+    varuna.io.signal.installHandlers();
+
     const cfg = varuna.config.loadDefault(allocator);
-    try varuna.app.run(allocator, args, stdout, cfg);
+    varuna.app.run(allocator, args, stdout, cfg) catch |err| {
+        if (varuna.io.signal.isShutdownRequested()) {
+            try stdout.print("\nshutdown requested, cleaning up...\n", .{});
+        } else {
+            return err;
+        }
+    };
     try stdout.flush();
 }

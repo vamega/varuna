@@ -119,9 +119,10 @@ pub fn seed(
 
     // Run event loop -- accept connections and serve piece requests.
     // Exit when all peers disconnect (after at least one connected).
+    const signal_seed = @import("../io/signal.zig");
     var had_peer = false;
     event_loop.submitTimeout(2 * std.time.ns_per_s) catch {};
-    while (event_loop.running) {
+    while (event_loop.running and !signal_seed.isShutdownRequested()) {
         event_loop.tick() catch break;
         if (event_loop.peer_count > 0) had_peer = true;
         if (had_peer and event_loop.peer_count == 0) break;
@@ -310,7 +311,8 @@ pub fn download(
     // Submit a timeout so the loop doesn't block forever without CQEs
     event_loop.submitTimeout(2 * std.time.ns_per_s) catch {};
 
-    while (!piece_tracker.isComplete() and event_loop.peer_count > 0) {
+    const signal = @import("../io/signal.zig");
+    while (!piece_tracker.isComplete() and event_loop.peer_count > 0 and !signal.isShutdownRequested()) {
         event_loop.tick() catch break;
 
         // Report progress
