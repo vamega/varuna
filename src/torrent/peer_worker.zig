@@ -195,14 +195,17 @@ pub const WorkerContext = struct {
             }
         }
 
+        // Check if another worker already completed this piece (endgame)
+        if (self.tracker.isPieceComplete(piece_index)) return 0;
+
         if (!try storage.verify.verifyPieceBuffer(plan, piece_buffer)) {
             return error.PieceHashMismatch;
         }
 
         try store.writePiece(plan.spans, piece_buffer);
-        self.tracker.completePiece(piece_index, plan.piece_length);
+        const is_new = self.tracker.completePiece(piece_index, plan.piece_length);
 
-        return plan.piece_length;
+        return if (is_new) plan.piece_length else 0;
     }
 };
 

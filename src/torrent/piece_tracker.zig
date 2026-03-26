@@ -89,25 +89,30 @@ pub const PieceTracker = struct {
 
     /// Claim an uncompleted, unassigned piece that the given peer has.
     /// Uses rarest-first selection: picks the eligible piece with the lowest
-    /// availability count. Falls back to sequential if no availability data.
+    /// availability count. In endgame mode (all remaining pieces are in-progress),
+    /// allows claiming pieces already assigned to other workers.
     pub fn claimPiece(self: *PieceTracker, peer_has: ?*const Bitfield) ?u32 {
         self.mutex.lock();
         defer self.mutex.unlock();
 
+        // First pass: find unassigned pieces (normal mode)
         var best_index: ?u32 = null;
         var best_availability: u16 = std.math.maxInt(u16);
+        var has_unassigned = false;
 
         var index: u32 = 0;
         while (index < self.piece_count) : (index += 1) {
             if (self.complete.has(index)) continue;
-            if (self.in_progress.has(index)) continue;
             if (peer_has) |bf| {
                 if (!bf.has(index)) continue;
             }
-            const avail = self.availability[index];
-            if (avail < best_availability) {
-                best_availability = avail;
-                best_index = index;
+            if (!self.in_progress.has(index)) {
+                has_unassigned = true;
+                const avail = self.availability[index];
+                if (avail < best_availability) {
+                    best_availability = avail;
+                    best_index = index;
+                }
             }
         }
 
@@ -115,17 +120,35 @@ pub const PieceTracker = struct {
             self.in_progress.set(idx) catch return null;
             return idx;
         }
+
+        // Endgame mode: all remaining pieces are in-progress.
+        // Allow duplicate claims so multiple workers race to finish.
+        if (!has_unassigned and self.complete.count < self.piece_count) {
+            index = 0;
+            while (index < self.piece_count) : (index += 1) {
+                if (self.complete.has(index)) continue;
+                if (peer_has) |bf| {
+                    if (!bf.has(index)) continue;
+                }
+                return index;
+            }
+        }
+
         return null;
     }
 
     /// Mark a piece as fully downloaded and verified.
-    pub fn completePiece(self: *PieceTracker, piece_index: u32, piece_length: u32) void {
+    /// Returns true if this was the first completion (not a duplicate from endgame).
+    pub fn completePiece(self: *PieceTracker, piece_index: u32, piece_length: u32) bool {
         self.mutex.lock();
         defer self.mutex.unlock();
 
+        if (self.complete.has(piece_index)) {
+            return false; // Duplicate completion from endgame mode
+        }
         self.complete.set(piece_index) catch {};
-        // in_progress bit doesn't need clearing since complete takes precedence in claimPiece
         self.bytes_complete += piece_length;
+        return true;
     }
 
     /// Release a claimed piece back to the pool (peer disconnected or failed).
@@ -134,6 +157,12 @@ pub const PieceTracker = struct {
         defer self.mutex.unlock();
 
         self.clearInProgress(piece_index);
+    }
+
+    pub fn isPieceComplete(self: *PieceTracker, piece_index: u32) bool {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        return self.complete.has(piece_index);
     }
 
     pub fn isComplete(self: *PieceTracker) bool {
@@ -283,4 +312,33 @@ test "addBitfieldAvailability updates counts" {
     try std.testing.expectEqual(@as(u16, 1), tracker.availability[2]);
     try std.testing.expectEqual(@as(u16, 0), tracker.availability[3]);
     try std.testing.expectEqual(@as(u16, 1), tracker.availability[4]);
+}
+
+test "endgame mode allows duplicate claims" {
+    var bf = try Bitfield.init(std.testing.allocator, 3);
+    defer bf.deinit(std.testing.allocator);
+
+    var tracker = try PieceTracker.init(std.testing.allocator, 3, 4, 12, &bf, 0);
+    defer tracker.deinit(std.testing.allocator);
+
+    // Complete pieces 0 and 1
+    _ = tracker.claimPiece(null); // claim 0
+    _ = tracker.completePiece(0, 4);
+    _ = tracker.claimPiece(null); // claim 1
+    _ = tracker.completePiece(1, 4);
+
+    // Claim piece 2 (last one)
+    const first_claim = tracker.claimPiece(null);
+    try std.testing.expectEqual(@as(?u32, 2), first_claim);
+
+    // All remaining pieces are in-progress -> endgame mode
+    // Second claim should also return piece 2
+    const endgame_claim = tracker.claimPiece(null);
+    try std.testing.expectEqual(@as(?u32, 2), endgame_claim);
+
+    // First completion wins
+    try std.testing.expect(tracker.completePiece(2, 4));
+    // Duplicate completion returns false
+    try std.testing.expect(!tracker.completePiece(2, 4));
+    try std.testing.expect(tracker.isComplete());
 }
