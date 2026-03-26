@@ -434,6 +434,12 @@ fn isSelfPeer(address: std.net.Address, own_port: u16) bool {
             const localhost = comptime std.mem.nativeToBig(u32, 0x7f000001);
             break :blk (ip == localhost) or (ip == 0);
         },
+        std.posix.AF.INET6 => blk: {
+            const ip = address.in6.sa.addr;
+            const loopback = [_]u8{ 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1 };
+            const unspecified = [_]u8{0} ** 16;
+            break :blk std.mem.eql(u8, &ip, &loopback) or std.mem.eql(u8, &ip, &unspecified);
+        },
         else => false,
     };
 }
