@@ -87,6 +87,19 @@ tracepoint:syscalls:sys_enter_sendto /comm == "varuna"/ { @sendto = count(); }
 '
 ```
 
+## Benchmark Baselines (ReleaseFast, 2026-03-25)
+
+Host: WSL2, kernel 6.6.87.2, x86_64
+
+| Benchmark | Per-iteration | Throughput | Notes |
+|-----------|--------------|------------|-------|
+| kernel_parser | <1ns | N/A | Compiler optimizes away in release |
+| bencode_parse | 79us | 32 MB/s | 200-entry dictionary |
+| sha1_256kb | 228us | 1,096 MB/s | Software SHA-1, LLVM auto-vectorized |
+| metainfo_parse | 36us | 37 MB/s | Full parse including info_hash |
+
+SHA-1 at 1.1 GB/s means piece verification is not a bottleneck for typical network speeds (<100 MB/s). Hardware SHA-NI would add ~2x but is not urgent.
+
 ## Interpretation Notes
 
 - A minimal-client build that still shows `read`, `write`, `connect`, `recvfrom`, or `sendto` is expected until the networking and storage paths are moved to `io_uring`.
