@@ -39,6 +39,10 @@ Update it whenever a milestone lands, the near-term backlog changes, or a new op
 - `varuna create` command for native .torrent file creation (single-file).
 - Bencode encoder with parse-encode roundtrip verification.
 - Dead single-peer code removed from client.zig (-330 lines).
+- Announce-list support (BEP 12): multiple tracker URLs with fallback.
+- Private tracker support: private flag parsing, key and numwant announce parameters.
+- `varuna create` command for native .torrent file creation from Zig.
+- Bencode encoder, comment field, improved inspect output.
 - io_uring is the I/O path for all hot-path file and network operations:
   - `src/io/ring.zig` wraps `std.os.linux.IoUring` with blocking convenience methods.
   - `PieceStore` read/write/sync routes through `Ring.pread_all`/`pwrite_all`/`fsync`.
