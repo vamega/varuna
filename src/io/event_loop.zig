@@ -50,11 +50,18 @@ pub fn decodeUserData(user_data: u64) OpData {
 
 // ── Peer ──────────────────────────────────────────────────
 
+pub const PeerMode = enum {
+    download, // we connected out -- we request pieces
+    seed, // peer connected to us -- we serve pieces
+};
+
 pub const PeerState = enum {
     free,
     connecting,
     handshake_send,
     handshake_recv,
+    inbound_handshake_recv, // seed mode: recv handshake first
+    inbound_handshake_send, // seed mode: then send handshake + bitfield
     active_recv_header,
     active_recv_body,
     disconnecting,
@@ -63,6 +70,7 @@ pub const PeerState = enum {
 pub const Peer = struct {
     fd: posix.fd_t = -1,
     state: PeerState = .free,
+    mode: PeerMode = .download,
     address: std.net.Address = undefined,
 
     // Recv state: small header buffer, then body on demand
@@ -77,6 +85,7 @@ pub const Peer = struct {
     // Peer wire state
     send_pending: bool = false,
     peer_choking: bool = true,
+    am_choking: bool = true,
     am_interested: bool = false,
     availability_known: bool = false,
     availability: ?Bitfield = null,
@@ -105,6 +114,12 @@ pub const EventLoop = struct {
     shared_fds: []const posix.fd_t,
     info_hash: [20]u8,
     peer_id: [20]u8,
+
+    // Accept socket for seeding (-1 if not seeding)
+    listen_fd: posix.fd_t = -1,
+
+    // Complete pieces bitfield (for seeding -- which pieces we can serve)
+    complete_pieces: ?*const Bitfield = null,
 
     // Background hasher for SHA verification (off event loop thread)
     hasher: ?Hasher = null,
@@ -166,6 +181,19 @@ pub const EventLoop = struct {
         return slot;
     }
 
+    /// Start accepting inbound connections for seeding.
+    pub fn startAccepting(self: *EventLoop, listen_fd: posix.fd_t, complete_pieces: *const Bitfield) !void {
+        self.listen_fd = listen_fd;
+        self.complete_pieces = complete_pieces;
+        try self.submitAccept();
+    }
+
+    fn submitAccept(self: *EventLoop) !void {
+        if (self.listen_fd < 0) return;
+        const ud = encodeUserData(.{ .slot = 0, .op_type = .accept, .context = 0 });
+        _ = try self.ring.accept(ud, self.listen_fd, null, null, posix.SOCK.CLOEXEC | posix.SOCK.NONBLOCK);
+    }
+
     pub fn removePeer(self: *EventLoop, slot: u16) void {
         const peer = &self.peers[slot];
         if (peer.current_piece) |piece_index| {
@@ -223,8 +251,42 @@ pub const EventLoop = struct {
             .peer_recv => self.handleRecv(op.slot, cqe),
             .peer_send => self.handleSend(op.slot, cqe),
             .disk_write => self.handleDiskWrite(op.slot, cqe),
-            .accept, .disk_read, .http_connect, .http_send, .http_recv, .timeout, .cancel => {},
+            .accept => self.handleAccept(cqe),
+            .disk_read, .http_connect, .http_send, .http_recv, .timeout, .cancel => {},
         }
+    }
+
+    fn handleAccept(self: *EventLoop, cqe: linux.io_uring_cqe) void {
+        if (cqe.res < 0) {
+            // Accept failed, try again
+            self.submitAccept() catch {};
+            return;
+        }
+        const new_fd: posix.fd_t = @intCast(cqe.res);
+
+        // Allocate a peer slot for the inbound connection
+        const slot = self.allocSlot() orelse {
+            posix.close(new_fd);
+            self.submitAccept() catch {};
+            return;
+        };
+
+        const peer = &self.peers[slot];
+        peer.* = Peer{
+            .fd = new_fd,
+            .state = .inbound_handshake_recv,
+            .mode = .seed,
+        };
+        peer.handshake_offset = 0;
+        self.peer_count += 1;
+
+        // Start receiving the peer's handshake
+        self.submitHandshakeRecv(slot) catch {
+            self.removePeer(slot);
+        };
+
+        // Re-submit accept for more connections
+        self.submitAccept() catch {};
     }
 
     fn handleConnect(self: *EventLoop, slot: u16, cqe: linux.io_uring_cqe) void {
@@ -266,6 +328,23 @@ pub const EventLoop = struct {
                 peer.state = .handshake_recv;
                 peer.handshake_offset = 0;
                 self.submitHandshakeRecv(slot) catch {
+                    self.removePeer(slot);
+                };
+            },
+            .inbound_handshake_send => {
+                // Handshake sent -- now send bitfield, unchoke, and go active
+                if (self.complete_pieces) |cp| {
+                    self.submitMessage(slot, 5, cp.bits) catch {
+                        self.removePeer(slot);
+                        return;
+                    };
+                }
+                // Unchoke the peer
+                peer.am_choking = false;
+                self.submitMessage(slot, 1, &.{}) catch {};
+                peer.state = .active_recv_header;
+                peer.header_offset = 0;
+                self.submitHeaderRecv(slot) catch {
                     self.removePeer(slot);
                 };
             },
@@ -313,6 +392,36 @@ pub const EventLoop = struct {
                 self.submitHeaderRecv(slot) catch {
                     self.removePeer(slot);
                 };
+            },
+            .inbound_handshake_recv => {
+                // Seed mode: we received the peer's handshake
+                peer.handshake_offset += n;
+                if (peer.handshake_offset < 68) {
+                    self.submitHandshakeRecv(slot) catch {
+                        self.removePeer(slot);
+                    };
+                    return;
+                }
+                // Validate info_hash
+                if (!std.mem.eql(u8, peer.handshake_buf[28..48], self.info_hash[0..])) {
+                    self.removePeer(slot);
+                    return;
+                }
+                // Send our handshake back
+                peer.state = .inbound_handshake_send;
+                var buf: [68]u8 = undefined;
+                buf[0] = pw.protocol_length;
+                @memcpy(buf[1 .. 1 + pw.protocol_string.len], pw.protocol_string);
+                @memset(buf[20..28], 0);
+                @memcpy(buf[28..48], self.info_hash[0..]);
+                @memcpy(buf[48..68], self.peer_id[0..]);
+                @memcpy(peer.handshake_buf[0..68], &buf);
+                const ud = encodeUserData(.{ .slot = slot, .op_type = .peer_send, .context = 0 });
+                _ = self.ring.send(ud, peer.fd, peer.handshake_buf[0..68], 0) catch {
+                    self.removePeer(slot);
+                    return;
+                };
+                peer.send_pending = true;
             },
             .active_recv_header => {
                 peer.header_offset += n;
@@ -406,7 +515,13 @@ pub const EventLoop = struct {
                 peer.pipeline_sent = peer.blocks_received;
             },
             1 => peer.peer_choking = false, // unchoke
-            2 => {}, // interested
+            2 => { // interested
+                if (peer.mode == .seed and peer.am_choking) {
+                    // Unchoke the peer
+                    self.submitMessage(slot, 1, &.{}) catch {};
+                    peer.am_choking = false;
+                }
+            },
             3 => {}, // not interested
             4 => { // have
                 if (payload.len >= 4) {
@@ -427,6 +542,11 @@ pub const EventLoop = struct {
                 }
                 peer.availability_known = true;
                 self.piece_tracker.addBitfieldAvailability(payload);
+            },
+            6 => { // request
+                if (peer.mode == .seed and !peer.am_choking and payload.len >= 12) {
+                    self.servePieceRequest(slot, payload);
+                }
             },
             7 => { // piece
                 if (payload.len >= 8) {
@@ -453,6 +573,59 @@ pub const EventLoop = struct {
             },
             else => {},
         }
+    }
+
+    // ── Piece upload (seed mode) ─────────────────────────
+
+    fn servePieceRequest(self: *EventLoop, slot: u16, payload: []const u8) void {
+        const piece_index = std.mem.readInt(u32, payload[0..4], .big);
+        const block_offset = std.mem.readInt(u32, payload[4..8], .big);
+        const block_length = std.mem.readInt(u32, payload[8..12], .big);
+
+        // Validate
+        const cp = self.complete_pieces orelse return;
+        if (!cp.has(piece_index)) return;
+        const piece_size = self.session.layout.pieceSize(piece_index) catch return;
+        if (block_offset + block_length > piece_size) return;
+
+        // Read piece data from disk
+        const plan = storage.verify.planPieceVerification(self.allocator, self.session, piece_index) catch return;
+        defer storage.verify.freePiecePlan(self.allocator, plan);
+
+        const read_buf = self.allocator.alloc(u8, piece_size) catch return;
+        defer self.allocator.free(read_buf);
+
+        // Blocking read from shared fds -- this is synchronous but short
+        // TODO: use io_uring pread for fully async disk read
+        for (plan.spans) |span| {
+            const block = read_buf[span.piece_offset .. span.piece_offset + span.length];
+            _ = posix.pread(self.shared_fds[span.file_index], block, span.file_offset) catch return;
+        }
+
+        // Build and send piece message: 4-byte len + id(7) + piece_index + block_offset + data
+        const msg_len: u32 = 1 + 8 + block_length;
+        var header: [13]u8 = undefined;
+        std.mem.writeInt(u32, header[0..4], msg_len, .big);
+        header[4] = 7; // piece message id
+        std.mem.writeInt(u32, header[5..9], piece_index, .big);
+        std.mem.writeInt(u32, header[9..13], block_offset, .big);
+
+        const peer = &self.peers[slot];
+        // Send header via io_uring
+        @memcpy(peer.handshake_buf[0..13], &header);
+        const ud = encodeUserData(.{ .slot = slot, .op_type = .peer_send, .context = 0 });
+        _ = self.ring.send(ud, peer.fd, peer.handshake_buf[0..13], 0) catch return;
+        peer.send_pending = true;
+
+        // Send block data -- allocate a buffer that outlives this function
+        const send_buf = self.allocator.alloc(u8, block_length) catch return;
+        @memcpy(send_buf, read_buf[@intCast(block_offset)..][0..block_length]);
+        const ud2 = encodeUserData(.{ .slot = slot, .op_type = .peer_send, .context = 1 }); // context=1 means free buffer
+        _ = self.ring.send(ud2, peer.fd, send_buf, 0) catch {
+            self.allocator.free(send_buf);
+            return;
+        };
+        // TODO: free send_buf when send completes (need to track allocated send buffers)
     }
 
     // ── Piece download coordination ───────────────────────

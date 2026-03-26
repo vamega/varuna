@@ -86,54 +86,46 @@ pub fn seed(
 
     try logStatus(options.status_writer, "seed announce accepted, peers={}\n", .{announce_response.peers.len});
 
-    const transport = @import("../net/transport.zig");
-    const seed_worker_mod = @import("seed_worker.zig");
-
+    const EventLoop = @import("../io/event_loop.zig").EventLoop;
     const shared_fds = try store.fileHandles(allocator);
     defer allocator.free(shared_fds);
 
-    var workers = std.ArrayList(seed_worker_mod.SeedWorkerContext).empty;
-    defer workers.deinit(allocator);
-    var threads = std.ArrayList(std.Thread).empty;
-    defer threads.deinit(allocator);
+    // Use a dummy PieceTracker (seeding doesn't track downloads)
+    const PieceTracker = @import("piece_tracker.zig").PieceTracker;
+    var piece_tracker = try PieceTracker.init(
+        allocator,
+        session.pieceCount(),
+        session.layout.piece_length,
+        session.totalSize(),
+        &recheck.complete_pieces,
+        recheck.bytes_complete,
+    );
+    defer piece_tracker.deinit(allocator);
 
-    // Accept loop: accept up to max_peers connections
-    var accepted: u32 = 0;
-    while (accepted < options.max_peers) {
-        const accept_result = transport.tcpAccept(&ring, server.stream.handle) catch break;
+    var event_loop = try EventLoop.init(
+        allocator,
+        &session,
+        &piece_tracker,
+        shared_fds,
+        options.peer_id,
+        4,
+    );
+    defer event_loop.deinit();
 
-        try logStatus(options.status_writer, "incoming peer: {f}\n", .{accept_result.address});
+    // Start accepting inbound connections
+    try event_loop.startAccepting(server.stream.handle, &recheck.complete_pieces);
 
-        const worker_index = workers.items.len;
-        try workers.append(allocator, .{
-            .allocator = allocator,
-            .session = &session,
-            .complete_pieces = &recheck.complete_pieces,
-            .shared_fds = shared_fds,
-            .fd = accept_result.fd,
-            .peer_id = options.peer_id,
-        });
+    try logStatus(options.status_writer, "accepting peers via event loop\n", .{});
 
-        const thread = std.Thread.spawn(
-            .{},
-            seed_worker_mod.SeedWorkerContext.run,
-            .{&workers.items[worker_index]},
-        ) catch {
-            std.posix.close(accept_result.fd);
-            continue;
-        };
-        try threads.append(allocator, thread);
-        accepted += 1;
-    }
-
-    // Join all seed workers
-    for (threads.items) |thread| {
-        thread.join();
-    }
-
-    var total_seeded: u64 = 0;
-    for (workers.items) |worker| {
-        total_seeded += worker.bytes_seeded;
+    // Run event loop -- accept connections and serve piece requests.
+    // Exit when all peers disconnect (after at least one connected).
+    var had_peer = false;
+    event_loop.submitTimeout(2 * std.time.ns_per_s) catch {};
+    while (event_loop.running) {
+        event_loop.tick() catch break;
+        if (event_loop.peer_count > 0) had_peer = true;
+        if (had_peer and event_loop.peer_count == 0) break;
+        event_loop.submitTimeout(2 * std.time.ns_per_s) catch {};
     }
 
     sendTrackerEvent(allocator, &ring, announce_url, &session, options, .stopped, 0);
@@ -142,7 +134,7 @@ pub fn seed(
     return .{
         .info_hash = session.metainfo.info_hash,
         .piece_count = session.pieceCount(),
-        .bytes_seeded = total_seeded,
+        .bytes_seeded = 0,
         .bytes_complete = recheck.bytes_complete,
         .peer = null,
     };
