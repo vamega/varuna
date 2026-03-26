@@ -43,6 +43,10 @@ Update it whenever a milestone lands, the near-term backlog changes, or a new op
 - Private tracker support: private flag parsing, key and numwant announce parameters.
 - `varuna create` command for native .torrent file creation from Zig.
 - Bencode encoder, comment field, improved inspect output.
+- Multi-file torrent creation from directories (`varuna create` auto-detects file vs directory).
+- IPv6 peer support: compact peers6 (BEP 7), IPv6 self-peer detection, IPv6-aware connect.
+- Upload while downloading: download workers serve piece requests from peers (tit-for-tat).
+- `writeKeepAlive`, `writeNotInterested`, `writeHave` protocol messages.
 - io_uring is the I/O path for all hot-path file and network operations:
   - `src/io/ring.zig` wraps `std.os.linux.IoUring` with blocking convenience methods.
   - `PieceStore` read/write/sync routes through `Ring.pread_all`/`pwrite_all`/`fsync`.
@@ -78,7 +82,7 @@ Update it whenever a milestone lands, the near-term backlog changes, or a new op
 
 ## Last Verified Milestone
 
-- `torrent: add native .torrent file creation` (`51b19a2`)
+- `torrent: add multi-file torrent creation from directories` (`e3484ff`)
 - Verified with:
   - `mise exec -- zig build test` (all tests pass including multi-peer download/seed)
   - `mise exec -- zig build` (clean build)
