@@ -7,4 +7,5 @@ pub const metainfo = @import("metainfo.zig");
 pub const peer_id = @import("peer_id.zig");
 pub const peer_worker = @import("peer_worker.zig");
 pub const piece_tracker = @import("piece_tracker.zig");
+pub const seed_worker = @import("seed_worker.zig");
 pub const session = @import("session.zig");

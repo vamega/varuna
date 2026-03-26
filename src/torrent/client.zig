@@ -43,6 +43,7 @@ pub const DownloadOptions = struct {
 pub const SeedOptions = struct {
     peer_id: [20]u8,
     port: u16 = 6881,
+    max_peers: u32 = 5,
     status_writer: ?*std.Io.Writer = null,
 };
 
@@ -115,20 +116,50 @@ pub fn seed(
     try logStatus(options.status_writer, "seed announce accepted, peers={}\n", .{announce_response.peers.len});
 
     const transport = @import("../net/transport.zig");
-    const accept_result = try transport.tcpAccept(&ring, server.stream.handle);
-    defer std.posix.close(accept_result.fd);
+    const seed_worker_mod = @import("seed_worker.zig");
 
-    try logStatus(options.status_writer, "incoming peer: {f}\n", .{accept_result.address});
+    var workers = std.ArrayList(seed_worker_mod.SeedWorkerContext).empty;
+    defer workers.deinit(allocator);
+    var threads = std.ArrayList(std.Thread).empty;
+    defer threads.deinit(allocator);
 
-    const bytes_seeded = try seedPeer(
-        allocator,
-        &session,
-        &store,
-        &recheck.complete_pieces,
-        &ring,
-        accept_result.fd,
-        options.peer_id,
-    );
+    // Accept loop: accept up to max_peers connections
+    var accepted: u32 = 0;
+    while (accepted < options.max_peers) {
+        const accept_result = transport.tcpAccept(&ring, server.stream.handle) catch break;
+
+        try logStatus(options.status_writer, "incoming peer: {f}\n", .{accept_result.address});
+
+        const worker_index = workers.items.len;
+        try workers.append(allocator, .{
+            .allocator = allocator,
+            .session = &session,
+            .complete_pieces = &recheck.complete_pieces,
+            .fd = accept_result.fd,
+            .peer_id = options.peer_id,
+        });
+
+        const thread = std.Thread.spawn(
+            .{},
+            seed_worker_mod.SeedWorkerContext.run,
+            .{&workers.items[worker_index]},
+        ) catch {
+            std.posix.close(accept_result.fd);
+            continue;
+        };
+        try threads.append(allocator, thread);
+        accepted += 1;
+    }
+
+    // Join all seed workers
+    for (threads.items) |thread| {
+        thread.join();
+    }
+
+    var total_seeded: u64 = 0;
+    for (workers.items) |worker| {
+        total_seeded += worker.bytes_seeded;
+    }
 
     sendTrackerEvent(allocator, &http_client, announce_url, &session, options, .stopped, 0);
     try logStatus(options.status_writer, "seed complete: {s}\n", .{session.metainfo.name});
@@ -136,9 +167,9 @@ pub fn seed(
     return .{
         .info_hash = session.metainfo.info_hash,
         .piece_count = session.pieceCount(),
-        .bytes_seeded = bytes_seeded,
+        .bytes_seeded = total_seeded,
         .bytes_complete = recheck.bytes_complete,
-        .peer = accept_result.address,
+        .peer = null,
     };
 }
 
@@ -844,6 +875,7 @@ const SeedThreadContext = struct {
         self.result = seed(std.heap.page_allocator, self.torrent_bytes, self.target_root, .{
             .peer_id = "SEEDER-PEER-ID-00001".*,
             .port = self.port,
+            .max_peers = 1,
         }) catch |err| {
             self.err = err;
             return;
