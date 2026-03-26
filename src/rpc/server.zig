@@ -193,7 +193,7 @@ pub const ApiServer = struct {
 
     // ── SQE helpers ───────────────────────────────────────
 
-    fn submitAccept(self: *ApiServer) !void {
+    pub fn submitAccept(self: *ApiServer) !void {
         const ud = encodeUd(0, OP_ACCEPT);
         _ = try self.ring.inner.accept(ud, self.listen_fd, null, null, posix.SOCK.CLOEXEC);
     }

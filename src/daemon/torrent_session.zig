@@ -120,7 +120,7 @@ pub const TorrentSession = struct {
         self.state = .stopped;
     }
 
-    pub fn getStats(self: *const TorrentSession) Stats {
+    pub fn getStats(self: *TorrentSession) Stats {
         const pieces_have = if (self.piece_tracker) |*pt| pt.completedCount() else 0;
         const progress = if (self.piece_count > 0)
             @as(f64, @floatFromInt(pieces_have)) / @as(f64, @floatFromInt(self.piece_count))
