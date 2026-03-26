@@ -169,21 +169,35 @@ pub const EventLoop = struct {
 
     pub fn run(self: *EventLoop) !void {
         while (self.running and !self.piece_tracker.isComplete()) {
-            // Try to assign pieces to idle peers
-            self.tryAssignPieces();
-
-            _ = try self.ring.submit_and_wait(1);
-
-            var cqes: [cqe_batch_size]linux.io_uring_cqe = undefined;
-            const count = try self.ring.copy_cqes(&cqes, 0);
-
-            for (cqes[0..count]) |cqe| {
-                self.dispatch(cqe);
-            }
-
-            // Check if all peers disconnected
+            try self.tick();
             if (self.peer_count == 0) break;
         }
+    }
+
+    /// Run one iteration of the event loop. Blocks until at least one
+    /// CQE is available. Returns the number of CQEs processed.
+    pub fn tick(self: *EventLoop) !void {
+        self.tryAssignPieces();
+
+        _ = try self.ring.submit_and_wait(1);
+
+        var cqes: [cqe_batch_size]linux.io_uring_cqe = undefined;
+        const count = try self.ring.copy_cqes(&cqes, 0);
+
+        for (cqes[0..count]) |cqe| {
+            self.dispatch(cqe);
+        }
+    }
+
+    /// Submit a timeout SQE so that submit_and_wait returns even if
+    /// no I/O completes. This allows the caller to do periodic work.
+    pub fn submitTimeout(self: *EventLoop, timeout_ns: u64) !void {
+        const ts = linux.kernel_timespec{
+            .sec = @intCast(timeout_ns / std.time.ns_per_s),
+            .nsec = @intCast(timeout_ns % std.time.ns_per_s),
+        };
+        const ud = encodeUserData(.{ .slot = 0, .op_type = .timeout, .context = 0 });
+        _ = try self.ring.timeout(ud, &ts, 0, 0);
     }
 
     pub fn stop(self: *EventLoop) void {
