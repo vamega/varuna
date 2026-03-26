@@ -2,6 +2,7 @@ pub const app = @import("app.zig");
 pub const bitfield = @import("bitfield.zig");
 pub const config = @import("config.zig");
 pub const io = @import("io/root.zig");
+pub const rpc = @import("rpc/root.zig");
 pub const net = @import("net/root.zig");
 pub const runtime = @import("runtime/root.zig");
 pub const storage = @import("storage/root.zig");
