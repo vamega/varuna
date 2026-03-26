@@ -63,6 +63,18 @@ pub fn recheckExistingData(
     session: *const torrent.session.Session,
     store: *writer.PieceStore,
 ) !RecheckState {
+    return recheckWithKnownPieces(allocator, session, store, null);
+}
+
+/// Recheck with an optional set of already-known-complete pieces.
+/// Pieces in `known_complete` are trusted and skipped (not re-hashed).
+/// This is the fast path when resume state is available.
+pub fn recheckWithKnownPieces(
+    allocator: std.mem.Allocator,
+    session: *const torrent.session.Session,
+    store: *writer.PieceStore,
+    known_complete: ?*const PieceSet,
+) !RecheckState {
     var complete_pieces = try PieceSet.init(allocator, session.pieceCount());
     errdefer complete_pieces.deinit(allocator);
 
@@ -70,13 +82,26 @@ pub fn recheckExistingData(
     defer allocator.free(scratch);
 
     var bytes_complete: u64 = 0;
+    var pieces_skipped: u32 = 0;
     var piece_index: u32 = 0;
     while (piece_index < session.pieceCount()) : (piece_index += 1) {
+        // Fast path: trust resume state for this piece
+        if (known_complete) |kc| {
+            if (kc.has(piece_index)) {
+                const plan = try planPieceVerification(allocator, session, piece_index);
+                defer freePiecePlan(allocator, plan);
+                try complete_pieces.set(piece_index);
+                bytes_complete += plan.piece_length;
+                pieces_skipped += 1;
+                continue;
+            }
+        }
+
         const plan = try planPieceVerification(allocator, session, piece_index);
         defer freePiecePlan(allocator, plan);
 
         const piece_data = scratch[0..plan.piece_length];
-        try store.readPiece(plan.spans, piece_data);
+        store.readPiece(plan.spans, piece_data) catch continue;
         if (try verifyPieceBuffer(plan, piece_data)) {
             try complete_pieces.set(piece_index);
             bytes_complete += plan.piece_length;

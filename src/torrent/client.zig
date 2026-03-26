@@ -166,26 +166,43 @@ pub fn download(
     var resume_writer: ?storage.resume_state.ResumeWriter = null;
     defer if (resume_writer) |*rw| rw.deinit(allocator);
 
-    var recheck = try storage.verify.recheckExistingData(allocator, &session, &store);
-    defer recheck.deinit(allocator);
+    var resume_pieces: ?storage.verify.PieceSet = null;
+    defer if (resume_pieces) |*rp| rp.deinit(allocator);
 
     if (options.resume_db_path) |db_path| {
         if (storage.resume_state.ResumeWriter.init(db_path, session.metainfo.info_hash)) |rw| {
             resume_writer = rw;
-            // Persist the recheck results for future fast startup
-            var completed_pieces = std.ArrayList(u32).empty;
-            defer completed_pieces.deinit(allocator);
-            var i: u32 = 0;
-            while (i < session.pieceCount()) : (i += 1) {
-                if (recheck.complete_pieces.has(i)) {
-                    completed_pieces.append(allocator, i) catch break;
+            // Load known-complete pieces from DB
+            var bf = storage.verify.PieceSet.init(allocator, session.pieceCount()) catch null;
+            if (bf) |*loaded_bf| {
+                const loaded_count = resume_writer.?.db.loadCompletePieces(session.metainfo.info_hash, loaded_bf) catch 0;
+                if (loaded_count > 0) {
+                    try logStatus(options.status_writer, "resume: loaded {} pieces from database\n", .{loaded_count});
+                    resume_pieces = loaded_bf.*;
+                } else {
+                    loaded_bf.deinit(allocator);
                 }
             }
-            if (completed_pieces.items.len > 0) {
-                resume_writer.?.db.markCompleteBatch(session.metainfo.info_hash, completed_pieces.items) catch {};
+        } else |_| {}
+    }
+
+    // Recheck with resume fast path (skips hashing known-complete pieces)
+    const known_ptr: ?*const storage.verify.PieceSet = if (resume_pieces) |*rp| rp else null;
+    var recheck = try storage.verify.recheckWithKnownPieces(allocator, &session, &store, known_ptr);
+    defer recheck.deinit(allocator);
+
+    // Persist recheck results to resume DB for next startup
+    if (resume_writer) |*rw| {
+        var completed_pieces = std.ArrayList(u32).empty;
+        defer completed_pieces.deinit(allocator);
+        var i: u32 = 0;
+        while (i < session.pieceCount()) : (i += 1) {
+            if (recheck.complete_pieces.has(i)) {
+                completed_pieces.append(allocator, i) catch break;
             }
-        } else |_| {
-            // Resume DB unavailable, continue without it
+        }
+        if (completed_pieces.items.len > 0) {
+            rw.db.markCompleteBatch(session.metainfo.info_hash, completed_pieces.items) catch {};
         }
     }
 
