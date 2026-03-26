@@ -105,6 +105,27 @@ pub const Ring = struct {
         try checkCqe(cqe);
     }
 
+    pub fn connect_timeout(self: *Ring, fd: posix.fd_t, addr: *const posix.sockaddr, addrlen: posix.socklen_t, timeout_secs: u32) !void {
+        const connect_sqe = try self.inner.connect(0, fd, addr, addrlen);
+        connect_sqe.flags |= linux.IOSQE_IO_LINK;
+
+        const ts = linux.kernel_timespec{ .sec = timeout_secs, .nsec = 0 };
+        _ = try self.inner.link_timeout(1, &ts, 0);
+
+        _ = try self.inner.submit();
+
+        // Collect both CQEs (connect + link_timeout)
+        const connect_cqe = try self.inner.copy_cqe();
+        const timeout_cqe = try self.inner.copy_cqe();
+
+        // Check which completed: if connect succeeded, timeout is cancelled (ECANCELED)
+        // If timeout fired, connect is cancelled (ECANCELED)
+        const connect_result = if (connect_cqe.user_data == 0) connect_cqe else timeout_cqe;
+        const e = connect_result.err();
+        if (e == .CANCELED) return error.ConnectionTimedOut;
+        if (e != .SUCCESS) return posix.unexpectedErrno(e);
+    }
+
     pub fn accept(self: *Ring, fd: posix.fd_t, addr: ?*posix.sockaddr, addrlen: ?*posix.socklen_t, flags: u32) !posix.fd_t {
         _ = try self.inner.accept(0, fd, addr, addrlen, flags);
         _ = try self.inner.submit();
