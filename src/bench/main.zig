@@ -120,6 +120,36 @@ fn benchMetainfoParse(stdout: *std.Io.Writer) !void {
     try printResult(stdout, "metainfo_parse", iterations, timer.read(), total_bytes, checksum);
 }
 
+fn benchBitfieldOps(stdout: *std.Io.Writer) !void {
+    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    const piece_count: u32 = 10_000;
+    var bf = try varuna.bitfield.Bitfield.init(allocator, piece_count);
+    defer bf.deinit(allocator);
+
+    const iterations: usize = 1_000;
+
+    var timer = try std.time.Timer.start();
+    var checksum: u64 = 0;
+    for (0..iterations) |iter| {
+        // Simulate scanning for a claimable piece (rarest-first inner loop)
+        var i: u32 = 0;
+        while (i < piece_count) : (i += 1) {
+            if (!bf.has(i)) {
+                checksum +%= i;
+                break;
+            }
+        }
+        // Set a piece to simulate progress
+        bf.set(@intCast(iter % piece_count)) catch {};
+    }
+
+    const total_ops: u64 = @as(u64, iterations) * piece_count;
+    try printResult(stdout, "bitfield_scan_10k", iterations, timer.read(), total_ops, checksum);
+}
+
 pub fn main() !void {
     var writer = std.fs.File.stdout().writer(&stdout_buffer);
     const stdout = &writer.interface;
@@ -128,4 +158,5 @@ pub fn main() !void {
     try benchBencodeParse(stdout);
     try benchSha1(stdout);
     try benchMetainfoParse(stdout);
+    try benchBitfieldOps(stdout);
 }
