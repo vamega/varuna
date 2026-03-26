@@ -214,6 +214,14 @@ fn runInspect(
     try writer.print("name={s}\n", .{metainfo.name});
     try writer.print("info_hash={s}\n", .{info_hash_hex[0..]});
     try writer.print("announce={s}\n", .{metainfo.announce orelse ""});
+    if (metainfo.announce_list.len > 0) {
+        for (metainfo.announce_list) |url| {
+            try writer.print("announce_url={s}\n", .{url});
+        }
+    }
+    if (metainfo.comment) |comment| {
+        try writer.print("comment={s}\n", .{comment});
+    }
     try writer.print("piece_length={}\n", .{metainfo.piece_length});
     try writer.print("pieces={}\n", .{try metainfo.pieceCount()});
     try writer.print("total_size={}\n", .{metainfo.totalSize()});
