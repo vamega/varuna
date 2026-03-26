@@ -23,6 +23,7 @@ Update it whenever a milestone lands, the near-term backlog changes, or a new op
 - Tracker lifecycle events: `completed` sent after download, `stopped` sent on seed exit and download failure.
 - Block request pipelining (depth 5) reduces per-block RTT overhead.
 - Benchmark suite covers kernel parsing, bencode parsing, SHA-1 hashing, and metainfo parsing.
+- Multi-peer download: thread-per-peer workers with PieceTracker coordination, `--max-peers` option (default 5).
 - io_uring is the I/O path for all hot-path file and network operations:
   - `src/io/ring.zig` wraps `std.os.linux.IoUring` with blocking convenience methods.
   - `PieceStore` read/write/sync routes through `Ring.pread_all`/`pwrite_all`/`fsync`.
@@ -38,8 +39,8 @@ Update it whenever a milestone lands, the near-term backlog changes, or a new op
   - handle stale peers and tracker edge cases more deliberately
   - validate behavior against more private-tracker expectations
 - Widen peer behavior past the current minimal contract:
-  - more than one active peer
-  - better piece selection than strict sequential download
+  - ~~more than one active peer~~ Done: thread-per-peer workers with PieceTracker coordination, --max-peers option
+  - better piece selection than strict sequential download (rarest-first -- Cycle 2)
   - stronger peer/session state handling
   - ~~pipeline block requests~~ Done: pipeline depth of 5 outstanding requests per piece
 - Replace full startup-only resume with persisted resume state (SQLite, background thread -- see [docs/io-uring-syscalls.md](docs/io-uring-syscalls.md) for constraints).
