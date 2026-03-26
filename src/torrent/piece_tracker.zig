@@ -6,6 +6,7 @@ const Bitfield = @import("../bitfield.zig").Bitfield;
 /// when done, or releasePiece if they fail mid-download.
 pub const PieceTracker = struct {
     mutex: std.Thread.Mutex = .{},
+    progress_cond: std.Thread.Condition = .{},
     complete: Bitfield,
     in_progress: Bitfield,
     availability: []u16,
@@ -148,7 +149,16 @@ pub const PieceTracker = struct {
         }
         self.complete.set(piece_index) catch {};
         self.bytes_complete += piece_length;
+        self.progress_cond.signal();
         return true;
+    }
+
+    /// Wait for progress (piece completion) with a timeout.
+    /// Returns true if signaled, false on timeout.
+    pub fn waitForProgress(self: *PieceTracker, timeout_ns: u64) void {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        self.progress_cond.timedWait(&self.mutex, timeout_ns) catch {};
     }
 
     /// Release a claimed piece back to the pool (peer disconnected or failed).

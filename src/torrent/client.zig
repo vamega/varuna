@@ -284,7 +284,8 @@ pub fn download(
     var last_reported_count: u32 = piece_tracker.completedCount();
 
     while (!piece_tracker.isComplete()) {
-        std.Thread.sleep(2 * std.time.ns_per_s);
+        // Wait for piece completion signal or 2-second timeout for re-announce check
+        _ = piece_tracker.waitForProgress(2 * std.time.ns_per_s);
 
         if (piece_tracker.isComplete()) break;
 
