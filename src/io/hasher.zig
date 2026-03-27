@@ -39,12 +39,15 @@ pub const Hasher = struct {
         valid: bool,
     };
 
-    pub fn init(allocator: std.mem.Allocator, thread_count: ?u32) !Hasher {
+    /// Create a heap-allocated Hasher. Must be heap-allocated because
+    /// worker threads hold pointers to it.
+    pub fn create(allocator: std.mem.Allocator, thread_count: ?u32) !*Hasher {
         const count = thread_count orelse default_thread_count;
         const efd = try posix.eventfd(0, linux.EFD.NONBLOCK | linux.EFD.CLOEXEC);
         errdefer posix.close(efd);
 
-        var self = Hasher{
+        const self = try allocator.create(Hasher);
+        self.* = .{
             .allocator = allocator,
             .threads = try allocator.alloc(std.Thread, count),
             .pending_jobs = std.ArrayList(Job).empty,
@@ -58,14 +61,22 @@ pub const Hasher = struct {
             self.queue_cond.broadcast();
             for (self.threads[0..spawned]) |t| t.join();
             allocator.free(self.threads);
+            allocator.destroy(self);
         }
 
         for (self.threads) |*t| {
-            t.* = try std.Thread.spawn(.{}, workerFn, .{&self});
+            t.* = try std.Thread.spawn(.{}, workerFn, .{self});
             spawned += 1;
         }
 
         return self;
+    }
+
+    // Keep init as a convenience that returns the struct (for tests only)
+    pub fn init(allocator: std.mem.Allocator, thread_count: ?u32) !Hasher {
+        _ = thread_count;
+        _ = allocator;
+        return error.UseCreateInstead;
     }
 
     pub fn deinit(self: *Hasher) void {
@@ -179,8 +190,11 @@ pub const Hasher = struct {
 };
 
 test "hasher pool verifies pieces correctly" {
-    var hasher = Hasher.init(std.testing.allocator, 2) catch return error.SkipZigTest;
-    defer hasher.deinit();
+    var hasher = Hasher.create(std.testing.allocator, 2) catch return error.SkipZigTest;
+    defer {
+        hasher.deinit();
+        std.testing.allocator.destroy(hasher);
+    }
 
     // Submit a valid piece
     const data1 = try std.testing.allocator.alloc(u8, 4);
@@ -229,8 +243,11 @@ test "hasher pool verifies pieces correctly" {
 }
 
 test "hasher pool thread count" {
-    var hasher = Hasher.init(std.testing.allocator, 8) catch return error.SkipZigTest;
-    defer hasher.deinit();
+    var hasher = Hasher.create(std.testing.allocator, 8) catch return error.SkipZigTest;
+    defer {
+        hasher.deinit();
+        std.testing.allocator.destroy(hasher);
+    }
 
     try std.testing.expectEqual(@as(usize, 8), hasher.threadCount());
 }

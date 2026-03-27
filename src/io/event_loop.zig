@@ -60,8 +60,10 @@ pub const PeerState = enum {
     connecting,
     handshake_send,
     handshake_recv,
-    inbound_handshake_recv, // seed mode: recv handshake first
-    inbound_handshake_send, // seed mode: then send handshake + bitfield
+    inbound_handshake_recv,
+    inbound_handshake_send, // sending our handshake back
+    inbound_bitfield_send, // sending bitfield
+    inbound_unchoke_send, // sending unchoke
     active_recv_header,
     active_recv_body,
     disconnecting,
@@ -122,7 +124,7 @@ pub const EventLoop = struct {
     complete_pieces: ?*const Bitfield = null,
 
     // Background hasher for SHA verification (off event loop thread)
-    hasher: ?Hasher = null,
+    hasher: ?*Hasher = null,
 
     pub fn init(
         allocator: std.mem.Allocator,
@@ -135,7 +137,7 @@ pub const EventLoop = struct {
         const peers = try allocator.alloc(Peer, max_peers);
         @memset(peers, Peer{});
 
-        const hasher = Hasher.init(allocator, hasher_threads) catch null;
+        const hasher = Hasher.create(allocator, hasher_threads) catch null;
 
         return .{
             .ring = try linux.IoUring.init(256, 0),
@@ -151,7 +153,10 @@ pub const EventLoop = struct {
     }
 
     pub fn deinit(self: *EventLoop) void {
-        if (self.hasher) |*h| h.deinit();
+        if (self.hasher) |h| {
+            h.deinit();
+            self.allocator.destroy(h);
+        }
         for (self.peers) |*peer| {
             self.cleanupPeer(peer);
         }
@@ -337,16 +342,31 @@ pub const EventLoop = struct {
                 };
             },
             .inbound_handshake_send => {
-                // Handshake sent -- now send bitfield, unchoke, and go active
+                // Handshake sent -- send bitfield if we have pieces
                 if (self.complete_pieces) |cp| {
+                    peer.state = .inbound_bitfield_send;
                     self.submitMessage(slot, 5, cp.bits) catch {
                         self.removePeer(slot);
-                        return;
+                    };
+                } else {
+                    // No bitfield to send, go straight to unchoke
+                    peer.state = .inbound_unchoke_send;
+                    peer.am_choking = false;
+                    self.submitMessage(slot, 1, &.{}) catch {
+                        self.removePeer(slot);
                     };
                 }
-                // Unchoke the peer
+            },
+            .inbound_bitfield_send => {
+                // Bitfield sent -- now send unchoke
+                peer.state = .inbound_unchoke_send;
                 peer.am_choking = false;
-                self.submitMessage(slot, 1, &.{}) catch {};
+                self.submitMessage(slot, 1, &.{}) catch {
+                    self.removePeer(slot);
+                };
+            },
+            .inbound_unchoke_send => {
+                // Unchoke sent -- go active
                 peer.state = .active_recv_header;
                 peer.header_offset = 0;
                 self.submitHeaderRecv(slot) catch {
@@ -701,7 +721,7 @@ pub const EventLoop = struct {
         var hash: [20]u8 = undefined;
         @memcpy(&hash, expected_hash);
 
-        if (self.hasher) |*h| {
+        if (self.hasher) |h| {
             // Submit to background hasher thread (non-blocking)
             h.submitVerify(slot, piece_index, piece_buf, hash) catch {
                 self.piece_tracker.releasePiece(piece_index);
@@ -725,7 +745,7 @@ pub const EventLoop = struct {
     /// Process completed hash results from the background hasher.
     /// Called each tick from the event loop.
     fn processHashResults(self: *EventLoop) void {
-        const h = &(self.hasher orelse return);
+        const h = self.hasher orelse return;
         const results = h.drainResults();
         for (results) |result| {
             if (result.valid) {
