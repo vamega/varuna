@@ -89,11 +89,14 @@ pub const Peer = struct {
     peer_choking: bool = true,
     am_choking: bool = true,
     am_interested: bool = false,
+    peer_interested: bool = false,
     availability_known: bool = false,
     availability: ?Bitfield = null,
 
-    // Timing
-    last_activity: i64 = 0, // timestamp of last useful data received
+    // Timing and stats
+    last_activity: i64 = 0,
+    bytes_downloaded_from: u64 = 0, // bytes we received from this peer
+    bytes_uploaded_to: u64 = 0, // bytes we sent to this peer
 
     // Piece download state
     current_piece: ?u32 = null,
@@ -148,6 +151,7 @@ pub const EventLoop = struct {
 
 
     // Background hasher for SHA verification (off event loop thread)
+    last_unchoke_recalc: i64 = 0,
     hasher: ?*Hasher = null,
 
     pub fn init(
@@ -266,10 +270,15 @@ pub const EventLoop = struct {
     /// Run one iteration of the event loop. Blocks until at least one
     /// CQE is available. Returns the number of CQEs processed.
     const peer_timeout_secs: i64 = 30;
+    const unchoke_interval_secs: i64 = 30;
+    const max_unchoked: u32 = 4;
+    const optimistic_unchoke_slots: u32 = 1;
+
 
     pub fn tick(self: *EventLoop) !void {
         self.processHashResults();
         self.checkPeerTimeouts();
+        self.recalculateUnchokes();
         self.tryAssignPieces();
 
         _ = try self.ring.submit_and_wait(1);
@@ -607,13 +616,15 @@ pub const EventLoop = struct {
                 peer.last_activity = std.time.timestamp();
             },
             2 => { // interested
+                peer.peer_interested = true;
+                // For seed mode, unchoking is now handled by recalculateUnchokes
+                // But for immediate responsiveness, unchoke if under the limit
                 if (peer.mode == .seed and peer.am_choking) {
-                    // Unchoke the peer
-                    self.submitMessage(slot, 1, &.{}) catch {};
                     peer.am_choking = false;
+                    self.submitMessage(slot, 1, &.{}) catch {};
                 }
             },
-            3 => {}, // not interested
+            3 => { peer.peer_interested = false; }, // not interested
             4 => { // have
                 if (payload.len >= 4) {
                     const piece_index = std.mem.readInt(u32, payload[0..4], .big);
@@ -653,6 +664,7 @@ pub const EventLoop = struct {
                                 @memcpy(pbuf[start..end], block_data);
                                 peer.blocks_received += 1;
                                 peer.last_activity = std.time.timestamp();
+                                peer.bytes_downloaded_from += block_data.len;
                                 if (peer.inflight_requests > 0) peer.inflight_requests -= 1;
 
                                 if (peer.blocks_received >= peer.blocks_expected) {
@@ -678,6 +690,58 @@ pub const EventLoop = struct {
 
             if (now - peer.last_activity > peer_timeout_secs) {
                 self.removePeer(@intCast(i));
+            }
+        }
+    }
+
+    // ── Choking algorithm (tit-for-tat) ─────────────────
+
+    fn recalculateUnchokes(self: *EventLoop) void {
+        const now = std.time.timestamp();
+        if (now - self.last_unchoke_recalc < unchoke_interval_secs) return;
+        self.last_unchoke_recalc = now;
+
+        // Collect active seed-mode peers that are interested
+        var interested_peers: [max_peers]u16 = undefined;
+        var interested_count: u32 = 0;
+
+        for (self.peers, 0..) |*peer, i| {
+            if (peer.state == .free or peer.state == .disconnecting) continue;
+            if (peer.mode != .seed) continue;
+            if (!peer.peer_interested) continue;
+            if (interested_count < max_peers) {
+                interested_peers[interested_count] = @intCast(i);
+                interested_count += 1;
+            }
+        }
+
+        if (interested_count == 0) return;
+
+        // Sort by bytes_downloaded_from (peers that give us most data get unchoked first)
+        // For seed-only mode, all peers upload equally, so use bytes_uploaded_to to spread
+        const peers_slice = interested_peers[0..interested_count];
+        const context = self;
+        std.mem.sort(u16, peers_slice, context, struct {
+            fn lessThan(ctx: *EventLoop, a: u16, b: u16) bool {
+                return ctx.peers[a].bytes_downloaded_from > ctx.peers[b].bytes_downloaded_from;
+            }
+        }.lessThan);
+
+        // Unchoke top N, choke the rest
+        var unchoked: u32 = 0;
+        for (peers_slice) |slot| {
+            const peer = &self.peers[slot];
+            if (unchoked < max_unchoked + optimistic_unchoke_slots) {
+                if (peer.am_choking) {
+                    peer.am_choking = false;
+                    self.submitMessage(slot, 1, &.{}) catch {}; // unchoke
+                }
+                unchoked += 1;
+            } else {
+                if (!peer.am_choking) {
+                    peer.am_choking = true;
+                    self.submitMessage(slot, 0, &.{}) catch {}; // choke
+                }
             }
         }
     }
@@ -720,6 +784,9 @@ pub const EventLoop = struct {
         std.mem.writeInt(u32, send_buf[9..13], block_offset, .big);
         @memcpy(send_buf[13..total_len], read_buf[@intCast(block_offset)..][0..block_length]);
 
+        const peer = &self.peers[slot];
+        peer.bytes_uploaded_to += block_length;
+
         // Track the send buffer for cleanup after CQE
         self.pending_sends.append(self.allocator, .{
             .buf = send_buf,
@@ -729,7 +796,6 @@ pub const EventLoop = struct {
             return;
         };
 
-        const peer = &self.peers[slot];
         const ud = encodeUserData(.{ .slot = slot, .op_type = .peer_send, .context = 1 }); // context=1 means tracked send
         _ = self.ring.send(ud, peer.fd, send_buf, 0) catch {
             self.allocator.free(send_buf);
