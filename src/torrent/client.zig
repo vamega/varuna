@@ -354,11 +354,11 @@ pub fn download(
                 // Have pending writes, tick to process disk write CQEs
                 event_loop.submitTimeout(10 * std.time.ns_per_ms) catch {};
                 event_loop.tick() catch break;
-            } else if (drain_ticks > 10) {
+            } else if (drain_ticks > 50) {
                 break;
             } else {
                 // Wait for hasher to produce results
-                std.Thread.sleep(5 * std.time.ns_per_ms);
+                std.Thread.sleep(10 * std.time.ns_per_ms);
             }
         }
     }
