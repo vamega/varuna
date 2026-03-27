@@ -63,6 +63,7 @@ Update it whenever a milestone lands, the near-term backlog changes, or a new op
 - **TorrentSession + SessionManager**: multi-torrent state management with lifecycle (checking, downloading, seeding, paused, stopped, error).
 - **varuna-ctl**: CLI client that talks to daemon via HTTP over io_uring. Commands: list, add, pause, resume, delete, version, stats.
 - TOML config file with `[daemon]` section (api_port, api_bind).
+- **Real swarm verified**: `demo_swarm.sh` passes with opentracker + varuna-tools seed + varuna-tools download. Full io_uring event loop piece transfer verified with `cmp`.
 - io_uring is the I/O path for all hot-path file and network operations:
   - `src/io/ring.zig` wraps `std.os.linux.IoUring` with blocking convenience methods.
   - `PieceStore` read/write/sync routes through `Ring.pread_all`/`pwrite_all`/`fsync`.
