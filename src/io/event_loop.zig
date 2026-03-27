@@ -190,7 +190,11 @@ pub const EventLoop = struct {
         const peers = try allocator.alloc(Peer, max_peers);
         @memset(peers, Peer{});
 
-        const hasher = Hasher.create(allocator, hasher_threads) catch null;
+        // Only create hasher for download mode (seed doesn't need SHA verification)
+        const hasher = if (hasher_threads > 0)
+            Hasher.create(allocator, hasher_threads) catch null
+        else
+            null;
 
         var el = EventLoop{
             .ring = try linux.IoUring.init(256, 0),

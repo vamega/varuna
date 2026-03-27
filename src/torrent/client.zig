@@ -108,7 +108,7 @@ pub fn seed(
         &piece_tracker,
         shared_fds,
         options.peer_id,
-        4,
+        0, // no hasher threads for seed mode
     );
     defer event_loop.deinit();
 

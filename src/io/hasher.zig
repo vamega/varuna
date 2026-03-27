@@ -154,7 +154,9 @@ pub const Hasher = struct {
             // Wait for a job
             self.queue_mutex.lock();
             while (self.pending_jobs.items.len == 0 and self.running.load(.acquire)) {
-                self.queue_cond.timedWait(&self.queue_mutex, 100 * std.time.ns_per_ms) catch {};
+                // Use long timeout to minimize futex contention when idle.
+                // submitVerify signals the condvar when a job is available.
+                self.queue_cond.timedWait(&self.queue_mutex, 1 * std.time.ns_per_s) catch {};
             }
 
             if (self.pending_jobs.items.len == 0) {
