@@ -261,6 +261,20 @@ pub const TorrentSession = struct {
             self.event_loop.?.tick() catch break;
 
             if (self.piece_tracker.?.isComplete()) {
+                // Drain hasher results + pending disk writes
+                var drain: u32 = 0;
+                while (drain < 200) : (drain += 1) {
+                    self.event_loop.?.processHashResults();
+                    if (self.event_loop.?.pending_writes.items.len > 0) {
+                        self.event_loop.?.submitTimeout(10 * std.time.ns_per_ms) catch {};
+                        self.event_loop.?.tick() catch break;
+                    } else if (drain > 50) {
+                        break;
+                    } else {
+                        std.Thread.sleep(10 * std.time.ns_per_ms);
+                    }
+                }
+
                 self.state = .seeding;
                 self.store.?.sync() catch {};
 
