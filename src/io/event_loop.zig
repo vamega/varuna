@@ -355,6 +355,8 @@ pub const EventLoop = struct {
         self.recalculateUnchokes();
         self.tryAssignPieces();
 
+        // Flush any queued SQEs before waiting
+        _ = self.ring.submit() catch {};
         _ = try self.ring.submit_and_wait(1);
 
         var cqes: [cqe_batch_size]linux.io_uring_cqe = undefined;
@@ -1062,10 +1064,17 @@ pub const EventLoop = struct {
             _ = try self.ring.send(ud, peer.fd, peer.handshake_buf[0 .. 5 + payload.len], 0);
             peer.send_pending = true;
         } else {
-            // For larger messages, send header then payload separately
-            @memcpy(peer.handshake_buf[0..5], &header);
-            const ud = encodeUserData(.{ .slot = slot, .op_type = .peer_send, .context = 0 });
-            _ = try self.ring.send(ud, peer.fd, peer.handshake_buf[0..5], 0);
+            // For larger messages, allocate a buffer for the complete message
+            const total_len = 5 + payload.len;
+            const send_buf = try self.allocator.alloc(u8, total_len);
+            @memcpy(send_buf[0..5], &header);
+            @memcpy(send_buf[5..total_len], payload);
+
+            // Track for cleanup
+            try self.pending_sends.append(self.allocator, .{ .buf = send_buf, .slot = slot });
+
+            const ud = encodeUserData(.{ .slot = slot, .op_type = .peer_send, .context = 1 }); // context=1 = tracked
+            _ = try self.ring.send(ud, peer.fd, send_buf, 0);
             peer.send_pending = true;
         }
     }
