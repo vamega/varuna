@@ -75,7 +75,7 @@ pub fn seed(
     try logStatus(options.status_writer, "listening for peers on port {}\n", .{options.port});
 
     const announce_url = session.metainfo.announce orelse return error.MissingAnnounceUrl;
-    const announce_response = try tracker.announce.fetchViaRing(allocator, &ring, .{
+    const announce_response = try tracker.announce.fetchAuto(allocator, &ring, .{
         .announce_url = announce_url,
         .info_hash = session.metainfo.info_hash,
         .peer_id = options.peer_id,
@@ -241,7 +241,7 @@ pub fn download(
     var announce_url: []const u8 = tracker_urls.items[0];
     var announce_response: ?tracker.announce.Response = null;
     for (tracker_urls.items) |url| {
-        const resp = tracker.announce.fetchViaRing(allocator, &ring, .{
+        const resp = tracker.announce.fetchAuto(allocator, &ring, .{
             .announce_url = url,
             .info_hash = session.metainfo.info_hash,
             .peer_id = options.peer_id,
@@ -393,7 +393,7 @@ fn sendTrackerEvent(
     downloaded: u64,
 ) void {
     const left: u64 = if (event == .completed) 0 else session.totalSize();
-    const response = tracker.announce.fetchViaRing(allocator, ring, .{
+    const response = tracker.announce.fetchAuto(allocator, ring, .{
         .announce_url = announce_url,
         .info_hash = session.metainfo.info_hash,
         .peer_id = options.peer_id,

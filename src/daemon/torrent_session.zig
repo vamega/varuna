@@ -205,7 +205,7 @@ pub const TorrentSession = struct {
         self.state = .downloading;
 
         const announce_url = session.metainfo.announce orelse return error.MissingAnnounceUrl;
-        const announce_response = tracker.announce.fetchViaRing(self.allocator, &self.ring.?, .{
+        const announce_response = tracker.announce.fetchAuto(self.allocator, &self.ring.?, .{
             .announce_url = announce_url,
             .info_hash = session.metainfo.info_hash,
             .peer_id = self.peer_id,
@@ -279,7 +279,7 @@ pub const TorrentSession = struct {
                 self.store.?.sync() catch {};
 
                 // Send completed event (best-effort)
-                if (tracker.announce.fetchViaRing(self.allocator, &self.ring.?, .{
+                if (tracker.announce.fetchAuto(self.allocator, &self.ring.?, .{
                     .announce_url = announce_url,
                     .info_hash = session.metainfo.info_hash,
                     .peer_id = self.peer_id,

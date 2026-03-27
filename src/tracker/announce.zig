@@ -54,6 +54,19 @@ pub fn fetch(
     return parseResponse(allocator, body.writer.buffer[0..body.writer.end]);
 }
 
+/// Fetch tracker announce, auto-selecting HTTP or UDP based on URL scheme.
+/// All I/O goes through io_uring.
+pub fn fetchAuto(
+    allocator: std.mem.Allocator,
+    ring: *@import("../io/ring.zig").Ring,
+    request: Request,
+) !Response {
+    if (std.mem.startsWith(u8, request.announce_url, "udp://")) {
+        return @import("udp.zig").fetchViaUdp(allocator, ring, request);
+    }
+    return fetchViaRing(allocator, ring, request);
+}
+
 /// Fetch tracker announce using our io_uring-based HTTP client.
 /// This replaces the std.http.Client path -- all I/O goes through io_uring.
 pub fn fetchViaRing(
