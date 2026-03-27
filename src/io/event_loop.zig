@@ -134,6 +134,7 @@ pub const EventLoop = struct {
 
     const PendingSend = struct {
         buf: []u8,
+        sent: usize = 0, // bytes already sent (for partial send retry)
         slot: u16,
     };
 
@@ -470,17 +471,26 @@ pub const EventLoop = struct {
     }
 
     fn handleSend(self: *EventLoop, slot: u16, cqe: linux.io_uring_cqe) void {
-        // Check if this was a tracked send buffer (context=1 from servePieceRequest)
-        const op = decodeUserData(cqe.user_data);
-        if (op.context == 1) {
-            self.freePendingSend(slot);
-        }
-
         const peer = &self.peers[slot];
         if (cqe.res <= 0) {
+            // Check if this was a tracked send buffer -- free it on error
+            const op = decodeUserData(cqe.user_data);
+            if (op.context == 1) self.freePendingSend(slot);
             self.removePeer(slot);
             return;
         }
+
+        // Check if this was a tracked send buffer (context=1)
+        const op = decodeUserData(cqe.user_data);
+        if (op.context == 1) {
+            const bytes_sent: usize = @intCast(cqe.res);
+            // Check for partial send and re-submit remainder
+            if (!self.handlePartialSend(slot, bytes_sent)) {
+                // Full send complete, free the buffer
+                self.freePendingSend(slot);
+            }
+        }
+
         peer.send_pending = false;
 
         switch (peer.state) {
@@ -950,16 +960,47 @@ pub const EventLoop = struct {
 
         const geometry = self.session.geometry();
 
-        while (peer.inflight_requests < pipeline_depth and peer.pipeline_sent < peer.blocks_expected) {
-            const req = try geometry.requestForBlock(piece_index, peer.pipeline_sent);
-            var payload: [12]u8 = undefined;
-            std.mem.writeInt(u32, payload[0..4], req.piece_index, .big);
-            std.mem.writeInt(u32, payload[4..8], req.piece_offset, .big);
-            std.mem.writeInt(u32, payload[8..12], req.length, .big);
-            try self.submitMessage(slot, 6, &payload);
-            peer.pipeline_sent += 1;
-            peer.inflight_requests += 1;
+        // Count how many requests to send
+        var to_send: u32 = 0;
+        while (peer.inflight_requests + to_send < pipeline_depth and peer.pipeline_sent + to_send < peer.blocks_expected) {
+            to_send += 1;
         }
+        if (to_send == 0) return;
+
+        // Build all requests into one buffer (17 bytes each: 4 len + 1 id + 12 payload)
+        const request_size: usize = 17;
+        const total_len = request_size * to_send;
+        const send_buf = self.allocator.alloc(u8, total_len) catch return;
+
+        var i: u32 = 0;
+        while (i < to_send) : (i += 1) {
+            const req = geometry.requestForBlock(piece_index, peer.pipeline_sent + i) catch {
+                self.allocator.free(send_buf);
+                return;
+            };
+            const offset = i * request_size;
+            // 4-byte length prefix
+            std.mem.writeInt(u32, send_buf[offset..][0..4], 13, .big); // 1 + 12
+            send_buf[offset + 4] = 6; // request message id
+            std.mem.writeInt(u32, send_buf[offset + 5 ..][0..4], req.piece_index, .big);
+            std.mem.writeInt(u32, send_buf[offset + 9 ..][0..4], req.piece_offset, .big);
+            std.mem.writeInt(u32, send_buf[offset + 13 ..][0..4], req.length, .big);
+        }
+
+        // Track for cleanup
+        self.pending_sends.append(self.allocator, .{ .buf = send_buf, .slot = slot }) catch {
+            self.allocator.free(send_buf);
+            return;
+        };
+
+        const ud = encodeUserData(.{ .slot = slot, .op_type = .peer_send, .context = 1 });
+        _ = self.ring.send(ud, peer.fd, send_buf, 0) catch {
+            self.allocator.free(send_buf);
+            return;
+        };
+        peer.send_pending = true;
+        peer.pipeline_sent += to_send;
+        peer.inflight_requests += to_send;
     }
 
     fn completePieceDownload(self: *EventLoop, slot: u16) void {
@@ -1097,6 +1138,27 @@ pub const EventLoop = struct {
             _ = try self.ring.send(ud, peer.fd, send_buf, 0);
             peer.send_pending = true;
         }
+    }
+
+    /// Handle partial send: re-submit remaining bytes. Returns true if partial (more to send).
+    fn handlePartialSend(self: *EventLoop, slot: u16, bytes_sent: usize) bool {
+        for (self.pending_sends.items) |*ps| {
+            if (ps.slot == slot) {
+                ps.sent += bytes_sent;
+                if (ps.sent < ps.buf.len) {
+                    // Partial send -- re-submit remainder
+                    const remaining = ps.buf[ps.sent..];
+                    const ud = encodeUserData(.{ .slot = slot, .op_type = .peer_send, .context = 1 });
+                    _ = self.ring.send(ud, self.peers[slot].fd, remaining, 0) catch {
+                        return false; // treat as complete on error
+                    };
+                    self.peers[slot].send_pending = true;
+                    return true;
+                }
+                return false; // fully sent
+            }
+        }
+        return false;
     }
 
     fn freePendingSend(self: *EventLoop, slot: u16) void {
