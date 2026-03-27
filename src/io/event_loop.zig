@@ -73,6 +73,7 @@ pub const Peer = struct {
     fd: posix.fd_t = -1,
     state: PeerState = .free,
     mode: PeerMode = .download,
+    torrent_id: u8 = 0,
     address: std.net.Address = undefined,
 
     // Recv state: small header buffer, then body on demand
@@ -107,11 +108,26 @@ pub const Peer = struct {
     inflight_requests: u32 = 0,
 };
 
+// ── Torrent context (per-torrent state within shared event loop) ──
+
+pub const max_torrents: u8 = 64;
+
+pub const TorrentContext = struct {
+    session: *const session_mod.Session,
+    piece_tracker: *PieceTracker,
+    shared_fds: []const posix.fd_t,
+    info_hash: [20]u8,
+    peer_id: [20]u8,
+    complete_pieces: ?*const Bitfield = null,
+    active: bool = true,
+};
+
 // ── Event loop ────────────────────────────────────────────
 
 pub const EventLoop = struct {
     const PendingWrite = struct {
         piece_index: u32,
+        torrent_id: u8,
         buf: []u8,
         spans_remaining: u32,
     };
@@ -127,7 +143,11 @@ pub const EventLoop = struct {
     peer_count: u16 = 0,
     running: bool = true,
 
-    // Session context
+    // Multi-torrent contexts
+    torrents: [max_torrents]?TorrentContext = [_]?TorrentContext{null} ** max_torrents,
+    torrent_count: u8 = 0,
+
+    // Legacy single-torrent pointers (used by existing code, point to torrents[0])
     session: *const session_mod.Session,
     piece_tracker: *PieceTracker,
     shared_fds: []const posix.fd_t,
@@ -149,7 +169,6 @@ pub const EventLoop = struct {
     // Pending sends: track allocated send buffers (for seed piece responses).
     pending_sends: std.ArrayList(PendingSend),
 
-
     // Background hasher for SHA verification (off event loop thread)
     last_unchoke_recalc: i64 = 0,
     hasher: ?*Hasher = null,
@@ -167,7 +186,7 @@ pub const EventLoop = struct {
 
         const hasher = Hasher.create(allocator, hasher_threads) catch null;
 
-        return .{
+        var el = EventLoop{
             .ring = try linux.IoUring.init(256, 0),
             .allocator = allocator,
             .peers = peers,
@@ -180,6 +199,54 @@ pub const EventLoop = struct {
             .pending_sends = std.ArrayList(PendingSend).empty,
             .hasher = hasher,
         };
+
+        // Register as torrent 0 for backwards compatibility
+        el.torrents[0] = .{
+            .session = session,
+            .piece_tracker = piece_tracker,
+            .shared_fds = shared_fds,
+            .info_hash = session.metainfo.info_hash,
+            .peer_id = peer_id,
+        };
+        el.torrent_count = 1;
+
+        return el;
+    }
+
+    /// Add a new torrent context to the event loop. Returns torrent_id.
+    pub fn addTorrent(
+        self: *EventLoop,
+        session: *const session_mod.Session,
+        piece_tracker: *PieceTracker,
+        shared_fds: []const posix.fd_t,
+        peer_id: [20]u8,
+    ) !u8 {
+        for (&self.torrents, 0..) |*slot, i| {
+            if (slot.* == null) {
+                slot.* = .{
+                    .session = session,
+                    .piece_tracker = piece_tracker,
+                    .shared_fds = shared_fds,
+                    .info_hash = session.metainfo.info_hash,
+                    .peer_id = peer_id,
+                };
+                self.torrent_count += 1;
+                return @intCast(i);
+            }
+        }
+        return error.TooManyTorrents;
+    }
+
+    /// Remove a torrent context and disconnect all its peers.
+    pub fn removeTorrent(self: *EventLoop, torrent_id: u8) void {
+        // Disconnect all peers for this torrent
+        for (self.peers, 0..) |*peer, i| {
+            if (peer.state != .free and peer.torrent_id == torrent_id) {
+                self.removePeer(@intCast(i));
+            }
+        }
+        self.torrents[torrent_id] = null;
+        if (self.torrent_count > 0) self.torrent_count -= 1;
     }
 
     pub fn deinit(self: *EventLoop) void {
@@ -204,16 +271,23 @@ pub const EventLoop = struct {
     }
 
     pub fn addPeer(self: *EventLoop, address: std.net.Address) !u16 {
+        return self.addPeerForTorrent(address, 0);
+    }
+
+    pub fn addPeerForTorrent(self: *EventLoop, address: std.net.Address, torrent_id: u8) !u16 {
         // Validate address family
         const family = address.any.family;
         if (family != posix.AF.INET and family != posix.AF.INET6) {
             return error.InvalidAddressFamily;
         }
 
+        if (self.torrents[torrent_id] == null) return error.TorrentNotFound;
+
         const slot = self.allocSlot() orelse return error.TooManyPeers;
         const peer = &self.peers[slot];
         peer.* = Peer{
             .state = .connecting,
+            .torrent_id = torrent_id,
             .address = address,
         };
 
@@ -362,13 +436,17 @@ pub const EventLoop = struct {
         peer.state = .handshake_send;
         peer.last_activity = std.time.timestamp();
 
-        // Build and send handshake
+        // Build and send handshake using the peer's torrent context
+        const tc = self.getTorrentContext(peer.torrent_id) orelse {
+            self.removePeer(slot);
+            return;
+        };
         var buf: [68]u8 = undefined;
         buf[0] = pw.protocol_length;
         @memcpy(buf[1 .. 1 + pw.protocol_string.len], pw.protocol_string);
         @memset(buf[20..28], 0);
-        @memcpy(buf[28..48], self.info_hash[0..]);
-        @memcpy(buf[48..68], self.peer_id[0..]);
+        @memcpy(buf[28..48], tc.info_hash[0..]);
+        @memcpy(buf[48..68], tc.peer_id[0..]);
         @memcpy(peer.handshake_buf[0..68], &buf);
 
         const ud = encodeUserData(.{ .slot = slot, .op_type = .peer_send, .context = 0 });
@@ -452,6 +530,10 @@ pub const EventLoop = struct {
             return;
         }
         const n: usize = @intCast(cqe.res);
+        const tc_recv = self.getTorrentContext(peer.torrent_id) orelse {
+            self.removePeer(slot);
+            return;
+        };
 
         switch (peer.state) {
             .handshake_recv => {
@@ -463,7 +545,7 @@ pub const EventLoop = struct {
                     return;
                 }
                 // Validate handshake
-                if (!std.mem.eql(u8, peer.handshake_buf[28..48], self.info_hash[0..])) {
+                if (!std.mem.eql(u8, peer.handshake_buf[28..48], tc_recv.info_hash[0..])) {
                     self.removePeer(slot);
                     return;
                 }
@@ -489,7 +571,7 @@ pub const EventLoop = struct {
                     return;
                 }
                 // Validate info_hash
-                if (!std.mem.eql(u8, peer.handshake_buf[28..48], self.info_hash[0..])) {
+                if (!std.mem.eql(u8, peer.handshake_buf[28..48], tc_recv.info_hash[0..])) {
                     self.removePeer(slot);
                     return;
                 }
@@ -499,8 +581,8 @@ pub const EventLoop = struct {
                 buf[0] = pw.protocol_length;
                 @memcpy(buf[1 .. 1 + pw.protocol_string.len], pw.protocol_string);
                 @memset(buf[20..28], 0);
-                @memcpy(buf[28..48], self.info_hash[0..]);
-                @memcpy(buf[48..68], self.peer_id[0..]);
+                @memcpy(buf[28..48], tc_recv.info_hash[0..]);
+                @memcpy(buf[48..68], tc_recv.peer_id[0..]);
                 @memcpy(peer.handshake_buf[0..68], &buf);
                 const ud = encodeUserData(.{ .slot = slot, .op_type = .peer_send, .context = 0 });
                 _ = self.ring.send(ud, peer.fd, peer.handshake_buf[0..68], 0) catch {
@@ -916,6 +998,7 @@ pub const EventLoop = struct {
                 // Track the buffer so we can free it after all writes complete
                 self.pending_writes.append(self.allocator, .{
                     .piece_index = result.piece_index,
+                    .torrent_id = 0, // TODO: get from hasher result
                     .buf = result.piece_buf,
                     .spans_remaining = span_count,
                 }) catch {
@@ -997,6 +1080,11 @@ pub const EventLoop = struct {
             }
             i += 1;
         }
+    }
+
+    fn getTorrentContext(self: *EventLoop, torrent_id: u8) ?*TorrentContext {
+        if (torrent_id >= max_torrents) return null;
+        return if (self.torrents[torrent_id]) |*tc| tc else null;
     }
 
     fn cleanupPeer(self: *EventLoop, peer: *Peer) void {
