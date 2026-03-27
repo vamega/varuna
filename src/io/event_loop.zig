@@ -92,6 +92,9 @@ pub const Peer = struct {
     availability_known: bool = false,
     availability: ?Bitfield = null,
 
+    // Timing
+    last_activity: i64 = 0, // timestamp of last useful data received
+
     // Piece download state
     current_piece: ?u32 = null,
     piece_buf: ?[]u8 = null,
@@ -262,8 +265,11 @@ pub const EventLoop = struct {
 
     /// Run one iteration of the event loop. Blocks until at least one
     /// CQE is available. Returns the number of CQEs processed.
+    const peer_timeout_secs: i64 = 30;
+
     pub fn tick(self: *EventLoop) !void {
         self.processHashResults();
+        self.checkPeerTimeouts();
         self.tryAssignPieces();
 
         _ = try self.ring.submit_and_wait(1);
@@ -345,6 +351,7 @@ pub const EventLoop = struct {
         }
         const peer = &self.peers[slot];
         peer.state = .handshake_send;
+        peer.last_activity = std.time.timestamp();
 
         // Build and send handshake
         var buf: [68]u8 = undefined;
@@ -595,7 +602,10 @@ pub const EventLoop = struct {
                 peer.inflight_requests = 0;
                 peer.pipeline_sent = peer.blocks_received;
             },
-            1 => peer.peer_choking = false, // unchoke
+            1 => {
+                peer.peer_choking = false; // unchoke
+                peer.last_activity = std.time.timestamp();
+            },
             2 => { // interested
                 if (peer.mode == .seed and peer.am_choking) {
                     // Unchoke the peer
@@ -642,6 +652,7 @@ pub const EventLoop = struct {
                             if (end <= pbuf.len) {
                                 @memcpy(pbuf[start..end], block_data);
                                 peer.blocks_received += 1;
+                                peer.last_activity = std.time.timestamp();
                                 if (peer.inflight_requests > 0) peer.inflight_requests -= 1;
 
                                 if (peer.blocks_received >= peer.blocks_expected) {
@@ -653,6 +664,21 @@ pub const EventLoop = struct {
                 }
             },
             else => {},
+        }
+    }
+
+    // ── Peer timeout ───────────────────────────────────────
+
+    fn checkPeerTimeouts(self: *EventLoop) void {
+        const now = std.time.timestamp();
+        for (self.peers, 0..) |*peer, i| {
+            if (peer.state == .free or peer.state == .disconnecting) continue;
+            if (peer.last_activity == 0) continue;
+            if (peer.mode == .seed) continue; // don't timeout seed peers
+
+            if (now - peer.last_activity > peer_timeout_secs) {
+                self.removePeer(@intCast(i));
+            }
         }
     }
 
