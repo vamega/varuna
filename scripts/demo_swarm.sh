@@ -68,7 +68,7 @@ mise exec -- node "$ROOT_DIR/scripts/create_torrent.mjs" \
 
 mise exec -- zig build >/dev/null
 
-INFO_HASH="$("$ROOT_DIR/zig-out/bin/varuna" inspect "$TORRENT_PATH" | awk -F= '/^info_hash=/{print $2}')"
+INFO_HASH="$("$ROOT_DIR/zig-out/bin/varuna-tools" inspect "$TORRENT_PATH" | awk -F= '/^info_hash=/{print $2}')"
 if [[ -z "$INFO_HASH" ]]; then
   echo "failed to extract torrent info hash" >&2
   exit 1
@@ -78,11 +78,11 @@ fi
 TRACKER_PID="$!"
 wait_for_tcp 127.0.0.1 "$TRACKER_PORT"
 
-"$ROOT_DIR/zig-out/bin/varuna" seed "$TORRENT_PATH" "$WORK_DIR/seed-root" --port "$SEED_PORT" >"$SEED_LOG" 2>&1 &
+"$ROOT_DIR/zig-out/bin/varuna-tools" seed "$TORRENT_PATH" "$WORK_DIR/seed-root" --port "$SEED_PORT" >"$SEED_LOG" 2>&1 &
 SEED_PID="$!"
 wait_for_log "$SEED_LOG" "seed announce accepted"
 
-"$ROOT_DIR/zig-out/bin/varuna" download "$TORRENT_PATH" "$WORK_DIR/download-root" --port "$DOWNLOAD_PORT" | tee "$DOWNLOAD_LOG"
+"$ROOT_DIR/zig-out/bin/varuna-tools" download "$TORRENT_PATH" "$WORK_DIR/download-root" --port "$DOWNLOAD_PORT" | tee "$DOWNLOAD_LOG"
 
 wait "$SEED_PID"
 SEED_PID=""
