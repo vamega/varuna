@@ -343,6 +343,26 @@ pub fn download(
         }
     }
 
+    // Drain remaining hasher results and disk writes.
+    // The hasher thread may still be processing when the download loop exits
+    // (the hash and disk write happen asynchronously after piece data is received).
+    {
+        var drain_ticks: u32 = 0;
+        while (drain_ticks < 200) : (drain_ticks += 1) {
+            event_loop.processHashResults();
+            if (event_loop.pending_writes.items.len > 0) {
+                // Have pending writes, tick to process disk write CQEs
+                event_loop.submitTimeout(10 * std.time.ns_per_ms) catch {};
+                event_loop.tick() catch break;
+            } else if (drain_ticks > 10) {
+                break;
+            } else {
+                // Wait for hasher to produce results
+                std.Thread.sleep(5 * std.time.ns_per_ms);
+            }
+        }
+    }
+
     // Sync files
     store.sync() catch {};
 

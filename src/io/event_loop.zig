@@ -110,6 +110,11 @@ pub const EventLoop = struct {
         spans_remaining: u32,
     };
 
+    const PendingSend = struct {
+        buf: []u8,
+        slot: u16,
+    };
+
     ring: linux.IoUring,
     allocator: std.mem.Allocator,
     peers: []Peer,
@@ -133,8 +138,10 @@ pub const EventLoop = struct {
     timeout_ts: linux.kernel_timespec = .{ .sec = 2, .nsec = 0 },
 
     // Pending disk writes: track buffers that io_uring is writing to disk.
-    // Each entry is freed when all write CQEs for that piece complete.
     pending_writes: std.ArrayList(PendingWrite),
+
+    // Pending sends: track allocated send buffers (for seed piece responses).
+    pending_sends: std.ArrayList(PendingSend),
 
 
     // Background hasher for SHA verification (off event loop thread)
@@ -163,6 +170,7 @@ pub const EventLoop = struct {
             .info_hash = session.metainfo.info_hash,
             .peer_id = peer_id,
             .pending_writes = std.ArrayList(PendingWrite).empty,
+            .pending_sends = std.ArrayList(PendingSend).empty,
             .hasher = hasher,
         };
     }
@@ -172,11 +180,15 @@ pub const EventLoop = struct {
             h.deinit();
             self.allocator.destroy(h);
         }
-        // Free any pending write buffers
+        // Free any pending write/send buffers
         for (self.pending_writes.items) |pending| {
             self.allocator.free(pending.buf);
         }
         self.pending_writes.deinit(self.allocator);
+        for (self.pending_sends.items) |ps| {
+            self.allocator.free(ps.buf);
+        }
+        self.pending_sends.deinit(self.allocator);
         for (self.peers) |*peer| {
             self.cleanupPeer(peer);
         }
@@ -352,6 +364,12 @@ pub const EventLoop = struct {
     }
 
     fn handleSend(self: *EventLoop, slot: u16, cqe: linux.io_uring_cqe) void {
+        // Check if this was a tracked send buffer (context=1 from servePieceRequest)
+        const op = decodeUserData(cqe.user_data);
+        if (op.context == 1) {
+            self.freePendingSend(slot);
+        }
+
         const peer = &self.peers[slot];
         if (cqe.res <= 0) {
             self.removePeer(slot);
@@ -658,37 +676,40 @@ pub const EventLoop = struct {
         const read_buf = self.allocator.alloc(u8, piece_size) catch return;
         defer self.allocator.free(read_buf);
 
-        // Blocking read from shared fds -- this is synchronous but short
+        // Read from disk (blocking pread -- small, from page cache)
         // TODO: use io_uring pread for fully async disk read
         for (plan.spans) |span| {
             const block = read_buf[span.piece_offset .. span.piece_offset + span.length];
             _ = posix.pread(self.shared_fds[span.file_index], block, span.file_offset) catch return;
         }
 
-        // Build and send piece message: 4-byte len + id(7) + piece_index + block_offset + data
+        // Build complete piece message in one buffer: 4-byte len + id(7) + piece_index + block_offset + data
         const msg_len: u32 = 1 + 8 + block_length;
-        var header: [13]u8 = undefined;
-        std.mem.writeInt(u32, header[0..4], msg_len, .big);
-        header[4] = 7; // piece message id
-        std.mem.writeInt(u32, header[5..9], piece_index, .big);
-        std.mem.writeInt(u32, header[9..13], block_offset, .big);
+        const total_len: usize = 4 + @as(usize, msg_len);
+        const send_buf = self.allocator.alloc(u8, total_len) catch return;
 
-        const peer = &self.peers[slot];
-        // Send header via io_uring
-        @memcpy(peer.handshake_buf[0..13], &header);
-        const ud = encodeUserData(.{ .slot = slot, .op_type = .peer_send, .context = 0 });
-        _ = self.ring.send(ud, peer.fd, peer.handshake_buf[0..13], 0) catch return;
-        peer.send_pending = true;
+        std.mem.writeInt(u32, send_buf[0..4], msg_len, .big);
+        send_buf[4] = 7;
+        std.mem.writeInt(u32, send_buf[5..9], piece_index, .big);
+        std.mem.writeInt(u32, send_buf[9..13], block_offset, .big);
+        @memcpy(send_buf[13..total_len], read_buf[@intCast(block_offset)..][0..block_length]);
 
-        // Send block data -- allocate a buffer that outlives this function
-        const send_buf = self.allocator.alloc(u8, block_length) catch return;
-        @memcpy(send_buf, read_buf[@intCast(block_offset)..][0..block_length]);
-        const ud2 = encodeUserData(.{ .slot = slot, .op_type = .peer_send, .context = 1 }); // context=1 means free buffer
-        _ = self.ring.send(ud2, peer.fd, send_buf, 0) catch {
+        // Track the send buffer for cleanup after CQE
+        self.pending_sends.append(self.allocator, .{
+            .buf = send_buf,
+            .slot = slot,
+        }) catch {
             self.allocator.free(send_buf);
             return;
         };
-        // TODO: free send_buf when send completes (need to track allocated send buffers)
+
+        const peer = &self.peers[slot];
+        const ud = encodeUserData(.{ .slot = slot, .op_type = .peer_send, .context = 1 }); // context=1 means tracked send
+        _ = self.ring.send(ud, peer.fd, send_buf, 0) catch {
+            self.allocator.free(send_buf);
+            return;
+        };
+        peer.send_pending = true;
     }
 
     // ── Piece download coordination ───────────────────────
@@ -782,7 +803,7 @@ pub const EventLoop = struct {
 
     /// Process completed hash results from the background hasher.
     /// Called each tick from the event loop.
-    fn processHashResults(self: *EventLoop) void {
+    pub fn processHashResults(self: *EventLoop) void {
         const h = self.hasher orelse return;
         const results = h.drainResults();
         for (results) |result| {
@@ -871,6 +892,18 @@ pub const EventLoop = struct {
             const ud = encodeUserData(.{ .slot = slot, .op_type = .peer_send, .context = 0 });
             _ = try self.ring.send(ud, peer.fd, peer.handshake_buf[0..5], 0);
             peer.send_pending = true;
+        }
+    }
+
+    fn freePendingSend(self: *EventLoop, slot: u16) void {
+        var i: usize = 0;
+        while (i < self.pending_sends.items.len) {
+            if (self.pending_sends.items[i].slot == slot) {
+                self.allocator.free(self.pending_sends.items[i].buf);
+                _ = self.pending_sends.swapRemove(i);
+                return;
+            }
+            i += 1;
         }
     }
 
