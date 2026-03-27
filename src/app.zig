@@ -252,10 +252,9 @@ fn runCreate(
     writer: *std.Io.Writer,
 ) !void {
     const is_dir = blk: {
-        _ = std.fs.cwd().statFile(file_path) catch |err| {
-            break :blk err == error.IsDir;
-        };
-        break :blk false;
+        var dir = std.fs.cwd().openDir(file_path, .{}) catch break :blk false;
+        dir.close();
+        break :blk true;
     };
 
     const torrent_bytes = if (is_dir)
