@@ -169,6 +169,11 @@ pub const EventLoop = struct {
     // Pending sends: track allocated send buffers (for seed piece responses).
     pending_sends: std.ArrayList(PendingSend),
 
+    // Piece read cache for seed mode (avoid re-reading from disk per block)
+    cached_piece_index: ?u32 = null,
+    cached_piece_data: ?[]u8 = null,
+    cached_piece_len: usize = 0,
+
     // Background hasher for SHA verification (off event loop thread)
     last_unchoke_recalc: i64 = 0,
     hasher: ?*Hasher = null,
@@ -254,6 +259,8 @@ pub const EventLoop = struct {
             h.deinit();
             self.allocator.destroy(h);
         }
+        // Free piece cache
+        if (self.cached_piece_data) |d| self.allocator.free(d);
         // Free any pending write/send buffers
         for (self.pending_writes.items) |pending| {
             self.allocator.free(pending.buf);
@@ -365,6 +372,9 @@ pub const EventLoop = struct {
         for (cqes[0..count]) |cqe| {
             self.dispatch(cqe);
         }
+
+        // Flush any SQEs queued during dispatch (piece responses, block requests, etc.)
+        _ = self.ring.submit() catch {};
     }
 
     /// Submit a timeout SQE so that submit_and_wait returns even if
@@ -843,19 +853,29 @@ pub const EventLoop = struct {
         const piece_size = self.session.layout.pieceSize(piece_index) catch return;
         if (block_offset + block_length > piece_size) return;
 
-        // Read piece data from disk
-        const plan = storage.verify.planPieceVerification(self.allocator, self.session, piece_index) catch return;
-        defer storage.verify.freePiecePlan(self.allocator, plan);
+        // Read piece data from disk (cached to avoid re-reading for each block)
+        if (self.cached_piece_index == null or self.cached_piece_index.? != piece_index) {
+            const plan = storage.verify.planPieceVerification(self.allocator, self.session, piece_index) catch return;
+            defer storage.verify.freePiecePlan(self.allocator, plan);
 
-        const read_buf = self.allocator.alloc(u8, piece_size) catch return;
-        defer self.allocator.free(read_buf);
+            if (self.cached_piece_data) |old| {
+                if (old.len < piece_size) {
+                    self.allocator.free(old);
+                    self.cached_piece_data = self.allocator.alloc(u8, piece_size) catch return;
+                }
+            } else {
+                self.cached_piece_data = self.allocator.alloc(u8, piece_size) catch return;
+            }
 
-        // Read from disk (blocking pread -- small, from page cache)
-        // TODO: use io_uring pread for fully async disk read
-        for (plan.spans) |span| {
-            const block = read_buf[span.piece_offset .. span.piece_offset + span.length];
-            _ = posix.pread(self.shared_fds[span.file_index], block, span.file_offset) catch return;
+            const read_buf = self.cached_piece_data.?;
+            for (plan.spans) |span| {
+                const block = read_buf[span.piece_offset .. span.piece_offset + span.length];
+                _ = posix.pread(self.shared_fds[span.file_index], block, span.file_offset) catch return;
+            }
+            self.cached_piece_index = piece_index;
+            self.cached_piece_len = piece_size;
         }
+        const read_buf = self.cached_piece_data.?;
 
         // Build complete piece message in one buffer: 4-byte len + id(7) + piece_index + block_offset + data
         const msg_len: u32 = 1 + 8 + block_length;
