@@ -104,6 +104,12 @@ pub const Peer = struct {
 // ── Event loop ────────────────────────────────────────────
 
 pub const EventLoop = struct {
+    const PendingWrite = struct {
+        piece_index: u32,
+        buf: []u8,
+        spans_remaining: u32,
+    };
+
     ring: linux.IoUring,
     allocator: std.mem.Allocator,
     peers: []Peer,
@@ -125,6 +131,11 @@ pub const EventLoop = struct {
 
     // Timeout storage (must outlive the SQE)
     timeout_ts: linux.kernel_timespec = .{ .sec = 2, .nsec = 0 },
+
+    // Pending disk writes: track buffers that io_uring is writing to disk.
+    // Each entry is freed when all write CQEs for that piece complete.
+    pending_writes: std.ArrayList(PendingWrite),
+
 
     // Background hasher for SHA verification (off event loop thread)
     hasher: ?*Hasher = null,
@@ -151,6 +162,7 @@ pub const EventLoop = struct {
             .shared_fds = shared_fds,
             .info_hash = session.metainfo.info_hash,
             .peer_id = peer_id,
+            .pending_writes = std.ArrayList(PendingWrite).empty,
             .hasher = hasher,
         };
     }
@@ -160,6 +172,11 @@ pub const EventLoop = struct {
             h.deinit();
             self.allocator.destroy(h);
         }
+        // Free any pending write buffers
+        for (self.pending_writes.items) |pending| {
+            self.allocator.free(pending.buf);
+        }
+        self.pending_writes.deinit(self.allocator);
         for (self.peers) |*peer| {
             self.cleanupPeer(peer);
         }
@@ -519,17 +536,28 @@ pub const EventLoop = struct {
 
     fn handleDiskWrite(self: *EventLoop, slot: u16, cqe: linux.io_uring_cqe) void {
         _ = slot;
-        // Piece write completed via io_uring -- mark piece as done.
-        // The piece_index is encoded in the op context.
         const op = decodeUserData(cqe.user_data);
         const piece_index: u32 = @intCast(op.context);
-        if (piece_index < self.session.pieceCount()) {
-            const piece_length = self.session.layout.pieceSize(piece_index) catch 0;
-            _ = self.piece_tracker.completePiece(piece_index, piece_length);
+
+        // Find the pending write for this piece and decrement spans_remaining
+        var i: usize = 0;
+        while (i < self.pending_writes.items.len) {
+            const pending_w = &self.pending_writes.items[i];
+            if (pending_w.piece_index == piece_index) {
+                pending_w.spans_remaining -= 1;
+                if (pending_w.spans_remaining == 0) {
+                    // All spans written -- mark piece complete and free buffer
+                    if (piece_index < self.session.pieceCount()) {
+                        const piece_length = self.session.layout.pieceSize(piece_index) catch 0;
+                        _ = self.piece_tracker.completePiece(piece_index, piece_length);
+                    }
+                    self.allocator.free(pending_w.buf);
+                    _ = self.pending_writes.swapRemove(i);
+                }
+                return;
+            }
+            i += 1;
         }
-        // Note: piece_buf is freed after all spans are written.
-        // For simplicity, we free on the last span write.
-        // TODO: track span write count for multi-span pieces.
     }
 
     // ── Message processing ────────────────────────────────
@@ -760,15 +788,33 @@ pub const EventLoop = struct {
         for (results) |result| {
             if (result.valid) {
                 // Write verified piece to disk via io_uring
-                const plan = storage.verify.planPieceVerification(self.allocator, self.session, result.piece_index) catch continue;
+                const plan = storage.verify.planPieceVerification(self.allocator, self.session, result.piece_index) catch {
+                    self.allocator.free(result.piece_buf);
+                    continue;
+                };
                 defer storage.verify.freePiecePlan(self.allocator, plan);
+
+                const span_count: u32 = @intCast(plan.spans.len);
+                if (span_count == 0) {
+                    self.allocator.free(result.piece_buf);
+                    continue;
+                }
+
+                // Track the buffer so we can free it after all writes complete
+                self.pending_writes.append(self.allocator, .{
+                    .piece_index = result.piece_index,
+                    .buf = result.piece_buf,
+                    .spans_remaining = span_count,
+                }) catch {
+                    self.allocator.free(result.piece_buf);
+                    continue;
+                };
 
                 for (plan.spans) |span| {
                     const block = result.piece_buf[span.piece_offset .. span.piece_offset + span.length];
                     const ud = encodeUserData(.{ .slot = result.slot, .op_type = .disk_write, .context = @intCast(result.piece_index) });
                     _ = self.ring.write(ud, self.shared_fds[span.file_index], block, span.file_offset) catch continue;
                 }
-                // Piece completion finalized in handleDiskWrite
             } else {
                 // Hash mismatch -- release piece back to pool
                 self.piece_tracker.releasePiece(result.piece_index);

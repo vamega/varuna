@@ -5,6 +5,15 @@ Keep the root minimal and move implementation under `src/` as the codebase forms
 
 Keep [DECISIONS.md](DECISIONS.md) updated whenever scope, constraints, architecture choices, or profiling strategy change. Keep [STATUS.md](STATUS.md) updated with completed work, next work, and known issues. Keep [perf/README.md](perf/README.md) aligned with the actual profiling workflow and available build steps. When existing markdown files are no longer enough to capture ongoing decisions, plans, workflows, compatibility notes, or risks, add a new markdown file in the appropriate location and link it from `AGENTS.md` plus the most relevant existing document so later agents can discover it quickly.
 
+## Progress Reports & Work Log
+After completing meaningful work (bug fixes, new features, architectural changes), write a short report in `progress-reports/`. Each file should be named descriptively (e.g., `2026-03-27-connect-sqe-dangling-pointer.md`) and contain:
+- What was done and why
+- What was learned (especially non-obvious things about io_uring, Zig, or BitTorrent protocol)
+- Any remaining issues or follow-up work
+- Code references (file:line) for key changes
+
+This serves as institutional memory -- future agents can read these to understand past decisions, pitfalls encountered, and patterns that worked. Keep entries concise but include enough detail that someone unfamiliar with the change can understand the root cause and fix.
+
 ## Build, Test, and Development Commands
 Use Zig stable only: Zig `0.15.2` or the latest stable release, never nightly.
 Use `mise` to install project tools locally, and keep tool versions pinned in `mise.toml`.
