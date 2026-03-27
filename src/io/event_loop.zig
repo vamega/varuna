@@ -175,6 +175,12 @@ pub const EventLoop = struct {
     cached_piece_data: ?[]u8 = null,
     cached_piece_len: usize = 0,
 
+    // Re-announce state
+    announce_url: ?[]const u8 = null,
+    announce_interval: u32 = 1800,
+    last_announce_time: i64 = 0,
+    min_peers_for_reannounce: u16 = 1, // re-announce when below this
+
     // Background hasher for SHA verification (off event loop thread)
     last_unchoke_recalc: i64 = 0,
     hasher: ?*Hasher = null,
@@ -361,9 +367,17 @@ pub const EventLoop = struct {
     const optimistic_unchoke_slots: u32 = 1;
 
 
+    /// Configure re-announce parameters.
+    pub fn setAnnounce(self: *EventLoop, url: []const u8, interval: u32) void {
+        self.announce_url = url;
+        self.announce_interval = interval;
+        self.last_announce_time = std.time.timestamp();
+    }
+
     pub fn tick(self: *EventLoop) !void {
         self.processHashResults();
         self.checkPeerTimeouts();
+        self.checkReannounce();
         self.recalculateUnchokes();
         self.tryAssignPieces();
 
@@ -784,6 +798,41 @@ pub const EventLoop = struct {
                 }
             },
             else => {},
+        }
+    }
+
+    // ── Re-announce ─────────────────────────────────────────
+
+    fn checkReannounce(self: *EventLoop) void {
+        const url = self.announce_url orelse return;
+        if (self.peer_count >= self.min_peers_for_reannounce) return;
+
+        const now = std.time.timestamp();
+        if (now - self.last_announce_time < @as(i64, self.announce_interval)) return;
+
+        self.last_announce_time = now;
+
+        // Re-announce using a temporary blocking Ring (not on event loop ring)
+        const RingType = @import("ring.zig").Ring;
+        var tmp_ring = RingType.init(16) catch return;
+        defer tmp_ring.deinit();
+
+        const tc = self.getTorrentContext(0) orelse return;
+        const tracker_mod = @import("../tracker/root.zig");
+        const response = tracker_mod.announce.fetchAuto(self.allocator, &tmp_ring, .{
+            .announce_url = url,
+            .info_hash = tc.info_hash,
+            .peer_id = tc.peer_id,
+            .port = 6881, // TODO: get from config
+            .left = if (self.piece_tracker.isComplete()) 0 else self.piece_tracker.bytesRemaining(),
+            .event = null,
+        }) catch return;
+        defer tracker_mod.announce.freeResponse(self.allocator, response);
+
+        // Add new peers
+        for (response.peers) |peer| {
+            if (self.peer_count >= max_peers) break;
+            _ = self.addPeer(peer.address) catch continue;
         }
     }
 

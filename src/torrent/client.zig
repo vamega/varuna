@@ -303,6 +303,9 @@ pub fn download(
         return error.NoReachablePeers;
     }
 
+    // Configure re-announce so the event loop can find new peers
+    event_loop.setAnnounce(announce_url, response.interval);
+
     try logStatus(options.status_writer, "connecting to {} peers via event loop\n", .{peers_added});
 
     // Run event loop with periodic progress reporting
