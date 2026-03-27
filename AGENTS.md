@@ -72,6 +72,8 @@ When adding new I/O paths to the daemon, always use the Ring or event loop. Veri
 
 See [docs/io-uring-syscalls.md](docs/io-uring-syscalls.md) for the full syscall reference, current io_uring coverage, and notes on DNS resolution, SHA hardware acceleration, and SQLite resume state.
 
+See [docs/future-features.md](docs/future-features.md) for planned features: systemd-notify, SHA-NI acceleration, uTP, SO_BINDTODEVICE, socket activation, UDP tracker, DHT/PEX, magnet links, encryption.
+
 ## Coding Style & Naming Conventions
 Use `zig fmt` as the formatting authority. Prefer small modules, explicit ownership, and low-allocation designs. Default to arena or slab-backed allocation where dynamic memory is unavoidable. Use `snake_case` for files, functions, and local variables; `PascalCase` for types; and descriptive subsystem names like `piece_picker.zig` or `disk_scheduler.zig`. Keep Linux- and io_uring-specific code explicit rather than hidden behind generic abstractions.
 
