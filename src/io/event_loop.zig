@@ -123,6 +123,9 @@ pub const EventLoop = struct {
     // Complete pieces bitfield (for seeding -- which pieces we can serve)
     complete_pieces: ?*const Bitfield = null,
 
+    // Timeout storage (must outlive the SQE)
+    timeout_ts: linux.kernel_timespec = .{ .sec = 2, .nsec = 0 },
+
     // Background hasher for SHA verification (off event loop thread)
     hasher: ?*Hasher = null,
 
@@ -165,6 +168,12 @@ pub const EventLoop = struct {
     }
 
     pub fn addPeer(self: *EventLoop, address: std.net.Address) !u16 {
+        // Validate address family
+        const family = address.any.family;
+        if (family != posix.AF.INET and family != posix.AF.INET6) {
+            return error.InvalidAddressFamily;
+        }
+
         const slot = self.allocSlot() orelse return error.TooManyPeers;
         const peer = &self.peers[slot];
         peer.* = Peer{
@@ -173,14 +182,15 @@ pub const EventLoop = struct {
         };
 
         const fd = try posix.socket(
-            address.any.family,
+            family,
             posix.SOCK.STREAM | posix.SOCK.CLOEXEC | posix.SOCK.NONBLOCK,
             posix.IPPROTO.TCP,
         );
         peer.fd = fd;
 
         const ud = encodeUserData(.{ .slot = slot, .op_type = .peer_connect, .context = 0 });
-        _ = try self.ring.connect(ud, fd, &address.any, address.getOsSockLen());
+        // Use peer.address (stored in slot) not the parameter (stack-local, dangling after return)
+        _ = try self.ring.connect(ud, fd, &peer.address.any, peer.address.getOsSockLen());
 
         self.peer_count += 1;
         return slot;
@@ -240,12 +250,12 @@ pub const EventLoop = struct {
     /// Submit a timeout SQE so that submit_and_wait returns even if
     /// no I/O completes. This allows the caller to do periodic work.
     pub fn submitTimeout(self: *EventLoop, timeout_ns: u64) !void {
-        const ts = linux.kernel_timespec{
+        self.timeout_ts = .{
             .sec = @intCast(timeout_ns / std.time.ns_per_s),
             .nsec = @intCast(timeout_ns % std.time.ns_per_s),
         };
         const ud = encodeUserData(.{ .slot = 0, .op_type = .timeout, .context = 0 });
-        _ = try self.ring.timeout(ud, &ts, 0, 0);
+        _ = try self.ring.timeout(ud, &self.timeout_ts, 0, 0);
     }
 
     pub fn stop(self: *EventLoop) void {

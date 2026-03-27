@@ -313,7 +313,10 @@ pub fn download(
 
     const signal = @import("../io/signal.zig");
     while (!piece_tracker.isComplete() and event_loop.peer_count > 0 and !signal.isShutdownRequested()) {
-        event_loop.tick() catch break;
+        event_loop.tick() catch |err| {
+            try logStatus(options.status_writer, "tick error: {s}, peers={}\n", .{ @errorName(err), event_loop.peer_count });
+            break;
+        };
 
         // Report progress
         const current_count = piece_tracker.completedCount();
