@@ -37,6 +37,10 @@ pub fn main() !void {
 
     // Session manager
     var session_manager = varuna.daemon.session_manager.SessionManager.init(allocator);
+    session_manager.port = cfg.network.port;
+    session_manager.max_peers = cfg.network.max_peers;
+    session_manager.hasher_threads = cfg.performance.hasher_threads;
+    if (cfg.storage.data_dir) |dir| session_manager.default_save_path = dir;
     defer session_manager.deinit();
 
     // API handler

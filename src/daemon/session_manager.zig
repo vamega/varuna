@@ -8,6 +8,10 @@ pub const SessionManager = struct {
     allocator: std.mem.Allocator,
     mutex: std.Thread.Mutex = .{},
     sessions: std.StringHashMap(*TorrentSession),
+    default_save_path: []const u8 = "/tmp/varuna-downloads",
+    port: u16 = 6881,
+    max_peers: u32 = 50,
+    hasher_threads: u32 = 4,
 
     pub fn init(allocator: std.mem.Allocator) SessionManager {
         return .{
@@ -36,6 +40,10 @@ pub const SessionManager = struct {
 
         session.* = try TorrentSession.create(self.allocator, torrent_bytes, save_path);
         errdefer session.deinit();
+
+        session.port = self.port;
+        session.max_peers = self.max_peers;
+        session.hasher_threads = self.hasher_threads;
 
         const hash_hex = session.info_hash_hex;
 

@@ -6,6 +6,8 @@ const tracker = @import("../tracker/root.zig");
 const Ring = @import("../io/ring.zig").Ring;
 const EventLoop = @import("../io/event_loop.zig").EventLoop;
 const PieceTracker = @import("../torrent/piece_tracker.zig").PieceTracker;
+const signal = @import("../io/signal.zig");
+const peer_id_mod = @import("../torrent/peer_id.zig");
 
 pub const State = enum {
     checking,
@@ -18,7 +20,7 @@ pub const State = enum {
 
 pub const Stats = struct {
     state: State,
-    progress: f64, // 0.0 to 1.0
+    progress: f64,
     download_speed: u64 = 0,
     upload_speed: u64 = 0,
     pieces_have: u32 = 0,
@@ -31,6 +33,7 @@ pub const Stats = struct {
     info_hash_hex: [40]u8 = [_]u8{'0'} ** 40,
     save_path: []const u8 = "",
     added_on: i64 = 0,
+    error_msg: ?[]const u8 = null,
 };
 
 pub const TorrentSession = struct {
@@ -38,17 +41,30 @@ pub const TorrentSession = struct {
     state: State = .stopped,
     torrent_bytes: []const u8,
     save_path: []const u8,
-    session: ?session_mod.Session = null,
-    piece_tracker: ?PieceTracker = null,
-    store: ?storage.writer.PieceStore = null,
-    ring: ?Ring = null,
-    shared_fds: ?[]posix.fd_t = null,
+
+    // Parsed metadata
     info_hash: [20]u8,
     info_hash_hex: [40]u8,
     name: []const u8,
     total_size: u64,
     piece_count: u32,
     added_on: i64,
+    peer_id: [20]u8,
+
+    // Runtime state (created on start, freed on stop)
+    session: ?session_mod.Session = null,
+    piece_tracker: ?PieceTracker = null,
+    store: ?storage.writer.PieceStore = null,
+    ring: ?Ring = null,
+    shared_fds: ?[]posix.fd_t = null,
+    event_loop: ?EventLoop = null,
+    thread: ?std.Thread = null,
+
+    // Config
+    port: u16 = 6881,
+    max_peers: u32 = 50,
+    hasher_threads: u32 = 4,
+
     error_message: ?[]const u8 = null,
 
     pub fn create(
@@ -56,7 +72,6 @@ pub const TorrentSession = struct {
         torrent_bytes: []const u8,
         save_path: []const u8,
     ) !TorrentSession {
-        // Parse torrent metadata without fully loading session
         const owned_bytes = try allocator.dupe(u8, torrent_bytes);
         errdefer allocator.free(owned_bytes);
 
@@ -79,6 +94,7 @@ pub const TorrentSession = struct {
             .total_size = meta.totalSize(),
             .piece_count = try meta.pieceCount(),
             .added_on = std.time.timestamp(),
+            .peer_id = peer_id_mod.generate(),
         };
     }
 
@@ -94,18 +110,16 @@ pub const TorrentSession = struct {
         if (self.state == .downloading or self.state == .seeding or self.state == .checking) return;
 
         self.state = .checking;
-        // Load session, recheck, announce -- on a background thread
-        const thread = std.Thread.spawn(.{}, startWorker, .{self}) catch {
+        self.thread = std.Thread.spawn(.{}, startWorker, .{self}) catch {
             self.state = .@"error";
             return;
         };
-        thread.detach();
     }
 
     pub fn pause(self: *TorrentSession) void {
         if (self.state == .downloading or self.state == .seeding) {
             self.state = .paused;
-            // TODO: stop event loop, disconnect peers
+            if (self.event_loop) |*el| el.stop();
         }
     }
 
@@ -116,6 +130,11 @@ pub const TorrentSession = struct {
     }
 
     pub fn stop(self: *TorrentSession) void {
+        if (self.event_loop) |*el| el.stop();
+        if (self.thread) |t| {
+            t.join();
+            self.thread = null;
+        }
         self.stopInternal();
         self.state = .stopped;
     }
@@ -137,9 +156,12 @@ pub const TorrentSession = struct {
             .info_hash_hex = self.info_hash_hex,
             .save_path = self.save_path,
             .added_on = self.added_on,
-            .peers_connected = 0, // TODO: from event loop
+            .peers_connected = if (self.event_loop) |*el| el.peer_count else 0,
+            .error_msg = self.error_message,
         };
     }
+
+    // ── Background thread ─────────────────────────────────
 
     fn startWorker(self: *TorrentSession) void {
         self.doStart() catch |err| {
@@ -149,24 +171,21 @@ pub const TorrentSession = struct {
     }
 
     fn doStart(self: *TorrentSession) !void {
-        // Initialize ring for file I/O
         const ring = try Ring.init(16);
         self.ring = ring;
 
-        // Load session
         const session = try session_mod.Session.load(self.allocator, self.torrent_bytes, self.save_path);
         self.session = session;
 
-        // Create PieceStore
         const store = try storage.writer.PieceStore.init(self.allocator, &self.session.?, &self.ring.?);
         self.store = store;
 
-        // Recheck existing data
+        // Recheck
+        self.state = .checking;
         var recheck = try storage.verify.recheckExistingData(self.allocator, &self.session.?, &self.store.?, null);
         defer recheck.deinit(self.allocator);
 
-        // Create piece tracker
-        self.piece_tracker = try PieceTracker.init(
+        const piece_tracker = try PieceTracker.init(
             self.allocator,
             session.pieceCount(),
             session.layout.piece_length,
@@ -174,16 +193,103 @@ pub const TorrentSession = struct {
             &recheck.complete_pieces,
             recheck.bytes_complete,
         );
+        self.piece_tracker = piece_tracker;
 
         if (recheck.bytes_complete == session.totalSize()) {
             self.state = .seeding;
-        } else {
-            self.state = .downloading;
-            // TODO: announce to tracker, start event loop with peers
+            // TODO: announce as seeder, accept inbound peers
+            return;
+        }
+
+        // Download: announce to tracker, get peers, run event loop
+        self.state = .downloading;
+
+        const announce_url = session.metainfo.announce orelse return error.MissingAnnounceUrl;
+        const announce_response = tracker.announce.fetchViaRing(self.allocator, &self.ring.?, .{
+            .announce_url = announce_url,
+            .info_hash = session.metainfo.info_hash,
+            .peer_id = self.peer_id,
+            .port = self.port,
+            .left = session.totalSize() - recheck.bytes_complete,
+        }) catch {
+            self.state = .@"error";
+            self.error_message = std.fmt.allocPrint(self.allocator, "tracker announce failed: {s}", .{announce_url}) catch null;
+            return;
+        };
+        defer tracker.announce.freeResponse(self.allocator, announce_response);
+
+        if (announce_response.peers.len == 0) {
+            self.state = .@"error";
+            self.error_message = std.fmt.allocPrint(self.allocator, "no peers from tracker", .{}) catch null;
+            return;
+        }
+
+        // Get shared file handles
+        const shared_fds = try self.store.?.fileHandles(self.allocator);
+        self.shared_fds = shared_fds;
+
+        // Create and run event loop
+        const event_loop = try EventLoop.init(
+            self.allocator,
+            &self.session.?,
+            &self.piece_tracker.?,
+            shared_fds,
+            self.peer_id,
+            self.hasher_threads,
+        );
+        self.event_loop = event_loop;
+
+        // Add peers
+        var peers_added: u32 = 0;
+        for (announce_response.peers) |peer| {
+            if (peers_added >= self.max_peers) break;
+            _ = self.event_loop.?.addPeer(peer.address) catch continue;
+            peers_added += 1;
+        }
+
+        if (peers_added == 0) {
+            self.state = .@"error";
+            self.error_message = std.fmt.allocPrint(self.allocator, "could not connect to any peers", .{}) catch null;
+            return;
+        }
+
+        // Submit timeout for periodic checks
+        self.event_loop.?.submitTimeout(2 * std.time.ns_per_s) catch {};
+
+        // Run event loop until complete, paused, or shutdown
+        while (self.state == .downloading and !signal.isShutdownRequested()) {
+            self.event_loop.?.tick() catch break;
+
+            if (self.piece_tracker.?.isComplete()) {
+                self.state = .seeding;
+                self.store.?.sync() catch {};
+
+                // Send completed event (best-effort)
+                if (tracker.announce.fetchViaRing(self.allocator, &self.ring.?, .{
+                    .announce_url = announce_url,
+                    .info_hash = session.metainfo.info_hash,
+                    .peer_id = self.peer_id,
+                    .port = self.port,
+                    .left = 0,
+                    .event = .completed,
+                })) |resp| {
+                    tracker.announce.freeResponse(self.allocator, resp);
+                } else |_| {}
+                break;
+            }
+
+            if (self.event_loop.?.peer_count == 0) break;
+
+            // Re-submit timeout
+            self.event_loop.?.submitTimeout(2 * std.time.ns_per_s) catch {};
         }
     }
 
     fn stopInternal(self: *TorrentSession) void {
+        if (self.event_loop) |*el| {
+            el.deinit();
+            self.event_loop = null;
+        }
         if (self.shared_fds) |fds| {
             self.allocator.free(fds);
             self.shared_fds = null;

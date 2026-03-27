@@ -86,8 +86,7 @@ pub const ApiHandler = struct {
             return .{ .status = 400, .body = "{\"error\":\"no torrent data\"}" };
         }
 
-        // Use default save path
-        const save_path = "/tmp/varuna-downloads";
+        const save_path = self.session_manager.default_save_path;
         _ = self.session_manager.addTorrent(body, save_path) catch |err| {
             const msg = std.fmt.allocPrint(allocator, "{{\"error\":\"{s}\"}}", .{@errorName(err)}) catch
                 return .{ .status = 500, .body = "{\"error\":\"internal\"}" };

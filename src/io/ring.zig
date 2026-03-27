@@ -137,6 +137,11 @@ pub const Ring = struct {
         const connect_result = if (connect_cqe.user_data == 0) connect_cqe else timeout_cqe;
         const e = connect_result.err();
         if (e == .CANCELED) return error.ConnectionTimedOut;
+        if (e == .CONNREFUSED) return error.ConnectionRefused;
+        if (e == .CONNRESET) return error.ConnectionResetByPeer;
+        if (e == .NETUNREACH) return error.NetworkUnreachable;
+        if (e == .HOSTUNREACH) return error.HostUnreachable;
+        if (e == .TIMEDOUT) return error.ConnectionTimedOut;
         if (e != .SUCCESS) return posix.unexpectedErrno(e);
     }
 
@@ -168,8 +173,17 @@ pub const Ring = struct {
 
     fn checkCqe(cqe: linux.io_uring_cqe) !void {
         const e = cqe.err();
-        if (e != .SUCCESS) {
-            return posix.unexpectedErrno(e);
+        switch (e) {
+            .SUCCESS => {},
+            .CONNREFUSED => return error.ConnectionRefused,
+            .CONNRESET => return error.ConnectionResetByPeer,
+            .NETUNREACH => return error.NetworkUnreachable,
+            .HOSTUNREACH => return error.HostUnreachable,
+            .TIMEDOUT => return error.ConnectionTimedOut,
+            .PIPE => return error.BrokenPipe,
+            .CONNABORTED => return error.ConnectionAborted,
+            .CANCELED => return error.OperationCanceled,
+            else => return posix.unexpectedErrno(e),
         }
     }
 };
