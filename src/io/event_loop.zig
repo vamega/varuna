@@ -351,7 +351,7 @@ pub const EventLoop = struct {
 
     /// Run one iteration of the event loop. Blocks until at least one
     /// CQE is available. Returns the number of CQEs processed.
-    const peer_timeout_secs: i64 = 30;
+    const peer_timeout_secs: i64 = 60;
     const unchoke_interval_secs: i64 = 30;
     const max_unchoked: u32 = 4;
     const optimistic_unchoke_slots: u32 = 1;
