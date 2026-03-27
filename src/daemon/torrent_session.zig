@@ -120,11 +120,18 @@ pub const TorrentSession = struct {
         if (self.state == .downloading or self.state == .seeding) {
             self.state = .paused;
             if (self.event_loop) |*el| el.stop();
+            // Wait for background thread to exit
+            if (self.thread) |t| {
+                t.join();
+                self.thread = null;
+            }
         }
     }
 
     pub fn resume_session(self: *TorrentSession) void {
         if (self.state == .paused) {
+            // Clean up old resources before restarting
+            self.stopInternal();
             self.start();
         }
     }

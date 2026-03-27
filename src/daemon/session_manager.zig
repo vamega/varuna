@@ -45,19 +45,17 @@ pub const SessionManager = struct {
         session.max_peers = self.max_peers;
         session.hasher_threads = self.hasher_threads;
 
-        const hash_hex = session.info_hash_hex;
-
         self.mutex.lock();
         defer self.mutex.unlock();
 
-        // Check for duplicate
-        if (self.sessions.get(&hash_hex)) |_| {
+        // Check for duplicate -- use pointer to session's stable memory
+        if (self.sessions.get(&session.info_hash_hex)) |_| {
             session.deinit();
             self.allocator.destroy(session);
             return error.TorrentAlreadyExists;
         }
 
-        try self.sessions.put(&hash_hex, session);
+        try self.sessions.put(&session.info_hash_hex, session);
 
         // Auto-start
         session.start();
