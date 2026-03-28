@@ -15,6 +15,7 @@ pub const SessionManager = struct {
     port: u16 = 6881,
     max_peers: u32 = 50,
     hasher_threads: u32 = 4,
+    resume_db_path: ?[*:0]const u8 = null,
 
     pub fn init(allocator: std.mem.Allocator) SessionManager {
         return .{
@@ -47,6 +48,7 @@ pub const SessionManager = struct {
         session.port = self.port;
         session.max_peers = self.max_peers;
         session.hasher_threads = self.hasher_threads;
+        session.resume_db_path = self.resume_db_path;
 
         self.mutex.lock();
         defer self.mutex.unlock();

@@ -8,6 +8,7 @@ const EventLoop = @import("../io/event_loop.zig").EventLoop;
 const PieceTracker = @import("../torrent/piece_tracker.zig").PieceTracker;
 const signal = @import("../io/signal.zig");
 const peer_id_mod = @import("../torrent/peer_id.zig");
+const ResumeWriter = storage.resume_state.ResumeWriter;
 
 pub const State = enum {
     checking,
@@ -63,10 +64,15 @@ pub const TorrentSession = struct {
     pending_peers: ?[]std.net.Address = null, // peers waiting for main thread to add
     thread: ?std.Thread = null,
 
+    // Resume state persistence (runs on background thread)
+    resume_writer: ?ResumeWriter = null,
+    resume_last_count: u32 = 0,
+
     // Config
     port: u16 = 6881,
     max_peers: u32 = 50,
     hasher_threads: u32 = 4,
+    resume_db_path: ?[*:0]const u8 = null,
 
     error_message: ?[]const u8 = null,
 
@@ -138,6 +144,9 @@ pub const TorrentSession = struct {
                 t.join();
                 self.thread = null;
             }
+            // Flush resume state after thread has exited
+            self.persistNewCompletions();
+            self.flushResume();
         }
     }
 
@@ -234,10 +243,47 @@ pub const TorrentSession = struct {
         const store = try storage.writer.PieceStore.init(self.allocator, &self.session.?, &self.ring.?);
         self.store = store;
 
-        // Recheck
+        // Open resume DB and load known-complete pieces (fast path: skip rehash)
+        var resume_pieces: ?storage.verify.PieceSet = null;
+        defer if (resume_pieces) |*rp| rp.deinit(self.allocator);
+
+        if (self.resume_db_path) |db_path| {
+            if (ResumeWriter.init(db_path, session.metainfo.info_hash)) |rw| {
+                self.resume_writer = rw;
+                // Load known-complete pieces from DB
+                var bf = storage.verify.PieceSet.init(self.allocator, session.pieceCount()) catch null;
+                if (bf) |*loaded_bf| {
+                    const loaded_count = self.resume_writer.?.db.loadCompletePieces(session.metainfo.info_hash, loaded_bf) catch 0;
+                    if (loaded_count > 0) {
+                        resume_pieces = loaded_bf.*;
+                    } else {
+                        loaded_bf.deinit(self.allocator);
+                    }
+                }
+            } else |_| {}
+        }
+
+        // Recheck with resume fast path (skips hashing known-complete pieces)
         self.state = .checking;
-        var recheck = try storage.verify.recheckExistingData(self.allocator, &self.session.?, &self.store.?, null);
+        const known_ptr: ?*const storage.verify.PieceSet = if (resume_pieces) |*rp| rp else null;
+        var recheck = try storage.verify.recheckExistingData(self.allocator, &self.session.?, &self.store.?, known_ptr);
         defer recheck.deinit(self.allocator);
+
+        // Persist recheck results to resume DB for next startup
+        if (self.resume_writer) |*rw| {
+            var completed_pieces = std.ArrayList(u32).empty;
+            defer completed_pieces.deinit(self.allocator);
+            var idx: u32 = 0;
+            while (idx < session.pieceCount()) : (idx += 1) {
+                if (recheck.complete_pieces.has(idx)) {
+                    completed_pieces.append(self.allocator, idx) catch {};
+                }
+            }
+            if (completed_pieces.items.len > 0) {
+                rw.db.markCompleteBatch(session.metainfo.info_hash, completed_pieces.items) catch {};
+            }
+        }
+        self.resume_last_count = recheck.complete_pieces.count;
 
         const piece_tracker = try PieceTracker.init(
             self.allocator,
@@ -334,6 +380,9 @@ pub const TorrentSession = struct {
         while (self.state == .downloading and !signal.isShutdownRequested()) {
             self.event_loop.?.tick() catch break;
 
+            // Persist newly completed pieces to resume DB
+            self.persistNewCompletions();
+
             if (self.piece_tracker.?.isComplete()) {
                 var drain: u32 = 0;
                 while (drain < 200) : (drain += 1) {
@@ -350,6 +399,8 @@ pub const TorrentSession = struct {
 
                 self.state = .seeding;
                 self.store.?.sync() catch {};
+                self.persistNewCompletions();
+                self.flushResume();
 
                 if (tracker.announce.fetchAuto(self.allocator, &self.ring.?, .{
                     .announce_url = announce_url,
@@ -370,6 +421,15 @@ pub const TorrentSession = struct {
     }
 
     fn stopInternal(self: *TorrentSession) void {
+        // Flush resume state before tearing down (runs on caller's thread,
+        // which is always a background thread -- never the event loop thread)
+        self.persistNewCompletions();
+        self.flushResume();
+        if (self.resume_writer) |*rw| {
+            rw.deinit(self.allocator);
+            self.resume_writer = null;
+        }
+
         if (self.event_loop) |*el| {
             el.deinit();
             self.event_loop = null;
@@ -393,6 +453,36 @@ pub const TorrentSession = struct {
         if (self.ring) |*r| {
             r.deinit();
             self.ring = null;
+        }
+    }
+
+    // ── Resume persistence helpers ────────────────────────
+
+    /// Scan piece_tracker for newly completed pieces since last check
+    /// and queue them in the resume writer. Safe to call from any thread
+    /// (ResumeWriter.recordPiece is mutex-protected).
+    pub fn persistNewCompletions(self: *TorrentSession) void {
+        const rw = &(self.resume_writer orelse return);
+        const pt = &(self.piece_tracker orelse return);
+        const current_count = pt.completedCount();
+        if (current_count == self.resume_last_count) return;
+
+        // Scan for newly completed pieces
+        var i: u32 = 0;
+        while (i < self.piece_count) : (i += 1) {
+            if (pt.isPieceComplete(i)) {
+                rw.recordPiece(self.allocator, i) catch {};
+            }
+        }
+        self.resume_last_count = current_count;
+    }
+
+    /// Flush pending resume writes to SQLite. Safe to call from any
+    /// thread -- the actual SQLite I/O is blocking, which is fine
+    /// because this is never called from the io_uring event loop thread.
+    pub fn flushResume(self: *TorrentSession) void {
+        if (self.resume_writer) |*rw| {
+            rw.flush() catch {};
         }
     }
 };

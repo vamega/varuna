@@ -43,12 +43,35 @@ pub fn main() !void {
     };
     defer shared_el.deinit();
 
+    // Resolve resume DB path (config override or default XDG location)
+    var resume_db_buf: [1024]u8 = undefined;
+    const resume_db_path: ?[*:0]const u8 = blk: {
+        if (cfg.storage.resume_db) |p| {
+            const z = std.fmt.bufPrintZ(&resume_db_buf, "{s}", .{p}) catch break :blk null;
+            _ = z;
+            break :blk @ptrCast(&resume_db_buf);
+        }
+        // Default: ~/.local/share/varuna/resume.db
+        const home = std.posix.getenv("HOME") orelse break :blk null;
+        const z = std.fmt.bufPrintZ(&resume_db_buf, "{s}/.local/share/varuna/resume.db", .{home}) catch break :blk null;
+        _ = z;
+        // Ensure parent directory exists (e.g. ~/.local/share/varuna/)
+        const path_str = std.mem.span(@as([*:0]const u8, @ptrCast(&resume_db_buf)));
+        const dir_end = std.mem.lastIndexOfScalar(u8, path_str, '/') orelse break :blk null;
+        std.fs.makeDirAbsolute(resume_db_buf[0..dir_end]) catch |err| switch (err) {
+            error.PathAlreadyExists => {},
+            else => break :blk null,
+        };
+        break :blk @ptrCast(&resume_db_buf);
+    };
+
     // Session manager
     var session_manager = varuna.daemon.session_manager.SessionManager.init(allocator);
     session_manager.shared_event_loop = &shared_el;
     session_manager.port = cfg.network.port;
     session_manager.max_peers = cfg.network.max_peers;
     session_manager.hasher_threads = cfg.performance.hasher_threads;
+    session_manager.resume_db_path = resume_db_path;
     if (cfg.storage.data_dir) |dir| session_manager.default_save_path = dir;
     defer session_manager.deinit();
 
@@ -81,6 +104,7 @@ pub fn main() !void {
     shared_el.submitTimeout(100 * std.time.ns_per_ms) catch {};
 
     // Main loop: tick shared event loop + poll API server
+    var resume_tick_counter: u32 = 0;
     while (!varuna.io.signal.isShutdownRequested()) {
         // Poll API server (non-blocking)
         _ = api_server.poll() catch {};
@@ -94,6 +118,21 @@ pub fn main() !void {
                 const sess = entry.value_ptr.*;
                 if (sess.pending_peers != null) {
                     _ = sess.integrateIntoEventLoop();
+                }
+            }
+            session_manager.mutex.unlock();
+        }
+
+        // Periodically persist completed pieces to resume DB (~every 5s at 100ms tick)
+        resume_tick_counter +%= 1;
+        if (resume_tick_counter % 50 == 0) {
+            session_manager.mutex.lock();
+            var iter = session_manager.sessions.iterator();
+            while (iter.next()) |entry| {
+                const sess = entry.value_ptr.*;
+                if (sess.state == .downloading or sess.state == .seeding) {
+                    sess.persistNewCompletions();
+                    sess.flushResume();
                 }
             }
             session_manager.mutex.unlock();

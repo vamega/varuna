@@ -60,10 +60,10 @@ Update it whenever a milestone lands, the near-term backlog changes, or a new op
 - **Async seed disk reads**: `IORING_OP_READ` for serving piece requests, with piece cache. No blocking fallback.
 - **Batched block sends**: cache-hit piece block responses queued per tick and flushed as one combined send buffer per peer (~4x fewer send SQEs).
 - **Daemon end-to-end download verified**: tracker + seeder + daemon download with file comparison.
+- **Resume DB in daemon mode**: `TorrentSession` opens SQLite resume DB on start, loads known-complete pieces to skip rehash, persists new completions periodically (~5s), and flushes on stop/pause/shutdown. Shared DB path from config (`storage.resume_db`) or default `~/.local/share/varuna/resume.db`.
 
 ## Next
 
-- Resume DB integration in daemon mode (progress lost on daemon restart).
 - Daemon seeding after download (accept inbound peers, announce as seeder).
 - Per-torrent peer count in daemon stats (currently reports global count).
 - Investigate data corruption at ~17MB with 64KB pieces (see progress-reports/2026-03-28-async-pread-and-corruption.md).
@@ -73,7 +73,7 @@ Update it whenever a milestone lands, the near-term backlog changes, or a new op
 ## Known Issues
 
 - The packaged Ubuntu `opentracker` build used by `scripts/tracker.sh` requires explicit info-hash whitelisting (`--whitelist-hash`).
-- Resume currently depends on full piece recheck, which can be expensive on large datasets.
+- Resume fast path depends on SQLite DB integrity; if the DB is deleted or corrupted, a full recheck occurs (safe fallback).
 - Data corruption observed at ~17MB with 64KB pieces (300+ pieces). Works fine with 16KB pieces. Root cause under investigation.
 - Some restricted or sandboxed environments can interfere with local tracker startup and socket behavior.
 
