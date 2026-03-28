@@ -181,3 +181,28 @@ Follow-up triggers:
 - Convert to batched event loop when multi-peer concurrency is implemented.
 - Replace `std.http.Client` with ring-based HTTP when tracker round-trip time becomes a bottleneck.
 - Consider registered file descriptors and buffer rings for further kernel overhead reduction.
+
+### 2026-03-28: Speed Restrictions via Token Bucket
+
+Context:
+Rate limiting is a standard feature in BitTorrent clients. Users need to control bandwidth usage per-torrent and globally.
+
+Decision:
+- Use token bucket algorithm with 1-second burst capacity (capacity = rate in bytes/sec).
+- Rate limiting happens at the event loop level, not at the kernel/socket level.
+- Download throttling: skip piece assignment and pipeline filling when bucket is empty. Already-received data is still processed (we cannot un-receive bytes from io_uring).
+- Upload throttling: drop piece requests from peers when bucket is empty. Peers will re-request.
+- Per-torrent limits checked first, then global limits. Both must allow the transfer.
+- A rate of 0 means unlimited (all operations pass through with no overhead).
+- API follows qBittorrent conventions for compatibility with existing frontends.
+
+Reasoning:
+- Token bucket is the industry standard for BitTorrent rate limiting (libtorrent, qBittorrent, rtorrent all use variants).
+- Non-blocking throttling (skip work instead of sleep) maintains the io_uring event loop policy: no blocking calls on the event loop thread.
+- Checking tokens in `tryAssignPieces`/`tryFillPipeline` is more efficient than throttling at the socket level, because it avoids submitting io_uring SQEs that would just be delayed.
+- Dropping upload requests when throttled is simpler and more efficient than queuing them. Peers implement retry logic per the BitTorrent protocol.
+
+Follow-up triggers:
+- Add alternative speed mode (qBittorrent's "alt speed" with scheduler) if needed.
+- Consider SO_MAX_PACING_RATE for kernel-level pacing if application-level throttling proves too coarse.
+- Add rate limit persistence across daemon restarts (currently only in-memory and config file).

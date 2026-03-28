@@ -69,6 +69,8 @@ Update it whenever a milestone lands, the near-term backlog changes, or a new op
 
 - **systemd-notify support**: `READY=1` after API server is listening, `STOPPING=1` on shutdown. Direct `AF_UNIX`/`SOCK_DGRAM` socket protocol, no libsystemd dependency. Supports abstract sockets.
 
+- **Download and upload speed restrictions**: Token bucket rate limiting at the event loop level. Per-torrent and global (daemon-wide) limits. Config file support (`network.dl_limit`, `network.ul_limit`). qBittorrent-compatible API endpoints (`app/preferences`, `app/setPreferences`, `torrents/setDownloadLimit`, `torrents/setUploadLimit`, `torrents/downloadLimit`, `torrents/uploadLimit`). CLI commands (`set-dl-limit`, `set-ul-limit`, `get-dl-limit`, `get-ul-limit`). Non-blocking design: throttling skips piece assignment and pipeline filling rather than blocking the event loop.
+
 ## Next
 
 - Improve tracker lifecycle: handle stale peers, validate against additional private-tracker edge cases.

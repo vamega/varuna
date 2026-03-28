@@ -65,6 +65,10 @@ pub fn main() !void {
         break :blk @ptrCast(&resume_db_buf);
     };
 
+    // Apply global speed limits from config
+    if (cfg.network.dl_limit > 0) shared_el.setGlobalDlLimit(cfg.network.dl_limit);
+    if (cfg.network.ul_limit > 0) shared_el.setGlobalUlLimit(cfg.network.ul_limit);
+
     // Session manager
     var session_manager = varuna.daemon.session_manager.SessionManager.init(allocator);
     session_manager.shared_event_loop = &shared_el;

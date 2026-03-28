@@ -14,11 +14,19 @@ pub const ApiHandler = struct {
         }
 
         if (std.mem.eql(u8, request.path, "/api/v2/app/preferences")) {
-            return .{ .body = "{}" };
+            return self.handlePreferences(allocator);
+        }
+
+        if (std.mem.eql(u8, request.path, "/api/v2/app/setPreferences") and std.mem.eql(u8, request.method, "POST")) {
+            return self.handleSetPreferences(allocator, request.body);
         }
 
         if (std.mem.eql(u8, request.path, "/api/v2/transfer/info")) {
             return self.handleTransferInfo(allocator);
+        }
+
+        if (std.mem.eql(u8, request.path, "/api/v2/transfer/speedLimitsMode")) {
+            return self.handleSpeedLimitsMode(allocator);
         }
 
         if (std.mem.startsWith(u8, request.path, "/api/v2/torrents/")) {
@@ -45,7 +53,11 @@ pub const ApiHandler = struct {
             total_ul_data += stat.bytes_uploaded;
         }
 
-        const body = std.fmt.allocPrint(allocator, "{{\"dl_info_speed\":{},\"up_info_speed\":{},\"dl_info_data\":{},\"up_info_data\":{},\"active_torrents\":{}}}", .{ total_dl_speed, total_ul_speed, total_dl_data, total_ul_data, stats.len }) catch
+        const el = self.session_manager.shared_event_loop;
+        const dl_limit: u64 = if (el) |e| e.getGlobalDlLimit() else 0;
+        const ul_limit: u64 = if (el) |e| e.getGlobalUlLimit() else 0;
+
+        const body = std.fmt.allocPrint(allocator, "{{\"dl_info_speed\":{},\"up_info_speed\":{},\"dl_info_data\":{},\"up_info_data\":{},\"dl_rate_limit\":{},\"up_rate_limit\":{},\"active_torrents\":{}}}", .{ total_dl_speed, total_ul_speed, total_dl_data, total_ul_data, dl_limit, ul_limit, stats.len }) catch
             return .{ .status = 500, .body = "{\"error\":\"internal\"}" };
         return .{ .body = body, .owned_body = body };
     }
@@ -71,6 +83,22 @@ pub const ApiHandler = struct {
 
         if (std.mem.eql(u8, action, "resume") and std.mem.eql(u8, method, "POST")) {
             return self.handleTorrentsResume(allocator, body);
+        }
+
+        if (std.mem.eql(u8, action, "setDownloadLimit") and std.mem.eql(u8, method, "POST")) {
+            return self.handleSetTorrentDlLimit(allocator, body);
+        }
+
+        if (std.mem.eql(u8, action, "setUploadLimit") and std.mem.eql(u8, method, "POST")) {
+            return self.handleSetTorrentUlLimit(allocator, body);
+        }
+
+        if (std.mem.eql(u8, action, "downloadLimit") and std.mem.eql(u8, method, "POST")) {
+            return self.handleGetTorrentDlLimit(allocator, body);
+        }
+
+        if (std.mem.eql(u8, action, "uploadLimit") and std.mem.eql(u8, method, "POST")) {
+            return self.handleGetTorrentUlLimit(allocator, body);
         }
 
         return .{ .status = 404, .body = "{\"error\":\"unknown action\"}" };
@@ -151,12 +179,106 @@ pub const ApiHandler = struct {
 
         return .{ .body = "{\"status\":\"ok\"}" };
     }
+
+    // ── Speed limit handlers ─────────────────────────────
+
+    fn handlePreferences(self: *const ApiHandler, allocator: std.mem.Allocator) server.Response {
+        const el = self.session_manager.shared_event_loop;
+        const dl_limit: u64 = if (el) |e| e.getGlobalDlLimit() else 0;
+        const ul_limit: u64 = if (el) |e| e.getGlobalUlLimit() else 0;
+
+        const body = std.fmt.allocPrint(allocator, "{{\"dl_limit\":{},\"up_limit\":{}}}", .{ dl_limit, ul_limit }) catch
+            return .{ .status = 500, .body = "{\"error\":\"internal\"}" };
+        return .{ .body = body, .owned_body = body };
+    }
+
+    fn handleSetPreferences(self: *const ApiHandler, allocator: std.mem.Allocator, body: []const u8) server.Response {
+        _ = allocator;
+        const el = self.session_manager.shared_event_loop orelse
+            return .{ .status = 500, .body = "{\"error\":\"no event loop\"}" };
+
+        // Parse simple form params: dl_limit=N&up_limit=N
+        if (extractParam(body, "dl_limit")) |dl_str| {
+            if (std.fmt.parseInt(u64, dl_str, 10)) |dl| {
+                el.setGlobalDlLimit(dl);
+            } else |_| {}
+        }
+        if (extractParam(body, "up_limit")) |ul_str| {
+            if (std.fmt.parseInt(u64, ul_str, 10)) |ul| {
+                el.setGlobalUlLimit(ul);
+            } else |_| {}
+        }
+
+        return .{ .body = "{\"status\":\"ok\"}" };
+    }
+
+    fn handleSpeedLimitsMode(_: *const ApiHandler, _: std.mem.Allocator) server.Response {
+        // qBittorrent uses 0 = normal, 1 = alternative limits active.
+        // We always report 0 (no alternative mode).
+        return .{ .body = "0" };
+    }
+
+    fn handleSetTorrentDlLimit(self: *const ApiHandler, allocator: std.mem.Allocator, body: []const u8) server.Response {
+        const hash = extractParam(body, "hashes") orelse
+            return .{ .status = 400, .body = "{\"error\":\"missing hashes\"}" };
+        const limit_str = extractParam(body, "limit") orelse
+            return .{ .status = 400, .body = "{\"error\":\"missing limit\"}" };
+        const limit = std.fmt.parseInt(u64, limit_str, 10) catch
+            return .{ .status = 400, .body = "{\"error\":\"invalid limit\"}" };
+
+        self.session_manager.setTorrentDlLimit(hash, limit) catch |err| {
+            const msg = std.fmt.allocPrint(allocator, "{{\"error\":\"{s}\"}}", .{@errorName(err)}) catch
+                return .{ .status = 500, .body = "{\"error\":\"internal\"}" };
+            return .{ .status = 404, .body = msg, .owned_body = msg };
+        };
+        return .{ .body = "{\"status\":\"ok\"}" };
+    }
+
+    fn handleSetTorrentUlLimit(self: *const ApiHandler, allocator: std.mem.Allocator, body: []const u8) server.Response {
+        const hash = extractParam(body, "hashes") orelse
+            return .{ .status = 400, .body = "{\"error\":\"missing hashes\"}" };
+        const limit_str = extractParam(body, "limit") orelse
+            return .{ .status = 400, .body = "{\"error\":\"missing limit\"}" };
+        const limit = std.fmt.parseInt(u64, limit_str, 10) catch
+            return .{ .status = 400, .body = "{\"error\":\"invalid limit\"}" };
+
+        self.session_manager.setTorrentUlLimit(hash, limit) catch |err| {
+            const msg = std.fmt.allocPrint(allocator, "{{\"error\":\"{s}\"}}", .{@errorName(err)}) catch
+                return .{ .status = 500, .body = "{\"error\":\"internal\"}" };
+            return .{ .status = 404, .body = msg, .owned_body = msg };
+        };
+        return .{ .body = "{\"status\":\"ok\"}" };
+    }
+
+    fn handleGetTorrentDlLimit(self: *const ApiHandler, allocator: std.mem.Allocator, body: []const u8) server.Response {
+        const hash = extractParam(body, "hashes") orelse
+            return .{ .status = 400, .body = "{\"error\":\"missing hashes\"}" };
+
+        const stats = self.session_manager.getStats(hash) catch
+            return .{ .status = 404, .body = "{\"error\":\"torrent not found\"}" };
+
+        const resp = std.fmt.allocPrint(allocator, "{}", .{stats.dl_limit}) catch
+            return .{ .status = 500, .body = "{\"error\":\"internal\"}" };
+        return .{ .body = resp, .owned_body = resp };
+    }
+
+    fn handleGetTorrentUlLimit(self: *const ApiHandler, allocator: std.mem.Allocator, body: []const u8) server.Response {
+        const hash = extractParam(body, "hashes") orelse
+            return .{ .status = 400, .body = "{\"error\":\"missing hashes\"}" };
+
+        const stats = self.session_manager.getStats(hash) catch
+            return .{ .status = 404, .body = "{\"error\":\"torrent not found\"}" };
+
+        const resp = std.fmt.allocPrint(allocator, "{}", .{stats.ul_limit}) catch
+            return .{ .status = 500, .body = "{\"error\":\"internal\"}" };
+        return .{ .body = resp, .owned_body = resp };
+    }
 };
 
 fn serializeTorrentInfo(allocator: std.mem.Allocator, json: *std.ArrayList(u8), stat: TorrentSession.Stats) !void {
     try json.print(
         allocator,
-        "{{\"name\":\"{s}\",\"hash\":\"{s}\",\"state\":\"{s}\",\"size\":{},\"progress\":{d:.4},\"dlspeed\":{},\"upspeed\":{},\"num_seeds\":0,\"num_leechs\":{},\"added_on\":{},\"save_path\":\"{s}\",\"pieces_have\":{},\"pieces_num\":{}}}",
+        "{{\"name\":\"{s}\",\"hash\":\"{s}\",\"state\":\"{s}\",\"size\":{},\"progress\":{d:.4},\"dlspeed\":{},\"upspeed\":{},\"num_seeds\":0,\"num_leechs\":{},\"added_on\":{},\"save_path\":\"{s}\",\"pieces_have\":{},\"pieces_num\":{},\"dl_limit\":{},\"up_limit\":{}}}",
         .{
             stat.name,
             stat.info_hash_hex,
@@ -170,6 +292,8 @@ fn serializeTorrentInfo(allocator: std.mem.Allocator, json: *std.ArrayList(u8), 
             stat.save_path,
             stat.pieces_have,
             stat.pieces_total,
+            stat.dl_limit,
+            stat.ul_limit,
         },
     );
 }

@@ -125,6 +125,52 @@ pub const SessionManager = struct {
         defer self.mutex.unlock();
         return self.sessions.count();
     }
+
+    /// Set per-torrent download speed limit (bytes/sec). 0 = unlimited.
+    pub fn setTorrentDlLimit(self: *SessionManager, hash: []const u8, limit: u64) !void {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+
+        const session = self.sessions.get(hash) orelse return error.TorrentNotFound;
+        session.dl_limit = limit;
+
+        // Apply to event loop if running
+        if (self.shared_event_loop) |el| {
+            if (session.torrent_id_in_shared) |tid| {
+                el.setTorrentDlLimit(tid, limit);
+            }
+        }
+    }
+
+    /// Set per-torrent upload speed limit (bytes/sec). 0 = unlimited.
+    pub fn setTorrentUlLimit(self: *SessionManager, hash: []const u8, limit: u64) !void {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+
+        const session = self.sessions.get(hash) orelse return error.TorrentNotFound;
+        session.ul_limit = limit;
+
+        // Apply to event loop if running
+        if (self.shared_event_loop) |el| {
+            if (session.torrent_id_in_shared) |tid| {
+                el.setTorrentUlLimit(tid, limit);
+            }
+        }
+    }
+
+    /// Set global download speed limit (bytes/sec). 0 = unlimited.
+    pub fn setGlobalDlLimit(self: *SessionManager, limit: u64) void {
+        if (self.shared_event_loop) |el| {
+            el.setGlobalDlLimit(limit);
+        }
+    }
+
+    /// Set global upload speed limit (bytes/sec). 0 = unlimited.
+    pub fn setGlobalUlLimit(self: *SessionManager, limit: u64) void {
+        if (self.shared_event_loop) |el| {
+            el.setGlobalUlLimit(limit);
+        }
+    }
 };
 
 test "session manager add and list" {

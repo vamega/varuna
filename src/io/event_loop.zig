@@ -8,6 +8,7 @@ const session_mod = @import("../torrent/session.zig");
 const storage = @import("../storage/root.zig");
 const pw = @import("../net/peer_wire.zig");
 const Hasher = @import("hasher.zig").Hasher;
+const RateLimiter = @import("rate_limiter.zig").RateLimiter;
 
 const max_peers: u16 = 4096;
 const cqe_batch_size = 64;
@@ -138,6 +139,9 @@ pub const TorrentContext = struct {
     last_ul_bytes: u64 = 0,
     current_dl_speed: u64 = 0,
     current_ul_speed: u64 = 0,
+
+    // Per-torrent rate limiters (0 = unlimited)
+    rate_limiter: RateLimiter = RateLimiter.initComptime(0, 0),
 };
 
 // ── Event loop ────────────────────────────────────────────
@@ -228,6 +232,9 @@ pub const EventLoop = struct {
     announce_interval: u32 = 1800,
     last_announce_time: i64 = 0,
     min_peers_for_reannounce: u16 = 1, // re-announce when below this
+
+    // Global rate limiter (applies across all torrents, 0 = unlimited)
+    global_rate_limiter: RateLimiter = RateLimiter.initComptime(0, 0),
 
     // Background hasher for SHA verification (off event loop thread)
     last_unchoke_recalc: i64 = 0,
@@ -609,6 +616,117 @@ pub const EventLoop = struct {
 
     pub fn stop(self: *EventLoop) void {
         self.running = false;
+    }
+
+    // ── Rate limiting ────────────────────────────────────
+
+    /// Set global download rate limit (bytes/sec). 0 = unlimited.
+    pub fn setGlobalDlLimit(self: *EventLoop, rate: u64) void {
+        self.global_rate_limiter.setDownloadRate(rate);
+    }
+
+    /// Set global upload rate limit (bytes/sec). 0 = unlimited.
+    pub fn setGlobalUlLimit(self: *EventLoop, rate: u64) void {
+        self.global_rate_limiter.setUploadRate(rate);
+    }
+
+    /// Get global download rate limit (bytes/sec). 0 = unlimited.
+    pub fn getGlobalDlLimit(self: *const EventLoop) u64 {
+        return self.global_rate_limiter.download.rate;
+    }
+
+    /// Get global upload rate limit (bytes/sec). 0 = unlimited.
+    pub fn getGlobalUlLimit(self: *const EventLoop) u64 {
+        return self.global_rate_limiter.upload.rate;
+    }
+
+    /// Set per-torrent download rate limit (bytes/sec). 0 = unlimited.
+    pub fn setTorrentDlLimit(self: *EventLoop, torrent_id: u8, rate: u64) void {
+        if (self.getTorrentContext(torrent_id)) |tc| {
+            tc.rate_limiter.setDownloadRate(rate);
+        }
+    }
+
+    /// Set per-torrent upload rate limit (bytes/sec). 0 = unlimited.
+    pub fn setTorrentUlLimit(self: *EventLoop, torrent_id: u8, rate: u64) void {
+        if (self.getTorrentContext(torrent_id)) |tc| {
+            tc.rate_limiter.setUploadRate(rate);
+        }
+    }
+
+    /// Get per-torrent download rate limit (bytes/sec). 0 = unlimited.
+    pub fn getTorrentDlLimit(self: *const EventLoop, torrent_id: u8) u64 {
+        if (torrent_id >= max_torrents) return 0;
+        const tc = self.torrents[torrent_id] orelse return 0;
+        return tc.rate_limiter.download.rate;
+    }
+
+    /// Get per-torrent upload rate limit (bytes/sec). 0 = unlimited.
+    pub fn getTorrentUlLimit(self: *const EventLoop, torrent_id: u8) u64 {
+        if (torrent_id >= max_torrents) return 0;
+        const tc = self.torrents[torrent_id] orelse return 0;
+        return tc.rate_limiter.upload.rate;
+    }
+
+    /// Check if a download of `amount` bytes is allowed by both per-torrent
+    /// and global rate limiters. Returns the number of bytes allowed (may be
+    /// less than requested). Returns 0 if throttled.
+    fn consumeDownloadTokens(self: *EventLoop, torrent_id: u8, amount: u64) u64 {
+        // Check per-torrent limit first
+        var allowed = amount;
+        if (self.getTorrentContext(torrent_id)) |tc| {
+            if (tc.rate_limiter.download.isActive()) {
+                allowed = tc.rate_limiter.download.consume(allowed);
+                if (allowed == 0) return 0;
+            }
+        }
+        // Then check global limit
+        if (self.global_rate_limiter.download.isActive()) {
+            allowed = self.global_rate_limiter.download.consume(allowed);
+        }
+        return allowed;
+    }
+
+    /// Check if an upload of `amount` bytes is allowed by both per-torrent
+    /// and global rate limiters. Returns the number of bytes allowed.
+    fn consumeUploadTokens(self: *EventLoop, torrent_id: u8, amount: u64) u64 {
+        var allowed = amount;
+        if (self.getTorrentContext(torrent_id)) |tc| {
+            if (tc.rate_limiter.upload.isActive()) {
+                allowed = tc.rate_limiter.upload.consume(allowed);
+                if (allowed == 0) return 0;
+            }
+        }
+        if (self.global_rate_limiter.upload.isActive()) {
+            allowed = self.global_rate_limiter.upload.consume(allowed);
+        }
+        return allowed;
+    }
+
+    /// Check if download is currently throttled for a torrent.
+    fn isDownloadThrottled(self: *EventLoop, torrent_id: u8) bool {
+        if (self.global_rate_limiter.download.isActive()) {
+            if (self.global_rate_limiter.download.available() == 0) return true;
+        }
+        if (self.getTorrentContext(torrent_id)) |tc| {
+            if (tc.rate_limiter.download.isActive()) {
+                if (tc.rate_limiter.download.available() == 0) return true;
+            }
+        }
+        return false;
+    }
+
+    /// Check if upload is currently throttled for a torrent.
+    fn isUploadThrottled(self: *EventLoop, torrent_id: u8) bool {
+        if (self.global_rate_limiter.upload.isActive()) {
+            if (self.global_rate_limiter.upload.available() == 0) return true;
+        }
+        if (self.getTorrentContext(torrent_id)) |tc| {
+            if (tc.rate_limiter.upload.isActive()) {
+                if (tc.rate_limiter.upload.available() == 0) return true;
+            }
+        }
+        return false;
     }
 
     // ── CQE dispatch ──────────────────────────────────────
@@ -1022,6 +1140,9 @@ pub const EventLoop = struct {
                     const block_offset = std.mem.readInt(u32, payload[4..8], .big);
                     const block_data = payload[8..];
 
+                    // Consume download tokens for rate limiting accounting
+                    _ = self.consumeDownloadTokens(peer.torrent_id, block_data.len);
+
                     if (peer.current_piece != null and peer.current_piece.? == piece_index) {
                         if (peer.piece_buf) |pbuf| {
                             const start: usize = @intCast(block_offset);
@@ -1166,6 +1287,10 @@ pub const EventLoop = struct {
         const block_length = std.mem.readInt(u32, payload[8..12], .big);
 
         const peer = &self.peers[slot];
+
+        // Check upload rate limit -- drop request if throttled
+        if (self.isUploadThrottled(peer.torrent_id)) return;
+
         const tc = self.getTorrentContext(peer.torrent_id) orelse return;
         const sess = tc.session orelse return;
 
@@ -1344,6 +1469,9 @@ pub const EventLoop = struct {
                 continue;
             }
 
+            // Consume upload tokens for rate limiting
+            _ = self.consumeUploadTokens(peer.torrent_id, total_uploaded);
+
             peer.bytes_uploaded_to += total_uploaded;
 
             self.pending_sends.append(self.allocator, .{
@@ -1370,6 +1498,11 @@ pub const EventLoop = struct {
     }
 
     fn sendPieceBlock(self: *EventLoop, slot: u16, piece_index: u32, block_offset: u32, block_length: u32, read_buf: []u8) void {
+        const peer = &self.peers[slot];
+
+        // Check upload rate limit
+        if (self.isUploadThrottled(peer.torrent_id)) return;
+
         const msg_len: u32 = 1 + 8 + block_length;
         const total_len: usize = 4 + @as(usize, msg_len);
         const send_buf = self.allocator.alloc(u8, total_len) catch return;
@@ -1380,7 +1513,8 @@ pub const EventLoop = struct {
         std.mem.writeInt(u32, send_buf[9..13], block_offset, .big);
         @memcpy(send_buf[13..total_len], read_buf[@intCast(block_offset)..][0..block_length]);
 
-        const peer = &self.peers[slot];
+        // Consume upload tokens
+        _ = self.consumeUploadTokens(peer.torrent_id, block_length);
         peer.bytes_uploaded_to += block_length;
 
         self.pending_sends.append(self.allocator, .{
@@ -1446,6 +1580,12 @@ pub const EventLoop = struct {
                 continue;
             }
 
+            // Skip piece assignment when download is throttled
+            if (self.isDownloadThrottled(peer.torrent_id)) {
+                i += 1;
+                continue;
+            }
+
             const tc = self.getTorrentContext(peer.torrent_id) orelse {
                 _ = self.idle_peers.swapRemove(i);
                 continue;
@@ -1497,6 +1637,9 @@ pub const EventLoop = struct {
         const piece_index = peer.current_piece orelse return;
         if (peer.peer_choking) return;
         if (peer.send_pending) return;
+
+        // Skip filling pipeline when download is throttled
+        if (self.isDownloadThrottled(peer.torrent_id)) return;
 
         const tc = self.getTorrentContext(peer.torrent_id) orelse return;
         const sess = tc.session orelse return;

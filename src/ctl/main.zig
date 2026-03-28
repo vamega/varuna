@@ -89,6 +89,70 @@ pub fn main() !void {
         try doGet(allocator, stdout, api_host, api_port, "/api/v2/app/webapiVersion");
     } else if (std.mem.eql(u8, command, "stats")) {
         try doGet(allocator, stdout, api_host, api_port, "/api/v2/transfer/info");
+    } else if (std.mem.eql(u8, command, "set-dl-limit")) {
+        if (args.len < 4) {
+            try stdout.print("usage: varuna-ctl set-dl-limit <hash|global> <bytes-per-sec>\n", .{});
+        } else {
+            const target = args[2];
+            const limit = args[3];
+            if (std.mem.eql(u8, target, "global")) {
+                var body_buf = std.ArrayList(u8).empty;
+                defer body_buf.deinit(allocator);
+                try body_buf.print(allocator, "dl_limit={s}", .{limit});
+                try doPost(allocator, stdout, api_host, api_port, "/api/v2/app/setPreferences", body_buf.items);
+            } else {
+                var body_buf = std.ArrayList(u8).empty;
+                defer body_buf.deinit(allocator);
+                try body_buf.print(allocator, "hashes={s}&limit={s}", .{ target, limit });
+                try doPost(allocator, stdout, api_host, api_port, "/api/v2/torrents/setDownloadLimit", body_buf.items);
+            }
+        }
+    } else if (std.mem.eql(u8, command, "set-ul-limit")) {
+        if (args.len < 4) {
+            try stdout.print("usage: varuna-ctl set-ul-limit <hash|global> <bytes-per-sec>\n", .{});
+        } else {
+            const target = args[2];
+            const limit = args[3];
+            if (std.mem.eql(u8, target, "global")) {
+                var body_buf = std.ArrayList(u8).empty;
+                defer body_buf.deinit(allocator);
+                try body_buf.print(allocator, "up_limit={s}", .{limit});
+                try doPost(allocator, stdout, api_host, api_port, "/api/v2/app/setPreferences", body_buf.items);
+            } else {
+                var body_buf = std.ArrayList(u8).empty;
+                defer body_buf.deinit(allocator);
+                try body_buf.print(allocator, "hashes={s}&limit={s}", .{ target, limit });
+                try doPost(allocator, stdout, api_host, api_port, "/api/v2/torrents/setUploadLimit", body_buf.items);
+            }
+        }
+    } else if (std.mem.eql(u8, command, "get-dl-limit")) {
+        if (args.len < 3) {
+            try stdout.print("usage: varuna-ctl get-dl-limit <hash|global>\n", .{});
+        } else {
+            const target = args[2];
+            if (std.mem.eql(u8, target, "global")) {
+                try doGet(allocator, stdout, api_host, api_port, "/api/v2/app/preferences");
+            } else {
+                var body_buf = std.ArrayList(u8).empty;
+                defer body_buf.deinit(allocator);
+                try body_buf.print(allocator, "hashes={s}", .{target});
+                try doPost(allocator, stdout, api_host, api_port, "/api/v2/torrents/downloadLimit", body_buf.items);
+            }
+        }
+    } else if (std.mem.eql(u8, command, "get-ul-limit")) {
+        if (args.len < 3) {
+            try stdout.print("usage: varuna-ctl get-ul-limit <hash|global>\n", .{});
+        } else {
+            const target = args[2];
+            if (std.mem.eql(u8, target, "global")) {
+                try doGet(allocator, stdout, api_host, api_port, "/api/v2/app/preferences");
+            } else {
+                var body_buf = std.ArrayList(u8).empty;
+                defer body_buf.deinit(allocator);
+                try body_buf.print(allocator, "hashes={s}", .{target});
+                try doPost(allocator, stdout, api_host, api_port, "/api/v2/torrents/uploadLimit", body_buf.items);
+            }
+        }
     } else {
         try stdout.print("unknown command: {s}\n\n", .{command});
         try printUsage(stdout, api_host, api_port);
@@ -191,6 +255,10 @@ fn printUsage(stdout: *std.Io.Writer, host: []const u8, port: u16) !void {
     try stdout.print("  pause <hash>                   pause torrent\n", .{});
     try stdout.print("  resume <hash>                  resume torrent\n", .{});
     try stdout.print("  delete <hash>                  delete torrent\n", .{});
+    try stdout.print("  set-dl-limit <hash|global> <N> set download limit (bytes/sec, 0=off)\n", .{});
+    try stdout.print("  set-ul-limit <hash|global> <N> set upload limit (bytes/sec, 0=off)\n", .{});
+    try stdout.print("  get-dl-limit <hash|global>     get download limit\n", .{});
+    try stdout.print("  get-ul-limit <hash|global>     get upload limit\n", .{});
     try stdout.print("  version                        daemon API version\n", .{});
     try stdout.print("  stats                          global transfer stats\n", .{});
     try stdout.print("\ndaemon: http://{s}:{}\n", .{ host, port });
