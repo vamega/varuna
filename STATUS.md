@@ -62,26 +62,30 @@ Update it whenever a milestone lands, the near-term backlog changes, or a new op
 - **Daemon end-to-end download verified**: tracker + seeder + daemon download with file comparison.
 - **Resume DB in daemon mode**: `TorrentSession` opens SQLite resume DB on start, loads known-complete pieces to skip rehash, persists new completions periodically (~5s), and flushes on stop/pause/shutdown. Shared DB path from config (`storage.resume_db`) or default `~/.local/share/varuna/resume.db`.
 
+- **Daemon seeding after download**: announces event=completed, creates listen socket, accepts inbound peers. Multi-torrent inbound handshake matching.
+- **Per-torrent peer count**: getStats() reports peer count for specific torrent, not global.
+- **Data corruption fixes**: inline SHA-1 uses actual piece size, PendingWrite/PendingSend lifetime fixes, hasher result carries torrent_id.
+- **Daemon swarm integration test**: `scripts/demo_daemon_swarm.sh` tests full daemon API flow with file verification.
+
 ## Next
 
-- Daemon seeding after download (accept inbound peers, announce as seeder).
-- Per-torrent peer count in daemon stats (currently reports global count).
-- Investigate data corruption at ~17MB with 64KB pieces (see progress-reports/2026-03-28-async-pread-and-corruption.md).
 - Improve tracker lifecycle: handle stale peers, validate against private-tracker expectations.
-- Broader integration test coverage around CLI workflows and tracker compatibility.
+- Broader integration test coverage (larger files, multi-torrent daemon, resume across restart).
+- Test daemon seeding: verify a second downloader can download from the daemon after it seeds.
+- systemd-notify support (see docs/future-features.md).
+- UDP tracker support (BEP 15) — partially implemented in src/tracker/udp.zig.
 
 ## Known Issues
 
-- The packaged Ubuntu `opentracker` build used by `scripts/tracker.sh` requires explicit info-hash whitelisting (`--whitelist-hash`).
-- Resume fast path depends on SQLite DB integrity; if the DB is deleted or corrupted, a full recheck occurs (safe fallback).
-- Data corruption observed at ~17MB with 64KB pieces (300+ pieces). Works fine with 16KB pieces. Root cause under investigation.
-- Some restricted or sandboxed environments can interfere with local tracker startup and socket behavior.
+- The packaged Ubuntu `opentracker` build requires explicit info-hash whitelisting (`--whitelist-hash`).
+- Resume fast path depends on SQLite DB integrity; if deleted/corrupted, full recheck occurs (safe fallback).
+- Some restricted or sandboxed environments can interfere with local tracker startup.
 
 ## Last Verified Milestone
 
-- `io: batch piece block responses into single sends (Option C)` (`a3da224`)
+- `test: add daemon swarm integration test script` (`eb25bb0`)
 - Verified with:
   - `zig build test` (all tests pass)
   - `zig build` (clean build)
   - `scripts/demo_swarm.sh` (standalone swarm passes)
-  - Daemon integration: start daemon, add torrent via API, daemon stays alive, list shows torrent
+  - `scripts/demo_daemon_swarm.sh` (daemon download + file verification)

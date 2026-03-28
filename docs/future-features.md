@@ -2,9 +2,9 @@
 
 Features to implement eventually, tracked here for reference. Not prioritized for immediate work.
 
-## 0. Blocking Call Removal (from strace audit)
+## 0. ~~Blocking Call Removal~~ (DONE)
 
-**Seed async pread:** Replace `posix.pread` in `servePieceRequest` (event_loop.zig) with `IORING_OP_READ`. Currently blocks the event loop for each piece block request. Requires async state machine: submit read SQE → on CQE build piece message → submit send SQE. See `progress-reports/2026-03-27-strace-blocking-audit.md` for full audit.
+Seed async pread is implemented via `IORING_OP_READ` with piece cache and batched block sends.
 
 ## 1. systemd-notify support (without libsystemd dependency)
 
