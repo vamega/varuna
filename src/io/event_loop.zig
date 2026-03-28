@@ -81,7 +81,9 @@ pub const Peer = struct {
     header_offset: usize = 0,
     handshake_buf: [68]u8 = undefined,
     handshake_offset: usize = 0,
+    small_body_buf: [16]u8 = undefined,
     body_buf: ?[]u8 = null,
+    body_is_heap: bool = false,
     body_offset: usize = 0,
     body_expected: usize = 0,
 
@@ -768,11 +770,17 @@ pub const EventLoop = struct {
                     self.removePeer(slot);
                     return;
                 }
-                // Allocate body buffer and start reading
-                peer.body_buf = self.allocator.alloc(u8, msg_len) catch {
-                    self.removePeer(slot);
-                    return;
-                };
+                // Use inline buffer for small messages, heap for large ones
+                if (msg_len <= peer.small_body_buf.len) {
+                    peer.body_buf = peer.small_body_buf[0..msg_len];
+                    peer.body_is_heap = false;
+                } else {
+                    peer.body_buf = self.allocator.alloc(u8, msg_len) catch {
+                        self.removePeer(slot);
+                        return;
+                    };
+                    peer.body_is_heap = true;
+                }
                 peer.body_offset = 0;
                 peer.body_expected = msg_len;
                 peer.state = .active_recv_body;
@@ -791,10 +799,11 @@ pub const EventLoop = struct {
                 // Full message received -- process it
                 self.processMessage(slot);
                 // Free body and read next header
-                if (peer.body_buf) |buf| {
-                    self.allocator.free(buf);
-                    peer.body_buf = null;
+                if (peer.body_is_heap) {
+                    if (peer.body_buf) |buf| self.allocator.free(buf);
                 }
+                peer.body_buf = null;
+                peer.body_is_heap = false;
                 peer.state = .active_recv_header;
                 peer.header_offset = 0;
                 self.submitHeaderRecv(slot) catch {
@@ -1561,7 +1570,9 @@ pub const EventLoop = struct {
 
     fn cleanupPeer(self: *EventLoop, peer: *Peer) void {
         if (peer.fd >= 0) posix.close(peer.fd);
-        if (peer.body_buf) |buf| self.allocator.free(buf);
+        if (peer.body_is_heap) {
+            if (peer.body_buf) |buf| self.allocator.free(buf);
+        }
         if (peer.piece_buf) |buf| self.allocator.free(buf);
         if (peer.availability) |*bf| bf.deinit(self.allocator);
     }
