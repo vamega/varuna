@@ -24,6 +24,10 @@ pub const Hasher = struct {
     // eventfd for waking the event loop when results are ready
     event_fd: posix.fd_t = -1,
 
+    // Count of jobs currently being processed by worker threads
+    // (dequeued from pending_jobs but not yet added to completed_results).
+    in_flight: std.atomic.Value(u32) = std.atomic.Value(u32).init(0),
+
     pub const Job = struct {
         slot: u16,
         piece_index: u32,
@@ -125,8 +129,11 @@ pub const Hasher = struct {
         self.queue_cond.signal();
     }
 
-    /// Drain completed results. Called from the event loop thread.
-    pub fn drainResults(self: *Hasher) []const Result {
+    /// Atomically drain completed results into a caller-owned buffer.
+    /// Called from the event loop thread. The returned slice is valid until
+    /// the next call to drainResultsInto (which reuses the swap buffer).
+    /// This avoids the TOCTOU race of the old drainResults+clearResults pair.
+    pub fn drainResultsInto(self: *Hasher, swap_buf: *std.ArrayList(Result)) []const Result {
         self.result_mutex.lock();
         defer self.result_mutex.unlock();
 
@@ -136,13 +143,30 @@ pub const Hasher = struct {
             _ = posix.read(self.event_fd, &buf) catch {};
         }
 
-        return self.completed_results.items;
+        // Swap: caller gets the completed results, hasher gets the (empty) swap buffer.
+        // This is O(1) and lock-free for the caller's processing loop.
+        const tmp = self.completed_results;
+        self.completed_results = swap_buf.*;
+        swap_buf.* = tmp;
+
+        return swap_buf.items;
     }
 
-    pub fn clearResults(self: *Hasher) void {
-        self.result_mutex.lock();
-        defer self.result_mutex.unlock();
-        self.completed_results.clearRetainingCapacity();
+    /// Returns true if there are pending jobs, in-flight hashes, or unread results.
+    /// Called from the event loop thread to decide whether draining is complete.
+    pub fn hasPendingWork(self: *Hasher) bool {
+        if (self.in_flight.load(.acquire) > 0) return true;
+        {
+            self.queue_mutex.lock();
+            defer self.queue_mutex.unlock();
+            if (self.pending_jobs.items.len > 0) return true;
+        }
+        {
+            self.result_mutex.lock();
+            defer self.result_mutex.unlock();
+            if (self.completed_results.items.len > 0) return true;
+        }
+        return false;
     }
 
     pub fn getEventFd(self: *Hasher) posix.fd_t {
@@ -169,6 +193,7 @@ pub const Hasher = struct {
             }
 
             const job = self.pending_jobs.orderedRemove(0);
+            _ = self.in_flight.fetchAdd(1, .acq_rel);
             self.queue_mutex.unlock();
 
             // Hash the piece (CPU-intensive, runs in parallel across pool)
@@ -186,6 +211,7 @@ pub const Hasher = struct {
                 .torrent_id = job.torrent_id,
             }) catch {};
             self.result_mutex.unlock();
+            _ = self.in_flight.fetchSub(1, .acq_rel);
 
             // Wake the event loop
             if (self.event_fd >= 0) {
@@ -217,36 +243,30 @@ test "hasher pool verifies pieces correctly" {
     std.crypto.hash.Sha1.hash("spam", &expected2, .{}); // wrong hash for "eggs"
     try hasher.submitVerify(1, 1, data2, expected2, 0);
 
-    // Wait for results
+    // Wait for results using the swap-based API
+    var swap_buf = std.ArrayList(Hasher.Result).empty;
+    defer swap_buf.deinit(std.testing.allocator);
+
     var attempts: u32 = 0;
+    var valid_count: u32 = 0;
+    var invalid_count: u32 = 0;
     while (attempts < 100) : (attempts += 1) {
         std.Thread.sleep(10 * std.time.ns_per_ms);
-        const results = hasher.drainResults();
-        if (results.len >= 2) {
-            var valid_count: u32 = 0;
-            var invalid_count: u32 = 0;
-            for (results) |r| {
-                if (r.valid) {
-                    valid_count += 1;
-                } else {
-                    invalid_count += 1;
-                    std.testing.allocator.free(r.piece_buf);
-                }
-            }
-            try std.testing.expectEqual(@as(u32, 1), valid_count);
-            try std.testing.expectEqual(@as(u32, 1), invalid_count);
-            hasher.clearResults();
-            // Free valid piece buf
-            for (hasher.drainResults()) |r| {
+        const results = hasher.drainResultsInto(&swap_buf);
+        for (results) |r| {
+            if (r.valid) {
+                valid_count += 1;
+                std.testing.allocator.free(r.piece_buf);
+            } else {
+                invalid_count += 1;
                 std.testing.allocator.free(r.piece_buf);
             }
-            // Free the valid result's buf from the first drain
-            std.testing.allocator.free(data1);
-            return;
         }
-        hasher.clearResults();
+        swap_buf.clearRetainingCapacity();
+        if (valid_count + invalid_count >= 2) break;
     }
-    return error.TestTimeout;
+    try std.testing.expectEqual(@as(u32, 1), valid_count);
+    try std.testing.expectEqual(@as(u32, 1), invalid_count);
 }
 
 test "hasher pool thread count" {

@@ -251,6 +251,7 @@ pub const EventLoop = struct {
     // Background hasher for SHA verification (off event loop thread)
     last_unchoke_recalc: i64 = 0,
     hasher: ?*Hasher = null,
+    hash_result_swap: std.ArrayList(Hasher.Result) = std.ArrayList(Hasher.Result).empty,
 
     // Compact list of peer slots that are idle (active, unchoked, have
     // availability, and need a piece assignment).  Avoids scanning all
@@ -490,6 +491,7 @@ pub const EventLoop = struct {
         self.pending_reads.deinit(self.allocator);
         self.queued_responses.deinit(self.allocator);
         self.idle_peers.deinit(self.allocator);
+        self.hash_result_swap.deinit(self.allocator);
         for (self.peers) |*peer| {
             self.cleanupPeer(peer);
         }
@@ -1803,11 +1805,68 @@ pub const EventLoop = struct {
             peer.current_piece = null;
             self.markIdle(slot);
         } else {
-            // Fallback: inline verification (blocks event loop)
+            // Fallback: inline verification and write (blocks event loop).
+            // This path is only reached if the hasher thread pool failed to create.
             var actual: [20]u8 = undefined;
             std.crypto.hash.Sha1.hash(piece_buf[0..piece_buf.len], &actual, .{});
-            // Simplified inline path -- use hasher in production
-            pt.releasePiece(piece_index);
+            const valid = std.mem.eql(u8, &actual, &hash);
+            if (valid) {
+                // Write piece to disk via io_uring
+                const plan = storage.verify.planPieceVerification(self.allocator, sess, piece_index) catch {
+                    pt.releasePiece(piece_index);
+                    self.allocator.free(piece_buf);
+                    peer.piece_buf = null;
+                    peer.current_piece = null;
+                    self.markIdle(slot);
+                    return;
+                };
+                defer storage.verify.freePiecePlan(self.allocator, plan);
+
+                const span_count: u32 = @intCast(plan.spans.len);
+                if (span_count == 0) {
+                    pt.releasePiece(piece_index);
+                    self.allocator.free(piece_buf);
+                    peer.piece_buf = null;
+                    peer.current_piece = null;
+                    self.markIdle(slot);
+                    return;
+                }
+
+                // Track pending writes for completion
+                self.pending_writes.put(self.allocator, .{
+                    .piece_index = piece_index,
+                    .torrent_id = peer.torrent_id,
+                }, .{
+                    .piece_index = piece_index,
+                    .torrent_id = peer.torrent_id,
+                    .slot = slot,
+                    .buf = piece_buf,
+                    .spans_remaining = span_count,
+                }) catch {
+                    pt.releasePiece(piece_index);
+                    self.allocator.free(piece_buf);
+                    peer.piece_buf = null;
+                    peer.current_piece = null;
+                    self.markIdle(slot);
+                    return;
+                };
+
+                for (plan.spans) |span| {
+                    const block = piece_buf[span.piece_offset .. span.piece_offset + span.length];
+                    const ud = encodeUserData(.{ .slot = slot, .op_type = .disk_write, .context = @as(u40, @intCast(peer.torrent_id)) << 32 | @as(u40, piece_index) });
+                    _ = self.ring.write(ud, tc.shared_fds[span.file_index], block, span.file_offset) catch |err| {
+                        log.warn("inline disk write for piece {d}: {s}", .{ piece_index, @errorName(err) });
+                        continue;
+                    };
+                }
+                // Buffer ownership transferred to pending_writes; will be freed on completion
+                peer.piece_buf = null;
+            } else {
+                // Hash mismatch -- release piece and free buffer
+                pt.releasePiece(piece_index);
+                self.allocator.free(piece_buf);
+                peer.piece_buf = null;
+            }
             peer.current_piece = null;
             self.markIdle(slot);
         }
@@ -1817,7 +1876,7 @@ pub const EventLoop = struct {
     /// Called each tick from the event loop.
     pub fn processHashResults(self: *EventLoop) void {
         const h = self.hasher orelse return;
-        const results = h.drainResults();
+        const results = h.drainResultsInto(&self.hash_result_swap);
         for (results) |result| {
             // Use torrent_id stored in the hash result (not from the slot,
             // which may have been freed and reassigned since submission).
@@ -1874,7 +1933,8 @@ pub const EventLoop = struct {
                 self.allocator.free(result.piece_buf);
             }
         }
-        h.clearResults();
+        // Results are already swapped out of the hasher -- no clearResults needed.
+        self.hash_result_swap.clearRetainingCapacity();
     }
 
     // ── SQE helpers ───────────────────────────────────────

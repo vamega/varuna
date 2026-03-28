@@ -21,17 +21,49 @@ PASS=0
 FAIL=0
 FAILURES=()
 
-# Port base -- each test gets its own triple (tracker, seed, download)
-PORT_BASE="${PORT_BASE:-7100}"
+# Port base -- each test gets 100-port spacing to avoid TIME_WAIT conflicts
+PORT_BASE="${PORT_BASE:-40000}"
 
 cleanup_pids() {
   local pid
   for pid in "$@"; do
     if [[ -n "$pid" ]] && kill -0 "$pid" 2>/dev/null; then
       kill "$pid" 2>/dev/null || true
+    fi
+  done
+  sleep 0.2
+  # Force-kill anything still alive
+  for pid in "$@"; do
+    if [[ -n "$pid" ]] && kill -0 "$pid" 2>/dev/null; then
+      kill -9 "$pid" 2>/dev/null || true
+    fi
+  done
+  for pid in "$@"; do
+    if [[ -n "$pid" ]]; then
       wait "$pid" 2>/dev/null || true
     fi
   done
+  # Verify all dead
+  for pid in "$@"; do
+    if [[ -n "$pid" ]] && kill -0 "$pid" 2>/dev/null; then
+      echo "  warning: process $pid still alive after cleanup" >&2
+      sleep 0.5
+      kill -9 "$pid" 2>/dev/null || true
+      wait "$pid" 2>/dev/null || true
+    fi
+  done
+}
+
+wait_for_port_free() {
+  local port="$1"
+  for _ in $(seq 1 40); do
+    if ! bash -c "exec 3<>/dev/tcp/127.0.0.1/$port" 2>/dev/null; then
+      return 0
+    fi
+    sleep 0.1
+  done
+  echo "  warning: port $port still in use after 4s" >&2
+  return 1
 }
 
 wait_for_tcp() {
@@ -70,18 +102,38 @@ echo "building varuna-tools..."
 echo "build complete"
 echo ""
 
+# Kill any lingering processes from THIS worktree's previous runs.
+# Only kill processes whose command line references this ROOT_DIR to avoid
+# interfering with other concurrent test runs from different worktrees.
+for pid in $(pgrep -f "$ROOT_DIR/zig-out/bin/varuna-tools (seed|download)" 2>/dev/null || true); do
+  [[ "$pid" == "$$" ]] && continue
+  kill -9 "$pid" 2>/dev/null || true
+done
+for pid in $(pgrep -f "$ROOT_DIR/.tools/opentracker" 2>/dev/null || true); do
+  kill -9 "$pid" 2>/dev/null || true
+done
+sleep 1
+
 test_index=0
 for entry in "${TESTS[@]}"; do
   read -r payload_bytes piece_bytes label <<<"$entry"
   test_index=$((test_index + 1))
 
-  tracker_port=$((PORT_BASE + test_index * 10))
-  seed_port=$((PORT_BASE + test_index * 10 + 1))
-  download_port=$((PORT_BASE + test_index * 10 + 2))
+  tracker_port=$((PORT_BASE + test_index * 100))
+  seed_port=$((PORT_BASE + test_index * 100 + 1))
+  download_port=$((PORT_BASE + test_index * 100 + 2))
 
   expected_pieces=$(( (payload_bytes + piece_bytes - 1) / piece_bytes ))
 
   echo "--- test $test_index: $label ($expected_pieces pieces) ---"
+
+  # Verify tracker port is free before starting
+  if ! wait_for_port_free "$tracker_port"; then
+    echo "  FAIL: port $tracker_port still in use"
+    FAIL=$((FAIL + 1))
+    FAILURES+=("$label: port conflict")
+    continue
+  fi
 
   TEST_DIR="$WORK_DIR/test-$test_index"
   mkdir -p "$TEST_DIR/seed-root" "$TEST_DIR/download-root"
@@ -153,7 +205,7 @@ for entry in "${TESTS[@]}"; do
   # Start downloader with timeout
   download_ok=false
   "$TOOLS_BIN" download "$TORRENT_PATH" "$TEST_DIR/download-root" \
-    --port "$download_port" >"$DOWNLOAD_LOG" 2>&1 &
+    --port "$download_port" --max-peers 1 >"$DOWNLOAD_LOG" 2>&1 &
   DOWNLOAD_PID="$!"
 
   # Wait for download to finish with timeout
@@ -176,6 +228,7 @@ for entry in "${TESTS[@]}"; do
     DOWNLOAD_PID=""
   elif [[ -z "$DOWNLOAD_PID" ]]; then
     # timed out, already handled
+    sleep 0.5
     continue
   fi
 
@@ -188,6 +241,7 @@ for entry in "${TESTS[@]}"; do
     run_cleanup
     FAIL=$((FAIL + 1))
     FAILURES+=("$label: no output file")
+    sleep 0.5
     continue
   fi
 
@@ -208,6 +262,8 @@ for entry in "${TESTS[@]}"; do
   fi
 
   run_cleanup
+  # Brief pause for socket TIME_WAIT cleanup between tests
+  sleep 0.5
   echo ""
 done
 

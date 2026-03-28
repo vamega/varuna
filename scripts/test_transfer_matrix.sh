@@ -9,18 +9,46 @@ FAIL_COUNT=0
 SKIP_COUNT=0
 RESULTS=()
 
-# Base port — each test increments by 10 to avoid conflicts
-BASE_PORT="${BASE_PORT:-7200}"
+# Each test gets a port range of 100 starting from 30000+
+# to avoid conflicts with standard services and other tests.
+NEXT_PORT="${BASE_PORT:-30000}"
 
 cleanup_test() {
   local pids="$1"
+  # Send SIGTERM first for graceful shutdown
   for pid in $pids; do
     kill "$pid" 2>/dev/null || true
   done
-  sleep 0.3
+  sleep 0.2
+  # Force-kill anything still alive
+  for pid in $pids; do
+    kill -9 "$pid" 2>/dev/null || true
+  done
+  # Wait for all processes to fully exit
   for pid in $pids; do
     wait "$pid" 2>/dev/null || true
   done
+  # Verify all processes are dead
+  for pid in $pids; do
+    if kill -0 "$pid" 2>/dev/null; then
+      echo "    warning: process $pid still alive after cleanup" >&2
+      sleep 0.5
+      kill -9 "$pid" 2>/dev/null || true
+      wait "$pid" 2>/dev/null || true
+    fi
+  done
+}
+
+wait_for_port_free() {
+  local port="$1"
+  for _ in $(seq 1 40); do
+    if ! bash -c "exec 3<>/dev/tcp/127.0.0.1/$port" 2>/dev/null; then
+      return 0
+    fi
+    sleep 0.1
+  done
+  echo "    warning: port $port still in use after 4s" >&2
+  return 1
 }
 
 wait_for_tcp() {
@@ -33,8 +61,8 @@ wait_for_tcp() {
 }
 
 wait_for_log() {
-  local file="$1" pattern="$2"
-  for _ in $(seq 1 200); do
+  local file="$1" pattern="$2" max_wait="${3:-600}"
+  for _ in $(seq 1 "$max_wait"); do
     [[ -f "$file" ]] && grep -q "$pattern" "$file" && return 0
     sleep 0.05
   done
@@ -45,14 +73,23 @@ wait_for_log() {
 # Args: test_name payload_size_kb piece_length_bytes timeout_secs
 run_single_file_test() {
   local name="$1" size_kb="$2" piece_len="$3" timeout_s="${4:-60}"
-  local port_base=$BASE_PORT
-  BASE_PORT=$((BASE_PORT + 10))
+  local port_base=$NEXT_PORT
+  NEXT_PORT=$((NEXT_PORT + 100))
 
   local tp=$port_base sp=$((port_base+1)) dp=$((port_base+2))
   local W=$(mktemp -d -t "vt-${name}-XXXXXX")
   local pids=""
 
   echo -n "  $name (${size_kb}KB, piece=${piece_len})... "
+
+  # Verify tracker port is free before starting
+  if ! wait_for_port_free "$tp"; then
+    echo "SKIP (port $tp in use)"
+    SKIP_COUNT=$((SKIP_COUNT + 1))
+    RESULTS+=("SKIP $name (port conflict)")
+    rm -rf "$W"
+    return
+  fi
 
   mkdir -p "$W/seed" "$W/dl"
   dd if=/dev/urandom of="$W/seed/payload.bin" bs=1024 count="$size_kb" 2>/dev/null
@@ -81,7 +118,7 @@ run_single_file_test() {
   pids="$pids $!"
   wait_for_log "$W/seed.log" "seed announce accepted" || { echo "SKIP (seed)"; SKIP_COUNT=$((SKIP_COUNT+1)); RESULTS+=("SKIP $name"); cleanup_test "$pids"; rm -rf "$W"; return; }
 
-  if timeout "$timeout_s" "$ROOT_DIR/zig-out/bin/varuna-tools" download "$W/test.torrent" "$W/dl" --port "$dp" >"$W/dl.log" 2>&1; then
+  if timeout "$timeout_s" "$ROOT_DIR/zig-out/bin/varuna-tools" download "$W/test.torrent" "$W/dl" --port "$dp" --max-peers 1 >"$W/dl.log" 2>&1; then
     if cmp -s "$W/seed/payload.bin" "$W/dl/payload.bin"; then
       echo "PASS"
       PASS_COUNT=$((PASS_COUNT + 1))
@@ -106,6 +143,8 @@ run_single_file_test() {
 
   cleanup_test "$pids"
   rm -rf "$W"
+  # Brief pause for socket TIME_WAIT cleanup between tests
+  sleep 0.5
 }
 
 # Run a multi-file (directory) transfer test
@@ -113,14 +152,23 @@ run_single_file_test() {
 # file_specs is "size1_kb:name1,size2_kb:name2,..."
 run_multi_file_test() {
   local name="$1" file_specs="$2" piece_len="$3" timeout_s="${4:-60}"
-  local port_base=$BASE_PORT
-  BASE_PORT=$((BASE_PORT + 10))
+  local port_base=$NEXT_PORT
+  NEXT_PORT=$((NEXT_PORT + 100))
 
   local tp=$port_base sp=$((port_base+1)) dp=$((port_base+2))
   local W=$(mktemp -d -t "vt-${name}-XXXXXX")
   local pids=""
 
   echo -n "  $name (multi-file, piece=${piece_len})... "
+
+  # Verify tracker port is free before starting
+  if ! wait_for_port_free "$tp"; then
+    echo "SKIP (port $tp in use)"
+    SKIP_COUNT=$((SKIP_COUNT + 1))
+    RESULTS+=("SKIP $name (port conflict)")
+    rm -rf "$W"
+    return
+  fi
 
   mkdir -p "$W/seed/content" "$W/dl"
 
@@ -162,7 +210,7 @@ run_multi_file_test() {
   pids="$pids $!"
   wait_for_log "$W/seed.log" "seed announce accepted" || { echo "SKIP (seed)"; SKIP_COUNT=$((SKIP_COUNT+1)); RESULTS+=("SKIP $name"); cleanup_test "$pids"; rm -rf "$W"; return; }
 
-  if timeout "$timeout_s" "$ROOT_DIR/zig-out/bin/varuna-tools" download "$W/test.torrent" "$W/dl" --port "$dp" >"$W/dl.log" 2>&1; then
+  if timeout "$timeout_s" "$ROOT_DIR/zig-out/bin/varuna-tools" download "$W/test.torrent" "$W/dl" --port "$dp" --max-peers 1 >"$W/dl.log" 2>&1; then
     # Verify each file
     local all_match=true
     for spec in "${specs[@]}"; do
@@ -194,6 +242,8 @@ run_multi_file_test() {
 
   cleanup_test "$pids"
   rm -rf "$W"
+  # Brief pause for socket TIME_WAIT cleanup between tests
+  sleep 0.5
 }
 
 # ─── Main ───────────────────────────────────────────────
@@ -205,9 +255,16 @@ echo ""
 # Build
 zig build >/dev/null 2>&1
 
-# Kill any lingering processes
-pkill -9 -f "varuna-tools seed" 2>/dev/null; true
-pkill -9 opentracker 2>/dev/null; true
+# Kill any lingering processes from THIS worktree's previous runs.
+# Only kill processes whose command line references this ROOT_DIR to avoid
+# interfering with other concurrent test runs from different worktrees.
+for pid in $(pgrep -f "$ROOT_DIR/zig-out/bin/varuna-tools (seed|download)" 2>/dev/null || true); do
+  [[ "$pid" == "$$" ]] && continue
+  kill -9 "$pid" 2>/dev/null || true
+done
+for pid in $(pgrep -f "$ROOT_DIR/.tools/opentracker" 2>/dev/null || true); do
+  kill -9 "$pid" 2>/dev/null || true
+done
 sleep 1
 
 # ── Small files ──────────────────────────────────────────

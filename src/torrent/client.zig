@@ -353,19 +353,27 @@ pub fn download(
     // Drain remaining hasher results and disk writes.
     // The hasher thread may still be processing when the download loop exits
     // (the hash and disk write happen asynchronously after piece data is received).
-    {
+    // We must wait for: hasher jobs -> hash results -> disk writes -> write CQEs.
+    if (!piece_tracker.isComplete()) {
         var drain_ticks: u32 = 0;
-        while (drain_ticks < 200) : (drain_ticks += 1) {
-            event_loop.processHashResults();
-            if (event_loop.pending_writes.count() > 0) {
-                // Have pending writes, tick to process disk write CQEs
-                event_loop.submitTimeout(10 * std.time.ns_per_ms) catch {};
+        while (drain_ticks < 500) : (drain_ticks += 1) {
+            const has_pending_writes = event_loop.pending_writes.count() > 0;
+            const hasher_busy = if (event_loop.hasher) |h| h.hasPendingWork() else false;
+
+            if (!has_pending_writes and !hasher_busy) break;
+
+            if (has_pending_writes or hasher_busy) {
+                // Use tick() to process hash results, submit disk writes, and handle CQEs.
+                // tick() calls processHashResults() + ring.submit() + submit_and_wait().
+                event_loop.submitTimeout(50 * std.time.ns_per_ms) catch {};
                 event_loop.tick() catch break;
-            } else if (drain_ticks > 50) {
-                break;
-            } else {
-                // Wait for hasher to produce results
-                std.Thread.sleep(10 * std.time.ns_per_ms);
+            }
+
+            if (piece_tracker.isComplete() and event_loop.pending_writes.count() == 0) break;
+
+            // If hasher still busy but no pending writes or CQEs yet, brief sleep
+            if (!has_pending_writes and hasher_busy) {
+                std.Thread.sleep(2 * std.time.ns_per_ms);
             }
         }
     }
