@@ -103,6 +103,10 @@ pub fn main() !void {
     // Submit timeout for shared event loop
     shared_el.submitTimeout(100 * std.time.ns_per_ms) catch {};
 
+    // Listen socket for accepting inbound peer connections (created once, shared across torrents)
+    var listen_fd: std.posix.fd_t = -1;
+    defer if (listen_fd >= 0) std.posix.close(listen_fd);
+
     // Main loop: tick shared event loop + poll API server
     var resume_tick_counter: u32 = 0;
     while (!varuna.io.signal.isShutdownRequested()) {
@@ -118,6 +122,32 @@ pub fn main() !void {
                 const sess = entry.value_ptr.*;
                 if (sess.pending_peers != null) {
                     _ = sess.integrateIntoEventLoop();
+                }
+            }
+            session_manager.mutex.unlock();
+        }
+
+        // Check if any sessions need seed mode setup (completed download or 100% recheck)
+        {
+            session_manager.mutex.lock();
+            var iter = session_manager.sessions.iterator();
+            while (iter.next()) |entry| {
+                const sess = entry.value_ptr.*;
+
+                // Check for download-to-seed transition
+                _ = sess.checkSeedTransition();
+
+                // Set up seed mode if flagged by background thread or transition
+                if (sess.pending_seed_setup) {
+                    if (sess.integrateSeedIntoEventLoop()) {
+                        // Create listen socket once for the first seeding torrent
+                        if (listen_fd < 0) {
+                            listen_fd = createListenSocket(cfg.network.port) catch -1;
+                            if (listen_fd >= 0) {
+                                shared_el.ensureAccepting(listen_fd) catch {};
+                            }
+                        }
+                    }
                 }
             }
             session_manager.mutex.unlock();
@@ -139,8 +169,8 @@ pub fn main() !void {
         }
 
         // Tick shared event loop (non-blocking poll)
-        if (shared_el.peer_count > 0) {
-            // Has active peers -- use tick which calls submit_and_wait
+        if (shared_el.peer_count > 0 or shared_el.listen_fd >= 0) {
+            // Has active peers or accepting connections -- use tick which calls submit_and_wait
             shared_el.submitTimeout(100 * std.time.ns_per_ms) catch {};
             shared_el.tick() catch {};
         } else {
@@ -151,6 +181,27 @@ pub fn main() !void {
 
     try stdout.print("\nshutting down...\n", .{});
     try stdout.flush();
+}
+
+/// Create a non-blocking listen socket bound to 0.0.0.0:port for accepting
+/// inbound peer connections. Uses standard socket creation (one-time setup,
+/// not on the hot path -- io_uring handles the accept calls).
+fn createListenSocket(port: u16) !std.posix.fd_t {
+    const addr = std.net.Address.initIp4(.{ 0, 0, 0, 0 }, port);
+    const fd = try std.posix.socket(
+        std.posix.AF.INET,
+        std.posix.SOCK.STREAM | std.posix.SOCK.CLOEXEC | std.posix.SOCK.NONBLOCK,
+        std.posix.IPPROTO.TCP,
+    );
+    errdefer std.posix.close(fd);
+
+    // Allow address reuse
+    const one: u32 = 1;
+    std.posix.setsockopt(fd, std.posix.SOL.SOCKET, std.posix.SO.REUSEADDR, std.mem.asBytes(&one)) catch {};
+
+    try std.posix.bind(fd, &addr.any, addr.getOsSockLen());
+    try std.posix.listen(fd, 128);
+    return fd;
 }
 
 // Global state for handler dispatch (Zig fn pointers can't capture state)
