@@ -310,6 +310,17 @@ pub const EventLoop = struct {
         return error.TooManyTorrents;
     }
 
+    /// Count the number of active peers for a specific torrent.
+    pub fn peerCountForTorrent(self: *const EventLoop, torrent_id: u8) u16 {
+        var count: u16 = 0;
+        for (self.peers) |*peer| {
+            if (peer.state != .free and peer.torrent_id == torrent_id) {
+                count += 1;
+            }
+        }
+        return count;
+    }
+
     /// Remove a torrent context and disconnect all its peers.
     pub fn removeTorrent(self: *EventLoop, torrent_id: u8) void {
         // Disconnect all peers for this torrent

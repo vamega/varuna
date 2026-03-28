@@ -210,7 +210,7 @@ pub const TorrentSession = struct {
             .info_hash_hex = self.info_hash_hex,
             .save_path = self.save_path,
             .added_on = self.added_on,
-            .peers_connected = if (self.event_loop) |*el| el.peer_count else if (self.shared_event_loop) |sel| sel.peer_count else 0,
+            .peers_connected = if (self.event_loop) |*el| el.peer_count else if (self.shared_event_loop) |sel| if (self.torrent_id_in_shared) |tid| sel.peerCountForTorrent(tid) else 0 else 0,
             .error_msg = self.error_message,
         };
     }
