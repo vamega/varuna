@@ -138,6 +138,15 @@ pub const EventLoop = struct {
         slot: u16,
     };
 
+    /// Queued piece block response for batched sending.
+    /// Multiple blocks queued in the same tick are combined into one send.
+    const QueuedBlockResponse = struct {
+        slot: u16,
+        piece_index: u32,
+        block_offset: u32,
+        block_length: u32,
+    };
+
     /// Tracks an async piece read for seed mode.
     /// For multi-span pieces, multiple io_uring reads are submitted.
     /// When all reads complete, the piece response is sent.
@@ -191,6 +200,9 @@ pub const EventLoop = struct {
     cached_piece_data: ?[]u8 = null,
     cached_piece_len: usize = 0,
 
+    // Queued piece block responses (batched per tick, flushed after CQE dispatch)
+    queued_responses: std.ArrayList(QueuedBlockResponse),
+
     // Re-announce state
     announce_url: ?[]const u8 = null,
     announce_interval: u32 = 1800,
@@ -223,6 +235,7 @@ pub const EventLoop = struct {
             .pending_writes = std.ArrayList(PendingWrite).empty,
             .pending_sends = std.ArrayList(PendingSend).empty,
             .pending_reads = std.ArrayList(PendingPieceRead).empty,
+            .queued_responses = std.ArrayList(QueuedBlockResponse).empty,
             .hasher = hasher,
         };
     }
@@ -256,6 +269,7 @@ pub const EventLoop = struct {
             .pending_writes = std.ArrayList(PendingWrite).empty,
             .pending_sends = std.ArrayList(PendingSend).empty,
             .pending_reads = std.ArrayList(PendingPieceRead).empty,
+            .queued_responses = std.ArrayList(QueuedBlockResponse).empty,
             .hasher = hasher,
         };
 
@@ -328,6 +342,7 @@ pub const EventLoop = struct {
             self.allocator.free(pr.read_buf);
         }
         self.pending_reads.deinit(self.allocator);
+        self.queued_responses.deinit(self.allocator);
         for (self.peers) |*peer| {
             self.cleanupPeer(peer);
         }
@@ -440,6 +455,9 @@ pub const EventLoop = struct {
         for (cqes[0..count]) |cqe| {
             self.dispatch(cqe);
         }
+
+        // Batch-send any queued piece block responses
+        self.flushQueuedResponses();
 
         // Flush any SQEs queued during dispatch (piece responses, block requests, etc.)
         _ = self.ring.submit() catch {};
@@ -981,9 +999,14 @@ pub const EventLoop = struct {
         const piece_size = sess.layout.pieceSize(piece_index) catch return;
         if (block_offset + block_length > piece_size) return;
 
-        // If piece is cached, serve immediately (no disk I/O needed)
+        // If piece is cached, queue for batched send (flushed after CQE dispatch)
         if (self.cached_piece_index != null and self.cached_piece_index.? == piece_index) {
-            self.sendPieceBlock(slot, piece_index, block_offset, block_length, self.cached_piece_data.?);
+            self.queued_responses.append(self.allocator, .{
+                .slot = slot,
+                .piece_index = piece_index,
+                .block_offset = block_offset,
+                .block_length = block_length,
+            }) catch {};
             return;
         }
 
@@ -1054,11 +1077,107 @@ pub const EventLoop = struct {
                     self.cached_piece_index = pi;
                     self.cached_piece_len = ps;
 
-                    self.sendPieceBlock(slot, pi, bo, bl, buf);
+                    // Queue for batched send (flushed after CQE dispatch)
+                    self.queued_responses.append(self.allocator, .{
+                        .slot = slot,
+                        .piece_index = pi,
+                        .block_offset = bo,
+                        .block_length = bl,
+                    }) catch {
+                        // Fallback: send individually
+                        self.sendPieceBlock(slot, pi, bo, bl, buf);
+                    };
                 }
                 return;
             }
         }
+    }
+
+    /// Flush all queued piece block responses, batching by peer slot.
+    /// All blocks for a given peer are concatenated into one send buffer.
+    fn flushQueuedResponses(self: *EventLoop) void {
+        if (self.queued_responses.items.len == 0) return;
+        const cached_data = self.cached_piece_data orelse {
+            self.queued_responses.items.len = 0;
+            return;
+        };
+
+        // Process all queued responses, grouping by slot.
+        // Since most responses in a tick are for the same peer, we use a simple
+        // approach: sort by slot, then batch consecutive entries.
+        const items = self.queued_responses.items;
+
+        // Sort by slot for grouping
+        std.mem.sort(QueuedBlockResponse, items, {}, struct {
+            fn lessThan(_: void, a: QueuedBlockResponse, b: QueuedBlockResponse) bool {
+                return a.slot < b.slot;
+            }
+        }.lessThan);
+
+        var i: usize = 0;
+        while (i < items.len) {
+            const current_slot = items[i].slot;
+
+            // Find end of this peer's batch
+            var j = i + 1;
+            while (j < items.len and items[j].slot == current_slot) j += 1;
+            const batch = items[i..j];
+
+            // Calculate total send buffer size
+            var total_len: usize = 0;
+            for (batch) |resp| {
+                total_len += 4 + 1 + 8 + @as(usize, resp.block_length); // len_prefix + msg_id + piece_index + offset + data
+            }
+
+            // Allocate single buffer for all blocks
+            const send_buf = self.allocator.alloc(u8, total_len) catch {
+                // Fallback: send individually
+                for (batch) |resp| {
+                    self.sendPieceBlock(resp.slot, resp.piece_index, resp.block_offset, resp.block_length, cached_data);
+                }
+                i = j;
+                continue;
+            };
+
+            // Pack all block responses into the buffer
+            var offset: usize = 0;
+            var total_uploaded: u64 = 0;
+            for (batch) |resp| {
+                const msg_len: u32 = 1 + 8 + resp.block_length;
+                std.mem.writeInt(u32, send_buf[offset..][0..4], msg_len, .big);
+                send_buf[offset + 4] = 7; // piece message id
+                std.mem.writeInt(u32, send_buf[offset + 5 ..][0..4], resp.piece_index, .big);
+                std.mem.writeInt(u32, send_buf[offset + 9 ..][0..4], resp.block_offset, .big);
+                const data_start: usize = @intCast(resp.block_offset);
+                @memcpy(send_buf[offset + 13 ..][0..resp.block_length], cached_data[data_start..][0..resp.block_length]);
+                offset += 4 + 1 + 8 + @as(usize, resp.block_length);
+                total_uploaded += resp.block_length;
+            }
+
+            const peer = &self.peers[current_slot];
+            peer.bytes_uploaded_to += total_uploaded;
+
+            self.pending_sends.append(self.allocator, .{
+                .buf = send_buf,
+                .slot = current_slot,
+            }) catch {
+                self.allocator.free(send_buf);
+                i = j;
+                continue;
+            };
+
+            const ud = encodeUserData(.{ .slot = current_slot, .op_type = .peer_send, .context = 1 });
+            _ = self.ring.send(ud, peer.fd, send_buf, 0) catch {
+                self.allocator.free(send_buf);
+                i = j;
+                continue;
+            };
+            peer.send_pending = true;
+
+            i = j;
+        }
+
+        self.queued_responses.items.len = 0;
     }
 
     fn sendPieceBlock(self: *EventLoop, slot: u16, piece_index: u32, block_offset: u32, block_length: u32, read_buf: []u8) void {
