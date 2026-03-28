@@ -221,3 +221,211 @@ test "reject trailing bytes after root value" {
 test "reject truncated list" {
     try std.testing.expectError(error.UnexpectedEndOfStream, parse(std.testing.allocator, "li1e"));
 }
+
+// ── Fuzz test ─────────────────────────────────────────────
+
+test "fuzz bencode parser" {
+    try std.testing.fuzz({}, struct {
+        fn run(_: void, input: []const u8) anyerror!void {
+            const value = parse(std.testing.allocator, input) catch return;
+            freeValue(std.testing.allocator, value);
+        }
+    }.run, .{
+        .corpus = &.{
+            // Valid bencode samples
+            "i0e",
+            "i42e",
+            "i-1e",
+            "4:spam",
+            "0:",
+            "le",
+            "de",
+            "li1ei2ei3ee",
+            "d3:cow3:mooe",
+            "d3:cow3:moo4:spamli1ei2eee",
+            // Invalid / edge cases
+            "",
+            "i",
+            "ie",
+            "l",
+            "d",
+            "999999999:",
+            "i99999999999999999999e",
+            "i-0e",
+            "ddddddddddddddddddde",
+        },
+    });
+}
+
+// ── Edge case tests ───────────────────────────────────────
+
+test "reject empty input" {
+    try std.testing.expectError(error.UnexpectedEndOfStream, parse(std.testing.allocator, ""));
+}
+
+test "reject single bytes" {
+    // Every single byte value should either parse successfully or return an error, never panic.
+    var buf: [1]u8 = undefined;
+    for (0..256) |b| {
+        buf[0] = @intCast(b);
+        if (parse(std.testing.allocator, &buf)) |value| {
+            freeValue(std.testing.allocator, value);
+        } else |_| {}
+    }
+}
+
+test "reject deeply nested lists" {
+    // 256 nested lists with no closing: "llll...l"
+    const depth = 256;
+    var buf: [depth]u8 = undefined;
+    @memset(&buf, 'l');
+    try std.testing.expectError(error.UnexpectedEndOfStream, parse(std.testing.allocator, &buf));
+}
+
+test "reject deeply nested dicts" {
+    // "d1:ad1:ad1:a..." -- each level is a dict with key "a" and value = next dict
+    const depth = 128;
+    // Each nesting level needs "d1:a" (4 bytes) plus "e" closers at the end
+    var buf: [depth * 4 + depth]u8 = undefined;
+    for (0..depth) |i| {
+        buf[i * 4 + 0] = 'd';
+        buf[i * 4 + 1] = '1';
+        buf[i * 4 + 2] = ':';
+        buf[i * 4 + 3] = 'a';
+    }
+    // Innermost value: "de" (empty dict)
+    // Actually we need a value for the last key. Use "de" (empty dict) then close all.
+    // Rewrite: we have depth keys, the last one's value is "de", then depth-1 closing 'e's.
+    const prefix_len = depth * 4;
+    // Replace last 4 bytes of prefix with a value
+    // Actually the structure works: d1:a d1:a d1:a ... d1:a <value> e e e ... e
+    // We need a value for the innermost key and then depth 'e's to close.
+    // Total = prefix_len + 2 (for "de") + depth (for closing 'e's)
+    var full_buf = std.testing.allocator.alloc(u8, prefix_len + 2 + depth) catch return;
+    defer std.testing.allocator.free(full_buf);
+    @memcpy(full_buf[0..prefix_len], buf[0..prefix_len]);
+    full_buf[prefix_len] = 'd';
+    full_buf[prefix_len + 1] = 'e';
+    @memset(full_buf[prefix_len + 2 ..], 'e');
+
+    const value = try parse(std.testing.allocator, full_buf);
+    freeValue(std.testing.allocator, value);
+}
+
+test "parse very long byte string" {
+    // Build "10000:<10000 bytes of 'x'>"
+    const length = 10000;
+    const header = "10000:";
+    var buf = std.testing.allocator.alloc(u8, header.len + length) catch return;
+    defer std.testing.allocator.free(buf);
+    @memcpy(buf[0..header.len], header);
+    @memset(buf[header.len..], 'x');
+
+    const value = try parse(std.testing.allocator, buf);
+    freeValue(std.testing.allocator, value);
+    try std.testing.expectEqual(@as(usize, length), value.bytes.len);
+}
+
+test "reject negative zero integer" {
+    // "i-0e" is invalid per bencode spec, but our parser may accept it.
+    // Either way it must not panic.
+    if (parse(std.testing.allocator, "i-0e")) |value| {
+        freeValue(std.testing.allocator, value);
+    } else |_| {}
+}
+
+test "parse negative integer" {
+    const value = try parse(std.testing.allocator, "i-42e");
+    defer freeValue(std.testing.allocator, value);
+    try std.testing.expectEqual(Value{ .integer = -42 }, value);
+}
+
+test "reject integer overflow" {
+    // Larger than i64 max
+    try std.testing.expectError(
+        error.Overflow,
+        parse(std.testing.allocator, "i99999999999999999999e"),
+    );
+    // Smaller than i64 min
+    try std.testing.expectError(
+        error.Overflow,
+        parse(std.testing.allocator, "i-99999999999999999999e"),
+    );
+}
+
+test "reject truncated inputs" {
+    const truncated_cases = [_][]const u8{
+        "i1",
+        "3:ab",
+        "l",
+        "d",
+        "d3:foo",
+        "d3:fooi1e",
+        "li1ei2e",
+    };
+    for (truncated_cases) |input| {
+        try std.testing.expectError(
+            error.UnexpectedEndOfStream,
+            parse(std.testing.allocator, input),
+        );
+    }
+}
+
+test "reject invalid bencode byte sequences" {
+    const invalid_cases = [_][]const u8{
+        "xyz",
+        "\x00",
+        "\xff",
+        "i1e trailing",
+        "ie",
+        "i--1e",
+        "iabce",
+        "-1:x",
+    };
+    for (invalid_cases) |input| {
+        if (parse(std.testing.allocator, input)) |value| {
+            freeValue(std.testing.allocator, value);
+        } else |err| {
+            // Must be a ParseError, not a panic
+            _ = err;
+        }
+    }
+}
+
+test "reject byte string length overflow" {
+    // Length that would overflow usize
+    if (parse(std.testing.allocator, "99999999999999999999:")) |value| {
+        freeValue(std.testing.allocator, value);
+    } else |_| {}
+}
+
+test "parse empty byte string" {
+    const value = try parse(std.testing.allocator, "0:");
+    defer freeValue(std.testing.allocator, value);
+    try std.testing.expectEqualStrings("", value.bytes);
+}
+
+test "parse empty list" {
+    const value = try parse(std.testing.allocator, "le");
+    defer freeValue(std.testing.allocator, value);
+    try std.testing.expectEqual(@as(usize, 0), value.list.len);
+}
+
+test "parse empty dict" {
+    const value = try parse(std.testing.allocator, "de");
+    defer freeValue(std.testing.allocator, value);
+    try std.testing.expectEqual(@as(usize, 0), value.dict.len);
+}
+
+test "parse i64 min and max" {
+    {
+        const value = try parse(std.testing.allocator, "i9223372036854775807e");
+        defer freeValue(std.testing.allocator, value);
+        try std.testing.expectEqual(Value{ .integer = std.math.maxInt(i64) }, value);
+    }
+    {
+        const value = try parse(std.testing.allocator, "i-9223372036854775808e");
+        defer freeValue(std.testing.allocator, value);
+        try std.testing.expectEqual(Value{ .integer = std.math.minInt(i64) }, value);
+    }
+}

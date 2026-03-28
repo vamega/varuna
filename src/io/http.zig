@@ -255,6 +255,88 @@ test "parse content length" {
     try std.testing.expectEqual(@as(?usize, 42), parseContentLength(headers));
 }
 
+// ── Fuzz and edge case tests for HTTP response parsing ────
+
+test "fuzz HTTP response parsers" {
+    try std.testing.fuzz({}, struct {
+        fn run(_: void, input: []const u8) anyerror!void {
+            // All three parsers must not panic on any input
+            _ = findBodyStart(input);
+            _ = parseContentLength(input);
+            _ = parseStatusCode(input);
+        }
+    }.run, .{
+        .corpus = &.{
+            "",
+            "HTTP/1.1 200 OK\r\nContent-Length: 11\r\n\r\nhello world",
+            "HTTP/1.1 404 Not Found\r\n\r\n",
+            "HTTP/1.0 500 Internal Server Error\r\n\r\n",
+            "garbage",
+            "\r\n\r\n",
+            "HTTP/",
+            "HTTP/1.1 ",
+            "HTTP/1.1 999 X\r\n\r\n",
+            "Content-Length: 99999999999999999999\r\n\r\n",
+        },
+    });
+}
+
+test "fuzz URL parser" {
+    try std.testing.fuzz({}, struct {
+        fn run(_: void, input: []const u8) anyerror!void {
+            _ = parseUrl(input) catch return;
+        }
+    }.run, .{
+        .corpus = &.{
+            "",
+            "http://example.com",
+            "http://example.com:8080/path",
+            "https://example.com",
+            "example.com:80/path",
+            "http://[::1]:8080/path",
+            "http://:8080",
+            "http://host:99999/path",
+        },
+    });
+}
+
+test "parseStatusCode edge cases" {
+    try std.testing.expectEqual(@as(?u16, null), parseStatusCode(""));
+    try std.testing.expectEqual(@as(?u16, null), parseStatusCode("HTTP/1.1"));
+    try std.testing.expectEqual(@as(?u16, null), parseStatusCode("HTTP/1.1 "));
+    try std.testing.expectEqual(@as(?u16, null), parseStatusCode("HTTP/1.1 XX"));
+    try std.testing.expectEqual(@as(?u16, null), parseStatusCode("GET / HTTP"));
+    try std.testing.expectEqual(@as(?u16, 200), parseStatusCode("HTTP/1.0 200 OK\r\n"));
+    try std.testing.expectEqual(@as(?u16, 100), parseStatusCode("HTTP/1.1 100 Continue\r\n"));
+}
+
+test "parseContentLength edge cases" {
+    try std.testing.expectEqual(@as(?usize, null), parseContentLength(""));
+    try std.testing.expectEqual(@as(?usize, null), parseContentLength("No-Such-Header: 42\r\n"));
+    try std.testing.expectEqual(@as(?usize, 0), parseContentLength("Content-Length: 0\r\n"));
+    try std.testing.expectEqual(@as(?usize, null), parseContentLength("Content-Length: abc\r\n"));
+    try std.testing.expectEqual(@as(?usize, 42), parseContentLength("content-length: 42\r\n"));
+}
+
+test "findBodyStart edge cases" {
+    try std.testing.expectEqual(@as(?usize, null), findBodyStart(""));
+    try std.testing.expectEqual(@as(?usize, null), findBodyStart("\r\n"));
+    try std.testing.expectEqual(@as(?usize, null), findBodyStart("\r\n\r"));
+    try std.testing.expectEqual(@as(?usize, 4), findBodyStart("\r\n\r\n"));
+    try std.testing.expectEqual(@as(?usize, 4), findBodyStart("\r\n\r\nbody here"));
+}
+
+test "parseUrl edge cases" {
+    // HTTPS should be rejected
+    try std.testing.expectError(error.HttpsNotSupported, parseUrl("https://example.com"));
+
+    // Invalid port
+    try std.testing.expectError(error.InvalidPort, parseUrl("http://example.com:notaport/path"));
+
+    // Port overflow
+    try std.testing.expectError(error.InvalidPort, parseUrl("http://example.com:99999/path"));
+}
+
 test "http get against local fake server" {
     var ring = Ring.init(16) catch return error.SkipZigTest;
     defer ring.deinit();
