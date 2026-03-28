@@ -4,11 +4,23 @@ const Bitfield = @import("../bitfield.zig").Bitfield;
 /// Thread-safe coordinator for piece assignment across multiple download workers.
 /// Workers call claimPiece to get exclusive ownership of a piece, completePiece
 /// when done, or releasePiece if they fail mid-download.
+///
+/// Supports two optional modes:
+/// - **Selective download**: a `wanted` bitfield masks out pieces belonging
+///   exclusively to skipped files. Unwanted pieces are never claimed and do not
+///   count towards completion.
+/// - **Sequential download**: when `sequential` is true, `claimPiece` returns
+///   the lowest-index eligible piece instead of the rarest, enabling streaming
+///   playback while downloading.
 pub const PieceTracker = struct {
     mutex: std.Thread.Mutex = .{},
     progress_cond: std.Thread.Condition = .{},
     complete: Bitfield,
     in_progress: Bitfield,
+    /// Optional mask of pieces we actually want. null = want everything.
+    wanted: ?Bitfield,
+    /// Number of pieces we need (wanted.count when selective, else piece_count).
+    wanted_count: u32,
     availability: []u16,
     piece_count: u32,
     total_size: u64,
@@ -20,6 +32,9 @@ pub const PieceTracker = struct {
     /// Tracked minimum availability among unclaimed pieces. Pieces with availability
     /// above this value cannot be the rarest, allowing early-exit when we find a match.
     min_availability: u16 = 0,
+    /// When true, claimPiece uses sequential (lowest-index) selection instead of
+    /// rarest-first. This allows streaming playback while downloading.
+    sequential: bool = false,
 
     pub fn init(
         allocator: std.mem.Allocator,
@@ -48,6 +63,8 @@ pub const PieceTracker = struct {
         return .{
             .complete = complete,
             .in_progress = in_progress,
+            .wanted = null,
+            .wanted_count = piece_count,
             .availability = availability,
             .piece_count = piece_count,
             .total_size = total_size,
@@ -62,7 +79,33 @@ pub const PieceTracker = struct {
         allocator.free(self.availability);
         self.complete.deinit(allocator);
         self.in_progress.deinit(allocator);
+        if (self.wanted) |*w| w.deinit(allocator);
         self.* = undefined;
+    }
+
+    /// Set the wanted piece mask for selective download. Caller transfers
+    /// ownership of the Bitfield to the PieceTracker. Passing null clears
+    /// the mask (want everything).
+    pub fn setWanted(self: *PieceTracker, wanted: ?Bitfield) void {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        self.wanted = wanted;
+        self.wanted_count = if (wanted) |w| w.count else self.piece_count;
+        // Reset scan hint since the wanted set changed.
+        self.scan_hint = 0;
+        self.min_availability = 0;
+    }
+
+    /// Enable or disable sequential download mode.
+    pub fn setSequential(self: *PieceTracker, enabled: bool) void {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        self.sequential = enabled;
+        // Reset hints -- sequential starts from the beginning.
+        if (enabled) {
+            self.scan_hint = 0;
+            self.min_availability = 0;
+        }
     }
 
     /// Report that a peer has a specific piece (from have message).
@@ -100,31 +143,46 @@ pub const PieceTracker = struct {
         }
     }
 
+    /// Return true when a piece is eligible for claiming (wanted and not complete).
+    fn isEligible(self: *const PieceTracker, index: u32) bool {
+        if (self.complete.has(index)) return false;
+        if (self.wanted) |w| {
+            if (!w.has(index)) return false;
+        }
+        return true;
+    }
+
     /// Claim an uncompleted, unassigned piece that the given peer has.
-    /// Uses rarest-first selection: picks the eligible piece with the lowest
-    /// availability count. In endgame mode (all remaining pieces are in-progress),
-    /// allows claiming pieces already assigned to other workers.
     ///
-    /// Optimization: maintains `scan_hint` (lowest unclaimed index) and
-    /// `min_availability` to avoid scanning pieces that are already claimed
-    /// or cannot be the rarest. For large torrents this turns the common case
-    /// from O(piece_count) into a scan over only the unclaimed tail.
+    /// Selection strategy depends on `sequential`:
+    /// - **false** (default): rarest-first among eligible pieces.
+    /// - **true**: lowest-index eligible piece the peer has.
+    ///
+    /// Pieces outside the `wanted` mask are never claimed.
+    ///
+    /// In endgame mode (all remaining wanted pieces are in-progress),
+    /// allows claiming pieces already assigned to other workers.
     pub fn claimPiece(self: *PieceTracker, peer_has: ?*const Bitfield) ?u32 {
         self.mutex.lock();
         defer self.mutex.unlock();
 
-        // First pass: find unassigned pieces (normal mode).
-        // Start from scan_hint to skip the fully-claimed prefix.
+        if (self.sequential) {
+            return self.claimSequentialLocked(peer_has);
+        }
+        return self.claimRarestFirstLocked(peer_has);
+    }
+
+    /// Rarest-first selection (the original algorithm, extended with wanted mask).
+    fn claimRarestFirstLocked(self: *PieceTracker, peer_has: ?*const Bitfield) ?u32 {
         var best_index: ?u32 = null;
         var best_availability: u16 = std.math.maxInt(u16);
         var has_unassigned = false;
-        var new_hint: u32 = self.piece_count; // track lowest unclaimed index we see
+        var new_hint: u32 = self.piece_count;
 
         var index: u32 = self.scan_hint;
         while (index < self.piece_count) : (index += 1) {
-            if (self.complete.has(index)) continue;
+            if (!self.isEligible(index)) continue;
             if (!self.in_progress.has(index)) {
-                // This piece is unclaimed -- track the lowest such index.
                 if (index < new_hint) new_hint = index;
                 has_unassigned = true;
 
@@ -135,8 +193,6 @@ pub const PieceTracker = struct {
                 if (avail < best_availability) {
                     best_availability = avail;
                     best_index = index;
-                    // Early exit: if we matched min_availability, this is
-                    // guaranteed to be the rarest (or tied for rarest).
                     if (avail <= self.min_availability) break;
                 }
             }
@@ -144,34 +200,63 @@ pub const PieceTracker = struct {
 
         if (best_index) |idx| {
             self.in_progress.set(idx) catch return null;
-            // Update scan_hint: if we just claimed the hint piece, advance it.
             if (idx == new_hint) {
-                // Find next unclaimed piece after idx.
                 var next = idx + 1;
-                while (next < self.piece_count and (self.complete.has(next) or self.in_progress.has(next))) : (next += 1) {}
+                while (next < self.piece_count and (!self.isEligible(next) or self.in_progress.has(next) or self.complete.has(next))) : (next += 1) {}
                 self.scan_hint = next;
             } else {
                 self.scan_hint = new_hint;
             }
-            // Update min_availability: the piece we just claimed is no longer
-            // available for selection. If it was the minimum, recompute lazily
-            // by setting min to the best we found (which is the same value since
-            // we picked it). Next call will find the true min.
             self.min_availability = best_availability;
             return idx;
         }
 
-        // Update scan_hint even when no piece was claimed for this peer.
         if (has_unassigned) {
             self.scan_hint = new_hint;
         }
 
-        // Endgame mode: all remaining pieces are in-progress.
-        // Allow duplicate claims so multiple workers race to finish.
-        if (!has_unassigned and self.complete.count < self.piece_count) {
+        // Endgame mode: all remaining wanted pieces are in-progress.
+        if (!has_unassigned and self.wantedRemaining() > 0) {
             index = 0;
             while (index < self.piece_count) : (index += 1) {
-                if (self.complete.has(index)) continue;
+                if (!self.isEligible(index)) continue;
+                if (peer_has) |bf| {
+                    if (!bf.has(index)) continue;
+                }
+                return index;
+            }
+        }
+
+        return null;
+    }
+
+    /// Sequential selection: pick the lowest-index eligible unclaimed piece.
+    fn claimSequentialLocked(self: *PieceTracker, peer_has: ?*const Bitfield) ?u32 {
+        var has_unassigned = false;
+
+        var index: u32 = self.scan_hint;
+        while (index < self.piece_count) : (index += 1) {
+            if (!self.isEligible(index)) continue;
+            if (self.in_progress.has(index)) continue;
+            has_unassigned = true;
+
+            if (peer_has) |bf| {
+                if (!bf.has(index)) continue;
+            }
+
+            self.in_progress.set(index) catch return null;
+            // Advance scan_hint past this piece.
+            var next = index + 1;
+            while (next < self.piece_count and (!self.isEligible(next) or self.in_progress.has(next) or self.complete.has(next))) : (next += 1) {}
+            self.scan_hint = next;
+            return index;
+        }
+
+        // Endgame: all remaining wanted pieces are in-progress.
+        if (!has_unassigned and self.wantedRemaining() > 0) {
+            index = 0;
+            while (index < self.piece_count) : (index += 1) {
+                if (!self.isEligible(index)) continue;
                 if (peer_has) |bf| {
                     if (!bf.has(index)) continue;
                 }
@@ -230,16 +315,41 @@ pub const PieceTracker = struct {
         return self.complete.has(piece_index);
     }
 
+    /// Returns true when all *wanted* pieces are complete.
+    /// With no wanted mask this is equivalent to "all pieces complete".
     pub fn isComplete(self: *PieceTracker) bool {
         self.mutex.lock();
         defer self.mutex.unlock();
-        return self.complete.count == self.piece_count;
+        return self.wantedRemaining() == 0;
     }
 
     pub fn completedCount(self: *PieceTracker) u32 {
         self.mutex.lock();
         defer self.mutex.unlock();
         return self.complete.count;
+    }
+
+    /// Number of wanted pieces that are complete.
+    pub fn wantedCompletedCount(self: *PieceTracker) u32 {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        return self.wantedCompletedCountLocked();
+    }
+
+    fn wantedCompletedCountLocked(self: *const PieceTracker) u32 {
+        const w = self.wanted orelse return self.complete.count;
+        // Count pieces that are both wanted and complete.
+        var count: u32 = 0;
+        var i: u32 = 0;
+        while (i < self.piece_count) : (i += 1) {
+            if (w.has(i) and self.complete.has(i)) count += 1;
+        }
+        return count;
+    }
+
+    /// Number of wanted pieces still remaining (not yet complete).
+    fn wantedRemaining(self: *const PieceTracker) u32 {
+        return self.wanted_count - self.wantedCompletedCountLocked();
     }
 
     pub fn bytesRemaining(self: *PieceTracker) u64 {
@@ -256,6 +366,8 @@ pub const PieceTracker = struct {
         if (self.in_progress.count > 0) self.in_progress.count -= 1;
     }
 };
+
+// ── Tests ─────────────────────────────────────────────────
 
 test "claim and complete pieces" {
     var bf = try Bitfield.init(std.testing.allocator, 8);
@@ -406,4 +518,133 @@ test "endgame mode allows duplicate claims" {
     // Duplicate completion returns false
     try std.testing.expect(!tracker.completePiece(2, 4));
     try std.testing.expect(tracker.isComplete());
+}
+
+test "wanted mask skips unwanted pieces" {
+    var bf = try Bitfield.init(std.testing.allocator, 4);
+    defer bf.deinit(std.testing.allocator);
+
+    var tracker = try PieceTracker.init(std.testing.allocator, 4, 4, 16, &bf, 0);
+    defer tracker.deinit(std.testing.allocator);
+
+    // Only want pieces 0 and 3
+    var wanted = try Bitfield.init(std.testing.allocator, 4);
+    try wanted.set(0);
+    try wanted.set(3);
+    tracker.setWanted(wanted);
+
+    const first = tracker.claimPiece(null);
+    try std.testing.expectEqual(@as(?u32, 0), first);
+
+    const second = tracker.claimPiece(null);
+    try std.testing.expectEqual(@as(?u32, 3), second);
+
+    // No more wanted pieces available
+    const third = tracker.claimPiece(null);
+    try std.testing.expectEqual(@as(?u32, null), third);
+
+    // Complete both wanted pieces -> isComplete should be true
+    _ = tracker.completePiece(0, 4);
+    _ = tracker.completePiece(3, 4);
+    try std.testing.expect(tracker.isComplete());
+
+    // Even though pieces 1 and 2 are not complete
+    try std.testing.expectEqual(@as(u32, 2), tracker.completedCount());
+    try std.testing.expectEqual(@as(u32, 2), tracker.wantedCompletedCount());
+}
+
+test "sequential mode returns pieces in order" {
+    var bf = try Bitfield.init(std.testing.allocator, 4);
+    defer bf.deinit(std.testing.allocator);
+
+    var tracker = try PieceTracker.init(std.testing.allocator, 4, 4, 16, &bf, 0);
+    defer tracker.deinit(std.testing.allocator);
+
+    tracker.setSequential(true);
+
+    // Add high availability for piece 0, low for piece 3
+    // Sequential should still pick piece 0 first (ignores availability).
+    tracker.addAvailability(0);
+    tracker.addAvailability(0);
+    tracker.addAvailability(0);
+    tracker.addAvailability(3);
+
+    const first = tracker.claimPiece(null);
+    try std.testing.expectEqual(@as(?u32, 0), first);
+
+    const second = tracker.claimPiece(null);
+    try std.testing.expectEqual(@as(?u32, 1), second);
+
+    const third = tracker.claimPiece(null);
+    try std.testing.expectEqual(@as(?u32, 2), third);
+
+    const fourth = tracker.claimPiece(null);
+    try std.testing.expectEqual(@as(?u32, 3), fourth);
+}
+
+test "sequential mode respects wanted mask" {
+    var bf = try Bitfield.init(std.testing.allocator, 6);
+    defer bf.deinit(std.testing.allocator);
+
+    var tracker = try PieceTracker.init(std.testing.allocator, 6, 4, 24, &bf, 0);
+    defer tracker.deinit(std.testing.allocator);
+
+    tracker.setSequential(true);
+
+    // Only want pieces 1, 3, 5
+    var wanted = try Bitfield.init(std.testing.allocator, 6);
+    try wanted.set(1);
+    try wanted.set(3);
+    try wanted.set(5);
+    tracker.setWanted(wanted);
+
+    const first = tracker.claimPiece(null);
+    try std.testing.expectEqual(@as(?u32, 1), first);
+
+    const second = tracker.claimPiece(null);
+    try std.testing.expectEqual(@as(?u32, 3), second);
+
+    const third = tracker.claimPiece(null);
+    try std.testing.expectEqual(@as(?u32, 5), third);
+}
+
+test "sequential endgame allows duplicate claims" {
+    var bf = try Bitfield.init(std.testing.allocator, 2);
+    defer bf.deinit(std.testing.allocator);
+
+    var tracker = try PieceTracker.init(std.testing.allocator, 2, 4, 8, &bf, 0);
+    defer tracker.deinit(std.testing.allocator);
+
+    tracker.setSequential(true);
+
+    _ = tracker.completePiece(0, 4);
+
+    // Claim piece 1
+    const first = tracker.claimPiece(null);
+    try std.testing.expectEqual(@as(?u32, 1), first);
+
+    // Endgame: piece 1 is in-progress, should still return it
+    const endgame = tracker.claimPiece(null);
+    try std.testing.expectEqual(@as(?u32, 1), endgame);
+}
+
+test "isComplete with wanted mask ignores unwanted pieces" {
+    var bf = try Bitfield.init(std.testing.allocator, 4);
+    defer bf.deinit(std.testing.allocator);
+
+    var tracker = try PieceTracker.init(std.testing.allocator, 4, 4, 16, &bf, 0);
+    defer tracker.deinit(std.testing.allocator);
+
+    // Want only piece 0
+    var wanted = try Bitfield.init(std.testing.allocator, 4);
+    try wanted.set(0);
+    tracker.setWanted(wanted);
+
+    try std.testing.expect(!tracker.isComplete());
+
+    _ = tracker.completePiece(0, 4);
+    try std.testing.expect(tracker.isComplete());
+
+    // Pieces 1, 2, 3 are not complete but also not wanted
+    try std.testing.expectEqual(@as(u32, 1), tracker.completedCount());
 }
