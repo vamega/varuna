@@ -30,6 +30,7 @@ pub const Hasher = struct {
         piece_buf: []u8,
         piece_length: u32,
         expected_hash: [20]u8,
+        torrent_id: u8,
     };
 
     pub const Result = struct {
@@ -37,6 +38,7 @@ pub const Hasher = struct {
         piece_index: u32,
         piece_buf: []u8,
         valid: bool,
+        torrent_id: u8,
     };
 
     /// Create a heap-allocated Hasher. Must be heap-allocated because
@@ -107,6 +109,7 @@ pub const Hasher = struct {
         piece_index: u32,
         piece_buf: []u8,
         expected_hash: [20]u8,
+        torrent_id: u8,
     ) !void {
         self.queue_mutex.lock();
         defer self.queue_mutex.unlock();
@@ -117,6 +120,7 @@ pub const Hasher = struct {
             .piece_buf = piece_buf,
             .piece_length = @intCast(piece_buf.len),
             .expected_hash = expected_hash,
+            .torrent_id = torrent_id,
         });
         self.queue_cond.signal();
     }
@@ -179,6 +183,7 @@ pub const Hasher = struct {
                 .piece_index = job.piece_index,
                 .piece_buf = job.piece_buf,
                 .valid = valid,
+                .torrent_id = job.torrent_id,
             }) catch {};
             self.result_mutex.unlock();
 
@@ -203,14 +208,14 @@ test "hasher pool verifies pieces correctly" {
     @memcpy(data1, "spam");
     var expected1: [20]u8 = undefined;
     std.crypto.hash.Sha1.hash("spam", &expected1, .{});
-    try hasher.submitVerify(0, 0, data1, expected1);
+    try hasher.submitVerify(0, 0, data1, expected1, 0);
 
     // Submit an invalid piece
     const data2 = try std.testing.allocator.alloc(u8, 4);
     @memcpy(data2, "eggs");
     var expected2: [20]u8 = undefined;
     std.crypto.hash.Sha1.hash("spam", &expected2, .{}); // wrong hash for "eggs"
-    try hasher.submitVerify(1, 1, data2, expected2);
+    try hasher.submitVerify(1, 1, data2, expected2, 0);
 
     // Wait for results
     var attempts: u32 = 0;
