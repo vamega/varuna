@@ -72,6 +72,8 @@ Update it whenever a milestone lands, the near-term backlog changes, or a new op
   - Startup banner reports io_uring availability.
 - **Shared multi-torrent event loop**: daemon runs all torrents on a single `EventLoop` thread. `TorrentContext` per torrent in the event loop. Background threads only for recheck + tracker announce. `initBare()` creates event loop without a default torrent; `addTorrent()` registers new torrents dynamically.
 - **Async seed disk reads**: `IORING_OP_READ` for serving piece requests, with piece cache. No blocking `pread` fallback.
+- **Batched block sends (Option C)**: cache-hit piece block responses are queued per tick and flushed as one combined send buffer per peer, reducing io_uring send SQEs ~4x for typical piece sizes.
+- **Daemon end-to-end download verified**: tracker + seeder + daemon download with file comparison. Save-path passthrough, state transitions, and peer count all work correctly.
 
 ## Next
 
@@ -101,7 +103,7 @@ Update it whenever a milestone lands, the near-term backlog changes, or a new op
 
 ## Last Verified Milestone
 
-- `daemon: fix shared event loop crash by migrating to TorrentContext` (`659923a`)
+- `io: batch piece block responses into single sends (Option C)` (`a3da224`)
 - Verified with:
   - `zig build test` (all tests pass)
   - `zig build` (clean build)
