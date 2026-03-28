@@ -4,10 +4,13 @@ const Stats = @import("torrent_session.zig").Stats;
 
 /// Manages multiple torrent sessions for the daemon.
 /// Thread-safe: the API server and event loop can access concurrently.
+const EventLoop = @import("../io/event_loop.zig").EventLoop;
+
 pub const SessionManager = struct {
     allocator: std.mem.Allocator,
     mutex: std.Thread.Mutex = .{},
     sessions: std.StringHashMap(*TorrentSession),
+    shared_event_loop: ?*EventLoop = null,
     default_save_path: []const u8 = "/tmp/varuna-downloads",
     port: u16 = 6881,
     max_peers: u32 = 50,
@@ -57,8 +60,8 @@ pub const SessionManager = struct {
 
         try self.sessions.put(&session.info_hash_hex, session);
 
-        // Auto-start
-        session.start();
+        // Auto-start (with shared event loop if available)
+        session.startWithEventLoop(self.shared_event_loop);
 
         return session;
     }

@@ -35,8 +35,17 @@ pub fn main() !void {
     try varuna.app.writeStartupBanner(stdout);
     try stdout.flush();
 
+    // Shared event loop for all torrents (single-threaded I/O)
+    var shared_el = varuna.io.event_loop.EventLoop.initBare(allocator, cfg.performance.hasher_threads) catch |err| {
+        try stdout.print("failed to create event loop: {s}\n", .{@errorName(err)});
+        try stdout.flush();
+        return err;
+    };
+    defer shared_el.deinit();
+
     // Session manager
     var session_manager = varuna.daemon.session_manager.SessionManager.init(allocator);
+    session_manager.shared_event_loop = &shared_el;
     session_manager.port = cfg.network.port;
     session_manager.max_peers = cfg.network.max_peers;
     session_manager.hasher_threads = cfg.performance.hasher_threads;
@@ -68,11 +77,37 @@ pub fn main() !void {
     // Submit initial accept
     api_server.submitAccept() catch {};
 
-    // Main loop: poll API server, check for shutdown
+    // Submit timeout for shared event loop
+    shared_el.submitTimeout(100 * std.time.ns_per_ms) catch {};
+
+    // Main loop: tick shared event loop + poll API server
     while (!varuna.io.signal.isShutdownRequested()) {
-        _ = api_server.poll() catch break;
-        // Small sleep to avoid busy-spinning when no CQEs
-        std.Thread.sleep(1 * std.time.ns_per_ms);
+        // Poll API server (non-blocking)
+        _ = api_server.poll() catch {};
+
+        // Check if any sessions need to be integrated into the event loop
+        // (background recheck thread completed, peers ready)
+        {
+            session_manager.mutex.lock();
+            var iter = session_manager.sessions.iterator();
+            while (iter.next()) |entry| {
+                const sess = entry.value_ptr.*;
+                if (sess.pending_peers != null) {
+                    _ = sess.integrateIntoEventLoop();
+                }
+            }
+            session_manager.mutex.unlock();
+        }
+
+        // Tick shared event loop (non-blocking poll)
+        if (shared_el.peer_count > 0) {
+            // Has active peers -- use tick which calls submit_and_wait
+            shared_el.submitTimeout(100 * std.time.ns_per_ms) catch {};
+            shared_el.tick() catch {};
+        } else {
+            // No active peers -- just sleep to avoid busy-spinning
+            std.Thread.sleep(10 * std.time.ns_per_ms);
+        }
     }
 
     try stdout.print("\nshutting down...\n", .{});

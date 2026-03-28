@@ -113,8 +113,8 @@ pub const Peer = struct {
 pub const max_torrents: u8 = 64;
 
 pub const TorrentContext = struct {
-    session: *const session_mod.Session,
-    piece_tracker: *PieceTracker,
+    session: ?*const session_mod.Session = null,
+    piece_tracker: ?*PieceTracker = null,
     shared_fds: []const posix.fd_t,
     info_hash: [20]u8,
     peer_id: [20]u8,
@@ -162,8 +162,8 @@ pub const EventLoop = struct {
     torrent_count: u8 = 0,
 
     // Legacy single-torrent pointers (used by existing code, point to torrents[0])
-    session: *const session_mod.Session,
-    piece_tracker: *PieceTracker,
+    session: ?*const session_mod.Session = null,
+    piece_tracker: ?*PieceTracker = null,
     shared_fds: []const posix.fd_t,
     info_hash: [20]u8,
     peer_id: [20]u8,
@@ -200,6 +200,32 @@ pub const EventLoop = struct {
     // Background hasher for SHA verification (off event loop thread)
     last_unchoke_recalc: i64 = 0,
     hasher: ?*Hasher = null,
+
+    /// Create a bare event loop with no initial torrent (for daemon mode).
+    pub fn initBare(allocator: std.mem.Allocator, hasher_threads: u32) !EventLoop {
+        const peers = try allocator.alloc(Peer, max_peers);
+        @memset(peers, Peer{});
+
+        const hasher = if (hasher_threads > 0)
+            Hasher.create(allocator, hasher_threads) catch null
+        else
+            null;
+
+        return .{
+            .ring = try linux.IoUring.init(256, 0),
+            .allocator = allocator,
+            .peers = peers,
+            .session = null,
+            .piece_tracker = null,
+            .shared_fds = &.{},
+            .info_hash = [_]u8{0} ** 20,
+            .peer_id = [_]u8{0} ** 20,
+            .pending_writes = std.ArrayList(PendingWrite).empty,
+            .pending_sends = std.ArrayList(PendingSend).empty,
+            .pending_reads = std.ArrayList(PendingPieceRead).empty,
+            .hasher = hasher,
+        };
+    }
 
     pub fn init(
         allocator: std.mem.Allocator,
@@ -361,7 +387,9 @@ pub const EventLoop = struct {
     pub fn removePeer(self: *EventLoop, slot: u16) void {
         const peer = &self.peers[slot];
         if (peer.current_piece) |piece_index| {
-            self.piece_tracker.releasePiece(piece_index);
+            if (self.getTorrentContext(peer.torrent_id)) |tc| {
+                if (tc.piece_tracker) |pt| pt.releasePiece(piece_index);
+            }
         }
         self.cleanupPeer(peer);
         peer.* = Peer{};
@@ -370,7 +398,7 @@ pub const EventLoop = struct {
 
     pub fn run(self: *EventLoop) !void {
         const signal = @import("signal.zig");
-        while (self.running and !self.piece_tracker.isComplete()) {
+        while (self.running and !(if (self.piece_tracker) |pt| pt.isComplete() else false)) {
             if (signal.isShutdownRequested()) {
                 self.running = false;
                 break;
@@ -726,9 +754,13 @@ pub const EventLoop = struct {
                 pending_w.spans_remaining -= 1;
                 if (pending_w.spans_remaining == 0) {
                     // All spans written -- mark piece complete and free buffer
-                    if (piece_index < self.session.pieceCount()) {
-                        const piece_length = self.session.layout.pieceSize(piece_index) catch 0;
-                        _ = self.piece_tracker.completePiece(piece_index, piece_length);
+                    if (self.getTorrentContext(pending_w.torrent_id)) |tc| {
+                        if (tc.session) |sess| {
+                            if (piece_index < sess.pieceCount()) {
+                                const piece_length = sess.layout.pieceSize(piece_index) catch 0;
+                                if (tc.piece_tracker) |pt| _ = pt.completePiece(piece_index, piece_length);
+                            }
+                        }
                     }
                     self.allocator.free(pending_w.buf);
                     _ = self.pending_writes.swapRemove(i);
@@ -779,18 +811,22 @@ pub const EventLoop = struct {
                         bf.set(piece_index) catch {};
                     }
                     peer.availability_known = true;
-                    self.piece_tracker.addAvailability(piece_index);
+                    if (self.getTorrentContext(peer.torrent_id)) |tc| {
+                        if (tc.piece_tracker) |pt| pt.addAvailability(piece_index);
+                    }
                 }
             },
             5 => { // bitfield
+                const tc_bf = self.getTorrentContext(peer.torrent_id) orelse return;
                 if (peer.availability == null) {
-                    peer.availability = Bitfield.init(self.allocator, self.session.pieceCount()) catch return;
+                    const sess = tc_bf.session orelse return;
+                    peer.availability = Bitfield.init(self.allocator, sess.pieceCount()) catch return;
                 }
                 if (peer.availability) |*bf| {
                     bf.importBitfield(payload);
                 }
                 peer.availability_known = true;
-                self.piece_tracker.addBitfieldAvailability(payload);
+                if (tc_bf.piece_tracker) |pt| pt.addBitfieldAvailability(payload);
             },
             6 => { // request
                 if (peer.mode == .seed and !peer.am_choking and payload.len >= 12) {
@@ -842,13 +878,14 @@ pub const EventLoop = struct {
         defer tmp_ring.deinit();
 
         const tc = self.getTorrentContext(0) orelse return;
+        const pt = tc.piece_tracker orelse return;
         const tracker_mod = @import("../tracker/root.zig");
         const response = tracker_mod.announce.fetchAuto(self.allocator, &tmp_ring, .{
             .announce_url = url,
             .info_hash = tc.info_hash,
             .peer_id = tc.peer_id,
             .port = 6881, // TODO: get from config
-            .left = if (self.piece_tracker.isComplete()) 0 else self.piece_tracker.bytesRemaining(),
+            .left = if (pt.isComplete()) 0 else pt.bytesRemaining(),
             .event = null,
         }) catch return;
         defer tracker_mod.announce.freeResponse(self.allocator, response);
@@ -934,10 +971,14 @@ pub const EventLoop = struct {
         const block_offset = std.mem.readInt(u32, payload[4..8], .big);
         const block_length = std.mem.readInt(u32, payload[8..12], .big);
 
+        const peer = &self.peers[slot];
+        const tc = self.getTorrentContext(peer.torrent_id) orelse return;
+        const sess = tc.session orelse return;
+
         // Validate
         const cp = self.complete_pieces orelse return;
         if (!cp.has(piece_index)) return;
-        const piece_size = self.session.layout.pieceSize(piece_index) catch return;
+        const piece_size = sess.layout.pieceSize(piece_index) catch return;
         if (block_offset + block_length > piece_size) return;
 
         // If piece is cached, serve immediately (no disk I/O needed)
@@ -947,7 +988,7 @@ pub const EventLoop = struct {
         }
 
         // Submit async io_uring reads for all spans (no blocking)
-        const plan = storage.verify.planPieceVerification(self.allocator, self.session, piece_index) catch return;
+        const plan = storage.verify.planPieceVerification(self.allocator, sess, piece_index) catch return;
         defer storage.verify.freePiecePlan(self.allocator, plan);
 
         if (plan.spans.len == 0) return;
@@ -972,7 +1013,7 @@ pub const EventLoop = struct {
         for (plan.spans) |span| {
             const target = read_buf[span.piece_offset .. span.piece_offset + span.length];
             const ud = encodeUserData(.{ .slot = slot, .op_type = .disk_read, .context = @intCast(piece_index) });
-            _ = self.ring.read(ud, self.shared_fds[span.file_index], .{ .buffer = target }, span.file_offset) catch {};
+            _ = self.ring.read(ud, tc.shared_fds[span.file_index], .{ .buffer = target }, span.file_offset) catch {};
         }
     }
 
@@ -1059,19 +1100,24 @@ pub const EventLoop = struct {
             if (peer.peer_choking) continue;
             if (!peer.availability_known) continue;
 
+            const tc = self.getTorrentContext(peer.torrent_id) orelse continue;
+            const pt = tc.piece_tracker orelse continue;
+
             const peer_bf: ?*const Bitfield = if (peer.availability) |*bf| bf else null;
-            const piece_index = self.piece_tracker.claimPiece(peer_bf) orelse continue;
+            const piece_index = pt.claimPiece(peer_bf) orelse continue;
 
             self.startPieceDownload(@intCast(i), piece_index) catch {
-                self.piece_tracker.releasePiece(piece_index);
+                pt.releasePiece(piece_index);
             };
         }
     }
 
     fn startPieceDownload(self: *EventLoop, slot: u16, piece_index: u32) !void {
         const peer = &self.peers[slot];
-        const piece_size = try self.session.layout.pieceSize(piece_index);
-        const geometry = self.session.geometry();
+        const tc = self.getTorrentContext(peer.torrent_id) orelse return error.TorrentNotFound;
+        const sess = tc.session orelse return error.TorrentNotFound;
+        const piece_size = try sess.layout.pieceSize(piece_index);
+        const geometry = sess.geometry();
         const block_count = try geometry.blockCount(piece_index);
 
         peer.current_piece = piece_index;
@@ -1090,7 +1136,9 @@ pub const EventLoop = struct {
         if (peer.peer_choking) return;
         if (peer.send_pending) return;
 
-        const geometry = self.session.geometry();
+        const tc = self.getTorrentContext(peer.torrent_id) orelse return;
+        const sess = tc.session orelse return;
+        const geometry = sess.geometry();
 
         // Count how many requests to send
         var to_send: u32 = 0;
@@ -1140,9 +1188,13 @@ pub const EventLoop = struct {
         const piece_index = peer.current_piece orelse return;
         const piece_buf = peer.piece_buf orelse return;
 
+        const tc = self.getTorrentContext(peer.torrent_id) orelse return;
+        const sess = tc.session orelse return;
+        const pt = tc.piece_tracker orelse return;
+
         // Get the expected hash for this piece
-        const expected_hash = self.session.layout.pieceHash(piece_index) catch {
-            self.piece_tracker.releasePiece(piece_index);
+        const expected_hash = sess.layout.pieceHash(piece_index) catch {
+            pt.releasePiece(piece_index);
             peer.current_piece = null;
             return;
         };
@@ -1152,7 +1204,7 @@ pub const EventLoop = struct {
         if (self.hasher) |h| {
             // Submit to background hasher thread (non-blocking)
             h.submitVerify(slot, piece_index, piece_buf, hash) catch {
-                self.piece_tracker.releasePiece(piece_index);
+                pt.releasePiece(piece_index);
                 peer.current_piece = null;
                 return;
             };
@@ -1165,7 +1217,7 @@ pub const EventLoop = struct {
             var actual: [20]u8 = undefined;
             std.crypto.hash.Sha1.hash(piece_buf[0..@intCast(peer.blocks_expected * 16384)], &actual, .{});
             // Simplified inline path -- use hasher in production
-            self.piece_tracker.releasePiece(piece_index);
+            pt.releasePiece(piece_index);
             peer.current_piece = null;
         }
     }
@@ -1176,9 +1228,20 @@ pub const EventLoop = struct {
         const h = self.hasher orelse return;
         const results = h.drainResults();
         for (results) |result| {
+            // Get torrent context from the peer slot that submitted this hash
+            const torrent_id = self.peers[result.slot].torrent_id;
+            const tc = self.getTorrentContext(torrent_id) orelse {
+                self.allocator.free(result.piece_buf);
+                continue;
+            };
+
             if (result.valid) {
+                const sess = tc.session orelse {
+                    self.allocator.free(result.piece_buf);
+                    continue;
+                };
                 // Write verified piece to disk via io_uring
-                const plan = storage.verify.planPieceVerification(self.allocator, self.session, result.piece_index) catch {
+                const plan = storage.verify.planPieceVerification(self.allocator, sess, result.piece_index) catch {
                     self.allocator.free(result.piece_buf);
                     continue;
                 };
@@ -1193,7 +1256,7 @@ pub const EventLoop = struct {
                 // Track the buffer so we can free it after all writes complete
                 self.pending_writes.append(self.allocator, .{
                     .piece_index = result.piece_index,
-                    .torrent_id = 0, // TODO: get from hasher result
+                    .torrent_id = torrent_id,
                     .buf = result.piece_buf,
                     .spans_remaining = span_count,
                 }) catch {
@@ -1204,11 +1267,11 @@ pub const EventLoop = struct {
                 for (plan.spans) |span| {
                     const block = result.piece_buf[span.piece_offset .. span.piece_offset + span.length];
                     const ud = encodeUserData(.{ .slot = result.slot, .op_type = .disk_write, .context = @intCast(result.piece_index) });
-                    _ = self.ring.write(ud, self.shared_fds[span.file_index], block, span.file_offset) catch continue;
+                    _ = self.ring.write(ud, tc.shared_fds[span.file_index], block, span.file_offset) catch continue;
                 }
             } else {
                 // Hash mismatch -- release piece back to pool
-                self.piece_tracker.releasePiece(result.piece_index);
+                if (tc.piece_tracker) |pt| pt.releasePiece(result.piece_index);
                 self.allocator.free(result.piece_buf);
             }
         }

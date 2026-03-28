@@ -58,6 +58,9 @@ pub const TorrentSession = struct {
     ring: ?Ring = null,
     shared_fds: ?[]posix.fd_t = null,
     event_loop: ?EventLoop = null,
+    shared_event_loop: ?*EventLoop = null,
+    torrent_id_in_shared: ?u8 = null,
+    pending_peers: ?[]std.net.Address = null, // peers waiting for main thread to add
     thread: ?std.Thread = null,
 
     // Config
@@ -100,16 +103,26 @@ pub const TorrentSession = struct {
 
     pub fn deinit(self: *TorrentSession) void {
         self.stopInternal();
+        if (self.pending_peers) |pp| self.allocator.free(pp);
         self.allocator.free(self.torrent_bytes);
         self.allocator.free(self.save_path);
         self.allocator.free(self.name);
         if (self.error_message) |msg| self.allocator.free(msg);
     }
 
+    /// Start with own event loop (for varuna-tools, backwards compat).
     pub fn start(self: *TorrentSession) void {
+        self.startWithEventLoop(null);
+    }
+
+    /// Start with a shared event loop (for daemon mode).
+    /// Recheck runs on a background thread. When ready, peers are
+    /// added to the shared event loop instead of creating a new one.
+    pub fn startWithEventLoop(self: *TorrentSession, shared_el: ?*EventLoop) void {
         if (self.state == .downloading or self.state == .seeding or self.state == .checking) return;
 
         self.state = .checking;
+        self.shared_event_loop = shared_el;
         self.thread = std.Thread.spawn(.{}, startWorker, .{self}) catch {
             self.state = .@"error";
             return;
@@ -144,6 +157,35 @@ pub const TorrentSession = struct {
         }
         self.stopInternal();
         self.state = .stopped;
+    }
+
+    /// Called by the main thread to integrate this session into the shared
+    /// event loop after the background recheck thread completes.
+    /// Returns true if peers were added.
+    pub fn integrateIntoEventLoop(self: *TorrentSession) bool {
+        const sel = self.shared_event_loop orelse return false;
+        const peers = self.pending_peers orelse return false;
+        defer {
+            self.allocator.free(peers);
+            self.pending_peers = null;
+        }
+
+        if (self.session == null or self.piece_tracker == null or self.shared_fds == null) return false;
+
+        const tid = sel.addTorrent(
+            &self.session.?,
+            &self.piece_tracker.?,
+            self.shared_fds.?,
+            self.peer_id,
+        ) catch return false;
+        self.torrent_id_in_shared = tid;
+
+        var added: u32 = 0;
+        for (peers) |addr| {
+            _ = sel.addPeerForTorrent(addr, tid) catch continue;
+            added += 1;
+        }
+        return added > 0;
     }
 
     pub fn getStats(self: *TorrentSession) Stats {
@@ -235,7 +277,30 @@ pub const TorrentSession = struct {
         const shared_fds = try self.store.?.fileHandles(self.allocator);
         self.shared_fds = shared_fds;
 
-        // Create and run event loop
+        if (self.shared_event_loop != null) {
+            // Daemon mode: store peer addresses for the main thread to add
+            // (the event loop is NOT thread-safe, so we can't add peers here)
+            var peer_list = std.ArrayList(std.net.Address).empty;
+            defer peer_list.deinit(self.allocator);
+            for (announce_response.peers) |peer| {
+                if (peer_list.items.len >= self.max_peers) break;
+                peer_list.append(self.allocator, peer.address) catch continue;
+            }
+
+            if (peer_list.items.len == 0) {
+                self.state = .@"error";
+                self.error_message = std.fmt.allocPrint(self.allocator, "no reachable peers", .{}) catch null;
+                return;
+            }
+
+            // Store peers for main thread to process
+            self.pending_peers = peer_list.toOwnedSlice(self.allocator) catch null;
+            self.state = .downloading;
+            // Background thread exits -- main thread will call integrateIntoEventLoop()
+            return;
+        }
+
+        // Standalone mode: create and run own event loop (for varuna-tools)
         const event_loop = try EventLoop.init(
             self.allocator,
             &self.session.?,
@@ -246,7 +311,6 @@ pub const TorrentSession = struct {
         );
         self.event_loop = event_loop;
 
-        // Add peers
         var peers_added: u32 = 0;
         for (announce_response.peers) |peer| {
             if (peers_added >= self.max_peers) break;
@@ -260,15 +324,12 @@ pub const TorrentSession = struct {
             return;
         }
 
-        // Submit timeout for periodic checks
         self.event_loop.?.submitTimeout(2 * std.time.ns_per_s) catch {};
 
-        // Run event loop until complete, paused, or shutdown
         while (self.state == .downloading and !signal.isShutdownRequested()) {
             self.event_loop.?.tick() catch break;
 
             if (self.piece_tracker.?.isComplete()) {
-                // Drain hasher results + pending disk writes
                 var drain: u32 = 0;
                 while (drain < 200) : (drain += 1) {
                     self.event_loop.?.processHashResults();
@@ -285,7 +346,6 @@ pub const TorrentSession = struct {
                 self.state = .seeding;
                 self.store.?.sync() catch {};
 
-                // Send completed event (best-effort)
                 if (tracker.announce.fetchAuto(self.allocator, &self.ring.?, .{
                     .announce_url = announce_url,
                     .info_hash = session.metainfo.info_hash,
@@ -300,8 +360,6 @@ pub const TorrentSession = struct {
             }
 
             if (self.event_loop.?.peer_count == 0) break;
-
-            // Re-submit timeout
             self.event_loop.?.submitTimeout(2 * std.time.ns_per_s) catch {};
         }
     }
