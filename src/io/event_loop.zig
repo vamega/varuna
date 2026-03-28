@@ -310,35 +310,6 @@ pub const EventLoop = struct {
         return error.TooManyTorrents;
     }
 
-    /// Set the complete_pieces bitfield for a torrent (enables seed mode for that torrent).
-    pub fn setTorrentCompletePieces(self: *EventLoop, torrent_id: u8, cp: *const Bitfield) void {
-        if (torrent_id < max_torrents) {
-            if (self.torrents[torrent_id]) |*tc| {
-                tc.complete_pieces = cp;
-            }
-        }
-    }
-
-    /// Find a torrent context by info_hash. Returns the torrent_id if found.
-    pub fn findTorrentByInfoHash(self: *EventLoop, info_hash: *const [20]u8) ?u8 {
-        for (&self.torrents, 0..) |*slot, i| {
-            if (slot.*) |*tc| {
-                if (tc.active and std.mem.eql(u8, tc.info_hash[0..], info_hash[0..])) {
-                    return @intCast(i);
-                }
-            }
-        }
-        return null;
-    }
-
-    /// Ensure the event loop is accepting inbound connections on the given listen socket.
-    /// Safe to call multiple times -- only sets up accepting once.
-    pub fn ensureAccepting(self: *EventLoop, listen_fd: posix.fd_t) !void {
-        if (self.listen_fd >= 0) return; // already accepting
-        self.listen_fd = listen_fd;
-        try self.submitAccept();
-    }
-
     /// Count the number of active peers for a specific torrent.
     pub fn peerCountForTorrent(self: *const EventLoop, torrent_id: u8) u16 {
         var count: u16 = 0;
@@ -469,6 +440,7 @@ pub const EventLoop = struct {
     const unchoke_interval_secs: i64 = 30;
     const max_unchoked: u32 = 4;
     const optimistic_unchoke_slots: u32 = 1;
+
 
     /// Configure re-announce parameters.
     pub fn setAnnounce(self: *EventLoop, url: []const u8, interval: u32) void {
@@ -629,10 +601,7 @@ pub const EventLoop = struct {
             },
             .inbound_handshake_send => {
                 // Handshake sent -- send bitfield if we have pieces
-                // Use per-torrent complete_pieces, falling back to global
-                const tc_send = self.getTorrentContext(peer.torrent_id);
-                const cp_for_send = if (tc_send) |tc_s| tc_s.complete_pieces else self.complete_pieces;
-                if (cp_for_send) |cp| {
+                if (self.complete_pieces) |cp| {
                     peer.state = .inbound_bitfield_send;
                     self.submitMessage(slot, 5, cp.bits) catch {
                         self.removePeer(slot);
@@ -720,25 +689,19 @@ pub const EventLoop = struct {
                     };
                     return;
                 }
-                // Match info_hash against all registered torrents (multi-torrent daemon)
-                const inbound_hash: *const [20]u8 = peer.handshake_buf[28..48];
-                const matched_tid = self.findTorrentByInfoHash(inbound_hash) orelse {
+                // Validate info_hash
+                if (!std.mem.eql(u8, peer.handshake_buf[28..48], tc_recv.info_hash[0..])) {
                     self.removePeer(slot);
                     return;
-                };
-                peer.torrent_id = matched_tid;
-                const matched_tc = self.getTorrentContext(matched_tid) orelse {
-                    self.removePeer(slot);
-                    return;
-                };
+                }
                 // Send our handshake back
                 peer.state = .inbound_handshake_send;
                 var buf: [68]u8 = undefined;
                 buf[0] = pw.protocol_length;
                 @memcpy(buf[1 .. 1 + pw.protocol_string.len], pw.protocol_string);
                 @memset(buf[20..28], 0);
-                @memcpy(buf[28..48], matched_tc.info_hash[0..]);
-                @memcpy(buf[48..68], matched_tc.peer_id[0..]);
+                @memcpy(buf[28..48], tc_recv.info_hash[0..]);
+                @memcpy(buf[48..68], tc_recv.peer_id[0..]);
                 @memcpy(peer.handshake_buf[0..68], &buf);
                 const ud = encodeUserData(.{ .slot = slot, .op_type = .peer_send, .context = 0 });
                 _ = self.ring.send(ud, peer.fd, peer.handshake_buf[0..68], 0) catch {
@@ -869,9 +832,7 @@ pub const EventLoop = struct {
                     self.submitMessage(slot, 1, &.{}) catch {};
                 }
             },
-            3 => {
-                peer.peer_interested = false;
-            }, // not interested
+            3 => { peer.peer_interested = false; }, // not interested
             4 => { // have
                 if (payload.len >= 4) {
                     const piece_index = std.mem.readInt(u32, payload[0..4], .big);
@@ -1043,8 +1004,8 @@ pub const EventLoop = struct {
         const tc = self.getTorrentContext(peer.torrent_id) orelse return;
         const sess = tc.session orelse return;
 
-        // Validate -- use per-torrent complete_pieces, falling back to global
-        const cp = tc.complete_pieces orelse self.complete_pieces orelse return;
+        // Validate
+        const cp = self.complete_pieces orelse return;
         if (!cp.has(piece_index)) return;
         const piece_size = sess.layout.pieceSize(piece_index) catch return;
         if (block_offset + block_length > piece_size) return;

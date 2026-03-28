@@ -61,11 +61,10 @@ Update it whenever a milestone lands, the near-term backlog changes, or a new op
 - **Batched block sends**: cache-hit piece block responses queued per tick and flushed as one combined send buffer per peer (~4x fewer send SQEs).
 - **Daemon end-to-end download verified**: tracker + seeder + daemon download with file comparison.
 - **Resume DB in daemon mode**: `TorrentSession` opens SQLite resume DB on start, loads known-complete pieces to skip rehash, persists new completions periodically (~5s), and flushes on stop/pause/shutdown. Shared DB path from config (`storage.resume_db`) or default `~/.local/share/varuna/resume.db`.
-- **Daemon seeding after download**: when a torrent finishes downloading (or rechecks as 100% complete), the daemon announces `event=completed` to the tracker on a background thread, creates a shared listen socket, and starts accepting inbound peer connections via io_uring. Multi-torrent info_hash matching routes inbound peers to the correct torrent context.
 
 ## Next
 
-- Per-torrent listen port configuration (currently uses a single shared port).
+- Daemon seeding after download (accept inbound peers, announce as seeder).
 - Per-torrent peer count in daemon stats (currently reports global count).
 - Investigate data corruption at ~17MB with 64KB pieces (see progress-reports/2026-03-28-async-pread-and-corruption.md).
 - Improve tracker lifecycle: handle stale peers, validate against private-tracker expectations.
