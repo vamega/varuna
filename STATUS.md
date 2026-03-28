@@ -70,6 +70,8 @@ Update it whenever a milestone lands, the near-term backlog changes, or a new op
   - Peer wire protocol send/recv routes through `Ring.send_all`/`recv_exact`.
   - TCP connect and accept use `Ring.connect`/`Ring.accept` via `src/net/transport.zig`.
   - Startup banner reports io_uring availability.
+- **Shared multi-torrent event loop**: daemon runs all torrents on a single `EventLoop` thread. `TorrentContext` per torrent in the event loop. Background threads only for recheck + tracker announce. `initBare()` creates event loop without a default torrent; `addTorrent()` registers new torrents dynamically.
+- **Async seed disk reads**: `IORING_OP_READ` for serving piece requests, with piece cache. No blocking `pread` fallback.
 
 ## Next
 
@@ -99,8 +101,9 @@ Update it whenever a milestone lands, the near-term backlog changes, or a new op
 
 ## Last Verified Milestone
 
-- `torrent: add multi-file torrent creation from directories` (`e3484ff`)
+- `daemon: fix shared event loop crash by migrating to TorrentContext` (`659923a`)
 - Verified with:
-  - `mise exec -- zig build test` (all tests pass including multi-peer download/seed)
-  - `mise exec -- zig build` (clean build)
-  - `mise exec -- zig build bench -Doptimize=ReleaseFast` (baseline metrics)
+  - `zig build test` (all tests pass)
+  - `zig build` (clean build)
+  - `scripts/demo_swarm.sh` (standalone swarm passes)
+  - Daemon integration: start daemon, add torrent via API, daemon stays alive, list shows torrent
