@@ -142,6 +142,11 @@ pub const TorrentContext = struct {
 // ── Event loop ────────────────────────────────────────────
 
 pub const EventLoop = struct {
+    const PendingWriteKey = struct {
+        piece_index: u32,
+        torrent_id: u8,
+    };
+
     const PendingWrite = struct {
         piece_index: u32,
         torrent_id: u8,
@@ -201,7 +206,7 @@ pub const EventLoop = struct {
     timeout_ts: linux.kernel_timespec = .{ .sec = 2, .nsec = 0 },
 
     // Pending disk writes: track buffers that io_uring is writing to disk.
-    pending_writes: std.ArrayList(PendingWrite),
+    pending_writes: std.AutoHashMapUnmanaged(PendingWriteKey, PendingWrite),
 
     // Pending sends: track allocated send buffers (for seed piece responses).
     pending_sends: std.ArrayList(PendingSend),
@@ -246,7 +251,7 @@ pub const EventLoop = struct {
             .ring = try linux.IoUring.init(256, 0),
             .allocator = allocator,
             .peers = peers,
-            .pending_writes = std.ArrayList(PendingWrite).empty,
+            .pending_writes = .empty,
             .pending_sends = std.ArrayList(PendingSend).empty,
             .pending_reads = std.ArrayList(PendingPieceRead).empty,
             .queued_responses = try std.ArrayList(QueuedBlockResponse).initCapacity(allocator, 256),
@@ -276,7 +281,7 @@ pub const EventLoop = struct {
             .ring = try linux.IoUring.init(256, 0),
             .allocator = allocator,
             .peers = peers,
-            .pending_writes = std.ArrayList(PendingWrite).empty,
+            .pending_writes = .empty,
             .pending_sends = std.ArrayList(PendingSend).empty,
             .pending_reads = std.ArrayList(PendingPieceRead).empty,
             .queued_responses = try std.ArrayList(QueuedBlockResponse).initCapacity(allocator, 256),
@@ -448,8 +453,11 @@ pub const EventLoop = struct {
         // Free piece cache
         if (self.cached_piece_data) |d| self.allocator.free(d);
         // Free any pending write/send buffers
-        for (self.pending_writes.items) |pending| {
-            self.allocator.free(pending.buf);
+        {
+            var it = self.pending_writes.valueIterator();
+            while (it.next()) |pending| {
+                self.allocator.free(pending.buf);
+            }
         }
         self.pending_writes.deinit(self.allocator);
         for (self.pending_sends.items) |ps| {
@@ -909,27 +917,22 @@ pub const EventLoop = struct {
         const write_torrent_id: u8 = @intCast((op.context >> 32) & 0xFF);
 
         // Find the pending write for this piece and decrement spans_remaining
-        var i: usize = 0;
-        while (i < self.pending_writes.items.len) {
-            const pending_w = &self.pending_writes.items[i];
-            if (pending_w.piece_index == piece_index and pending_w.torrent_id == write_torrent_id) {
-                pending_w.spans_remaining -= 1;
-                if (pending_w.spans_remaining == 0) {
-                    // All spans written -- mark piece complete and free buffer
-                    if (self.getTorrentContext(pending_w.torrent_id)) |tc| {
-                        if (tc.session) |sess| {
-                            if (piece_index < sess.pieceCount()) {
-                                const piece_length = sess.layout.pieceSize(piece_index) catch 0;
-                                if (tc.piece_tracker) |pt| _ = pt.completePiece(piece_index, piece_length);
-                            }
+        const key = PendingWriteKey{ .piece_index = piece_index, .torrent_id = write_torrent_id };
+        if (self.pending_writes.getPtr(key)) |pending_w| {
+            pending_w.spans_remaining -= 1;
+            if (pending_w.spans_remaining == 0) {
+                // All spans written -- mark piece complete and free buffer
+                if (self.getTorrentContext(pending_w.torrent_id)) |tc| {
+                    if (tc.session) |sess| {
+                        if (piece_index < sess.pieceCount()) {
+                            const piece_length = sess.layout.pieceSize(piece_index) catch 0;
+                            if (tc.piece_tracker) |pt| _ = pt.completePiece(piece_index, piece_length);
                         }
                     }
-                    self.allocator.free(pending_w.buf);
-                    _ = self.pending_writes.swapRemove(i);
                 }
-                return;
+                self.allocator.free(pending_w.buf);
+                _ = self.pending_writes.remove(key);
             }
-            i += 1;
         }
     }
 
@@ -1594,7 +1597,10 @@ pub const EventLoop = struct {
                 }
 
                 // Track the buffer so we can free it after all writes complete
-                self.pending_writes.append(self.allocator, .{
+                self.pending_writes.put(self.allocator, .{
+                    .piece_index = result.piece_index,
+                    .torrent_id = torrent_id,
+                }, .{
                     .piece_index = result.piece_index,
                     .torrent_id = torrent_id,
                     .slot = result.slot,

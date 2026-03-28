@@ -357,7 +357,7 @@ pub fn download(
         var drain_ticks: u32 = 0;
         while (drain_ticks < 200) : (drain_ticks += 1) {
             event_loop.processHashResults();
-            if (event_loop.pending_writes.items.len > 0) {
+            if (event_loop.pending_writes.count() > 0) {
                 // Have pending writes, tick to process disk write CQEs
                 event_loop.submitTimeout(10 * std.time.ns_per_ms) catch {};
                 event_loop.tick() catch break;
