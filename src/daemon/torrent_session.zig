@@ -9,8 +9,6 @@ const PieceTracker = @import("../torrent/piece_tracker.zig").PieceTracker;
 const signal = @import("../io/signal.zig");
 const peer_id_mod = @import("../torrent/peer_id.zig");
 const ResumeWriter = storage.resume_state.ResumeWriter;
-const FilePriority = @import("../torrent/file_priority.zig").FilePriority;
-const file_priority_mod = @import("../torrent/file_priority.zig");
 
 pub const State = enum {
     checking,
@@ -41,6 +39,12 @@ pub const Stats = struct {
     dl_limit: u64 = 0,
     /// Per-torrent upload speed limit (bytes/sec). 0 = unlimited.
     ul_limit: u64 = 0,
+    /// Estimated time remaining in seconds. -1 if unknown or not downloading.
+    eta: i64 = -1,
+    /// Share ratio: bytes_uploaded / bytes_downloaded. 0.0 if no downloads yet.
+    ratio: f64 = 0.0,
+    /// Whether sequential download mode is enabled.
+    sequential_download: bool = false,
 };
 
 pub const TorrentSession = struct {
@@ -87,9 +91,12 @@ pub const TorrentSession = struct {
     dl_limit: u64 = 0,
     ul_limit: u64 = 0,
 
-    // Selective & sequential download
-    file_priorities: ?[]FilePriority = null,
+    // Sequential download mode (stored, but actual piece picking depends on workstream B)
     sequential_download: bool = false,
+
+    // Per-file priorities: 0=skip, 1=normal, 6=high, 7=max (stored, actual selective
+    // download depends on workstream B). null means all files are normal priority.
+    file_priorities: ?[]u8 = null,
 
     error_message: ?[]const u8 = null,
 
@@ -132,10 +139,10 @@ pub const TorrentSession = struct {
             self.announce_thread = null;
         }
         if (self.pending_peers) |pp| self.allocator.free(pp);
-        if (self.file_priorities) |fp| self.allocator.free(fp);
         self.allocator.free(self.torrent_bytes);
         self.allocator.free(self.save_path);
         self.allocator.free(self.name);
+        if (self.file_priorities) |fp| self.allocator.free(fp);
         if (self.error_message) |msg| self.allocator.free(msg);
     }
 
@@ -236,11 +243,9 @@ pub const TorrentSession = struct {
         else
             0.0;
 
-        // Auto-transition to seeding when all wanted pieces are complete
-        if (self.state == .downloading) {
-            if (self.piece_tracker) |*pt| {
-                if (pt.isComplete()) self.state = .seeding;
-            }
+        // Auto-transition to seeding when all pieces are complete
+        if (self.state == .downloading and pieces_have == self.piece_count and self.piece_count > 0) {
+            self.state = .seeding;
         }
 
         // Read speed stats from the event loop
@@ -250,6 +255,22 @@ pub const TorrentSession = struct {
             el.getSpeedStats(0)
         else
             @import("../io/event_loop.zig").SpeedStats{};
+
+        // Compute ETA: bytes_remaining / download_speed
+        const bytes_remaining = if (self.total_size > speed_stats.dl_total)
+            self.total_size - speed_stats.dl_total
+        else
+            0;
+        const eta: i64 = if (self.state == .downloading and speed_stats.dl_speed > 0)
+            @intCast(bytes_remaining / speed_stats.dl_speed)
+        else
+            -1;
+
+        // Compute share ratio: uploaded / downloaded
+        const ratio: f64 = if (speed_stats.dl_total > 0)
+            @as(f64, @floatFromInt(speed_stats.ul_total)) / @as(f64, @floatFromInt(speed_stats.dl_total))
+        else
+            0.0;
 
         return .{
             .state = self.state,
@@ -269,37 +290,10 @@ pub const TorrentSession = struct {
             .error_msg = self.error_message,
             .dl_limit = self.dl_limit,
             .ul_limit = self.ul_limit,
+            .eta = eta,
+            .ratio = ratio,
+            .sequential_download = self.sequential_download,
         };
-    }
-
-    // ── Selective & sequential download ─────────────────────
-
-    /// Update per-file download priorities. Can be called while downloading.
-    /// Rebuilds the wanted piece mask and updates the PieceTracker.
-    pub fn setFilePriorities(self: *TorrentSession, priorities: []const FilePriority) !void {
-        const owned = try self.allocator.dupe(FilePriority, priorities);
-        if (self.file_priorities) |old| self.allocator.free(old);
-        self.file_priorities = owned;
-
-        // Update the live PieceTracker if it exists.
-        if (self.piece_tracker) |*pt| {
-            if (self.session) |*sess| {
-                if (!file_priority_mod.allWanted(owned)) {
-                    const wanted = try file_priority_mod.buildPieceMask(self.allocator, &sess.layout, owned);
-                    pt.setWanted(wanted);
-                } else {
-                    pt.setWanted(null);
-                }
-            }
-        }
-    }
-
-    /// Enable or disable sequential download mode. Can be toggled at runtime.
-    pub fn setSequentialDownload(self: *TorrentSession, enabled: bool) void {
-        self.sequential_download = enabled;
-        if (self.piece_tracker) |*pt| {
-            pt.setSequential(enabled);
-        }
     }
 
     // ── Background thread ─────────────────────────────────
@@ -318,7 +312,7 @@ pub const TorrentSession = struct {
         const session = try session_mod.Session.load(self.allocator, self.torrent_bytes, self.save_path);
         self.session = session;
 
-        const store = try storage.writer.PieceStore.initWithPriorities(self.allocator, &self.session.?, &self.ring.?, self.file_priorities);
+        const store = try storage.writer.PieceStore.init(self.allocator, &self.session.?, &self.ring.?);
         self.store = store;
 
         // Open resume DB and load known-complete pieces (fast path: skip rehash)
@@ -363,7 +357,7 @@ pub const TorrentSession = struct {
         }
         self.resume_last_count = recheck.complete_pieces.count;
 
-        var piece_tracker = try PieceTracker.init(
+        const piece_tracker = try PieceTracker.init(
             self.allocator,
             session.pieceCount(),
             session.layout.piece_length,
@@ -371,20 +365,6 @@ pub const TorrentSession = struct {
             &recheck.complete_pieces,
             recheck.bytes_complete,
         );
-
-        // Apply selective download mask if file priorities are set.
-        if (self.file_priorities) |fp| {
-            if (!file_priority_mod.allWanted(fp)) {
-                const wanted = try file_priority_mod.buildPieceMask(self.allocator, &session.layout, fp);
-                piece_tracker.setWanted(wanted);
-            }
-        }
-
-        // Apply sequential download mode.
-        if (self.sequential_download) {
-            piece_tracker.setSequential(true);
-        }
-
         self.piece_tracker = piece_tracker;
 
         if (recheck.bytes_complete == session.totalSize()) {
@@ -652,7 +632,7 @@ pub const TorrentSession = struct {
         } else |_| {}
     }
 
-    fn announceCompletedWorker(self: *TorrentSession) void {
+    pub fn announceCompletedWorker(self: *TorrentSession) void {
         // Need a Ring for the HTTP announce
         var ring = Ring.init(16) catch return;
         defer ring.deinit();

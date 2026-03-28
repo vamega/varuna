@@ -120,6 +120,72 @@ pub const SessionManager = struct {
         return session.getStats();
     }
 
+    /// Get direct access to a TorrentSession by hash. Caller must not store the pointer
+    /// beyond the scope of a single request (the session could be removed concurrently).
+    pub fn getSession(self: *SessionManager, hash: []const u8) !*TorrentSession {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+
+        return self.sessions.get(hash) orelse error.TorrentNotFound;
+    }
+
+    /// Toggle sequential download mode for a torrent.
+    pub fn setSequentialDownload(self: *SessionManager, hash: []const u8, enabled: bool) !void {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+
+        const session = self.sessions.get(hash) orelse return error.TorrentNotFound;
+        session.sequential_download = enabled;
+    }
+
+    /// Set file priority for specific file indices.
+    /// priority: 0=skip, 1=normal, 6=high, 7=max
+    pub fn setFilePriority(self: *SessionManager, hash: []const u8, file_indices: []const u32, priority: u8) !void {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+
+        const session = self.sessions.get(hash) orelse return error.TorrentNotFound;
+        const meta = if (session.session) |*s| s.metainfo else return error.TorrentNotReady;
+        const file_count = meta.files.len;
+
+        // Lazily allocate file_priorities array (default all to 1=normal)
+        if (session.file_priorities == null) {
+            const fp = try self.allocator.alloc(u8, file_count);
+            @memset(fp, 1);
+            session.file_priorities = fp;
+        }
+
+        const fp = session.file_priorities.?;
+        for (file_indices) |idx| {
+            if (idx < fp.len) {
+                fp[idx] = priority;
+            }
+        }
+    }
+
+    /// Force re-announce to tracker for a torrent.
+    pub fn forceReannounce(self: *SessionManager, hash: []const u8) !void {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+
+        const session = self.sessions.get(hash) orelse return error.TorrentNotFound;
+        // Spawn a background thread to do the announce (blocking HTTP is fine there)
+        if (session.announce_thread != null) return; // already announcing
+        session.announce_thread = std.Thread.spawn(.{}, TorrentSession.announceCompletedWorker, .{session}) catch return;
+    }
+
+    /// Force piece recheck for a torrent: stop, recheck, resume.
+    pub fn forceRecheck(self: *SessionManager, hash: []const u8) !void {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+
+        const session = self.sessions.get(hash) orelse return error.TorrentNotFound;
+        // Stop the session (joins threads, frees runtime state)
+        session.stop();
+        // Restart it (will recheck from disk)
+        session.startWithEventLoop(self.shared_event_loop);
+    }
+
     pub fn count(self: *SessionManager) usize {
         self.mutex.lock();
         defer self.mutex.unlock();

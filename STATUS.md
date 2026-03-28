@@ -27,6 +27,14 @@ Update it whenever a milestone lands, the near-term backlog changes, or a new op
 - **Graceful shutdown**: SIGINT/SIGTERM → flush resume DB, send tracker stopped event, close connections.
 - **qBittorrent-compatible HTTP API**: webapiVersion, preferences, transfer/info, torrents/info, add, delete, pause, resume, speed limit endpoints.
 - **varuna-ctl**: list, add (--save-path), pause, resume, delete, version, stats, set-dl-limit, set-ul-limit, get-dl-limit, get-ul-limit.
+- **API: ETA and share ratio**: computed in Stats (bytes_remaining/dl_speed, uploaded/downloaded), returned in torrents/info and torrents/properties.
+- **API: torrents/files**: per-file name, size, progress, priority from metainfo + piece completion status.
+- **API: torrents/trackers**: announce URL list with status, tier, peer count.
+- **API: torrents/properties**: detailed torrent properties (save_path, piece_size, comment, speeds, ETA, ratio, time_active, seeding_time, etc.).
+- **API: torrents/filePrio**: set per-file priority (0=skip, 1=normal, 6=high, 7=max). Values stored, actual selective download depends on workstream B.
+- **API: torrents/setSequentialDownload**: toggle sequential mode. Value stored, actual piece picking depends on workstream B.
+- **API: torrents/forceReannounce**: trigger immediate tracker re-announce on background thread.
+- **API: torrents/recheck**: stop torrent, recheck all pieces from disk, resume.
 - **Daemon seeding after download**: announces completed, creates listen socket, accepts inbound peers, multi-torrent handshake matching.
 - **Async seed disk reads**: IORING_OP_READ with piece cache, no blocking fallback.
 - **systemd-notify**: READY=1 / STOPPING=1 via AF_UNIX, no libsystemd dependency.
@@ -49,11 +57,7 @@ Update it whenever a milestone lands, the near-term backlog changes, or a new op
 ### Common Features
 - **uTP (BEP 29)**: UDP-based transport with LEDBAT congestion control.
 - **API auth**: /api/v2/auth/login for daemon security.
-- **Torrent properties API**: /api/v2/torrents/properties (ETA, ratio, creation date).
-- **Torrent files API**: /api/v2/torrents/files (file list with sizes, progress, priority).
-- **Torrent trackers API**: /api/v2/torrents/trackers.
 - **Sync API**: /api/v2/sync/maindata for Flood WebUI live updates.
-- **Force reannounce / recheck**: API endpoints for manual trigger.
 - **Categories/labels**: organize torrents.
 - **Watch folders**: auto-add torrents from directory.
 
