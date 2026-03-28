@@ -21,6 +21,10 @@ pub const Config = struct {
         port: u16 = 6881,
         max_peers: u32 = 50,
         connect_timeout_secs: u32 = 10,
+        /// Global download speed limit in bytes/sec. 0 = unlimited.
+        dl_limit: u64 = 0,
+        /// Global upload speed limit in bytes/sec. 0 = unlimited.
+        ul_limit: u64 = 0,
     };
 
     pub const Performance = struct {

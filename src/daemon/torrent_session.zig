@@ -35,6 +35,10 @@ pub const Stats = struct {
     save_path: []const u8 = "",
     added_on: i64 = 0,
     error_msg: ?[]const u8 = null,
+    /// Per-torrent download speed limit (bytes/sec). 0 = unlimited.
+    dl_limit: u64 = 0,
+    /// Per-torrent upload speed limit (bytes/sec). 0 = unlimited.
+    ul_limit: u64 = 0,
 };
 
 pub const TorrentSession = struct {
@@ -76,6 +80,10 @@ pub const TorrentSession = struct {
     max_peers: u32 = 50,
     hasher_threads: u32 = 4,
     resume_db_path: ?[*:0]const u8 = null,
+
+    // Per-torrent speed limits (bytes/sec, 0 = unlimited)
+    dl_limit: u64 = 0,
+    ul_limit: u64 = 0,
 
     error_message: ?[]const u8 = null,
 
@@ -202,6 +210,10 @@ pub const TorrentSession = struct {
         ) catch return false;
         self.torrent_id_in_shared = tid;
 
+        // Apply per-torrent speed limits to the event loop context
+        if (self.dl_limit > 0) sel.setTorrentDlLimit(tid, self.dl_limit);
+        if (self.ul_limit > 0) sel.setTorrentUlLimit(tid, self.ul_limit);
+
         var added: u32 = 0;
         for (peers) |addr| {
             _ = sel.addPeerForTorrent(addr, tid) catch continue;
@@ -246,6 +258,8 @@ pub const TorrentSession = struct {
             .added_on = self.added_on,
             .peers_connected = if (self.event_loop) |*el| el.peer_count else if (self.shared_event_loop) |sel| if (self.torrent_id_in_shared) |tid| sel.peerCountForTorrent(tid) else 0 else 0,
             .error_msg = self.error_message,
+            .dl_limit = self.dl_limit,
+            .ul_limit = self.ul_limit,
         };
     }
 
@@ -529,6 +543,10 @@ pub const TorrentSession = struct {
                 self.tracker_key,
             ) catch return false;
             self.torrent_id_in_shared = tid;
+
+            // Apply per-torrent speed limits to the event loop context
+            if (self.dl_limit > 0) sel.setTorrentDlLimit(tid, self.dl_limit);
+            if (self.ul_limit > 0) sel.setTorrentUlLimit(tid, self.ul_limit);
         }
 
         // Set the complete_pieces bitfield so seed mode can serve pieces
