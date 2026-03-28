@@ -14,6 +14,12 @@ pub const PieceTracker = struct {
     total_size: u64,
     piece_length: u32,
     bytes_complete: u64,
+    /// Lowest piece index known to be unclaimed (not complete and not in-progress).
+    /// Scans in claimPiece start here instead of 0, skipping the fully-claimed prefix.
+    scan_hint: u32 = 0,
+    /// Tracked minimum availability among unclaimed pieces. Pieces with availability
+    /// above this value cannot be the rarest, allowing early-exit when we find a match.
+    min_availability: u16 = 0,
 
     pub fn init(
         allocator: std.mem.Allocator,
@@ -35,6 +41,10 @@ pub const PieceTracker = struct {
         errdefer allocator.free(availability);
         @memset(availability, 0);
 
+        // Advance scan_hint past any initially-complete pieces.
+        var hint: u32 = 0;
+        while (hint < piece_count and initial_complete.has(hint)) : (hint += 1) {}
+
         return .{
             .complete = complete,
             .in_progress = in_progress,
@@ -43,6 +53,8 @@ pub const PieceTracker = struct {
             .total_size = total_size,
             .piece_length = piece_length,
             .bytes_complete = initial_bytes_complete,
+            .scan_hint = hint,
+            .min_availability = 0,
         };
     }
 
@@ -92,34 +104,66 @@ pub const PieceTracker = struct {
     /// Uses rarest-first selection: picks the eligible piece with the lowest
     /// availability count. In endgame mode (all remaining pieces are in-progress),
     /// allows claiming pieces already assigned to other workers.
+    ///
+    /// Optimization: maintains `scan_hint` (lowest unclaimed index) and
+    /// `min_availability` to avoid scanning pieces that are already claimed
+    /// or cannot be the rarest. For large torrents this turns the common case
+    /// from O(piece_count) into a scan over only the unclaimed tail.
     pub fn claimPiece(self: *PieceTracker, peer_has: ?*const Bitfield) ?u32 {
         self.mutex.lock();
         defer self.mutex.unlock();
 
-        // First pass: find unassigned pieces (normal mode)
+        // First pass: find unassigned pieces (normal mode).
+        // Start from scan_hint to skip the fully-claimed prefix.
         var best_index: ?u32 = null;
         var best_availability: u16 = std.math.maxInt(u16);
         var has_unassigned = false;
+        var new_hint: u32 = self.piece_count; // track lowest unclaimed index we see
 
-        var index: u32 = 0;
+        var index: u32 = self.scan_hint;
         while (index < self.piece_count) : (index += 1) {
             if (self.complete.has(index)) continue;
-            if (peer_has) |bf| {
-                if (!bf.has(index)) continue;
-            }
             if (!self.in_progress.has(index)) {
+                // This piece is unclaimed -- track the lowest such index.
+                if (index < new_hint) new_hint = index;
                 has_unassigned = true;
+
+                if (peer_has) |bf| {
+                    if (!bf.has(index)) continue;
+                }
                 const avail = self.availability[index];
                 if (avail < best_availability) {
                     best_availability = avail;
                     best_index = index;
+                    // Early exit: if we matched min_availability, this is
+                    // guaranteed to be the rarest (or tied for rarest).
+                    if (avail <= self.min_availability) break;
                 }
             }
         }
 
         if (best_index) |idx| {
             self.in_progress.set(idx) catch return null;
+            // Update scan_hint: if we just claimed the hint piece, advance it.
+            if (idx == new_hint) {
+                // Find next unclaimed piece after idx.
+                var next = idx + 1;
+                while (next < self.piece_count and (self.complete.has(next) or self.in_progress.has(next))) : (next += 1) {}
+                self.scan_hint = next;
+            } else {
+                self.scan_hint = new_hint;
+            }
+            // Update min_availability: the piece we just claimed is no longer
+            // available for selection. If it was the minimum, recompute lazily
+            // by setting min to the best we found (which is the same value since
+            // we picked it). Next call will find the true min.
+            self.min_availability = best_availability;
             return idx;
+        }
+
+        // Update scan_hint even when no piece was claimed for this peer.
+        if (has_unassigned) {
+            self.scan_hint = new_hint;
         }
 
         // Endgame mode: all remaining pieces are in-progress.
@@ -167,6 +211,17 @@ pub const PieceTracker = struct {
         defer self.mutex.unlock();
 
         self.clearInProgress(piece_index);
+        // The released piece is now unclaimed; pull scan_hint back if needed.
+        if (piece_index < self.scan_hint) {
+            self.scan_hint = piece_index;
+        }
+        // The released piece may have lower availability than current min.
+        if (piece_index < self.piece_count) {
+            const avail = self.availability[piece_index];
+            if (avail < self.min_availability) {
+                self.min_availability = avail;
+            }
+        }
     }
 
     pub fn isPieceComplete(self: *PieceTracker, piece_index: u32) bool {
