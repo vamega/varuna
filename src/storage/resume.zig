@@ -31,14 +31,17 @@ pub const ResumeDb = struct {
         }
 
         // Create schema
-        if (sqlite.sqlite3_exec(d,
+        if (sqlite.sqlite3_exec(
+            d,
             "CREATE TABLE IF NOT EXISTS pieces (" ++
                 "info_hash BLOB NOT NULL, " ++
                 "piece_index INTEGER NOT NULL, " ++
                 "completed_at INTEGER NOT NULL DEFAULT (strftime('%s','now')), " ++
                 "PRIMARY KEY (info_hash, piece_index)" ++
                 ")",
-            null, null, null,
+            null,
+            null,
+            null,
         ) != sqlite.SQLITE_OK) {
             _ = sqlite.sqlite3_close(d);
             return error.SqliteSchemaFailed;
@@ -46,18 +49,24 @@ pub const ResumeDb = struct {
 
         // Prepare statements
         var insert_stmt: ?*sqlite.Stmt = null;
-        if (sqlite.sqlite3_prepare_v2(d,
+        if (sqlite.sqlite3_prepare_v2(
+            d,
             "INSERT OR IGNORE INTO pieces (info_hash, piece_index) VALUES (?1, ?2)",
-            -1, &insert_stmt, null,
+            -1,
+            &insert_stmt,
+            null,
         ) != sqlite.SQLITE_OK) {
             _ = sqlite.sqlite3_close(d);
             return error.SqlitePrepareFailed;
         }
 
         var query_stmt: ?*sqlite.Stmt = null;
-        if (sqlite.sqlite3_prepare_v2(d,
+        if (sqlite.sqlite3_prepare_v2(
+            d,
             "SELECT piece_index FROM pieces WHERE info_hash = ?1",
-            -1, &query_stmt, null,
+            -1,
+            &query_stmt,
+            null,
         ) != sqlite.SQLITE_OK) {
             _ = sqlite.sqlite3_finalize(insert_stmt.?);
             _ = sqlite.sqlite3_close(d);
@@ -65,9 +74,12 @@ pub const ResumeDb = struct {
         }
 
         var delete_stmt: ?*sqlite.Stmt = null;
-        if (sqlite.sqlite3_prepare_v2(d,
+        if (sqlite.sqlite3_prepare_v2(
+            d,
             "DELETE FROM pieces WHERE info_hash = ?1",
-            -1, &delete_stmt, null,
+            -1,
+            &delete_stmt,
+            null,
         ) != sqlite.SQLITE_OK) {
             _ = sqlite.sqlite3_finalize(insert_stmt.?);
             _ = sqlite.sqlite3_finalize(query_stmt.?);

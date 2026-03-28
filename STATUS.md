@@ -71,7 +71,7 @@ Update it whenever a milestone lands, the near-term backlog changes, or a new op
 
 ## Next
 
-- Improve tracker lifecycle: handle stale peers, validate against private-tracker expectations.
+- Improve tracker lifecycle: handle stale peers, validate against additional private-tracker edge cases.
 - Broader integration test coverage (larger files, multi-torrent daemon, resume across restart).
 - Test daemon seeding: verify a second downloader can download from the daemon after it seeds.
 - UDP tracker support (BEP 15) — partially implemented in src/tracker/udp.zig.

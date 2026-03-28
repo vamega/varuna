@@ -51,6 +51,7 @@ pub const TorrentSession = struct {
     piece_count: u32,
     added_on: i64,
     peer_id: [20]u8,
+    tracker_key: [8]u8,
 
     // Runtime state (created on start, freed on stop)
     session: ?session_mod.Session = null,
@@ -106,6 +107,7 @@ pub const TorrentSession = struct {
             .piece_count = try meta.pieceCount(),
             .added_on = std.time.timestamp(),
             .peer_id = peer_id_mod.generate(),
+            .tracker_key = tracker.announce.Request.generateKey(),
         };
     }
 
@@ -191,11 +193,12 @@ pub const TorrentSession = struct {
 
         if (self.session == null or self.piece_tracker == null or self.shared_fds == null) return false;
 
-        const tid = sel.addTorrent(
+        const tid = sel.addTorrentWithKey(
             &self.session.?,
             &self.piece_tracker.?,
             self.shared_fds.?,
             self.peer_id,
+            self.tracker_key,
         ) catch return false;
         self.torrent_id_in_shared = tid;
 
@@ -323,25 +326,45 @@ pub const TorrentSession = struct {
         // Download: announce to tracker, get peers, run event loop
         self.state = .downloading;
 
-        const announce_url = session.metainfo.announce orelse return error.MissingAnnounceUrl;
-        const announce_response = tracker.announce.fetchAuto(self.allocator, &self.ring.?, .{
-            .announce_url = announce_url,
-            .info_hash = session.metainfo.info_hash,
-            .peer_id = self.peer_id,
-            .port = self.port,
-            .left = session.totalSize() - recheck.bytes_complete,
-        }) catch {
+        const tracker_urls = self.buildTrackerUrls(&session) catch {
             self.state = .@"error";
-            self.error_message = std.fmt.allocPrint(self.allocator, "tracker announce failed: {s}", .{announce_url}) catch null;
+            self.error_message = std.fmt.allocPrint(self.allocator, "no announce URL available", .{}) catch null;
             return;
         };
-        defer tracker.announce.freeResponse(self.allocator, announce_response);
+        defer self.allocator.free(tracker_urls);
 
-        if (announce_response.peers.len == 0) {
+        if (tracker_urls.len == 0) {
             self.state = .@"error";
-            self.error_message = std.fmt.allocPrint(self.allocator, "no peers from tracker", .{}) catch null;
+            self.error_message = std.fmt.allocPrint(self.allocator, "no announce URL available", .{}) catch null;
             return;
         }
+
+        var announce_response: ?tracker.announce.Response = null;
+        var announce_url: []const u8 = tracker_urls[0];
+        for (tracker_urls) |url| {
+            const resp = tracker.announce.fetchAuto(self.allocator, &self.ring.?, .{
+                .announce_url = url,
+                .info_hash = session.metainfo.info_hash,
+                .peer_id = self.peer_id,
+                .port = self.port,
+                .left = session.totalSize() - recheck.bytes_complete,
+                .key = self.tracker_key,
+            }) catch continue;
+
+            if (resp.peers.len > 0) {
+                announce_url = url;
+                announce_response = resp;
+                break;
+            }
+            tracker.announce.freeResponse(self.allocator, resp);
+        }
+
+        const announce_resp = announce_response orelse {
+            self.state = .@"error";
+            self.error_message = std.fmt.allocPrint(self.allocator, "tracker announce failed for all URLs", .{}) catch null;
+            return;
+        };
+        defer tracker.announce.freeResponse(self.allocator, announce_resp);
 
         // Get shared file handles
         const shared_fds = try self.store.?.fileHandles(self.allocator);
@@ -352,7 +375,7 @@ pub const TorrentSession = struct {
             // (the event loop is NOT thread-safe, so we can't add peers here)
             var peer_list = std.ArrayList(std.net.Address).empty;
             defer peer_list.deinit(self.allocator);
-            for (announce_response.peers) |peer| {
+            for (announce_resp.peers) |peer| {
                 if (peer_list.items.len >= self.max_peers) break;
                 peer_list.append(self.allocator, peer.address) catch continue;
             }
@@ -382,7 +405,7 @@ pub const TorrentSession = struct {
         self.event_loop = event_loop;
 
         var peers_added: u32 = 0;
-        for (announce_response.peers) |peer| {
+        for (announce_resp.peers) |peer| {
             if (peers_added >= self.max_peers) break;
             _ = self.event_loop.?.addPeer(peer.address) catch continue;
             peers_added += 1;
@@ -428,6 +451,7 @@ pub const TorrentSession = struct {
                     .port = self.port,
                     .left = 0,
                     .event = .completed,
+                    .key = self.tracker_key,
                 })) |resp| {
                     tracker.announce.freeResponse(self.allocator, resp);
                 } else |_| {}
@@ -484,11 +508,12 @@ pub const TorrentSession = struct {
 
         // Ensure the torrent is registered in the shared event loop
         if (self.torrent_id_in_shared == null) {
-            const tid = sel.addTorrent(
+            const tid = sel.addTorrentWithKey(
                 &self.session.?,
                 &self.piece_tracker.?,
                 self.shared_fds.?,
                 self.peer_id,
+                self.tracker_key,
             ) catch return false;
             self.torrent_id_in_shared = tid;
         }
@@ -537,6 +562,7 @@ pub const TorrentSession = struct {
             .port = self.port,
             .left = 0,
             .event = .completed,
+            .key = self.tracker_key,
         })) |resp| {
             tracker.announce.freeResponse(self.allocator, resp);
         } else |_| {}
@@ -557,9 +583,32 @@ pub const TorrentSession = struct {
             .port = self.port,
             .left = 0,
             .event = .completed,
+            .key = self.tracker_key,
         })) |resp| {
             tracker.announce.freeResponse(self.allocator, resp);
         } else |_| {}
+    }
+
+    /// Build a deduplicated list of tracker URLs from announce + announce-list.
+    fn buildTrackerUrls(self: *TorrentSession, session: *const session_mod.Session) ![]const []const u8 {
+        var urls = std.ArrayList([]const u8).empty;
+        defer urls.deinit(self.allocator);
+
+        if (session.metainfo.announce) |url| {
+            try urls.append(self.allocator, url);
+        }
+        for (session.metainfo.announce_list) |url| {
+            var already_added = false;
+            for (urls.items) |existing| {
+                if (std.mem.eql(u8, existing, url)) {
+                    already_added = true;
+                    break;
+                }
+            }
+            if (!already_added) try urls.append(self.allocator, url);
+        }
+
+        return urls.toOwnedSlice(self.allocator);
     }
 
     // ── Resume persistence helpers ────────────────────────

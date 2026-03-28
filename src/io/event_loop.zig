@@ -118,6 +118,7 @@ pub const TorrentContext = struct {
     shared_fds: []const posix.fd_t,
     info_hash: [20]u8,
     peer_id: [20]u8,
+    tracker_key: ?[8]u8 = null,
     complete_pieces: ?*const Bitfield = null,
     active: bool = true,
 };
@@ -295,6 +296,18 @@ pub const EventLoop = struct {
         shared_fds: []const posix.fd_t,
         peer_id: [20]u8,
     ) !u8 {
+        return self.addTorrentWithKey(session, piece_tracker, shared_fds, peer_id, null);
+    }
+
+    /// Add a new torrent context with a tracker key. Returns torrent_id.
+    pub fn addTorrentWithKey(
+        self: *EventLoop,
+        session: *const session_mod.Session,
+        piece_tracker: *PieceTracker,
+        shared_fds: []const posix.fd_t,
+        peer_id: [20]u8,
+        tracker_key: ?[8]u8,
+    ) !u8 {
         for (&self.torrents, 0..) |*slot, i| {
             if (slot.* == null) {
                 slot.* = .{
@@ -303,6 +316,7 @@ pub const EventLoop = struct {
                     .shared_fds = shared_fds,
                     .info_hash = session.metainfo.info_hash,
                     .peer_id = peer_id,
+                    .tracker_key = tracker_key,
                 };
                 self.torrent_count += 1;
                 return @intCast(i);
@@ -460,7 +474,6 @@ pub const EventLoop = struct {
     const unchoke_interval_secs: i64 = 30;
     const max_unchoked: u32 = 4;
     const optimistic_unchoke_slots: u32 = 1;
-
 
     /// Configure re-announce parameters.
     pub fn setAnnounce(self: *EventLoop, url: []const u8, interval: u32) void {
@@ -869,7 +882,9 @@ pub const EventLoop = struct {
                     self.submitMessage(slot, 1, &.{}) catch {};
                 }
             },
-            3 => { peer.peer_interested = false; }, // not interested
+            3 => {
+                peer.peer_interested = false;
+            }, // not interested
             4 => { // have
                 if (payload.len >= 4) {
                     const piece_index = std.mem.readInt(u32, payload[0..4], .big);
@@ -957,6 +972,7 @@ pub const EventLoop = struct {
             .port = 6881, // TODO: get from config
             .left = if (pt.isComplete()) 0 else pt.bytesRemaining(),
             .event = null,
+            .key = tc.tracker_key,
         }) catch return;
         defer tracker_mod.announce.freeResponse(self.allocator, response);
 

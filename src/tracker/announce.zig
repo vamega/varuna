@@ -10,14 +10,27 @@ pub const Request = struct {
     downloaded: u64 = 0,
     left: u64,
     event: ?Event = .started,
-    key: ?[]const u8 = null,
-    numwant: ?u32 = null,
+    key: ?[8]u8 = null,
+    numwant: u32 = 50,
 
     pub const Event = enum {
         started,
         completed,
         stopped,
     };
+
+    /// Generate a random 8-character hex key for tracker authentication.
+    /// This should be called once per session and reused across announces.
+    pub fn generateKey() [8]u8 {
+        const hex = "0123456789abcdef";
+        var buf: [8]u8 = undefined;
+        var random_bytes: [8]u8 = undefined;
+        std.crypto.random.bytes(&random_bytes);
+        for (random_bytes, 0..) |byte, i| {
+            buf[i] = hex[byte & 0x0f];
+        }
+        return buf;
+    }
 };
 
 pub const Peer = struct {
@@ -110,11 +123,9 @@ fn buildUrl(allocator: std.mem.Allocator, request: Request) ![]u8 {
         try appendQueryString(allocator, &url, "event", @tagName(event));
     }
     if (request.key) |key| {
-        try appendQueryString(allocator, &url, "key", key);
+        try appendQueryString(allocator, &url, "key", &key);
     }
-    if (request.numwant) |numwant| {
-        try appendQueryInt(allocator, &url, "numwant", numwant);
-    }
+    try appendQueryInt(allocator, &url, "numwant", request.numwant);
 
     return url.toOwnedSlice(allocator);
 }
@@ -340,6 +351,45 @@ test "build announce url percent encodes binary fields" {
     try std.testing.expect(std.mem.indexOf(u8, url, "peer_id=ABCDEFGHIJKLMNOPQRST") != null);
     try std.testing.expect(std.mem.indexOf(u8, url, "compact=1") != null);
     try std.testing.expect(std.mem.indexOf(u8, url, "event=started") != null);
+    try std.testing.expect(std.mem.indexOf(u8, url, "numwant=50") != null);
+}
+
+test "build url includes key when provided" {
+    const url = try buildUrl(std.testing.allocator, .{
+        .announce_url = "http://tracker.example/announce",
+        .info_hash = [_]u8{0} ** 20,
+        .peer_id = "ABCDEFGHIJKLMNOPQRST".*,
+        .port = 6881,
+        .left = 100,
+        .key = "abcd1234".*,
+    });
+    defer std.testing.allocator.free(url);
+
+    try std.testing.expect(std.mem.indexOf(u8, url, "key=abcd1234") != null);
+}
+
+test "build url omits key when not provided" {
+    const url = try buildUrl(std.testing.allocator, .{
+        .announce_url = "http://tracker.example/announce",
+        .info_hash = [_]u8{0} ** 20,
+        .peer_id = "ABCDEFGHIJKLMNOPQRST".*,
+        .port = 6881,
+        .left = 100,
+        .event = null,
+    });
+    defer std.testing.allocator.free(url);
+
+    try std.testing.expect(std.mem.indexOf(u8, url, "key=") == null);
+    // Also verify event is omitted when null
+    try std.testing.expect(std.mem.indexOf(u8, url, "event=") == null);
+}
+
+test "generate key produces 8 hex characters" {
+    const key = Request.generateKey();
+    try std.testing.expectEqual(@as(usize, 8), key.len);
+    for (key) |c| {
+        try std.testing.expect((c >= '0' and c <= '9') or (c >= 'a' and c <= 'f'));
+    }
 }
 
 test "parse compact tracker response" {

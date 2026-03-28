@@ -276,6 +276,26 @@ test "piece hash accessors expose torrent piece metadata" {
     try std.testing.expectError(error.InvalidPieceIndex, info.pieceHash(3));
 }
 
+test "parse private flag in metainfo" {
+    const input =
+        "d4:infod6:lengthi5e4:name8:test.bin12:piece lengthi16384e6:pieces20:abcdefghijklmnopqrst7:privatei1eee";
+
+    const metainfo = try parse(std.testing.allocator, input);
+    defer freeMetainfo(std.testing.allocator, metainfo);
+
+    try std.testing.expect(metainfo.isPrivate());
+}
+
+test "non-private torrent defaults to false" {
+    const input =
+        "d4:infod6:lengthi5e4:name8:test.bin12:piece lengthi16384e6:pieces20:abcdefghijklmnopqrstee";
+
+    const metainfo = try parse(std.testing.allocator, input);
+    defer freeMetainfo(std.testing.allocator, metainfo);
+
+    try std.testing.expect(!metainfo.isPrivate());
+}
+
 test "reject non-dictionary torrent root" {
     try std.testing.expectError(
         error.UnexpectedBencodeType,

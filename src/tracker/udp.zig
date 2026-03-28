@@ -5,7 +5,6 @@ const announce_mod = @import("announce.zig");
 
 /// UDP tracker protocol (BEP 15).
 /// All I/O via io_uring sendmsg/recvmsg.
-
 const protocol_id: u64 = 0x41727101980; // magic constant
 const action_connect: u32 = 0;
 const action_announce: u32 = 1;
@@ -65,8 +64,11 @@ pub fn fetchViaUdp(
     std.mem.writeInt(u64, announce_buf[72..80], request.uploaded, .big);
     std.mem.writeInt(u32, announce_buf[80..84], eventToInt(request.event), .big);
     std.mem.writeInt(u32, announce_buf[84..88], 0, .big); // IP (0 = default)
-    std.mem.writeInt(u32, announce_buf[88..92], generateTransactionId(), .big); // key
-    std.mem.writeInt(i32, announce_buf[92..96], -1, .big); // numwant (-1 = default)
+    // Use session key if provided, otherwise generate a random one
+    const key_value: u32 = if (request.key) |k| std.mem.readInt(u32, k[0..4], .big) else generateTransactionId();
+    std.mem.writeInt(u32, announce_buf[88..92], key_value, .big); // key
+    const numwant_i32: i32 = @intCast(@min(request.numwant, std.math.maxInt(i32)));
+    std.mem.writeInt(i32, announce_buf[92..96], numwant_i32, .big); // numwant
     std.mem.writeInt(u16, announce_buf[96..98], request.port, .big);
 
     try ring.send_all(fd, &announce_buf);
