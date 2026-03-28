@@ -128,7 +128,6 @@ pub const EventLoop = struct {
     const PendingWrite = struct {
         piece_index: u32,
         torrent_id: u8,
-        slot: u16,
         buf: []u8,
         spans_remaining: u32,
     };
@@ -811,14 +810,13 @@ pub const EventLoop = struct {
     fn handleDiskWrite(self: *EventLoop, slot: u16, cqe: linux.io_uring_cqe) void {
         _ = slot;
         const op = decodeUserData(cqe.user_data);
-        const piece_index: u32 = @intCast(op.context & 0xFFFFFFFF);
-        const write_torrent_id: u8 = @intCast((op.context >> 32) & 0xFF);
+        const piece_index: u32 = @intCast(op.context);
 
         // Find the pending write for this piece and decrement spans_remaining
         var i: usize = 0;
         while (i < self.pending_writes.items.len) {
             const pending_w = &self.pending_writes.items[i];
-            if (pending_w.piece_index == piece_index and pending_w.torrent_id == write_torrent_id) {
+            if (pending_w.piece_index == piece_index) {
                 pending_w.spans_remaining -= 1;
                 if (pending_w.spans_remaining == 0) {
                     // All spans written -- mark piece complete and free buffer
@@ -1207,14 +1205,6 @@ pub const EventLoop = struct {
             }
 
             const peer = &self.peers[current_slot];
-
-            // Skip if peer disconnected between queueing and flushing
-            if (peer.state == .free or peer.state == .disconnecting) {
-                self.allocator.free(send_buf);
-                i = j;
-                continue;
-            }
-
             peer.bytes_uploaded_to += total_uploaded;
 
             self.pending_sends.append(self.allocator, .{
@@ -1382,7 +1372,7 @@ pub const EventLoop = struct {
 
         if (self.hasher) |h| {
             // Submit to background hasher thread (non-blocking)
-            h.submitVerify(slot, piece_index, piece_buf, hash, peer.torrent_id) catch {
+            h.submitVerify(slot, piece_index, piece_buf, hash) catch {
                 pt.releasePiece(piece_index);
                 peer.current_piece = null;
                 return;
@@ -1394,7 +1384,7 @@ pub const EventLoop = struct {
         } else {
             // Fallback: inline verification (blocks event loop)
             var actual: [20]u8 = undefined;
-            std.crypto.hash.Sha1.hash(piece_buf[0..piece_buf.len], &actual, .{});
+            std.crypto.hash.Sha1.hash(piece_buf[0..@intCast(peer.blocks_expected * 16384)], &actual, .{});
             // Simplified inline path -- use hasher in production
             pt.releasePiece(piece_index);
             peer.current_piece = null;
@@ -1407,9 +1397,8 @@ pub const EventLoop = struct {
         const h = self.hasher orelse return;
         const results = h.drainResults();
         for (results) |result| {
-            // Use torrent_id stored in the hash result (not from the slot,
-            // which may have been freed and reassigned since submission).
-            const torrent_id = result.torrent_id;
+            // Get torrent context from the peer slot that submitted this hash
+            const torrent_id = self.peers[result.slot].torrent_id;
             const tc = self.getTorrentContext(torrent_id) orelse {
                 self.allocator.free(result.piece_buf);
                 continue;
@@ -1437,7 +1426,6 @@ pub const EventLoop = struct {
                 self.pending_writes.append(self.allocator, .{
                     .piece_index = result.piece_index,
                     .torrent_id = torrent_id,
-                    .slot = result.slot,
                     .buf = result.piece_buf,
                     .spans_remaining = span_count,
                 }) catch {
@@ -1447,7 +1435,7 @@ pub const EventLoop = struct {
 
                 for (plan.spans) |span| {
                     const block = result.piece_buf[span.piece_offset .. span.piece_offset + span.length];
-                    const ud = encodeUserData(.{ .slot = result.slot, .op_type = .disk_write, .context = @as(u40, @intCast(torrent_id)) << 32 | @as(u40, result.piece_index) });
+                    const ud = encodeUserData(.{ .slot = result.slot, .op_type = .disk_write, .context = @intCast(result.piece_index) });
                     _ = self.ring.write(ud, tc.shared_fds[span.file_index], block, span.file_offset) catch continue;
                 }
             } else {
@@ -1543,9 +1531,7 @@ pub const EventLoop = struct {
             if (self.pending_sends.items[i].slot == slot) {
                 self.allocator.free(self.pending_sends.items[i].buf);
                 _ = self.pending_sends.swapRemove(i);
-                // Don't increment i -- swapRemove moved a new element here.
-                // Don't return -- there may be more entries for this slot.
-                continue;
+                return;
             }
             i += 1;
         }
