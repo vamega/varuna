@@ -1,6 +1,7 @@
 const std = @import("std");
 const posix = std.posix;
 const linux = std.os.linux;
+const log = std.log.scoped(.event_loop);
 const Bitfield = @import("../bitfield.zig").Bitfield;
 const PieceTracker = @import("../torrent/piece_tracker.zig").PieceTracker;
 const session_mod = @import("../torrent/session.zig");
@@ -574,7 +575,9 @@ pub const EventLoop = struct {
         self.updateSpeedCounters();
 
         // Flush any queued SQEs before waiting
-        _ = self.ring.submit() catch {};
+        _ = self.ring.submit() catch |err| {
+            log.warn("ring submit (pre-wait): {s}", .{@errorName(err)});
+        };
         _ = try self.ring.submit_and_wait(1);
 
         var cqes: [cqe_batch_size]linux.io_uring_cqe = undefined;
@@ -588,7 +591,9 @@ pub const EventLoop = struct {
         self.flushQueuedResponses();
 
         // Flush any SQEs queued during dispatch (piece responses, block requests, etc.)
-        _ = self.ring.submit() catch {};
+        _ = self.ring.submit() catch |err| {
+            log.warn("ring submit (post-dispatch): {s}", .{@errorName(err)});
+        };
     }
 
     /// Submit a timeout SQE so that submit_and_wait returns even if
@@ -624,7 +629,10 @@ pub const EventLoop = struct {
     fn handleAccept(self: *EventLoop, cqe: linux.io_uring_cqe) void {
         if (cqe.res < 0) {
             // Accept failed, try again
-            self.submitAccept() catch {};
+            log.warn("accept failed: errno={d}", .{-cqe.res});
+            self.submitAccept() catch |err| {
+                log.err("re-submit accept after failure: {s}", .{@errorName(err)});
+            };
             return;
         }
         const new_fd: posix.fd_t = @intCast(cqe.res);
@@ -632,7 +640,9 @@ pub const EventLoop = struct {
         // Allocate a peer slot for the inbound connection
         const slot = self.allocSlot() orelse {
             posix.close(new_fd);
-            self.submitAccept() catch {};
+            self.submitAccept() catch |err| {
+                log.err("re-submit accept after slot exhaustion: {s}", .{@errorName(err)});
+            };
             return;
         };
 
@@ -651,7 +661,9 @@ pub const EventLoop = struct {
         };
 
         // Re-submit accept for more connections
-        self.submitAccept() catch {};
+        self.submitAccept() catch |err| {
+            log.err("re-submit accept: {s}", .{@errorName(err)});
+        };
     }
 
     fn handleConnect(self: *EventLoop, slot: u16, cqe: linux.io_uring_cqe) void {
@@ -1025,7 +1037,9 @@ pub const EventLoop = struct {
                                 } else {
                                     // Refill pipeline — request more blocks if slots available.
                                     // Without this, pieces with more blocks than pipeline_depth stall.
-                                    self.tryFillPipeline(slot) catch {};
+                                    self.tryFillPipeline(slot) catch |err| {
+                                        log.debug("pipeline refill failed for slot {d}: {s}", .{ slot, @errorName(err) });
+                                    };
                                 }
                             }
                         }
@@ -1128,13 +1142,17 @@ pub const EventLoop = struct {
             if (unchoked < max_unchoked + optimistic_unchoke_slots) {
                 if (peer.am_choking) {
                     peer.am_choking = false;
-                    self.submitMessage(slot, 1, &.{}) catch {}; // unchoke
+                    self.submitMessage(slot, 1, &.{}) catch |err| {
+                        log.debug("unchoke send for slot {d}: {s}", .{ slot, @errorName(err) });
+                    }; // unchoke
                 }
                 unchoked += 1;
             } else {
                 if (!peer.am_choking) {
                     peer.am_choking = true;
-                    self.submitMessage(slot, 0, &.{}) catch {}; // choke
+                    self.submitMessage(slot, 0, &.{}) catch |err| {
+                        log.debug("choke send for slot {d}: {s}", .{ slot, @errorName(err) });
+                    }; // choke
                 }
             }
         }
@@ -1165,7 +1183,9 @@ pub const EventLoop = struct {
                 .piece_index = piece_index,
                 .block_offset = block_offset,
                 .block_length = block_length,
-            }) catch {};
+            }) catch |err| {
+                log.warn("queue cached piece response: {s}", .{@errorName(err)});
+            };
             return;
         }
 
@@ -1195,7 +1215,9 @@ pub const EventLoop = struct {
         for (plan.spans) |span| {
             const target = read_buf[span.piece_offset .. span.piece_offset + span.length];
             const ud = encodeUserData(.{ .slot = slot, .op_type = .disk_read, .context = @intCast(piece_index) });
-            _ = self.ring.read(ud, tc.shared_fds[span.file_index], .{ .buffer = target }, span.file_offset) catch {};
+            _ = self.ring.read(ud, tc.shared_fds[span.file_index], .{ .buffer = target }, span.file_offset) catch |err| {
+                log.warn("disk read submit for piece {d}: {s}", .{ piece_index, @errorName(err) });
+            };
         }
     }
 
@@ -1395,7 +1417,9 @@ pub const EventLoop = struct {
         for (self.idle_peers.items) |s| {
             if (s == slot) return;
         }
-        self.idle_peers.append(self.allocator, slot) catch {};
+        self.idle_peers.append(self.allocator, slot) catch |err| {
+            log.debug("idle_peers append for slot {d}: {s}", .{ slot, @errorName(err) });
+        };
     }
 
     /// Remove a slot from the idle_peers list (swap-remove for O(1)).
@@ -1614,7 +1638,10 @@ pub const EventLoop = struct {
                 for (plan.spans) |span| {
                     const block = result.piece_buf[span.piece_offset .. span.piece_offset + span.length];
                     const ud = encodeUserData(.{ .slot = result.slot, .op_type = .disk_write, .context = @as(u40, @intCast(torrent_id)) << 32 | @as(u40, result.piece_index) });
-                    _ = self.ring.write(ud, tc.shared_fds[span.file_index], block, span.file_offset) catch continue;
+                    _ = self.ring.write(ud, tc.shared_fds[span.file_index], block, span.file_offset) catch |err| {
+                        log.warn("disk write submit for piece {d}: {s}", .{ result.piece_index, @errorName(err) });
+                        continue;
+                    };
                 }
             } else {
                 // Hash mismatch -- release piece back to pool
