@@ -18,13 +18,18 @@ pub const Config = struct {
     };
 
     pub const Network = struct {
-        port: u16 = 6881,
+        port_min: u16 = 6881,
+        port_max: u16 = 6889,
         max_peers: u32 = 50,
         connect_timeout_secs: u32 = 10,
         /// Global download speed limit in bytes/sec. 0 = unlimited.
         dl_limit: u64 = 0,
         /// Global upload speed limit in bytes/sec. 0 = unlimited.
         ul_limit: u64 = 0,
+        /// Network interface to bind to (e.g. "wg0"). Requires CAP_NET_RAW or root.
+        bind_device: ?[]const u8 = null,
+        /// Local IP address to bind to (e.g. "10.0.0.1").
+        bind_address: ?[]const u8 = null,
     };
 
     pub const Performance = struct {
@@ -80,13 +85,16 @@ pub fn loadDefault(allocator: std.mem.Allocator) Config {
 
 test "default config has sensible values" {
     const config = Config{};
-    try std.testing.expectEqual(@as(u16, 6881), config.network.port);
+    try std.testing.expectEqual(@as(u16, 6881), config.network.port_min);
+    try std.testing.expectEqual(@as(u16, 6889), config.network.port_max);
     try std.testing.expectEqual(@as(u32, 50), config.network.max_peers);
     try std.testing.expectEqual(@as(u32, 4), config.performance.hasher_threads);
     try std.testing.expectEqual(@as(u32, 5), config.performance.pipeline_depth);
+    try std.testing.expectEqual(@as(?[]const u8, null), config.network.bind_device);
+    try std.testing.expectEqual(@as(?[]const u8, null), config.network.bind_address);
 }
 
 test "load missing file returns defaults" {
     const config = load(std.testing.allocator, "nonexistent.toml") catch Config{};
-    try std.testing.expectEqual(@as(u16, 6881), config.network.port);
+    try std.testing.expectEqual(@as(u16, 6881), config.network.port_min);
 }

@@ -32,12 +32,15 @@ Update it whenever a milestone lands, the near-term backlog changes, or a new op
 - **systemd-notify**: READY=1 / STOPPING=1 via AF_UNIX, no libsystemd dependency.
 - **Download/upload speed restrictions**: token bucket rate limiter, per-torrent + global limits, non-blocking throttling. Config, API, CLI support.
 - **Performance optimizations**: popcount bitfield, inline message buffers, idle peers list (O(k) not O(4096)), HashMap pending_writes (O(1) not O(n)), claimPiece scan hint, error logging for silent catches.
+- **Bind interface / SO_BINDTODEVICE**: restrict daemon to specific NIC/VPN interface via `bind_device` config.
+- **Bind address**: bind all sockets to a specific local IP via `bind_address` config.
+- **Port ranges**: `port_min`/`port_max` config; daemon tries each port until one succeeds, reports actual bound port.
 - **Testing**: 19 peer wire protocol tests, bencode fuzz/edge tests, HTTP parser edge tests, comprehensive transfer test matrix (23 test cases: 1KB-50MB, 16KB/64KB/256KB pieces, multi-file torrents).
 
 ## Next
 
 ### Essential for Private Tracker Use
-- **Bind interface / SO_BINDTODEVICE**: restrict daemon to specific NIC/VPN interface (config + socket option).
+- ~~**Bind interface / SO_BINDTODEVICE**: restrict daemon to specific NIC/VPN interface (config + socket option).~~ (Done)
 - **SOCKS/HTTP proxy support**: for tracker and peer connections (privacy, region-locked trackers).
 - **BEP 10 (Extension Protocol)**: extension handshake in reserved bytes — prerequisite for MSE, ut_metadata, PEX.
 - **MSE encryption (BEP 6)**: message stream encryption, required by many private trackers.

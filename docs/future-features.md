@@ -36,19 +36,17 @@ Key aspects:
 
 Reference: libtorrent (arvidn) has a mature uTP implementation in `src/utp_stream.cpp`.
 
-## 4. SO_BINDTODEVICE support
+## 4. ~~SO_BINDTODEVICE support~~ (DONE)
 
-Restrict the daemon to a specific network interface. Useful for:
-- Binding to a VPN interface only (privacy)
-- Multi-homed servers where torrent traffic should use a specific NIC
-- Preventing traffic from leaking to the wrong interface
-
-Implementation: `setsockopt(fd, SOL_SOCKET, SO_BINDTODEVICE, "eth0", 4)` before `bind()`. Can be done via io_uring `IORING_OP_SETSOCKOPT` (kernel 6.7+) or conventional `setsockopt` at socket creation.
+Implemented in `src/net/socket.zig`. Applied to peer listen socket, outbound peer sockets, and API server socket. Also added `bind_address` for IP-level binding and port range support (`port_min`/`port_max`).
 
 Config:
 ```toml
 [network]
-bind_device = "wg0"  # restrict to this interface
+bind_device = "wg0"       # restrict to this interface
+bind_address = "10.0.0.1"  # bind to specific IP
+port_min = 6881            # port range start
+port_max = 6889            # port range end
 ```
 
 ## 5. systemd socket activation

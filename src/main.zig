@@ -65,6 +65,10 @@ pub fn main() !void {
         break :blk @ptrCast(&resume_db_buf);
     };
 
+    // Apply bind configuration to event loop for outbound peer sockets
+    shared_el.bind_device = cfg.network.bind_device;
+    shared_el.bind_address = cfg.network.bind_address;
+
     // Apply global speed limits from config
     if (cfg.network.dl_limit > 0) shared_el.setGlobalDlLimit(cfg.network.dl_limit);
     if (cfg.network.ul_limit > 0) shared_el.setGlobalUlLimit(cfg.network.ul_limit);
@@ -72,7 +76,7 @@ pub fn main() !void {
     // Session manager
     var session_manager = varuna.daemon.session_manager.SessionManager.init(allocator);
     session_manager.shared_event_loop = &shared_el;
-    session_manager.port = cfg.network.port;
+    session_manager.port = cfg.network.port_min;
     session_manager.max_peers = cfg.network.max_peers;
     session_manager.hasher_threads = cfg.performance.hasher_threads;
     session_manager.resume_db_path = resume_db_path;
@@ -85,7 +89,7 @@ pub fn main() !void {
     };
 
     // HTTP API server (all I/O via io_uring)
-    var api_server = varuna.rpc.server.ApiServer.init(allocator, cfg.daemon.api_bind, cfg.daemon.api_port) catch |err| {
+    var api_server = varuna.rpc.server.ApiServer.initWithDevice(allocator, cfg.daemon.api_bind, cfg.daemon.api_port, cfg.network.bind_device) catch |err| {
         try stdout.print("failed to start API server: {s}\n", .{@errorName(err)});
         try stdout.flush();
         return err;
@@ -148,10 +152,12 @@ pub fn main() !void {
                     if (sess.integrateSeedIntoEventLoop()) {
                         // Create listen socket once for the first seeding torrent
                         if (listen_fd < 0) {
-                            listen_fd = createListenSocket(cfg.network.port) catch -1;
-                            if (listen_fd >= 0) {
+                            if (createListenSocket(cfg.network)) |result| {
+                                listen_fd = result.fd;
+                                // Update the port used for tracker announces to the actual bound port
+                                session_manager.port = result.port;
                                 shared_el.ensureAccepting(listen_fd) catch {};
-                            }
+                            } else |_| {}
                         }
                     }
                 }
@@ -190,25 +196,55 @@ pub fn main() !void {
     try stdout.flush();
 }
 
-/// Create a non-blocking listen socket bound to 0.0.0.0:port for accepting
-/// inbound peer connections. Uses standard socket creation (one-time setup,
-/// not on the hot path -- io_uring handles the accept calls).
-fn createListenSocket(port: u16) !std.posix.fd_t {
-    const addr = std.net.Address.initIp4(.{ 0, 0, 0, 0 }, port);
-    const fd = try std.posix.socket(
-        std.posix.AF.INET,
-        std.posix.SOCK.STREAM | std.posix.SOCK.CLOEXEC | std.posix.SOCK.NONBLOCK,
-        std.posix.IPPROTO.TCP,
-    );
-    errdefer std.posix.close(fd);
+/// Create a non-blocking listen socket for accepting inbound peer connections.
+/// Tries each port in [port_min, port_max] until one succeeds.
+/// Returns the fd and the actual bound port.
+/// Uses standard socket creation (one-time setup, not on the hot path --
+/// io_uring handles the accept calls).
+fn createListenSocket(
+    net_cfg: varuna.config.Config.Network,
+) !struct { fd: std.posix.fd_t, port: u16 } {
+    const socket_util = varuna.net.socket;
 
-    // Allow address reuse
-    const one: u32 = 1;
-    std.posix.setsockopt(fd, std.posix.SOL.SOCKET, std.posix.SO.REUSEADDR, std.mem.asBytes(&one)) catch {};
+    if (net_cfg.port_min > net_cfg.port_max) return error.InvalidPortRange;
 
-    try std.posix.bind(fd, &addr.any, addr.getOsSockLen());
-    try std.posix.listen(fd, 128);
-    return fd;
+    var port = net_cfg.port_min;
+    while (port <= net_cfg.port_max) : (port += 1) {
+        const bind_addr_str = net_cfg.bind_address orelse "0.0.0.0";
+        const addr = std.net.Address.parseIp4(bind_addr_str, port) catch
+            std.net.Address.parseIp6(bind_addr_str, port) catch
+            return error.InvalidBindAddress;
+
+        const fd = std.posix.socket(
+            addr.any.family,
+            std.posix.SOCK.STREAM | std.posix.SOCK.CLOEXEC | std.posix.SOCK.NONBLOCK,
+            std.posix.IPPROTO.TCP,
+        ) catch continue;
+        errdefer std.posix.close(fd);
+
+        // Allow address reuse
+        const one: u32 = 1;
+        std.posix.setsockopt(fd, std.posix.SOL.SOCKET, std.posix.SO.REUSEADDR, std.mem.asBytes(&one)) catch {};
+
+        // Apply SO_BINDTODEVICE if configured
+        if (net_cfg.bind_device) |device| {
+            socket_util.applyBindDevice(fd, device) catch |err| {
+                std.posix.close(fd);
+                return err;
+            };
+        }
+
+        std.posix.bind(fd, &addr.any, addr.getOsSockLen()) catch {
+            std.posix.close(fd);
+            continue;
+        };
+        std.posix.listen(fd, 128) catch {
+            std.posix.close(fd);
+            continue;
+        };
+        return .{ .fd = fd, .port = port };
+    }
+    return error.AddressInUse;
 }
 
 // Global state for handler dispatch (Zig fn pointers can't capture state)

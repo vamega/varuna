@@ -2,6 +2,7 @@ const std = @import("std");
 const posix = std.posix;
 const linux = std.os.linux;
 const Ring = @import("../io/ring.zig").Ring;
+const socket_util = @import("../net/socket.zig");
 
 const max_api_clients = 64;
 const recv_buf_size = 8192;
@@ -17,6 +18,10 @@ pub const ApiServer = struct {
     running: bool = true,
 
     pub fn init(allocator: std.mem.Allocator, bind_addr: []const u8, port: u16) !ApiServer {
+        return initWithDevice(allocator, bind_addr, port, null);
+    }
+
+    pub fn initWithDevice(allocator: std.mem.Allocator, bind_addr: []const u8, port: u16, bind_device: ?[]const u8) !ApiServer {
         const ring = try Ring.init(64);
         errdefer {
             var r = ring;
@@ -35,6 +40,11 @@ pub const ApiServer = struct {
         // SO_REUSEADDR
         const enable: u32 = 1;
         try posix.setsockopt(fd, posix.SOL.SOCKET, posix.SO.REUSEADDR, std.mem.asBytes(&enable));
+
+        // SO_BINDTODEVICE if configured
+        if (bind_device) |device| {
+            try socket_util.applyBindDevice(fd, device);
+        }
 
         try posix.bind(fd, &addr.any, addr.getOsSockLen());
         try posix.listen(fd, 128);

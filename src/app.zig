@@ -101,7 +101,7 @@ fn parseTransferOptions(args: []const []const u8, cfg: Config) !TransferOptions 
     var options = TransferOptions{
         .torrent_path = args[0],
         .target_root = args[1],
-        .port = cfg.network.port,
+        .port = cfg.network.port_min,
         .max_peers = cfg.network.max_peers,
     };
 

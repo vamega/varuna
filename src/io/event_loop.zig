@@ -9,6 +9,7 @@ const storage = @import("../storage/root.zig");
 const pw = @import("../net/peer_wire.zig");
 const Hasher = @import("hasher.zig").Hasher;
 const RateLimiter = @import("rate_limiter.zig").RateLimiter;
+const socket_util = @import("../net/socket.zig");
 
 const max_peers: u16 = 4096;
 const cqe_batch_size = 64;
@@ -200,6 +201,10 @@ pub const EventLoop = struct {
 
     // Listening port for tracker announces
     port: u16 = 6881,
+
+    // Bind configuration for outbound sockets
+    bind_device: ?[]const u8 = null,
+    bind_address: ?[]const u8 = null,
 
     // Accept socket for seeding (-1 if not seeding)
     listen_fd: posix.fd_t = -1,
@@ -511,7 +516,11 @@ pub const EventLoop = struct {
             posix.SOCK.STREAM | posix.SOCK.CLOEXEC | posix.SOCK.NONBLOCK,
             posix.IPPROTO.TCP,
         );
+        errdefer posix.close(fd);
         peer.fd = fd;
+
+        // Apply bind configuration (SO_BINDTODEVICE and/or local address) to outbound socket
+        try socket_util.applyBindConfig(fd, self.bind_device, self.bind_address, 0);
 
         const ud = encodeUserData(.{ .slot = slot, .op_type = .peer_connect, .context = 0 });
         // Use peer.address (stored in slot) not the parameter (stack-local, dangling after return)
