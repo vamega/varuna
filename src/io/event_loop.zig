@@ -139,14 +139,16 @@ pub const EventLoop = struct {
     };
 
     /// Tracks an async piece read for seed mode.
-    /// When the read CQE completes, we build the piece response and send it.
+    /// For multi-span pieces, multiple io_uring reads are submitted.
+    /// When all reads complete, the piece response is sent.
     const PendingPieceRead = struct {
         slot: u16,
         piece_index: u32,
         block_offset: u32,
         block_length: u32,
-        read_buf: []u8, // buffer for the full piece (read target)
+        read_buf: []u8,
         piece_size: u32,
+        reads_remaining: u32, // number of io_uring read CQEs still pending
     };
 
     ring: linux.IoUring,
@@ -942,47 +944,33 @@ pub const EventLoop = struct {
             return;
         }
 
-        // Submit async io_uring read for the piece
+        // Submit async io_uring reads for all spans (no blocking)
         const plan = storage.verify.planPieceVerification(self.allocator, self.session, piece_index) catch return;
         defer storage.verify.freePiecePlan(self.allocator, plan);
 
-        // Allocate read buffer
-        const read_buf = self.allocator.alloc(u8, piece_size) catch return;
+        if (plan.spans.len == 0) return;
 
-        if (plan.spans.len == 1) {
-            // Single-span: one io_uring read
-            const span = plan.spans[0];
-            self.pending_reads.append(self.allocator, .{
-                .slot = slot,
-                .piece_index = piece_index,
-                .block_offset = block_offset,
-                .block_length = block_length,
-                .read_buf = read_buf,
-                .piece_size = piece_size,
-            }) catch {
-                self.allocator.free(read_buf);
-                return;
-            };
+        const read_buf = self.allocator.alloc(u8, piece_size) catch return;
+        const span_count: u32 = @intCast(plan.spans.len);
+
+        self.pending_reads.append(self.allocator, .{
+            .slot = slot,
+            .piece_index = piece_index,
+            .block_offset = block_offset,
+            .block_length = block_length,
+            .read_buf = read_buf,
+            .piece_size = piece_size,
+            .reads_remaining = span_count,
+        }) catch {
+            self.allocator.free(read_buf);
+            return;
+        };
+
+        // Submit one io_uring read per span (all non-blocking)
+        for (plan.spans) |span| {
+            const target = read_buf[span.piece_offset .. span.piece_offset + span.length];
             const ud = encodeUserData(.{ .slot = slot, .op_type = .disk_read, .context = @intCast(piece_index) });
-            _ = self.ring.read(ud, self.shared_fds[span.file_index], .{ .buffer = read_buf[0..piece_size] }, span.file_offset) catch {
-                self.allocator.free(read_buf);
-                return;
-            };
-        } else {
-            // Multi-span: blocking pread fallback (crosses file boundaries)
-            for (plan.spans) |span| {
-                const block = read_buf[span.piece_offset .. span.piece_offset + span.length];
-                _ = posix.pread(self.shared_fds[span.file_index], block, span.file_offset) catch {
-                    self.allocator.free(read_buf);
-                    return;
-                };
-            }
-            // Update cache and serve
-            if (self.cached_piece_data) |old| self.allocator.free(old);
-            self.cached_piece_data = read_buf;
-            self.cached_piece_index = piece_index;
-            self.cached_piece_len = piece_size;
-            self.sendPieceBlock(slot, piece_index, block_offset, block_length, read_buf);
+            _ = self.ring.read(ud, self.shared_fds[span.file_index], .{ .buffer = target }, span.file_offset) catch {};
         }
     }
 
@@ -990,29 +978,43 @@ pub const EventLoop = struct {
         const op = decodeUserData(cqe.user_data);
         const piece_index: u32 = @intCast(op.context);
 
-        // Find the matching pending read
-        var i: usize = 0;
-        while (i < self.pending_reads.items.len) {
-            const pr = self.pending_reads.items[i];
+        // Find the matching pending read and decrement reads_remaining
+        for (self.pending_reads.items) |*pr| {
             if (pr.piece_index == piece_index and pr.slot == op.slot) {
-                _ = self.pending_reads.swapRemove(i);
-
                 if (cqe.res <= 0) {
+                    // Read failed -- abort this pending read entirely
+                    pr.reads_remaining = 0;
                     self.allocator.free(pr.read_buf);
+                    // Remove from list
+                    const idx = (@intFromPtr(pr) - @intFromPtr(self.pending_reads.items.ptr)) / @sizeOf(PendingPieceRead);
+                    _ = self.pending_reads.swapRemove(idx);
                     return;
                 }
 
-                // Update cache
-                if (self.cached_piece_data) |old| self.allocator.free(old);
-                self.cached_piece_data = pr.read_buf;
-                self.cached_piece_index = pr.piece_index;
-                self.cached_piece_len = pr.piece_size;
+                pr.reads_remaining -= 1;
+                if (pr.reads_remaining == 0) {
+                    // All spans read -- update cache and send
+                    const slot = pr.slot;
+                    const pi = pr.piece_index;
+                    const bo = pr.block_offset;
+                    const bl = pr.block_length;
+                    const buf = pr.read_buf;
+                    const ps = pr.piece_size;
 
-                // Now send the block
-                self.sendPieceBlock(pr.slot, pr.piece_index, pr.block_offset, pr.block_length, pr.read_buf);
+                    // Remove from pending list
+                    const idx = (@intFromPtr(pr) - @intFromPtr(self.pending_reads.items.ptr)) / @sizeOf(PendingPieceRead);
+                    _ = self.pending_reads.swapRemove(idx);
+
+                    // Update cache
+                    if (self.cached_piece_data) |old| self.allocator.free(old);
+                    self.cached_piece_data = buf;
+                    self.cached_piece_index = pi;
+                    self.cached_piece_len = ps;
+
+                    self.sendPieceBlock(slot, pi, bo, bl, buf);
+                }
                 return;
             }
-            i += 1;
         }
     }
 
