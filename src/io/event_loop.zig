@@ -232,10 +232,17 @@ pub const EventLoop = struct {
     // Queued piece block responses (batched per tick, flushed after CQE dispatch)
     queued_responses: std.ArrayList(QueuedBlockResponse),
 
+    // Connection limits
+    max_connections: u32 = 500,
+    max_peers_per_torrent: u32 = 100,
+    max_half_open: u32 = 50,
+    half_open_count: u32 = 0,
+
     // Re-announce state
     announce_url: ?[]const u8 = null,
     announce_interval: u32 = 1800,
     last_announce_time: i64 = 0,
+    announce_jitter_secs: i32 = 0, // random jitter applied to this torrent's interval
     min_peers_for_reannounce: u16 = 1, // re-announce when below this
 
     // Global rate limiter (applies across all torrents, 0 = unlimited)
@@ -503,6 +510,33 @@ pub const EventLoop = struct {
 
         if (self.torrents[torrent_id] == null) return error.TorrentNotFound;
 
+        // Enforce global connection limit
+        if (self.peer_count >= self.max_connections) {
+            log.warn("global connection limit reached ({d}/{d})", .{ self.peer_count, self.max_connections });
+            return error.ConnectionLimitReached;
+        }
+
+        // Enforce per-torrent connection limit
+        if (self.peerCountForTorrent(torrent_id) >= self.max_peers_per_torrent) {
+            log.warn("per-torrent connection limit reached for torrent {d} ({d}/{d})", .{
+                torrent_id,
+                self.peerCountForTorrent(torrent_id),
+                self.max_peers_per_torrent,
+            });
+            return error.TorrentConnectionLimitReached;
+        }
+
+        // Enforce half-open connection limit
+        if (self.half_open_count >= self.max_half_open) {
+            return error.HalfOpenLimitReached;
+        }
+
+        // Log warning when approaching global limit (>90%)
+        const threshold = self.max_connections / 10 * 9;
+        if (self.peer_count >= threshold and self.peer_count < self.max_connections) {
+            log.warn("approaching global connection limit ({d}/{d})", .{ self.peer_count, self.max_connections });
+        }
+
         const slot = self.allocSlot() orelse return error.TooManyPeers;
         const peer = &self.peers[slot];
         peer.* = Peer{
@@ -527,6 +561,7 @@ pub const EventLoop = struct {
         _ = try self.ring.connect(ud, fd, &peer.address.any, peer.address.getOsSockLen());
 
         self.peer_count += 1;
+        self.half_open_count += 1;
         return slot;
     }
 
@@ -545,6 +580,10 @@ pub const EventLoop = struct {
 
     pub fn removePeer(self: *EventLoop, slot: u16) void {
         const peer = &self.peers[slot];
+        // Track half-open connection cleanup
+        if (peer.state == .connecting and self.half_open_count > 0) {
+            self.half_open_count -= 1;
+        }
         if (peer.current_piece) |piece_index| {
             if (self.getTorrentContext(peer.torrent_id)) |tc| {
                 if (tc.piece_tracker) |pt| pt.releasePiece(piece_index);
@@ -764,6 +803,19 @@ pub const EventLoop = struct {
         }
         const new_fd: posix.fd_t = @intCast(cqe.res);
 
+        // Enforce global connection limit on inbound connections
+        if (self.peer_count >= self.max_connections) {
+            log.warn("rejecting inbound connection: global limit reached ({d}/{d})", .{
+                self.peer_count,
+                self.max_connections,
+            });
+            posix.close(new_fd);
+            self.submitAccept() catch |err| {
+                log.err("re-submit accept after connection limit: {s}", .{@errorName(err)});
+            };
+            return;
+        }
+
         // Allocate a peer slot for the inbound connection
         const slot = self.allocSlot() orelse {
             posix.close(new_fd);
@@ -794,6 +846,9 @@ pub const EventLoop = struct {
     }
 
     fn handleConnect(self: *EventLoop, slot: u16, cqe: linux.io_uring_cqe) void {
+        // Connection attempt completed (success or failure) -- no longer half-open
+        if (self.half_open_count > 0) self.half_open_count -= 1;
+
         if (cqe.res < 0) {
             self.removePeer(slot);
             return;
@@ -1187,9 +1242,14 @@ pub const EventLoop = struct {
         if (self.peer_count >= self.min_peers_for_reannounce) return;
 
         const now = std.time.timestamp();
-        if (now - self.last_announce_time < @as(i64, self.announce_interval)) return;
+        // Apply jitter to the announce interval (±10% of interval)
+        const jittered_interval = @as(i64, self.announce_interval) + @as(i64, self.announce_jitter_secs);
+        const effective_interval = @max(jittered_interval, 60); // floor at 60s
+        if (now - self.last_announce_time < effective_interval) return;
 
         self.last_announce_time = now;
+        // Generate new jitter for next cycle: ±10% of interval
+        self.announce_jitter_secs = self.generateAnnounceJitter();
 
         // Re-announce using a temporary blocking Ring (not on event loop ring)
         const RingType = @import("ring.zig").Ring;
@@ -1210,11 +1270,24 @@ pub const EventLoop = struct {
         }) catch return;
         defer tracker_mod.announce.freeResponse(self.allocator, response);
 
-        // Add new peers
+        // Add new peers (respect connection limits)
         for (response.peers) |peer| {
-            if (self.peer_count >= max_peers) break;
+            if (self.peer_count >= self.max_connections) break;
             _ = self.addPeer(peer.address) catch continue;
         }
+    }
+
+    /// Generate random jitter for announce interval: ±10% of the interval.
+    fn generateAnnounceJitter(self: *const EventLoop) i32 {
+        const interval: i32 = @intCast(self.announce_interval);
+        const jitter_range = @divTrunc(interval, 5); // 20% total range (±10%)
+        if (jitter_range == 0) return 0;
+        // Use timestamp-based seed for simple PRNG (good enough for jitter)
+        const now: u64 = @bitCast(std.time.timestamp());
+        const hash = now *% 6364136223846793005 +% 1442695040888963407;
+        const raw: u32 = @truncate(hash >> 33);
+        const jitter: i32 = @as(i32, @intCast(raw % @as(u32, @intCast(jitter_range + 1)))) - @divTrunc(jitter_range, 2);
+        return jitter;
     }
 
     // ── Peer timeout ───────────────────────────────────────

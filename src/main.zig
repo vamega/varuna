@@ -69,6 +69,11 @@ pub fn main() !void {
     shared_el.bind_device = cfg.network.bind_device;
     shared_el.bind_address = cfg.network.bind_address;
 
+    // Apply connection limits from config
+    shared_el.max_connections = cfg.network.max_connections;
+    shared_el.max_peers_per_torrent = cfg.network.max_peers_per_torrent;
+    shared_el.max_half_open = cfg.network.max_half_open;
+
     // Apply global speed limits from config
     if (cfg.network.dl_limit > 0) shared_el.setGlobalDlLimit(cfg.network.dl_limit);
     if (cfg.network.ul_limit > 0) shared_el.setGlobalUlLimit(cfg.network.ul_limit);
@@ -125,13 +130,16 @@ pub fn main() !void {
 
         // Check if any sessions need to be integrated into the event loop
         // (background recheck thread completed, peers ready)
+        // Skip if already at global connection limit
         {
             session_manager.mutex.lock();
             var iter = session_manager.sessions.iterator();
             while (iter.next()) |entry| {
                 const sess = entry.value_ptr.*;
                 if (sess.pending_peers != null) {
-                    _ = sess.integrateIntoEventLoop();
+                    if (shared_el.peer_count < shared_el.max_connections) {
+                        _ = sess.integrateIntoEventLoop();
+                    }
                 }
             }
             session_manager.mutex.unlock();

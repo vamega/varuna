@@ -385,6 +385,26 @@ pub const TorrentSession = struct {
         // Download: announce to tracker, get peers, run event loop
         self.state = .downloading;
 
+        // Initial announce delay: random 0 to interval/4 to stagger multiple torrents
+        // and avoid thundering herd on the tracker when many torrents start at once.
+        {
+            const base_interval: u64 = 1800; // default tracker interval
+            const max_delay_ns = (base_interval / 4) * std.time.ns_per_s;
+            if (max_delay_ns > 0) {
+                // Simple hash-based jitter using info_hash bytes for deterministic spread
+                const seed = @as(u64, self.info_hash[0]) |
+                    (@as(u64, self.info_hash[1]) << 8) |
+                    (@as(u64, self.info_hash[2]) << 16) |
+                    (@as(u64, self.info_hash[3]) << 24);
+                const delay_ns = seed % max_delay_ns;
+                // Cap at 5 seconds to avoid excessive startup delay
+                const capped_delay = @min(delay_ns, 5 * std.time.ns_per_s);
+                if (capped_delay > 0) {
+                    std.Thread.sleep(capped_delay);
+                }
+            }
+        }
+
         const tracker_urls = self.buildTrackerUrls(&session) catch {
             self.state = .@"error";
             self.error_message = std.fmt.allocPrint(self.allocator, "no announce URL available", .{}) catch null;

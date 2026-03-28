@@ -40,6 +40,7 @@ Update it whenever a milestone lands, the near-term backlog changes, or a new op
 - **systemd-notify**: READY=1 / STOPPING=1 via AF_UNIX, no libsystemd dependency.
 - **Download/upload speed restrictions**: token bucket rate limiter, per-torrent + global limits, non-blocking throttling. Config, API, CLI support.
 - **Performance optimizations**: popcount bitfield, inline message buffers, idle peers list (O(k) not O(4096)), HashMap pending_writes (O(1) not O(n)), claimPiece scan hint, error logging for silent catches.
+- **Connection limits & announce staggering**: global connection limit (default 500), per-torrent limit (default 100), half-open connection limit (default 50), announce jitter (±10%), initial announce delay to prevent thundering herd.
 - **Selective file download**: per-file priorities (normal/high/do_not_download), piece-mask based filtering, boundary-piece handling for cross-file pieces, lazy file creation for previously-skipped files.
 - **Sequential download mode**: per-torrent toggle switches PieceTracker from rarest-first to lowest-index selection, enabling streaming playback while downloading.
 - **Testing**: 19 peer wire protocol tests, bencode fuzz/edge tests, HTTP parser edge tests, comprehensive transfer test matrix (23 test cases: 1KB-50MB, 16KB/64KB/256KB pieces, multi-file torrents).

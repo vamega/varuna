@@ -22,6 +22,12 @@ pub const Config = struct {
         port_max: u16 = 6889,
         max_peers: u32 = 50,
         connect_timeout_secs: u32 = 10,
+        /// Global maximum number of connections across all torrents.
+        max_connections: u32 = 500,
+        /// Maximum number of peers per individual torrent.
+        max_peers_per_torrent: u32 = 100,
+        /// Maximum number of simultaneous outbound connections (SYN queue protection).
+        max_half_open: u32 = 50,
         /// Global download speed limit in bytes/sec. 0 = unlimited.
         dl_limit: u64 = 0,
         /// Global upload speed limit in bytes/sec. 0 = unlimited.
@@ -88,6 +94,9 @@ test "default config has sensible values" {
     try std.testing.expectEqual(@as(u16, 6881), config.network.port_min);
     try std.testing.expectEqual(@as(u16, 6889), config.network.port_max);
     try std.testing.expectEqual(@as(u32, 50), config.network.max_peers);
+    try std.testing.expectEqual(@as(u32, 500), config.network.max_connections);
+    try std.testing.expectEqual(@as(u32, 100), config.network.max_peers_per_torrent);
+    try std.testing.expectEqual(@as(u32, 50), config.network.max_half_open);
     try std.testing.expectEqual(@as(u32, 4), config.performance.hasher_threads);
     try std.testing.expectEqual(@as(u32, 5), config.performance.pipeline_depth);
     try std.testing.expectEqual(@as(?[]const u8, null), config.network.bind_device);
