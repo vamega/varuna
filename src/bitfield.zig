@@ -53,14 +53,17 @@ pub const Bitfield = struct {
     }
 
     fn countSetBits(bits: []const u8, piece_count: u32) u32 {
+        const full_bytes: usize = @intCast(piece_count / 8);
         var total: u32 = 0;
-        var index: u32 = 0;
-        while (index < piece_count) : (index += 1) {
-            const byte_index: usize = @intCast(index / 8);
-            const bit_index: u3 = @intCast(7 - (index % 8));
-            if ((bits[byte_index] & (@as(u8, 1) << bit_index)) != 0) {
-                total += 1;
-            }
+        for (bits[0..full_bytes]) |byte| {
+            total += @popCount(byte);
+        }
+        const remaining_bits: u4 = @intCast(piece_count % 8);
+        if (remaining_bits > 0) {
+            // Mask out trailing bits beyond piece_count (keep only the top remaining_bits)
+            const shift: u3 = @intCast(8 - remaining_bits);
+            const mask: u8 = @as(u8, 0xFF) << shift;
+            total += @popCount(bits[full_bytes] & mask);
         }
         return total;
     }

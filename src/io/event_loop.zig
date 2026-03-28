@@ -172,12 +172,8 @@ pub const EventLoop = struct {
     torrents: [max_torrents]?TorrentContext = [_]?TorrentContext{null} ** max_torrents,
     torrent_count: u8 = 0,
 
-    // Legacy single-torrent pointers (used by existing code, point to torrents[0])
-    session: ?*const session_mod.Session = null,
-    piece_tracker: ?*PieceTracker = null,
-    shared_fds: []const posix.fd_t,
-    info_hash: [20]u8,
-    peer_id: [20]u8,
+    // Listening port for tracker announces
+    port: u16 = 6881,
 
     // Accept socket for seeding (-1 if not seeding)
     listen_fd: posix.fd_t = -1,
@@ -229,15 +225,10 @@ pub const EventLoop = struct {
             .ring = try linux.IoUring.init(256, 0),
             .allocator = allocator,
             .peers = peers,
-            .session = null,
-            .piece_tracker = null,
-            .shared_fds = &.{},
-            .info_hash = [_]u8{0} ** 20,
-            .peer_id = [_]u8{0} ** 20,
             .pending_writes = std.ArrayList(PendingWrite).empty,
             .pending_sends = std.ArrayList(PendingSend).empty,
             .pending_reads = std.ArrayList(PendingPieceRead).empty,
-            .queued_responses = std.ArrayList(QueuedBlockResponse).empty,
+            .queued_responses = try std.ArrayList(QueuedBlockResponse).initCapacity(allocator, 256),
             .hasher = hasher,
         };
     }
@@ -263,15 +254,10 @@ pub const EventLoop = struct {
             .ring = try linux.IoUring.init(256, 0),
             .allocator = allocator,
             .peers = peers,
-            .session = session,
-            .piece_tracker = piece_tracker,
-            .shared_fds = shared_fds,
-            .info_hash = session.metainfo.info_hash,
-            .peer_id = peer_id,
             .pending_writes = std.ArrayList(PendingWrite).empty,
             .pending_sends = std.ArrayList(PendingSend).empty,
             .pending_reads = std.ArrayList(PendingPieceRead).empty,
-            .queued_responses = std.ArrayList(QueuedBlockResponse).empty,
+            .queued_responses = try std.ArrayList(QueuedBlockResponse).initCapacity(allocator, 256),
             .hasher = hasher,
         };
 
@@ -458,7 +444,7 @@ pub const EventLoop = struct {
 
     pub fn run(self: *EventLoop) !void {
         const signal = @import("signal.zig");
-        while (self.running and !(if (self.piece_tracker) |pt| pt.isComplete() else false)) {
+        while (self.running and !(if (self.getTorrentContext(0)) |tc| if (tc.piece_tracker) |pt| pt.isComplete() else false else false)) {
             if (signal.isShutdownRequested()) {
                 self.running = false;
                 break;
@@ -969,7 +955,7 @@ pub const EventLoop = struct {
             .announce_url = url,
             .info_hash = tc.info_hash,
             .peer_id = tc.peer_id,
-            .port = 6881, // TODO: get from config
+            .port = self.port,
             .left = if (pt.isComplete()) 0 else pt.bytesRemaining(),
             .event = null,
             .key = tc.tracker_key,

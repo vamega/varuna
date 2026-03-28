@@ -435,7 +435,8 @@ pub const TorrentSession = struct {
                     } else if (drain > 50) {
                         break;
                     } else {
-                        std.Thread.sleep(10 * std.time.ns_per_ms);
+                        self.event_loop.?.submitTimeout(10 * std.time.ns_per_ms) catch {};
+                        self.event_loop.?.tick() catch break;
                     }
                 }
 
