@@ -157,7 +157,8 @@ run_multi_file_test() {
   pids="$!"
   wait_for_tcp "$tp" || { echo "SKIP (tracker)"; SKIP_COUNT=$((SKIP_COUNT+1)); RESULTS+=("SKIP $name"); cleanup_test "$pids"; rm -rf "$W"; return; }
 
-  "$ROOT_DIR/zig-out/bin/varuna-tools" seed "$W/test.torrent" "$W/seed/content" --port "$sp" >"$W/seed.log" 2>&1 &
+  # Multi-file torrents: pass parent dir so PieceStore finds <torrent_name>/<file_path>
+  "$ROOT_DIR/zig-out/bin/varuna-tools" seed "$W/test.torrent" "$W/seed" --port "$sp" >"$W/seed.log" 2>&1 &
   pids="$pids $!"
   wait_for_log "$W/seed.log" "seed announce accepted" || { echo "SKIP (seed)"; SKIP_COUNT=$((SKIP_COUNT+1)); RESULTS+=("SKIP $name"); cleanup_test "$pids"; rm -rf "$W"; return; }
 
