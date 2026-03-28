@@ -917,6 +917,10 @@ pub const EventLoop = struct {
 
                                 if (peer.blocks_received >= peer.blocks_expected) {
                                     self.completePieceDownload(slot);
+                                } else {
+                                    // Refill pipeline — request more blocks if slots available.
+                                    // Without this, pieces with more blocks than pipeline_depth stall.
+                                    self.tryFillPipeline(slot) catch {};
                                 }
                             }
                         }
