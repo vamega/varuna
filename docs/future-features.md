@@ -6,15 +6,9 @@ Features to implement eventually, tracked here for reference. Not prioritized fo
 
 Seed async pread is implemented via `IORING_OP_READ` with piece cache and batched block sends.
 
-## 1. systemd-notify support (without libsystemd dependency)
+## 1. ~~systemd-notify support~~ (DONE)
 
-Notify systemd when the daemon is ready, stopping, or reloading. Implement by writing to the `$NOTIFY_SOCKET` Unix domain socket directly -- no libsystemd dependency needed.
-
-Reference implementation: https://www.freedesktop.org/software/systemd/man/latest/sd_notify.html (C and Python examples at the bottom of the page show the raw socket protocol).
-
-Protocol: send `READY=1\n` to the `AF_UNIX`/`SOCK_DGRAM` socket at the path in `$NOTIFY_SOCKET`. Also supports `STATUS=...`, `STOPPING=1`, `WATCHDOG=1`.
-
-Ideally route through io_uring (`IORING_OP_SENDMSG` on the Unix socket) so it doesn't block the event loop.
+Implemented in `src/daemon/systemd.zig`. Sends `READY=1` after API server is listening and `STOPPING=1` on shutdown. Uses standard POSIX `AF_UNIX`/`SOCK_DGRAM` socket (one-time setup, not hot path). No libsystemd dependency. Supports both filesystem and abstract (`@`-prefixed) sockets.
 
 ## 2. SHA-NI and hardware-accelerated SHA instructions
 

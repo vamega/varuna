@@ -67,12 +67,13 @@ Update it whenever a milestone lands, the near-term backlog changes, or a new op
 - **Data corruption fixes**: inline SHA-1 uses actual piece size, PendingWrite/PendingSend lifetime fixes, hasher result carries torrent_id.
 - **Daemon swarm integration test**: `scripts/demo_daemon_swarm.sh` tests full daemon API flow with file verification.
 
+- **systemd-notify support**: `READY=1` after API server is listening, `STOPPING=1` on shutdown. Direct `AF_UNIX`/`SOCK_DGRAM` socket protocol, no libsystemd dependency. Supports abstract sockets.
+
 ## Next
 
 - Improve tracker lifecycle: handle stale peers, validate against private-tracker expectations.
 - Broader integration test coverage (larger files, multi-torrent daemon, resume across restart).
 - Test daemon seeding: verify a second downloader can download from the daemon after it seeds.
-- systemd-notify support (see docs/future-features.md).
 - UDP tracker support (BEP 15) — partially implemented in src/tracker/udp.zig.
 
 ## Known Issues

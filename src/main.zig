@@ -97,6 +97,8 @@ pub fn main() !void {
     try stdout.print("ready (Ctrl-C to stop)\n", .{});
     try stdout.flush();
 
+    varuna.daemon.systemd.notifyReady();
+
     // Submit initial accept
     api_server.submitAccept() catch {};
 
@@ -179,6 +181,7 @@ pub fn main() !void {
         }
     }
 
+    varuna.daemon.systemd.notifyStopping();
     try stdout.print("\nshutting down...\n", .{});
     try stdout.flush();
 }
