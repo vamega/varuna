@@ -134,8 +134,19 @@ pub const EventLoop = struct {
 
     const PendingSend = struct {
         buf: []u8,
-        sent: usize = 0, // bytes already sent (for partial send retry)
+        sent: usize = 0,
         slot: u16,
+    };
+
+    /// Tracks an async piece read for seed mode.
+    /// When the read CQE completes, we build the piece response and send it.
+    const PendingPieceRead = struct {
+        slot: u16,
+        piece_index: u32,
+        block_offset: u32,
+        block_length: u32,
+        read_buf: []u8, // buffer for the full piece (read target)
+        piece_size: u32,
     };
 
     ring: linux.IoUring,
@@ -169,6 +180,9 @@ pub const EventLoop = struct {
 
     // Pending sends: track allocated send buffers (for seed piece responses).
     pending_sends: std.ArrayList(PendingSend),
+
+    // Pending piece reads: async disk reads for seed piece serving.
+    pending_reads: std.ArrayList(PendingPieceRead),
 
     // Piece read cache for seed mode (avoid re-reading from disk per block)
     cached_piece_index: ?u32 = null,
@@ -213,6 +227,7 @@ pub const EventLoop = struct {
             .peer_id = peer_id,
             .pending_writes = std.ArrayList(PendingWrite).empty,
             .pending_sends = std.ArrayList(PendingSend).empty,
+            .pending_reads = std.ArrayList(PendingPieceRead).empty,
             .hasher = hasher,
         };
 
@@ -281,6 +296,10 @@ pub const EventLoop = struct {
             self.allocator.free(ps.buf);
         }
         self.pending_sends.deinit(self.allocator);
+        for (self.pending_reads.items) |pr| {
+            self.allocator.free(pr.read_buf);
+        }
+        self.pending_reads.deinit(self.allocator);
         for (self.peers) |*peer| {
             self.cleanupPeer(peer);
         }
@@ -421,7 +440,8 @@ pub const EventLoop = struct {
             .peer_send => self.handleSend(op.slot, cqe),
             .disk_write => self.handleDiskWrite(op.slot, cqe),
             .accept => self.handleAccept(cqe),
-            .disk_read, .http_connect, .http_send, .http_recv, .timeout, .cancel => {},
+            .disk_read => self.handleSeedDiskRead(cqe),
+            .http_connect, .http_send, .http_recv, .timeout, .cancel => {},
         }
     }
 
@@ -916,31 +936,87 @@ pub const EventLoop = struct {
         const piece_size = self.session.layout.pieceSize(piece_index) catch return;
         if (block_offset + block_length > piece_size) return;
 
-        // Read piece data from disk (cached to avoid re-reading for each block)
-        if (self.cached_piece_index == null or self.cached_piece_index.? != piece_index) {
-            const plan = storage.verify.planPieceVerification(self.allocator, self.session, piece_index) catch return;
-            defer storage.verify.freePiecePlan(self.allocator, plan);
+        // If piece is cached, serve immediately (no disk I/O needed)
+        if (self.cached_piece_index != null and self.cached_piece_index.? == piece_index) {
+            self.sendPieceBlock(slot, piece_index, block_offset, block_length, self.cached_piece_data.?);
+            return;
+        }
 
-            if (self.cached_piece_data) |old| {
-                if (old.len < piece_size) {
-                    self.allocator.free(old);
-                    self.cached_piece_data = self.allocator.alloc(u8, piece_size) catch return;
-                }
-            } else {
-                self.cached_piece_data = self.allocator.alloc(u8, piece_size) catch return;
-            }
+        // Submit async io_uring read for the piece
+        const plan = storage.verify.planPieceVerification(self.allocator, self.session, piece_index) catch return;
+        defer storage.verify.freePiecePlan(self.allocator, plan);
 
-            const read_buf = self.cached_piece_data.?;
+        // Allocate read buffer
+        const read_buf = self.allocator.alloc(u8, piece_size) catch return;
+
+        if (plan.spans.len == 1) {
+            // Single-span: one io_uring read
+            const span = plan.spans[0];
+            self.pending_reads.append(self.allocator, .{
+                .slot = slot,
+                .piece_index = piece_index,
+                .block_offset = block_offset,
+                .block_length = block_length,
+                .read_buf = read_buf,
+                .piece_size = piece_size,
+            }) catch {
+                self.allocator.free(read_buf);
+                return;
+            };
+            const ud = encodeUserData(.{ .slot = slot, .op_type = .disk_read, .context = @intCast(piece_index) });
+            _ = self.ring.read(ud, self.shared_fds[span.file_index], .{ .buffer = read_buf[0..piece_size] }, span.file_offset) catch {
+                self.allocator.free(read_buf);
+                return;
+            };
+        } else {
+            // Multi-span: blocking pread fallback (crosses file boundaries)
             for (plan.spans) |span| {
                 const block = read_buf[span.piece_offset .. span.piece_offset + span.length];
-                _ = posix.pread(self.shared_fds[span.file_index], block, span.file_offset) catch return;
+                _ = posix.pread(self.shared_fds[span.file_index], block, span.file_offset) catch {
+                    self.allocator.free(read_buf);
+                    return;
+                };
             }
+            // Update cache and serve
+            if (self.cached_piece_data) |old| self.allocator.free(old);
+            self.cached_piece_data = read_buf;
             self.cached_piece_index = piece_index;
             self.cached_piece_len = piece_size;
+            self.sendPieceBlock(slot, piece_index, block_offset, block_length, read_buf);
         }
-        const read_buf = self.cached_piece_data.?;
+    }
 
-        // Build complete piece message in one buffer: 4-byte len + id(7) + piece_index + block_offset + data
+    fn handleSeedDiskRead(self: *EventLoop, cqe: linux.io_uring_cqe) void {
+        const op = decodeUserData(cqe.user_data);
+        const piece_index: u32 = @intCast(op.context);
+
+        // Find the matching pending read
+        var i: usize = 0;
+        while (i < self.pending_reads.items.len) {
+            const pr = self.pending_reads.items[i];
+            if (pr.piece_index == piece_index and pr.slot == op.slot) {
+                _ = self.pending_reads.swapRemove(i);
+
+                if (cqe.res <= 0) {
+                    self.allocator.free(pr.read_buf);
+                    return;
+                }
+
+                // Update cache
+                if (self.cached_piece_data) |old| self.allocator.free(old);
+                self.cached_piece_data = pr.read_buf;
+                self.cached_piece_index = pr.piece_index;
+                self.cached_piece_len = pr.piece_size;
+
+                // Now send the block
+                self.sendPieceBlock(pr.slot, pr.piece_index, pr.block_offset, pr.block_length, pr.read_buf);
+                return;
+            }
+            i += 1;
+        }
+    }
+
+    fn sendPieceBlock(self: *EventLoop, slot: u16, piece_index: u32, block_offset: u32, block_length: u32, read_buf: []u8) void {
         const msg_len: u32 = 1 + 8 + block_length;
         const total_len: usize = 4 + @as(usize, msg_len);
         const send_buf = self.allocator.alloc(u8, total_len) catch return;
@@ -954,7 +1030,6 @@ pub const EventLoop = struct {
         const peer = &self.peers[slot];
         peer.bytes_uploaded_to += block_length;
 
-        // Track the send buffer for cleanup after CQE
         self.pending_sends.append(self.allocator, .{
             .buf = send_buf,
             .slot = slot,
@@ -963,7 +1038,7 @@ pub const EventLoop = struct {
             return;
         };
 
-        const ud = encodeUserData(.{ .slot = slot, .op_type = .peer_send, .context = 1 }); // context=1 means tracked send
+        const ud = encodeUserData(.{ .slot = slot, .op_type = .peer_send, .context = 1 });
         _ = self.ring.send(ud, peer.fd, send_buf, 0) catch {
             self.allocator.free(send_buf);
             return;
