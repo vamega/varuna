@@ -311,6 +311,25 @@ pub const EventLoop = struct {
         return error.TooManyTorrents;
     }
 
+    /// Set the complete_pieces bitfield for a torrent (enables seed mode).
+    pub fn setTorrentCompletePieces(self: *EventLoop, torrent_id: u8, cp: *const Bitfield) void {
+        if (torrent_id < max_torrents) {
+            if (self.torrents[torrent_id]) |*tc| {
+                tc.complete_pieces = cp;
+            }
+        }
+        // Also set global complete_pieces for backwards compatibility with standalone mode
+        self.complete_pieces = cp;
+    }
+
+    /// Ensure the event loop is accepting inbound connections.
+    /// Safe to call multiple times -- only sets up accepting once.
+    pub fn ensureAccepting(self: *EventLoop, listen_fd: posix.fd_t) !void {
+        if (self.listen_fd >= 0) return;
+        self.listen_fd = listen_fd;
+        try self.submitAccept();
+    }
+
     /// Count the number of active peers for a specific torrent.
     pub fn peerCountForTorrent(self: *const EventLoop, torrent_id: u8) u16 {
         var count: u16 = 0;
@@ -602,7 +621,8 @@ pub const EventLoop = struct {
             },
             .inbound_handshake_send => {
                 // Handshake sent -- send bitfield if we have pieces
-                if (self.complete_pieces) |cp| {
+                const tc_bp = self.getTorrentContext(peer.torrent_id);
+                if ((if (tc_bp) |t| t.complete_pieces else null) orelse self.complete_pieces) |cp| {
                     peer.state = .inbound_bitfield_send;
                     self.submitMessage(slot, 5, cp.bits) catch {
                         self.removePeer(slot);
@@ -690,19 +710,34 @@ pub const EventLoop = struct {
                     };
                     return;
                 }
-                // Validate info_hash
-                if (!std.mem.eql(u8, peer.handshake_buf[28..48], tc_recv.info_hash[0..])) {
+                // Match info_hash against all registered torrents
+                const inbound_hash = peer.handshake_buf[28..48];
+                var resp_tc: *const TorrentContext = tc_recv;
+                var resp_tid: u8 = peer.torrent_id;
+                var matched = false;
+                for (&self.torrents, 0..) |*tslot, ti| {
+                    if (tslot.*) |*tc_match| {
+                        if (tc_match.active and std.mem.eql(u8, &tc_match.info_hash, inbound_hash)) {
+                            resp_tc = tc_match;
+                            resp_tid = @intCast(ti);
+                            matched = true;
+                            break;
+                        }
+                    }
+                }
+                if (!matched) {
                     self.removePeer(slot);
                     return;
                 }
+                peer.torrent_id = resp_tid;
                 // Send our handshake back
                 peer.state = .inbound_handshake_send;
                 var buf: [68]u8 = undefined;
                 buf[0] = pw.protocol_length;
                 @memcpy(buf[1 .. 1 + pw.protocol_string.len], pw.protocol_string);
                 @memset(buf[20..28], 0);
-                @memcpy(buf[28..48], tc_recv.info_hash[0..]);
-                @memcpy(buf[48..68], tc_recv.peer_id[0..]);
+                @memcpy(buf[28..48], &resp_tc.info_hash);
+                @memcpy(buf[48..68], &resp_tc.peer_id);
                 @memcpy(peer.handshake_buf[0..68], &buf);
                 const ud = encodeUserData(.{ .slot = slot, .op_type = .peer_send, .context = 0 });
                 _ = self.ring.send(ud, peer.fd, peer.handshake_buf[0..68], 0) catch {
@@ -1007,7 +1042,8 @@ pub const EventLoop = struct {
         const sess = tc.session orelse return;
 
         // Validate
-        const cp = self.complete_pieces orelse return;
+        // Use per-torrent complete_pieces, falling back to global
+        const cp = tc.complete_pieces orelse self.complete_pieces orelse return;
         if (!cp.has(piece_index)) return;
         const piece_size = sess.layout.pieceSize(piece_index) catch return;
         if (block_offset + block_length > piece_size) return;

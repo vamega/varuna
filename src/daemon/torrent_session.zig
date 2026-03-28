@@ -62,7 +62,9 @@ pub const TorrentSession = struct {
     shared_event_loop: ?*EventLoop = null,
     torrent_id_in_shared: ?u8 = null,
     pending_peers: ?[]std.net.Address = null, // peers waiting for main thread to add
+    pending_seed_setup: bool = false, // signals main thread to set up seed mode
     thread: ?std.Thread = null,
+    announce_thread: ?std.Thread = null, // background thread for completed announce
 
     // Resume state persistence (runs on background thread)
     resume_writer: ?ResumeWriter = null,
@@ -109,6 +111,10 @@ pub const TorrentSession = struct {
 
     pub fn deinit(self: *TorrentSession) void {
         self.stopInternal();
+        if (self.announce_thread) |t| {
+            t.join();
+            self.announce_thread = null;
+        }
         if (self.pending_peers) |pp| self.allocator.free(pp);
         self.allocator.free(self.torrent_bytes);
         self.allocator.free(self.save_path);
@@ -163,6 +169,10 @@ pub const TorrentSession = struct {
         if (self.thread) |t| {
             t.join();
             self.thread = null;
+        }
+        if (self.announce_thread) |t| {
+            t.join();
+            self.announce_thread = null;
         }
         self.stopInternal();
         self.state = .stopped;
@@ -296,8 +306,17 @@ pub const TorrentSession = struct {
         self.piece_tracker = piece_tracker;
 
         if (recheck.bytes_complete == session.totalSize()) {
+            // Get shared file handles for serving pieces
+            const shared_fds = try self.store.?.fileHandles(self.allocator);
+            self.shared_fds = shared_fds;
+
             self.state = .seeding;
-            // TODO: announce as seeder, accept inbound peers
+            if (self.shared_event_loop != null) {
+                // Daemon mode: signal main thread to set up seed mode
+                self.pending_seed_setup = true;
+                // Announce as seeder on this background thread (blocking HTTP is fine here)
+                self.announceAsSeeder();
+            }
             return;
         }
 
@@ -454,6 +473,93 @@ pub const TorrentSession = struct {
             r.deinit();
             self.ring = null;
         }
+    }
+
+    /// Called by the main thread to set up seed mode for this session
+    /// in the shared event loop. Creates the torrent context if needed,
+    /// sets complete_pieces, and returns true on success.
+    pub fn integrateSeedIntoEventLoop(self: *TorrentSession) bool {
+        const sel = self.shared_event_loop orelse return false;
+        if (self.session == null or self.piece_tracker == null or self.shared_fds == null) return false;
+
+        // Ensure the torrent is registered in the shared event loop
+        if (self.torrent_id_in_shared == null) {
+            const tid = sel.addTorrent(
+                &self.session.?,
+                &self.piece_tracker.?,
+                self.shared_fds.?,
+                self.peer_id,
+            ) catch return false;
+            self.torrent_id_in_shared = tid;
+        }
+
+        // Set the complete_pieces bitfield so seed mode can serve pieces
+        sel.setTorrentCompletePieces(
+            self.torrent_id_in_shared.?,
+            &self.piece_tracker.?.complete,
+        );
+        self.pending_seed_setup = false;
+        return true;
+    }
+
+    /// Check if this session just completed downloading and needs seed setup.
+    /// Called from the main thread during periodic checks.
+    pub fn checkSeedTransition(self: *TorrentSession) bool {
+        if (self.state != .downloading) return false;
+        const pt = &(self.piece_tracker orelse return false);
+        if (!pt.isComplete()) return false;
+
+        // Transition to seeding
+        self.state = .seeding;
+        self.persistNewCompletions();
+        self.flushResume();
+
+        // Signal seed setup needed
+        self.pending_seed_setup = true;
+
+        // Announce completion on a background thread (blocking HTTP)
+        if (self.announce_thread == null) {
+            self.announce_thread = std.Thread.spawn(.{}, announceCompletedWorker, .{self}) catch null;
+        }
+
+        return true;
+    }
+
+    /// Announce to the tracker as a completed seeder (called from background thread).
+    fn announceAsSeeder(self: *TorrentSession) void {
+        const session = &(self.session orelse return);
+        const announce_url = session.metainfo.announce orelse return;
+
+        if (tracker.announce.fetchAuto(self.allocator, &self.ring.?, .{
+            .announce_url = announce_url,
+            .info_hash = session.metainfo.info_hash,
+            .peer_id = self.peer_id,
+            .port = self.port,
+            .left = 0,
+            .event = .completed,
+        })) |resp| {
+            tracker.announce.freeResponse(self.allocator, resp);
+        } else |_| {}
+    }
+
+    fn announceCompletedWorker(self: *TorrentSession) void {
+        // Need a Ring for the HTTP announce
+        var ring = Ring.init(16) catch return;
+        defer ring.deinit();
+
+        const session = &(self.session orelse return);
+        const announce_url = session.metainfo.announce orelse return;
+
+        if (tracker.announce.fetchAuto(self.allocator, &ring, .{
+            .announce_url = announce_url,
+            .info_hash = session.metainfo.info_hash,
+            .peer_id = self.peer_id,
+            .port = self.port,
+            .left = 0,
+            .event = .completed,
+        })) |resp| {
+            tracker.announce.freeResponse(self.allocator, resp);
+        } else |_| {}
     }
 
     // ── Resume persistence helpers ────────────────────────
