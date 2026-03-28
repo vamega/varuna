@@ -222,12 +222,24 @@ pub const TorrentSession = struct {
             self.state = .seeding;
         }
 
+        // Read speed stats from the event loop
+        const speed_stats = if (self.shared_event_loop) |sel|
+            if (self.torrent_id_in_shared) |tid| sel.getSpeedStats(tid) else @import("../io/event_loop.zig").SpeedStats{}
+        else if (self.event_loop) |*el|
+            el.getSpeedStats(0)
+        else
+            @import("../io/event_loop.zig").SpeedStats{};
+
         return .{
             .state = self.state,
             .progress = progress,
+            .download_speed = speed_stats.dl_speed,
+            .upload_speed = speed_stats.ul_speed,
             .pieces_have = pieces_have,
             .pieces_total = self.piece_count,
             .total_size = self.total_size,
+            .bytes_downloaded = speed_stats.dl_total,
+            .bytes_uploaded = speed_stats.ul_total,
             .name = self.name,
             .info_hash_hex = self.info_hash_hex,
             .save_path = self.save_path,

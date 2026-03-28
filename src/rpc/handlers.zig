@@ -30,8 +30,22 @@ pub const ApiHandler = struct {
     }
 
     fn handleTransferInfo(self: *const ApiHandler, allocator: std.mem.Allocator) server.Response {
-        const count = self.session_manager.count();
-        const body = std.fmt.allocPrint(allocator, "{{\"dl_info_speed\":0,\"up_info_speed\":0,\"dl_info_data\":0,\"up_info_data\":0,\"active_torrents\":{}}}", .{count}) catch
+        const stats = self.session_manager.getAllStats(allocator) catch
+            return .{ .status = 500, .body = "{\"error\":\"internal\"}" };
+        defer allocator.free(stats);
+
+        var total_dl_speed: u64 = 0;
+        var total_ul_speed: u64 = 0;
+        var total_dl_data: u64 = 0;
+        var total_ul_data: u64 = 0;
+        for (stats) |stat| {
+            total_dl_speed += stat.download_speed;
+            total_ul_speed += stat.upload_speed;
+            total_dl_data += stat.bytes_downloaded;
+            total_ul_data += stat.bytes_uploaded;
+        }
+
+        const body = std.fmt.allocPrint(allocator, "{{\"dl_info_speed\":{},\"up_info_speed\":{},\"dl_info_data\":{},\"up_info_data\":{},\"active_torrents\":{}}}", .{ total_dl_speed, total_ul_speed, total_dl_data, total_ul_data, stats.len }) catch
             return .{ .status = 500, .body = "{\"error\":\"internal\"}" };
         return .{ .body = body, .owned_body = body };
     }

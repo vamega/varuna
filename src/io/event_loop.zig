@@ -114,6 +114,13 @@ pub const Peer = struct {
 
 pub const max_torrents: u8 = 64;
 
+pub const SpeedStats = struct {
+    dl_speed: u64 = 0,
+    ul_speed: u64 = 0,
+    dl_total: u64 = 0,
+    ul_total: u64 = 0,
+};
+
 pub const TorrentContext = struct {
     session: ?*const session_mod.Session = null,
     piece_tracker: ?*PieceTracker = null,
@@ -123,6 +130,13 @@ pub const TorrentContext = struct {
     tracker_key: ?[8]u8 = null,
     complete_pieces: ?*const Bitfield = null,
     active: bool = true,
+
+    // Speed tracking (updated every ~2 seconds in tick)
+    last_speed_check: i64 = 0,
+    last_dl_bytes: u64 = 0,
+    last_ul_bytes: u64 = 0,
+    current_dl_speed: u64 = 0,
+    current_ul_speed: u64 = 0,
 };
 
 // ── Event loop ────────────────────────────────────────────
@@ -343,6 +357,70 @@ pub const EventLoop = struct {
         return count;
     }
 
+    /// Get speed and total byte stats for a specific torrent.
+    pub fn getSpeedStats(self: *const EventLoop, torrent_id: u8) SpeedStats {
+        if (torrent_id >= max_torrents) return .{};
+        const tc = self.torrents[torrent_id] orelse return .{};
+
+        // Sum current totals from all peers for this torrent
+        var dl_total: u64 = 0;
+        var ul_total: u64 = 0;
+        for (self.peers) |*peer| {
+            if (peer.state != .free and peer.torrent_id == torrent_id) {
+                dl_total += peer.bytes_downloaded_from;
+                ul_total += peer.bytes_uploaded_to;
+            }
+        }
+
+        return .{
+            .dl_speed = tc.current_dl_speed,
+            .ul_speed = tc.current_ul_speed,
+            .dl_total = dl_total,
+            .ul_total = ul_total,
+        };
+    }
+
+    /// Update speed counters for all active torrents (called from tick).
+    fn updateSpeedCounters(self: *EventLoop) void {
+        const now = std.time.timestamp();
+
+        for (&self.torrents, 0..) |*slot, idx| {
+            const tc = &(slot.* orelse continue);
+            const tid: u8 = @intCast(idx);
+
+            // Sum bytes across peers for this torrent
+            var dl_total: u64 = 0;
+            var ul_total: u64 = 0;
+            for (self.peers) |*peer| {
+                if (peer.state != .free and peer.torrent_id == tid) {
+                    dl_total += peer.bytes_downloaded_from;
+                    ul_total += peer.bytes_uploaded_to;
+                }
+            }
+
+            if (tc.last_speed_check == 0) {
+                // First check: initialize baselines, no speed yet
+                tc.last_speed_check = now;
+                tc.last_dl_bytes = dl_total;
+                tc.last_ul_bytes = ul_total;
+                continue;
+            }
+
+            const elapsed = now - tc.last_speed_check;
+            if (elapsed < 2) continue;
+
+            const elapsed_u: u64 = @intCast(elapsed);
+            const dl_delta = dl_total -| tc.last_dl_bytes;
+            const ul_delta = ul_total -| tc.last_ul_bytes;
+
+            tc.current_dl_speed = dl_delta / elapsed_u;
+            tc.current_ul_speed = ul_delta / elapsed_u;
+            tc.last_speed_check = now;
+            tc.last_dl_bytes = dl_total;
+            tc.last_ul_bytes = ul_total;
+        }
+    }
+
     /// Remove a torrent context and disconnect all its peers.
     pub fn removeTorrent(self: *EventLoop, torrent_id: u8) void {
         // Disconnect all peers for this torrent
@@ -476,6 +554,7 @@ pub const EventLoop = struct {
         self.checkReannounce();
         self.recalculateUnchokes();
         self.tryAssignPieces();
+        self.updateSpeedCounters();
 
         // Flush any queued SQEs before waiting
         _ = self.ring.submit() catch {};
