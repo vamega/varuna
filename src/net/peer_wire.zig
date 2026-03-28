@@ -39,18 +39,23 @@ pub const InboundMessage = union(enum) {
     port: u16,
 };
 
-pub fn writeHandshake(
-    ring: *Ring,
-    fd: posix.fd_t,
-    info_hash: [20]u8,
-    peer_id: [20]u8,
-) !void {
+pub fn serializeHandshake(info_hash: [20]u8, peer_id: [20]u8) [68]u8 {
     var buffer: [68]u8 = undefined;
     buffer[0] = protocol_length;
     @memcpy(buffer[1 .. 1 + protocol_string.len], protocol_string);
     @memset(buffer[20..28], 0);
     @memcpy(buffer[28..48], info_hash[0..]);
     @memcpy(buffer[48..68], peer_id[0..]);
+    return buffer;
+}
+
+pub fn writeHandshake(
+    ring: *Ring,
+    fd: posix.fd_t,
+    info_hash: [20]u8,
+    peer_id: [20]u8,
+) !void {
+    var buffer = serializeHandshake(info_hash, peer_id);
     try ring.send_all(fd, &buffer);
 }
 
@@ -128,9 +133,48 @@ pub fn freeMessage(allocator: std.mem.Allocator, message: InboundMessage) void {
     }
 }
 
+pub const keepalive_bytes = [_]u8{ 0, 0, 0, 0 };
+
+pub fn serializeHeader(id: u8, payload: []const u8) [5]u8 {
+    const payload_with_id = std.math.cast(u32, payload.len + 1) orelse unreachable;
+    var header: [5]u8 = undefined;
+    std.mem.writeInt(u32, header[0..4], payload_with_id, .big);
+    header[4] = id;
+    return header;
+}
+
+pub fn serializeHave(piece_index: u32) [9]u8 {
+    var buf: [9]u8 = undefined;
+    const header = serializeHeader(4, buf[5..9]);
+    @memcpy(buf[0..5], &header);
+    std.mem.writeInt(u32, buf[5..9], piece_index, .big);
+    return buf;
+}
+
+pub fn serializeRequest(request: Request) [17]u8 {
+    var buf: [17]u8 = undefined;
+    const header = serializeHeader(6, buf[5..17]);
+    @memcpy(buf[0..5], &header);
+    std.mem.writeInt(u32, buf[5..9], request.piece_index, .big);
+    std.mem.writeInt(u32, buf[9..13], request.block_offset, .big);
+    std.mem.writeInt(u32, buf[13..17], request.length, .big);
+    return buf;
+}
+
+pub fn serializePieceHeader(piece_index: u32, block_offset: u32, block_len: usize) ![13]u8 {
+    const payload_length = 1 + 8 + block_len;
+    const frame_length = std.math.cast(u32, payload_length) orelse return error.MessageTooLarge;
+
+    var header: [13]u8 = undefined;
+    std.mem.writeInt(u32, header[0..4], frame_length, .big);
+    header[4] = 7;
+    std.mem.writeInt(u32, header[5..9], piece_index, .big);
+    std.mem.writeInt(u32, header[9..13], block_offset, .big);
+    return header;
+}
+
 pub fn writeKeepAlive(ring: *Ring, fd: posix.fd_t) !void {
-    const header = [_]u8{ 0, 0, 0, 0 };
-    try ring.send_all(fd, &header);
+    try ring.send_all(fd, &keepalive_bytes);
 }
 
 pub fn writeInterested(ring: *Ring, fd: posix.fd_t) !void {
@@ -150,17 +194,13 @@ pub fn writeBitfield(ring: *Ring, fd: posix.fd_t, bitfield: []const u8) !void {
 }
 
 pub fn writeHave(ring: *Ring, fd: posix.fd_t, piece_index: u32) !void {
-    var payload: [4]u8 = undefined;
-    std.mem.writeInt(u32, &payload, piece_index, .big);
-    try writeMessageWithPayload(ring, fd, 4, &payload);
+    var buf = serializeHave(piece_index);
+    try ring.send_all(fd, &buf);
 }
 
 pub fn writeRequest(ring: *Ring, fd: posix.fd_t, request: Request) !void {
-    var payload: [12]u8 = undefined;
-    std.mem.writeInt(u32, payload[0..4], request.piece_index, .big);
-    std.mem.writeInt(u32, payload[4..8], request.block_offset, .big);
-    std.mem.writeInt(u32, payload[8..12], request.length, .big);
-    try writeMessageWithPayload(ring, fd, 6, &payload);
+    var buf = serializeRequest(request);
+    try ring.send_all(fd, &buf);
 }
 
 pub fn writePiece(
@@ -170,15 +210,7 @@ pub fn writePiece(
     block_offset: u32,
     block: []const u8,
 ) !void {
-    const payload_length = 1 + 8 + block.len;
-    const frame_length = std.math.cast(u32, payload_length) orelse return error.MessageTooLarge;
-
-    var header: [13]u8 = undefined;
-    std.mem.writeInt(u32, header[0..4], frame_length, .big);
-    header[4] = 7;
-    std.mem.writeInt(u32, header[5..9], piece_index, .big);
-    std.mem.writeInt(u32, header[9..13], block_offset, .big);
-
+    var header = try serializePieceHeader(piece_index, block_offset, block.len);
     try ring.send_all(fd, &header);
     try ring.send_all(fd, block);
 }
@@ -274,11 +306,165 @@ fn writeMessageWithPayload(
     id: u8,
     payload: []const u8,
 ) !void {
-    const payload_with_id = std.math.cast(u32, payload.len + 1) orelse return error.MessageTooLarge;
-    var header: [5]u8 = undefined;
-    std.mem.writeInt(u32, header[0..4], payload_with_id, .big);
-    header[4] = id;
-
+    var header = serializeHeader(id, payload);
     try ring.send_all(fd, &header);
     try ring.send_all(fd, payload);
+}
+
+// ── Tests ────────────────────────────────────────────────────
+
+test "handshake serialization roundtrip" {
+    const info_hash = [_]u8{0xAA} ** 20;
+    const peer_id = [_]u8{0xBB} ** 20;
+    const buf = serializeHandshake(info_hash, peer_id);
+
+    // byte 0: protocol string length
+    try std.testing.expectEqual(@as(u8, 19), buf[0]);
+    // bytes 1..20: protocol string
+    try std.testing.expectEqualStrings("BitTorrent protocol", buf[1..20]);
+    // bytes 20..28: reserved (all zeros)
+    try std.testing.expectEqualSlices(u8, &([_]u8{0} ** 8), buf[20..28]);
+    // bytes 28..48: info_hash
+    try std.testing.expectEqualSlices(u8, &info_hash, buf[28..48]);
+    // bytes 48..68: peer_id
+    try std.testing.expectEqualSlices(u8, &peer_id, buf[48..68]);
+    // total length
+    try std.testing.expectEqual(@as(usize, 68), buf.len);
+}
+
+test "handshake preserves distinct info_hash and peer_id" {
+    var info_hash: [20]u8 = undefined;
+    var peer_id: [20]u8 = undefined;
+    for (0..20) |i| {
+        info_hash[i] = @intCast(i);
+        peer_id[i] = @intCast(i + 100);
+    }
+    const buf = serializeHandshake(info_hash, peer_id);
+    try std.testing.expectEqualSlices(u8, &info_hash, buf[28..48]);
+    try std.testing.expectEqualSlices(u8, &peer_id, buf[48..68]);
+}
+
+test "keepalive is four zero bytes" {
+    try std.testing.expectEqualSlices(u8, &[_]u8{ 0, 0, 0, 0 }, &keepalive_bytes);
+}
+
+test "serializeHeader choke id=0" {
+    const header = serializeHeader(0, &.{});
+    // length = 1 (id only, no payload), big-endian
+    try std.testing.expectEqualSlices(u8, &[_]u8{ 0, 0, 0, 1, 0 }, &header);
+}
+
+test "serializeHeader unchoke id=1" {
+    const header = serializeHeader(1, &.{});
+    try std.testing.expectEqualSlices(u8, &[_]u8{ 0, 0, 0, 1, 1 }, &header);
+}
+
+test "serializeHeader interested id=2" {
+    const header = serializeHeader(2, &.{});
+    try std.testing.expectEqualSlices(u8, &[_]u8{ 0, 0, 0, 1, 2 }, &header);
+}
+
+test "serializeHeader not_interested id=3" {
+    const header = serializeHeader(3, &.{});
+    try std.testing.expectEqualSlices(u8, &[_]u8{ 0, 0, 0, 1, 3 }, &header);
+}
+
+test "serializeHeader bitfield id=5 with payload" {
+    const bits = [_]u8{ 0xFF, 0x80 };
+    const header = serializeHeader(5, &bits);
+    // length = 1 (id) + 2 (payload) = 3
+    try std.testing.expectEqualSlices(u8, &[_]u8{ 0, 0, 0, 3, 5 }, &header);
+}
+
+test "serializeHave encodes piece_index big-endian" {
+    const buf = serializeHave(42);
+    // length=5 (1 id + 4 index), id=4, index=42
+    try std.testing.expectEqualSlices(u8, &[_]u8{ 0, 0, 0, 5, 4, 0, 0, 0, 42 }, &buf);
+}
+
+test "serializeHave with large piece_index" {
+    const buf = serializeHave(0x01020304);
+    try std.testing.expectEqualSlices(u8, &[_]u8{ 0, 0, 0, 5, 4, 0x01, 0x02, 0x03, 0x04 }, &buf);
+}
+
+test "serializeHave piece_index zero" {
+    const buf = serializeHave(0);
+    try std.testing.expectEqualSlices(u8, &[_]u8{ 0, 0, 0, 5, 4, 0, 0, 0, 0 }, &buf);
+}
+
+test "serializeRequest encodes three u32 fields" {
+    const buf = serializeRequest(.{
+        .piece_index = 1,
+        .block_offset = 16384,
+        .length = 16384,
+    });
+    // length = 1 + 12 = 13
+    var expected: [17]u8 = undefined;
+    std.mem.writeInt(u32, expected[0..4], 13, .big);
+    expected[4] = 6;
+    std.mem.writeInt(u32, expected[5..9], 1, .big);
+    std.mem.writeInt(u32, expected[9..13], 16384, .big);
+    std.mem.writeInt(u32, expected[13..17], 16384, .big);
+    try std.testing.expectEqualSlices(u8, &expected, &buf);
+}
+
+test "serializeRequest with zero values" {
+    const buf = serializeRequest(.{
+        .piece_index = 0,
+        .block_offset = 0,
+        .length = 0,
+    });
+    try std.testing.expectEqualSlices(u8, &[_]u8{
+        0, 0, 0, 13, 6,
+        0, 0, 0, 0,  0,
+        0, 0, 0, 0,  0,
+        0, 0,
+    }, &buf);
+}
+
+test "serializePieceHeader encodes frame correctly" {
+    const header = try serializePieceHeader(7, 0, 1024);
+    // frame_length = 1 (id) + 8 (index+offset) + 1024 (block) = 1033
+    var expected: [13]u8 = undefined;
+    std.mem.writeInt(u32, expected[0..4], 1033, .big);
+    expected[4] = 7;
+    std.mem.writeInt(u32, expected[5..9], 7, .big);
+    std.mem.writeInt(u32, expected[9..13], 0, .big);
+    try std.testing.expectEqualSlices(u8, &expected, &header);
+}
+
+test "serializePieceHeader with standard block size" {
+    // standard 16 KiB block
+    const header = try serializePieceHeader(0, 0, 16384);
+    const frame_len = std.mem.readInt(u32, header[0..4], .big);
+    // 1 + 8 + 16384 = 16393
+    try std.testing.expectEqual(@as(u32, 16393), frame_len);
+    try std.testing.expectEqual(@as(u8, 7), header[4]);
+}
+
+test "serializePieceHeader with zero-length block" {
+    const header = try serializePieceHeader(0, 0, 0);
+    const frame_len = std.mem.readInt(u32, header[0..4], .big);
+    // 1 + 8 + 0 = 9
+    try std.testing.expectEqual(@as(u32, 9), frame_len);
+}
+
+test "expectEmptyPayload accepts zero length" {
+    const msg = try expectEmptyPayload(0, .choke);
+    try std.testing.expectEqual(InboundMessage.choke, msg);
+}
+
+test "expectEmptyPayload rejects nonzero length" {
+    try std.testing.expectError(error.InvalidMessageLength, expectEmptyPayload(1, .choke));
+    try std.testing.expectError(error.InvalidMessageLength, expectEmptyPayload(100, .unchoke));
+}
+
+test "protocol constants are correct" {
+    try std.testing.expectEqual(@as(u8, 19), protocol_length);
+    try std.testing.expectEqual(@as(usize, 19), protocol_string.len);
+    try std.testing.expectEqualStrings("BitTorrent protocol", protocol_string);
+}
+
+test "max_message_length is 1 MiB" {
+    try std.testing.expectEqual(@as(u32, 1048576), max_message_length);
 }
