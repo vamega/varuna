@@ -41,8 +41,10 @@ pub const ApiHandler = struct {
             return self.handleTorrentsInfo(allocator);
         }
 
-        if (std.mem.eql(u8, action, "add") and std.mem.eql(u8, method, "POST")) {
-            return self.handleTorrentsAdd(allocator, body);
+        if (std.mem.startsWith(u8, action, "add") and std.mem.eql(u8, method, "POST")) {
+            // Extract query string from action (e.g. "add?savepath=/foo")
+            const query = if (std.mem.indexOf(u8, action, "?")) |q| action[q + 1 ..] else "";
+            return self.handleTorrentsAdd(allocator, body, query);
         }
 
         if (std.mem.eql(u8, action, "delete") and std.mem.eql(u8, method, "POST")) {
@@ -79,14 +81,14 @@ pub const ApiHandler = struct {
         return .{ .body = body, .owned_body = body };
     }
 
-    fn handleTorrentsAdd(self: *const ApiHandler, allocator: std.mem.Allocator, body: []const u8) server.Response {
+    fn handleTorrentsAdd(self: *const ApiHandler, allocator: std.mem.Allocator, body: []const u8, query: []const u8) server.Response {
         // For now, expect raw torrent bytes in body
         // TODO: multipart form parsing for proper qBittorrent compatibility
         if (body.len == 0) {
             return .{ .status = 400, .body = "{\"error\":\"no torrent data\"}" };
         }
 
-        const save_path = self.session_manager.default_save_path;
+        const save_path = extractParam(query, "savepath") orelse self.session_manager.default_save_path;
         _ = self.session_manager.addTorrent(body, save_path) catch |err| {
             const msg = std.fmt.allocPrint(allocator, "{{\"error\":\"{s}\"}}", .{@errorName(err)}) catch
                 return .{ .status = 500, .body = "{\"error\":\"internal\"}" };

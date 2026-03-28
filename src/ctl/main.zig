@@ -35,11 +35,28 @@ pub fn main() !void {
         }
     } else if (std.mem.eql(u8, command, "add")) {
         if (args.len < 3) {
-            try stdout.print("usage: varuna-ctl add <torrent-file>\n", .{});
+            try stdout.print("usage: varuna-ctl add <torrent-file> [--save-path <dir>]\n", .{});
         } else {
             const torrent_bytes = try std.fs.cwd().readFileAlloc(allocator, args[2], 16 * 1024 * 1024);
             defer allocator.free(torrent_bytes);
-            try doPost(allocator, stdout, api_host, api_port, "/api/v2/torrents/add", torrent_bytes);
+
+            // Parse --save-path
+            var save_path: ?[]const u8 = null;
+            var i: usize = 3;
+            while (i < args.len) : (i += 1) {
+                if (std.mem.eql(u8, args[i], "--save-path") and i + 1 < args.len) {
+                    save_path = args[i + 1];
+                    i += 1;
+                }
+            }
+
+            var path = std.ArrayList(u8).empty;
+            defer path.deinit(allocator);
+            try path.appendSlice(allocator, "/api/v2/torrents/add");
+            if (save_path) |sp| {
+                try path.print(allocator, "?savepath={s}", .{sp});
+            }
+            try doPost(allocator, stdout, api_host, api_port, path.items, torrent_bytes);
         }
     } else if (std.mem.eql(u8, command, "pause")) {
         if (args.len < 3) {
