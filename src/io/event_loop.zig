@@ -664,7 +664,8 @@ pub const EventLoop = struct {
                 // Parse message length
                 const msg_len = std.mem.readInt(u32, &peer.header_buf, .big);
                 if (msg_len == 0) {
-                    // Keep-alive
+                    // Keep-alive -- peer is alive
+                    peer.last_activity = std.time.timestamp();
                     peer.header_offset = 0;
                     self.submitHeaderRecv(slot) catch {
                         self.removePeer(slot);
@@ -745,6 +746,9 @@ pub const EventLoop = struct {
         const body = peer.body_buf orelse return;
         if (body.len == 0) return;
 
+        // Any message from the peer means it's alive
+        peer.last_activity = std.time.timestamp();
+
         const id = body[0];
         const payload = body[1..];
 
@@ -757,7 +761,6 @@ pub const EventLoop = struct {
             },
             1 => {
                 peer.peer_choking = false; // unchoke
-                peer.last_activity = std.time.timestamp();
             },
             2 => { // interested
                 peer.peer_interested = true;
@@ -807,7 +810,6 @@ pub const EventLoop = struct {
                             if (end <= pbuf.len) {
                                 @memcpy(pbuf[start..end], block_data);
                                 peer.blocks_received += 1;
-                                peer.last_activity = std.time.timestamp();
                                 peer.bytes_downloaded_from += block_data.len;
                                 if (peer.inflight_requests > 0) peer.inflight_requests -= 1;
 
