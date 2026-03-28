@@ -227,6 +227,11 @@ pub const EventLoop = struct {
     last_unchoke_recalc: i64 = 0,
     hasher: ?*Hasher = null,
 
+    // Compact list of peer slots that are idle (active, unchoked, have
+    // availability, and need a piece assignment).  Avoids scanning all
+    // max_peers slots every tick in tryAssignPieces.
+    idle_peers: std.ArrayList(u16),
+
     /// Create a bare event loop with no initial torrent (for daemon mode).
     pub fn initBare(allocator: std.mem.Allocator, hasher_threads: u32) !EventLoop {
         const peers = try allocator.alloc(Peer, max_peers);
@@ -245,6 +250,7 @@ pub const EventLoop = struct {
             .pending_sends = std.ArrayList(PendingSend).empty,
             .pending_reads = std.ArrayList(PendingPieceRead).empty,
             .queued_responses = try std.ArrayList(QueuedBlockResponse).initCapacity(allocator, 256),
+            .idle_peers = std.ArrayList(u16).empty,
             .hasher = hasher,
         };
     }
@@ -274,6 +280,7 @@ pub const EventLoop = struct {
             .pending_sends = std.ArrayList(PendingSend).empty,
             .pending_reads = std.ArrayList(PendingPieceRead).empty,
             .queued_responses = try std.ArrayList(QueuedBlockResponse).initCapacity(allocator, 256),
+            .idle_peers = std.ArrayList(u16).empty,
             .hasher = hasher,
         };
 
@@ -454,6 +461,7 @@ pub const EventLoop = struct {
         }
         self.pending_reads.deinit(self.allocator);
         self.queued_responses.deinit(self.allocator);
+        self.idle_peers.deinit(self.allocator);
         for (self.peers) |*peer| {
             self.cleanupPeer(peer);
         }
@@ -517,6 +525,7 @@ pub const EventLoop = struct {
                 if (tc.piece_tracker) |pt| pt.releasePiece(piece_index);
             }
         }
+        self.unmarkIdle(slot);
         self.cleanupPeer(peer);
         peer.* = Peer{};
         if (self.peer_count > 0) self.peer_count -= 1;
@@ -943,9 +952,11 @@ pub const EventLoop = struct {
                 // Clear pipeline state
                 peer.inflight_requests = 0;
                 peer.pipeline_sent = peer.blocks_received;
+                self.unmarkIdle(slot);
             },
             1 => {
                 peer.peer_choking = false; // unchoke
+                self.markIdle(slot);
             },
             2 => { // interested
                 peer.peer_interested = true;
@@ -969,6 +980,7 @@ pub const EventLoop = struct {
                     if (self.getTorrentContext(peer.torrent_id)) |tc| {
                         if (tc.piece_tracker) |pt| pt.addAvailability(piece_index);
                     }
+                    self.markIdle(slot);
                 }
             },
             5 => { // bitfield
@@ -982,6 +994,7 @@ pub const EventLoop = struct {
                 }
                 peer.availability_known = true;
                 if (tc_bf.piece_tracker) |pt| pt.addBitfieldAvailability(payload);
+                self.markIdle(slot);
             },
             6 => { // request
                 if (peer.mode == .seed and !peer.am_choking and payload.len >= 12) {
@@ -1361,24 +1374,76 @@ pub const EventLoop = struct {
         peer.send_pending = true;
     }
 
+    // ── Idle-peer tracking (for efficient tryAssignPieces) ─
+
+    /// Returns true when a slot is eligible for piece assignment.
+    fn isIdleCandidate(peer: *const Peer) bool {
+        return (peer.state == .active_recv_header or peer.state == .active_recv_body) and
+            peer.current_piece == null and
+            !peer.peer_choking and
+            peer.availability_known;
+    }
+
+    /// Add a slot to the idle_peers list if it is eligible and not already present.
+    fn markIdle(self: *EventLoop, slot: u16) void {
+        const peer = &self.peers[slot];
+        if (!isIdleCandidate(peer)) return;
+        // Avoid duplicates by scanning the (small) list.
+        for (self.idle_peers.items) |s| {
+            if (s == slot) return;
+        }
+        self.idle_peers.append(self.allocator, slot) catch {};
+    }
+
+    /// Remove a slot from the idle_peers list (swap-remove for O(1)).
+    fn unmarkIdle(self: *EventLoop, slot: u16) void {
+        for (self.idle_peers.items, 0..) |s, idx| {
+            if (s == slot) {
+                _ = self.idle_peers.swapRemove(idx);
+                return;
+            }
+        }
+    }
+
     // ── Piece download coordination ───────────────────────
 
     fn tryAssignPieces(self: *EventLoop) void {
-        for (self.peers, 0..) |*peer, i| {
-            if (peer.state != .active_recv_header and peer.state != .active_recv_body) continue;
-            if (peer.current_piece != null) continue;
-            if (peer.peer_choking) continue;
-            if (!peer.availability_known) continue;
+        var i: usize = 0;
+        while (i < self.idle_peers.items.len) {
+            const slot = self.idle_peers.items[i];
+            const peer = &self.peers[slot];
 
-            const tc = self.getTorrentContext(peer.torrent_id) orelse continue;
-            const pt = tc.piece_tracker orelse continue;
+            // Re-check eligibility (state may have changed since enqueue).
+            if (!isIdleCandidate(peer)) {
+                _ = self.idle_peers.swapRemove(i);
+                continue;
+            }
+
+            const tc = self.getTorrentContext(peer.torrent_id) orelse {
+                _ = self.idle_peers.swapRemove(i);
+                continue;
+            };
+            const pt = tc.piece_tracker orelse {
+                _ = self.idle_peers.swapRemove(i);
+                continue;
+            };
 
             const peer_bf: ?*const Bitfield = if (peer.availability) |*bf| bf else null;
-            const piece_index = pt.claimPiece(peer_bf) orelse continue;
-
-            self.startPieceDownload(@intCast(i), piece_index) catch {
-                pt.releasePiece(piece_index);
+            const piece_index = pt.claimPiece(peer_bf) orelse {
+                // No piece available for this peer right now; keep it in the
+                // list so we retry next tick.
+                i += 1;
+                continue;
             };
+
+            self.startPieceDownload(slot, piece_index) catch {
+                pt.releasePiece(piece_index);
+                i += 1;
+                continue;
+            };
+
+            // Successfully assigned -- remove from idle list.
+            _ = self.idle_peers.swapRemove(i);
         }
     }
 
@@ -1466,6 +1531,7 @@ pub const EventLoop = struct {
         const expected_hash = sess.layout.pieceHash(piece_index) catch {
             pt.releasePiece(piece_index);
             peer.current_piece = null;
+            self.markIdle(slot);
             return;
         };
         var hash: [20]u8 = undefined;
@@ -1476,12 +1542,14 @@ pub const EventLoop = struct {
             h.submitVerify(slot, piece_index, piece_buf, hash, peer.torrent_id) catch {
                 pt.releasePiece(piece_index);
                 peer.current_piece = null;
+                self.markIdle(slot);
                 return;
             };
             // Don't free piece_buf -- the hasher owns it now.
             // The peer can start downloading another piece immediately.
             peer.piece_buf = null;
             peer.current_piece = null;
+            self.markIdle(slot);
         } else {
             // Fallback: inline verification (blocks event loop)
             var actual: [20]u8 = undefined;
@@ -1489,6 +1557,7 @@ pub const EventLoop = struct {
             // Simplified inline path -- use hasher in production
             pt.releasePiece(piece_index);
             peer.current_piece = null;
+            self.markIdle(slot);
         }
     }
 
