@@ -214,6 +214,7 @@ pub const EventLoop = struct {
 
     // Timeout storage (must outlive the SQE)
     timeout_ts: linux.kernel_timespec = .{ .sec = 2, .nsec = 0 },
+    timeout_pending: bool = false,
 
     // Pending disk writes: track buffers that io_uring is writing to disk.
     pending_writes: std.AutoHashMapUnmanaged(PendingWriteKey, PendingWrite),
@@ -656,12 +657,14 @@ pub const EventLoop = struct {
     /// Submit a timeout SQE so that submit_and_wait returns even if
     /// no I/O completes. This allows the caller to do periodic work.
     pub fn submitTimeout(self: *EventLoop, timeout_ns: u64) !void {
+        if (self.timeout_pending) return; // previous timeout SQE still in flight
         self.timeout_ts = .{
             .sec = @intCast(timeout_ns / std.time.ns_per_s),
             .nsec = @intCast(timeout_ns % std.time.ns_per_s),
         };
         const ud = encodeUserData(.{ .slot = 0, .op_type = .timeout, .context = 0 });
         _ = try self.ring.timeout(ud, &self.timeout_ts, 0, 0);
+        self.timeout_pending = true;
     }
 
     pub fn stop(self: *EventLoop) void {
@@ -790,7 +793,10 @@ pub const EventLoop = struct {
             .disk_write => self.handleDiskWrite(op.slot, cqe),
             .accept => self.handleAccept(cqe),
             .disk_read => self.handleSeedDiskRead(cqe),
-            .http_connect, .http_send, .http_recv, .timeout, .cancel => {},
+            .timeout => {
+                self.timeout_pending = false;
+            },
+            .http_connect, .http_send, .http_recv, .cancel => {},
         }
     }
 
@@ -1115,6 +1121,20 @@ pub const EventLoop = struct {
         // Find the pending write for this piece and decrement spans_remaining
         const key = PendingWriteKey{ .piece_index = piece_index, .torrent_id = write_torrent_id };
         if (self.pending_writes.getPtr(key)) |pending_w| {
+            // Check for write errors (disk full, I/O error, etc.)
+            if (cqe.res < 0) {
+                log.err("disk write failed for piece {d} torrent {d}: errno={d}", .{
+                    piece_index, write_torrent_id, -cqe.res,
+                });
+                // Release the piece back so it can be re-downloaded
+                if (self.getTorrentContext(pending_w.torrent_id)) |tc| {
+                    if (tc.piece_tracker) |pt| pt.releasePiece(piece_index);
+                }
+                self.allocator.free(pending_w.buf);
+                _ = self.pending_writes.remove(key);
+                return;
+            }
+
             pending_w.spans_remaining -= 1;
             if (pending_w.spans_remaining == 0) {
                 // All spans written -- mark piece complete and free buffer
@@ -1891,6 +1911,23 @@ pub const EventLoop = struct {
                     self.allocator.free(result.piece_buf);
                     continue;
                 };
+
+                // Endgame duplicate: another peer already verified this piece
+                // and a write is in flight. Skip the duplicate -- just free
+                // the buffer and mark the piece complete (the first write
+                // will handle persistence).
+                const pending_key = PendingWriteKey{
+                    .piece_index = result.piece_index,
+                    .torrent_id = torrent_id,
+                };
+                if (self.pending_writes.contains(pending_key)) {
+                    log.debug("skipping duplicate write for piece {d} torrent {d} (endgame)", .{
+                        result.piece_index, torrent_id,
+                    });
+                    self.allocator.free(result.piece_buf);
+                    continue;
+                }
+
                 // Write verified piece to disk via io_uring
                 const plan = storage.verify.planPieceVerification(self.allocator, sess, result.piece_index) catch {
                     self.allocator.free(result.piece_buf);
