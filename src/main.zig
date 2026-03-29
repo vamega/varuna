@@ -174,6 +174,7 @@ pub fn main() !void {
         }
 
         // Periodically persist completed pieces to resume DB (~every 5s at 100ms tick)
+        // and trigger tracker scrapes for swarm health stats.
         resume_tick_counter +%= 1;
         if (resume_tick_counter % 50 == 0) {
             session_manager.mutex.lock();
@@ -183,6 +184,7 @@ pub fn main() !void {
                 if (sess.state == .downloading or sess.state == .seeding) {
                     sess.persistNewCompletions();
                     sess.flushResume();
+                    sess.maybeScrape();
                 }
             }
             session_manager.mutex.unlock();

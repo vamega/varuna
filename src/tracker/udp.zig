@@ -116,7 +116,7 @@ const ParsedUdpUrl = struct {
     port: u16,
 };
 
-fn parseUdpUrl(url: []const u8) ?ParsedUdpUrl {
+pub fn parseUdpUrl(url: []const u8) ?ParsedUdpUrl {
     const after_scheme = if (std.mem.startsWith(u8, url, "udp://"))
         url[6..]
     else
@@ -133,7 +133,7 @@ fn parseUdpUrl(url: []const u8) ?ParsedUdpUrl {
     return .{ .host = host_port, .port = 80 };
 }
 
-fn resolveAddress(allocator: std.mem.Allocator, host: []const u8, port: u16) !std.net.Address {
+pub fn resolveAddress(allocator: std.mem.Allocator, host: []const u8, port: u16) !std.net.Address {
     if (std.net.Address.parseIp4(host, port)) |addr| return addr else |_| {}
     if (std.net.Address.parseIp6(host, port)) |addr| return addr else |_| {}
 

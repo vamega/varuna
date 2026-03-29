@@ -47,6 +47,10 @@ pub const Stats = struct {
     ratio: f64 = 0.0,
     /// Whether sequential download mode is enabled.
     sequential_download: bool = false,
+    /// Tracker scrape result: seeders, leechers, snatches.
+    scrape_complete: u32 = 0,
+    scrape_incomplete: u32 = 0,
+    scrape_downloaded: u32 = 0,
 };
 
 pub const TorrentSession = struct {
@@ -104,6 +108,11 @@ pub const TorrentSession = struct {
     file_priorities: ?[]u8 = null,
 
     error_message: ?[]const u8 = null,
+
+    // Scrape state
+    scrape_result: ?tracker.scrape.ScrapeResult = null,
+    last_scrape_time: i64 = 0,
+    scraping: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
 
     pub fn create(
         allocator: std.mem.Allocator,
@@ -380,6 +389,9 @@ pub const TorrentSession = struct {
             .eta = eta,
             .ratio = ratio,
             .sequential_download = self.sequential_download,
+            .scrape_complete = if (self.scrape_result) |sr| sr.complete else 0,
+            .scrape_incomplete = if (self.scrape_result) |sr| sr.incomplete else 0,
+            .scrape_downloaded = if (self.scrape_result) |sr| sr.downloaded else 0,
         };
     }
 
@@ -773,6 +785,47 @@ pub const TorrentSession = struct {
             .key = self.tracker_key,
         })) |resp| {
             tracker.announce.freeResponse(self.allocator, resp);
+        } else |_| {}
+    }
+
+    /// Trigger a background scrape if enough time has passed (30 minutes).
+    /// Safe to call from any thread. The scrape runs on a detached background
+    /// thread and updates scrape_result atomically.
+    pub fn maybeScrape(self: *TorrentSession) void {
+        if (self.state != .downloading and self.state != .seeding) return;
+        const now = std.time.timestamp();
+        const scrape_interval: i64 = 30 * 60; // 30 minutes
+        if (now - self.last_scrape_time < scrape_interval) return;
+
+        // Avoid overlapping scrapes
+        if (self.scraping.swap(true, .acq_rel)) return;
+
+        self.last_scrape_time = now;
+        const thread = std.Thread.spawn(.{}, scrapeWorker, .{self}) catch {
+            self.scraping.store(false, .release);
+            return;
+        };
+        thread.detach();
+    }
+
+    fn scrapeWorker(self: *TorrentSession) void {
+        defer self.scraping.store(false, .release);
+
+        // Lazily create the shared announce ring (reused across announces and scrapes)
+        if (self.announce_ring == null) {
+            self.announce_ring = Ring.init(16) catch return;
+        }
+
+        const session = &(self.session orelse return);
+        const announce_url = session.metainfo.announce orelse return;
+
+        if (tracker.scrape.scrapeAuto(
+            self.allocator,
+            &self.announce_ring.?,
+            announce_url,
+            session.metainfo.info_hash,
+        )) |result| {
+            self.scrape_result = result;
         } else |_| {}
     }
 

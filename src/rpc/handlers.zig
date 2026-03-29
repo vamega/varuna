@@ -399,17 +399,26 @@ pub const ApiHandler = struct {
         var tier: u32 = 0;
         var first = true;
 
+        // Scrape stats (shared across all trackers for now)
+        const stats = session.getStats();
+        const scrape_complete = stats.scrape_complete;
+        const scrape_incomplete = stats.scrape_incomplete;
+        const scrape_downloaded = stats.scrape_downloaded;
+
         // Primary announce URL
         if (meta.announce) |url| {
             if (!first) json.append(allocator, ',') catch {};
             first = false;
             // Status: 1 = contacted, 2 = working, 0 = disabled
             const status: u8 = if (session.state == .downloading or session.state == .seeding) 2 else 1;
-            json.print(allocator, "{{\"url\":\"{s}\",\"status\":{},\"tier\":{},\"num_peers\":{}}}", .{
+            json.print(allocator, "{{\"url\":\"{s}\",\"status\":{},\"tier\":{},\"num_peers\":{},\"num_seeds\":{},\"num_leeches\":{},\"num_downloaded\":{}}}", .{
                 url,
                 status,
                 tier,
-                session.getStats().peers_connected,
+                stats.peers_connected,
+                scrape_complete,
+                scrape_incomplete,
+                scrape_downloaded,
             }) catch {};
             tier += 1;
         }
@@ -422,7 +431,7 @@ pub const ApiHandler = struct {
             }
             if (!first) json.append(allocator, ',') catch {};
             first = false;
-            json.print(allocator, "{{\"url\":\"{s}\",\"status\":1,\"tier\":{},\"num_peers\":0}}", .{
+            json.print(allocator, "{{\"url\":\"{s}\",\"status\":1,\"tier\":{},\"num_peers\":0,\"num_seeds\":0,\"num_leeches\":0,\"num_downloaded\":0}}", .{
                 url,
                 tier,
             }) catch {};
@@ -567,7 +576,7 @@ pub const ApiHandler = struct {
 fn serializeTorrentInfo(allocator: std.mem.Allocator, json: *std.ArrayList(u8), stat: TorrentSession.Stats) !void {
     try json.print(
         allocator,
-        "{{\"name\":\"{s}\",\"hash\":\"{s}\",\"state\":\"{s}\",\"size\":{},\"progress\":{d:.4},\"dlspeed\":{},\"upspeed\":{},\"num_seeds\":0,\"num_leechs\":{},\"added_on\":{},\"save_path\":\"{s}\",\"pieces_have\":{},\"pieces_num\":{},\"dl_limit\":{},\"up_limit\":{},\"eta\":{},\"ratio\":{d:.4},\"seq_dl\":{}}}",
+        "{{\"name\":\"{s}\",\"hash\":\"{s}\",\"state\":\"{s}\",\"size\":{},\"progress\":{d:.4},\"dlspeed\":{},\"upspeed\":{},\"num_seeds\":{},\"num_leechs\":{},\"added_on\":{},\"save_path\":\"{s}\",\"pieces_have\":{},\"pieces_num\":{},\"dl_limit\":{},\"up_limit\":{},\"eta\":{},\"ratio\":{d:.4},\"seq_dl\":{}}}",
         .{
             stat.name,
             stat.info_hash_hex,
@@ -576,6 +585,7 @@ fn serializeTorrentInfo(allocator: std.mem.Allocator, json: *std.ArrayList(u8), 
             stat.progress,
             stat.download_speed,
             stat.upload_speed,
+            stat.scrape_complete,
             stat.peers_connected,
             stat.added_on,
             stat.save_path,

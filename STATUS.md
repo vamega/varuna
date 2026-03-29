@@ -45,6 +45,7 @@ Update it whenever a milestone lands, the near-term backlog changes, or a new op
 - **Sequential download mode**: per-torrent toggle switches PieceTracker from rarest-first to lowest-index selection, enabling streaming playback while downloading.
 - **uTP protocol layer (BEP 29)**: packet header codec, UtpSocket state machine, LEDBAT congestion control, UtpManager connection multiplexer with accept queue. 30+ tests.
 - **BEP 10 (Extension Protocol)**: extension handshake negotiation in reserved bytes, extension message parsing. Advertises ut_metadata and ut_pex. Peer extension ID mapping stored per-peer.
+- **Tracker scrape support (HTTP + UDP)**: scrapeHttp/scrapeUdp/scrapeAuto in `src/tracker/scrape.zig`. HTTP scrape derives URL by replacing "announce" with "scrape", parses bencoded files dict. UDP scrape uses BEP 15 action=2. Background scrape every 30 minutes populates seeders/leechers/snatches in Stats. Wired into torrents/trackers and torrents/info API endpoints.
 - **Testing**: 19 peer wire protocol tests, bencode fuzz/edge tests, HTTP parser edge tests, comprehensive transfer test matrix (23 test cases: 1KB-50MB, 16KB/64KB/256KB pieces, multi-file torrents).
 
 ## Next
@@ -54,7 +55,7 @@ Update it whenever a milestone lands, the near-term backlog changes, or a new op
 - **SOCKS/HTTP proxy support**: for tracker and peer connections (privacy, region-locked trackers).
 - ~~**BEP 10 (Extension Protocol)**: extension handshake in reserved bytes — prerequisite for MSE, ut_metadata, PEX.~~ (Done)
 - **MSE encryption (BEP 6)**: message stream encryption, required by many private trackers.
-- **Scrape support**: query peer counts without announcing.
+- ~~**Scrape support**: query peer counts without announcing.~~ (Done)
 - ~~**Selective file download**: skip files in multi-file torrents, file priority levels.~~ (Done)
 
 ### Common Features
