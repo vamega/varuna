@@ -24,17 +24,24 @@ Steps:
 
 Note: Zig std lib SHA-256 already has SHA-NI acceleration. Only SHA-1 needs custom work.
 
-## 3. uTP support (BEP 29)
+## 3. ~~uTP support (BEP 29)~~ (Protocol layer DONE, event loop integration TODO)
 
-uTP (Micro Transport Protocol) is a UDP-based transport used by uTorrent and many other clients. It provides TCP-like reliability with better congestion control for BitTorrent traffic (LEDBAT algorithm). Many peers only support uTP.
+Core protocol implemented in `src/net/utp.zig`, `src/net/ledbat.zig`, `src/net/utp_manager.zig`:
+- Packet header encoding/decoding (20-byte BEP 29 header, all 5 packet types)
+- Selective ACK extension
+- UtpSocket connection state machine (IDLE -> SYN_SENT/SYN_RECV -> CONNECTED -> FIN_SENT/CLOSED/RESET)
+- Three-way handshake (SYN, SYN-ACK, data)
+- LEDBAT congestion control (delay-based, 100ms target, slow start + congestion avoidance)
+- RTT estimation with Karn's algorithm
+- Receive reorder buffer for out-of-order packets
+- UtpManager multiplexer: routes packets by connection_id, accept queue for inbound connections
 
-Key aspects:
-- UDP-based, so uses `IORING_OP_SENDMSG` / `IORING_OP_RECVMSG`
-- Implements its own congestion control (LEDBAT -- Less than Best Effort)
-- Connection management, retransmission, ordering
-- Can coexist with TCP peers on the same session
-
-Reference: libtorrent (arvidn) has a mature uTP implementation in `src/utp_stream.cpp`.
+**Remaining work for full integration:**
+- Register UDP socket with io_uring event loop (`IORING_OP_RECVMSG` / `IORING_OP_SENDMSG`)
+- Add `utp_recv` / `utp_send` OpType variants to event_loop.zig
+- Wire UtpManager into PeerState so uTP and TCP peers coexist in the same session
+- Outbound retransmission buffer with actual payload tracking
+- Timer integration for RTO-based retransmission
 
 ## 4. ~~SO_BINDTODEVICE support~~ (DONE)
 

@@ -43,6 +43,7 @@ Update it whenever a milestone lands, the near-term backlog changes, or a new op
 - **Connection limits & announce staggering**: global connection limit (default 500), per-torrent limit (default 100), half-open connection limit (default 50), announce jitter (±10%), initial announce delay to prevent thundering herd.
 - **Selective file download**: per-file priorities (normal/high/do_not_download), piece-mask based filtering, boundary-piece handling for cross-file pieces, lazy file creation for previously-skipped files.
 - **Sequential download mode**: per-torrent toggle switches PieceTracker from rarest-first to lowest-index selection, enabling streaming playback while downloading.
+- **uTP protocol layer (BEP 29)**: packet header codec, UtpSocket state machine, LEDBAT congestion control, UtpManager connection multiplexer with accept queue. 30+ tests.
 - **Testing**: 19 peer wire protocol tests, bencode fuzz/edge tests, HTTP parser edge tests, comprehensive transfer test matrix (23 test cases: 1KB-50MB, 16KB/64KB/256KB pieces, multi-file torrents).
 
 ## Next
@@ -56,7 +57,7 @@ Update it whenever a milestone lands, the near-term backlog changes, or a new op
 - ~~**Selective file download**: skip files in multi-file torrents, file priority levels.~~ (Done)
 
 ### Common Features
-- **uTP (BEP 29)**: UDP-based transport with LEDBAT congestion control.
+- **uTP (BEP 29) event loop integration**: protocol layer done, needs io_uring UDP socket and event loop wiring.
 - **API auth**: /api/v2/auth/login for daemon security.
 - **Sync API**: /api/v2/sync/maindata for Flood WebUI live updates.
 - **Categories/labels**: organize torrents.
