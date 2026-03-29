@@ -245,6 +245,15 @@ pub const EventLoop = struct {
     last_announce_time: i64 = 0,
     announce_jitter_secs: i32 = 0, // random jitter applied to this torrent's interval
     min_peers_for_reannounce: u16 = 1, // re-announce when below this
+    // Background announce thread state: announce runs on a background thread
+    // with its own io_uring ring to avoid blocking the main event loop.
+    // The ring is created once and reused across announces.
+    announce_ring: ?@import("ring.zig").Ring = null,
+    announcing: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
+    // Peers discovered by the background announce thread, picked up by the
+    // main thread on the next tick. Protected by atomic flag.
+    announce_result_peers: ?[]std.net.Address = null,
+    announce_results_ready: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
 
     // Global rate limiter (applies across all torrents, 0 = unlimited)
     global_rate_limiter: RateLimiter = RateLimiter.initComptime(0, 0),
@@ -497,6 +506,9 @@ pub const EventLoop = struct {
             self.cleanupPeer(peer);
         }
         self.allocator.free(self.peers);
+        // Clean up shared announce ring (created once, reused across announces)
+        if (self.announce_ring) |*r| r.deinit();
+        if (self.announce_result_peers) |peers| self.allocator.free(peers);
         self.ring.deinit();
     }
 
@@ -1260,6 +1272,19 @@ pub const EventLoop = struct {
     // ── Re-announce ─────────────────────────────────────────
 
     fn checkReannounce(self: *EventLoop) void {
+        // Pick up results from a previous background announce
+        if (self.announce_results_ready.load(.acquire)) {
+            if (self.announce_result_peers) |peers| {
+                for (peers) |addr| {
+                    if (self.peer_count >= self.max_connections) break;
+                    _ = self.addPeer(addr) catch continue;
+                }
+                self.allocator.free(peers);
+                self.announce_result_peers = null;
+            }
+            self.announce_results_ready.store(false, .release);
+        }
+
         const url = self.announce_url orelse return;
         if (self.peer_count >= self.min_peers_for_reannounce) return;
 
@@ -1273,30 +1298,82 @@ pub const EventLoop = struct {
         // Generate new jitter for next cycle: ±10% of interval
         self.announce_jitter_secs = self.generateAnnounceJitter();
 
-        // Re-announce using a temporary blocking Ring (not on event loop ring)
-        const RingType = @import("ring.zig").Ring;
-        var tmp_ring = RingType.init(16) catch return;
-        defer tmp_ring.deinit();
+        // Already announcing -- skip
+        if (self.announcing.load(.acquire)) return;
+
+        // Lazily create the shared announce ring (reused across announces)
+        if (self.announce_ring == null) {
+            const RingType = @import("ring.zig").Ring;
+            self.announce_ring = RingType.init(16) catch return;
+        }
 
         const tc = self.getTorrentContext(0) orelse return;
         const pt = tc.piece_tracker orelse return;
+
+        // Spawn background thread for blocking DNS + HTTP announce.
+        // The background thread uses announce_ring (not the event loop ring)
+        // so it doesn't block peer I/O.
+        self.announcing.store(true, .release);
+
+        const thread = std.Thread.spawn(.{}, announceWorkerThread, .{
+            self,
+            url,
+            tc.info_hash,
+            tc.peer_id,
+            tc.tracker_key,
+            if (pt.isComplete()) 0 else pt.bytesRemaining(),
+        }) catch {
+            self.announcing.store(false, .release);
+            return;
+        };
+        thread.detach();
+    }
+
+    /// Background thread for tracker re-announce. Uses the shared announce_ring
+    /// (separate from the main event loop ring) for blocking HTTP I/O.
+    /// Results are stored in announce_result_peers and picked up on the next tick.
+    fn announceWorkerThread(
+        self: *EventLoop,
+        url: []const u8,
+        info_hash: [20]u8,
+        peer_id: [20]u8,
+        tracker_key: ?[8]u8,
+        left: u64,
+    ) void {
+        defer self.announcing.store(false, .release);
+
+        const ring = &(self.announce_ring orelse return);
         const tracker_mod = @import("../tracker/root.zig");
-        const response = tracker_mod.announce.fetchAuto(self.allocator, &tmp_ring, .{
+        const response = tracker_mod.announce.fetchAuto(self.allocator, ring, .{
             .announce_url = url,
-            .info_hash = tc.info_hash,
-            .peer_id = tc.peer_id,
+            .info_hash = info_hash,
+            .peer_id = peer_id,
             .port = self.port,
-            .left = if (pt.isComplete()) 0 else pt.bytesRemaining(),
+            .left = left,
             .event = null,
-            .key = tc.tracker_key,
+            .key = tracker_key,
         }) catch return;
         defer tracker_mod.announce.freeResponse(self.allocator, response);
 
-        // Add new peers (respect connection limits)
+        if (response.peers.len == 0) return;
+
+        // Collect peer addresses for the main thread to add
+        var addrs = self.allocator.alloc(std.net.Address, response.peers.len) catch return;
+        var count: usize = 0;
         for (response.peers) |peer| {
-            if (self.peer_count >= self.max_connections) break;
-            _ = self.addPeer(peer.address) catch continue;
+            addrs[count] = peer.address;
+            count += 1;
         }
+        if (count < addrs.len) {
+            addrs = self.allocator.realloc(addrs, count) catch {
+                self.allocator.free(addrs);
+                return;
+            };
+        }
+
+        // Store results for the main thread (atomic handoff)
+        self.announce_result_peers = addrs;
+        self.announce_results_ready.store(true, .release);
     }
 
     /// Generate random jitter for announce interval: ±10% of the interval.

@@ -75,7 +75,10 @@ pub const TorrentSession = struct {
     pending_peers: ?[]std.net.Address = null, // peers waiting for main thread to add
     pending_seed_setup: bool = false, // signals main thread to set up seed mode
     thread: ?std.Thread = null,
-    announce_thread: ?std.Thread = null, // background thread for completed announce
+    // Shared ring for background announce HTTP I/O (created once, reused).
+    // Separate from the main event loop ring to avoid blocking peer I/O.
+    announce_ring: ?Ring = null,
+    announcing: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
 
     // Resume state persistence (runs on background thread)
     resume_writer: ?ResumeWriter = null,
@@ -134,9 +137,14 @@ pub const TorrentSession = struct {
 
     pub fn deinit(self: *TorrentSession) void {
         self.stopInternal();
-        if (self.announce_thread) |t| {
-            t.join();
-            self.announce_thread = null;
+        // Wait for any in-flight background announce to finish before
+        // tearing down the announce ring it may be using.
+        while (self.announcing.load(.acquire)) {
+            std.Thread.sleep(1 * std.time.ns_per_ms);
+        }
+        if (self.announce_ring) |*r| {
+            r.deinit();
+            self.announce_ring = null;
         }
         if (self.pending_peers) |pp| self.allocator.free(pp);
         self.allocator.free(self.torrent_bytes);
@@ -194,9 +202,9 @@ pub const TorrentSession = struct {
             t.join();
             self.thread = null;
         }
-        if (self.announce_thread) |t| {
-            t.join();
-            self.announce_thread = null;
+        // Wait for any in-flight background announce to finish
+        while (self.announcing.load(.acquire)) {
+            std.Thread.sleep(1 * std.time.ns_per_ms);
         }
         self.stopInternal();
         self.state = .stopped;
@@ -626,9 +634,14 @@ pub const TorrentSession = struct {
         // Signal seed setup needed
         self.pending_seed_setup = true;
 
-        // Announce completion on a background thread (blocking HTTP)
-        if (self.announce_thread == null) {
-            self.announce_thread = std.Thread.spawn(.{}, announceCompletedWorker, .{self}) catch null;
+        // Announce completion on a background thread (blocking HTTP).
+        // Uses the shared announce_ring to avoid creating a new ring per announce.
+        if (!self.announcing.swap(true, .acq_rel)) {
+            const thread = std.Thread.spawn(.{}, announceCompletedWorker, .{self}) catch {
+                self.announcing.store(false, .release);
+                return true;
+            };
+            thread.detach();
         }
 
         return true;
@@ -653,14 +666,17 @@ pub const TorrentSession = struct {
     }
 
     pub fn announceCompletedWorker(self: *TorrentSession) void {
-        // Need a Ring for the HTTP announce
-        var ring = Ring.init(16) catch return;
-        defer ring.deinit();
+        defer self.announcing.store(false, .release);
+
+        // Lazily create the shared announce ring (reused across announces)
+        if (self.announce_ring == null) {
+            self.announce_ring = Ring.init(16) catch return;
+        }
 
         const session = &(self.session orelse return);
         const announce_url = session.metainfo.announce orelse return;
 
-        if (tracker.announce.fetchAuto(self.allocator, &ring, .{
+        if (tracker.announce.fetchAuto(self.allocator, &self.announce_ring.?, .{
             .announce_url = announce_url,
             .info_hash = session.metainfo.info_hash,
             .peer_id = self.peer_id,

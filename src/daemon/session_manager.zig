@@ -169,9 +169,14 @@ pub const SessionManager = struct {
         defer self.mutex.unlock();
 
         const session = self.sessions.get(hash) orelse return error.TorrentNotFound;
-        // Spawn a background thread to do the announce (blocking HTTP is fine there)
-        if (session.announce_thread != null) return; // already announcing
-        session.announce_thread = std.Thread.spawn(.{}, TorrentSession.announceCompletedWorker, .{session}) catch return;
+        // Spawn a background thread to do the announce (blocking HTTP is fine there).
+        // Uses the session's shared announce_ring to avoid creating a new ring per announce.
+        if (session.announcing.swap(true, .acq_rel)) return; // already announcing
+        const thread = std.Thread.spawn(.{}, TorrentSession.announceCompletedWorker, .{session}) catch {
+            session.announcing.store(false, .release);
+            return;
+        };
+        thread.detach();
     }
 
     /// Force piece recheck for a torrent: stop, recheck, resume.
