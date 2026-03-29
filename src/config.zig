@@ -10,6 +10,8 @@ pub const Config = struct {
     pub const Daemon = struct {
         api_port: u16 = 8080,
         api_bind: []const u8 = "127.0.0.1",
+        api_username: []const u8 = "admin",
+        api_password: []const u8 = "adminadmin",
     };
 
     pub const Storage = struct {

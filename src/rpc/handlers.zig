@@ -1,5 +1,6 @@
 const std = @import("std");
 const server = @import("server.zig");
+const auth = @import("auth.zig");
 const SessionManager = @import("../daemon/session_manager.zig").SessionManager;
 const TorrentSession = @import("../daemon/torrent_session.zig");
 const metainfo_mod = @import("../torrent/metainfo.zig");
@@ -8,8 +9,26 @@ const metainfo_mod = @import("../torrent/metainfo.zig");
 /// Holds a reference to the SessionManager for state access.
 pub const ApiHandler = struct {
     session_manager: *SessionManager,
+    session_store: auth.SessionStore = .{},
+    api_username: []const u8 = "admin",
+    api_password: []const u8 = "adminadmin",
 
-    pub fn handle(self: *const ApiHandler, allocator: std.mem.Allocator, request: server.Request) server.Response {
+    pub fn handle(self: *ApiHandler, allocator: std.mem.Allocator, request: server.Request) server.Response {
+        // Auth endpoints are always accessible
+        if (std.mem.eql(u8, request.path, "/api/v2/auth/login") and std.mem.eql(u8, request.method, "POST")) {
+            return self.handleLogin(allocator, request.body);
+        }
+        if (std.mem.eql(u8, request.path, "/api/v2/auth/logout")) {
+            return self.handleLogout(request.cookie_sid);
+        }
+
+        // All other endpoints require a valid session
+        const sid = request.cookie_sid orelse
+            return .{ .status = 403, .body = "Forbidden" };
+        if (!self.session_store.validateSession(sid)) {
+            return .{ .status = 403, .body = "Forbidden" };
+        }
+
         if (std.mem.eql(u8, request.path, "/api/v2/app/webapiVersion")) {
             return .{ .body = "\"2.9.3\"" };
         }
@@ -36,6 +55,34 @@ pub const ApiHandler = struct {
         }
 
         return .{ .status = 404, .body = "{\"error\":\"not found\"}" };
+    }
+
+    fn handleLogin(self: *ApiHandler, allocator: std.mem.Allocator, body: []const u8) server.Response {
+        const username = extractParam(body, "username") orelse
+            return .{ .status = 400, .body = "missing username" };
+        const password = extractParam(body, "password") orelse
+            return .{ .status = 400, .body = "missing password" };
+
+        if (!std.mem.eql(u8, username, self.api_username) or !std.mem.eql(u8, password, self.api_password)) {
+            return .{ .body = "Fails.", .content_type = "text/plain" };
+        }
+
+        const sid = self.session_store.createSession();
+        const cookie_header = std.fmt.allocPrint(allocator, "Set-Cookie: SID={s}; HttpOnly; path=/\r\n", .{sid}) catch
+            return .{ .status = 500, .body = "{\"error\":\"internal\"}" };
+        return .{
+            .body = "Ok.",
+            .content_type = "text/plain",
+            .extra_headers = cookie_header,
+            .owned_extra_headers = cookie_header,
+        };
+    }
+
+    fn handleLogout(self: *ApiHandler, cookie_sid: ?[]const u8) server.Response {
+        if (cookie_sid) |sid| {
+            self.session_store.removeSession(sid);
+        }
+        return .{ .body = "Ok.", .content_type = "text/plain" };
     }
 
     fn handleTransferInfo(self: *const ApiHandler, allocator: std.mem.Allocator) server.Response {

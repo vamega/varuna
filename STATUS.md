@@ -46,6 +46,7 @@ Update it whenever a milestone lands, the near-term backlog changes, or a new op
 - **uTP protocol layer (BEP 29)**: packet header codec, UtpSocket state machine, LEDBAT congestion control, UtpManager connection multiplexer with accept queue. 30+ tests.
 - **BEP 10 (Extension Protocol)**: extension handshake negotiation in reserved bytes, extension message parsing. Advertises ut_metadata and ut_pex. Peer extension ID mapping stored per-peer.
 - **Tracker scrape support (HTTP + UDP)**: scrapeHttp/scrapeUdp/scrapeAuto in `src/tracker/scrape.zig`. HTTP scrape derives URL by replacing "announce" with "scrape", parses bencoded files dict. UDP scrape uses BEP 15 action=2. Background scrape every 30 minutes populates seeders/leechers/snatches in Stats. Wired into torrents/trackers and torrents/info API endpoints.
+- **API auth (qBittorrent-compatible)**: session-based authentication matching qBittorrent's `/api/v2/auth/login` and `/api/v2/auth/logout` flow. Random 32-char hex SID cookies, 1-hour inactivity timeout, max 10 concurrent sessions. All endpoints except login require valid SID. `varuna-ctl` auto-logins before each command. Configurable `api_username`/`api_password` in `[daemon]` config section.
 - **Testing**: 19 peer wire protocol tests, bencode fuzz/edge tests, HTTP parser edge tests, comprehensive transfer test matrix (23 test cases: 1KB-50MB, 16KB/64KB/256KB pieces, multi-file torrents).
 
 ## Next
@@ -60,7 +61,7 @@ Update it whenever a milestone lands, the near-term backlog changes, or a new op
 
 ### Common Features
 - **uTP (BEP 29) event loop integration**: protocol layer done, needs io_uring UDP socket and event loop wiring.
-- **API auth**: /api/v2/auth/login for daemon security.
+- ~~**API auth**: /api/v2/auth/login for daemon security.~~ (Done)
 - **Sync API**: /api/v2/sync/maindata for Flood WebUI live updates.
 - **Categories/labels**: organize torrents.
 - **Watch folders**: auto-add torrents from directory.

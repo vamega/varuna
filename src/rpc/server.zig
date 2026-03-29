@@ -3,6 +3,7 @@ const posix = std.posix;
 const linux = std.os.linux;
 const Ring = @import("../io/ring.zig").Ring;
 const socket_util = @import("../net/socket.zig");
+const auth = @import("auth.zig");
 
 const max_api_clients = 64;
 const recv_buf_size = 8192;
@@ -222,15 +223,22 @@ pub const ApiServer = struct {
         var buf = std.ArrayList(u8).empty;
         defer buf.deinit(self.allocator);
 
-        buf.print(self.allocator, "HTTP/1.1 {} {s}\r\nContent-Type: {s}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n", .{
+        buf.print(self.allocator, "HTTP/1.1 {} {s}\r\nContent-Type: {s}\r\nContent-Length: {}\r\nConnection: close\r\n", .{
             response.status,
             statusText(response.status),
             response.content_type,
             response.body.len,
         }) catch return;
+        if (response.extra_headers) |hdrs| {
+            buf.appendSlice(self.allocator, hdrs) catch return;
+        }
+        buf.appendSlice(self.allocator, "\r\n") catch return;
         buf.appendSlice(self.allocator, response.body) catch return;
 
         if (response.owned_body) |owned| {
+            self.allocator.free(owned);
+        }
+        if (response.owned_extra_headers) |owned| {
             self.allocator.free(owned);
         }
 
@@ -280,6 +288,7 @@ pub const Request = struct {
     method: []const u8,
     path: []const u8,
     body: []const u8 = "",
+    cookie_sid: ?[]const u8 = null,
 };
 
 pub const Response = struct {
@@ -287,6 +296,8 @@ pub const Response = struct {
     content_type: []const u8 = "application/json",
     body: []const u8 = "",
     owned_body: ?[]u8 = null, // if set, freed after send
+    extra_headers: ?[]const u8 = null, // optional extra headers (e.g. Set-Cookie)
+    owned_extra_headers: ?[]u8 = null, // if set, freed after send
 };
 
 pub const ApiClient = struct {
@@ -310,10 +321,15 @@ fn parseRequest(data: []const u8) ?Request {
 
     const body = data[header_end + 4 ..];
 
+    // Extract SID from Cookie header
+    const headers = data[first_line_end + 2 .. header_end];
+    const cookie_sid = auth.extractSidFromHeaders(headers);
+
     return .{
         .method = method,
         .path = path,
         .body = body,
+        .cookie_sid = cookie_sid,
     };
 }
 

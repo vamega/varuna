@@ -91,6 +91,8 @@ pub fn main() !void {
     // API handler
     var api_handler = varuna.rpc.handlers.ApiHandler{
         .session_manager = &session_manager,
+        .api_username = cfg.daemon.api_username,
+        .api_password = cfg.daemon.api_password,
     };
 
     // HTTP API server (all I/O via io_uring)

@@ -17,32 +17,62 @@ pub fn main() !void {
     const api_port = cfg.daemon.api_port;
     const api_host = cfg.daemon.api_bind;
 
-    if (args.len <= 1) {
+    // Parse global flags: --username, --password
+    var api_username: []const u8 = cfg.daemon.api_username;
+    var api_password: []const u8 = cfg.daemon.api_password;
+    var cmd_start: usize = 1;
+    while (cmd_start < args.len) {
+        if (std.mem.eql(u8, args[cmd_start], "--username") and cmd_start + 1 < args.len) {
+            api_username = args[cmd_start + 1];
+            cmd_start += 2;
+        } else if (std.mem.eql(u8, args[cmd_start], "--password") and cmd_start + 1 < args.len) {
+            api_password = args[cmd_start + 1];
+            cmd_start += 2;
+        } else {
+            break;
+        }
+    }
+
+    if (cmd_start >= args.len) {
         try printUsage(stdout, api_host, api_port);
         try stdout.flush();
         return;
     }
 
-    const command = args[1];
+    // Login first to get SID
+    const sid = doLogin(allocator, stdout, api_host, api_port, api_username, api_password) catch |err| {
+        try stdout.print("error: login failed ({s})\n", .{@errorName(err)});
+        try stdout.flush();
+        return;
+    };
+    defer if (sid) |s| allocator.free(s);
+
+    if (sid == null) {
+        try stdout.print("error: authentication failed (bad credentials?)\n", .{});
+        try stdout.flush();
+        return;
+    }
+
+    const command = args[cmd_start];
 
     if (std.mem.eql(u8, command, "list")) {
-        try doGet(allocator, stdout, api_host, api_port, "/api/v2/torrents/info");
+        try doGet(allocator, stdout, api_host, api_port, "/api/v2/torrents/info", sid);
     } else if (std.mem.eql(u8, command, "status")) {
-        if (args.len < 3) {
+        if (cmd_start + 1 >= args.len) {
             try stdout.print("usage: varuna-ctl status <hash>\n", .{});
         } else {
-            try doGet(allocator, stdout, api_host, api_port, "/api/v2/torrents/info");
+            try doGet(allocator, stdout, api_host, api_port, "/api/v2/torrents/info", sid);
         }
     } else if (std.mem.eql(u8, command, "add")) {
-        if (args.len < 3) {
+        if (cmd_start + 1 >= args.len) {
             try stdout.print("usage: varuna-ctl add <torrent-file> [--save-path <dir>]\n", .{});
         } else {
-            const torrent_bytes = try std.fs.cwd().readFileAlloc(allocator, args[2], 16 * 1024 * 1024);
+            const torrent_bytes = try std.fs.cwd().readFileAlloc(allocator, args[cmd_start + 1], 16 * 1024 * 1024);
             defer allocator.free(torrent_bytes);
 
             // Parse --save-path
             var save_path: ?[]const u8 = null;
-            var i: usize = 3;
+            var i: usize = cmd_start + 2;
             while (i < args.len) : (i += 1) {
                 if (std.mem.eql(u8, args[i], "--save-path") and i + 1 < args.len) {
                     save_path = args[i + 1];
@@ -56,101 +86,101 @@ pub fn main() !void {
             if (save_path) |sp| {
                 try path.print(allocator, "?savepath={s}", .{sp});
             }
-            try doPost(allocator, stdout, api_host, api_port, path.items, torrent_bytes);
+            try doPost(allocator, stdout, api_host, api_port, path.items, torrent_bytes, sid);
         }
     } else if (std.mem.eql(u8, command, "pause")) {
-        if (args.len < 3) {
+        if (cmd_start + 1 >= args.len) {
             try stdout.print("usage: varuna-ctl pause <hash>\n", .{});
         } else {
             var body = std.ArrayList(u8).empty;
             defer body.deinit(allocator);
-            try body.print(allocator, "hashes={s}", .{args[2]});
-            try doPost(allocator, stdout, api_host, api_port, "/api/v2/torrents/pause", body.items);
+            try body.print(allocator, "hashes={s}", .{args[cmd_start + 1]});
+            try doPost(allocator, stdout, api_host, api_port, "/api/v2/torrents/pause", body.items, sid);
         }
     } else if (std.mem.eql(u8, command, "resume")) {
-        if (args.len < 3) {
+        if (cmd_start + 1 >= args.len) {
             try stdout.print("usage: varuna-ctl resume <hash>\n", .{});
         } else {
             var body = std.ArrayList(u8).empty;
             defer body.deinit(allocator);
-            try body.print(allocator, "hashes={s}", .{args[2]});
-            try doPost(allocator, stdout, api_host, api_port, "/api/v2/torrents/resume", body.items);
+            try body.print(allocator, "hashes={s}", .{args[cmd_start + 1]});
+            try doPost(allocator, stdout, api_host, api_port, "/api/v2/torrents/resume", body.items, sid);
         }
     } else if (std.mem.eql(u8, command, "delete")) {
-        if (args.len < 3) {
+        if (cmd_start + 1 >= args.len) {
             try stdout.print("usage: varuna-ctl delete <hash> [--delete-files]\n", .{});
         } else {
             var body = std.ArrayList(u8).empty;
             defer body.deinit(allocator);
-            try body.print(allocator, "hashes={s}", .{args[2]});
-            try doPost(allocator, stdout, api_host, api_port, "/api/v2/torrents/delete", body.items);
+            try body.print(allocator, "hashes={s}", .{args[cmd_start + 1]});
+            try doPost(allocator, stdout, api_host, api_port, "/api/v2/torrents/delete", body.items, sid);
         }
     } else if (std.mem.eql(u8, command, "version")) {
-        try doGet(allocator, stdout, api_host, api_port, "/api/v2/app/webapiVersion");
+        try doGet(allocator, stdout, api_host, api_port, "/api/v2/app/webapiVersion", sid);
     } else if (std.mem.eql(u8, command, "stats")) {
-        try doGet(allocator, stdout, api_host, api_port, "/api/v2/transfer/info");
+        try doGet(allocator, stdout, api_host, api_port, "/api/v2/transfer/info", sid);
     } else if (std.mem.eql(u8, command, "set-dl-limit")) {
-        if (args.len < 4) {
+        if (cmd_start + 2 >= args.len) {
             try stdout.print("usage: varuna-ctl set-dl-limit <hash|global> <bytes-per-sec>\n", .{});
         } else {
-            const target = args[2];
-            const limit = args[3];
+            const target = args[cmd_start + 1];
+            const limit = args[cmd_start + 2];
             if (std.mem.eql(u8, target, "global")) {
                 var body_buf = std.ArrayList(u8).empty;
                 defer body_buf.deinit(allocator);
                 try body_buf.print(allocator, "dl_limit={s}", .{limit});
-                try doPost(allocator, stdout, api_host, api_port, "/api/v2/app/setPreferences", body_buf.items);
+                try doPost(allocator, stdout, api_host, api_port, "/api/v2/app/setPreferences", body_buf.items, sid);
             } else {
                 var body_buf = std.ArrayList(u8).empty;
                 defer body_buf.deinit(allocator);
                 try body_buf.print(allocator, "hashes={s}&limit={s}", .{ target, limit });
-                try doPost(allocator, stdout, api_host, api_port, "/api/v2/torrents/setDownloadLimit", body_buf.items);
+                try doPost(allocator, stdout, api_host, api_port, "/api/v2/torrents/setDownloadLimit", body_buf.items, sid);
             }
         }
     } else if (std.mem.eql(u8, command, "set-ul-limit")) {
-        if (args.len < 4) {
+        if (cmd_start + 2 >= args.len) {
             try stdout.print("usage: varuna-ctl set-ul-limit <hash|global> <bytes-per-sec>\n", .{});
         } else {
-            const target = args[2];
-            const limit = args[3];
+            const target = args[cmd_start + 1];
+            const limit = args[cmd_start + 2];
             if (std.mem.eql(u8, target, "global")) {
                 var body_buf = std.ArrayList(u8).empty;
                 defer body_buf.deinit(allocator);
                 try body_buf.print(allocator, "up_limit={s}", .{limit});
-                try doPost(allocator, stdout, api_host, api_port, "/api/v2/app/setPreferences", body_buf.items);
+                try doPost(allocator, stdout, api_host, api_port, "/api/v2/app/setPreferences", body_buf.items, sid);
             } else {
                 var body_buf = std.ArrayList(u8).empty;
                 defer body_buf.deinit(allocator);
                 try body_buf.print(allocator, "hashes={s}&limit={s}", .{ target, limit });
-                try doPost(allocator, stdout, api_host, api_port, "/api/v2/torrents/setUploadLimit", body_buf.items);
+                try doPost(allocator, stdout, api_host, api_port, "/api/v2/torrents/setUploadLimit", body_buf.items, sid);
             }
         }
     } else if (std.mem.eql(u8, command, "get-dl-limit")) {
-        if (args.len < 3) {
+        if (cmd_start + 1 >= args.len) {
             try stdout.print("usage: varuna-ctl get-dl-limit <hash|global>\n", .{});
         } else {
-            const target = args[2];
+            const target = args[cmd_start + 1];
             if (std.mem.eql(u8, target, "global")) {
-                try doGet(allocator, stdout, api_host, api_port, "/api/v2/app/preferences");
+                try doGet(allocator, stdout, api_host, api_port, "/api/v2/app/preferences", sid);
             } else {
                 var body_buf = std.ArrayList(u8).empty;
                 defer body_buf.deinit(allocator);
                 try body_buf.print(allocator, "hashes={s}", .{target});
-                try doPost(allocator, stdout, api_host, api_port, "/api/v2/torrents/downloadLimit", body_buf.items);
+                try doPost(allocator, stdout, api_host, api_port, "/api/v2/torrents/downloadLimit", body_buf.items, sid);
             }
         }
     } else if (std.mem.eql(u8, command, "get-ul-limit")) {
-        if (args.len < 3) {
+        if (cmd_start + 1 >= args.len) {
             try stdout.print("usage: varuna-ctl get-ul-limit <hash|global>\n", .{});
         } else {
-            const target = args[2];
+            const target = args[cmd_start + 1];
             if (std.mem.eql(u8, target, "global")) {
-                try doGet(allocator, stdout, api_host, api_port, "/api/v2/app/preferences");
+                try doGet(allocator, stdout, api_host, api_port, "/api/v2/app/preferences", sid);
             } else {
                 var body_buf = std.ArrayList(u8).empty;
                 defer body_buf.deinit(allocator);
                 try body_buf.print(allocator, "hashes={s}", .{target});
-                try doPost(allocator, stdout, api_host, api_port, "/api/v2/torrents/uploadLimit", body_buf.items);
+                try doPost(allocator, stdout, api_host, api_port, "/api/v2/torrents/uploadLimit", body_buf.items, sid);
             }
         }
     } else {
@@ -161,12 +191,87 @@ pub fn main() !void {
     try stdout.flush();
 }
 
+/// Login to the daemon API and return the SID cookie value.
+/// Returns null if credentials are rejected, error on connection failure.
+fn doLogin(
+    allocator: std.mem.Allocator,
+    stdout: *std.Io.Writer,
+    host: []const u8,
+    port: u16,
+    username: []const u8,
+    password: []const u8,
+) !?[]u8 {
+    _ = stdout;
+    var ring = varuna.io.ring.Ring.init(16) catch return error.IoUringUnavailable;
+    defer ring.deinit();
+
+    const addr = std.net.Address.parseIp4(host, port) catch return error.InvalidAddress;
+
+    const fd = try ring.socket(addr.any.family, std.posix.SOCK.STREAM | std.posix.SOCK.CLOEXEC, std.posix.IPPROTO.TCP);
+    defer std.posix.close(fd);
+
+    try ring.connect_timeout(fd, &addr.any, addr.getOsSockLen(), 5);
+
+    // Build login body
+    var body_buf = std.ArrayList(u8).empty;
+    defer body_buf.deinit(allocator);
+    try body_buf.print(allocator, "username={s}&password={s}", .{ username, password });
+
+    // Build HTTP POST
+    var request = std.ArrayList(u8).empty;
+    defer request.deinit(allocator);
+    try request.print(allocator, "POST /api/v2/auth/login HTTP/1.1\r\nHost: {s}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n", .{ host, body_buf.items.len });
+    try request.appendSlice(allocator, body_buf.items);
+
+    try ring.send_all(fd, request.items);
+
+    // Read response
+    var response_buf: [8192]u8 = undefined;
+    const n = try ring.recv(fd, &response_buf);
+    const response = response_buf[0..n];
+
+    // Check for successful login (body should be "Ok.")
+    const header_end = std.mem.indexOf(u8, response, "\r\n\r\n") orelse return null;
+    const resp_body = response[header_end + 4 ..];
+    if (!std.mem.eql(u8, resp_body, "Ok.")) return null;
+
+    // Extract SID from Set-Cookie header
+    const headers = response[0..header_end];
+    return extractSidFromSetCookie(allocator, headers);
+}
+
+/// Extract SID value from a Set-Cookie header in the response.
+fn extractSidFromSetCookie(allocator: std.mem.Allocator, headers: []const u8) ?[]u8 {
+    var line_start: usize = 0;
+    while (line_start < headers.len) {
+        const line_end = std.mem.indexOfPos(u8, headers, line_start, "\r\n") orelse headers.len;
+        const line = headers[line_start..line_end];
+
+        // Look for "Set-Cookie:" header
+        if (line.len > 11 and std.ascii.eqlIgnoreCase(line[0..11], "Set-Cookie:")) {
+            const value = std.mem.trimLeft(u8, line[11..], " ");
+            // Parse "SID=<value>; HttpOnly; path=/"
+            if (std.mem.startsWith(u8, value, "SID=")) {
+                const sid_start = 4;
+                const sid_end = std.mem.indexOfScalar(u8, value[sid_start..], ';') orelse (value.len - sid_start);
+                const sid = value[sid_start .. sid_start + sid_end];
+                return allocator.dupe(u8, sid) catch return null;
+            }
+        }
+
+        if (line_end >= headers.len) break;
+        line_start = line_end + 2;
+    }
+    return null;
+}
+
 fn doGet(
     allocator: std.mem.Allocator,
     stdout: *std.Io.Writer,
     host: []const u8,
     port: u16,
     path: []const u8,
+    sid: ?[]const u8,
 ) !void {
     var ring = varuna.io.ring.Ring.init(16) catch {
         try stdout.print("error: io_uring unavailable\n", .{});
@@ -174,18 +279,50 @@ fn doGet(
     };
     defer ring.deinit();
 
-    var http = varuna.io.http.HttpClient.init(allocator, &ring);
-    var url = std.ArrayList(u8).empty;
-    defer url.deinit(allocator);
-    try url.print(allocator, "http://{s}:{}{s}", .{ host, port, path });
-
-    var response = http.get(url.items) catch |err| {
-        try stdout.print("error: could not reach daemon ({s})\n", .{@errorName(err)});
+    const addr = std.net.Address.parseIp4(host, port) catch {
+        try stdout.print("error: invalid daemon address\n", .{});
         return;
     };
-    defer response.deinit();
 
-    try stdout.print("{s}\n", .{response.body});
+    const fd = ring.socket(addr.any.family, std.posix.SOCK.STREAM | std.posix.SOCK.CLOEXEC, std.posix.IPPROTO.TCP) catch {
+        try stdout.print("error: could not create socket\n", .{});
+        return;
+    };
+    defer std.posix.close(fd);
+
+    ring.connect_timeout(fd, &addr.any, addr.getOsSockLen(), 5) catch {
+        try stdout.print("error: could not connect to daemon\n", .{});
+        return;
+    };
+
+    // Build HTTP GET with Cookie header
+    var request = std.ArrayList(u8).empty;
+    defer request.deinit(allocator);
+    try request.print(allocator, "GET {s} HTTP/1.1\r\nHost: {s}\r\n", .{ path, host });
+    if (sid) |s| {
+        try request.print(allocator, "Cookie: SID={s}\r\n", .{s});
+    }
+    try request.appendSlice(allocator, "Connection: close\r\n\r\n");
+
+    ring.send_all(fd, request.items) catch {
+        try stdout.print("error: failed to send request\n", .{});
+        return;
+    };
+
+    // Read response
+    var response_buf: [8192]u8 = undefined;
+    const n = ring.recv(fd, &response_buf) catch {
+        try stdout.print("error: failed to read response\n", .{});
+        return;
+    };
+    const response = response_buf[0..n];
+
+    // Extract body
+    if (std.mem.indexOf(u8, response, "\r\n\r\n")) |body_start| {
+        try stdout.print("{s}\n", .{response[body_start + 4 ..]});
+    } else {
+        try stdout.print("{s}\n", .{response});
+    }
 }
 
 fn doPost(
@@ -195,6 +332,7 @@ fn doPost(
     port: u16,
     path: []const u8,
     body: []const u8,
+    sid: ?[]const u8,
 ) !void {
     // Build a raw HTTP POST request and send via io_uring
     var ring = varuna.io.ring.Ring.init(16) catch {
@@ -219,10 +357,14 @@ fn doPost(
         return;
     };
 
-    // Build HTTP POST
+    // Build HTTP POST with Cookie header
     var request = std.ArrayList(u8).empty;
     defer request.deinit(allocator);
-    try request.print(allocator, "POST {s} HTTP/1.1\r\nHost: {s}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n", .{ path, host, body.len });
+    try request.print(allocator, "POST {s} HTTP/1.1\r\nHost: {s}\r\nContent-Length: {}\r\n", .{ path, host, body.len });
+    if (sid) |s| {
+        try request.print(allocator, "Cookie: SID={s}\r\n", .{s});
+    }
+    try request.appendSlice(allocator, "Connection: close\r\n\r\n");
     try request.appendSlice(allocator, body);
 
     ring.send_all(fd, request.items) catch {
@@ -248,7 +390,10 @@ fn doPost(
 
 fn printUsage(stdout: *std.Io.Writer, host: []const u8, port: u16) !void {
     try stdout.print("varuna-ctl: control the varuna daemon\n\n", .{});
-    try stdout.print("commands:\n", .{});
+    try stdout.print("options:\n", .{});
+    try stdout.print("  --username <user>              API username (default: admin)\n", .{});
+    try stdout.print("  --password <pass>              API password (default: adminadmin)\n", .{});
+    try stdout.print("\ncommands:\n", .{});
     try stdout.print("  list                           list all torrents\n", .{});
     try stdout.print("  add <torrent-file>             add torrent\n", .{});
     try stdout.print("  status <hash>                  torrent details\n", .{});
