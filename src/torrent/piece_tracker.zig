@@ -96,6 +96,20 @@ pub const PieceTracker = struct {
         self.min_availability = 0;
     }
 
+    /// Atomically replace the wanted mask and return the old one so the
+    /// caller can free it outside the lock. This avoids requiring the
+    /// PieceTracker to know the allocator.
+    pub fn swapWanted(self: *PieceTracker, new_wanted: ?Bitfield) ?Bitfield {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        const old = self.wanted;
+        self.wanted = new_wanted;
+        self.wanted_count = if (new_wanted) |w| w.count else self.piece_count;
+        self.scan_hint = 0;
+        self.min_availability = 0;
+        return old;
+    }
+
     /// Enable or disable sequential download mode.
     pub fn setSequential(self: *PieceTracker, enabled: bool) void {
         self.mutex.lock();

@@ -136,6 +136,8 @@ pub const SessionManager = struct {
 
         const session = self.sessions.get(hash) orelse return error.TorrentNotFound;
         session.sequential_download = enabled;
+        // Propagate to the piece tracker so claimPiece() uses the right strategy.
+        session.applySequentialMode();
     }
 
     /// Set file priority for specific file indices.
@@ -161,6 +163,10 @@ pub const SessionManager = struct {
                 fp[idx] = priority;
             }
         }
+
+        // Rebuild the wanted-piece mask and apply it to the piece tracker
+        // so claimPiece() immediately respects the new priorities.
+        _ = session.applyFilePriorities();
     }
 
     /// Force re-announce to tracker for a torrent.

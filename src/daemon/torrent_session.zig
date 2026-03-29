@@ -6,6 +6,8 @@ const tracker = @import("../tracker/root.zig");
 const Ring = @import("../io/ring.zig").Ring;
 const EventLoop = @import("../io/event_loop.zig").EventLoop;
 const PieceTracker = @import("../torrent/piece_tracker.zig").PieceTracker;
+const file_priority = @import("../torrent/file_priority.zig");
+const FilePriority = file_priority.FilePriority;
 const signal = @import("../io/signal.zig");
 const peer_id_mod = @import("../torrent/peer_id.zig");
 const ResumeWriter = storage.resume_state.ResumeWriter;
@@ -236,12 +238,89 @@ pub const TorrentSession = struct {
         if (self.dl_limit > 0) sel.setTorrentDlLimit(tid, self.dl_limit);
         if (self.ul_limit > 0) sel.setTorrentUlLimit(tid, self.ul_limit);
 
+        // Apply file priorities (selective download) and sequential mode
+        // to the piece tracker so claimPiece() respects them.
+        _ = self.applyFilePriorities();
+        self.applySequentialMode();
+
         var added: u32 = 0;
         for (peers) |addr| {
             _ = sel.addPeerForTorrent(addr, tid) catch continue;
             added += 1;
         }
         return added > 0;
+    }
+
+    /// Convert raw API priority (0=skip, 1=normal, 6=high, 7=max) to FilePriority enum.
+    fn apiPriorityToEnum(raw: u8) FilePriority {
+        return switch (raw) {
+            0 => .do_not_download,
+            6, 7 => .high,
+            else => .normal,
+        };
+    }
+
+    /// Build a wanted-piece mask from the current file_priorities and apply it
+    /// to the piece_tracker via setWanted(). If no files are marked
+    /// do_not_download the mask is cleared (want everything).
+    /// Returns true if a mask was applied, false if all files are wanted.
+    pub fn applyFilePriorities(self: *TorrentSession) bool {
+        const pt = &(self.piece_tracker orelse return false);
+        const sess = &(self.session orelse return false);
+        const fp_raw = self.file_priorities orelse {
+            // No priority array at all -- want everything.
+            const old = pt.swapWanted(null);
+            if (old) |o| {
+                var copy = o;
+                copy.deinit(self.allocator);
+            }
+            return false;
+        };
+
+        // Convert raw u8 priorities to FilePriority enums (stack-allocate up to 256 files,
+        // heap-allocate for larger torrents).
+        var stack_buf: [256]FilePriority = undefined;
+        const fp_enums: []FilePriority = if (fp_raw.len <= stack_buf.len)
+            stack_buf[0..fp_raw.len]
+        else
+            self.allocator.alloc(FilePriority, fp_raw.len) catch return false;
+        defer if (fp_raw.len > stack_buf.len) self.allocator.free(fp_enums);
+
+        for (fp_raw, 0..) |raw, i| {
+            fp_enums[i] = apiPriorityToEnum(raw);
+        }
+
+        if (file_priority.allWanted(fp_enums)) {
+            const old = pt.swapWanted(null);
+            if (old) |o| {
+                var copy = o;
+                copy.deinit(self.allocator);
+            }
+            return false;
+        }
+
+        const mask = file_priority.buildPieceMask(
+            self.allocator,
+            &sess.layout,
+            fp_enums,
+        ) catch return false;
+
+        // Swap in the new mask and free the old one. swapWanted atomically
+        // replaces the mask under the PieceTracker mutex, so concurrent
+        // claimPiece() calls see either the old or new mask, never a freed one.
+        const old = pt.swapWanted(mask);
+        if (old) |o| {
+            var copy = o;
+            copy.deinit(self.allocator);
+        }
+        return true;
+    }
+
+    /// Propagate the sequential_download flag to the piece_tracker.
+    pub fn applySequentialMode(self: *TorrentSession) void {
+        if (self.piece_tracker) |*pt| {
+            pt.setSequential(self.sequential_download);
+        }
     }
 
     pub fn getStats(self: *TorrentSession) Stats {
@@ -491,6 +570,10 @@ pub const TorrentSession = struct {
         );
         self.event_loop = event_loop;
 
+        // Apply file priorities and sequential mode for standalone mode too.
+        _ = self.applyFilePriorities();
+        self.applySequentialMode();
+
         var peers_added: u32 = 0;
         for (announce_resp.peers) |peer| {
             if (peers_added >= self.max_peers) break;
@@ -608,6 +691,10 @@ pub const TorrentSession = struct {
             // Apply per-torrent speed limits to the event loop context
             if (self.dl_limit > 0) sel.setTorrentDlLimit(tid, self.dl_limit);
             if (self.ul_limit > 0) sel.setTorrentUlLimit(tid, self.ul_limit);
+
+            // Apply file priorities and sequential mode
+            _ = self.applyFilePriorities();
+            self.applySequentialMode();
         }
 
         // Set the complete_pieces bitfield so seed mode can serve pieces
