@@ -1,6 +1,7 @@
 const std = @import("std");
 const server = @import("server.zig");
 const auth = @import("auth.zig");
+const multipart = @import("multipart.zig");
 const sync_mod = @import("sync.zig");
 const SessionManager = @import("../daemon/session_manager.zig").SessionManager;
 const TorrentSession = @import("../daemon/torrent_session.zig");
@@ -53,7 +54,7 @@ pub const ApiHandler = struct {
 
         if (std.mem.startsWith(u8, request.path, "/api/v2/torrents/")) {
             const action = request.path["/api/v2/torrents/".len..];
-            return self.handleTorrents(allocator, request.method, action, request.body);
+            return self.handleTorrents(allocator, request.method, action, request.body, request.content_type);
         }
 
         if (std.mem.startsWith(u8, request.path, "/api/v2/sync/maindata")) {
@@ -116,7 +117,7 @@ pub const ApiHandler = struct {
         return .{ .body = body, .owned_body = body };
     }
 
-    fn handleTorrents(self: *const ApiHandler, allocator: std.mem.Allocator, method: []const u8, action: []const u8, body: []const u8) server.Response {
+    fn handleTorrents(self: *const ApiHandler, allocator: std.mem.Allocator, method: []const u8, action: []const u8, body: []const u8, content_type: ?[]const u8) server.Response {
         // Split action from query string (e.g. "files?hash=abc" -> "files", "hash=abc")
         const query_sep = std.mem.indexOf(u8, action, "?");
         const action_name = if (query_sep) |q| action[0..q] else action;
@@ -132,7 +133,7 @@ pub const ApiHandler = struct {
         }
 
         if (std.mem.startsWith(u8, action_name, "add") and std.mem.eql(u8, method, "POST")) {
-            return self.handleTorrentsAdd(allocator, body, query);
+            return self.handleTorrentsAdd(allocator, body, query, content_type);
         }
 
         if (std.mem.eql(u8, action_name, "delete") and std.mem.eql(u8, method, "POST")) {
@@ -213,15 +214,34 @@ pub const ApiHandler = struct {
         return .{ .body = body, .owned_body = body };
     }
 
-    fn handleTorrentsAdd(self: *const ApiHandler, allocator: std.mem.Allocator, body: []const u8, query: []const u8) server.Response {
-        // For now, expect raw torrent bytes in body
-        // TODO: multipart form parsing for proper qBittorrent compatibility
-        if (body.len == 0) {
+    fn handleTorrentsAdd(self: *const ApiHandler, allocator: std.mem.Allocator, body: []const u8, query: []const u8, content_type: ?[]const u8) server.Response {
+        var torrent_data: []const u8 = body;
+        var save_path: []const u8 = extractParam(query, "savepath") orelse self.session_manager.default_save_path;
+
+        // Parse multipart/form-data if that's the content type (qBittorrent/Flood WebUI)
+        if (multipart.isMultipart(content_type)) {
+            const parts = multipart.parse(allocator, content_type.?, body) catch {
+                return .{ .status = 400, .body = "{\"error\":\"malformed multipart body\"}" };
+            };
+            defer multipart.freeParts(allocator, parts);
+
+            // Extract torrent file data
+            const torrent_part = multipart.findPart(parts, "torrents") orelse {
+                return .{ .status = 400, .body = "{\"error\":\"no torrents part in multipart\"}" };
+            };
+            torrent_data = torrent_part.data;
+
+            // Extract optional parameters from form fields
+            if (multipart.findPart(parts, "savepath")) |sp| {
+                if (sp.data.len > 0) save_path = sp.data;
+            }
+        }
+
+        if (torrent_data.len == 0) {
             return .{ .status = 400, .body = "{\"error\":\"no torrent data\"}" };
         }
 
-        const save_path = extractParam(query, "savepath") orelse self.session_manager.default_save_path;
-        _ = self.session_manager.addTorrent(body, save_path) catch |err| {
+        _ = self.session_manager.addTorrent(torrent_data, save_path) catch |err| {
             const msg = std.fmt.allocPrint(allocator, "{{\"error\":\"{s}\"}}", .{@errorName(err)}) catch
                 return .{ .status = 500, .body = "{\"error\":\"internal\"}" };
             return .{ .status = 400, .body = msg, .owned_body = msg };

@@ -7,6 +7,7 @@ const auth = @import("auth.zig");
 
 const max_api_clients = 64;
 const recv_buf_size = 8192;
+const max_request_size = 4 * 1024 * 1024; // 4 MiB max for torrent uploads
 
 /// HTTP API server running entirely on io_uring.
 /// Accept, recv, parse, route, send -- all via SQEs, no blocking I/O.
@@ -175,25 +176,65 @@ pub const ApiServer = struct {
         const n: usize = @intCast(cqe.res);
         client.recv_offset += n;
 
-        // Check if we have a complete HTTP request (ends with \r\n\r\n)
         const data = client.recv_buf.?[0..client.recv_offset];
-        if (std.mem.indexOf(u8, data, "\r\n\r\n")) |_| {
-            // Parse and handle request
-            const request = parseRequest(data) orelse {
-                self.sendErrorResponse(slot, 400, "Bad Request");
-                return;
-            };
 
-            const response = self.handler(self.allocator, request);
-            self.sendResponse(slot, response);
-        } else if (client.recv_offset >= recv_buf_size) {
-            self.sendErrorResponse(slot, 413, "Request Too Large");
-        } else {
-            // Need more data
-            self.submitRecv(slot) catch {
-                self.closeClient(slot);
-            };
+        // First, we need the headers (terminated by \r\n\r\n)
+        const header_end = std.mem.indexOf(u8, data, "\r\n\r\n") orelse {
+            // Haven't received complete headers yet
+            if (client.recv_offset >= data.len) {
+                self.sendErrorResponse(slot, 413, "Request Too Large");
+            } else {
+                self.submitRecv(slot) catch {
+                    self.closeClient(slot);
+                };
+            }
+            return;
+        };
+
+        // Headers are complete. Check if we need to wait for the body.
+        const body_start = header_end + 4;
+        const first_line_end = std.mem.indexOf(u8, data, "\r\n") orelse {
+            self.sendErrorResponse(slot, 400, "Bad Request");
+            return;
+        };
+        const headers = data[first_line_end + 2 .. header_end];
+        const content_length = parseContentLength(headers);
+
+        if (content_length) |expected_body_len| {
+            const body_received = client.recv_offset - body_start;
+
+            if (body_received < expected_body_len) {
+                // Need more body data. Grow buffer if needed.
+                const total_needed = body_start + expected_body_len;
+                if (total_needed > max_request_size) {
+                    self.sendErrorResponse(slot, 413, "Request Too Large");
+                    return;
+                }
+
+                if (total_needed > client.recv_buf.?.len) {
+                    // Grow the buffer
+                    const new_buf = self.allocator.realloc(client.recv_buf.?, total_needed) catch {
+                        self.sendErrorResponse(slot, 500, "Internal Server Error");
+                        return;
+                    };
+                    client.recv_buf = new_buf;
+                }
+
+                self.submitRecv(slot) catch {
+                    self.closeClient(slot);
+                };
+                return;
+            }
         }
+
+        // We have enough data. Parse and handle.
+        const request = parseRequest(data) orelse {
+            self.sendErrorResponse(slot, 400, "Bad Request");
+            return;
+        };
+
+        const response = self.handler(self.allocator, request);
+        self.sendResponse(slot, response);
     }
 
     fn handleSend(self: *ApiServer, slot: u8, cqe: linux.io_uring_cqe) void {
@@ -289,6 +330,7 @@ pub const Request = struct {
     path: []const u8,
     body: []const u8 = "",
     cookie_sid: ?[]const u8 = null,
+    content_type: ?[]const u8 = null,
 };
 
 pub const Response = struct {
@@ -321,16 +363,52 @@ fn parseRequest(data: []const u8) ?Request {
 
     const body = data[header_end + 4 ..];
 
-    // Extract SID from Cookie header
+    // Extract headers
     const headers = data[first_line_end + 2 .. header_end];
     const cookie_sid = auth.extractSidFromHeaders(headers);
+    const content_type = extractHeader(headers, "content-type");
 
     return .{
         .method = method,
         .path = path,
         .body = body,
         .cookie_sid = cookie_sid,
+        .content_type = content_type,
     };
+}
+
+/// Extract Content-Length from raw header block. Returns null if not present or invalid.
+fn parseContentLength(headers: []const u8) ?usize {
+    const value = extractHeader(headers, "content-length") orelse return null;
+    return std.fmt.parseInt(usize, value, 10) catch null;
+}
+
+/// Case-insensitive header extraction from the raw header block.
+fn extractHeader(headers: []const u8, name: []const u8) ?[]const u8 {
+    var pos: usize = 0;
+    while (pos < headers.len) {
+        const line_end = std.mem.indexOfPos(u8, headers, pos, "\r\n") orelse headers.len;
+        const line = headers[pos..line_end];
+        pos = if (line_end + 2 <= headers.len) line_end + 2 else headers.len;
+
+        // Find colon
+        const colon = std.mem.indexOfScalar(u8, line, ':') orelse continue;
+        const header_name = line[0..colon];
+
+        // Case-insensitive comparison
+        if (header_name.len != name.len) continue;
+        var match = true;
+        for (header_name, name) |a, b| {
+            if (std.ascii.toLower(a) != std.ascii.toLower(b)) {
+                match = false;
+                break;
+            }
+        }
+        if (!match) continue;
+
+        return std.mem.trimLeft(u8, line[colon + 1 ..], " ");
+    }
+    return null;
 }
 
 fn defaultHandler(_: std.mem.Allocator, request: Request) Response {
@@ -366,6 +444,36 @@ test "parse POST request with body" {
     try std.testing.expectEqualStrings("POST", req.method);
     try std.testing.expectEqualStrings("/api/v2/torrents/add", req.path);
     try std.testing.expectEqualStrings("hello", req.body);
+}
+
+test "parse request extracts content-type" {
+    const data = "POST /api/v2/torrents/add HTTP/1.1\r\nContent-Type: multipart/form-data; boundary=abc\r\nContent-Length: 0\r\n\r\n";
+    const req = parseRequest(data).?;
+    try std.testing.expectEqualStrings("multipart/form-data; boundary=abc", req.content_type.?);
+}
+
+test "parse request without content-type" {
+    const data = "GET /api/v2/app/webapiVersion HTTP/1.1\r\nHost: localhost\r\n\r\n";
+    const req = parseRequest(data).?;
+    try std.testing.expect(req.content_type == null);
+}
+
+test "extractHeader case insensitive" {
+    const headers = "Host: localhost\r\ncontent-type: text/plain\r\nContent-Length: 42\r\n";
+    try std.testing.expectEqualStrings("text/plain", extractHeader(headers, "content-type").?);
+    try std.testing.expectEqualStrings("text/plain", extractHeader(headers, "Content-Type").?);
+    try std.testing.expectEqualStrings("42", extractHeader(headers, "content-length").?);
+    try std.testing.expect(extractHeader(headers, "x-missing") == null);
+}
+
+test "parseContentLength extracts length" {
+    const headers = "Content-Type: text/plain\r\nContent-Length: 1234\r\n";
+    try std.testing.expectEqual(@as(?usize, 1234), parseContentLength(headers));
+}
+
+test "parseContentLength returns null when missing" {
+    const headers = "Content-Type: text/plain\r\n";
+    try std.testing.expect(parseContentLength(headers) == null);
 }
 
 test "api server init and deinit" {
