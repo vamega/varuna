@@ -1,6 +1,7 @@
 const std = @import("std");
 const server = @import("server.zig");
 const auth = @import("auth.zig");
+const sync_mod = @import("sync.zig");
 const SessionManager = @import("../daemon/session_manager.zig").SessionManager;
 const TorrentSession = @import("../daemon/torrent_session.zig");
 const metainfo_mod = @import("../torrent/metainfo.zig");
@@ -10,6 +11,7 @@ const metainfo_mod = @import("../torrent/metainfo.zig");
 pub const ApiHandler = struct {
     session_manager: *SessionManager,
     session_store: auth.SessionStore = .{},
+    sync_state: sync_mod.SyncState,
     api_username: []const u8 = "admin",
     api_password: []const u8 = "adminadmin",
 
@@ -52,6 +54,10 @@ pub const ApiHandler = struct {
         if (std.mem.startsWith(u8, request.path, "/api/v2/torrents/")) {
             const action = request.path["/api/v2/torrents/".len..];
             return self.handleTorrents(allocator, request.method, action, request.body);
+        }
+
+        if (std.mem.startsWith(u8, request.path, "/api/v2/sync/maindata")) {
+            return self.handleSyncMaindata(allocator, request.path);
         }
 
         return .{ .status = 404, .body = "{\"error\":\"not found\"}" };
@@ -617,6 +623,25 @@ pub const ApiHandler = struct {
         };
 
         return .{ .body = "{\"status\":\"ok\"}" };
+    }
+
+    fn handleSyncMaindata(self: *ApiHandler, allocator: std.mem.Allocator, path: []const u8) server.Response {
+        // Parse rid from query string: /api/v2/sync/maindata?rid=N
+        var request_rid: u64 = 0;
+        if (std.mem.indexOf(u8, path, "?")) |q| {
+            const query = path[q + 1 ..];
+            if (extractParam(query, "rid")) |rid_str| {
+                request_rid = std.fmt.parseInt(u64, rid_str, 10) catch 0;
+            }
+        }
+
+        const body = self.sync_state.computeDelta(
+            self.session_manager,
+            allocator,
+            request_rid,
+        ) catch
+            return .{ .status = 500, .body = "{\"error\":\"internal\"}" };
+        return .{ .body = body, .owned_body = body };
     }
 };
 

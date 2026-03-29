@@ -91,9 +91,11 @@ pub fn main() !void {
     // API handler
     var api_handler = varuna.rpc.handlers.ApiHandler{
         .session_manager = &session_manager,
+        .sync_state = varuna.rpc.sync.SyncState.init(allocator),
         .api_username = cfg.daemon.api_username,
         .api_password = cfg.daemon.api_password,
     };
+    defer api_handler.sync_state.deinit();
 
     // HTTP API server (all I/O via io_uring)
     var api_server = varuna.rpc.server.ApiServer.initWithDevice(allocator, cfg.daemon.api_bind, cfg.daemon.api_port, cfg.network.bind_device) catch |err| {
