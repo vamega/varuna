@@ -1,10 +1,14 @@
 const std = @import("std");
 const posix = std.posix;
 const Ring = @import("../io/ring.zig").Ring;
+const extensions = @import("extensions.zig");
 
 pub const protocol_string = "BitTorrent protocol";
 pub const protocol_length: u8 = protocol_string.len;
 pub const max_message_length: u32 = 1 * 1024 * 1024;
+
+/// BEP 10 extension message ID.
+pub const msg_extension: u8 = extensions.msg_id;
 
 pub const Request = struct {
     piece_index: u32,
@@ -44,6 +48,8 @@ pub fn serializeHandshake(info_hash: [20]u8, peer_id: [20]u8) [68]u8 {
     buffer[0] = protocol_length;
     @memcpy(buffer[1 .. 1 + protocol_string.len], protocol_string);
     @memset(buffer[20..28], 0);
+    // BEP 10: advertise extension protocol support
+    buffer[20 + extensions.reserved_byte] |= extensions.reserved_mask;
     @memcpy(buffer[28..48], info_hash[0..]);
     @memcpy(buffer[48..68], peer_id[0..]);
     return buffer;
@@ -322,8 +328,10 @@ test "handshake serialization roundtrip" {
     try std.testing.expectEqual(@as(u8, 19), buf[0]);
     // bytes 1..20: protocol string
     try std.testing.expectEqualStrings("BitTorrent protocol", buf[1..20]);
-    // bytes 20..28: reserved (all zeros)
-    try std.testing.expectEqualSlices(u8, &([_]u8{0} ** 8), buf[20..28]);
+    // bytes 20..28: reserved (BEP 10 extension bit set at byte 5)
+    var expected_reserved = [_]u8{0} ** 8;
+    expected_reserved[extensions.reserved_byte] = extensions.reserved_mask;
+    try std.testing.expectEqualSlices(u8, &expected_reserved, buf[20..28]);
     // bytes 28..48: info_hash
     try std.testing.expectEqualSlices(u8, &info_hash, buf[28..48]);
     // bytes 48..68: peer_id

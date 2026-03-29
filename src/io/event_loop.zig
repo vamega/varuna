@@ -7,6 +7,7 @@ const PieceTracker = @import("../torrent/piece_tracker.zig").PieceTracker;
 const session_mod = @import("../torrent/session.zig");
 const storage = @import("../storage/root.zig");
 const pw = @import("../net/peer_wire.zig");
+const ext = @import("../net/extensions.zig");
 const Hasher = @import("hasher.zig").Hasher;
 const RateLimiter = @import("rate_limiter.zig").RateLimiter;
 const socket_util = @import("../net/socket.zig");
@@ -63,8 +64,10 @@ pub const PeerState = enum {
     connecting,
     handshake_send,
     handshake_recv,
+    extension_handshake_send, // BEP 10: sending extension handshake after peer handshake
     inbound_handshake_recv,
     inbound_handshake_send, // sending our handshake back
+    inbound_extension_handshake_send, // BEP 10: sending extension handshake (inbound)
     inbound_bitfield_send, // sending bitfield
     inbound_unchoke_send, // sending unchoke
     active_recv_header,
@@ -111,6 +114,10 @@ pub const Peer = struct {
     blocks_expected: u32 = 0,
     pipeline_sent: u32 = 0,
     inflight_requests: u32 = 0,
+
+    // BEP 10 extension protocol state
+    extensions_supported: bool = false, // peer advertised BEP 10 support
+    extension_ids: ?ext.ExtensionIds = null, // peer's extension ID mapping
 };
 
 // ── Torrent context (per-torrent state within shared event loop) ──
@@ -886,6 +893,8 @@ pub const EventLoop = struct {
         buf[0] = pw.protocol_length;
         @memcpy(buf[1 .. 1 + pw.protocol_string.len], pw.protocol_string);
         @memset(buf[20..28], 0);
+        // BEP 10: advertise extension protocol support
+        buf[20 + ext.reserved_byte] |= ext.reserved_mask;
         @memcpy(buf[28..48], tc.info_hash[0..]);
         @memcpy(buf[48..68], tc.peer_id[0..]);
         @memcpy(peer.handshake_buf[0..68], &buf);
@@ -930,22 +939,27 @@ pub const EventLoop = struct {
                     self.removePeer(slot);
                 };
             },
+            .extension_handshake_send => {
+                // BEP 10: extension handshake sent (outbound peer).
+                // Now send interested and go active.
+                self.sendInterestedAndGoActive(slot);
+            },
             .inbound_handshake_send => {
-                // Handshake sent -- send bitfield if we have pieces
-                const tc_bp = self.getTorrentContext(peer.torrent_id);
-                if ((if (tc_bp) |t| t.complete_pieces else null) orelse self.complete_pieces) |cp| {
-                    peer.state = .inbound_bitfield_send;
-                    self.submitMessage(slot, 5, cp.bits) catch {
-                        self.removePeer(slot);
+                // Handshake sent -- send extension handshake if peer supports BEP 10
+                if (peer.extensions_supported) {
+                    peer.state = .inbound_extension_handshake_send;
+                    self.submitExtensionHandshake(slot) catch {
+                        // Fall through to bitfield/unchoke on failure
+                        self.sendInboundBitfieldOrUnchoke(slot);
                     };
                 } else {
-                    // No bitfield to send, go straight to unchoke
-                    peer.state = .inbound_unchoke_send;
-                    peer.am_choking = false;
-                    self.submitMessage(slot, 1, &.{}) catch {
-                        self.removePeer(slot);
-                    };
+                    self.sendInboundBitfieldOrUnchoke(slot);
                 }
+            },
+            .inbound_extension_handshake_send => {
+                // BEP 10: extension handshake sent (inbound peer).
+                // Continue with bitfield/unchoke.
+                self.sendInboundBitfieldOrUnchoke(slot);
             },
             .inbound_bitfield_send => {
                 // Bitfield sent -- now send unchoke
@@ -1000,17 +1014,26 @@ pub const EventLoop = struct {
                     self.removePeer(slot);
                     return;
                 }
-                // Send interested message
-                self.submitMessage(slot, 2, &.{}) catch {
-                    self.removePeer(slot);
-                    return;
-                };
-                peer.am_interested = true;
-                peer.state = .active_recv_header;
-                peer.header_offset = 0;
-                self.submitHeaderRecv(slot) catch {
-                    self.removePeer(slot);
-                };
+                // BEP 10: check if peer supports extensions
+                const recv_reserved = peer.handshake_buf[20..28];
+                peer.extensions_supported = ext.supportsExtensions(recv_reserved[0..8].*);
+
+                if (peer.extensions_supported) {
+                    // Send extension handshake first, then interested on send completion
+                    self.submitExtensionHandshake(slot) catch {
+                        // Extension handshake failed; fall through to send interested anyway
+                        self.sendInterestedAndGoActive(slot);
+                        return;
+                    };
+                    peer.state = .extension_handshake_send;
+                    // Start receiving messages while we wait for extension handshake send to complete
+                    peer.header_offset = 0;
+                    self.submitHeaderRecv(slot) catch {
+                        self.removePeer(slot);
+                    };
+                } else {
+                    self.sendInterestedAndGoActive(slot);
+                }
             },
             .inbound_handshake_recv => {
                 // Seed mode: we received the peer's handshake
@@ -1041,12 +1064,17 @@ pub const EventLoop = struct {
                     return;
                 }
                 peer.torrent_id = resp_tid;
+                // BEP 10: check if inbound peer supports extensions
+                const inbound_reserved = peer.handshake_buf[20..28];
+                peer.extensions_supported = ext.supportsExtensions(inbound_reserved[0..8].*);
                 // Send our handshake back
                 peer.state = .inbound_handshake_send;
                 var buf: [68]u8 = undefined;
                 buf[0] = pw.protocol_length;
                 @memcpy(buf[1 .. 1 + pw.protocol_string.len], pw.protocol_string);
                 @memset(buf[20..28], 0);
+                // BEP 10: advertise extension protocol support
+                buf[20 + ext.reserved_byte] |= ext.reserved_mask;
                 @memcpy(buf[28..48], &resp_tc.info_hash);
                 @memcpy(buf[48..68], &resp_tc.peer_id);
                 @memcpy(peer.handshake_buf[0..68], &buf);
@@ -1263,6 +1291,33 @@ pub const EventLoop = struct {
                             }
                         }
                     }
+                }
+            },
+            ext.msg_id => {
+                // BEP 10: extension message
+                if (payload.len < 1) return;
+                const sub_id = payload[0];
+                const ext_payload = payload[1..];
+
+                if (sub_id == ext.handshake_sub_id) {
+                    // Extension handshake: parse peer's extension map
+                    var result = ext.decodeExtensionHandshake(self.allocator, ext_payload) catch {
+                        log.debug("slot {d}: failed to decode extension handshake", .{slot});
+                        return;
+                    };
+                    peer.extension_ids = result.handshake.extensions;
+                    log.debug("slot {d}: peer extensions: ut_metadata={d} ut_pex={d} client={s}", .{
+                        slot,
+                        result.handshake.extensions.ut_metadata,
+                        result.handshake.extensions.ut_pex,
+                        result.handshake.client,
+                    });
+                    ext.freeDecoded(self.allocator, &result);
+                } else {
+                    // Extension-specific message -- stub for future handlers
+                    log.debug("slot {d}: unhandled extension message sub_id={d} len={d}", .{
+                        slot, sub_id, ext_payload.len,
+                    });
                 }
             },
             else => {},
@@ -2049,6 +2104,60 @@ pub const EventLoop = struct {
         }
         // Results are already swapped out of the hasher -- no clearResults needed.
         self.hash_result_swap.clearRetainingCapacity();
+    }
+
+    // ── BEP 10 helpers ────────────────────────────────────
+
+    /// Send our BEP 10 extension handshake as a tracked (heap-allocated) send.
+    fn submitExtensionHandshake(self: *EventLoop, slot: u16) !void {
+        const peer = &self.peers[slot];
+        // Encode the bencoded extension handshake payload
+        const ext_payload = try ext.encodeExtensionHandshake(self.allocator, self.port);
+        defer self.allocator.free(ext_payload);
+
+        // Build the full framed message: 4-byte len | msg_id=20 | sub_id=0 | payload
+        const frame = try ext.serializeExtensionMessage(self.allocator, ext.handshake_sub_id, ext_payload);
+
+        // Track for cleanup
+        try self.pending_sends.append(self.allocator, .{ .buf = frame, .slot = slot });
+
+        const ud = encodeUserData(.{ .slot = slot, .op_type = .peer_send, .context = 1 }); // context=1 = tracked
+        _ = try self.ring.send(ud, peer.fd, frame, 0);
+        peer.send_pending = true;
+    }
+
+    /// Helper: send interested and transition to active recv (outbound download peer).
+    fn sendInterestedAndGoActive(self: *EventLoop, slot: u16) void {
+        const peer = &self.peers[slot];
+        self.submitMessage(slot, 2, &.{}) catch {
+            self.removePeer(slot);
+            return;
+        };
+        peer.am_interested = true;
+        peer.state = .active_recv_header;
+        peer.header_offset = 0;
+        self.submitHeaderRecv(slot) catch {
+            self.removePeer(slot);
+        };
+    }
+
+    /// Helper: send bitfield (if available) then unchoke for an inbound seed peer.
+    fn sendInboundBitfieldOrUnchoke(self: *EventLoop, slot: u16) void {
+        const peer = &self.peers[slot];
+        const tc_bp = self.getTorrentContext(peer.torrent_id);
+        if ((if (tc_bp) |t| t.complete_pieces else null) orelse self.complete_pieces) |cp| {
+            peer.state = .inbound_bitfield_send;
+            self.submitMessage(slot, 5, cp.bits) catch {
+                self.removePeer(slot);
+            };
+        } else {
+            // No bitfield to send, go straight to unchoke
+            peer.state = .inbound_unchoke_send;
+            peer.am_choking = false;
+            self.submitMessage(slot, 1, &.{}) catch {
+                self.removePeer(slot);
+            };
+        }
     }
 
     // ── SQE helpers ───────────────────────────────────────

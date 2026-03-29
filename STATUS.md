@@ -44,6 +44,7 @@ Update it whenever a milestone lands, the near-term backlog changes, or a new op
 - **Selective file download**: per-file priorities (normal/high/do_not_download), piece-mask based filtering, boundary-piece handling for cross-file pieces, lazy file creation for previously-skipped files.
 - **Sequential download mode**: per-torrent toggle switches PieceTracker from rarest-first to lowest-index selection, enabling streaming playback while downloading.
 - **uTP protocol layer (BEP 29)**: packet header codec, UtpSocket state machine, LEDBAT congestion control, UtpManager connection multiplexer with accept queue. 30+ tests.
+- **BEP 10 (Extension Protocol)**: extension handshake negotiation in reserved bytes, extension message parsing. Advertises ut_metadata and ut_pex. Peer extension ID mapping stored per-peer.
 - **Testing**: 19 peer wire protocol tests, bencode fuzz/edge tests, HTTP parser edge tests, comprehensive transfer test matrix (23 test cases: 1KB-50MB, 16KB/64KB/256KB pieces, multi-file torrents).
 
 ## Next
@@ -51,7 +52,7 @@ Update it whenever a milestone lands, the near-term backlog changes, or a new op
 ### Essential for Private Tracker Use
 - **Bind interface / SO_BINDTODEVICE**: restrict daemon to specific NIC/VPN interface (config + socket option).
 - **SOCKS/HTTP proxy support**: for tracker and peer connections (privacy, region-locked trackers).
-- **BEP 10 (Extension Protocol)**: extension handshake in reserved bytes — prerequisite for MSE, ut_metadata, PEX.
+- ~~**BEP 10 (Extension Protocol)**: extension handshake in reserved bytes — prerequisite for MSE, ut_metadata, PEX.~~ (Done)
 - **MSE encryption (BEP 6)**: message stream encryption, required by many private trackers.
 - **Scrape support**: query peer counts without announcing.
 - ~~**Selective file download**: skip files in multi-file torrents, file priority levels.~~ (Done)
