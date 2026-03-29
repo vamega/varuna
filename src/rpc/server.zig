@@ -141,7 +141,7 @@ pub const ApiServer = struct {
         const new_fd: posix.fd_t = @intCast(cqe.res);
 
         const slot = self.allocClientSlot() orelse {
-            posix.close(new_fd);
+            _ = self.ring.inner.close(0, new_fd) catch {};
             self.submitAccept() catch {};
             return;
         };
@@ -149,7 +149,7 @@ pub const ApiServer = struct {
         var client = &self.clients[slot];
         client.fd = new_fd;
         client.recv_buf = self.allocator.alloc(u8, recv_buf_size) catch {
-            posix.close(new_fd);
+            _ = self.ring.inner.close(0, new_fd) catch {};
             client.fd = -1;
             self.submitAccept() catch {};
             return;
@@ -258,7 +258,10 @@ pub const ApiServer = struct {
 
     fn closeClient(self: *ApiServer, slot: u8) void {
         const client = &self.clients[slot];
-        if (client.fd >= 0) posix.close(client.fd);
+        if (client.fd >= 0) {
+            _ = self.ring.inner.close(0, client.fd) catch {};
+            client.fd = -1;
+        }
         if (client.recv_buf) |buf| self.allocator.free(buf);
         client.* = .{};
     }
