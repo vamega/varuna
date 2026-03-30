@@ -290,7 +290,7 @@ pub const PieceTracker = struct {
         if (self.complete.has(piece_index)) {
             return false; // Duplicate completion from endgame mode
         }
-        self.complete.set(piece_index) catch {};
+        self.complete.set(piece_index) catch return false;
         self.bytes_complete += piece_length;
         self.progress_cond.signal();
         return true;
@@ -327,6 +327,19 @@ pub const PieceTracker = struct {
         self.mutex.lock();
         defer self.mutex.unlock();
         return self.complete.has(piece_index);
+    }
+
+    /// Count completed pieces in the range [start, end_exclusive) under a single lock.
+    /// Used by RPC handlers to compute per-file progress without per-piece locking.
+    pub fn countCompleteInRange(self: *PieceTracker, start: u32, end_exclusive: u32) u32 {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        var count: u32 = 0;
+        var idx = start;
+        while (idx < end_exclusive) : (idx += 1) {
+            if (self.complete.has(idx)) count += 1;
+        }
+        return count;
     }
 
     /// Returns true when all *wanted* pieces are complete.

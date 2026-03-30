@@ -189,6 +189,9 @@ pub const EventLoop = struct {
         buf: []u8,
         sent: usize = 0,
         slot: u16,
+        /// Unique ID for matching CQEs to the correct PendingSend when
+        /// multiple sends are in-flight for the same slot.
+        send_id: u32,
     };
 
     /// A uTP packet waiting to be sent over the UDP socket.
@@ -269,6 +272,9 @@ pub const EventLoop = struct {
 
     // Pending sends: track allocated send buffers (for seed piece responses).
     pending_sends: std.ArrayList(PendingSend),
+    // Monotonic counter for unique PendingSend identification across CQEs.
+    // Starts at 1 because context=0 means "untracked send" (no PendingSend entry).
+    next_send_id: u32 = 1,
 
     // Pending piece reads: async disk reads for seed piece serving.
     pending_reads: std.ArrayList(PendingPieceRead),
@@ -918,15 +924,32 @@ pub const EventLoop = struct {
         _ = try self.ring.accept(ud, self.listen_fd, null, null, posix.SOCK.CLOEXEC | posix.SOCK.NONBLOCK);
     }
 
+    /// Allocate a unique send_id for a new PendingSend and return the
+    /// encoded user data with the send_id in the context field.
+    /// Allocate a unique send_id for a new PendingSend and return the
+    /// encoded user data with the send_id in the context field.
+    /// send_id is never 0, since context=0 means "untracked send".
+    pub fn nextTrackedSendUserData(self: *EventLoop, slot: u16) struct { ud: u64, send_id: u32 } {
+        const id = self.next_send_id;
+        self.next_send_id +%= 1;
+        if (self.next_send_id == 0) self.next_send_id = 1;
+        return .{
+            .ud = encodeUserData(.{ .slot = slot, .op_type = .peer_send, .context = @as(u40, id) }),
+            .send_id = id,
+        };
+    }
+
     /// Handle partial send: re-submit remaining bytes. Returns true if partial (more to send).
-    pub fn handlePartialSend(self: *EventLoop, slot: u16, bytes_sent: usize) bool {
+    /// Matches by send_id (extracted from the CQE context field) so that multiple
+    /// in-flight sends for the same slot are correctly distinguished.
+    pub fn handlePartialSend(self: *EventLoop, slot: u16, send_id: u32, bytes_sent: usize) bool {
         for (self.pending_sends.items) |*ps| {
-            if (ps.slot == slot) {
+            if (ps.slot == slot and ps.send_id == send_id) {
                 ps.sent += bytes_sent;
                 if (ps.sent < ps.buf.len) {
-                    // Partial send -- re-submit remainder
+                    // Partial send -- re-submit remainder with same send_id
                     const remaining = ps.buf[ps.sent..];
-                    const ud = encodeUserData(.{ .slot = slot, .op_type = .peer_send, .context = 1 });
+                    const ud = encodeUserData(.{ .slot = slot, .op_type = .peer_send, .context = @as(u40, send_id) });
                     _ = self.ring.send(ud, self.peers[slot].fd, remaining, 0) catch {
                         return false; // treat as complete on error
                     };
@@ -939,14 +962,14 @@ pub const EventLoop = struct {
         return false;
     }
 
-    /// Free ONE pending send buffer for the given slot (the first match).
+    /// Free ONE pending send buffer matching the send_id.
     /// Called when a single send CQE completes -- each CQE corresponds to
     /// exactly one buffer.  Freeing all buffers for a slot here would be a
     /// use-after-free when multiple tracked sends are in flight for the
     /// same peer (e.g. extension handshake + piece response).
-    pub fn freeOnePendingSend(self: *EventLoop, slot: u16) void {
+    pub fn freeOnePendingSend(self: *EventLoop, slot: u16, send_id: u32) void {
         for (self.pending_sends.items, 0..) |ps, i| {
-            if (ps.slot == slot) {
+            if (ps.slot == slot and ps.send_id == send_id) {
                 self.allocator.free(ps.buf);
                 _ = self.pending_sends.swapRemove(i);
                 return;

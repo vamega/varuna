@@ -105,32 +105,31 @@ pub fn handleConnect(self: *EventLoop, slot: u16, cqe: linux.io_uring_cqe) void 
 
 pub fn handleSend(self: *EventLoop, slot: u16, cqe: linux.io_uring_cqe) void {
     const peer = &self.peers[slot];
+    const op = decodeUserData(cqe.user_data);
+    const send_id: u32 = @truncate(op.context);
 
     // Guard: if the peer slot was already freed (stale CQE from a
     // previously-closed fd), just free the tracked buffer if any.
     if (peer.state == .free) {
-        const op = decodeUserData(cqe.user_data);
-        if (op.context == 1) self.freeOnePendingSend(slot);
+        if (op.context != 0) self.freeOnePendingSend(slot, send_id);
         return;
     }
 
     if (cqe.res <= 0) {
         // Check if this was a tracked send buffer -- free it on error.
         // Only free ONE buffer: removePeer will clean up the rest.
-        const op = decodeUserData(cqe.user_data);
-        if (op.context == 1) self.freeOnePendingSend(slot);
+        if (op.context != 0) self.freeOnePendingSend(slot, send_id);
         self.removePeer(slot);
         return;
     }
 
-    // Check if this was a tracked send buffer (context=1)
-    const op = decodeUserData(cqe.user_data);
-    if (op.context == 1) {
+    // Check if this was a tracked send buffer (context != 0, send_id encoded)
+    if (op.context != 0) {
         const bytes_sent: usize = @intCast(cqe.res);
         // Check for partial send and re-submit remainder
-        if (!self.handlePartialSend(slot, bytes_sent)) {
+        if (!self.handlePartialSend(slot, send_id, bytes_sent)) {
             // Full send complete, free the buffer
-            self.freeOnePendingSend(slot);
+            self.freeOnePendingSend(slot, send_id);
         }
     }
 

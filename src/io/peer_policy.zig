@@ -123,14 +123,14 @@ pub fn tryFillPipeline(self: *EventLoop, slot: u16) !void {
         std.mem.writeInt(u32, send_buf[offset + 13 ..][0..4], req.length, .big);
     }
 
-    // Track for cleanup
-    self.pending_sends.append(self.allocator, .{ .buf = send_buf, .slot = slot }) catch {
+    // Track for cleanup with unique send_id
+    const ts = self.nextTrackedSendUserData(slot);
+    self.pending_sends.append(self.allocator, .{ .buf = send_buf, .slot = slot, .send_id = ts.send_id }) catch {
         self.allocator.free(send_buf);
         return;
     };
 
-    const ud = encodeUserData(.{ .slot = slot, .op_type = .peer_send, .context = 1 });
-    _ = self.ring.send(ud, peer.fd, send_buf, 0) catch {
+    _ = self.ring.send(ts.ud, peer.fd, send_buf, 0) catch {
         self.allocator.free(send_buf);
         return;
     };

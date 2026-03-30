@@ -3,6 +3,7 @@ const server = @import("server.zig");
 const auth = @import("auth.zig");
 const multipart = @import("multipart.zig");
 const sync_mod = @import("sync.zig");
+const json_mod = @import("json.zig");
 const SessionManager = @import("../daemon/session_manager.zig").SessionManager;
 const TorrentSession = @import("../daemon/torrent_session.zig");
 const metainfo_mod = @import("../torrent/metainfo.zig");
@@ -448,27 +449,52 @@ pub const ApiHandler = struct {
         const hash = extractParam(body, "hash") orelse
             return .{ .status = 400, .body = "{\"error\":\"missing hash\"}" };
 
-        // Get file info with all data copied under the SessionManager mutex,
-        // avoiding use-after-free if the session is removed concurrently.
-        const file_infos = self.session_manager.getSessionFiles(allocator, hash) catch |err| switch (err) {
-            error.TorrentNotFound => return .{ .status = 404, .body = "{\"error\":\"torrent not found\"}" },
-            error.TorrentNotReady => return .{ .status = 409, .body = "{\"error\":\"torrent metadata not ready\"}" },
-            else => return .{ .status = 500, .body = "{\"error\":\"internal\"}" },
-        };
-        defer SessionManager.freeFileInfos(allocator, file_infos);
+        const session = self.session_manager.getSession(hash) catch
+            return .{ .status = 404, .body = "{\"error\":\"torrent not found\"}" };
 
+        // Need parsed session for file metadata
+        const sess = session.session orelse
+            return .{ .status = 409, .body = "{\"error\":\"torrent metadata not ready\"}" };
+
+        const meta = sess.metainfo;
         var json = std.ArrayList(u8).empty;
         defer json.deinit(allocator);
 
         json.append(allocator, '[') catch return .{ .status = 500, .body = "[]" };
 
-        for (file_infos, 0..) |fi, i| {
+        for (meta.files, 0..) |file, i| {
             if (i > 0) json.append(allocator, ',') catch {};
-            json.print(allocator, "{{\"name\":\"{s}\",\"size\":{},\"progress\":{d:.4},\"priority\":{}}}", .{
-                fi.name,
-                fi.size,
-                fi.progress,
-                fi.priority,
+
+            // Compute per-file progress by checking which pieces overlap this file
+            const layout_file = sess.layout.files[i];
+            var file_progress: f64 = 0.0;
+            if (session.piece_tracker) |*pt| {
+                const total_file_pieces = layout_file.end_piece_exclusive - layout_file.first_piece;
+                if (total_file_pieces > 0) {
+                    const pieces_complete = pt.countCompleteInRange(layout_file.first_piece, layout_file.end_piece_exclusive);
+                    file_progress = @as(f64, @floatFromInt(pieces_complete)) / @as(f64, @floatFromInt(total_file_pieces));
+                }
+            }
+
+            // Build file name from path components
+            var name_buf = std.ArrayList(u8).empty;
+            defer name_buf.deinit(allocator);
+            for (file.path, 0..) |component, ci| {
+                if (ci > 0) name_buf.append(allocator, '/') catch {};
+                name_buf.appendSlice(allocator, component) catch {};
+            }
+
+            // Get file priority (default 1=normal)
+            const priority: u8 = if (session.file_priorities) |fp|
+                if (i < fp.len) fp[i] else 1
+            else
+                1;
+
+            json.print(allocator, "{{\"name\":\"{f}\",\"size\":{},\"progress\":{d:.4},\"priority\":{}}}", .{
+                json_mod.jsonSafe(name_buf.items),
+                file.length,
+                file_progress,
+                priority,
             }) catch {};
         }
 
@@ -481,31 +507,59 @@ pub const ApiHandler = struct {
         const hash = extractParam(body, "hash") orelse
             return .{ .status = 400, .body = "{\"error\":\"missing hash\"}" };
 
-        // Get tracker info with all data copied under the SessionManager mutex,
-        // avoiding use-after-free if the session is removed concurrently.
-        const tracker_infos = self.session_manager.getSessionTrackers(allocator, hash) catch |err| switch (err) {
-            error.TorrentNotFound => return .{ .status = 404, .body = "{\"error\":\"torrent not found\"}" },
-            error.TorrentNotReady => return .{ .status = 409, .body = "{\"error\":\"torrent metadata not ready\"}" },
-            else => return .{ .status = 500, .body = "{\"error\":\"internal\"}" },
-        };
-        defer SessionManager.freeTrackerInfos(allocator, tracker_infos);
+        const session = self.session_manager.getSession(hash) catch
+            return .{ .status = 404, .body = "{\"error\":\"torrent not found\"}" };
+
+        const sess = session.session orelse
+            return .{ .status = 409, .body = "{\"error\":\"torrent metadata not ready\"}" };
+
+        const meta = sess.metainfo;
 
         var json = std.ArrayList(u8).empty;
         defer json.deinit(allocator);
 
         json.append(allocator, '[') catch return .{ .status = 500, .body = "[]" };
 
-        for (tracker_infos, 0..) |ti, i| {
-            if (i > 0) json.append(allocator, ',') catch {};
+        var tier: u32 = 0;
+        var first = true;
+
+        // Scrape stats (shared across all trackers for now)
+        const stats = session.getStats();
+        const scrape_complete = stats.scrape_complete;
+        const scrape_incomplete = stats.scrape_incomplete;
+        const scrape_downloaded = stats.scrape_downloaded;
+
+        // Primary announce URL
+        if (meta.announce) |url| {
+            if (!first) json.append(allocator, ',') catch {};
+            first = false;
+            // Status: 1 = contacted, 2 = working, 0 = disabled
+            const status: u8 = if (session.state == .downloading or session.state == .seeding) 2 else 1;
             json.print(allocator, "{{\"url\":\"{s}\",\"status\":{},\"tier\":{},\"num_peers\":{},\"num_seeds\":{},\"num_leeches\":{},\"num_downloaded\":{}}}", .{
-                ti.url,
-                ti.status,
-                ti.tier,
-                ti.num_peers,
-                ti.num_seeds,
-                ti.num_leeches,
-                ti.num_downloaded,
+                url,
+                status,
+                tier,
+                stats.peers_connected,
+                scrape_complete,
+                scrape_incomplete,
+                scrape_downloaded,
             }) catch {};
+            tier += 1;
+        }
+
+        // Announce list URLs
+        for (meta.announce_list) |url| {
+            // Skip if same as primary announce
+            if (meta.announce) |primary| {
+                if (std.mem.eql(u8, url, primary)) continue;
+            }
+            if (!first) json.append(allocator, ',') catch {};
+            first = false;
+            json.print(allocator, "{{\"url\":\"{s}\",\"status\":1,\"tier\":{},\"num_peers\":0,\"num_seeds\":0,\"num_leeches\":0,\"num_downloaded\":0}}", .{
+                url,
+                tier,
+            }) catch {};
+            tier += 1;
         }
 
         json.append(allocator, ']') catch {};
@@ -517,17 +571,14 @@ pub const ApiHandler = struct {
         const hash = extractParam(body, "hash") orelse
             return .{ .status = 400, .body = "{\"error\":\"missing hash\"}" };
 
-        // Get properties with all data copied under the SessionManager mutex,
-        // avoiding use-after-free if the session is removed concurrently.
-        const props = self.session_manager.getSessionProperties(allocator, hash) catch |err| switch (err) {
-            error.TorrentNotFound => return .{ .status = 404, .body = "{\"error\":\"torrent not found\"}" },
-            else => return .{ .status = 500, .body = "{\"error\":\"internal\"}" },
-        };
-        defer SessionManager.freePropertiesInfo(allocator, props);
+        const session = self.session_manager.getSession(hash) catch
+            return .{ .status = 404, .body = "{\"error\":\"torrent not found\"}" };
 
-        const stat = props.stats;
-        const comment = props.comment;
-        const piece_size = props.piece_size;
+        const stat = session.getStats();
+
+        // Get optional metadata fields
+        const comment: []const u8 = if (session.session) |*sess| (sess.metainfo.comment orelse "") else "";
+        const piece_size: u32 = if (session.session) |*sess| sess.metainfo.piece_length else 0;
 
         // Time active since added
         const now = std.time.timestamp();
@@ -866,11 +917,12 @@ pub const ApiHandler = struct {
 };
 
 fn serializeTorrentInfo(allocator: std.mem.Allocator, json: *std.ArrayList(u8), stat: TorrentSession.Stats) !void {
+    const esc = json_mod.jsonSafe;
     try json.print(
         allocator,
-        "{{\"name\":\"{s}\",\"hash\":\"{s}\",\"state\":\"{s}\",\"size\":{},\"progress\":{d:.4},\"dlspeed\":{},\"upspeed\":{},\"num_seeds\":{},\"num_leechs\":{},\"added_on\":{},\"save_path\":\"{s}\",\"pieces_have\":{},\"pieces_num\":{},\"dl_limit\":{},\"up_limit\":{},\"eta\":{},\"ratio\":{d:.4},\"seq_dl\":{},\"is_private\":{},\"category\":\"{s}\",\"tags\":\"{s}\"}}",
+        "{{\"name\":\"{f}\",\"hash\":\"{s}\",\"state\":\"{s}\",\"size\":{},\"progress\":{d:.4},\"dlspeed\":{},\"upspeed\":{},\"num_seeds\":{},\"num_leechs\":{},\"added_on\":{},\"save_path\":\"{f}\",\"pieces_have\":{},\"pieces_num\":{},\"dl_limit\":{},\"up_limit\":{},\"eta\":{},\"ratio\":{d:.4},\"seq_dl\":{},\"is_private\":{},\"category\":\"{f}\",\"tags\":\"{f}\"}}",
         .{
-            stat.name,
+            esc(stat.name),
             stat.info_hash_hex,
             @tagName(stat.state),
             stat.total_size,
@@ -880,7 +932,7 @@ fn serializeTorrentInfo(allocator: std.mem.Allocator, json: *std.ArrayList(u8), 
             stat.scrape_complete,
             stat.peers_connected,
             stat.added_on,
-            stat.save_path,
+            esc(stat.save_path),
             stat.pieces_have,
             stat.pieces_total,
             stat.dl_limit,
@@ -889,8 +941,8 @@ fn serializeTorrentInfo(allocator: std.mem.Allocator, json: *std.ArrayList(u8), 
             stat.ratio,
             @as(u8, if (stat.sequential_download) 1 else 0),
             @as(u8, if (stat.is_private) 1 else 0),
-            stat.category,
-            stat.tags,
+            esc(stat.category),
+            esc(stat.tags),
         },
     );
 }

@@ -202,11 +202,11 @@ pub fn submitMessage(self: *EventLoop, slot: u16, id: u8, payload: []const u8) !
         @memcpy(send_buf[0..5], &header);
         @memcpy(send_buf[5..total_len], payload);
 
-        // Track for cleanup
-        try self.pending_sends.append(self.allocator, .{ .buf = send_buf, .slot = slot });
+        // Track for cleanup with unique send_id
+        const ts = self.nextTrackedSendUserData(slot);
+        try self.pending_sends.append(self.allocator, .{ .buf = send_buf, .slot = slot, .send_id = ts.send_id });
 
-        const ud = encodeUserData(.{ .slot = slot, .op_type = .peer_send, .context = 1 }); // context=1 = tracked
-        _ = try self.ring.send(ud, peer.fd, send_buf, 0);
+        _ = try self.ring.send(ts.ud, peer.fd, send_buf, 0);
         peer.send_pending = true;
     }
 }
@@ -223,11 +223,11 @@ pub fn submitExtensionHandshake(self: *EventLoop, slot: u16) !void {
     // Build the full framed message: 4-byte len | msg_id=20 | sub_id=0 | payload
     const frame = try ext.serializeExtensionMessage(self.allocator, ext.handshake_sub_id, ext_payload);
 
-    // Track for cleanup
-    try self.pending_sends.append(self.allocator, .{ .buf = frame, .slot = slot });
+    // Track for cleanup with unique send_id
+    const ts = self.nextTrackedSendUserData(slot);
+    try self.pending_sends.append(self.allocator, .{ .buf = frame, .slot = slot, .send_id = ts.send_id });
 
-    const ud = encodeUserData(.{ .slot = slot, .op_type = .peer_send, .context = 1 }); // context=1 = tracked
-    _ = try self.ring.send(ud, peer.fd, frame, 0);
+    _ = try self.ring.send(ts.ud, peer.fd, frame, 0);
     peer.send_pending = true;
 }
 

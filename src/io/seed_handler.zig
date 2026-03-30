@@ -204,20 +204,21 @@ pub fn flushQueuedResponses(self: *EventLoop) void {
 
         peer.bytes_uploaded_to += total_uploaded;
 
+        const ts = self.nextTrackedSendUserData(current_slot);
         self.pending_sends.append(self.allocator, .{
             .buf = send_buf,
             .slot = current_slot,
+            .send_id = ts.send_id,
         }) catch {
             self.allocator.free(send_buf);
             i = j;
             continue;
         };
 
-        const ud = encodeUserData(.{ .slot = current_slot, .op_type = .peer_send, .context = 1 });
-        _ = self.ring.send(ud, peer.fd, send_buf, 0) catch {
+        _ = self.ring.send(ts.ud, peer.fd, send_buf, 0) catch {
             // SQE submission failed -- free via the pending_sends entry
             // to avoid leaving a dangling pointer in the list.
-            self.freeOnePendingSend(current_slot);
+            self.freeOnePendingSend(current_slot, ts.send_id);
             i = j;
             continue;
         };
@@ -249,19 +250,20 @@ pub fn sendPieceBlock(self: *EventLoop, slot: u16, piece_index: u32, block_offse
     _ = self.consumeUploadTokens(peer.torrent_id, block_length);
     peer.bytes_uploaded_to += block_length;
 
+    const ts = self.nextTrackedSendUserData(slot);
     self.pending_sends.append(self.allocator, .{
         .buf = send_buf,
         .slot = slot,
+        .send_id = ts.send_id,
     }) catch {
         self.allocator.free(send_buf);
         return;
     };
 
-    const ud = encodeUserData(.{ .slot = slot, .op_type = .peer_send, .context = 1 });
-    _ = self.ring.send(ud, peer.fd, send_buf, 0) catch {
+    _ = self.ring.send(ts.ud, peer.fd, send_buf, 0) catch {
         // SQE submission failed -- free via the pending_sends entry
         // (not directly) to avoid leaving a dangling pointer.
-        self.freeOnePendingSend(slot);
+        self.freeOnePendingSend(slot, ts.send_id);
         return;
     };
     peer.send_pending = true;

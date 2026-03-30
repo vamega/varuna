@@ -1,6 +1,7 @@
 const std = @import("std");
 const TorrentStats = @import("../daemon/torrent_session.zig").Stats;
 const SessionManager = @import("../daemon/session_manager.zig").SessionManager;
+const json_mod = @import("json.zig");
 
 /// Delta sync state for the /api/v2/sync/maindata endpoint.
 /// Tracks torrent snapshots across request IDs so that only changes
@@ -238,11 +239,12 @@ fn statsHash(stat: TorrentStats) u64 {
 
 /// Serialize a full torrent stats object as a JSON object.
 fn serializeTorrentObject(allocator: std.mem.Allocator, json: *std.ArrayList(u8), stat: TorrentStats) !void {
+    const esc = json_mod.jsonSafe;
     try json.print(
         allocator,
-        "{{\"name\":\"{s}\",\"hash\":\"{s}\",\"state\":\"{s}\",\"size\":{},\"progress\":{d:.4},\"dlspeed\":{},\"upspeed\":{},\"num_seeds\":{},\"num_leechs\":{},\"added_on\":{},\"save_path\":\"{s}\",\"pieces_have\":{},\"pieces_num\":{},\"dl_limit\":{},\"up_limit\":{},\"eta\":{},\"ratio\":{d:.4},\"seq_dl\":{},\"is_private\":{},\"category\":\"{s}\",\"tags\":\"{s}\"}}",
+        "{{\"name\":\"{f}\",\"hash\":\"{s}\",\"state\":\"{s}\",\"size\":{},\"progress\":{d:.4},\"dlspeed\":{},\"upspeed\":{},\"num_seeds\":{},\"num_leechs\":{},\"added_on\":{},\"save_path\":\"{f}\",\"pieces_have\":{},\"pieces_num\":{},\"dl_limit\":{},\"up_limit\":{},\"eta\":{},\"ratio\":{d:.4},\"seq_dl\":{},\"is_private\":{},\"category\":\"{f}\",\"tags\":\"{f}\"}}",
         .{
-            stat.name,
+            esc(stat.name),
             stat.info_hash_hex,
             @tagName(stat.state),
             stat.total_size,
@@ -252,7 +254,7 @@ fn serializeTorrentObject(allocator: std.mem.Allocator, json: *std.ArrayList(u8)
             stat.scrape_complete,
             stat.peers_connected,
             stat.added_on,
-            stat.save_path,
+            esc(stat.save_path),
             stat.pieces_have,
             stat.pieces_total,
             stat.dl_limit,
@@ -261,8 +263,8 @@ fn serializeTorrentObject(allocator: std.mem.Allocator, json: *std.ArrayList(u8)
             stat.ratio,
             @as(u8, if (stat.sequential_download) 1 else 0),
             @as(u8, if (stat.is_private) 1 else 0),
-            stat.category,
-            stat.tags,
+            esc(stat.category),
+            esc(stat.tags),
         },
     );
 }
