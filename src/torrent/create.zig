@@ -1,4 +1,5 @@
 const std = @import("std");
+const Sha1 = @import("../crypto/sha1.zig");
 const Ring = @import("../io/ring.zig").Ring;
 
 pub const CreateOptions = struct {
@@ -41,7 +42,7 @@ pub fn createSingleFile(
         if (n != to_read) return error.UnexpectedEndOfFile;
 
         var digest: [20]u8 = undefined;
-        std.crypto.hash.Sha1.hash(read_buffer[0..to_read], &digest, .{});
+        Sha1.hash(read_buffer[0..to_read], &digest, .{});
         @memcpy(piece_hashes[piece_index * 20 ..][0..20], &digest);
     }
 
@@ -214,7 +215,7 @@ fn hashMultiFilePieces(
     const read_buffer = try allocator.alloc(u8, piece_length);
     defer allocator.free(read_buffer);
 
-    var hasher = std.crypto.hash.Sha1.init(.{});
+    var hasher = Sha1.init(.{});
     var piece_index: usize = 0;
     var bytes_in_piece: usize = 0;
 
@@ -237,7 +238,7 @@ fn hashMultiFilePieces(
 
             if (bytes_in_piece == piece_length) {
                 hasher.final(piece_hashes[piece_index * 20 ..][0..20]);
-                hasher = std.crypto.hash.Sha1.init(.{});
+                hasher = Sha1.init(.{});
                 piece_index += 1;
                 bytes_in_piece = 0;
             }

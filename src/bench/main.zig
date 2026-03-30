@@ -74,25 +74,52 @@ fn benchBencodeParse(stdout: *std.Io.Writer) !void {
     try printResult(stdout, "bencode_parse", iterations, timer.read(), total_bytes, checksum);
 }
 
-fn benchSha1(stdout: *std.Io.Writer) !void {
-    const piece_size: usize = 256 * 1024;
-    var buffer: [piece_size]u8 = undefined;
-    for (&buffer, 0..) |*byte, i| {
-        byte.* = @truncate(i *% 7 +% 13);
-    }
-
-    const iterations: usize = 500;
-
+fn benchSha1Generic(
+    stdout: *std.Io.Writer,
+    comptime HashFn: type,
+    comptime name: []const u8,
+    buffer: []const u8,
+    iterations: usize,
+) !void {
     var timer = try std.time.Timer.start();
     var checksum: u64 = 0;
     for (0..iterations) |_| {
         var digest: [20]u8 = undefined;
-        std.crypto.hash.Sha1.hash(&buffer, &digest, .{});
+        HashFn.hash(buffer, &digest, .{});
         checksum +%= digest[0];
     }
 
-    const total_bytes: u64 = @as(u64, iterations) * piece_size;
-    try printResult(stdout, "sha1_256kb", iterations, timer.read(), total_bytes, checksum);
+    const total_bytes: u64 = @as(u64, iterations) * buffer.len;
+    try printResult(stdout, name, iterations, timer.read(), total_bytes, checksum);
+}
+
+fn benchSha1(stdout: *std.Io.Writer) !void {
+    const Sha1 = varuna.crypto.Sha1;
+    const StdSha1 = std.crypto.hash.Sha1;
+
+    const piece_256k: usize = 256 * 1024;
+    const piece_1m: usize = 1024 * 1024;
+    var buffer_256k: [piece_256k]u8 = undefined;
+    var buffer_1m: [piece_1m]u8 = undefined;
+    for (&buffer_256k, 0..) |*byte, i| byte.* = @truncate(i *% 7 +% 13);
+    for (&buffer_1m, 0..) |*byte, i| byte.* = @truncate(i *% 7 +% 13);
+
+    const iterations_256k: usize = 2000;
+    const iterations_1m: usize = 500;
+
+    // Report whether SHA-NI is active
+    try stdout.print("sha1_ni_enabled={}\n", .{Sha1.hasShaNi()});
+    try stdout.flush();
+
+    // std lib (software-only) -- 256KB
+    try benchSha1Generic(stdout, StdSha1, "sha1_std_256kb", &buffer_256k, iterations_256k);
+    // varuna (SHA-NI when available) -- 256KB
+    try benchSha1Generic(stdout, Sha1, "sha1_varuna_256kb", &buffer_256k, iterations_256k);
+
+    // std lib -- 1MB
+    try benchSha1Generic(stdout, StdSha1, "sha1_std_1mb", &buffer_1m, iterations_1m);
+    // varuna -- 1MB
+    try benchSha1Generic(stdout, Sha1, "sha1_varuna_1mb", &buffer_1m, iterations_1m);
 }
 
 fn benchMetainfoParse(stdout: *std.Io.Writer) !void {

@@ -10,19 +10,15 @@ Seed async pread is implemented via `IORING_OP_READ` with piece cache and batche
 
 Implemented in `src/daemon/systemd.zig`. Sends `READY=1` after API server is listening and `STOPPING=1` on shutdown. Uses standard POSIX `AF_UNIX`/`SOCK_DGRAM` socket (one-time setup, not hot path). No libsystemd dependency. Supports both filesystem and abstract (`@`-prefixed) sockets.
 
-## 2. SHA-NI and hardware-accelerated SHA instructions
+## 2. ~~SHA-NI and hardware-accelerated SHA-1~~ (DONE)
 
-Zig std lib SHA-1 is software-only (~1.1 GB/s in release mode). SHA-NI instructions on x86_64 (Intel Goldmont+ 2016, AMD Zen 2017+) can achieve ~3-5 GB/s.
+Implemented in `src/crypto/sha1.zig`. Uses x86_64 SHA-NI instructions (`sha1rnds4`, `sha1nexte`, `sha1msg1`, `sha1msg2`) via Zig inline assembly when compiled for a CPU with SHA-NI support. Falls back to software SHA-1 (same algorithm as `std.crypto.hash.Sha1`) on CPUs without SHA-NI.
 
-Reference implementation: https://github.com/noloader/SHA-Intrinsics -- shows how to detect and use SHA-1/SHA-256 hardware acceleration via intrinsics on x86 (SHA-NI), ARM (SHA extensions), and POWER8 (SHA).
+Benchmark results (ReleaseFast, 256KB pieces): std = ~1,075 MB/s vs SHA-NI = ~2,145 MB/s (2x speedup). Detection is comptime via `builtin.cpu.has(.x86, .sha)`, which is automatically enabled when building on a machine with SHA-NI (Zig's default target uses native CPU features).
 
-Steps:
-1. Create benchmarks comparing std lib SHA-1 vs SHA-NI implementation
-2. Runtime CPU feature detection (`cpuid` for SHA-NI support)
-3. Implement SHA-1 and SHA-256 (for BEP 52 / BitTorrent v2) with intrinsics
-4. Fallback to std lib on CPUs without SHA-NI
+All `std.crypto.hash.Sha1` usages in the codebase replaced with `src/crypto/sha1.zig`.
 
-Note: Zig std lib SHA-256 already has SHA-NI acceleration. Only SHA-1 needs custom work.
+Note: Zig std lib SHA-256 already has SHA-NI acceleration. SHA-256 for BEP 52 (BitTorrent v2) would use std lib directly.
 
 ## 3. ~~uTP support (BEP 29)~~ (Protocol layer DONE, event loop integration TODO)
 

@@ -1,10 +1,11 @@
 const std = @import("std");
+const Sha1 = @import("../crypto/sha1.zig");
 
 pub fn compute(torrent_bytes: []const u8) ![20]u8 {
     const info_bytes = try findInfoBytes(torrent_bytes);
 
     var digest: [20]u8 = undefined;
-    std.crypto.hash.Sha1.hash(info_bytes, &digest, .{});
+    Sha1.hash(info_bytes, &digest, .{});
     return digest;
 }
 
@@ -127,7 +128,7 @@ test "compute info hash matches direct sha1 of raw info bytes" {
 
     const expected_info = "d6:lengthi5e4:name8:test.bin12:piece lengthi16384e6:pieces20:abcdefghijklmnopqrste";
     var expected: [20]u8 = undefined;
-    std.crypto.hash.Sha1.hash(expected_info, &expected, .{});
+    Sha1.hash(expected_info, &expected, .{});
 
     try std.testing.expectEqual(expected, try compute(input));
 }

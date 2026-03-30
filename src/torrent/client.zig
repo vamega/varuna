@@ -1,4 +1,5 @@
 const std = @import("std");
+const Sha1 = @import("../crypto/sha1.zig");
 const peer_wire = @import("../net/peer_wire.zig");
 const storage = @import("../storage/root.zig");
 const tracker = @import("../tracker/root.zig");
@@ -689,7 +690,7 @@ fn buildPieceHashes(
         const end = @min(start + @as(usize, piece_length), payload.len);
 
         var digest: [20]u8 = undefined;
-        std.crypto.hash.Sha1.hash(payload[start..end], &digest, .{});
+        Sha1.hash(payload[start..end], &digest, .{});
         @memcpy(hashes[piece_index * 20 ..][0..20], &digest);
     }
 

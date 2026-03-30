@@ -1,6 +1,7 @@
 const std = @import("std");
 const posix = std.posix;
 const log = std.log.scoped(.event_loop);
+const Sha1 = @import("../crypto/sha1.zig");
 const Bitfield = @import("../bitfield.zig").Bitfield;
 const storage = @import("../storage/root.zig");
 const EventLoop = @import("event_loop.zig").EventLoop;
@@ -174,7 +175,7 @@ pub fn completePieceDownload(self: *EventLoop, slot: u16) void {
         // Fallback: inline verification and write (blocks event loop).
         // This path is only reached if the hasher thread pool failed to create.
         var actual: [20]u8 = undefined;
-        std.crypto.hash.Sha1.hash(piece_buf[0..piece_buf.len], &actual, .{});
+        Sha1.hash(piece_buf[0..piece_buf.len], &actual, .{});
         const valid = std.mem.eql(u8, &actual, &hash);
         if (valid) {
             // Write piece to disk via io_uring

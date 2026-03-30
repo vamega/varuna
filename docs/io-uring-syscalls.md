@@ -157,17 +157,15 @@ Varuna's current minimum kernel is 6.6, which covers everything up to and includ
 
 ## SHA Hardware Acceleration Notes
 
-The current codebase uses `std.crypto.hash.Sha1` for piece verification. Benchmarks show ~8 MB/s in debug mode (much faster in release). Future considerations:
+The codebase uses `src/crypto/sha1.zig` for all SHA-1 piece verification. This module provides SHA-NI hardware acceleration on x86_64 CPUs with SHA extensions (Intel Goldmont+ 2016, AMD Zen 2017+), falling back to a software implementation identical to `std.crypto.hash.Sha1` on other targets.
 
-1. **Zig std lib status**: Check whether `std.crypto.hash.Sha1` uses hardware acceleration (SHA-NI instructions on x86_64, SHA extensions on ARM). If it already does, the win from a custom library is small.
+**Current benchmarks (ReleaseFast, 256KB pieces):**
+- Software (std lib): ~1,075 MB/s
+- SHA-NI (varuna):    ~2,145 MB/s (2x speedup)
 
-2. **SHA-NI / x86_64**: Intel SHA extensions (`sha1msg1`, `sha1msg2`, `sha1rnds4`, `sha1nexte`) provide ~3-5x speedup over software SHA-1. Available on Intel Goldmont+ (2016), AMD Zen (2017), and later.
+Detection is comptime via `builtin.cpu.has(.x86, .sha)`. Zig's default build target uses native CPU features, so SHA-NI is enabled automatically when building on a supported machine. No external libraries or runtime CPUID needed.
 
-3. **External libraries**: If the std lib doesn't use SHA-NI, consider linking a library that does (e.g., OpenSSL's SHA-1, or a dedicated SHA-NI implementation).
-
-4. **BEP 52 (BitTorrent v2)**: Uses SHA-256 instead of SHA-1. Hardware SHA-256 is also available via SHA-NI. Any acceleration work should cover both SHA-1 and SHA-256.
-
-5. **Benchmarking approach**: Compare `std.crypto.hash.Sha1` throughput vs a SHA-NI implementation on the target hardware. If the delta is significant (>2x), add the dependency. If marginal, keep the std lib for simplicity.
+**BEP 52 (BitTorrent v2)**: Uses SHA-256 instead of SHA-1. Zig's `std.crypto.hash.sha2` already has SHA-NI acceleration for SHA-256, so no custom implementation is needed for v2 support.
 
 ## SQLite / Resume State Notes
 

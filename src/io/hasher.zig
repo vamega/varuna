@@ -1,6 +1,7 @@
 const std = @import("std");
 const posix = std.posix;
 const linux = std.os.linux;
+const Sha1 = @import("../crypto/sha1.zig");
 
 const default_thread_count = 4;
 
@@ -198,7 +199,7 @@ pub const Hasher = struct {
 
             // Hash the piece (CPU-intensive, runs in parallel across pool)
             var actual: [20]u8 = undefined;
-            std.crypto.hash.Sha1.hash(job.piece_buf[0..job.piece_length], &actual, .{});
+            Sha1.hash(job.piece_buf[0..job.piece_length], &actual, .{});
             const valid = std.mem.eql(u8, actual[0..], job.expected_hash[0..]);
 
             // Push result
@@ -233,14 +234,14 @@ test "hasher pool verifies pieces correctly" {
     const data1 = try std.testing.allocator.alloc(u8, 4);
     @memcpy(data1, "spam");
     var expected1: [20]u8 = undefined;
-    std.crypto.hash.Sha1.hash("spam", &expected1, .{});
+    Sha1.hash("spam", &expected1, .{});
     try hasher.submitVerify(0, 0, data1, expected1, 0);
 
     // Submit an invalid piece
     const data2 = try std.testing.allocator.alloc(u8, 4);
     @memcpy(data2, "eggs");
     var expected2: [20]u8 = undefined;
-    std.crypto.hash.Sha1.hash("spam", &expected2, .{}); // wrong hash for "eggs"
+    Sha1.hash("spam", &expected2, .{}); // wrong hash for "eggs"
     try hasher.submitVerify(1, 1, data2, expected2, 0);
 
     // Wait for results using the swap-based API

@@ -1,4 +1,5 @@
 const std = @import("std");
+const Sha1 = @import("../crypto/sha1.zig");
 const torrent = @import("../torrent/root.zig");
 const writer = @import("writer.zig");
 
@@ -54,7 +55,7 @@ pub fn verifyPieceBuffer(plan: PiecePlan, piece_data: []const u8) !bool {
     }
 
     var actual: [20]u8 = undefined;
-    std.crypto.hash.Sha1.hash(piece_data, &actual, .{});
+    Sha1.hash(piece_data, &actual, .{});
     return std.mem.eql(u8, actual[0..], plan.expected_hash[0..]);
 }
 
@@ -126,7 +127,7 @@ test "plan verification for multi file piece" {
 
 test "verify piece buffer against expected hash" {
     var hash: [20]u8 = undefined;
-    std.crypto.hash.Sha1.hash("spam", &hash, .{});
+    Sha1.hash("spam", &hash, .{});
 
     const plan = PiecePlan{
         .piece_index = 0,
@@ -146,10 +147,10 @@ test "recheck existing on-disk pieces" {
     defer ring.deinit();
 
     var hash0: [20]u8 = undefined;
-    std.crypto.hash.Sha1.hash("spam", &hash0, .{});
+    Sha1.hash("spam", &hash0, .{});
 
     var hash1: [20]u8 = undefined;
-    std.crypto.hash.Sha1.hash("eggs", &hash1, .{});
+    Sha1.hash("eggs", &hash1, .{});
 
     const hashes = hash0 ++ hash1;
     const input = try std.fmt.allocPrint(
