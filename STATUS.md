@@ -67,14 +67,19 @@ Update it whenever a milestone lands, the near-term backlog changes, or a new op
 - io_uring send buffer UAF fix: split free-one vs free-all pending sends, stale-CQE guards, SQE-submit-failure fix.
 - IORING_OP_CLOSE for hot-path fd cleanup in RPC server.
 - Session use-after-free fix: RPC handlers copy data under mutex instead of holding raw session pointers.
+- Shared event loop lifetime hardening: pause/stop/resume now detach torrents from the shared EventLoop before freeing runtime state, and resume preserves daemon/shared-loop integration.
+- Tracker background-worker hardening: session teardown now waits for both announce and scrape workers, and announce/scrape serialize access to the shared announce ring.
 - Hasher OOM resilience: free piece buffer and log on result append failure.
 - JSON injection prevention: escape helper for all user-provided strings in API responses.
 - Partial send buffer matching: monotonic send_id in CQE context to match correct in-flight buffer.
+- RPC server partial-send handling: API responses now track send progress until the full body is written.
+- Seed/read-path correctness: queued seed responses own exact block copies, async seed reads use unique IDs, and only successfully submitted reads/writes contribute to pending completion counts.
 
 ### Testing
 - 19 peer wire protocol tests, 10 BEP 10 extension tests, 31 uTP/LEDBAT tests, 5 categories tests, 8 resume DB tests.
 - Bencode fuzz + edge case tests, HTTP parser fuzz tests.
 - Fuzz tests for: multipart parser, tracker response, uTP packets, BEP 10 extensions, scrape response (18 fuzz tests total).
+- Regression tests for API partial-send progress, unique seed read IDs, seed block-copy batching, shared-event-loop detach on stop, shared-loop preservation on resume, and failed disk-write release.
 - Transfer test matrix: 24 tests (1KB-100MB, 16KB/64KB/256KB pieces, multi-file torrents). All pass.
 - Daemon swarm integration test, daemon-to-peer seeding test, selective download integration test.
 - SHA-1 benchmarks: std vs SHA-NI vs direct vs memory bandwidth baseline.
@@ -101,7 +106,7 @@ Update it whenever a milestone lands, the near-term backlog changes, or a new op
 
 ## Last Verified Milestone
 
-- `build: convert reference codebases to git submodules, add qui` (`0d69ad3`)
+- Working tree bugfix pass: shared-event-loop lifetime, seed read/response correctness, RPC accessor safety, API partial-send handling
 - Transfer test matrix: 24/24 pass
 - `zig build test`: all tests pass
 - `zig build`: clean build

@@ -387,9 +387,12 @@ pub fn handleDiskWrite(self: *EventLoop, slot: u16, cqe: linux.io_uring_cqe) voi
 
         pending_w.spans_remaining -= 1;
         if (pending_w.spans_remaining == 0) {
-            // All spans written -- mark piece complete and free buffer
+            // All submitted spans completed. If any submit failed earlier,
+            // release the piece so it can be downloaded again.
             if (self.getTorrentContext(pending_w.torrent_id)) |tc| {
-                if (tc.session) |sess| {
+                if (pending_w.write_failed) {
+                    if (tc.piece_tracker) |pt| pt.releasePiece(piece_index);
+                } else if (tc.session) |sess| {
                     if (piece_index < sess.pieceCount()) {
                         const piece_length = sess.layout.pieceSize(piece_index) catch 0;
                         if (tc.piece_tracker) |pt| _ = pt.completePiece(piece_index, piece_length);
@@ -400,4 +403,75 @@ pub fn handleDiskWrite(self: *EventLoop, slot: u16, cqe: linux.io_uring_cqe) voi
             _ = self.pending_writes.remove(key);
         }
     }
+}
+
+test "handleDiskWrite releases piece when any submit failed" {
+    const PieceTracker = @import("../torrent/piece_tracker.zig").PieceTracker;
+    const Bitfield = @import("../bitfield.zig").Bitfield;
+
+    const peers = try std.testing.allocator.alloc(Peer, 1);
+    defer std.testing.allocator.free(peers);
+    @memset(peers, Peer{});
+
+    var el: EventLoop = .{
+        .ring = undefined,
+        .allocator = std.testing.allocator,
+        .peers = peers,
+        .pending_writes = .empty,
+        .pending_sends = std.ArrayList(EventLoop.PendingSend).empty,
+        .pending_reads = std.ArrayList(EventLoop.PendingPieceRead).empty,
+        .queued_responses = std.ArrayList(EventLoop.QueuedBlockResponse).empty,
+        .idle_peers = std.ArrayList(u16).empty,
+    };
+    defer {
+        el.pending_writes.deinit(std.testing.allocator);
+        el.pending_sends.deinit(std.testing.allocator);
+        el.pending_reads.deinit(std.testing.allocator);
+        el.queued_responses.deinit(std.testing.allocator);
+        el.idle_peers.deinit(std.testing.allocator);
+    }
+
+    var initial_complete = try Bitfield.init(std.testing.allocator, 1);
+    defer initial_complete.deinit(std.testing.allocator);
+
+    var tracker = try PieceTracker.init(std.testing.allocator, 1, 16, 16, &initial_complete, 0);
+    defer tracker.deinit(std.testing.allocator);
+
+    try std.testing.expectEqual(@as(?u32, 0), tracker.claimPiece(null));
+
+    const empty_fds = [_]posix.fd_t{};
+    el.torrents[0] = .{
+        .piece_tracker = &tracker,
+        .shared_fds = empty_fds[0..],
+        .info_hash = [_]u8{0} ** 20,
+        .peer_id = [_]u8{0} ** 20,
+    };
+    el.torrent_count = 1;
+
+    const buf = try std.testing.allocator.alloc(u8, 16);
+    try el.pending_writes.put(std.testing.allocator, .{
+        .piece_index = 0,
+        .torrent_id = 0,
+    }, .{
+        .piece_index = 0,
+        .torrent_id = 0,
+        .slot = 0,
+        .buf = buf,
+        .spans_remaining = 1,
+        .write_failed = true,
+    });
+
+    var cqe = std.mem.zeroes(linux.io_uring_cqe);
+    cqe.user_data = encodeUserData(.{
+        .slot = 0,
+        .op_type = .disk_write,
+        .context = 0,
+    });
+    cqe.res = 16;
+
+    handleDiskWrite(&el, 0, cqe);
+
+    try std.testing.expectEqual(@as(usize, 0), el.pending_writes.count());
+    try std.testing.expectEqual(@as(u32, 0), tracker.completedCount());
+    try std.testing.expectEqual(@as(?u32, 0), tracker.claimPiece(null));
 }

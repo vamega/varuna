@@ -1,6 +1,7 @@
 const std = @import("std");
 const TorrentSession = @import("torrent_session.zig").TorrentSession;
 const Stats = @import("torrent_session.zig").Stats;
+const TorrentState = @import("torrent_session.zig").State;
 const categories_mod = @import("categories.zig");
 pub const CategoryStore = categories_mod.CategoryStore;
 pub const TagStore = categories_mod.TagStore;
@@ -165,15 +166,6 @@ pub const SessionManager = struct {
 
         const session = self.sessions.get(hash) orelse return error.TorrentNotFound;
         return session.getStats();
-    }
-
-    /// Get direct access to a TorrentSession by hash. Caller must not store the pointer
-    /// beyond the scope of a single request (the session could be removed concurrently).
-    pub fn getSession(self: *SessionManager, hash: []const u8) !*TorrentSession {
-        self.mutex.lock();
-        defer self.mutex.unlock();
-
-        return self.sessions.get(hash) orelse error.TorrentNotFound;
     }
 
     /// Toggle sequential download mode for a torrent.
@@ -424,20 +416,13 @@ pub const SessionManager = struct {
                 pos += component.len;
             }
 
-            // Compute per-file progress
+            // Compute per-file progress while taking the PieceTracker's own lock.
             const layout_file = layout.files[i];
             var file_progress: f64 = 0.0;
             if (session.piece_tracker) |*pt| {
-                var pieces_complete: u32 = 0;
-                var total_file_pieces: u32 = 0;
-                var pidx: u32 = layout_file.first_piece;
-                while (pidx < layout_file.end_piece_exclusive) : (pidx += 1) {
-                    total_file_pieces += 1;
-                    if (pt.complete.has(pidx)) {
-                        pieces_complete += 1;
-                    }
-                }
+                const total_file_pieces = layout_file.end_piece_exclusive - layout_file.first_piece;
                 if (total_file_pieces > 0) {
+                    const pieces_complete = pt.countCompleteInRange(layout_file.first_piece, layout_file.end_piece_exclusive);
                     file_progress = @as(f64, @floatFromInt(pieces_complete)) / @as(f64, @floatFromInt(total_file_pieces));
                 }
             }
@@ -542,13 +527,30 @@ pub const SessionManager = struct {
 
     /// Properties information returned by getSessionProperties().
     pub const PropertiesInfo = struct {
-        stats: Stats,
+        state: TorrentState,
+        total_size: u64,
+        pieces_have: u32,
+        pieces_total: u32,
+        download_speed: u64,
+        upload_speed: u64,
+        dl_limit: u64,
+        ul_limit: u64,
+        eta: i64,
+        ratio: f64,
+        peers_connected: u16,
+        added_on: i64,
+        bytes_downloaded: u64,
+        bytes_uploaded: u64,
+        sequential_download: bool,
+        is_private: bool,
+        save_path: []const u8, // owned, caller must free
         comment: []const u8, // owned, caller must free
         piece_size: u32,
     };
 
     /// Free a PropertiesInfo returned by getSessionProperties().
     pub fn freePropertiesInfo(allocator: std.mem.Allocator, info: PropertiesInfo) void {
+        allocator.free(info.save_path);
         allocator.free(info.comment);
     }
 
@@ -563,7 +565,23 @@ pub const SessionManager = struct {
         const piece_size: u32 = if (session.session) |*sess| sess.metainfo.piece_length else 0;
 
         return .{
-            .stats = stats,
+            .state = stats.state,
+            .total_size = stats.total_size,
+            .pieces_have = stats.pieces_have,
+            .pieces_total = stats.pieces_total,
+            .download_speed = stats.download_speed,
+            .upload_speed = stats.upload_speed,
+            .dl_limit = stats.dl_limit,
+            .ul_limit = stats.ul_limit,
+            .eta = stats.eta,
+            .ratio = stats.ratio,
+            .peers_connected = stats.peers_connected,
+            .added_on = stats.added_on,
+            .bytes_downloaded = stats.bytes_downloaded,
+            .bytes_uploaded = stats.bytes_uploaded,
+            .sequential_download = stats.sequential_download,
+            .is_private = stats.is_private,
+            .save_path = try allocator.dupe(u8, stats.save_path),
             .comment = try allocator.dupe(u8, comment),
             .piece_size = piece_size,
         };

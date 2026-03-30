@@ -90,6 +90,7 @@ pub const TorrentSession = struct {
     // Shared ring for background announce HTTP I/O (created once, reused).
     // Separate from the main event loop ring to avoid blocking peer I/O.
     announce_ring: ?Ring = null,
+    announce_ring_mutex: std.Thread.Mutex = .{},
     announcing: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
 
     // Resume state persistence (runs on background thread)
@@ -168,12 +169,7 @@ pub const TorrentSession = struct {
     }
 
     pub fn deinit(self: *TorrentSession) void {
-        self.stopInternal();
-        // Wait for any in-flight background announce to finish before
-        // tearing down the announce ring it may be using.
-        while (self.announcing.load(.acquire)) {
-            std.Thread.sleep(1 * std.time.ns_per_ms);
-        }
+        self.stop();
         if (self.announce_ring) |*r| {
             r.deinit();
             self.announce_ring = null;
@@ -212,7 +208,11 @@ pub const TorrentSession = struct {
     pub fn pause(self: *TorrentSession) void {
         if (self.state == .downloading or self.state == .seeding) {
             self.state = .paused;
-            if (self.event_loop) |*el| el.stop();
+            if (self.event_loop) |*el| {
+                el.stop();
+            } else {
+                self.detachFromSharedEventLoop();
+            }
             // Wait for background thread to exit
             if (self.thread) |t| {
                 t.join();
@@ -227,8 +227,9 @@ pub const TorrentSession = struct {
     pub fn resume_session(self: *TorrentSession) void {
         if (self.state == .paused) {
             // Clean up old resources before restarting
+            self.waitForBackgroundNetworkJobs();
             self.stopInternal();
-            self.start();
+            self.startWithEventLoop(self.shared_event_loop);
         }
     }
 
@@ -238,10 +239,8 @@ pub const TorrentSession = struct {
             t.join();
             self.thread = null;
         }
-        // Wait for any in-flight background announce to finish
-        while (self.announcing.load(.acquire)) {
-            std.Thread.sleep(1 * std.time.ns_per_ms);
-        }
+        self.detachFromSharedEventLoop();
+        self.waitForBackgroundNetworkJobs();
         self.stopInternal();
         self.state = .stopped;
     }
@@ -767,6 +766,8 @@ pub const TorrentSession = struct {
             r.deinit();
             self.ring = null;
         }
+        self.torrent_id_in_shared = null;
+        self.pending_seed_setup = false;
     }
 
     /// Called by the main thread to set up seed mode for this session
@@ -855,6 +856,9 @@ pub const TorrentSession = struct {
     pub fn announceCompletedWorker(self: *TorrentSession) void {
         defer self.announcing.store(false, .release);
 
+        self.announce_ring_mutex.lock();
+        defer self.announce_ring_mutex.unlock();
+
         // Lazily create the shared announce ring (reused across announces)
         if (self.announce_ring == null) {
             self.announce_ring = Ring.init(16) catch return;
@@ -898,6 +902,9 @@ pub const TorrentSession = struct {
 
     fn scrapeWorker(self: *TorrentSession) void {
         defer self.scraping.store(false, .release);
+
+        self.announce_ring_mutex.lock();
+        defer self.announce_ring_mutex.unlock();
 
         // Lazily create the shared announce ring (reused across announces and scrapes)
         if (self.announce_ring == null) {
@@ -982,4 +989,116 @@ pub const TorrentSession = struct {
             });
         }
     }
+
+    fn detachFromSharedEventLoop(self: *TorrentSession) void {
+        const sel = self.shared_event_loop orelse return;
+        if (self.torrent_id_in_shared) |tid| {
+            sel.removeTorrent(tid);
+            self.torrent_id_in_shared = null;
+        }
+        self.pending_seed_setup = false;
+    }
+
+    fn waitForBackgroundNetworkJobs(self: *TorrentSession) void {
+        while (self.announcing.load(.acquire) or self.scraping.load(.acquire)) {
+            std.Thread.sleep(1 * std.time.ns_per_ms);
+        }
+    }
 };
+
+fn initTestEventLoop(allocator: std.mem.Allocator) !EventLoop {
+    const peers = try allocator.alloc(EventLoop.Peer, 1);
+    @memset(peers, EventLoop.Peer{});
+    return .{
+        .ring = undefined,
+        .allocator = allocator,
+        .peers = peers,
+        .pending_writes = .empty,
+        .pending_sends = std.ArrayList(EventLoop.PendingSend).empty,
+        .pending_reads = std.ArrayList(EventLoop.PendingPieceRead).empty,
+        .queued_responses = std.ArrayList(EventLoop.QueuedBlockResponse).empty,
+        .idle_peers = std.ArrayList(u16).empty,
+    };
+}
+
+fn deinitTestEventLoop(allocator: std.mem.Allocator, el: *EventLoop) void {
+    el.pending_writes.deinit(allocator);
+    el.pending_sends.deinit(allocator);
+    el.pending_reads.deinit(allocator);
+    el.queued_responses.deinit(allocator);
+    el.idle_peers.deinit(allocator);
+    allocator.free(el.peers);
+}
+
+test "stop detaches torrent from shared event loop" {
+    var el = try initTestEventLoop(std.testing.allocator);
+    defer deinitTestEventLoop(std.testing.allocator, &el);
+
+    const empty_fds = [_]posix.fd_t{};
+    el.torrents[0] = .{
+        .shared_fds = empty_fds[0..],
+        .info_hash = [_]u8{0} ** 20,
+        .peer_id = [_]u8{0} ** 20,
+    };
+    el.torrent_count = 1;
+
+    var session = TorrentSession{
+        .allocator = std.testing.allocator,
+        .state = .downloading,
+        .torrent_bytes = "",
+        .save_path = "",
+        .info_hash = [_]u8{0} ** 20,
+        .info_hash_hex = [_]u8{'0'} ** 40,
+        .name = "",
+        .total_size = 0,
+        .piece_count = 0,
+        .added_on = 0,
+        .peer_id = [_]u8{0} ** 20,
+        .tracker_key = [_]u8{0} ** 8,
+        .shared_event_loop = &el,
+        .torrent_id_in_shared = 0,
+    };
+
+    session.stop();
+
+    try std.testing.expectEqual(State.stopped, session.state);
+    try std.testing.expect(session.torrent_id_in_shared == null);
+    try std.testing.expect(session.pending_seed_setup == false);
+    try std.testing.expect(el.torrents[0] == null);
+    try std.testing.expectEqual(@as(u8, 0), el.torrent_count);
+}
+
+test "resume_session preserves shared event loop mode" {
+    var el = try initTestEventLoop(std.testing.allocator);
+    defer deinitTestEventLoop(std.testing.allocator, &el);
+
+    var session = TorrentSession{
+        .allocator = std.testing.allocator,
+        .state = .paused,
+        .torrent_bytes = "",
+        .save_path = "",
+        .info_hash = [_]u8{0} ** 20,
+        .info_hash_hex = [_]u8{'0'} ** 40,
+        .name = "",
+        .total_size = 0,
+        .piece_count = 0,
+        .added_on = 0,
+        .peer_id = [_]u8{0} ** 20,
+        .tracker_key = [_]u8{0} ** 8,
+        .shared_event_loop = &el,
+    };
+
+    session.resume_session();
+    if (session.thread) |t| {
+        t.join();
+        session.thread = null;
+    }
+
+    try std.testing.expect(session.shared_event_loop == &el);
+
+    session.stop();
+    if (session.error_message) |msg| {
+        std.testing.allocator.free(msg);
+        session.error_message = null;
+    }
+}

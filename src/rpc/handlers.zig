@@ -449,52 +449,26 @@ pub const ApiHandler = struct {
         const hash = extractParam(body, "hash") orelse
             return .{ .status = 400, .body = "{\"error\":\"missing hash\"}" };
 
-        const session = self.session_manager.getSession(hash) catch
-            return .{ .status = 404, .body = "{\"error\":\"torrent not found\"}" };
+        const files = self.session_manager.getSessionFiles(allocator, hash) catch |err| switch (err) {
+            error.TorrentNotFound => return .{ .status = 404, .body = "{\"error\":\"torrent not found\"}" },
+            error.TorrentNotReady => return .{ .status = 409, .body = "{\"error\":\"torrent metadata not ready\"}" },
+            else => return .{ .status = 500, .body = "{\"error\":\"internal\"}" },
+        };
+        defer SessionManager.freeFileInfos(allocator, files);
 
-        // Need parsed session for file metadata
-        const sess = session.session orelse
-            return .{ .status = 409, .body = "{\"error\":\"torrent metadata not ready\"}" };
-
-        const meta = sess.metainfo;
         var json = std.ArrayList(u8).empty;
         defer json.deinit(allocator);
 
         json.append(allocator, '[') catch return .{ .status = 500, .body = "[]" };
 
-        for (meta.files, 0..) |file, i| {
+        for (files, 0..) |file, i| {
             if (i > 0) json.append(allocator, ',') catch {};
 
-            // Compute per-file progress by checking which pieces overlap this file
-            const layout_file = sess.layout.files[i];
-            var file_progress: f64 = 0.0;
-            if (session.piece_tracker) |*pt| {
-                const total_file_pieces = layout_file.end_piece_exclusive - layout_file.first_piece;
-                if (total_file_pieces > 0) {
-                    const pieces_complete = pt.countCompleteInRange(layout_file.first_piece, layout_file.end_piece_exclusive);
-                    file_progress = @as(f64, @floatFromInt(pieces_complete)) / @as(f64, @floatFromInt(total_file_pieces));
-                }
-            }
-
-            // Build file name from path components
-            var name_buf = std.ArrayList(u8).empty;
-            defer name_buf.deinit(allocator);
-            for (file.path, 0..) |component, ci| {
-                if (ci > 0) name_buf.append(allocator, '/') catch {};
-                name_buf.appendSlice(allocator, component) catch {};
-            }
-
-            // Get file priority (default 1=normal)
-            const priority: u8 = if (session.file_priorities) |fp|
-                if (i < fp.len) fp[i] else 1
-            else
-                1;
-
             json.print(allocator, "{{\"name\":\"{f}\",\"size\":{},\"progress\":{d:.4},\"priority\":{}}}", .{
-                json_mod.jsonSafe(name_buf.items),
-                file.length,
-                file_progress,
-                priority,
+                json_mod.jsonSafe(file.name),
+                file.size,
+                file.progress,
+                file.priority,
             }) catch {};
         }
 
@@ -507,59 +481,29 @@ pub const ApiHandler = struct {
         const hash = extractParam(body, "hash") orelse
             return .{ .status = 400, .body = "{\"error\":\"missing hash\"}" };
 
-        const session = self.session_manager.getSession(hash) catch
-            return .{ .status = 404, .body = "{\"error\":\"torrent not found\"}" };
-
-        const sess = session.session orelse
-            return .{ .status = 409, .body = "{\"error\":\"torrent metadata not ready\"}" };
-
-        const meta = sess.metainfo;
+        const trackers = self.session_manager.getSessionTrackers(allocator, hash) catch |err| switch (err) {
+            error.TorrentNotFound => return .{ .status = 404, .body = "{\"error\":\"torrent not found\"}" },
+            error.TorrentNotReady => return .{ .status = 409, .body = "{\"error\":\"torrent metadata not ready\"}" },
+            else => return .{ .status = 500, .body = "{\"error\":\"internal\"}" },
+        };
+        defer SessionManager.freeTrackerInfos(allocator, trackers);
 
         var json = std.ArrayList(u8).empty;
         defer json.deinit(allocator);
 
         json.append(allocator, '[') catch return .{ .status = 500, .body = "[]" };
 
-        var tier: u32 = 0;
-        var first = true;
-
-        // Scrape stats (shared across all trackers for now)
-        const stats = session.getStats();
-        const scrape_complete = stats.scrape_complete;
-        const scrape_incomplete = stats.scrape_incomplete;
-        const scrape_downloaded = stats.scrape_downloaded;
-
-        // Primary announce URL
-        if (meta.announce) |url| {
-            if (!first) json.append(allocator, ',') catch {};
-            first = false;
-            // Status: 1 = contacted, 2 = working, 0 = disabled
-            const status: u8 = if (session.state == .downloading or session.state == .seeding) 2 else 1;
-            json.print(allocator, "{{\"url\":\"{s}\",\"status\":{},\"tier\":{},\"num_peers\":{},\"num_seeds\":{},\"num_leeches\":{},\"num_downloaded\":{}}}", .{
-                url,
-                status,
-                tier,
-                stats.peers_connected,
-                scrape_complete,
-                scrape_incomplete,
-                scrape_downloaded,
+        for (trackers, 0..) |tracker, i| {
+            if (i > 0) json.append(allocator, ',') catch {};
+            json.print(allocator, "{{\"url\":\"{f}\",\"status\":{},\"tier\":{},\"num_peers\":{},\"num_seeds\":{},\"num_leeches\":{},\"num_downloaded\":{}}}", .{
+                json_mod.jsonSafe(tracker.url),
+                tracker.status,
+                tracker.tier,
+                tracker.num_peers,
+                tracker.num_seeds,
+                tracker.num_leeches,
+                tracker.num_downloaded,
             }) catch {};
-            tier += 1;
-        }
-
-        // Announce list URLs
-        for (meta.announce_list) |url| {
-            // Skip if same as primary announce
-            if (meta.announce) |primary| {
-                if (std.mem.eql(u8, url, primary)) continue;
-            }
-            if (!first) json.append(allocator, ',') catch {};
-            first = false;
-            json.print(allocator, "{{\"url\":\"{s}\",\"status\":1,\"tier\":{},\"num_peers\":0,\"num_seeds\":0,\"num_leeches\":0,\"num_downloaded\":0}}", .{
-                url,
-                tier,
-            }) catch {};
-            tier += 1;
         }
 
         json.append(allocator, ']') catch {};
@@ -571,44 +515,42 @@ pub const ApiHandler = struct {
         const hash = extractParam(body, "hash") orelse
             return .{ .status = 400, .body = "{\"error\":\"missing hash\"}" };
 
-        const session = self.session_manager.getSession(hash) catch
-            return .{ .status = 404, .body = "{\"error\":\"torrent not found\"}" };
-
-        const stat = session.getStats();
-
-        // Get optional metadata fields
-        const comment: []const u8 = if (session.session) |*sess| (sess.metainfo.comment orelse "") else "";
-        const piece_size: u32 = if (session.session) |*sess| sess.metainfo.piece_length else 0;
+        const info = self.session_manager.getSessionProperties(allocator, hash) catch |err| switch (err) {
+            error.TorrentNotFound => return .{ .status = 404, .body = "{\"error\":\"torrent not found\"}" },
+            else => return .{ .status = 500, .body = "{\"error\":\"internal\"}" },
+        };
+        defer SessionManager.freePropertiesInfo(allocator, info);
 
         // Time active since added
         const now = std.time.timestamp();
-        const time_active: i64 = now - stat.added_on;
-        const seeding_time: i64 = if (stat.state == .seeding) time_active else 0;
+        const time_active: i64 = now - info.added_on;
+        const seeding_time: i64 = if (info.state == .seeding) time_active else 0;
+        const esc = json_mod.jsonSafe;
 
         var json = std.ArrayList(u8).empty;
         defer json.deinit(allocator);
 
-        json.print(allocator, "{{\"save_path\":\"{s}\",\"creation_date\":-1,\"piece_size\":{},\"comment\":\"{s}\",\"total_size\":{},\"pieces_have\":{},\"pieces_num\":{},\"dl_speed\":{},\"up_speed\":{},\"dl_limit\":{},\"up_limit\":{},\"eta\":{},\"ratio\":{d:.4},\"time_active\":{},\"seeding_time\":{},\"nb_connections\":{},\"addition_date\":{},\"total_downloaded\":{},\"total_uploaded\":{},\"seq_dl\":{},\"is_private\":{}}}", .{
-            stat.save_path,
-            piece_size,
-            comment,
-            stat.total_size,
-            stat.pieces_have,
-            stat.pieces_total,
-            stat.download_speed,
-            stat.upload_speed,
-            stat.dl_limit,
-            stat.ul_limit,
-            stat.eta,
-            stat.ratio,
+        json.print(allocator, "{{\"save_path\":\"{f}\",\"creation_date\":-1,\"piece_size\":{},\"comment\":\"{f}\",\"total_size\":{},\"pieces_have\":{},\"pieces_num\":{},\"dl_speed\":{},\"up_speed\":{},\"dl_limit\":{},\"up_limit\":{},\"eta\":{},\"ratio\":{d:.4},\"time_active\":{},\"seeding_time\":{},\"nb_connections\":{},\"addition_date\":{},\"total_downloaded\":{},\"total_uploaded\":{},\"seq_dl\":{},\"is_private\":{}}}", .{
+            esc(info.save_path),
+            info.piece_size,
+            esc(info.comment),
+            info.total_size,
+            info.pieces_have,
+            info.pieces_total,
+            info.download_speed,
+            info.upload_speed,
+            info.dl_limit,
+            info.ul_limit,
+            info.eta,
+            info.ratio,
             time_active,
             seeding_time,
-            stat.peers_connected,
-            stat.added_on,
-            stat.bytes_downloaded,
-            stat.bytes_uploaded,
-            @as(u8, if (stat.sequential_download) 1 else 0),
-            @as(u8, if (stat.is_private) 1 else 0),
+            info.peers_connected,
+            info.added_on,
+            info.bytes_downloaded,
+            info.bytes_uploaded,
+            @as(u8, if (info.sequential_download) 1 else 0),
+            @as(u8, if (info.is_private) 1 else 0),
         }) catch return .{ .status = 500, .body = "{\"error\":\"internal\"}" };
 
         const result = json.toOwnedSlice(allocator) catch return .{ .status = 500, .body = "{\"error\":\"internal\"}" };

@@ -183,6 +183,7 @@ pub const EventLoop = struct {
         slot: u16,
         buf: []u8,
         spans_remaining: u32,
+        write_failed: bool = false,
     };
 
     pub const PendingSend = struct {
@@ -203,24 +204,28 @@ pub const EventLoop = struct {
 
     /// Queued piece block response for batched sending.
     /// Multiple blocks queued in the same tick are combined into one send.
+    /// Each entry owns an exact copy of the block bytes to keep batching
+    /// correct even if the piece cache changes before flush.
     pub const QueuedBlockResponse = struct {
         slot: u16,
         piece_index: u32,
         block_offset: u32,
         block_length: u32,
+        block_data: []u8,
     };
 
     /// Tracks an async piece read for seed mode.
     /// For multi-span pieces, multiple io_uring reads are submitted.
     /// When all reads complete, the piece response is sent.
     pub const PendingPieceRead = struct {
+        read_id: u32,
         slot: u16,
         piece_index: u32,
         block_offset: u32,
         block_length: u32,
         read_buf: []u8,
         piece_size: u32,
-        reads_remaining: u32, // number of io_uring read CQEs still pending
+        reads_remaining: u32, // number of successfully submitted read CQEs still pending
     };
 
     ring: linux.IoUring,
@@ -278,6 +283,7 @@ pub const EventLoop = struct {
 
     // Pending piece reads: async disk reads for seed piece serving.
     pending_reads: std.ArrayList(PendingPieceRead),
+    next_seed_read_id: u32 = 1,
 
     // Piece read cache for seed mode (avoid re-reading from disk per block)
     cached_piece_index: ?u32 = null,
@@ -412,6 +418,9 @@ pub const EventLoop = struct {
             self.allocator.free(pr.read_buf);
         }
         self.pending_reads.deinit(self.allocator);
+        for (self.queued_responses.items) |resp| {
+            self.allocator.free(resp.block_data);
+        }
         self.queued_responses.deinit(self.allocator);
         self.idle_peers.deinit(self.allocator);
         self.hash_result_swap.deinit(self.allocator);

@@ -238,9 +238,25 @@ pub const ApiServer = struct {
     }
 
     fn handleSend(self: *ApiServer, slot: u8, cqe: linux.io_uring_cqe) void {
-        _ = cqe;
-        // Response sent, close connection
-        self.closeClient(slot);
+        if (cqe.res <= 0) {
+            self.closeClient(slot);
+            return;
+        }
+
+        const client = &self.clients[slot];
+        const sent: usize = @intCast(cqe.res);
+        const complete = advanceSendProgress(client, sent) catch {
+            self.closeClient(slot);
+            return;
+        };
+        if (complete) {
+            self.closeClient(slot);
+            return;
+        }
+
+        self.submitSend(slot) catch {
+            self.closeClient(slot);
+        };
     }
 
     // ── SQE helpers ───────────────────────────────────────
@@ -257,10 +273,20 @@ pub const ApiServer = struct {
         _ = try self.ring.inner.recv(ud, client.fd, .{ .buffer = buf[client.recv_offset..] }, 0);
     }
 
+    fn submitSend(self: *ApiServer, slot: u8) !void {
+        const client = &self.clients[slot];
+        const buf = client.recv_buf orelse return error.NoSendBuffer;
+        if (client.send_offset >= buf.len) return error.NoSendBuffer;
+        const ud = encodeUd(slot, OP_SEND);
+        _ = try self.ring.inner.send(ud, client.fd, buf[client.send_offset..], 0);
+    }
+
     fn sendResponse(self: *ApiServer, slot: u8, response: Response) void {
         const client = &self.clients[slot];
+        defer freeOwnedResponse(self.allocator, response);
 
-        // Build HTTP response into the recv buffer (reuse it)
+        // Build the full response first, then swap it into the client only
+        // after ownership transfer succeeds.
         var buf = std.ArrayList(u8).empty;
         defer buf.deinit(self.allocator);
 
@@ -276,22 +302,17 @@ pub const ApiServer = struct {
         buf.appendSlice(self.allocator, "\r\n") catch return;
         buf.appendSlice(self.allocator, response.body) catch return;
 
-        if (response.owned_body) |owned| {
-            self.allocator.free(owned);
-        }
-        if (response.owned_extra_headers) |owned| {
-            self.allocator.free(owned);
-        }
+        const response_buf = buf.toOwnedSlice(self.allocator) catch return;
 
         // Store response in a buffer the client owns
         if (client.recv_buf) |old_buf| {
             self.allocator.free(old_buf);
         }
-        client.recv_buf = buf.toOwnedSlice(self.allocator) catch return;
+        client.recv_buf = response_buf;
         client.recv_offset = 0;
+        client.send_offset = 0;
 
-        const ud = encodeUd(slot, OP_SEND);
-        _ = self.ring.inner.send(ud, client.fd, client.recv_buf.?, 0) catch {
+        self.submitSend(slot) catch {
             self.closeClient(slot);
             return;
         };
@@ -346,6 +367,7 @@ pub const ApiClient = struct {
     fd: posix.fd_t = -1,
     recv_buf: ?[]u8 = null,
     recv_offset: usize = 0,
+    send_offset: usize = 0,
 };
 
 fn parseRequest(data: []const u8) ?Request {
@@ -414,6 +436,23 @@ fn extractHeader(headers: []const u8, name: []const u8) ?[]const u8 {
 fn defaultHandler(_: std.mem.Allocator, request: Request) Response {
     _ = request;
     return .{ .status = 404, .body = "{\"error\":\"not found\"}" };
+}
+
+fn freeOwnedResponse(allocator: std.mem.Allocator, response: Response) void {
+    if (response.owned_body) |owned| allocator.free(owned);
+    if (response.owned_extra_headers) |owned| allocator.free(owned);
+}
+
+fn advanceSendProgress(client: *ApiClient, sent: usize) !bool {
+    if (sent == 0) return error.InvalidSendLength;
+    const buf = client.recv_buf orelse return error.NoSendBuffer;
+    if (client.send_offset > buf.len) return error.InvalidSendLength;
+
+    const remaining = buf.len - client.send_offset;
+    if (sent > remaining) return error.InvalidSendLength;
+
+    client.send_offset += sent;
+    return client.send_offset == buf.len;
 }
 
 fn statusText(status: u16) []const u8 {
@@ -529,4 +568,26 @@ test "api server handles request via io_uring" {
 
     try std.testing.expect(std.mem.startsWith(u8, response, "HTTP/1.1 200 OK"));
     try std.testing.expect(std.mem.indexOf(u8, response, "\"2.9.3\"") != null);
+}
+
+test "advanceSendProgress tracks partial sends" {
+    var client = ApiClient{
+        .recv_buf = "hello"[0..],
+    };
+
+    try std.testing.expect(!(try advanceSendProgress(&client, 2)));
+    try std.testing.expectEqual(@as(usize, 2), client.send_offset);
+    try std.testing.expect(try advanceSendProgress(&client, 3));
+    try std.testing.expectEqual(@as(usize, 5), client.send_offset);
+}
+
+test "advanceSendProgress rejects invalid completions" {
+    var client = ApiClient{
+        .recv_buf = "abc"[0..],
+    };
+
+    try std.testing.expectError(error.InvalidSendLength, advanceSendProgress(&client, 0));
+    try std.testing.expectError(error.InvalidSendLength, advanceSendProgress(&client, 4));
+    client.recv_buf = null;
+    try std.testing.expectError(error.NoSendBuffer, advanceSendProgress(&client, 1));
 }

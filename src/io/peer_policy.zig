@@ -208,7 +208,7 @@ pub fn completePieceDownload(self: *EventLoop, slot: u16) void {
                 .torrent_id = peer.torrent_id,
                 .slot = slot,
                 .buf = piece_buf,
-                .spans_remaining = span_count,
+                .spans_remaining = 0,
             }) catch {
                 pt.releasePiece(piece_index);
                 self.allocator.free(piece_buf);
@@ -223,8 +223,26 @@ pub fn completePieceDownload(self: *EventLoop, slot: u16) void {
                 const ud = encodeUserData(.{ .slot = slot, .op_type = .disk_write, .context = @as(u40, @intCast(peer.torrent_id)) << 32 | @as(u40, piece_index) });
                 _ = self.ring.write(ud, tc.shared_fds[span.file_index], block, span.file_offset) catch |err| {
                     log.warn("inline disk write for piece {d}: {s}", .{ piece_index, @errorName(err) });
+                    if (self.pending_writes.getPtr(.{ .piece_index = piece_index, .torrent_id = peer.torrent_id })) |pending_w| {
+                        pending_w.write_failed = true;
+                    }
                     continue;
                 };
+                if (self.pending_writes.getPtr(.{ .piece_index = piece_index, .torrent_id = peer.torrent_id })) |pending_w| {
+                    pending_w.spans_remaining += 1;
+                }
+            }
+
+            if (self.pending_writes.getPtr(.{ .piece_index = piece_index, .torrent_id = peer.torrent_id })) |pending_w| {
+                if (pending_w.spans_remaining == 0) {
+                    _ = self.pending_writes.remove(.{ .piece_index = piece_index, .torrent_id = peer.torrent_id });
+                    pt.releasePiece(piece_index);
+                    self.allocator.free(piece_buf);
+                    peer.piece_buf = null;
+                    peer.current_piece = null;
+                    self.markIdle(slot);
+                    return;
+                }
             }
             // Buffer ownership transferred to pending_writes; will be freed on completion
             peer.piece_buf = null;
@@ -297,7 +315,7 @@ pub fn processHashResults(self: *EventLoop) void {
                 .torrent_id = torrent_id,
                 .slot = result.slot,
                 .buf = result.piece_buf,
-                .spans_remaining = span_count,
+                .spans_remaining = 0,
             }) catch {
                 self.allocator.free(result.piece_buf);
                 continue;
@@ -308,8 +326,23 @@ pub fn processHashResults(self: *EventLoop) void {
                 const ud = encodeUserData(.{ .slot = result.slot, .op_type = .disk_write, .context = @as(u40, @intCast(torrent_id)) << 32 | @as(u40, result.piece_index) });
                 _ = self.ring.write(ud, tc.shared_fds[span.file_index], block, span.file_offset) catch |err| {
                     log.warn("disk write submit for piece {d}: {s}", .{ result.piece_index, @errorName(err) });
+                    if (self.pending_writes.getPtr(.{ .piece_index = result.piece_index, .torrent_id = torrent_id })) |pending_w| {
+                        pending_w.write_failed = true;
+                    }
                     continue;
                 };
+                if (self.pending_writes.getPtr(.{ .piece_index = result.piece_index, .torrent_id = torrent_id })) |pending_w| {
+                    pending_w.spans_remaining += 1;
+                }
+            }
+
+            if (self.pending_writes.getPtr(.{ .piece_index = result.piece_index, .torrent_id = torrent_id })) |pending_w| {
+                if (pending_w.spans_remaining == 0) {
+                    _ = self.pending_writes.remove(.{ .piece_index = result.piece_index, .torrent_id = torrent_id });
+                    if (tc.piece_tracker) |pt| pt.releasePiece(result.piece_index);
+                    self.allocator.free(result.piece_buf);
+                    continue;
+                }
             }
         } else {
             // Hash mismatch -- release piece back to pool
