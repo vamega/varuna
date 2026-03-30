@@ -47,6 +47,8 @@ pub const Stats = struct {
     ratio: f64 = 0.0,
     /// Whether sequential download mode is enabled.
     sequential_download: bool = false,
+    /// Whether this is a private torrent (BEP 27).
+    is_private: bool = false,
     /// Tracker scrape result: seeders, leechers, snatches.
     scrape_complete: u32 = 0,
     scrape_incomplete: u32 = 0,
@@ -94,6 +96,9 @@ pub const TorrentSession = struct {
     // Current session totals (from event loop peers) are added on top.
     baseline_uploaded: u64 = 0,
     baseline_downloaded: u64 = 0,
+
+    // Metainfo flags
+    is_private: bool = false,
 
     // Config
     port: u16 = 6881,
@@ -148,6 +153,7 @@ pub const TorrentSession = struct {
             .added_on = std.time.timestamp(),
             .peer_id = peer_id_mod.generate(),
             .tracker_key = tracker.announce.Request.generateKey(),
+            .is_private = meta.isPrivate(),
         };
     }
 
@@ -245,6 +251,7 @@ pub const TorrentSession = struct {
             self.shared_fds.?,
             self.peer_id,
             self.tracker_key,
+            self.is_private,
         ) catch return false;
         self.torrent_id_in_shared = tid;
 
@@ -398,6 +405,7 @@ pub const TorrentSession = struct {
             .eta = eta,
             .ratio = ratio,
             .sequential_download = self.sequential_download,
+            .is_private = self.is_private,
             .scrape_complete = if (self.scrape_result) |sr| sr.complete else 0,
             .scrape_incomplete = if (self.scrape_result) |sr| sr.incomplete else 0,
             .scrape_downloaded = if (self.scrape_result) |sr| sr.downloaded else 0,
@@ -710,6 +718,7 @@ pub const TorrentSession = struct {
                 self.shared_fds.?,
                 self.peer_id,
                 self.tracker_key,
+                self.is_private,
             ) catch return false;
             self.torrent_id_in_shared = tid;
 

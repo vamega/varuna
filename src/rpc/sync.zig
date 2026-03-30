@@ -208,6 +208,7 @@ fn statsHash(stat: TorrentStats) u64 {
     hasher.update(std.mem.asBytes(&stat.eta));
     hasher.update(std.mem.asBytes(&stat.ratio));
     hasher.update(std.mem.asBytes(&stat.sequential_download));
+    hasher.update(std.mem.asBytes(&stat.is_private));
     hasher.update(std.mem.asBytes(&stat.scrape_complete));
     hasher.update(std.mem.asBytes(&stat.scrape_incomplete));
     return hasher.final();
@@ -217,7 +218,7 @@ fn statsHash(stat: TorrentStats) u64 {
 fn serializeTorrentObject(allocator: std.mem.Allocator, json: *std.ArrayList(u8), stat: TorrentStats) !void {
     try json.print(
         allocator,
-        "{{\"name\":\"{s}\",\"hash\":\"{s}\",\"state\":\"{s}\",\"size\":{},\"progress\":{d:.4},\"dlspeed\":{},\"upspeed\":{},\"num_seeds\":{},\"num_leechs\":{},\"added_on\":{},\"save_path\":\"{s}\",\"pieces_have\":{},\"pieces_num\":{},\"dl_limit\":{},\"up_limit\":{},\"eta\":{},\"ratio\":{d:.4},\"seq_dl\":{}}}",
+        "{{\"name\":\"{s}\",\"hash\":\"{s}\",\"state\":\"{s}\",\"size\":{},\"progress\":{d:.4},\"dlspeed\":{},\"upspeed\":{},\"num_seeds\":{},\"num_leechs\":{},\"added_on\":{},\"save_path\":\"{s}\",\"pieces_have\":{},\"pieces_num\":{},\"dl_limit\":{},\"up_limit\":{},\"eta\":{},\"ratio\":{d:.4},\"seq_dl\":{},\"is_private\":{}}}",
         .{
             stat.name,
             stat.info_hash_hex,
@@ -237,6 +238,7 @@ fn serializeTorrentObject(allocator: std.mem.Allocator, json: *std.ArrayList(u8)
             stat.eta,
             stat.ratio,
             @as(u8, if (stat.sequential_download) 1 else 0),
+            @as(u8, if (stat.is_private) 1 else 0),
         },
     );
 }

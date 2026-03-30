@@ -156,6 +156,7 @@ pub const TorrentContext = struct {
     tracker_key: ?[8]u8 = null,
     complete_pieces: ?*const Bitfield = null,
     active: bool = true,
+    is_private: bool = false,
 
     // Speed tracking (updated every ~2 seconds in tick)
     last_speed_check: i64 = 0,
@@ -432,7 +433,7 @@ pub const EventLoop = struct {
         shared_fds: []const posix.fd_t,
         peer_id: [20]u8,
     ) !u8 {
-        return self.addTorrentWithKey(session, piece_tracker, shared_fds, peer_id, null);
+        return self.addTorrentWithKey(session, piece_tracker, shared_fds, peer_id, null, false);
     }
 
     /// Add a new torrent context with a tracker key. Returns torrent_id.
@@ -443,6 +444,7 @@ pub const EventLoop = struct {
         shared_fds: []const posix.fd_t,
         peer_id: [20]u8,
         tracker_key: ?[8]u8,
+        is_private: bool,
     ) !u8 {
         for (&self.torrents, 0..) |*slot, i| {
             if (slot.* == null) {
@@ -453,12 +455,22 @@ pub const EventLoop = struct {
                     .info_hash = session.metainfo.info_hash,
                     .peer_id = peer_id,
                     .tracker_key = tracker_key,
+                    .is_private = is_private,
                 };
                 self.torrent_count += 1;
                 return @intCast(i);
             }
         }
         return error.TooManyTorrents;
+    }
+
+    /// Check whether peer discovery (DHT, PEX, LSD) is allowed for a torrent.
+    /// Private torrents MUST only use tracker-provided peers.
+    pub fn isPeerDiscoveryAllowed(self: *EventLoop, torrent_id: u8) bool {
+        if (self.getTorrentContext(torrent_id)) |tc| {
+            return !tc.is_private;
+        }
+        return true;
     }
 
     /// Set the complete_pieces bitfield for a torrent (enables seed mode).

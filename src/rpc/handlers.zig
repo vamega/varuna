@@ -537,7 +537,7 @@ pub const ApiHandler = struct {
         var json = std.ArrayList(u8).empty;
         defer json.deinit(allocator);
 
-        json.print(allocator, "{{\"save_path\":\"{s}\",\"creation_date\":-1,\"piece_size\":{},\"comment\":\"{s}\",\"total_size\":{},\"pieces_have\":{},\"pieces_num\":{},\"dl_speed\":{},\"up_speed\":{},\"dl_limit\":{},\"up_limit\":{},\"eta\":{},\"ratio\":{d:.4},\"time_active\":{},\"seeding_time\":{},\"nb_connections\":{},\"addition_date\":{},\"total_downloaded\":{},\"total_uploaded\":{},\"seq_dl\":{}}}", .{
+        json.print(allocator, "{{\"save_path\":\"{s}\",\"creation_date\":-1,\"piece_size\":{},\"comment\":\"{s}\",\"total_size\":{},\"pieces_have\":{},\"pieces_num\":{},\"dl_speed\":{},\"up_speed\":{},\"dl_limit\":{},\"up_limit\":{},\"eta\":{},\"ratio\":{d:.4},\"time_active\":{},\"seeding_time\":{},\"nb_connections\":{},\"addition_date\":{},\"total_downloaded\":{},\"total_uploaded\":{},\"seq_dl\":{},\"is_private\":{}}}", .{
             stat.save_path,
             piece_size,
             comment,
@@ -557,6 +557,7 @@ pub const ApiHandler = struct {
             stat.bytes_downloaded,
             stat.bytes_uploaded,
             @as(u8, if (stat.sequential_download) 1 else 0),
+            @as(u8, if (stat.is_private) 1 else 0),
         }) catch return .{ .status = 500, .body = "{\"error\":\"internal\"}" };
 
         const result = json.toOwnedSlice(allocator) catch return .{ .status = 500, .body = "{\"error\":\"internal\"}" };
@@ -668,7 +669,7 @@ pub const ApiHandler = struct {
 fn serializeTorrentInfo(allocator: std.mem.Allocator, json: *std.ArrayList(u8), stat: TorrentSession.Stats) !void {
     try json.print(
         allocator,
-        "{{\"name\":\"{s}\",\"hash\":\"{s}\",\"state\":\"{s}\",\"size\":{},\"progress\":{d:.4},\"dlspeed\":{},\"upspeed\":{},\"num_seeds\":{},\"num_leechs\":{},\"added_on\":{},\"save_path\":\"{s}\",\"pieces_have\":{},\"pieces_num\":{},\"dl_limit\":{},\"up_limit\":{},\"eta\":{},\"ratio\":{d:.4},\"seq_dl\":{}}}",
+        "{{\"name\":\"{s}\",\"hash\":\"{s}\",\"state\":\"{s}\",\"size\":{},\"progress\":{d:.4},\"dlspeed\":{},\"upspeed\":{},\"num_seeds\":{},\"num_leechs\":{},\"added_on\":{},\"save_path\":\"{s}\",\"pieces_have\":{},\"pieces_num\":{},\"dl_limit\":{},\"up_limit\":{},\"eta\":{},\"ratio\":{d:.4},\"seq_dl\":{},\"is_private\":{}}}",
         .{
             stat.name,
             stat.info_hash_hex,
@@ -688,6 +689,7 @@ fn serializeTorrentInfo(allocator: std.mem.Allocator, json: *std.ArrayList(u8), 
             stat.eta,
             stat.ratio,
             @as(u8, if (stat.sequential_download) 1 else 0),
+            @as(u8, if (stat.is_private) 1 else 0),
         },
     );
 }

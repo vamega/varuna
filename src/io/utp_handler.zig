@@ -411,7 +411,9 @@ fn handleUtpSendComplete(self: *EventLoop, peer_slot: u16) void {
 
 /// Send a BEP 10 extension handshake over uTP.
 fn submitUtpExtensionHandshake(self: *EventLoop, peer_slot: u16) !void {
-    const ext_payload = try ext.encodeExtensionHandshake(self.allocator, self.port);
+    const peer = &self.peers[peer_slot];
+    const is_private = if (self.getTorrentContext(peer.torrent_id)) |tc| tc.is_private else false;
+    const ext_payload = try ext.encodeExtensionHandshake(self.allocator, self.port, is_private);
     defer self.allocator.free(ext_payload);
     const frame = try ext.serializeExtensionMessage(self.allocator, ext.handshake_sub_id, ext_payload);
     defer self.allocator.free(frame);

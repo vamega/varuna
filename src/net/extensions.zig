@@ -71,16 +71,23 @@ pub fn setExtensionBit(reserved: *[8]u8) void {
 /// Encode our extension handshake payload (the data after the 6-byte
 /// message header: 4-byte length + msg_id 20 + sub_id 0).
 ///
+/// When `is_private` is true, ut_pex is omitted from the extension map
+/// because BEP 27 forbids peer exchange for private torrents.
+///
 /// The returned slice is allocated with `allocator` and must be freed
 /// by the caller.
-pub fn encodeExtensionHandshake(allocator: std.mem.Allocator, listen_port: u16) ![]u8 {
+pub fn encodeExtensionHandshake(allocator: std.mem.Allocator, listen_port: u16, is_private: bool) ![]u8 {
     // Build the "m" dictionary entries: extension name -> our local ID.
-    var m_entries = try allocator.alloc(bencode.Value.Entry, 2);
+    // For private torrents, don't advertise ut_pex (BEP 27).
+    const m_count: usize = if (is_private) 1 else 2;
+    var m_entries = try allocator.alloc(bencode.Value.Entry, m_count);
     defer allocator.free(m_entries);
 
     // Keys must be in sorted order for canonical bencode (ut_metadata < ut_pex).
     m_entries[0] = .{ .key = ext_ut_metadata, .value = .{ .integer = local_ut_metadata_id } };
-    m_entries[1] = .{ .key = ext_ut_pex, .value = .{ .integer = local_ut_pex_id } };
+    if (!is_private) {
+        m_entries[1] = .{ .key = ext_ut_pex, .value = .{ .integer = local_ut_pex_id } };
+    }
 
     // Top-level dictionary entries.  Bencode dictionaries should have
     // keys in sorted order: "m" < "p" < "v".
@@ -218,7 +225,7 @@ test "setExtensionBit sets only the correct bit" {
 }
 
 test "encode extension handshake produces valid bencode" {
-    const payload = try encodeExtensionHandshake(std.testing.allocator, 6881);
+    const payload = try encodeExtensionHandshake(std.testing.allocator, 6881, false);
     defer std.testing.allocator.free(payload);
 
     // Parse it back to verify it's valid bencode
@@ -246,7 +253,7 @@ test "encode extension handshake produces valid bencode" {
 }
 
 test "decode extension handshake roundtrip" {
-    const payload = try encodeExtensionHandshake(std.testing.allocator, 6881);
+    const payload = try encodeExtensionHandshake(std.testing.allocator, 6881, false);
     defer std.testing.allocator.free(payload);
 
     var result = try decodeExtensionHandshake(std.testing.allocator, payload);
@@ -306,6 +313,20 @@ test "serializeExtensionMessage frames correctly" {
     try std.testing.expectEqual(@as(u8, 20), frame[4]); // msg_id
     try std.testing.expectEqual(@as(u8, 0), frame[5]); // sub_id
     try std.testing.expectEqualStrings("hello", frame[6..11]);
+}
+
+test "private torrent extension handshake omits ut_pex" {
+    const payload = try encodeExtensionHandshake(std.testing.allocator, 6881, true);
+    defer std.testing.allocator.free(payload);
+
+    var result = try decodeExtensionHandshake(std.testing.allocator, payload);
+    defer freeDecoded(std.testing.allocator, &result);
+
+    // ut_metadata should still be advertised
+    try std.testing.expectEqual(@as(u8, local_ut_metadata_id), result.handshake.extensions.ut_metadata);
+    // ut_pex must NOT be advertised for private torrents (BEP 27)
+    try std.testing.expectEqual(@as(u8, 0), result.handshake.extensions.ut_pex);
+    try std.testing.expectEqual(@as(u16, 6881), result.handshake.port);
 }
 
 test "serializeExtensionMessage with empty payload" {

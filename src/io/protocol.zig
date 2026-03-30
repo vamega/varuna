@@ -134,6 +134,16 @@ pub fn processMessage(self: *EventLoop, slot: u16) void {
                 });
                 ext.freeDecoded(self.allocator, &result);
             } else {
+                // BEP 27: reject PEX messages for private torrents
+                if (peer.extension_ids) |ids| {
+                    if (ids.ut_pex != 0 and sub_id == ids.ut_pex) {
+                        const is_private = if (self.getTorrentContext(peer.torrent_id)) |tc| tc.is_private else false;
+                        if (is_private) {
+                            log.debug("slot {d}: ignoring ut_pex message for private torrent", .{slot});
+                            return;
+                        }
+                    }
+                }
                 // Extension-specific message -- stub for future handlers
                 log.debug("slot {d}: unhandled extension message sub_id={d} len={d}", .{
                     slot, sub_id, ext_payload.len,
@@ -204,8 +214,10 @@ pub fn submitMessage(self: *EventLoop, slot: u16, id: u8, payload: []const u8) !
 /// Send our BEP 10 extension handshake as a tracked (heap-allocated) send.
 pub fn submitExtensionHandshake(self: *EventLoop, slot: u16) !void {
     const peer = &self.peers[slot];
+    // Check if the torrent is private (BEP 27: don't advertise ut_pex)
+    const is_private = if (self.getTorrentContext(peer.torrent_id)) |tc| tc.is_private else false;
     // Encode the bencoded extension handshake payload
-    const ext_payload = try ext.encodeExtensionHandshake(self.allocator, self.port);
+    const ext_payload = try ext.encodeExtensionHandshake(self.allocator, self.port, is_private);
     defer self.allocator.free(ext_payload);
 
     // Build the full framed message: 4-byte len | msg_id=20 | sub_id=0 | payload
