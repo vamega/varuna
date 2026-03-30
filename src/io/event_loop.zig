@@ -1050,11 +1050,8 @@ pub const EventLoop = struct {
                         return;
                     };
                     peer.state = .extension_handshake_send;
-                    // Start receiving messages while we wait for extension handshake send to complete
-                    peer.header_offset = 0;
-                    self.submitHeaderRecv(slot) catch {
-                        self.removePeer(slot);
-                    };
+                    // Don't start header recv yet — sendInterestedAndGoActive will do it
+                    // after the extension handshake send completes.
                 } else {
                     self.sendInterestedAndGoActive(slot);
                 }
