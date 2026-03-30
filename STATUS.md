@@ -29,6 +29,7 @@ Update it whenever a milestone lands, the near-term backlog changes, or a new op
 - SQLite resume state: WAL mode, prepared statements, background thread. Daemon persists completions every ~5s.
 - Bundled SQLite option: `-Dsqlite=bundled` or `-Dsqlite=system`.
 - Resume fast path: loads known-complete pieces from SQLite, skips SHA-1 rehashing.
+- Lifetime transfer stats: total_uploaded/total_downloaded persisted to SQLite `transfer_stats` table, loaded as baseline on startup so share ratio survives daemon restarts.
 - fdatasync, fallocate pre-allocation via io_uring.
 
 ### Configuration

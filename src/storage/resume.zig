@@ -8,11 +8,18 @@ const Bitfield = @import("../bitfield.zig").Bitfield;
 ///
 /// Runs on a dedicated background thread -- SQLite operations
 /// block and must NOT run on the io_uring event loop thread.
+pub const TransferStats = struct {
+    total_uploaded: u64 = 0,
+    total_downloaded: u64 = 0,
+};
+
 pub const ResumeDb = struct {
     db: *sqlite.Db,
     insert_stmt: *sqlite.Stmt,
     query_stmt: *sqlite.Stmt,
     delete_stmt: *sqlite.Stmt,
+    save_stats_stmt: *sqlite.Stmt,
+    load_stats_stmt: *sqlite.Stmt,
 
     pub fn open(path: [*:0]const u8) !ResumeDb {
         var db: ?*sqlite.Db = null;
@@ -38,6 +45,22 @@ pub const ResumeDb = struct {
                 "piece_index INTEGER NOT NULL, " ++
                 "completed_at INTEGER NOT NULL DEFAULT (strftime('%s','now')), " ++
                 "PRIMARY KEY (info_hash, piece_index)" ++
+                ")",
+            null,
+            null,
+            null,
+        ) != sqlite.SQLITE_OK) {
+            _ = sqlite.sqlite3_close(d);
+            return error.SqliteSchemaFailed;
+        }
+
+        // Create transfer_stats table for lifetime byte counters
+        if (sqlite.sqlite3_exec(
+            d,
+            "CREATE TABLE IF NOT EXISTS transfer_stats (" ++
+                "info_hash BLOB NOT NULL PRIMARY KEY, " ++
+                "total_uploaded INTEGER NOT NULL DEFAULT 0, " ++
+                "total_downloaded INTEGER NOT NULL DEFAULT 0" ++
                 ")",
             null,
             null,
@@ -87,11 +110,47 @@ pub const ResumeDb = struct {
             return error.SqlitePrepareFailed;
         }
 
+        var save_stats_stmt: ?*sqlite.Stmt = null;
+        if (sqlite.sqlite3_prepare_v2(
+            d,
+            "INSERT INTO transfer_stats (info_hash, total_uploaded, total_downloaded) " ++
+                "VALUES (?1, ?2, ?3) " ++
+                "ON CONFLICT(info_hash) DO UPDATE SET " ++
+                "total_uploaded = ?2, total_downloaded = ?3",
+            -1,
+            &save_stats_stmt,
+            null,
+        ) != sqlite.SQLITE_OK) {
+            _ = sqlite.sqlite3_finalize(insert_stmt.?);
+            _ = sqlite.sqlite3_finalize(query_stmt.?);
+            _ = sqlite.sqlite3_finalize(delete_stmt.?);
+            _ = sqlite.sqlite3_close(d);
+            return error.SqlitePrepareFailed;
+        }
+
+        var load_stats_stmt: ?*sqlite.Stmt = null;
+        if (sqlite.sqlite3_prepare_v2(
+            d,
+            "SELECT total_uploaded, total_downloaded FROM transfer_stats WHERE info_hash = ?1",
+            -1,
+            &load_stats_stmt,
+            null,
+        ) != sqlite.SQLITE_OK) {
+            _ = sqlite.sqlite3_finalize(insert_stmt.?);
+            _ = sqlite.sqlite3_finalize(query_stmt.?);
+            _ = sqlite.sqlite3_finalize(delete_stmt.?);
+            _ = sqlite.sqlite3_finalize(save_stats_stmt.?);
+            _ = sqlite.sqlite3_close(d);
+            return error.SqlitePrepareFailed;
+        }
+
         return .{
             .db = d,
             .insert_stmt = insert_stmt.?,
             .query_stmt = query_stmt.?,
             .delete_stmt = delete_stmt.?,
+            .save_stats_stmt = save_stats_stmt.?,
+            .load_stats_stmt = load_stats_stmt.?,
         };
     }
 
@@ -99,6 +158,8 @@ pub const ResumeDb = struct {
         _ = sqlite.sqlite3_finalize(self.insert_stmt);
         _ = sqlite.sqlite3_finalize(self.query_stmt);
         _ = sqlite.sqlite3_finalize(self.delete_stmt);
+        _ = sqlite.sqlite3_finalize(self.save_stats_stmt);
+        _ = sqlite.sqlite3_finalize(self.load_stats_stmt);
         _ = sqlite.sqlite3_close(self.db);
     }
 
@@ -151,6 +212,32 @@ pub const ResumeDb = struct {
             return error.SqliteDeleteFailed;
         }
     }
+
+    /// Persist lifetime upload/download byte totals for a torrent.
+    pub fn saveTransferStats(self: *ResumeDb, info_hash: [20]u8, stats: TransferStats) !void {
+        _ = sqlite.sqlite3_reset(self.save_stats_stmt);
+        _ = sqlite.sqlite3_bind_blob(self.save_stats_stmt, 1, &info_hash, 20, sqlite.SQLITE_TRANSIENT);
+        _ = sqlite.sqlite3_bind_int64(self.save_stats_stmt, 2, @intCast(stats.total_uploaded));
+        _ = sqlite.sqlite3_bind_int64(self.save_stats_stmt, 3, @intCast(stats.total_downloaded));
+
+        if (sqlite.sqlite3_step(self.save_stats_stmt) != sqlite.SQLITE_DONE) {
+            return error.SqliteInsertFailed;
+        }
+    }
+
+    /// Load lifetime upload/download byte totals for a torrent.
+    pub fn loadTransferStats(self: *ResumeDb, info_hash: [20]u8) TransferStats {
+        _ = sqlite.sqlite3_reset(self.load_stats_stmt);
+        _ = sqlite.sqlite3_bind_blob(self.load_stats_stmt, 1, &info_hash, 20, sqlite.SQLITE_TRANSIENT);
+
+        if (sqlite.sqlite3_step(self.load_stats_stmt) == sqlite.SQLITE_ROW) {
+            return .{
+                .total_uploaded = @intCast(sqlite.sqlite3_column_int64(self.load_stats_stmt, 0)),
+                .total_downloaded = @intCast(sqlite.sqlite3_column_int64(self.load_stats_stmt, 1)),
+            };
+        }
+        return .{};
+    }
 };
 
 /// Background resume writer that batches piece completions.
@@ -201,6 +288,20 @@ pub const ResumeWriter = struct {
         self.mutex.lock();
         self.pending.clearRetainingCapacity();
         self.mutex.unlock();
+    }
+
+    /// Persist lifetime transfer stats. Thread-safe.
+    pub fn saveTransferStats(self: *ResumeWriter, stats: TransferStats) void {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        self.db.saveTransferStats(self.info_hash, stats) catch {};
+    }
+
+    /// Load lifetime transfer stats. Thread-safe.
+    pub fn loadTransferStats(self: *ResumeWriter) TransferStats {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        return self.db.loadTransferStats(self.info_hash);
     }
 };
 
@@ -267,4 +368,49 @@ test "resume db clear torrent" {
 
     const count = try db.loadCompletePieces(info_hash, &bf);
     try std.testing.expectEqual(@as(u32, 0), count);
+}
+
+test "resume db save and load transfer stats" {
+    var db = ResumeDb.open(":memory:") catch return error.SkipZigTest;
+    defer db.close();
+
+    const info_hash = [_]u8{0xDD} ** 20;
+
+    // Initially empty -- should return zeros
+    const empty = db.loadTransferStats(info_hash);
+    try std.testing.expectEqual(@as(u64, 0), empty.total_uploaded);
+    try std.testing.expectEqual(@as(u64, 0), empty.total_downloaded);
+
+    // Save some stats
+    try db.saveTransferStats(info_hash, .{ .total_uploaded = 1000, .total_downloaded = 5000 });
+
+    const loaded = db.loadTransferStats(info_hash);
+    try std.testing.expectEqual(@as(u64, 1000), loaded.total_uploaded);
+    try std.testing.expectEqual(@as(u64, 5000), loaded.total_downloaded);
+
+    // Update (upsert) with new totals
+    try db.saveTransferStats(info_hash, .{ .total_uploaded = 3000, .total_downloaded = 8000 });
+
+    const updated = db.loadTransferStats(info_hash);
+    try std.testing.expectEqual(@as(u64, 3000), updated.total_uploaded);
+    try std.testing.expectEqual(@as(u64, 8000), updated.total_downloaded);
+}
+
+test "resume db transfer stats isolated per torrent" {
+    var db = ResumeDb.open(":memory:") catch return error.SkipZigTest;
+    defer db.close();
+
+    const hash_a = [_]u8{0xEE} ** 20;
+    const hash_b = [_]u8{0xFF} ** 20;
+
+    try db.saveTransferStats(hash_a, .{ .total_uploaded = 100, .total_downloaded = 200 });
+    try db.saveTransferStats(hash_b, .{ .total_uploaded = 300, .total_downloaded = 400 });
+
+    const stats_a = db.loadTransferStats(hash_a);
+    try std.testing.expectEqual(@as(u64, 100), stats_a.total_uploaded);
+    try std.testing.expectEqual(@as(u64, 200), stats_a.total_downloaded);
+
+    const stats_b = db.loadTransferStats(hash_b);
+    try std.testing.expectEqual(@as(u64, 300), stats_b.total_uploaded);
+    try std.testing.expectEqual(@as(u64, 400), stats_b.total_downloaded);
 }

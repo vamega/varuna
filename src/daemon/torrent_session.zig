@@ -90,6 +90,11 @@ pub const TorrentSession = struct {
     resume_writer: ?ResumeWriter = null,
     resume_last_count: u32 = 0,
 
+    // Lifetime transfer stats baseline loaded from DB on startup.
+    // Current session totals (from event loop peers) are added on top.
+    baseline_uploaded: u64 = 0,
+    baseline_downloaded: u64 = 0,
+
     // Config
     port: u16 = 6881,
     max_peers: u32 = 50,
@@ -352,6 +357,10 @@ pub const TorrentSession = struct {
         else
             @import("../io/event_loop.zig").SpeedStats{};
 
+        // Lifetime totals = persisted baseline + current session
+        const total_downloaded = self.baseline_downloaded + speed_stats.dl_total;
+        const total_uploaded = self.baseline_uploaded + speed_stats.ul_total;
+
         // Compute ETA: bytes_remaining / download_speed
         const bytes_remaining = if (self.total_size > speed_stats.dl_total)
             self.total_size - speed_stats.dl_total
@@ -362,9 +371,9 @@ pub const TorrentSession = struct {
         else
             -1;
 
-        // Compute share ratio: uploaded / downloaded
-        const ratio: f64 = if (speed_stats.dl_total > 0)
-            @as(f64, @floatFromInt(speed_stats.ul_total)) / @as(f64, @floatFromInt(speed_stats.dl_total))
+        // Compute share ratio: uploaded / downloaded (lifetime)
+        const ratio: f64 = if (total_downloaded > 0)
+            @as(f64, @floatFromInt(total_uploaded)) / @as(f64, @floatFromInt(total_downloaded))
         else
             0.0;
 
@@ -376,8 +385,8 @@ pub const TorrentSession = struct {
             .pieces_have = pieces_have,
             .pieces_total = self.piece_count,
             .total_size = self.total_size,
-            .bytes_downloaded = speed_stats.dl_total,
-            .bytes_uploaded = speed_stats.ul_total,
+            .bytes_downloaded = total_downloaded,
+            .bytes_uploaded = total_uploaded,
             .name = self.name,
             .info_hash_hex = self.info_hash_hex,
             .save_path = self.save_path,
@@ -431,6 +440,10 @@ pub const TorrentSession = struct {
                         loaded_bf.deinit(self.allocator);
                     }
                 }
+                // Load lifetime transfer stats so share ratio survives restarts
+                const transfer_stats = self.resume_writer.?.loadTransferStats();
+                self.baseline_uploaded = transfer_stats.total_uploaded;
+                self.baseline_downloaded = transfer_stats.total_downloaded;
             } else |_| {}
         }
 
@@ -872,12 +885,26 @@ pub const TorrentSession = struct {
         self.resume_last_count = current_count;
     }
 
-    /// Flush pending resume writes to SQLite. Safe to call from any
-    /// thread -- the actual SQLite I/O is blocking, which is fine
-    /// because this is never called from the io_uring event loop thread.
+    /// Flush pending resume writes to SQLite, including lifetime
+    /// transfer stats. Safe to call from any thread -- the actual
+    /// SQLite I/O is blocking, which is fine because this is never
+    /// called from the io_uring event loop thread.
     pub fn flushResume(self: *TorrentSession) void {
         if (self.resume_writer) |*rw| {
             rw.flush() catch {};
+
+            // Persist lifetime transfer stats (baseline + current session)
+            const speed_stats = if (self.shared_event_loop) |sel|
+                if (self.torrent_id_in_shared) |tid| sel.getSpeedStats(tid) else @import("../io/event_loop.zig").SpeedStats{}
+            else if (self.event_loop) |*el|
+                el.getSpeedStats(0)
+            else
+                @import("../io/event_loop.zig").SpeedStats{};
+
+            rw.saveTransferStats(.{
+                .total_uploaded = self.baseline_uploaded + speed_stats.ul_total,
+                .total_downloaded = self.baseline_downloaded + speed_stats.dl_total,
+            });
         }
     }
 };
