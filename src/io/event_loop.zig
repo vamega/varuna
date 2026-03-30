@@ -612,6 +612,12 @@ pub const EventLoop = struct {
             }
         }
         self.unmarkIdle(slot);
+
+        // Free any tracked send buffers before closing the fd.  After
+        // close, stale CQEs will arrive for this slot -- the guard in
+        // handleSend will ignore them because the slot is .free.
+        self.freeAllPendingSends(slot);
+
         self.cleanupPeer(peer);
         peer.* = Peer{};
         if (self.peer_count > 0) self.peer_count -= 1;
@@ -876,11 +882,14 @@ pub const EventLoop = struct {
         // Connection attempt completed (success or failure) -- no longer half-open
         if (self.half_open_count > 0) self.half_open_count -= 1;
 
+        const peer = &self.peers[slot];
+        // Guard: stale CQE for an already-freed slot
+        if (peer.state == .free) return;
+
         if (cqe.res < 0) {
             self.removePeer(slot);
             return;
         }
-        const peer = &self.peers[slot];
         peer.state = .handshake_send;
         peer.last_activity = std.time.timestamp();
 
@@ -909,10 +918,20 @@ pub const EventLoop = struct {
 
     fn handleSend(self: *EventLoop, slot: u16, cqe: linux.io_uring_cqe) void {
         const peer = &self.peers[slot];
-        if (cqe.res <= 0) {
-            // Check if this was a tracked send buffer -- free it on error
+
+        // Guard: if the peer slot was already freed (stale CQE from a
+        // previously-closed fd), just free the tracked buffer if any.
+        if (peer.state == .free) {
             const op = decodeUserData(cqe.user_data);
-            if (op.context == 1) self.freePendingSend(slot);
+            if (op.context == 1) self.freeOnePendingSend(slot);
+            return;
+        }
+
+        if (cqe.res <= 0) {
+            // Check if this was a tracked send buffer -- free it on error.
+            // Only free ONE buffer: removePeer will clean up the rest.
+            const op = decodeUserData(cqe.user_data);
+            if (op.context == 1) self.freeOnePendingSend(slot);
             self.removePeer(slot);
             return;
         }
@@ -924,7 +943,7 @@ pub const EventLoop = struct {
             // Check for partial send and re-submit remainder
             if (!self.handlePartialSend(slot, bytes_sent)) {
                 // Full send complete, free the buffer
-                self.freePendingSend(slot);
+                self.freeOnePendingSend(slot);
             }
         }
 
@@ -990,6 +1009,11 @@ pub const EventLoop = struct {
 
     fn handleRecv(self: *EventLoop, slot: u16, cqe: linux.io_uring_cqe) void {
         const peer = &self.peers[slot];
+
+        // Guard: if the peer slot was already freed (stale CQE from a
+        // previously-closed fd), ignore the completion entirely.
+        if (peer.state == .free) return;
+
         if (cqe.res <= 0) {
             self.removePeer(slot);
             return;
@@ -1721,7 +1745,9 @@ pub const EventLoop = struct {
 
             const ud = encodeUserData(.{ .slot = current_slot, .op_type = .peer_send, .context = 1 });
             _ = self.ring.send(ud, peer.fd, send_buf, 0) catch {
-                self.allocator.free(send_buf);
+                // SQE submission failed -- free via the pending_sends entry
+                // to avoid leaving a dangling pointer in the list.
+                self.freeOnePendingSend(current_slot);
                 i = j;
                 continue;
             };
@@ -1763,7 +1789,9 @@ pub const EventLoop = struct {
 
         const ud = encodeUserData(.{ .slot = slot, .op_type = .peer_send, .context = 1 });
         _ = self.ring.send(ud, peer.fd, send_buf, 0) catch {
-            self.allocator.free(send_buf);
+            // SQE submission failed -- free via the pending_sends entry
+            // (not directly) to avoid leaving a dangling pointer.
+            self.freeOnePendingSend(slot);
             return;
         };
         peer.send_pending = true;
@@ -2238,14 +2266,31 @@ pub const EventLoop = struct {
         return false;
     }
 
-    fn freePendingSend(self: *EventLoop, slot: u16) void {
+    /// Free ONE pending send buffer for the given slot (the first match).
+    /// Called when a single send CQE completes -- each CQE corresponds to
+    /// exactly one buffer.  Freeing all buffers for a slot here would be a
+    /// use-after-free when multiple tracked sends are in flight for the
+    /// same peer (e.g. extension handshake + piece response).
+    fn freeOnePendingSend(self: *EventLoop, slot: u16) void {
+        for (self.pending_sends.items, 0..) |ps, i| {
+            if (ps.slot == slot) {
+                self.allocator.free(ps.buf);
+                _ = self.pending_sends.swapRemove(i);
+                return;
+            }
+        }
+    }
+
+    /// Free ALL pending send buffers for the given slot.
+    /// Called during peer removal to clean up any buffers that won't be
+    /// reclaimed by future CQE processing (the fd is closed so remaining
+    /// CQEs will arrive as errors for a potentially-reused slot).
+    fn freeAllPendingSends(self: *EventLoop, slot: u16) void {
         var i: usize = 0;
         while (i < self.pending_sends.items.len) {
             if (self.pending_sends.items[i].slot == slot) {
                 self.allocator.free(self.pending_sends.items[i].buf);
                 _ = self.pending_sends.swapRemove(i);
-                // Don't increment i -- swapRemove moved a new element here.
-                // Don't return -- there may be more entries for this slot.
                 continue;
             }
             i += 1;

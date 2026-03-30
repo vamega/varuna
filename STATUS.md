@@ -58,6 +58,7 @@ Update it whenever a milestone lands, the near-term backlog changes, or a new op
 - claimPiece scan hint + min_availability for faster rarest-first selection.
 - Hasher TOCTOU fix (atomic drainResultsInto), proper drain loop, endgame duplicate write skip.
 - timeout_pending tracking, write error checking in handleDiskWrite, error logging for silent catches.
+- **io_uring send buffer UAF fix**: split free-one vs free-all pending sends, stale-CQE guards on handleSend/handleRecv/handleConnect, SQE-submit-failure dangling-pointer fix. Tools binary restored from c_allocator to GPA.
 - IORING_OP_CLOSE for hot-path fd cleanup in RPC server.
 
 ### Testing
@@ -69,7 +70,7 @@ Update it whenever a milestone lands, the near-term backlog changes, or a new op
 
 ## Next
 
-- **Use-after-free investigation**: GPA debug poison exposed latent UAF in io_uring buffer lifecycle. Tools switched to c_allocator as workaround. Root cause needs fixing.
+- ~~Use-after-free investigation~~: **Fixed.** `freePendingSend` freed all buffers for a slot per CQE; now `freeOnePendingSend` frees one. `removePeer` now calls `freeAllPendingSends`. Stale-CQE guards added. Tools restored to GPA.
 - **uTP event loop integration**: wire UtpManager into io_uring (UDP socket, RECVMSG/SENDMSG, peer state machine for TCP/uTP coexistence).
 - **Statistics persistence**: persist lifetime uploaded/downloaded bytes to resume DB so ratio survives daemon restarts.
 - **Event loop module split**: event_loop.zig is 1700+ lines. Split into peer_handler, protocol, seed_handler, policy modules.
@@ -83,7 +84,7 @@ Update it whenever a milestone lands, the near-term backlog changes, or a new op
 
 ## Known Issues
 
-- Latent use-after-free in io_uring buffer lifecycle (masked by c_allocator in tools binary, needs proper fix).
+- Transfer test matrix (`scripts/test_transfer_matrix.sh`) failing with `NoReachablePeers` -- peer connect/handshake regression, unrelated to the (now-fixed) UAF.
 - The packaged Ubuntu `opentracker` build requires explicit info-hash whitelisting (`--whitelist-hash`).
 - Resume DB doesn't persist lifetime upload/download totals (ratio resets on restart).
 - `private=1` flag is parsed but enforcement (disable PEX when implemented) not yet wired.
