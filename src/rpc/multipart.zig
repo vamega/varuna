@@ -322,3 +322,72 @@ test "extractHeaderParam handles various formats" {
     );
     try std.testing.expect(extractHeaderParam("form-data; name=\"test\"", "filename") == null);
 }
+
+// ── Fuzz and edge case tests ─────────────────────────────
+
+test "fuzz multipart parser" {
+    try std.testing.fuzz({}, struct {
+        fn run(_: void, input: []const u8) anyerror!void {
+            // Split input: first half as content_type, second half as body.
+            // This exercises both extractBoundary and parse with random data.
+            const split = input.len / 2;
+            const content_type = input[0..split];
+            const body = input[split..];
+
+            // extractBoundary must not panic
+            _ = extractBoundary(content_type);
+
+            // parse must not panic
+            const parts = parse(std.testing.allocator, content_type, body) catch return;
+            freeParts(std.testing.allocator, parts);
+        }
+    }.run, .{
+        .corpus = &.{
+            // Valid multipart
+            "multipart/form-data; boundary=XXX" ++
+                "--XXX\r\nContent-Disposition: form-data; name=\"f\"\r\n\r\ndata\r\n--XXX--\r\n",
+            // Missing boundary parameter
+            "application/jsonsome body here",
+            // Empty input
+            "",
+            // Just boundary keyword
+            "boundary=",
+            // Boundary but no parts in body
+            "multipart/form-data; boundary=abc" ++ "no boundary markers",
+            // Quoted boundary
+            "multipart/form-data; boundary=\"qb\"" ++ "--qb\r\n\r\n\r\n--qb--",
+        },
+    });
+}
+
+test "multipart parser edge cases: empty and single bytes" {
+    // Empty content_type and body
+    try std.testing.expectError(ParseError.MissingBoundary, parse(std.testing.allocator, "", ""));
+
+    // Single byte inputs for content_type
+    var ct: [1]u8 = undefined;
+    var byte: u16 = 0;
+    while (byte <= 0xFF) : (byte += 1) {
+        ct[0] = @intCast(byte);
+        _ = extractBoundary(&ct);
+        const result = parse(std.testing.allocator, &ct, "");
+        if (result) |parts| {
+            freeParts(std.testing.allocator, parts);
+        } else |_| {}
+    }
+}
+
+test "multipart parser handles truncated valid input" {
+    const valid = "multipart/form-data; boundary=XXX" ++
+        "--XXX\r\nContent-Disposition: form-data; name=\"f\"\r\n\r\ndata\r\n--XXX--\r\n";
+
+    // Feed progressively longer prefixes -- none should panic
+    for (0..valid.len) |i| {
+        const truncated = valid[0..i];
+        const split = truncated.len / 2;
+        const result = parse(std.testing.allocator, truncated[0..split], truncated[split..]);
+        if (result) |parts| {
+            freeParts(std.testing.allocator, parts);
+        } else |_| {}
+    }
+}

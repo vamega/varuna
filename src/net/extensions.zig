@@ -338,3 +338,61 @@ test "serializeExtensionMessage with empty payload" {
     try std.testing.expectEqual(@as(u8, 20), frame[4]);
     try std.testing.expectEqual(@as(u8, 3), frame[5]);
 }
+
+// ── Fuzz and edge case tests ─────────────────────────────
+
+test "fuzz BEP 10 extension handshake decoder" {
+    try std.testing.fuzz({}, struct {
+        fn run(_: void, input: []const u8) anyerror!void {
+            var result = decodeExtensionHandshake(std.testing.allocator, input) catch return;
+            freeDecoded(std.testing.allocator, &result);
+        }
+    }.run, .{
+        .corpus = &.{
+            // Valid minimal dict
+            "de",
+            // Valid with m dict
+            "d1:md11:ut_metadatai1eee",
+            // Valid with all fields
+            "d1:md11:ut_metadatai3e6:ut_pexi2ee13:metadata_sizei12345e1:pi9999e1:v7:delugexe",
+            // Empty m dict
+            "d1:mdee",
+            // Non-dict (should error)
+            "i42e",
+            "le",
+            "4:spam",
+            // Invalid bencode
+            "",
+            "d",
+            "d1:m",
+            // Negative extension IDs (should be ignored)
+            "d1:md11:ut_metadatai-1eee",
+            // Overflow extension ID
+            "d1:md11:ut_metadatai999eee",
+            // Wrong type for m
+            "d1:m4:teste",
+            // Wrong type for port
+            "d1:p4:teste",
+            // Wrong type for version
+            "d1:vi42ee",
+        },
+    });
+}
+
+test "extension handshake decoder edge cases: single byte inputs" {
+    var buf: [1]u8 = undefined;
+    var byte: u16 = 0;
+    while (byte <= 0xFF) : (byte += 1) {
+        buf[0] = @intCast(byte);
+        var result = decodeExtensionHandshake(std.testing.allocator, &buf) catch continue;
+        freeDecoded(std.testing.allocator, &result);
+    }
+}
+
+test "extension handshake decoder handles truncated valid input" {
+    const valid = "d1:md11:ut_metadatai3e6:ut_pexi2ee13:metadata_sizei12345e1:pi9999e1:v7:delugexe";
+    for (0..valid.len) |i| {
+        var result = decodeExtensionHandshake(std.testing.allocator, valid[0..i]) catch continue;
+        freeDecoded(std.testing.allocator, &result);
+    }
+}

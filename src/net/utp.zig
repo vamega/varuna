@@ -934,3 +934,77 @@ test "timeout detection" {
     // Timed out.
     try std.testing.expect(sock.isTimedOut(1_600_000));
 }
+
+// ── Fuzz and edge case tests ─────────────────────────────
+
+test "fuzz uTP header decode" {
+    try std.testing.fuzz({}, struct {
+        fn run(_: void, input: []const u8) anyerror!void {
+            // Header.decode must not panic on any input
+            _ = Header.decode(input);
+
+            // If buffer is long enough, also exercise SelectiveAck.decode
+            if (input.len >= Header.size + 2) {
+                _ = SelectiveAck.decode(input[Header.size..]);
+            }
+        }
+    }.run, .{
+        .corpus = &.{
+            // Valid SYN packet (version 1, type 4=SYN)
+            &(Header{ .packet_type = .st_syn, .extension = .none, .connection_id = 1234, .timestamp_us = 0, .timestamp_diff_us = 0, .wnd_size = 65535, .seq_nr = 1, .ack_nr = 0 }).encode(),
+            // Valid DATA packet
+            &(Header{ .packet_type = .st_data, .extension = .none, .connection_id = 5678, .timestamp_us = 100, .timestamp_diff_us = 50, .wnd_size = 32768, .seq_nr = 10, .ack_nr = 9 }).encode(),
+            // Wrong version (should return null)
+            &[_]u8{ 0x42, 0x00 } ++ [_]u8{0} ** 18,
+            // Too short
+            "",
+            &[_]u8{0x41},
+            &[_]u8{0} ** 19,
+            // All zeros (version 0, should reject)
+            &[_]u8{0} ** 20,
+            // All 0xFF
+            &[_]u8{0xFF} ** 20,
+        },
+    });
+}
+
+test "uTP header decode edge cases: single byte inputs" {
+    var buf: [1]u8 = undefined;
+    var byte: u16 = 0;
+    while (byte <= 0xFF) : (byte += 1) {
+        buf[0] = @intCast(byte);
+        // Must return null for any single byte (too short)
+        try std.testing.expect(Header.decode(&buf) == null);
+    }
+}
+
+test "uTP header decode rejects all invalid versions" {
+    var buf = [_]u8{0} ** 20;
+    // Version nibble is low nibble of byte 0
+    // Only version 1 is valid
+    for (0..16) |v| {
+        buf[0] = @as(u8, @intCast(v)); // type=0 (st_data), version=v
+        const result = Header.decode(&buf);
+        if (v == 1) {
+            try std.testing.expect(result != null);
+        } else {
+            try std.testing.expect(result == null);
+        }
+    }
+}
+
+test "uTP selective ack decode edge cases" {
+    // Empty buffer
+    try std.testing.expect(SelectiveAck.decode("") == null);
+    // Single byte
+    try std.testing.expect(SelectiveAck.decode(&[_]u8{0}) == null);
+    // len=0 (invalid)
+    try std.testing.expect(SelectiveAck.decode(&[_]u8{ 0, 0 }) == null);
+    // len not multiple of 4
+    try std.testing.expect(SelectiveAck.decode(&[_]u8{ 0, 3, 0, 0, 0 }) == null);
+    // len=4 but buffer too short
+    try std.testing.expect(SelectiveAck.decode(&[_]u8{ 0, 4, 0 }) == null);
+    // Valid: len=4 with enough data
+    const valid = SelectiveAck.decode(&[_]u8{ 0, 4, 0xFF, 0, 0, 0 });
+    try std.testing.expect(valid != null);
+}

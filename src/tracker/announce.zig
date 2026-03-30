@@ -428,3 +428,69 @@ test "reject non-integer interval in tracker response" {
         parseResponse(std.testing.allocator, "d8:interval3:foo5:peers0:e"),
     );
 }
+
+// ── Fuzz and edge case tests ─────────────────────────────
+
+test "fuzz tracker announce response parser" {
+    try std.testing.fuzz({}, struct {
+        fn run(_: void, input: []const u8) anyerror!void {
+            const response = parseResponse(std.testing.allocator, input) catch return;
+            freeResponse(std.testing.allocator, response);
+        }
+    }.run, .{
+        .corpus = &.{
+            // Valid compact response
+            "d8:completei1e10:incompletei0e8:intervali30e5:peers6:\x7f\x00\x00\x01\x1a\xe1e",
+            // Valid dictionary peer response
+            "d8:intervali60e5:peersld2:ip9:127.0.0.14:porti7000eeee",
+            // Empty peers
+            "d8:intervali10e5:peers0:e",
+            // Failure reason
+            "d14:failure reason6:deniede",
+            // Non-dict
+            "li1ee",
+            // Empty dict
+            "de",
+            // Invalid bencode
+            "",
+            "i",
+            "d",
+            // Compact peers with IPv6 (peers6 key)
+            "d8:intervali30e5:peers0:6:peers618:\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x01\x1a\xe1e",
+            // Missing interval (should default)
+            "d5:peers0:e",
+            // Negative interval
+            "d8:intervali-1e5:peers0:e",
+        },
+    });
+}
+
+test "announce parser edge cases: single byte inputs" {
+    var buf: [1]u8 = undefined;
+    var byte: u16 = 0;
+    while (byte <= 0xFF) : (byte += 1) {
+        buf[0] = @intCast(byte);
+        const result = parseResponse(std.testing.allocator, &buf);
+        if (result) |response| {
+            freeResponse(std.testing.allocator, response);
+        } else |_| {}
+    }
+}
+
+test "announce parser handles truncated compact response" {
+    const valid = "d8:completei1e10:incompletei0e8:intervali30e5:peers6:\x7f\x00\x00\x01\x1a\xe1e";
+    for (0..valid.len) |i| {
+        const result = parseResponse(std.testing.allocator, valid[0..i]);
+        if (result) |response| {
+            freeResponse(std.testing.allocator, response);
+        } else |_| {}
+    }
+}
+
+test "announce parser handles odd-length compact peers" {
+    // Compact peers must be multiple of 6; odd lengths should error
+    try std.testing.expectError(
+        error.InvalidPeersField,
+        parseResponse(std.testing.allocator, "d8:intervali30e5:peers5:ABCDEe"),
+    );
+}

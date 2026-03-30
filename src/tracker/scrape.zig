@@ -362,3 +362,74 @@ test "parse scrape response rejects non-dict" {
         parseScrapeResponse(alloc, "li42ee", info_hash),
     );
 }
+
+// ── Fuzz and edge case tests ─────────────────────────────
+
+test "fuzz tracker scrape response parser" {
+    try std.testing.fuzz({}, struct {
+        fn run(_: void, input: []const u8) anyerror!void {
+            const info_hash = [_]u8{0xAB} ** 20;
+            const result = parseScrapeResponse(std.testing.allocator, input, info_hash) catch return;
+            // Result is a value struct, no deallocation needed
+            _ = result;
+        }
+    }.run, .{
+        .corpus = &.{
+            // Valid scrape response (info_hash key is raw bytes -- hard to embed,
+            // so use simpler corpus entries that exercise different paths)
+            "de",
+            "d5:filesdee",
+            "d14:failure reason6:deniede",
+            // Non-dict
+            "li42ee",
+            "i0e",
+            "4:spam",
+            // Invalid bencode
+            "",
+            "d",
+            "d5:files",
+            // files not a dict
+            "d5:filesi42ee",
+            // Nested dict with wrong types
+            "d5:filesd20:ABCDEFGHIJKLMNOPQRSTi42eee",
+        },
+    });
+}
+
+test "scrape parser edge cases: single byte inputs" {
+    const info_hash = [_]u8{0} ** 20;
+    var buf: [1]u8 = undefined;
+    var byte: u16 = 0;
+    while (byte <= 0xFF) : (byte += 1) {
+        buf[0] = @intCast(byte);
+        _ = parseScrapeResponse(std.testing.allocator, &buf, info_hash) catch continue;
+    }
+}
+
+test "scrape parser handles truncated valid response" {
+    const alloc = std.testing.allocator;
+    const info_hash = [_]u8{0xAB} ** 20;
+
+    // Build a valid response
+    var response_buf = std.ArrayList(u8).empty;
+    defer response_buf.deinit(alloc);
+
+    try response_buf.appendSlice(alloc, "d5:filesd20:");
+    try response_buf.appendSlice(alloc, info_hash[0..]);
+    try response_buf.appendSlice(alloc, "d8:completei10e10:incompletei5e10:downloadedi100eeee");
+
+    // Feed progressively longer prefixes
+    for (0..response_buf.items.len) |i| {
+        _ = parseScrapeResponse(alloc, response_buf.items[0..i], info_hash) catch continue;
+    }
+}
+
+test "scrape parser handles missing files key" {
+    const alloc = std.testing.allocator;
+    const info_hash = [_]u8{0} ** 20;
+
+    try std.testing.expectError(
+        error.MissingRequiredField,
+        parseScrapeResponse(alloc, "d3:foo3:bare", info_hash),
+    );
+}
