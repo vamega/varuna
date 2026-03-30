@@ -1,4 +1,4 @@
-/reference-codebases/
+# reference-codebases/ tracked via git submodules
 /.zig-cache/
 /zig-out/
 /node_modules/

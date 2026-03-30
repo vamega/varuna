@@ -1,0 +1,18 @@
+[submodule "reference-codebases/libtorrent"]
+	path = reference-codebases/libtorrent
+	url = https://github.com/arvidn/libtorrent.git
+[submodule "reference-codebases/libtorrent-rakshasa"]
+	path = reference-codebases/libtorrent-rakshasa
+	url = https://github.com/rakshasa/libtorrent.git
+[submodule "reference-codebases/qbittorrent"]
+	path = reference-codebases/qbittorrent
+	url = https://github.com/qbittorrent/qBittorrent.git
+[submodule "reference-codebases/rtorrent"]
+	path = reference-codebases/rtorrent
+	url = https://github.com/rakshasa/rtorrent.git
+[submodule "reference-codebases/vortex"]
+	path = reference-codebases/vortex
+	url = https://github.com/Nehliin/vortex.git
+[submodule "reference-codebases/qui"]
+	path = reference-codebases/qui
+	url = https://github.com/autobrr/qui.git
