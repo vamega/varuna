@@ -112,8 +112,8 @@ pub const Ledbat = struct {
             self.bytes_acked +|= bytes;
 
             if (self.bytes_acked >= self.cwnd and self.cwnd > 0) {
-                const window_factor: i64 = @as(i64, self.bytes_acked) * @as(i64, mss) / @as(i64, self.cwnd);
-                const delay_factor: i64 = off_target * @as(i64, mss) / @as(i64, target_delay_us);
+                const window_factor: i64 = @divTrunc(@as(i64, self.bytes_acked) * @as(i64, mss), @as(i64, self.cwnd));
+                const delay_factor: i64 = @divTrunc(off_target * @as(i64, mss), @as(i64, target_delay_us));
                 const gain = @divTrunc(window_factor * delay_factor, @as(i64, mss));
 
                 if (gain > 0) {

@@ -12,7 +12,7 @@ Update it whenever a milestone lands, the near-term backlog changes, or a new op
 - Private tracker support: private flag parsing, per-session key, numwant, compact=1.
 - IPv6 peer support (BEP 7): compact peers6, IPv6-aware connect.
 - BEP 10 Extension Protocol: handshake negotiation, extension message dispatch, advertises ut_metadata and ut_pex.
-- uTP protocol layer (BEP 29): packet codec, UtpSocket state machine, LEDBAT congestion control, UtpManager multiplexer. 30+ tests. (Event loop integration pending.)
+- uTP protocol layer (BEP 29): packet codec, UtpSocket state machine, LEDBAT congestion control, UtpManager multiplexer, io_uring event loop integration (UDP socket, RECVMSG/SENDMSG, inbound connection accept, peer wire protocol bridge). 30+ tests.
 - Multi-peer download: rarest-first piece selection, endgame mode, tit-for-tat choking, block pipelining (depth 5).
 - Multi-peer seeding: io_uring event loop, batched block sends, async disk reads with piece cache.
 - Selective file download: per-file priorities (normal/high/do_not_download), piece-mask filtering, boundary-piece handling, lazy file creation.
@@ -71,7 +71,8 @@ Update it whenever a milestone lands, the near-term backlog changes, or a new op
 ## Next
 
 - ~~Use-after-free investigation~~: **Fixed.** `freePendingSend` freed all buffers for a slot per CQE; now `freeOnePendingSend` frees one. `removePeer` now calls `freeAllPendingSends`. Stale-CQE guards added. Tools restored to GPA.
-- **uTP event loop integration**: wire UtpManager into io_uring (UDP socket, RECVMSG/SENDMSG, peer state machine for TCP/uTP coexistence).
+- ~~uTP event loop integration~~: **Done.** UDP socket, RECVMSG/SENDMSG via io_uring, inbound uTP connection accept, peer wire protocol bridge, timeout processing. Outbound uTP connect deferred.
+- **uTP outbound connections**: initiate uTP connections to peers (currently only inbound is supported).
 - **Statistics persistence**: persist lifetime uploaded/downloaded bytes to resume DB so ratio survives daemon restarts.
 - **Event loop module split**: event_loop.zig is 1700+ lines. Split into peer_handler, protocol, seed_handler, policy modules.
 - **Private flag enforcement**: disable PEX/DHT/LSD when `private=1` is set in torrent metadata.

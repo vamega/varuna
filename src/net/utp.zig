@@ -519,7 +519,7 @@ pub const UtpSocket = struct {
         self.rto = @min(@max(self.srtt + 4 * self.rttvar, min_rto_us), max_rto_us);
     }
 
-    fn makeAck(self: *UtpSocket, now_us: u32) [Header.size]u8 {
+    pub fn makeAck(self: *UtpSocket, now_us: u32) [Header.size]u8 {
         const hdr = Header{
             .packet_type = .st_state,
             .extension = .none,
