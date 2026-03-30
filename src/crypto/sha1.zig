@@ -208,6 +208,23 @@ fn detectAarch64Sha1() bool {
     return false;
 }
 
+// ── Direct round functions for benchmarking (no dispatch overhead) ──
+
+/// Round using SHA-NI directly, no detection check. Only valid on x86_64 with SHA-NI.
+/// Exported for benchmarking to measure dispatch overhead.
+pub fn roundDirectShaNi(d: *Sha1, b: *const [64]u8) void {
+    if (builtin.cpu.arch == .x86_64) {
+        d.roundShaNi(b);
+    } else {
+        d.roundSoftware(b);
+    }
+}
+
+/// Round using software path directly, no detection check.
+pub fn roundDirectSoftware(d: *Sha1, b: *const [64]u8) void {
+    d.roundSoftware(b);
+}
+
 // ── Round dispatch ──────────────────────────────────────────────────
 
 fn round(d: *Sha1, b: *const [64]u8) void {

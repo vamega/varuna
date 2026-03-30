@@ -93,6 +93,51 @@ fn benchSha1Generic(
     try printResult(stdout, name, iterations, timer.read(), total_bytes, checksum);
 }
 
+fn benchSha1DirectShaNi(
+    stdout: *std.Io.Writer,
+    comptime name: []const u8,
+    buffer: []const u8,
+    iterations: usize,
+) !void {
+    const Sha1 = varuna.crypto.Sha1;
+    var timer = try std.time.Timer.start();
+    var checksum: u64 = 0;
+    for (0..iterations) |_| {
+        // Use the direct SHA-NI round function — no detection, no switch
+        var d = Sha1.init(.{});
+        var off: usize = 0;
+        while (off + 64 <= buffer.len) : (off += 64) {
+            d.roundDirectShaNi(@ptrCast(buffer[off..][0..64]));
+        }
+        // Handle remaining bytes via full update for correctness
+        if (off < buffer.len) d.update(buffer[off..]);
+        var digest: [20]u8 = undefined;
+        d.final(&digest);
+        checksum +%= digest[0];
+    }
+    const total_bytes: u64 = @as(u64, iterations) * buffer.len;
+    try printResult(stdout, name, iterations, timer.read(), total_bytes, checksum);
+}
+
+fn benchSha1Noop(
+    stdout: *std.Io.Writer,
+    comptime name: []const u8,
+    buffer: []const u8,
+    iterations: usize,
+) !void {
+    // Measures memory bandwidth — read the buffer, return a fixed hash
+    var timer = try std.time.Timer.start();
+    var checksum: u64 = 0;
+    for (0..iterations) |_| {
+        // Touch every byte to measure read bandwidth
+        var sum: u8 = 0;
+        for (buffer) |b| sum +%= b;
+        checksum +%= sum;
+    }
+    const total_bytes: u64 = @as(u64, iterations) * buffer.len;
+    try printResult(stdout, name, iterations, timer.read(), total_bytes, checksum);
+}
+
 fn benchSha1(stdout: *std.Io.Writer) !void {
     const Sha1 = varuna.crypto.Sha1;
     const StdSha1 = std.crypto.hash.Sha1;
@@ -111,15 +156,17 @@ fn benchSha1(stdout: *std.Io.Writer) !void {
     try stdout.print("sha1_accel={s}, hw_enabled={}\n", .{ @tagName(Sha1.accel()), Sha1.hasShaNi() });
     try stdout.flush();
 
-    // std lib (software-only) -- 256KB
+    // --- 256KB ---
+    try benchSha1Noop(stdout, "sha1_noop_256kb", &buffer_256k, iterations_256k);
     try benchSha1Generic(stdout, StdSha1, "sha1_std_256kb", &buffer_256k, iterations_256k);
-    // varuna (SHA-NI when available) -- 256KB
     try benchSha1Generic(stdout, Sha1, "sha1_varuna_256kb", &buffer_256k, iterations_256k);
+    try benchSha1DirectShaNi(stdout, "sha1_direct_shani_256kb", &buffer_256k, iterations_256k);
 
-    // std lib -- 1MB
+    // --- 1MB ---
+    try benchSha1Noop(stdout, "sha1_noop_1mb", &buffer_1m, iterations_1m);
     try benchSha1Generic(stdout, StdSha1, "sha1_std_1mb", &buffer_1m, iterations_1m);
-    // varuna -- 1MB
     try benchSha1Generic(stdout, Sha1, "sha1_varuna_1mb", &buffer_1m, iterations_1m);
+    try benchSha1DirectShaNi(stdout, "sha1_direct_shani_1mb", &buffer_1m, iterations_1m);
 }
 
 fn benchMetainfoParse(stdout: *std.Io.Writer) !void {
