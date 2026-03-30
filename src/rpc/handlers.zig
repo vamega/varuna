@@ -448,60 +448,27 @@ pub const ApiHandler = struct {
         const hash = extractParam(body, "hash") orelse
             return .{ .status = 400, .body = "{\"error\":\"missing hash\"}" };
 
-        const session = self.session_manager.getSession(hash) catch
-            return .{ .status = 404, .body = "{\"error\":\"torrent not found\"}" };
+        // Get file info with all data copied under the SessionManager mutex,
+        // avoiding use-after-free if the session is removed concurrently.
+        const file_infos = self.session_manager.getSessionFiles(allocator, hash) catch |err| switch (err) {
+            error.TorrentNotFound => return .{ .status = 404, .body = "{\"error\":\"torrent not found\"}" },
+            error.TorrentNotReady => return .{ .status = 409, .body = "{\"error\":\"torrent metadata not ready\"}" },
+            else => return .{ .status = 500, .body = "{\"error\":\"internal\"}" },
+        };
+        defer SessionManager.freeFileInfos(allocator, file_infos);
 
-        // Need parsed session for file metadata
-        const sess = session.session orelse
-            return .{ .status = 409, .body = "{\"error\":\"torrent metadata not ready\"}" };
-
-        const meta = sess.metainfo;
         var json = std.ArrayList(u8).empty;
         defer json.deinit(allocator);
 
         json.append(allocator, '[') catch return .{ .status = 500, .body = "[]" };
 
-        for (meta.files, 0..) |file, i| {
+        for (file_infos, 0..) |fi, i| {
             if (i > 0) json.append(allocator, ',') catch {};
-
-            // Compute per-file progress by checking which pieces overlap this file
-            const layout_file = sess.layout.files[i];
-            var file_progress: f64 = 0.0;
-            if (session.piece_tracker) |*pt| {
-                var pieces_complete: u32 = 0;
-                var total_file_pieces: u32 = 0;
-                var pidx: u32 = layout_file.first_piece;
-                while (pidx < layout_file.end_piece_exclusive) : (pidx += 1) {
-                    total_file_pieces += 1;
-                    // Access the bitfield directly (thread-safe read of complete bits)
-                    if (pt.complete.has(pidx)) {
-                        pieces_complete += 1;
-                    }
-                }
-                if (total_file_pieces > 0) {
-                    file_progress = @as(f64, @floatFromInt(pieces_complete)) / @as(f64, @floatFromInt(total_file_pieces));
-                }
-            }
-
-            // Build file name from path components
-            var name_buf = std.ArrayList(u8).empty;
-            defer name_buf.deinit(allocator);
-            for (file.path, 0..) |component, ci| {
-                if (ci > 0) name_buf.append(allocator, '/') catch {};
-                name_buf.appendSlice(allocator, component) catch {};
-            }
-
-            // Get file priority (default 1=normal)
-            const priority: u8 = if (session.file_priorities) |fp|
-                if (i < fp.len) fp[i] else 1
-            else
-                1;
-
             json.print(allocator, "{{\"name\":\"{s}\",\"size\":{},\"progress\":{d:.4},\"priority\":{}}}", .{
-                name_buf.items,
-                file.length,
-                file_progress,
-                priority,
+                fi.name,
+                fi.size,
+                fi.progress,
+                fi.priority,
             }) catch {};
         }
 
@@ -514,59 +481,31 @@ pub const ApiHandler = struct {
         const hash = extractParam(body, "hash") orelse
             return .{ .status = 400, .body = "{\"error\":\"missing hash\"}" };
 
-        const session = self.session_manager.getSession(hash) catch
-            return .{ .status = 404, .body = "{\"error\":\"torrent not found\"}" };
-
-        const sess = session.session orelse
-            return .{ .status = 409, .body = "{\"error\":\"torrent metadata not ready\"}" };
-
-        const meta = sess.metainfo;
+        // Get tracker info with all data copied under the SessionManager mutex,
+        // avoiding use-after-free if the session is removed concurrently.
+        const tracker_infos = self.session_manager.getSessionTrackers(allocator, hash) catch |err| switch (err) {
+            error.TorrentNotFound => return .{ .status = 404, .body = "{\"error\":\"torrent not found\"}" },
+            error.TorrentNotReady => return .{ .status = 409, .body = "{\"error\":\"torrent metadata not ready\"}" },
+            else => return .{ .status = 500, .body = "{\"error\":\"internal\"}" },
+        };
+        defer SessionManager.freeTrackerInfos(allocator, tracker_infos);
 
         var json = std.ArrayList(u8).empty;
         defer json.deinit(allocator);
 
         json.append(allocator, '[') catch return .{ .status = 500, .body = "[]" };
 
-        var tier: u32 = 0;
-        var first = true;
-
-        // Scrape stats (shared across all trackers for now)
-        const stats = session.getStats();
-        const scrape_complete = stats.scrape_complete;
-        const scrape_incomplete = stats.scrape_incomplete;
-        const scrape_downloaded = stats.scrape_downloaded;
-
-        // Primary announce URL
-        if (meta.announce) |url| {
-            if (!first) json.append(allocator, ',') catch {};
-            first = false;
-            // Status: 1 = contacted, 2 = working, 0 = disabled
-            const status: u8 = if (session.state == .downloading or session.state == .seeding) 2 else 1;
+        for (tracker_infos, 0..) |ti, i| {
+            if (i > 0) json.append(allocator, ',') catch {};
             json.print(allocator, "{{\"url\":\"{s}\",\"status\":{},\"tier\":{},\"num_peers\":{},\"num_seeds\":{},\"num_leeches\":{},\"num_downloaded\":{}}}", .{
-                url,
-                status,
-                tier,
-                stats.peers_connected,
-                scrape_complete,
-                scrape_incomplete,
-                scrape_downloaded,
+                ti.url,
+                ti.status,
+                ti.tier,
+                ti.num_peers,
+                ti.num_seeds,
+                ti.num_leeches,
+                ti.num_downloaded,
             }) catch {};
-            tier += 1;
-        }
-
-        // Announce list URLs
-        for (meta.announce_list) |url| {
-            // Skip if same as primary announce
-            if (meta.announce) |primary| {
-                if (std.mem.eql(u8, url, primary)) continue;
-            }
-            if (!first) json.append(allocator, ',') catch {};
-            first = false;
-            json.print(allocator, "{{\"url\":\"{s}\",\"status\":1,\"tier\":{},\"num_peers\":0,\"num_seeds\":0,\"num_leeches\":0,\"num_downloaded\":0}}", .{
-                url,
-                tier,
-            }) catch {};
-            tier += 1;
         }
 
         json.append(allocator, ']') catch {};
@@ -578,14 +517,17 @@ pub const ApiHandler = struct {
         const hash = extractParam(body, "hash") orelse
             return .{ .status = 400, .body = "{\"error\":\"missing hash\"}" };
 
-        const session = self.session_manager.getSession(hash) catch
-            return .{ .status = 404, .body = "{\"error\":\"torrent not found\"}" };
+        // Get properties with all data copied under the SessionManager mutex,
+        // avoiding use-after-free if the session is removed concurrently.
+        const props = self.session_manager.getSessionProperties(allocator, hash) catch |err| switch (err) {
+            error.TorrentNotFound => return .{ .status = 404, .body = "{\"error\":\"torrent not found\"}" },
+            else => return .{ .status = 500, .body = "{\"error\":\"internal\"}" },
+        };
+        defer SessionManager.freePropertiesInfo(allocator, props);
 
-        const stat = session.getStats();
-
-        // Get optional metadata fields
-        const comment: []const u8 = if (session.session) |*sess| (sess.metainfo.comment orelse "") else "";
-        const piece_size: u32 = if (session.session) |*sess| sess.metainfo.piece_length else 0;
+        const stat = props.stats;
+        const comment = props.comment;
+        const piece_size = props.piece_size;
 
         // Time active since added
         const now = std.time.timestamp();

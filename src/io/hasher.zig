@@ -210,7 +210,16 @@ pub const Hasher = struct {
                 .piece_buf = job.piece_buf,
                 .valid = valid,
                 .torrent_id = job.torrent_id,
-            }) catch {};
+            }) catch {
+                // OOM: free the piece buffer to avoid leaking it. The piece
+                // will appear stuck in-progress; the peer timeout mechanism
+                // will eventually reclaim it, but at least we don't leak memory.
+                self.allocator.free(job.piece_buf);
+                std.log.err("hasher: OOM appending result for piece {d}, buffer freed", .{job.piece_index});
+                self.result_mutex.unlock();
+                _ = self.in_flight.fetchSub(1, .acq_rel);
+                continue;
+            };
             self.result_mutex.unlock();
             _ = self.in_flight.fetchSub(1, .acq_rel);
 

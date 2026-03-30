@@ -371,6 +371,204 @@ pub const SessionManager = struct {
         }
     }
 
+    // ── Thread-safe data accessors for RPC handlers ────────────
+    // These methods copy data while holding the mutex so that RPC handlers
+    // never hold a raw TorrentSession pointer after the mutex is released.
+
+    /// Per-file information returned by getSessionFiles().
+    pub const FileInfo = struct {
+        name: []const u8, // owned, caller must free
+        size: u64,
+        progress: f64,
+        priority: u8,
+    };
+
+    /// Free a FileInfo slice returned by getSessionFiles().
+    pub fn freeFileInfos(allocator: std.mem.Allocator, infos: []const FileInfo) void {
+        for (infos) |fi| allocator.free(fi.name);
+        allocator.free(infos);
+    }
+
+    /// Return per-file info for a torrent, copying all data under the mutex.
+    pub fn getSessionFiles(self: *SessionManager, allocator: std.mem.Allocator, hash: []const u8) ![]const FileInfo {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+
+        const session = self.sessions.get(hash) orelse return error.TorrentNotFound;
+        const sess = session.session orelse return error.TorrentNotReady;
+        const meta = sess.metainfo;
+        const layout = sess.layout;
+
+        var result = try allocator.alloc(FileInfo, meta.files.len);
+        var built: usize = 0;
+        errdefer {
+            for (result[0..built]) |fi| allocator.free(fi.name);
+            allocator.free(result);
+        }
+
+        for (meta.files, 0..) |file, i| {
+            // Build file name from path components
+            var name_len: usize = 0;
+            for (file.path, 0..) |component, ci| {
+                if (ci > 0) name_len += 1; // separator
+                name_len += component.len;
+            }
+            const name_buf = try allocator.alloc(u8, name_len);
+            var pos: usize = 0;
+            for (file.path, 0..) |component, ci| {
+                if (ci > 0) {
+                    name_buf[pos] = '/';
+                    pos += 1;
+                }
+                @memcpy(name_buf[pos..][0..component.len], component);
+                pos += component.len;
+            }
+
+            // Compute per-file progress
+            const layout_file = layout.files[i];
+            var file_progress: f64 = 0.0;
+            if (session.piece_tracker) |*pt| {
+                var pieces_complete: u32 = 0;
+                var total_file_pieces: u32 = 0;
+                var pidx: u32 = layout_file.first_piece;
+                while (pidx < layout_file.end_piece_exclusive) : (pidx += 1) {
+                    total_file_pieces += 1;
+                    if (pt.complete.has(pidx)) {
+                        pieces_complete += 1;
+                    }
+                }
+                if (total_file_pieces > 0) {
+                    file_progress = @as(f64, @floatFromInt(pieces_complete)) / @as(f64, @floatFromInt(total_file_pieces));
+                }
+            }
+
+            const priority: u8 = if (session.file_priorities) |fp|
+                if (i < fp.len) fp[i] else 1
+            else
+                1;
+
+            result[i] = .{
+                .name = name_buf,
+                .size = file.length,
+                .progress = file_progress,
+                .priority = priority,
+            };
+            built += 1;
+        }
+
+        return result;
+    }
+
+    /// Tracker information returned by getSessionTrackers().
+    pub const TrackerInfo = struct {
+        url: []const u8, // owned, caller must free
+        status: u8,
+        tier: u32,
+        num_peers: u16,
+        num_seeds: u32,
+        num_leeches: u32,
+        num_downloaded: u32,
+    };
+
+    /// Free a TrackerInfo slice returned by getSessionTrackers().
+    pub fn freeTrackerInfos(allocator: std.mem.Allocator, infos: []const TrackerInfo) void {
+        for (infos) |ti| allocator.free(ti.url);
+        allocator.free(infos);
+    }
+
+    /// Return tracker info for a torrent, copying all data under the mutex.
+    pub fn getSessionTrackers(self: *SessionManager, allocator: std.mem.Allocator, hash: []const u8) ![]const TrackerInfo {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+
+        const session = self.sessions.get(hash) orelse return error.TorrentNotFound;
+        const sess = session.session orelse return error.TorrentNotReady;
+        const meta = sess.metainfo;
+        const stats = session.getStats();
+
+        // Count trackers: primary announce (if any) + announce_list (minus duplicates)
+        var tracker_count: usize = 0;
+        if (meta.announce != null) tracker_count += 1;
+        for (meta.announce_list) |url| {
+            if (meta.announce) |primary| {
+                if (std.mem.eql(u8, url, primary)) continue;
+            }
+            tracker_count += 1;
+        }
+
+        var result = try allocator.alloc(TrackerInfo, tracker_count);
+        var built: usize = 0;
+        errdefer {
+            for (result[0..built]) |ti| allocator.free(ti.url);
+            allocator.free(result);
+        }
+
+        var tier: u32 = 0;
+
+        if (meta.announce) |url| {
+            const status: u8 = if (session.state == .downloading or session.state == .seeding) 2 else 1;
+            result[built] = .{
+                .url = try allocator.dupe(u8, url),
+                .status = status,
+                .tier = tier,
+                .num_peers = stats.peers_connected,
+                .num_seeds = stats.scrape_complete,
+                .num_leeches = stats.scrape_incomplete,
+                .num_downloaded = stats.scrape_downloaded,
+            };
+            built += 1;
+            tier += 1;
+        }
+
+        for (meta.announce_list) |url| {
+            if (meta.announce) |primary| {
+                if (std.mem.eql(u8, url, primary)) continue;
+            }
+            result[built] = .{
+                .url = try allocator.dupe(u8, url),
+                .status = 1,
+                .tier = tier,
+                .num_peers = 0,
+                .num_seeds = 0,
+                .num_leeches = 0,
+                .num_downloaded = 0,
+            };
+            built += 1;
+            tier += 1;
+        }
+
+        return result;
+    }
+
+    /// Properties information returned by getSessionProperties().
+    pub const PropertiesInfo = struct {
+        stats: Stats,
+        comment: []const u8, // owned, caller must free
+        piece_size: u32,
+    };
+
+    /// Free a PropertiesInfo returned by getSessionProperties().
+    pub fn freePropertiesInfo(allocator: std.mem.Allocator, info: PropertiesInfo) void {
+        allocator.free(info.comment);
+    }
+
+    /// Return torrent properties, copying all data under the mutex.
+    pub fn getSessionProperties(self: *SessionManager, allocator: std.mem.Allocator, hash: []const u8) !PropertiesInfo {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+
+        const session = self.sessions.get(hash) orelse return error.TorrentNotFound;
+        const stats = session.getStats();
+        const comment: []const u8 = if (session.session) |*sess| (sess.metainfo.comment orelse "") else "";
+        const piece_size: u32 = if (session.session) |*sess| sess.metainfo.piece_length else 0;
+
+        return .{
+            .stats = stats,
+            .comment = try allocator.dupe(u8, comment),
+            .piece_size = piece_size,
+        };
+    }
+
     /// Set global download speed limit (bytes/sec). 0 = unlimited.
     pub fn setGlobalDlLimit(self: *SessionManager, limit: u64) void {
         if (self.shared_event_loop) |el| {
