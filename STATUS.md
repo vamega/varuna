@@ -55,7 +55,7 @@ Update it whenever a milestone lands, the near-term backlog changes, or a new op
 - Download/upload speed tracking with 2-second rolling window.
 
 ### Performance & Hardening
-- **SHA-NI hardware-accelerated SHA-1**: `src/crypto/sha1.zig` uses x86_64 SHA-NI instructions when available (~2,145 MB/s vs ~1,075 MB/s software, 2x speedup). Comptime detection, software fallback for non-SHA-NI targets.
+- **SHA-1 hardware acceleration with runtime CPU detection**: `src/crypto/sha1.zig` supports x86_64 SHA-NI and AArch64 SHA1 crypto extensions. Detection is runtime via CPUID (x86_64) or getauxval/AT_HWCAP (AArch64), cached in an atomic global. A binary compiled on a generic target will still use hardware acceleration when run on a capable CPU.
 - popcount bitfield counting, inline message buffers (16-byte for small messages).
 - Idle peers list (O(k) not O(4096)), HashMap pending_writes (O(1) not O(n)).
 - claimPiece scan hint + min_availability for faster rarest-first selection.

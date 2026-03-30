@@ -157,13 +157,17 @@ Varuna's current minimum kernel is 6.6, which covers everything up to and includ
 
 ## SHA Hardware Acceleration Notes
 
-The codebase uses `src/crypto/sha1.zig` for all SHA-1 piece verification. This module provides SHA-NI hardware acceleration on x86_64 CPUs with SHA extensions (Intel Goldmont+ 2016, AMD Zen 2017+), falling back to a software implementation identical to `std.crypto.hash.Sha1` on other targets.
+The codebase uses `src/crypto/sha1.zig` for all SHA-1 piece verification. This module supports hardware acceleration on two architectures:
 
-**Current benchmarks (ReleaseFast, 256KB pieces):**
+- **x86_64 SHA-NI**: Intel Goldmont+ (2016), AMD Zen (2017+). Uses `sha1rnds4`, `sha1nexte`, `sha1msg1`, `sha1msg2` instructions.
+- **AArch64 SHA1 Crypto Extensions**: ARMv8-A with Crypto. Uses `sha1c`, `sha1p`, `sha1m`, `sha1h`, `sha1su0`, `sha1su1` instructions.
+- **Software fallback**: Same algorithm as `std.crypto.hash.Sha1`.
+
+**Current benchmarks (ReleaseFast, x86_64, 256KB pieces):**
 - Software (std lib): ~1,075 MB/s
 - SHA-NI (varuna):    ~2,145 MB/s (2x speedup)
 
-Detection is comptime via `builtin.cpu.has(.x86, .sha)`. Zig's default build target uses native CPU features, so SHA-NI is enabled automatically when building on a supported machine. No external libraries or runtime CPUID needed.
+Detection is runtime: CPUID on x86_64, `getauxval(AT_HWCAP)` on AArch64. The result is cached in an atomic global after the first call. A binary compiled with `-Dcpu=baseline` will still use hardware acceleration when run on a capable CPU.
 
 **BEP 52 (BitTorrent v2)**: Uses SHA-256 instead of SHA-1. Zig's `std.crypto.hash.sha2` already has SHA-NI acceleration for SHA-256, so no custom implementation is needed for v2 support.
 

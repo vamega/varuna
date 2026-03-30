@@ -107,8 +107,8 @@ fn benchSha1(stdout: *std.Io.Writer) !void {
     const iterations_256k: usize = 2000;
     const iterations_1m: usize = 500;
 
-    // Report whether SHA-NI is active
-    try stdout.print("sha1_ni_enabled={}\n", .{Sha1.hasShaNi()});
+    // Report runtime-detected acceleration backend
+    try stdout.print("sha1_accel={s}, hw_enabled={}\n", .{ @tagName(Sha1.accel()), Sha1.hasShaNi() });
     try stdout.flush();
 
     // std lib (software-only) -- 256KB

@@ -12,9 +12,13 @@ Implemented in `src/daemon/systemd.zig`. Sends `READY=1` after API server is lis
 
 ## 2. ~~SHA-NI and hardware-accelerated SHA-1~~ (DONE)
 
-Implemented in `src/crypto/sha1.zig`. Uses x86_64 SHA-NI instructions (`sha1rnds4`, `sha1nexte`, `sha1msg1`, `sha1msg2`) via Zig inline assembly when compiled for a CPU with SHA-NI support. Falls back to software SHA-1 (same algorithm as `std.crypto.hash.Sha1`) on CPUs without SHA-NI.
+Implemented in `src/crypto/sha1.zig` with runtime CPU detection and multi-architecture support:
 
-Benchmark results (ReleaseFast, 256KB pieces): std = ~1,075 MB/s vs SHA-NI = ~2,145 MB/s (2x speedup). Detection is comptime via `builtin.cpu.has(.x86, .sha)`, which is automatically enabled when building on a machine with SHA-NI (Zig's default target uses native CPU features).
+- **x86_64 SHA-NI**: `sha1rnds4`, `sha1nexte`, `sha1msg1`, `sha1msg2` via inline assembly. Runtime detection via CPUID (leaf 7 for SHA, leaf 1 for SSE4.1).
+- **AArch64 SHA1 Crypto Extensions**: `sha1c`, `sha1p`, `sha1m`, `sha1h`, `sha1su0`, `sha1su1` via inline assembly. Runtime detection via `getauxval(AT_HWCAP)` checking `HWCAP_SHA1`.
+- **Software fallback**: Same algorithm as `std.crypto.hash.Sha1` for CPUs without hardware support.
+
+Detection runs once on first use, result cached in `std.atomic.Value`. A binary compiled on a generic x86_64 target (without `-Dcpu=native`) will still use SHA-NI when run on a capable CPU.
 
 All `std.crypto.hash.Sha1` usages in the codebase replaced with `src/crypto/sha1.zig`.
 
