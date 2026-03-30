@@ -5,87 +5,92 @@ Update it whenever a milestone lands, the near-term backlog changes, or a new op
 
 ## Done
 
-- `.torrent` ingestion, bencode parsing, metainfo parsing, info-hash calculation, and piece/file layout mapping.
-- Target files created up front, verified pieces written with piece-to-file span mapping.
-- Startup resume through full piece recheck and on-disk SHA-1 verification.
-- HTTP and UDP tracker announce with compact peer lists (BEP 15 for UDP).
-- Multi-peer download with rarest-first piece selection, endgame mode, tit-for-tat choking.
-- Multi-peer seeding via io_uring event loop with batched block sends.
-- Block request pipelining (depth 5), connection timeout (10s via io_uring linked timeout).
-- Tracker re-announce on interval, announce-list fallback (BEP 12), completed/stopped events.
-- Private tracker support: private flag parsing, per-session key, numwant parameter.
+### Core Protocol
+- `.torrent` ingestion, bencode parsing, metainfo parsing, info-hash calculation, piece/file layout mapping.
+- HTTP and UDP tracker announce (BEP 15) with compact peer lists, announce-list fallback (BEP 12).
+- Tracker scrape (HTTP + UDP): seeders/leechers/snatches queried every 30 minutes.
+- Private tracker support: private flag parsing, per-session key, numwant, compact=1.
 - IPv6 peer support (BEP 7): compact peers6, IPv6-aware connect.
-- `varuna inspect`, `varuna verify`, `varuna create` (single-file and directories).
-- Bencode encoder with parse-encode roundtrip verification.
-- **Single-threaded io_uring event loop**: all peer I/O, disk I/O, HTTP API through io_uring.
+- BEP 10 Extension Protocol: handshake negotiation, extension message dispatch, advertises ut_metadata and ut_pex.
+- uTP protocol layer (BEP 29): packet codec, UtpSocket state machine, LEDBAT congestion control, UtpManager multiplexer. 30+ tests. (Event loop integration pending.)
+- Multi-peer download: rarest-first piece selection, endgame mode, tit-for-tat choking, block pipelining (depth 5).
+- Multi-peer seeding: io_uring event loop, batched block sends, async disk reads with piece cache.
+- Selective file download: per-file priorities (normal/high/do_not_download), piece-mask filtering, boundary-piece handling, lazy file creation.
+- Sequential download mode: per-torrent toggle for streaming playback.
+
+### Architecture
+- **Single-threaded io_uring event loop**: all peer I/O, disk I/O, HTTP API, tracker HTTP through io_uring.
 - **3-binary architecture**: `varuna` (daemon), `varuna-ctl` (CLI client), `varuna-tools` (standalone utilities).
-- **Shared multi-torrent event loop**: daemon runs all torrents on a single EventLoop thread with TorrentContext per torrent.
-- **SQLite resume state**: WAL mode, prepared statements, background thread. Daemon persists completions every ~5s.
-- **Bundled SQLite**: `-Dsqlite=bundled` compiles amalgamation, `-Dsqlite=system` (default) links system lib.
-- **TOML config file**: daemon, storage, network, performance sections. XDG config path support.
-- **SHA-1 verification threadpool**: configurable thread count.
-- **Graceful shutdown**: SIGINT/SIGTERM → flush resume DB, send tracker stopped event, close connections.
-- **qBittorrent-compatible HTTP API**: webapiVersion, preferences, transfer/info, torrents/info, add, delete, pause, resume, speed limit endpoints.
-- **varuna-ctl**: list, add (--save-path), pause, resume, delete, version, stats, set-dl-limit, set-ul-limit, get-dl-limit, get-ul-limit.
-- **API: ETA and share ratio**: computed in Stats (bytes_remaining/dl_speed, uploaded/downloaded), returned in torrents/info and torrents/properties.
-- **API: torrents/files**: per-file name, size, progress, priority from metainfo + piece completion status.
-- **API: torrents/trackers**: announce URL list with status, tier, peer count.
-- **API: torrents/properties**: detailed torrent properties (save_path, piece_size, comment, speeds, ETA, ratio, time_active, seeding_time, etc.).
-- **API: torrents/filePrio**: set per-file priority (0=skip, 1=normal, 6=high, 7=max). Values stored, actual selective download depends on workstream B.
-- **API: torrents/setSequentialDownload**: toggle sequential mode. Value stored, actual piece picking depends on workstream B.
-- **API: torrents/forceReannounce**: trigger immediate tracker re-announce on background thread.
-- **API: torrents/recheck**: stop torrent, recheck all pieces from disk, resume.
-- **Daemon seeding after download**: announces completed, creates listen socket, accepts inbound peers, multi-torrent handshake matching.
-- **Async seed disk reads**: IORING_OP_READ with piece cache, no blocking fallback.
-- **systemd-notify**: READY=1 / STOPPING=1 via AF_UNIX, no libsystemd dependency.
-- **Download/upload speed restrictions**: token bucket rate limiter, per-torrent + global limits, non-blocking throttling. Config, API, CLI support.
-- **Performance optimizations**: popcount bitfield, inline message buffers, idle peers list (O(k) not O(4096)), HashMap pending_writes (O(1) not O(n)), claimPiece scan hint, error logging for silent catches.
-- **Connection limits & announce staggering**: global connection limit (default 500), per-torrent limit (default 100), half-open connection limit (default 50), announce jitter (±10%), initial announce delay to prevent thundering herd.
-- **Selective file download**: per-file priorities (normal/high/do_not_download), piece-mask based filtering, boundary-piece handling for cross-file pieces, lazy file creation for previously-skipped files.
-- **Sequential download mode**: per-torrent toggle switches PieceTracker from rarest-first to lowest-index selection, enabling streaming playback while downloading.
-- **uTP protocol layer (BEP 29)**: packet header codec, UtpSocket state machine, LEDBAT congestion control, UtpManager connection multiplexer with accept queue. 30+ tests.
-- **BEP 10 (Extension Protocol)**: extension handshake negotiation in reserved bytes, extension message parsing. Advertises ut_metadata and ut_pex. Peer extension ID mapping stored per-peer.
-- **Tracker scrape support (HTTP + UDP)**: scrapeHttp/scrapeUdp/scrapeAuto in `src/tracker/scrape.zig`. HTTP scrape derives URL by replacing "announce" with "scrape", parses bencoded files dict. UDP scrape uses BEP 15 action=2. Background scrape every 30 minutes populates seeders/leechers/snatches in Stats. Wired into torrents/trackers and torrents/info API endpoints.
-- **API auth (qBittorrent-compatible)**: session-based authentication matching qBittorrent's `/api/v2/auth/login` and `/api/v2/auth/logout` flow. Random 32-char hex SID cookies, 1-hour inactivity timeout, max 10 concurrent sessions. All endpoints except login require valid SID. `varuna-ctl` auto-logins before each command. Configurable `api_username`/`api_password` in `[daemon]` config section.
-- **Sync API (`/api/v2/sync/maindata`)**: delta sync protocol matching qBittorrent. Clients poll with `rid` parameter; server returns only changed/added/removed torrents since that rid. Circular buffer of 100 snapshots, Wyhash-based change detection. Full update on `rid=0` or stale rid. Includes `server_state` with global transfer stats.
-- **Multipart form-data parsing for torrents/add**: qBittorrent/Flood WebUI compatibility. Zero-copy parser extracts torrent file data and form parameters (savepath, sequentialDownload, etc.) from multipart uploads. Content-Length-aware body buffering with dynamic growth up to 4 MiB. Raw body fallback for varuna-ctl.
-- **Testing**: 19 peer wire protocol tests, bencode fuzz/edge tests, HTTP parser edge tests, comprehensive transfer test matrix (23 test cases: 1KB-50MB, 16KB/64KB/256KB pieces, multi-file torrents).
+- **Shared multi-torrent event loop**: all torrents on one EventLoop thread with TorrentContext per torrent.
+- **Shared announce ring**: tracker announces reuse a single ring instead of spawning per-announce threads.
+- **Connection limits**: global (500), per-torrent (100), half-open (50). Announce jitter ±10% with initial stagger.
+
+### Storage & Resume
+- SQLite resume state: WAL mode, prepared statements, background thread. Daemon persists completions every ~5s.
+- Bundled SQLite option: `-Dsqlite=bundled` or `-Dsqlite=system`.
+- Resume fast path: loads known-complete pieces from SQLite, skips SHA-1 rehashing.
+- fdatasync, fallocate pre-allocation via io_uring.
+
+### Configuration
+- TOML config file with daemon, storage, network, performance sections. XDG config path support.
+- Bind interface (SO_BINDTODEVICE), bind address, port ranges (port_min/port_max).
+- Download/upload speed limits (per-torrent + global), connection limits, hasher threads, pipeline depth.
+
+### API (qBittorrent v2 compatible)
+- **Auth**: login/logout with session cookies (SID), 1-hour timeout, configurable credentials.
+- **Core**: webapiVersion, preferences, setPreferences, transfer/info, app/shutdown.
+- **Torrents**: info, add (multipart + raw), delete, pause, resume, properties, files, trackers.
+- **Controls**: filePrio, setSequentialDownload, setDownloadLimit, setUploadLimit, downloadLimit, uploadLimit, forceReannounce, recheck.
+- **Sync**: /api/v2/sync/maindata delta protocol (rid-based, Wyhash change detection, 100-snapshot circular buffer).
+- **Multipart form-data**: zero-copy parser for Flood/WebUI torrent uploads with savepath and options.
+- **varuna-ctl**: list, add (--save-path), pause, resume, delete, version, stats, speed limits (set/get), --username/--password auth.
+
+### Daemon Features
+- Graceful SIGINT/SIGTERM shutdown: flush resume DB, send tracker stopped, close connections.
+- systemd-notify: READY=1 / STOPPING=1 via AF_UNIX.
+- Daemon seeding after download: announces completed, creates listen socket, multi-torrent handshake matching.
+- ETA calculation and share ratio tracking in Stats.
+- Download/upload speed tracking with 2-second rolling window.
+
+### Performance & Hardening
+- popcount bitfield counting, inline message buffers (16-byte for small messages).
+- Idle peers list (O(k) not O(4096)), HashMap pending_writes (O(1) not O(n)).
+- claimPiece scan hint + min_availability for faster rarest-first selection.
+- Hasher TOCTOU fix (atomic drainResultsInto), proper drain loop, endgame duplicate write skip.
+- timeout_pending tracking, write error checking in handleDiskWrite, error logging for silent catches.
+- IORING_OP_CLOSE for hot-path fd cleanup in RPC server.
+
+### Testing
+- 19 peer wire protocol tests, 10 BEP 10 extension tests, 31 uTP/LEDBAT tests.
+- Bencode fuzz tests + HTTP parser edge case tests.
+- Transfer test matrix: 24 tests (1KB-100MB, 16KB/64KB/256KB pieces, multi-file torrents). All pass.
+- Daemon swarm integration test, daemon-to-peer seeding test, selective download integration test.
+- Profiling workflow: strace, perf, bpftrace build helpers.
 
 ## Next
 
-### Essential for Private Tracker Use
-- **Bind interface / SO_BINDTODEVICE**: restrict daemon to specific NIC/VPN interface (config + socket option).
-- **SOCKS/HTTP proxy support**: for tracker and peer connections (privacy, region-locked trackers).
-- ~~**BEP 10 (Extension Protocol)**: extension handshake in reserved bytes — prerequisite for MSE, ut_metadata, PEX.~~ (Done)
-- **MSE encryption (BEP 6)**: message stream encryption, required by many private trackers.
-- ~~**Scrape support**: query peer counts without announcing.~~ (Done)
-- ~~**Selective file download**: skip files in multi-file torrents, file priority levels.~~ (Done)
-
-### Common Features
-- **uTP (BEP 29) event loop integration**: protocol layer done, needs io_uring UDP socket and event loop wiring.
-- ~~**API auth**: /api/v2/auth/login for daemon security.~~ (Done)
-- ~~**Sync API**: /api/v2/sync/maindata for Flood WebUI live updates.~~ (Done)
-- **Categories/labels**: organize torrents.
-- **Watch folders**: auto-add torrents from directory.
-
-### Nice-to-Have
-- **Magnet links (BEP 9)**: requires BEP 10 extension protocol.
-- **DHT (BEP 5) / PEX (BEP 11)**: trackerless peer discovery.
-- **SHA-NI acceleration**: hardware SHA-1 for faster piece verification.
-- **systemd socket activation**: zero-downtime restarts.
-- **RSS feed integration**.
+- **Use-after-free investigation**: GPA debug poison exposed latent UAF in io_uring buffer lifecycle. Tools switched to c_allocator as workaround. Root cause needs fixing.
+- **uTP event loop integration**: wire UtpManager into io_uring (UDP socket, RECVMSG/SENDMSG, peer state machine for TCP/uTP coexistence).
+- **Statistics persistence**: persist lifetime uploaded/downloaded bytes to resume DB so ratio survives daemon restarts.
+- **Event loop module split**: event_loop.zig is 1700+ lines. Split into peer_handler, protocol, seed_handler, policy modules.
+- **Private flag enforcement**: disable PEX/DHT/LSD when `private=1` is set in torrent metadata.
+- **SHA-NI acceleration**: hardware SHA-1 on x86_64 (Goldmont+, Zen+) for faster piece verification.
+- **Categories/labels**: torrent organization with qBittorrent-compatible API endpoints.
+- **PEX (BEP 11)**: peer exchange via BEP 10 extensions.
+- **DHT (BEP 5)**: trackerless peer discovery.
+- **Magnet links (BEP 9)**: metadata download via ut_metadata extension.
+- **MSE encryption (BEP 6)**: message stream encryption/obfuscation.
 
 ## Known Issues
 
-- Intermittent data mismatch in test matrix when tests run in rapid sequence (likely port reuse / process cleanup timing). Individual tests pass in isolation.
+- Latent use-after-free in io_uring buffer lifecycle (masked by c_allocator in tools binary, needs proper fix).
 - The packaged Ubuntu `opentracker` build requires explicit info-hash whitelisting (`--whitelist-hash`).
-- Resume fast path depends on SQLite DB integrity; if deleted/corrupted, full recheck occurs (safe fallback).
-- `private=1` flag is parsed but not fully enforced (no DHT/PEX/LSD disable since those aren't implemented yet).
+- Resume DB doesn't persist lifetime upload/download totals (ratio resets on restart).
+- `private=1` flag is parsed but enforcement (disable PEX when implemented) not yet wired.
 
 ## Last Verified Milestone
 
-- `Merge branch 'varuna-speed-restrictions'` (`fa59bbf`)
-- Verified with:
-  - `zig build test` (all tests pass)
-  - `zig build` (clean build)
-  - `scripts/demo_swarm.sh` (standalone swarm passes)
+- `rpc: add multipart form-data parsing for torrents/add` (`c8cbd8d`)
+- Transfer test matrix: 24/24 pass (including 100MB)
+- `zig build test`: all tests pass
+- `scripts/demo_swarm.sh`: standalone swarm passes
