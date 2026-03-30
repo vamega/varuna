@@ -16,7 +16,7 @@ This serves as institutional memory -- future agents can read these to understan
 
 ## Build, Test, and Development Commands
 Use Zig stable only: Zig `0.15.2` or the latest stable release, never nightly.
-Use `mise` to install project tools locally, and keep tool versions pinned in `mise.toml`.
+Use `mise` to install project tools locally, and keep tool versions pinned in `mise.toml`. When working in a new checkout or worktree, run `mise trust` first so that `mise.toml` is recognized and `mise exec` commands work. Without this, scripts that use `mise exec -- node` (e.g., `scripts/create_torrent.mjs`) will fail with a trust error.
 
 SQLite3 is required for resume state persistence. Install `libsqlite3-dev` on Ubuntu/Debian. If the `-dev` package is not available, the `lib/libsqlite3.so` symlink in the project root points to the system shared library. SQLite operations MUST run on a background thread, never on the io_uring event loop thread (see `docs/io-uring-syscalls.md`).
 
