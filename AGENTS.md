@@ -22,25 +22,15 @@ SQLite3 is required for resume state persistence. Install `libsqlite3-dev` on Ub
 
 Ensure local developer documentation is available before doing substantial Linux or `io_uring` work. On Ubuntu 24.04 this means keeping `man-db`, `manpages`, `manpages-dev`, `manpages-posix`, `manpages-posix-dev`, and `liburing-dev` installed so syscall, POSIX, and `io_uring` man pages are locally searchable. `liburing-dev` specifically provides the `io_uring_*` man pages and the `io_uring_setup(2)` / `io_uring_enter(2)` / `io_uring_register(2)` pages.
 
-Ensure the repositories under `reference-codebases/` remain checked out and readable before relying on them for protocol, tracker, storage, or startup-behavior comparisons.
+The repositories under `reference-codebases/` are git submodules. Initialize them with `git submodule update --init` after cloning.
 
-Expected reference repositories:
-- `reference-codebases/libtorrent`
-- `reference-codebases/libtorrent-rakshasa`
-- `reference-codebases/qbittorrent`
-- `reference-codebases/rtorrent`
-- `reference-codebases/vortex`
-
-Clone commands to restore them:
-
-```bash
-mkdir -p reference-codebases
-git clone https://github.com/arvidn/libtorrent.git reference-codebases/libtorrent
-git clone https://github.com/rakshasa/libtorrent.git reference-codebases/libtorrent-rakshasa
-git clone https://github.com/qbittorrent/qBittorrent.git reference-codebases/qbittorrent
-git clone https://github.com/rakshasa/rtorrent.git reference-codebases/rtorrent
-git clone https://github.com/Nehliin/vortex.git reference-codebases/vortex
-```
+Reference repositories:
+- `reference-codebases/libtorrent` — arvidn/libtorrent (C++ BitTorrent library)
+- `reference-codebases/libtorrent-rakshasa` — rakshasa/libtorrent (rtorrent backend)
+- `reference-codebases/qbittorrent` — qBittorrent (reference WebAPI implementation)
+- `reference-codebases/rtorrent` — rakshasa/rtorrent (C++ client)
+- `reference-codebases/vortex` — Nehliin/vortex (Rust client)
+- `reference-codebases/qui` — autobrr/qui (alternative qBittorrent-compatible WebUI)
 
 - `mise install`: install pinned developer tools from `mise.toml`.
 - `zig build`: compile the daemon and default targets.
