@@ -1,6 +1,9 @@
 const std = @import("std");
 const TorrentSession = @import("torrent_session.zig").TorrentSession;
 const Stats = @import("torrent_session.zig").Stats;
+const categories_mod = @import("categories.zig");
+pub const CategoryStore = categories_mod.CategoryStore;
+pub const TagStore = categories_mod.TagStore;
 
 /// Manages multiple torrent sessions for the daemon.
 /// Thread-safe: the API server and event loop can access concurrently.
@@ -17,10 +20,16 @@ pub const SessionManager = struct {
     hasher_threads: u32 = 4,
     resume_db_path: ?[*:0]const u8 = null,
 
+    /// In-memory category and tag stores.
+    category_store: CategoryStore,
+    tag_store: TagStore,
+
     pub fn init(allocator: std.mem.Allocator) SessionManager {
         return .{
             .allocator = allocator,
             .sessions = std.StringHashMap(*TorrentSession).init(allocator),
+            .category_store = CategoryStore.init(allocator),
+            .tag_store = TagStore.init(allocator),
         };
     }
 
@@ -31,6 +40,8 @@ pub const SessionManager = struct {
             self.allocator.destroy(entry.value_ptr.*);
         }
         self.sessions.deinit();
+        self.category_store.deinit();
+        self.tag_store.deinit();
     }
 
     /// Add a torrent from raw .torrent bytes.
@@ -195,6 +206,87 @@ pub const SessionManager = struct {
         session.stop();
         // Restart it (will recheck from disk)
         session.startWithEventLoop(self.shared_event_loop);
+    }
+
+    // ── Category / Tag operations ─────────────────────────
+
+    /// Assign a category to a torrent. Empty string clears the category.
+    pub fn setTorrentCategory(self: *SessionManager, hash: []const u8, category_name: []const u8) !void {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+
+        const session = self.sessions.get(hash) orelse return error.TorrentNotFound;
+
+        // Validate that the category exists (unless clearing)
+        if (category_name.len > 0) {
+            if (self.category_store.get(category_name) == null) return error.CategoryNotFound;
+        }
+
+        // Free old category
+        if (session.category) |old| self.allocator.free(old);
+
+        if (category_name.len > 0) {
+            session.category = try self.allocator.dupe(u8, category_name);
+        } else {
+            session.category = null;
+        }
+    }
+
+    /// Add tags to a torrent. Tags are also registered in the global tag store.
+    pub fn addTorrentTags(self: *SessionManager, hash: []const u8, tag_names: []const u8) !void {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+
+        const session = self.sessions.get(hash) orelse return error.TorrentNotFound;
+
+        var iter = std.mem.splitScalar(u8, tag_names, ',');
+        while (iter.next()) |raw_tag| {
+            const tag = std.mem.trim(u8, raw_tag, " ");
+            if (tag.len == 0) continue;
+
+            // Register globally
+            try self.tag_store.create(tag);
+
+            // Check if torrent already has this tag
+            var found = false;
+            for (session.tags.items) |existing| {
+                if (std.mem.eql(u8, existing, tag)) {
+                    found = true;
+                    break;
+                }
+            }
+            if (!found) {
+                const owned = try self.allocator.dupe(u8, tag);
+                try session.tags.append(self.allocator, owned);
+            }
+        }
+        session.rebuildTagsString();
+    }
+
+    /// Remove tags from a torrent (does not remove from global tag store).
+    pub fn removeTorrentTags(self: *SessionManager, hash: []const u8, tag_names: []const u8) !void {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+
+        const session = self.sessions.get(hash) orelse return error.TorrentNotFound;
+
+        var iter = std.mem.splitScalar(u8, tag_names, ',');
+        while (iter.next()) |raw_tag| {
+            const tag = std.mem.trim(u8, raw_tag, " ");
+            if (tag.len == 0) continue;
+
+            // Find and remove from torrent's tag list
+            var i: usize = 0;
+            while (i < session.tags.items.len) {
+                if (std.mem.eql(u8, session.tags.items[i], tag)) {
+                    self.allocator.free(session.tags.items[i]);
+                    _ = session.tags.swapRemove(i);
+                    break;
+                }
+                i += 1;
+            }
+        }
+        session.rebuildTagsString();
     }
 
     pub fn count(self: *SessionManager) usize {

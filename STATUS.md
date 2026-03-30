@@ -42,7 +42,8 @@ Update it whenever a milestone lands, the near-term backlog changes, or a new op
 - **Core**: webapiVersion, preferences, setPreferences, transfer/info, app/shutdown.
 - **Torrents**: info, add (multipart + raw), delete, pause, resume, properties, files, trackers.
 - **Controls**: filePrio, setSequentialDownload, setDownloadLimit, setUploadLimit, downloadLimit, uploadLimit, forceReannounce, recheck.
-- **Sync**: /api/v2/sync/maindata delta protocol (rid-based, Wyhash change detection, 100-snapshot circular buffer).
+- **Categories & Tags**: categories (create/edit/remove/list/setCategory), tags (create/delete/addTags/removeTags/list). In-memory stores, per-torrent assignment, included in torrents/info and sync/maindata. Category accepted in torrents/add.
+- **Sync**: /api/v2/sync/maindata delta protocol (rid-based, Wyhash change detection, 100-snapshot circular buffer, categories/tags sections).
 - **Multipart form-data**: zero-copy parser for Flood/WebUI torrent uploads with savepath and options.
 - **varuna-ctl**: list, add (--save-path), pause, resume, delete, version, stats, speed limits (set/get), --username/--password auth.
 

@@ -192,6 +192,48 @@ pub const ApiHandler = struct {
             return self.handleTorrentsRecheck(allocator, body);
         }
 
+        // Category endpoints
+        if (std.mem.eql(u8, action_name, "categories")) {
+            return self.handleCategories(allocator);
+        }
+
+        if (std.mem.eql(u8, action_name, "createCategory") and std.mem.eql(u8, method, "POST")) {
+            return self.handleCreateCategory(allocator, params);
+        }
+
+        if (std.mem.eql(u8, action_name, "removeCategories") and std.mem.eql(u8, method, "POST")) {
+            return self.handleRemoveCategories(params);
+        }
+
+        if (std.mem.eql(u8, action_name, "editCategory") and std.mem.eql(u8, method, "POST")) {
+            return self.handleEditCategory(allocator, params);
+        }
+
+        if (std.mem.eql(u8, action_name, "setCategory") and std.mem.eql(u8, method, "POST")) {
+            return self.handleSetCategory(allocator, params);
+        }
+
+        // Tag endpoints
+        if (std.mem.eql(u8, action_name, "tags")) {
+            return self.handleTags(allocator);
+        }
+
+        if (std.mem.eql(u8, action_name, "createTags") and std.mem.eql(u8, method, "POST")) {
+            return self.handleCreateTags(params);
+        }
+
+        if (std.mem.eql(u8, action_name, "deleteTags") and std.mem.eql(u8, method, "POST")) {
+            return self.handleDeleteTags(params);
+        }
+
+        if (std.mem.eql(u8, action_name, "addTags") and std.mem.eql(u8, method, "POST")) {
+            return self.handleAddTags(allocator, params);
+        }
+
+        if (std.mem.eql(u8, action_name, "removeTags") and std.mem.eql(u8, method, "POST")) {
+            return self.handleRemoveTags(allocator, params);
+        }
+
         return .{ .status = 404, .body = "{\"error\":\"unknown action\"}" };
     }
 
@@ -217,6 +259,7 @@ pub const ApiHandler = struct {
     fn handleTorrentsAdd(self: *const ApiHandler, allocator: std.mem.Allocator, body: []const u8, query: []const u8, content_type: ?[]const u8) server.Response {
         var torrent_data: []const u8 = body;
         var save_path: []const u8 = extractParam(query, "savepath") orelse self.session_manager.default_save_path;
+        var category_param: ?[]const u8 = extractParam(query, "category");
 
         // Parse multipart/form-data if that's the content type (qBittorrent/Flood WebUI)
         if (multipart.isMultipart(content_type)) {
@@ -235,17 +278,32 @@ pub const ApiHandler = struct {
             if (multipart.findPart(parts, "savepath")) |sp| {
                 if (sp.data.len > 0) save_path = sp.data;
             }
+            if (multipart.findPart(parts, "category")) |cp| {
+                if (cp.data.len > 0) category_param = cp.data;
+            }
+        } else {
+            // Also check body for form-encoded category param
+            if (category_param == null) {
+                category_param = extractParam(body, "category");
+            }
         }
 
         if (torrent_data.len == 0) {
             return .{ .status = 400, .body = "{\"error\":\"no torrent data\"}" };
         }
 
-        _ = self.session_manager.addTorrent(torrent_data, save_path) catch |err| {
+        const session = self.session_manager.addTorrent(torrent_data, save_path) catch |err| {
             const msg = std.fmt.allocPrint(allocator, "{{\"error\":\"{s}\"}}", .{@errorName(err)}) catch
                 return .{ .status = 500, .body = "{\"error\":\"internal\"}" };
             return .{ .status = 400, .body = msg, .owned_body = msg };
         };
+
+        // Set category if provided (best-effort, don't fail the add)
+        if (category_param) |cat| {
+            if (cat.len > 0) {
+                self.session_manager.setTorrentCategory(&session.info_hash_hex, cat) catch {};
+            }
+        }
 
         return .{ .body = "{\"status\":\"ok\"}" };
     }
@@ -646,6 +704,186 @@ pub const ApiHandler = struct {
         return .{ .body = "{\"status\":\"ok\"}" };
     }
 
+    // ── Category endpoints ────────────────────────────────
+
+    fn handleCategories(self: *const ApiHandler, allocator: std.mem.Allocator) server.Response {
+        self.session_manager.mutex.lock();
+        defer self.session_manager.mutex.unlock();
+
+        const body = self.session_manager.category_store.serializeJson(allocator) catch
+            return .{ .status = 500, .body = "{\"error\":\"internal\"}" };
+        return .{ .body = body, .owned_body = body };
+    }
+
+    fn handleCreateCategory(self: *const ApiHandler, allocator: std.mem.Allocator, params: []const u8) server.Response {
+        const name = extractParam(params, "category") orelse
+            return .{ .status = 400, .body = "{\"error\":\"missing category\"}" };
+        const save_path = extractParam(params, "savePath") orelse "";
+
+        self.session_manager.mutex.lock();
+        defer self.session_manager.mutex.unlock();
+
+        self.session_manager.category_store.create(name, save_path) catch |err| {
+            const msg = std.fmt.allocPrint(allocator, "{{\"error\":\"{s}\"}}", .{@errorName(err)}) catch
+                return .{ .status = 500, .body = "{\"error\":\"internal\"}" };
+            return .{ .status = 409, .body = msg, .owned_body = msg };
+        };
+
+        return .{ .body = "{\"status\":\"ok\"}" };
+    }
+
+    fn handleRemoveCategories(self: *const ApiHandler, params: []const u8) server.Response {
+        const names = extractParam(params, "categories") orelse
+            return .{ .status = 400, .body = "{\"error\":\"missing categories\"}" };
+
+        self.session_manager.mutex.lock();
+        defer self.session_manager.mutex.unlock();
+
+        // Categories are newline-separated per qBittorrent API
+        var iter = std.mem.splitScalar(u8, names, '\n');
+        while (iter.next()) |raw_name| {
+            const name = std.mem.trim(u8, raw_name, " \r");
+            if (name.len == 0) continue;
+            self.session_manager.category_store.remove(name);
+
+            // Clear category from any torrents that had it
+            var sess_iter = self.session_manager.sessions.iterator();
+            while (sess_iter.next()) |entry| {
+                const session = entry.value_ptr.*;
+                if (session.category) |cat| {
+                    if (std.mem.eql(u8, cat, name)) {
+                        self.session_manager.allocator.free(cat);
+                        session.category = null;
+                    }
+                }
+            }
+        }
+
+        return .{ .body = "{\"status\":\"ok\"}" };
+    }
+
+    fn handleEditCategory(self: *const ApiHandler, allocator: std.mem.Allocator, params: []const u8) server.Response {
+        const name = extractParam(params, "category") orelse
+            return .{ .status = 400, .body = "{\"error\":\"missing category\"}" };
+        const save_path = extractParam(params, "savePath") orelse "";
+
+        self.session_manager.mutex.lock();
+        defer self.session_manager.mutex.unlock();
+
+        self.session_manager.category_store.edit(name, save_path) catch |err| {
+            const msg = std.fmt.allocPrint(allocator, "{{\"error\":\"{s}\"}}", .{@errorName(err)}) catch
+                return .{ .status = 500, .body = "{\"error\":\"internal\"}" };
+            return .{ .status = 409, .body = msg, .owned_body = msg };
+        };
+
+        return .{ .body = "{\"status\":\"ok\"}" };
+    }
+
+    fn handleSetCategory(self: *const ApiHandler, allocator: std.mem.Allocator, params: []const u8) server.Response {
+        const hash = extractParam(params, "hashes") orelse
+            return .{ .status = 400, .body = "{\"error\":\"missing hashes\"}" };
+        const category = extractParam(params, "category") orelse "";
+
+        self.session_manager.setTorrentCategory(hash, category) catch |err| {
+            const msg = std.fmt.allocPrint(allocator, "{{\"error\":\"{s}\"}}", .{@errorName(err)}) catch
+                return .{ .status = 500, .body = "{\"error\":\"internal\"}" };
+            return .{ .status = 404, .body = msg, .owned_body = msg };
+        };
+
+        return .{ .body = "{\"status\":\"ok\"}" };
+    }
+
+    // ── Tag endpoints ────────────────────────────────────
+
+    fn handleTags(self: *const ApiHandler, allocator: std.mem.Allocator) server.Response {
+        self.session_manager.mutex.lock();
+        defer self.session_manager.mutex.unlock();
+
+        const body = self.session_manager.tag_store.serializeJson(allocator) catch
+            return .{ .status = 500, .body = "{\"error\":\"internal\"}" };
+        return .{ .body = body, .owned_body = body };
+    }
+
+    fn handleCreateTags(self: *const ApiHandler, params: []const u8) server.Response {
+        const tags_str = extractParam(params, "tags") orelse
+            return .{ .status = 400, .body = "{\"error\":\"missing tags\"}" };
+
+        self.session_manager.mutex.lock();
+        defer self.session_manager.mutex.unlock();
+
+        var iter = std.mem.splitScalar(u8, tags_str, ',');
+        while (iter.next()) |raw_tag| {
+            const tag = std.mem.trim(u8, raw_tag, " ");
+            if (tag.len == 0) continue;
+            self.session_manager.tag_store.create(tag) catch continue;
+        }
+
+        return .{ .body = "{\"status\":\"ok\"}" };
+    }
+
+    fn handleDeleteTags(self: *const ApiHandler, params: []const u8) server.Response {
+        const tags_str = extractParam(params, "tags") orelse
+            return .{ .status = 400, .body = "{\"error\":\"missing tags\"}" };
+
+        self.session_manager.mutex.lock();
+        defer self.session_manager.mutex.unlock();
+
+        var iter = std.mem.splitScalar(u8, tags_str, ',');
+        while (iter.next()) |raw_tag| {
+            const tag = std.mem.trim(u8, raw_tag, " ");
+            if (tag.len == 0) continue;
+            self.session_manager.tag_store.delete(tag);
+
+            // Also remove from all torrents that have this tag
+            var sess_iter = self.session_manager.sessions.iterator();
+            while (sess_iter.next()) |entry| {
+                const session = entry.value_ptr.*;
+                var i: usize = 0;
+                while (i < session.tags.items.len) {
+                    if (std.mem.eql(u8, session.tags.items[i], tag)) {
+                        self.session_manager.allocator.free(session.tags.items[i]);
+                        _ = session.tags.swapRemove(i);
+                        session.rebuildTagsString();
+                        break;
+                    }
+                    i += 1;
+                }
+            }
+        }
+
+        return .{ .body = "{\"status\":\"ok\"}" };
+    }
+
+    fn handleAddTags(self: *const ApiHandler, allocator: std.mem.Allocator, params: []const u8) server.Response {
+        const hash = extractParam(params, "hashes") orelse
+            return .{ .status = 400, .body = "{\"error\":\"missing hashes\"}" };
+        const tags_str = extractParam(params, "tags") orelse
+            return .{ .status = 400, .body = "{\"error\":\"missing tags\"}" };
+
+        self.session_manager.addTorrentTags(hash, tags_str) catch |err| {
+            const msg = std.fmt.allocPrint(allocator, "{{\"error\":\"{s}\"}}", .{@errorName(err)}) catch
+                return .{ .status = 500, .body = "{\"error\":\"internal\"}" };
+            return .{ .status = 404, .body = msg, .owned_body = msg };
+        };
+
+        return .{ .body = "{\"status\":\"ok\"}" };
+    }
+
+    fn handleRemoveTags(self: *const ApiHandler, allocator: std.mem.Allocator, params: []const u8) server.Response {
+        const hash = extractParam(params, "hashes") orelse
+            return .{ .status = 400, .body = "{\"error\":\"missing hashes\"}" };
+        const tags_str = extractParam(params, "tags") orelse
+            return .{ .status = 400, .body = "{\"error\":\"missing tags\"}" };
+
+        self.session_manager.removeTorrentTags(hash, tags_str) catch |err| {
+            const msg = std.fmt.allocPrint(allocator, "{{\"error\":\"{s}\"}}", .{@errorName(err)}) catch
+                return .{ .status = 500, .body = "{\"error\":\"internal\"}" };
+            return .{ .status = 404, .body = msg, .owned_body = msg };
+        };
+
+        return .{ .body = "{\"status\":\"ok\"}" };
+    }
+
     fn handleSyncMaindata(self: *ApiHandler, allocator: std.mem.Allocator, path: []const u8) server.Response {
         // Parse rid from query string: /api/v2/sync/maindata?rid=N
         var request_rid: u64 = 0;
@@ -669,7 +907,7 @@ pub const ApiHandler = struct {
 fn serializeTorrentInfo(allocator: std.mem.Allocator, json: *std.ArrayList(u8), stat: TorrentSession.Stats) !void {
     try json.print(
         allocator,
-        "{{\"name\":\"{s}\",\"hash\":\"{s}\",\"state\":\"{s}\",\"size\":{},\"progress\":{d:.4},\"dlspeed\":{},\"upspeed\":{},\"num_seeds\":{},\"num_leechs\":{},\"added_on\":{},\"save_path\":\"{s}\",\"pieces_have\":{},\"pieces_num\":{},\"dl_limit\":{},\"up_limit\":{},\"eta\":{},\"ratio\":{d:.4},\"seq_dl\":{},\"is_private\":{}}}",
+        "{{\"name\":\"{s}\",\"hash\":\"{s}\",\"state\":\"{s}\",\"size\":{},\"progress\":{d:.4},\"dlspeed\":{},\"upspeed\":{},\"num_seeds\":{},\"num_leechs\":{},\"added_on\":{},\"save_path\":\"{s}\",\"pieces_have\":{},\"pieces_num\":{},\"dl_limit\":{},\"up_limit\":{},\"eta\":{},\"ratio\":{d:.4},\"seq_dl\":{},\"is_private\":{},\"category\":\"{s}\",\"tags\":\"{s}\"}}",
         .{
             stat.name,
             stat.info_hash_hex,
@@ -690,6 +928,8 @@ fn serializeTorrentInfo(allocator: std.mem.Allocator, json: *std.ArrayList(u8), 
             stat.ratio,
             @as(u8, if (stat.sequential_download) 1 else 0),
             @as(u8, if (stat.is_private) 1 else 0),
+            stat.category,
+            stat.tags,
         },
     );
 }

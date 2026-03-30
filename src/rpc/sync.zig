@@ -137,6 +137,26 @@ pub const SyncState = struct {
         }
         try json.append(allocator, ']');
 
+        // Categories
+        try json.appendSlice(allocator, ",\"categories\":");
+        {
+            session_manager.mutex.lock();
+            defer session_manager.mutex.unlock();
+            const cat_json = try session_manager.category_store.serializeJson(allocator);
+            defer allocator.free(cat_json);
+            try json.appendSlice(allocator, cat_json);
+        }
+
+        // Tags
+        try json.appendSlice(allocator, ",\"tags\":");
+        {
+            session_manager.mutex.lock();
+            defer session_manager.mutex.unlock();
+            const tag_json = try session_manager.tag_store.serializeJson(allocator);
+            defer allocator.free(tag_json);
+            try json.appendSlice(allocator, tag_json);
+        }
+
         // Server state
         try json.print(allocator, ",\"server_state\":{{\"dl_info_speed\":{},\"up_info_speed\":{},\"dl_info_data\":{},\"up_info_data\":{},\"dl_rate_limit\":{},\"up_rate_limit\":{},\"alltime_dl\":{},\"alltime_ul\":{}}}", .{
             total_dl_speed,
@@ -211,6 +231,8 @@ fn statsHash(stat: TorrentStats) u64 {
     hasher.update(std.mem.asBytes(&stat.is_private));
     hasher.update(std.mem.asBytes(&stat.scrape_complete));
     hasher.update(std.mem.asBytes(&stat.scrape_incomplete));
+    hasher.update(stat.category);
+    hasher.update(stat.tags);
     return hasher.final();
 }
 
@@ -218,7 +240,7 @@ fn statsHash(stat: TorrentStats) u64 {
 fn serializeTorrentObject(allocator: std.mem.Allocator, json: *std.ArrayList(u8), stat: TorrentStats) !void {
     try json.print(
         allocator,
-        "{{\"name\":\"{s}\",\"hash\":\"{s}\",\"state\":\"{s}\",\"size\":{},\"progress\":{d:.4},\"dlspeed\":{},\"upspeed\":{},\"num_seeds\":{},\"num_leechs\":{},\"added_on\":{},\"save_path\":\"{s}\",\"pieces_have\":{},\"pieces_num\":{},\"dl_limit\":{},\"up_limit\":{},\"eta\":{},\"ratio\":{d:.4},\"seq_dl\":{},\"is_private\":{}}}",
+        "{{\"name\":\"{s}\",\"hash\":\"{s}\",\"state\":\"{s}\",\"size\":{},\"progress\":{d:.4},\"dlspeed\":{},\"upspeed\":{},\"num_seeds\":{},\"num_leechs\":{},\"added_on\":{},\"save_path\":\"{s}\",\"pieces_have\":{},\"pieces_num\":{},\"dl_limit\":{},\"up_limit\":{},\"eta\":{},\"ratio\":{d:.4},\"seq_dl\":{},\"is_private\":{},\"category\":\"{s}\",\"tags\":\"{s}\"}}",
         .{
             stat.name,
             stat.info_hash_hex,
@@ -239,6 +261,8 @@ fn serializeTorrentObject(allocator: std.mem.Allocator, json: *std.ArrayList(u8)
             stat.ratio,
             @as(u8, if (stat.sequential_download) 1 else 0),
             @as(u8, if (stat.is_private) 1 else 0),
+            stat.category,
+            stat.tags,
         },
     );
 }

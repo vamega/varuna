@@ -53,6 +53,10 @@ pub const Stats = struct {
     scrape_complete: u32 = 0,
     scrape_incomplete: u32 = 0,
     scrape_downloaded: u32 = 0,
+    /// Category assigned to this torrent (empty string if none).
+    category: []const u8 = "",
+    /// Comma-separated tags assigned to this torrent (empty string if none).
+    tags: []const u8 = "",
 };
 
 pub const TorrentSession = struct {
@@ -119,6 +123,12 @@ pub const TorrentSession = struct {
 
     error_message: ?[]const u8 = null,
 
+    // Category and tags
+    category: ?[]const u8 = null,
+    tags: std.ArrayList([]const u8) = std.ArrayList([]const u8).empty,
+    /// Pre-computed comma-separated tags string for Stats serialization.
+    tags_string: ?[]const u8 = null,
+
     // Scrape state
     scrape_result: ?tracker.scrape.ScrapeResult = null,
     last_scrape_time: i64 = 0,
@@ -174,6 +184,10 @@ pub const TorrentSession = struct {
         self.allocator.free(self.name);
         if (self.file_priorities) |fp| self.allocator.free(fp);
         if (self.error_message) |msg| self.allocator.free(msg);
+        if (self.category) |cat| self.allocator.free(cat);
+        for (self.tags.items) |tag| self.allocator.free(tag);
+        self.tags.deinit(self.allocator);
+        if (self.tags_string) |ts| self.allocator.free(ts);
     }
 
     /// Start with own event loop (for varuna-tools, backwards compat).
@@ -344,6 +358,38 @@ pub const TorrentSession = struct {
         }
     }
 
+    /// Returns the pre-computed comma-separated tags string.
+    fn getTagsString(self: *const TorrentSession) []const u8 {
+        return self.tags_string orelse "";
+    }
+
+    /// Rebuild the cached comma-separated tags string. Must be called whenever
+    /// the tags list changes. Caller must hold the SessionManager mutex.
+    pub fn rebuildTagsString(self: *TorrentSession) void {
+        if (self.tags_string) |old| {
+            self.allocator.free(old);
+            self.tags_string = null;
+        }
+        if (self.tags.items.len == 0) return;
+        var total_len: usize = 0;
+        for (self.tags.items, 0..) |tag, i| {
+            if (i > 0) total_len += 2; // ", "
+            total_len += tag.len;
+        }
+        const buf = self.allocator.alloc(u8, total_len) catch return;
+        var pos: usize = 0;
+        for (self.tags.items, 0..) |tag, i| {
+            if (i > 0) {
+                buf[pos] = ',';
+                buf[pos + 1] = ' ';
+                pos += 2;
+            }
+            @memcpy(buf[pos..][0..tag.len], tag);
+            pos += tag.len;
+        }
+        self.tags_string = buf;
+    }
+
     pub fn getStats(self: *TorrentSession) Stats {
         const pieces_have = if (self.piece_tracker) |*pt| pt.completedCount() else 0;
         const progress = if (self.piece_count > 0)
@@ -409,6 +455,8 @@ pub const TorrentSession = struct {
             .scrape_complete = if (self.scrape_result) |sr| sr.complete else 0,
             .scrape_incomplete = if (self.scrape_result) |sr| sr.incomplete else 0,
             .scrape_downloaded = if (self.scrape_result) |sr| sr.downloaded else 0,
+            .category = self.category orelse "",
+            .tags = self.getTagsString(),
         };
     }
 
