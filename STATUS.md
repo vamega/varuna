@@ -75,7 +75,7 @@ Update it whenever a milestone lands, the near-term backlog changes, or a new op
 - ~~uTP event loop integration~~: **Done.** UDP socket, RECVMSG/SENDMSG via io_uring, inbound uTP connection accept, peer wire protocol bridge, timeout processing. Outbound uTP connect deferred.
 - **uTP outbound connections**: initiate uTP connections to peers (currently only inbound is supported).
 - **Statistics persistence**: persist lifetime uploaded/downloaded bytes to resume DB so ratio survives daemon restarts.
-- **Event loop module split**: event_loop.zig is 1700+ lines. Split into peer_handler, protocol, seed_handler, policy modules.
+- ~~Event loop module split~~: **Done.** event_loop.zig split into peer_handler, protocol, seed_handler, peer_policy, utp_handler modules (~730 lines core + 5 focused sub-modules).
 - **Private flag enforcement**: disable PEX/DHT/LSD when `private=1` is set in torrent metadata.
 - **SHA-NI acceleration**: hardware SHA-1 on x86_64 (Goldmont+, Zen+) for faster piece verification.
 - **Categories/labels**: torrent organization with qBittorrent-compatible API endpoints.
