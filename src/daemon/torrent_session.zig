@@ -500,6 +500,24 @@ pub const TorrentSession = struct {
                 const transfer_stats = self.resume_writer.?.loadTransferStats();
                 self.baseline_uploaded = transfer_stats.total_uploaded;
                 self.baseline_downloaded = transfer_stats.total_downloaded;
+
+                // Load persisted category and tags for this torrent
+                if (self.category == null) {
+                    if (self.resume_writer.?.db.loadTorrentCategory(self.allocator, session.metainfo.info_hash)) |cat| {
+                        self.category = cat;
+                    } else |_| {}
+                }
+                if (self.tags.items.len == 0) {
+                    if (self.resume_writer.?.db.loadTorrentTags(self.allocator, session.metainfo.info_hash)) |tags| {
+                        for (tags) |tag| {
+                            self.tags.append(self.allocator, tag) catch {
+                                self.allocator.free(tag);
+                            };
+                        }
+                        self.allocator.free(tags);
+                        self.rebuildTagsString();
+                    } else |_| {}
+                }
             } else |_| {}
         }
 

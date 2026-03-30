@@ -4,6 +4,7 @@ const Stats = @import("torrent_session.zig").Stats;
 const categories_mod = @import("categories.zig");
 pub const CategoryStore = categories_mod.CategoryStore;
 pub const TagStore = categories_mod.TagStore;
+const ResumeDb = @import("../storage/resume.zig").ResumeDb;
 
 /// Manages multiple torrent sessions for the daemon.
 /// Thread-safe: the API server and event loop can access concurrently.
@@ -24,6 +25,10 @@ pub const SessionManager = struct {
     category_store: CategoryStore,
     tag_store: TagStore,
 
+    /// Shared resume DB for category/tag persistence. Opened once, shared
+    /// with all sessions. null if no resume_db_path is configured.
+    resume_db: ?ResumeDb = null,
+
     pub fn init(allocator: std.mem.Allocator) SessionManager {
         return .{
             .allocator = allocator,
@@ -31,6 +36,36 @@ pub const SessionManager = struct {
             .category_store = CategoryStore.init(allocator),
             .tag_store = TagStore.init(allocator),
         };
+    }
+
+    /// Open the resume DB and load persisted categories and tags into
+    /// the in-memory stores. Call after setting resume_db_path and before
+    /// accepting API requests.
+    pub fn loadCategoriesAndTags(self: *SessionManager) void {
+        const db_path = self.resume_db_path orelse return;
+        var db = ResumeDb.open(db_path) catch return;
+
+        // Load categories
+        if (db.loadCategories(self.allocator)) |cats| {
+            for (cats) |cat| {
+                self.category_store.create(cat.name, cat.save_path) catch {};
+                // create() dupes the strings, so free the DB copies
+                self.allocator.free(cat.name);
+                self.allocator.free(cat.save_path);
+            }
+            self.allocator.free(cats);
+        } else |_| {}
+
+        // Load global tags
+        if (db.loadGlobalTags(self.allocator)) |tags| {
+            for (tags) |tag| {
+                self.tag_store.create(tag) catch {};
+                self.allocator.free(tag);
+            }
+            self.allocator.free(tags);
+        } else |_| {}
+
+        self.resume_db = db;
     }
 
     pub fn deinit(self: *SessionManager) void {
@@ -42,6 +77,7 @@ pub const SessionManager = struct {
         self.sessions.deinit();
         self.category_store.deinit();
         self.tag_store.deinit();
+        if (self.resume_db) |*db| db.close();
     }
 
     /// Add a torrent from raw .torrent bytes.
@@ -230,6 +266,11 @@ pub const SessionManager = struct {
         } else {
             session.category = null;
         }
+
+        // Persist to DB
+        if (self.resume_db) |*db| {
+            db.saveTorrentCategory(session.info_hash, category_name) catch {};
+        }
     }
 
     /// Add tags to a torrent. Tags are also registered in the global tag store.
@@ -246,6 +287,7 @@ pub const SessionManager = struct {
 
             // Register globally
             try self.tag_store.create(tag);
+            if (self.resume_db) |*db| db.saveGlobalTag(tag) catch {};
 
             // Check if torrent already has this tag
             var found = false;
@@ -258,6 +300,7 @@ pub const SessionManager = struct {
             if (!found) {
                 const owned = try self.allocator.dupe(u8, tag);
                 try session.tags.append(self.allocator, owned);
+                if (self.resume_db) |*db| db.saveTorrentTag(session.info_hash, tag) catch {};
             }
         }
         session.rebuildTagsString();
@@ -281,6 +324,7 @@ pub const SessionManager = struct {
                 if (std.mem.eql(u8, session.tags.items[i], tag)) {
                     self.allocator.free(session.tags.items[i]);
                     _ = session.tags.swapRemove(i);
+                    if (self.resume_db) |*db| db.removeTorrentTag(session.info_hash, tag) catch {};
                     break;
                 }
                 i += 1;

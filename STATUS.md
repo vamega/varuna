@@ -43,7 +43,7 @@ Update it whenever a milestone lands, the near-term backlog changes, or a new op
 - **Core**: webapiVersion, preferences, setPreferences, transfer/info.
 - **Torrents**: info, add (multipart + raw), delete, pause, resume, properties, files, trackers.
 - **Controls**: filePrio, setSequentialDownload, setDownloadLimit, setUploadLimit, downloadLimit, uploadLimit, forceReannounce, recheck.
-- **Categories & Tags**: categories (create/edit/remove/list/setCategory), tags (create/delete/addTags/removeTags/list).
+- **Categories & Tags**: categories (create/edit/remove/list/setCategory), tags (create/delete/addTags/removeTags/list). Persisted to SQLite resume DB (write-through on change, load at startup).
 - **Sync**: /api/v2/sync/maindata delta protocol (rid-based, Wyhash change detection, 100-snapshot circular buffer).
 - **Multipart form-data**: zero-copy parser for Flood/WebUI torrent uploads.
 - **varuna-ctl**: list, add (--save-path), pause, resume, delete, version, stats, speed limits (set/get), --username/--password auth.

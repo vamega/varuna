@@ -86,6 +86,8 @@ pub fn main() !void {
     session_manager.hasher_threads = cfg.performance.hasher_threads;
     session_manager.resume_db_path = resume_db_path;
     if (cfg.storage.data_dir) |dir| session_manager.default_save_path = dir;
+    // Load persisted categories and tags from the resume DB
+    session_manager.loadCategoriesAndTags();
     defer session_manager.deinit();
 
     // API handler

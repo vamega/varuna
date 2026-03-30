@@ -55,8 +55,17 @@ pub extern "sqlite3" fn sqlite3_bind_int64(stmt: *Stmt, col: c_int, value: i64) 
 
 pub extern "sqlite3" fn sqlite3_column_int(stmt: *Stmt, col: c_int) c_int;
 pub extern "sqlite3" fn sqlite3_column_int64(stmt: *Stmt, col: c_int) i64;
+pub extern "sqlite3" fn sqlite3_bind_text(
+    stmt: *Stmt,
+    col: c_int,
+    value: [*]const u8,
+    n: c_int,
+    destructor: ?*const fn (?*anyopaque) callconv(.c) void,
+) c_int;
+
 pub extern "sqlite3" fn sqlite3_column_blob(stmt: *Stmt, col: c_int) ?[*]const u8;
 pub extern "sqlite3" fn sqlite3_column_bytes(stmt: *Stmt, col: c_int) c_int;
+pub extern "sqlite3" fn sqlite3_column_text(stmt: *Stmt, col: c_int) ?[*:0]const u8;
 
 pub extern "sqlite3" fn sqlite3_errmsg(db: *Db) [*:0]const u8;
 pub extern "sqlite3" fn sqlite3_free(ptr: ?*anyopaque) void;

@@ -729,6 +729,9 @@ pub const ApiHandler = struct {
             return .{ .status = 409, .body = msg, .owned_body = msg };
         };
 
+        // Persist to DB
+        if (self.session_manager.resume_db) |*db| db.saveCategory(name, save_path) catch {};
+
         return .{ .body = "{\"status\":\"ok\"}" };
     }
 
@@ -745,6 +748,12 @@ pub const ApiHandler = struct {
             const name = std.mem.trim(u8, raw_name, " \r");
             if (name.len == 0) continue;
             self.session_manager.category_store.remove(name);
+
+            // Persist removal to DB
+            if (self.session_manager.resume_db) |*db| {
+                db.removeCategory(name) catch {};
+                db.clearCategoryFromTorrents(name) catch {};
+            }
 
             // Clear category from any torrents that had it
             var sess_iter = self.session_manager.sessions.iterator();
@@ -775,6 +784,9 @@ pub const ApiHandler = struct {
                 return .{ .status = 500, .body = "{\"error\":\"internal\"}" };
             return .{ .status = 409, .body = msg, .owned_body = msg };
         };
+
+        // Persist to DB (saveCategory upserts)
+        if (self.session_manager.resume_db) |*db| db.saveCategory(name, save_path) catch {};
 
         return .{ .body = "{\"status\":\"ok\"}" };
     }
@@ -816,6 +828,7 @@ pub const ApiHandler = struct {
             const tag = std.mem.trim(u8, raw_tag, " ");
             if (tag.len == 0) continue;
             self.session_manager.tag_store.create(tag) catch continue;
+            if (self.session_manager.resume_db) |*db| db.saveGlobalTag(tag) catch {};
         }
 
         return .{ .body = "{\"status\":\"ok\"}" };
@@ -833,6 +846,12 @@ pub const ApiHandler = struct {
             const tag = std.mem.trim(u8, raw_tag, " ");
             if (tag.len == 0) continue;
             self.session_manager.tag_store.delete(tag);
+
+            // Persist removal to DB
+            if (self.session_manager.resume_db) |*db| {
+                db.removeGlobalTag(tag) catch {};
+                db.removeTagFromTorrents(tag) catch {};
+            }
 
             // Also remove from all torrents that have this tag
             var sess_iter = self.session_manager.sessions.iterator();
