@@ -24,12 +24,14 @@ Update it whenever a milestone lands, the near-term backlog changes, or a new op
 - **Shared multi-torrent event loop**: all torrents on one EventLoop thread with TorrentContext per torrent.
 - **Shared announce ring**: tracker announces reuse a single ring instead of spawning per-announce threads.
 - **Connection limits**: global (500), per-torrent (100), half-open (50). Announce jitter ±10% with initial stagger.
+- **Reference codebases as git submodules**: libtorrent (arvidn), libtorrent-rakshasa, qBittorrent, rtorrent, vortex, qui (autobrr).
 
 ### Storage & Resume
 - SQLite resume state: WAL mode, prepared statements, background thread. Daemon persists completions every ~5s.
 - Bundled SQLite option: `-Dsqlite=bundled` or `-Dsqlite=system`.
 - Resume fast path: loads known-complete pieces from SQLite, skips SHA-1 rehashing.
 - Lifetime transfer stats: total_uploaded/total_downloaded persisted to SQLite, loaded as baseline on startup so share ratio survives daemon restarts.
+- Categories and tags persisted to SQLite (write-through on change, load at startup).
 - fdatasync, fallocate pre-allocation via io_uring.
 
 ### Configuration
@@ -43,7 +45,7 @@ Update it whenever a milestone lands, the near-term backlog changes, or a new op
 - **Core**: webapiVersion, preferences, setPreferences, transfer/info.
 - **Torrents**: info, add (multipart + raw), delete, pause, resume, properties, files, trackers.
 - **Controls**: filePrio, setSequentialDownload, setDownloadLimit, setUploadLimit, downloadLimit, uploadLimit, forceReannounce, recheck.
-- **Categories & Tags**: categories (create/edit/remove/list/setCategory), tags (create/delete/addTags/removeTags/list). Persisted to SQLite resume DB (write-through on change, load at startup).
+- **Categories & Tags**: categories (create/edit/remove/list/setCategory), tags (create/delete/addTags/removeTags/list).
 - **Sync**: /api/v2/sync/maindata delta protocol (rid-based, Wyhash change detection, 100-snapshot circular buffer).
 - **Multipart form-data**: zero-copy parser for Flood/WebUI torrent uploads.
 - **varuna-ctl**: list, add (--save-path), pause, resume, delete, version, stats, speed limits (set/get), --username/--password auth.
@@ -56,19 +58,24 @@ Update it whenever a milestone lands, the near-term backlog changes, or a new op
 - Download/upload speed tracking with 2-second rolling window.
 
 ### Performance & Hardening
-- **SHA-1 hardware acceleration**: runtime CPU detection for x86_64 SHA-NI (~2x speedup to ~2.2 GB/s) and AArch64 SHA1 crypto extensions. Atomic-cached dispatch, automatic fallback to software. Benchmarked against OpenSSL (matches at 256KB).
+- **SHA-1 hardware acceleration**: runtime CPU detection for x86_64 SHA-NI (~2x to ~2.2 GB/s) and AArch64 SHA1 crypto extensions. Atomic-cached dispatch, automatic fallback to software.
 - popcount bitfield counting, inline message buffers (16-byte for small messages).
 - Idle peers list (O(k) not O(4096)), HashMap pending_writes (O(1) not O(n)).
 - claimPiece scan hint + min_availability for faster rarest-first selection.
 - Hasher TOCTOU fix (atomic drainResultsInto), proper drain loop, endgame duplicate write skip.
 - timeout_pending tracking, write error checking in handleDiskWrite, error logging for silent catches.
-- io_uring send buffer UAF fix: split free-one vs free-all pending sends, stale-CQE guards, SQE-submit-failure dangling-pointer fix.
+- io_uring send buffer UAF fix: split free-one vs free-all pending sends, stale-CQE guards, SQE-submit-failure fix.
 - IORING_OP_CLOSE for hot-path fd cleanup in RPC server.
+- Session use-after-free fix: RPC handlers copy data under mutex instead of holding raw session pointers.
+- Hasher OOM resilience: free piece buffer and log on result append failure.
+- JSON injection prevention: escape helper for all user-provided strings in API responses.
+- Partial send buffer matching: monotonic send_id in CQE context to match correct in-flight buffer.
 
 ### Testing
-- 19 peer wire protocol tests, 10 BEP 10 extension tests, 31 uTP/LEDBAT tests, 5 categories tests.
-- Bencode fuzz tests + HTTP parser edge case tests.
-- Transfer test matrix: 24 tests (1KB-100MB, 16KB/64KB/256KB pieces, multi-file torrents).
+- 19 peer wire protocol tests, 10 BEP 10 extension tests, 31 uTP/LEDBAT tests, 5 categories tests, 8 resume DB tests.
+- Bencode fuzz + edge case tests, HTTP parser fuzz tests.
+- Fuzz tests for: multipart parser, tracker response, uTP packets, BEP 10 extensions, scrape response (18 fuzz tests total).
+- Transfer test matrix: 24 tests (1KB-100MB, 16KB/64KB/256KB pieces, multi-file torrents). All pass.
 - Daemon swarm integration test, daemon-to-peer seeding test, selective download integration test.
 - SHA-1 benchmarks: std vs SHA-NI vs direct vs memory bandwidth baseline.
 - Profiling workflow: strace, perf, bpftrace build helpers.
@@ -79,26 +86,23 @@ Update it whenever a milestone lands, the near-term backlog changes, or a new op
 - **uTP outbound connections**: initiate uTP connections to peers (currently inbound-only).
 - **PEX (BEP 11)**: peer exchange via BEP 10 extensions. Discover peers through existing connections.
 - **DHT (BEP 5)**: trackerless peer discovery (large feature).
-- **Magnet links (BEP 9)**: metadata download via ut_metadata extension (requires BEP 10, which is done).
+- **Magnet links (BEP 9)**: metadata download via ut_metadata extension.
 - **MSE encryption (BEP 6)**: message stream encryption/obfuscation (deferred).
 
 ### Operational
-- **Flood WebUI validation**: test against real Flood instance to find API serialization gaps.
-- **systemd socket activation**: fd inheritance from systemd for on-demand startup and clean restarts.
+- **Flood/qui WebUI validation**: test against real Flood or qui instance to find API gaps.
+- **systemd socket activation**: fd inheritance from systemd.
 - **Torrent data relocation**: move completed downloads to a different path via API.
-
-### Quality
-- **Run full test matrix**: verify all 24 tests pass after recent event loop split and feature additions.
 
 ## Known Issues
 
 - The packaged Ubuntu `opentracker` build requires explicit info-hash whitelisting (`--whitelist-hash`).
 - uTP supports inbound connections only; outbound uTP connect not yet implemented.
-- Categories and tags are in-memory only (not persisted across daemon restarts).
 
 ## Last Verified Milestone
 
-- `bench: add SHA-1 dispatch overhead and memory bandwidth benchmarks` (`623e076`)
+- `build: convert reference codebases to git submodules, add qui` (`0d69ad3`)
+- Transfer test matrix: 24/24 pass
 - `zig build test`: all tests pass
 - `zig build`: clean build
 - `scripts/demo_swarm.sh`: standalone swarm passes
