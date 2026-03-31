@@ -999,14 +999,11 @@ pub const SessionManager = struct {
         created_by: []const u8, // owned, caller must free
         creation_date: i64,
         trackers_count: u32,
-<<<<<<< HEAD
-        web_seeds_count: u32, // BEP 19 url-list + BEP 17 httpseeds
-=======
+        web_seeds_count: u32 = 0, // BEP 19 url-list + BEP 17 httpseeds
         /// Tracker scrape: total seeders.
         scrape_complete: u32 = 0,
         /// Tracker scrape: total leechers.
         scrape_incomplete: u32 = 0,
->>>>>>> worktree-agent-a9387f40
     };
 
     /// Free a PropertiesInfo returned by getSessionProperties().
@@ -1057,12 +1054,9 @@ pub const SessionManager = struct {
             .created_by = try allocator.dupe(u8, created_by),
             .creation_date = if (meta_opt) |m| m.creation_date else -1,
             .trackers_count = stats.trackers_count,
-<<<<<<< HEAD
             .web_seeds_count = if (meta_opt) |m| @intCast(m.url_list.len + m.http_seeds.len) else 0,
-=======
             .scrape_complete = stats.scrape_complete,
             .scrape_incomplete = stats.scrape_incomplete,
->>>>>>> worktree-agent-a9387f40
         };
     }
 
