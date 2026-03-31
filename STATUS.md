@@ -7,7 +7,7 @@ Update it whenever a milestone lands, the near-term backlog changes, or a new op
 
 ### Core Protocol
 - `.torrent` ingestion, bencode parsing, metainfo parsing, info-hash calculation, piece/file layout mapping.
-- HTTP and UDP tracker announce (BEP 15) with compact peer lists, multi-tracker simultaneous announce (BEP 12). All tiers queried in parallel; first successful response wins. Async DNS resolution with TTL-based caching (`src/io/dns.zig`). Build-time configurable backend: threadpool (default) or c-ares (`-Ddns=c-ares`).
+- HTTP, HTTPS, and UDP tracker announce (BEP 15) with compact peer lists, multi-tracker simultaneous announce (BEP 12). All tiers queried in parallel; first successful response wins. Async DNS resolution with TTL-based caching (`src/io/dns.zig`). Build-time configurable backend: threadpool (default) or c-ares (`-Ddns=c-ares`). HTTPS via vendored BoringSSL with BIO pair transport (all network I/O stays on io_uring); build-time configurable: `-Dtls=boringssl` (default) or `-Dtls=none`.
 - Tracker scrape (HTTP + UDP): seeders/leechers/snatches queried every 30 minutes.
 - Private tracker support: private flag parsing and enforcement (BEP 27). Per-session key, numwant, compact=1. PEX disabled for private torrents.
 - IPv6 peer support (BEP 7): compact peers6, IPv6-aware connect.
@@ -30,6 +30,7 @@ Update it whenever a milestone lands, the near-term backlog changes, or a new op
 - **Shared announce ring**: tracker announces reuse a single ring instead of spawning per-announce threads.
 - **Connection limits**: global (500), per-torrent (100), half-open (50). Announce jitter ±10% with initial stagger.
 - **Reference codebases as git submodules**: libtorrent (arvidn), libtorrent-rakshasa, qBittorrent, rtorrent, vortex, qui (autobrr).
+- **BoringSSL TLS**: vendored BoringSSL built as static libraries via pure Zig build (`build/boringssl.zig`). BIO pair transport decouples TLS record processing from socket I/O, keeping all network I/O on io_uring. TlsStream provides feedRecv/pendingSend interface for ciphertext shuttle.
 
 ### Storage & Resume
 - SQLite resume state: WAL mode, prepared statements, background thread. Daemon persists completions every ~5s.
@@ -46,7 +47,7 @@ Update it whenever a milestone lands, the near-term backlog changes, or a new op
 - Bind interface (SO_BINDTODEVICE), bind address, port ranges (port_min/port_max).
 - Download/upload speed limits (per-torrent + global), connection limits, hasher threads, pipeline depth.
 - API credentials (api_username, api_password).
-- Build options: `-Dsqlite=system|bundled`, `-Ddns=threadpool|c-ares`.
+- Build options: `-Dsqlite=system|bundled`, `-Ddns=threadpool|c-ares`, `-Dtls=boringssl|none`.
 - Peer ID masquerading: `network.masquerade_as` config option to identify as qBittorrent, rTorrent, uTorrent, Deluge, or Transmission. Useful for private trackers with client whitelists.
 
 ### API (qBittorrent v2 compatible)
@@ -140,6 +141,7 @@ Update it whenever a milestone lands, the near-term backlog changes, or a new op
 - DHT tests: 7 node_id tests, 8 routing_table tests, 8 krpc tests, 8 token tests, 7 lookup tests, 5 dht_engine tests, 1 persistence test (44 total).
 - 10 peer ID client identification tests (Azureus-style, Shadow-style, Mainline, unknown).
 - 17 peer ID masquerading tests: all 5 client formats, case insensitivity, malformed input, unsupported client error, random suffix validation.
+- 4 TLS tests: TlsStream init/deinit, ClientHello generation, garbage ciphertext handling, stub error returns. 3 HTTPS URL parsing tests.
 
 ## Next
 
@@ -165,9 +167,10 @@ Update it whenever a milestone lands, the near-term backlog changes, or a new op
 
 ## Last Verified Milestone
 
+- HTTPS tracker support via vendored BoringSSL (BIO pair + io_uring transport)
 - DHT (BEP 5) Phases 1-3
 - BEP 52 (BitTorrent v2 / Hybrid) Phases 1-6 (including runtime Merkle tree cache)
 - MSE/PE (BEP 6) async handshake + auto-fallback
 - All protocol features merged, all API stubs populated
 - `zig build test`: all tests pass
-- `zig build`: clean build
+- `zig build`: clean build (with `-Dtls=boringssl` default and `-Dtls=none`)

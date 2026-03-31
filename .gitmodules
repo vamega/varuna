@@ -16,3 +16,6 @@
 [submodule "reference-codebases/qui"]
 	path = reference-codebases/qui
 	url = https://github.com/autobrr/qui.git
+[submodule "vendor/boringssl"]
+	path = vendor/boringssl
+	url = https://github.com/google/boringssl.git

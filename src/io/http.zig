@@ -2,9 +2,12 @@ const std = @import("std");
 const posix = std.posix;
 const Ring = @import("ring.zig").Ring;
 const DnsResolver = @import("dns.zig").DnsResolver;
+const build_options = @import("build_options");
+const TlsStream = @import("tls.zig").TlsStream;
 
 /// Minimal HTTP/1.1 GET client over io_uring.
 /// Designed for tracker announces: simple GET requests with small responses.
+/// Supports both HTTP and HTTPS (when built with -Dtls=boringssl).
 pub const HttpClient = struct {
     ring: *Ring,
     allocator: std.mem.Allocator,
@@ -29,9 +32,19 @@ pub const HttpClient = struct {
     /// Perform an HTTP GET request and return the response body.
     /// DNS resolution runs on a background thread to avoid blocking the ring.
     /// When a DnsResolver is attached, results are cached across requests.
+    /// Supports both http:// and https:// URLs.
     pub fn get(self: *HttpClient, url: []const u8) !HttpResponse {
         const parsed = try parseUrl(url);
 
+        if (parsed.is_https) {
+            return self.getHttps(parsed);
+        }
+
+        return self.getHttp(parsed);
+    }
+
+    /// Plain HTTP GET over io_uring.
+    fn getHttp(self: *HttpClient, parsed: ParsedUrl) !HttpResponse {
         // Resolve DNS -- use shared cache if available, otherwise one-shot
         const address = if (self.dns_resolver) |r|
             try r.resolve(self.allocator, parsed.host, parsed.port)
@@ -99,6 +112,177 @@ pub const HttpClient = struct {
             .allocator = self.allocator,
         };
     }
+
+    /// HTTPS GET: TLS handshake + HTTP tunneled through BoringSSL BIO pair,
+    /// with all network I/O on io_uring.
+    fn getHttps(self: *HttpClient, parsed: ParsedUrl) !HttpResponse {
+        if (build_options.tls_backend != .boringssl) {
+            return error.HttpsNotSupported;
+        }
+
+        // Resolve DNS
+        const address = if (self.dns_resolver) |r|
+            try r.resolve(self.allocator, parsed.host, parsed.port)
+        else
+            try @import("dns.zig").resolveOnce(self.allocator, parsed.host, parsed.port);
+
+        // Connect via io_uring
+        const fd = try self.ring.socket(
+            address.any.family,
+            posix.SOCK.STREAM | posix.SOCK.CLOEXEC,
+            posix.IPPROTO.TCP,
+        );
+        errdefer posix.close(fd);
+
+        self.ring.connect_timeout(fd, &address.any, address.getOsSockLen(), 10) catch |err| {
+            if (err == error.ConnectionTimedOut) return error.ConnectionTimedOut;
+            return err;
+        };
+
+        // Initialize TLS
+        var tls_stream = try TlsStream.init(self.allocator, parsed.host);
+        defer tls_stream.deinit();
+
+        // Perform TLS handshake
+        try self.tlsHandshake(fd, &tls_stream);
+
+        // Build HTTP request
+        var request_buf = std.ArrayList(u8).empty;
+        defer request_buf.deinit(self.allocator);
+
+        try request_buf.print(self.allocator, "GET {s} HTTP/1.1\r\nHost: {s}\r\nConnection: close\r\n\r\n", .{
+            parsed.path,
+            parsed.host,
+        });
+
+        // Send HTTP request through TLS
+        try self.tlsSendAll(fd, &tls_stream, request_buf.items);
+
+        // Receive response through TLS
+        var response_buf = std.ArrayList(u8).empty;
+        errdefer response_buf.deinit(self.allocator);
+
+        try self.tlsRecvResponse(fd, &tls_stream, &response_buf);
+
+        posix.close(fd);
+
+        // Parse response
+        const body_start = findBodyStart(response_buf.items) orelse return error.InvalidHttpResponse;
+        const status = parseStatusCode(response_buf.items) orelse return error.InvalidHttpResponse;
+
+        return .{
+            .status = status,
+            .body = response_buf.items[body_start..],
+            .raw = response_buf,
+            .allocator = self.allocator,
+        };
+    }
+
+    /// Drive the TLS handshake to completion using io_uring for all network I/O.
+    fn tlsHandshake(self: *HttpClient, fd: posix.fd_t, tls_stream: *TlsStream) !void {
+        var send_buf: [16384]u8 = undefined;
+        var recv_buf: [16384]u8 = undefined;
+
+        var iterations: u32 = 0;
+        const max_iterations: u32 = 100; // prevent infinite loops
+
+        while (iterations < max_iterations) : (iterations += 1) {
+            const result = tls_stream.doHandshake() catch return error.TlsHandshakeFailed;
+
+            switch (result) {
+                .complete => return,
+                .want_write, .want_read => {
+                    // Always flush any pending outbound ciphertext first
+                    try self.tlsFlushPending(fd, tls_stream, &send_buf);
+
+                    if (result == .want_read) {
+                        // Need more data from the server
+                        const n = self.ring.recv(fd, &recv_buf) catch |err| {
+                            if (err == error.ConnectionClosed) return error.TlsHandshakeFailed;
+                            return err;
+                        };
+                        if (n == 0) return error.TlsHandshakeFailed;
+                        tls_stream.feedRecv(recv_buf[0..n]) catch return error.TlsHandshakeFailed;
+                    }
+                },
+            }
+        }
+
+        return error.TlsHandshakeFailed;
+    }
+
+    /// Flush all pending outbound ciphertext from the TLS stream via io_uring send.
+    fn tlsFlushPending(self: *HttpClient, fd: posix.fd_t, tls_stream: *TlsStream, send_buf: []u8) !void {
+        while (true) {
+            const n = tls_stream.pendingSend(send_buf) catch return;
+            if (n == 0) break;
+            try self.ring.send_all(fd, send_buf[0..n]);
+        }
+    }
+
+    /// Send all plaintext data through the TLS stream, flushing ciphertext via io_uring.
+    fn tlsSendAll(self: *HttpClient, fd: posix.fd_t, tls_stream: *TlsStream, data: []const u8) !void {
+        var send_buf: [16384]u8 = undefined;
+        var total: usize = 0;
+
+        while (total < data.len) {
+            const n = tls_stream.writePlaintext(data[total..]) catch return error.TlsWriteFailed;
+            if (n == 0) {
+                // BoringSSL wants to flush -- send pending ciphertext
+                try self.tlsFlushPending(fd, tls_stream, &send_buf);
+                continue;
+            }
+            total += n;
+            try self.tlsFlushPending(fd, tls_stream, &send_buf);
+        }
+    }
+
+    /// Receive an HTTP response through the TLS stream.
+    fn tlsRecvResponse(self: *HttpClient, fd: posix.fd_t, tls_stream: *TlsStream, response_buf: *std.ArrayList(u8)) !void {
+        var recv_buf: [16384]u8 = undefined;
+        var plaintext_buf: [16384]u8 = undefined;
+        var send_buf: [16384]u8 = undefined;
+
+        var iterations: u32 = 0;
+        const max_iterations: u32 = 10000;
+
+        while (iterations < max_iterations) : (iterations += 1) {
+            // Try to read any already-decrypted plaintext
+            const plain_n = tls_stream.readPlaintext(&plaintext_buf) catch return error.TlsReadFailed;
+            if (plain_n > 0) {
+                try response_buf.appendSlice(self.allocator, plaintext_buf[0..plain_n]);
+
+                // Check if we have the full HTTP response
+                if (self.isResponseComplete(response_buf.items)) break;
+                continue;
+            }
+
+            // No plaintext available -- need more ciphertext from the network
+            const n = self.ring.recv(fd, &recv_buf) catch |err| {
+                if (response_buf.items.len > 0) break;
+                return err;
+            };
+            if (n == 0) break; // connection closed
+
+            tls_stream.feedRecv(recv_buf[0..n]) catch return error.TlsReadFailed;
+
+            // Flush any renegotiation/alert data BoringSSL wants to send
+            self.tlsFlushPending(fd, tls_stream, &send_buf) catch {};
+        }
+    }
+
+    fn isResponseComplete(self: *HttpClient, data: []const u8) bool {
+        _ = self;
+        if (findBodyStart(data)) |body_start| {
+            const content_length = parseContentLength(data[0..body_start]);
+            if (content_length) |cl| {
+                return data.len >= body_start + cl;
+            }
+            // No Content-Length -- need to read until connection closes
+            return false;
+        }
+        return false;
+    }
 };
 
 pub const HttpResponse = struct {
@@ -118,14 +302,19 @@ const ParsedUrl = struct {
     host: []const u8,
     port: u16,
     path: []const u8,
+    is_https: bool,
 };
 
 fn parseUrl(url: []const u8) !ParsedUrl {
-    // Strip "http://" prefix
-    const after_scheme = if (std.mem.startsWith(u8, url, "http://"))
+    var is_https = false;
+    var default_port: u16 = 80;
+
+    const after_scheme = if (std.mem.startsWith(u8, url, "https://")) blk: {
+        is_https = true;
+        default_port = 443;
+        break :blk url[8..];
+    } else if (std.mem.startsWith(u8, url, "http://"))
         url[7..]
-    else if (std.mem.startsWith(u8, url, "https://"))
-        return error.HttpsNotSupported
     else
         url;
 
@@ -142,13 +331,15 @@ fn parseUrl(url: []const u8) !ParsedUrl {
             .host = host_port[0..colon],
             .port = port,
             .path = path,
+            .is_https = is_https,
         };
     }
 
     return .{
         .host = host_port,
-        .port = 80,
+        .port = default_port,
         .path = path,
+        .is_https = is_https,
     };
 }
 
@@ -189,6 +380,7 @@ test "parse url with port" {
     try std.testing.expectEqualStrings("tracker.example.com", parsed.host);
     try std.testing.expectEqual(@as(u16, 8080), parsed.port);
     try std.testing.expectEqualStrings("/announce?info_hash=abc", parsed.path);
+    try std.testing.expect(!parsed.is_https);
 }
 
 test "parse url default port" {
@@ -196,6 +388,7 @@ test "parse url default port" {
     try std.testing.expectEqualStrings("tracker.example.com", parsed.host);
     try std.testing.expectEqual(@as(u16, 80), parsed.port);
     try std.testing.expectEqualStrings("/announce", parsed.path);
+    try std.testing.expect(!parsed.is_https);
 }
 
 test "parse url no path" {
@@ -203,6 +396,23 @@ test "parse url no path" {
     try std.testing.expectEqualStrings("example.com", parsed.host);
     try std.testing.expectEqual(@as(u16, 6969), parsed.port);
     try std.testing.expectEqualStrings("/", parsed.path);
+    try std.testing.expect(!parsed.is_https);
+}
+
+test "parse https url" {
+    const parsed = try parseUrl("https://tracker.example.com/announce");
+    try std.testing.expectEqualStrings("tracker.example.com", parsed.host);
+    try std.testing.expectEqual(@as(u16, 443), parsed.port);
+    try std.testing.expectEqualStrings("/announce", parsed.path);
+    try std.testing.expect(parsed.is_https);
+}
+
+test "parse https url with port" {
+    const parsed = try parseUrl("https://tracker.example.com:8443/announce?info_hash=abc");
+    try std.testing.expectEqualStrings("tracker.example.com", parsed.host);
+    try std.testing.expectEqual(@as(u16, 8443), parsed.port);
+    try std.testing.expectEqualStrings("/announce?info_hash=abc", parsed.path);
+    try std.testing.expect(parsed.is_https);
 }
 
 test "parse status code" {
@@ -258,6 +468,7 @@ test "fuzz URL parser" {
             "http://example.com",
             "http://example.com:8080/path",
             "https://example.com",
+            "https://example.com:8443/path",
             "example.com:80/path",
             "http://[::1]:8080/path",
             "http://:8080",
@@ -292,14 +503,14 @@ test "findBodyStart edge cases" {
     try std.testing.expectEqual(@as(?usize, 4), findBodyStart("\r\n\r\nbody here"));
 }
 
-test "parseUrl edge cases" {
-    // HTTPS should be rejected
-    try std.testing.expectError(error.HttpsNotSupported, parseUrl("https://example.com"));
+test "parseUrl https is recognized" {
+    const parsed = try parseUrl("https://example.com");
+    try std.testing.expect(parsed.is_https);
+    try std.testing.expectEqual(@as(u16, 443), parsed.port);
+}
 
-    // Invalid port
+test "parseUrl invalid port" {
     try std.testing.expectError(error.InvalidPort, parseUrl("http://example.com:notaport/path"));
-
-    // Port overflow
     try std.testing.expectError(error.InvalidPort, parseUrl("http://example.com:99999/path"));
 }
 

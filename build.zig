@@ -1,4 +1,5 @@
 const std = @import("std");
+const boringssl = @import("build/boringssl.zig");
 
 pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
@@ -16,9 +17,16 @@ pub fn build(b: *std.Build) void {
         "DNS resolver backend: 'threadpool' uses getaddrinfo on background threads (default), 'c-ares' uses the c-ares async DNS library",
     ) orelse .threadpool;
 
-    // ── Build options module (dns backend selection) ────────
+    const tls_backend = b.option(
+        TlsBackend,
+        "tls",
+        "TLS backend: 'boringssl' links vendored BoringSSL for HTTPS tracker support (default), 'none' disables TLS",
+    ) orelse .boringssl;
+
+    // ── Build options module (dns backend + tls backend selection) ────────
     const build_options = b.addOptions();
     build_options.addOption(DnsBackend, "dns_backend", dns_backend);
+    build_options.addOption(TlsBackend, "tls_backend", tls_backend);
 
     const toml_dep = b.dependency("toml", .{
         .target = target,
@@ -62,6 +70,21 @@ pub fn build(b: *std.Build) void {
     // ── c-ares linking (when dns=c-ares) ────────────────────
     if (dns_backend == .c_ares) {
         varuna_mod.linkSystemLibrary("cares", .{});
+    }
+
+    // ── BoringSSL linking (when tls=boringssl) ──────────────
+    if (tls_backend == .boringssl) {
+        const boringssl_libs = boringssl.create(
+            b,
+            b.path("vendor/boringssl"),
+            target,
+            optimize,
+        );
+        // Link all three BoringSSL libraries into the varuna module
+        varuna_mod.linkLibrary(boringssl_libs.bcm);
+        varuna_mod.linkLibrary(boringssl_libs.crypto);
+        varuna_mod.linkLibrary(boringssl_libs.ssl);
+        varuna_mod.addIncludePath(boringssl_libs.include_path);
     }
 
     const varuna_import = [_]std.Build.Module.Import{
@@ -206,4 +229,12 @@ const DnsBackend = enum {
     /// c-ares async DNS library with epoll fd monitoring.
     /// Requires libc-ares-dev (Debian/Ubuntu) or c-ares-devel (RHEL/Fedora).
     c_ares,
+};
+
+/// TLS backend selection.
+pub const TlsBackend = enum {
+    /// Vendored BoringSSL — enables HTTPS tracker support.
+    boringssl,
+    /// No TLS — HTTPS tracker URLs will return error.HttpsNotSupported.
+    none,
 };

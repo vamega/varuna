@@ -12,3 +12,4 @@ pub const http = @import("http.zig");
 pub const rate_limiter = @import("rate_limiter.zig");
 pub const ring = @import("ring.zig");
 pub const signal = @import("signal.zig");
+pub const tls = @import("tls.zig");
