@@ -10,6 +10,16 @@ pub fn build(b: *std.Build) void {
         "SQLite linking strategy: 'system' links libsqlite3, 'bundled' compiles the amalgamation from vendor/sqlite/",
     ) orelse .system;
 
+    const dns_backend = b.option(
+        DnsBackend,
+        "dns",
+        "DNS resolver backend: 'threadpool' uses getaddrinfo on background threads (default), 'c-ares' uses the c-ares async DNS library",
+    ) orelse .threadpool;
+
+    // ── Build options module (dns backend selection) ────────
+    const build_options = b.addOptions();
+    build_options.addOption(DnsBackend, "dns_backend", dns_backend);
+
     const toml_dep = b.dependency("toml", .{
         .target = target,
         .optimize = optimize,
@@ -23,6 +33,7 @@ pub fn build(b: *std.Build) void {
         .link_libc = true,
         .imports = &.{
             .{ .name = "toml", .module = toml_mod },
+            .{ .name = "build_options", .module = build_options.createModule() },
         },
     });
 
@@ -46,6 +57,11 @@ pub fn build(b: *std.Build) void {
             });
             varuna_mod.addIncludePath(b.path("vendor/sqlite"));
         },
+    }
+
+    // ── c-ares linking (when dns=c-ares) ────────────────────
+    if (dns_backend == .c_ares) {
+        varuna_mod.linkSystemLibrary("cares", .{});
     }
 
     const varuna_import = [_]std.Build.Module.Import{
@@ -182,3 +198,12 @@ pub fn build(b: *std.Build) void {
     if (b.args) |args| perf_record_cmd.addArgs(args);
     perf_record_step.dependOn(&perf_record_cmd.step);
 }
+
+/// DNS resolver backend selection.
+const DnsBackend = enum {
+    /// Default: uses getaddrinfo on background threads with 5-second timeout.
+    threadpool,
+    /// c-ares async DNS library with epoll fd monitoring.
+    /// Requires libc-ares-dev (Debian/Ubuntu) or c-ares-devel (RHEL/Fedora).
+    c_ares,
+};
