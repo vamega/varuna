@@ -73,6 +73,8 @@ See [docs/io-uring-syscalls.md](docs/io-uring-syscalls.md) for the full syscall 
 
 See [docs/future-features.md](docs/future-features.md) for planned features: systemd-notify, SHA-NI acceleration, uTP, SO_BINDTODEVICE, socket activation, UDP tracker, DHT/PEX, magnet links, encryption.
 
+See [docs/dht-bep52-plan.md](docs/dht-bep52-plan.md) for the detailed implementation plan for DHT (BEP 5) and BitTorrent v2 / hybrid torrents (BEP 52).
+
 ## Coding Style & Naming Conventions
 Use `zig fmt` as the formatting authority. Prefer small modules, explicit ownership, and low-allocation designs. Default to arena or slab-backed allocation where dynamic memory is unavoidable. Use `snake_case` for files, functions, and local variables; `PascalCase` for types; and descriptive subsystem names like `piece_picker.zig` or `disk_scheduler.zig`. Keep Linux- and io_uring-specific code explicit rather than hidden behind generic abstractions.
 
