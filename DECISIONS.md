@@ -208,3 +208,25 @@ Follow-up triggers:
 
 Explicitly out of scope:
 - Time-based alternative speed scheduling (qBittorrent's "alt speed" scheduler). Varuna will not implement automatic time-of-day speed switching. Users who need scheduled rate changes should use external tooling (cron + varuna-ctl) to set limits at desired times.
+
+### 2026-03-30: Peer Exchange (BEP 11)
+
+Context:
+PEX is the standard mechanism for BitTorrent peers to exchange peer lists without relying solely on tracker announces. The BEP 10 extension protocol was already implemented, and ut_pex was advertised in the handshake (disabled for private torrents).
+
+Decision:
+- Implement BEP 11 with delta encoding: each PEX message contains only peers added/dropped since the last exchange with that particular peer.
+- Use per-peer PexState to track previously sent peer sets, and per-torrent TorrentPexState for the current connected peer set.
+- Allocate PEX state lazily (on first use) so private torrents and non-PEX peers have zero overhead.
+- Connect to PEX-discovered peers through the existing addPeerForTorrent machinery, respecting all connection limits.
+- Cap added/dropped lists at 50 peers per message and enforce 60-second intervals per peer, as recommended by BEP 11.
+
+Reasoning:
+- Delta encoding is required by BEP 11 and minimizes bandwidth (only changes are sent).
+- Lazy allocation avoids wasting memory for private torrents where PEX is forbidden.
+- Reusing addPeerForTorrent ensures PEX connections go through the same limit checks, dedup, and half-open tracking as tracker-discovered peers.
+- The tick-based approach (scanning peers each cycle) is simple and correct; the connected peer set is always accurate even if peers disconnect between PEX messages.
+
+Follow-up triggers:
+- Add PEX-specific connection rate limiting if PEX amplification becomes a concern.
+- Add integration test with multiple daemon instances exchanging peers via PEX.
