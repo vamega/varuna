@@ -56,16 +56,9 @@ port_min = 6881            # port range start
 port_max = 6889            # port range end
 ```
 
-## 5. systemd socket activation
+## 5. ~~systemd socket activation~~ (DONE)
 
-Let systemd manage the listen socket and pass it to the daemon via file descriptor inheritance. Allows:
-- Zero-downtime restarts (systemd holds the socket while daemon restarts)
-- On-demand daemon startup (systemd starts daemon when first connection arrives)
-- Consistent socket ownership and permissions
-
-Implementation: check `$LISTEN_FDS` and `$LISTEN_PID` environment variables at startup. If present, use fd 3+ instead of creating our own listen socket.
-
-Reference: https://www.freedesktop.org/software/systemd/man/latest/sd_listen_fds.html
+Implemented in `src/daemon/systemd.zig`. Checks `$LISTEN_FDS` and `$LISTEN_PID` at startup per sd_listen_fds(3). If present, uses fd 3+ instead of creating listen sockets. Supports multiple inherited fds (first for API server, second for peer listener). Sets FD_CLOEXEC on inherited fds. Integrated into daemon startup in `src/main.zig` and `src/rpc/server.zig` (initWithFd).
 
 ## 6. UDP tracker support (BEP 15)
 

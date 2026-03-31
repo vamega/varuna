@@ -100,7 +100,27 @@ pub fn main() !void {
     defer api_handler.sync_state.deinit();
 
     // HTTP API server (all I/O via io_uring)
-    var api_server = varuna.rpc.server.ApiServer.initWithDevice(allocator, cfg.daemon.api_bind, cfg.daemon.api_port, cfg.network.bind_device) catch |err| {
+    // Check for systemd socket activation first
+    const systemd_fds = varuna.daemon.systemd.listenFds();
+    var socket_activated = false;
+    var api_server = if (systemd_fds) |fds| blk: {
+        // Use the first inherited fd as the API listen socket.
+        // If systemd passes multiple sockets, the first one on api_port
+        // is preferred; otherwise just use fd 3.
+        var api_fd = fds[0];
+        for (fds) |fd| {
+            if (varuna.daemon.systemd.isListenSocketOnPort(fd, cfg.daemon.api_port)) {
+                api_fd = fd;
+                break;
+            }
+        }
+        socket_activated = true;
+        break :blk varuna.rpc.server.ApiServer.initWithFd(allocator, api_fd) catch |err| {
+            try stdout.print("failed to init API server with socket activation: {s}\n", .{@errorName(err)});
+            try stdout.flush();
+            return err;
+        };
+    } else varuna.rpc.server.ApiServer.initWithDevice(allocator, cfg.daemon.api_bind, cfg.daemon.api_port, cfg.network.bind_device) catch |err| {
         try stdout.print("failed to start API server: {s}\n", .{@errorName(err)});
         try stdout.flush();
         return err;
@@ -112,7 +132,11 @@ pub fn main() !void {
     api_handler_global = &api_handler;
     api_server.setHandler(globalApiHandler);
 
-    try stdout.print("api: http://{s}:{}\n", .{ cfg.daemon.api_bind, cfg.daemon.api_port });
+    if (socket_activated) {
+        try stdout.print("api: socket-activated (fd inherited from systemd)\n", .{});
+    } else {
+        try stdout.print("api: http://{s}:{}\n", .{ cfg.daemon.api_bind, cfg.daemon.api_port });
+    }
     try stdout.print("ready (Ctrl-C to stop)\n", .{});
     try stdout.flush();
 
@@ -125,8 +149,20 @@ pub fn main() !void {
     shared_el.submitTimeout(100 * std.time.ns_per_ms) catch {};
 
     // Listen socket for accepting inbound peer connections (created once, shared across torrents)
+    // If systemd provided multiple fds, try to use a second one as the peer listen socket.
     var listen_fd: std.posix.fd_t = -1;
-    defer if (listen_fd >= 0) std.posix.close(listen_fd);
+    var peer_socket_activated = false;
+    if (systemd_fds) |fds| {
+        if (fds.len > 1) {
+            // Second fd is the peer listen socket
+            for (fds[1..]) |fd| {
+                listen_fd = fd;
+                peer_socket_activated = true;
+                break;
+            }
+        }
+    }
+    defer if (listen_fd >= 0 and !peer_socket_activated) std.posix.close(listen_fd);
 
     // Main loop: tick shared event loop + poll API server
     var resume_tick_counter: u32 = 0;

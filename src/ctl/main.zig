@@ -110,9 +110,20 @@ pub fn main() !void {
         if (cmd_start + 1 >= args.len) {
             try stdout.print("usage: varuna-ctl delete <hash> [--delete-files]\n", .{});
         } else {
+            // Check for --delete-files flag
+            var delete_files = false;
+            var i: usize = cmd_start + 2;
+            while (i < args.len) : (i += 1) {
+                if (std.mem.eql(u8, args[i], "--delete-files")) {
+                    delete_files = true;
+                }
+            }
             var body = std.ArrayList(u8).empty;
             defer body.deinit(allocator);
-            try body.print(allocator, "hashes={s}", .{args[cmd_start + 1]});
+            try body.print(allocator, "hashes={s}&deleteFiles={s}", .{
+                args[cmd_start + 1],
+                if (delete_files) @as([]const u8, "true") else @as([]const u8, "false"),
+            });
             try doPost(allocator, stdout, api_host, api_port, "/api/v2/torrents/delete", body.items, sid);
         }
     } else if (std.mem.eql(u8, command, "version")) {
@@ -182,6 +193,24 @@ pub fn main() !void {
                 try body_buf.print(allocator, "hashes={s}", .{target});
                 try doPost(allocator, stdout, api_host, api_port, "/api/v2/torrents/uploadLimit", body_buf.items, sid);
             }
+        }
+    } else if (std.mem.eql(u8, command, "move")) {
+        if (cmd_start + 2 >= args.len) {
+            try stdout.print("usage: varuna-ctl move <hash> <new-path>\n", .{});
+        } else {
+            var body_buf = std.ArrayList(u8).empty;
+            defer body_buf.deinit(allocator);
+            try body_buf.print(allocator, "hashes={s}&location={s}", .{ args[cmd_start + 1], args[cmd_start + 2] });
+            try doPost(allocator, stdout, api_host, api_port, "/api/v2/torrents/setLocation", body_buf.items, sid);
+        }
+    } else if (std.mem.eql(u8, command, "conn-diag")) {
+        if (cmd_start + 1 >= args.len) {
+            try stdout.print("usage: varuna-ctl conn-diag <hash>\n", .{});
+        } else {
+            var path_buf = std.ArrayList(u8).empty;
+            defer path_buf.deinit(allocator);
+            try path_buf.print(allocator, "/api/v2/torrents/connDiagnostics?hash={s}", .{args[cmd_start + 1]});
+            try doGet(allocator, stdout, api_host, api_port, path_buf.items, sid);
         }
     } else {
         try stdout.print("unknown command: {s}\n\n", .{command});
@@ -399,11 +428,13 @@ fn printUsage(stdout: *std.Io.Writer, host: []const u8, port: u16) !void {
     try stdout.print("  status <hash>                  torrent details\n", .{});
     try stdout.print("  pause <hash>                   pause torrent\n", .{});
     try stdout.print("  resume <hash>                  resume torrent\n", .{});
-    try stdout.print("  delete <hash>                  delete torrent\n", .{});
+    try stdout.print("  delete <hash> [--delete-files] delete torrent (optionally remove data)\n", .{});
     try stdout.print("  set-dl-limit <hash|global> <N> set download limit (bytes/sec, 0=off)\n", .{});
     try stdout.print("  set-ul-limit <hash|global> <N> set upload limit (bytes/sec, 0=off)\n", .{});
     try stdout.print("  get-dl-limit <hash|global>     get download limit\n", .{});
     try stdout.print("  get-ul-limit <hash|global>     get upload limit\n", .{});
+    try stdout.print("  move <hash> <path>             move torrent data to new path\n", .{});
+    try stdout.print("  conn-diag <hash>               connection diagnostics\n", .{});
     try stdout.print("  version                        daemon API version\n", .{});
     try stdout.print("  stats                          global transfer stats\n", .{});
     try stdout.print("\ndaemon: http://{s}:{}\n", .{ host, port });

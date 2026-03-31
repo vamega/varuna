@@ -118,14 +118,148 @@ pub const SessionManager = struct {
 
     /// Remove a torrent by info hash hex string.
     pub fn removeTorrent(self: *SessionManager, hash: []const u8) !void {
-        self.mutex.lock();
-        defer self.mutex.unlock();
+        return self.removeTorrentEx(hash, false);
+    }
 
-        const kv = self.sessions.fetchRemove(hash) orelse return error.TorrentNotFound;
+    /// Remove a torrent with optional file deletion.
+    /// When delete_files is true, removes all data files and empty parent
+    /// directories under the torrent's save_path.
+    pub fn removeTorrentEx(self: *SessionManager, hash: []const u8, delete_files: bool) !void {
+        self.mutex.lock();
+
+        const kv = self.sessions.fetchRemove(hash) orelse {
+            self.mutex.unlock();
+            return error.TorrentNotFound;
+        };
         var session = kv.value;
+
+        // Grab info we need before deinit
+        const save_path = self.allocator.dupe(u8, session.save_path) catch {
+            self.mutex.unlock();
+            session.stop();
+            session.deinit();
+            self.allocator.destroy(session);
+            return;
+        };
+        defer self.allocator.free(save_path);
+
+        const info_hash = session.info_hash;
+
+        // Get file paths if we need to delete files
+        const file_paths: ?[]const []const u8 = if (delete_files) blk: {
+            if (session.session) |*sess| {
+                var paths = std.ArrayList([]const u8).empty;
+                for (sess.metainfo.files) |file| {
+                    var name_len: usize = 0;
+                    for (file.path, 0..) |component, ci| {
+                        if (ci > 0) name_len += 1;
+                        name_len += component.len;
+                    }
+                    const name_buf = self.allocator.alloc(u8, name_len) catch continue;
+                    var pos: usize = 0;
+                    for (file.path, 0..) |component, ci| {
+                        if (ci > 0) {
+                            name_buf[pos] = '/';
+                            pos += 1;
+                        }
+                        @memcpy(name_buf[pos..][0..component.len], component);
+                        pos += component.len;
+                    }
+                    paths.append(self.allocator, name_buf) catch {
+                        self.allocator.free(name_buf);
+                        continue;
+                    };
+                }
+                break :blk paths.toOwnedSlice(self.allocator) catch null;
+            } else break :blk null;
+        } else null;
+        defer if (file_paths) |fps| {
+            for (fps) |fp| self.allocator.free(fp);
+            self.allocator.free(fps);
+        };
+
+        // Also get the torrent name for multi-file torrents
+        const torrent_name = if (delete_files)
+            self.allocator.dupe(u8, session.name) catch null
+        else
+            null;
+        defer if (torrent_name) |tn| self.allocator.free(tn);
+
+        self.mutex.unlock();
+
+        // Stop and clean up the session
         session.stop();
         session.deinit();
         self.allocator.destroy(session);
+
+        // Clean up resume DB entries for this torrent
+        if (self.resume_db) |*db| {
+            db.clearTorrent(info_hash) catch {};
+            db.clearRateLimits(info_hash) catch {};
+            db.clearTorrentTags(info_hash) catch {};
+            db.saveTorrentCategory(info_hash, "") catch {};
+        }
+
+        // Delete data files if requested
+        if (delete_files) {
+            if (file_paths) |fps| {
+                for (fps) |relative_path| {
+                    // Build full path: save_path/name/relative_path (multi-file)
+                    // or save_path/relative_path (single-file)
+                    var path_buf: [4096]u8 = undefined;
+                    const full_path = if (torrent_name) |tn|
+                        std.fmt.bufPrint(&path_buf, "{s}/{s}/{s}", .{ save_path, tn, relative_path }) catch continue
+                    else
+                        std.fmt.bufPrint(&path_buf, "{s}/{s}", .{ save_path, relative_path }) catch continue;
+
+                    std.fs.deleteFileAbsolute(full_path) catch {};
+                }
+            }
+
+            // Clean up empty directories (bottom-up)
+            cleanupEmptyDirs(save_path, torrent_name);
+        }
+    }
+
+    /// Remove empty directories under save_path/torrent_name, bottom-up.
+    fn cleanupEmptyDirs(save_path: []const u8, torrent_name: ?[]const u8) void {
+        var path_buf: [4096]u8 = undefined;
+        const base = if (torrent_name) |tn|
+            std.fmt.bufPrint(&path_buf, "{s}/{s}", .{ save_path, tn }) catch return
+        else
+            save_path;
+
+        // Try to delete the torrent directory (will fail if not empty, which is fine)
+        removeEmptyTree(base);
+    }
+
+    /// Recursively try to remove empty directories.
+    fn removeEmptyTree(path: []const u8) void {
+        var dir = std.fs.openDirAbsolute(path, .{ .iterate = true }) catch return;
+
+        var has_entries = false;
+        var iter = dir.iterate();
+        while (iter.next() catch null) |entry| {
+            if (entry.kind == .directory) {
+                var sub_buf: [4096]u8 = undefined;
+                const sub_path = std.fmt.bufPrint(&sub_buf, "{s}/{s}", .{ path, entry.name }) catch {
+                    has_entries = true;
+                    continue;
+                };
+                removeEmptyTree(sub_path);
+                // Check if sub-dir still exists
+                std.fs.accessAbsolute(sub_path, .{}) catch {
+                    // sub-dir was removed, don't count it
+                    continue;
+                };
+            }
+            has_entries = true;
+        }
+        dir.close();
+
+        if (!has_entries) {
+            std.fs.deleteDirAbsolute(path) catch {};
+        }
     }
 
     /// Pause a torrent.
@@ -325,6 +459,103 @@ pub const SessionManager = struct {
         session.rebuildTagsString();
     }
 
+    /// Relocate torrent data to a new path. Pauses the torrent, moves files,
+    /// and updates the save_path. The actual file move is done on the calling
+    /// thread (which is the RPC handler thread, not the event loop).
+    pub fn setLocation(self: *SessionManager, hash: []const u8, new_path: []const u8) !void {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+
+        const session = self.sessions.get(hash) orelse return error.TorrentNotFound;
+        const was_active = session.state == .downloading or session.state == .seeding;
+
+        // Pause if active (stop I/O to the files)
+        if (was_active) {
+            session.pause();
+        }
+
+        // Move files from old save_path to new_path
+        const old_path = session.save_path;
+        moveDataFiles(old_path, new_path) catch |err| {
+            // Resume if we paused
+            if (was_active) session.resume_session();
+            return err;
+        };
+
+        // Update save_path
+        const owned_new_path = try self.allocator.dupe(u8, new_path);
+        self.allocator.free(old_path);
+        session.save_path = owned_new_path;
+
+        // Resume if it was active
+        if (was_active) {
+            session.resume_session();
+        }
+    }
+
+    /// Move all files and subdirectories from src to dst using standard fs ops.
+    /// This is a one-time operation, not hot-path -- standard I/O is acceptable.
+    fn moveDataFiles(src: []const u8, dst: []const u8) !void {
+        // Ensure destination directory exists
+        std.fs.makeDirAbsolute(dst) catch |err| switch (err) {
+            error.PathAlreadyExists => {},
+            else => return err,
+        };
+
+        // Try rename first (fast path: same filesystem)
+        // We need to iterate src and rename each entry
+        var dir = std.fs.openDirAbsolute(src, .{ .iterate = true }) catch return error.SourceNotFound;
+        defer dir.close();
+
+        var iter = dir.iterate();
+        while (iter.next() catch return error.IterateFailed) |entry| {
+            // Build full paths
+            var src_buf: [4096]u8 = undefined;
+            var dst_buf: [4096]u8 = undefined;
+
+            const src_path = std.fmt.bufPrint(&src_buf, "{s}/{s}", .{ src, entry.name }) catch continue;
+            const dst_path = std.fmt.bufPrint(&dst_buf, "{s}/{s}", .{ dst, entry.name }) catch continue;
+
+            // Try rename (works if same filesystem)
+            std.fs.renameAbsolute(src_path, dst_path) catch {
+                // Cross-filesystem: copy + delete
+                if (entry.kind == .directory) {
+                    // Recursively move subdirectory
+                    moveDataFiles(src_path, dst_path) catch continue;
+                    std.fs.deleteDirAbsolute(src_path) catch {};
+                } else {
+                    // Copy file using read/write loop
+                    const src_file = std.fs.openFileAbsolute(src_path, .{}) catch continue;
+                    defer src_file.close();
+                    const dst_file = std.fs.createFileAbsolute(dst_path, .{}) catch continue;
+                    defer dst_file.close();
+
+                    var copy_buf: [65536]u8 = undefined;
+                    var copy_ok = true;
+                    while (true) {
+                        const bytes_read = std.posix.read(src_file.handle, &copy_buf) catch {
+                            copy_ok = false;
+                            break;
+                        };
+                        if (bytes_read == 0) break;
+                        var written: usize = 0;
+                        while (written < bytes_read) {
+                            const w = std.posix.write(dst_file.handle, copy_buf[written..bytes_read]) catch {
+                                copy_ok = false;
+                                break;
+                            };
+                            written += w;
+                        }
+                        if (!copy_ok) break;
+                    }
+                    if (copy_ok) {
+                        std.fs.deleteFileAbsolute(src_path) catch {};
+                    }
+                }
+            };
+        }
+    }
+
     pub fn count(self: *SessionManager) usize {
         self.mutex.lock();
         defer self.mutex.unlock();
@@ -332,6 +563,7 @@ pub const SessionManager = struct {
     }
 
     /// Set per-torrent download speed limit (bytes/sec). 0 = unlimited.
+    /// Persists to SQLite so the limit survives daemon restarts.
     pub fn setTorrentDlLimit(self: *SessionManager, hash: []const u8, limit: u64) !void {
         self.mutex.lock();
         defer self.mutex.unlock();
@@ -345,9 +577,15 @@ pub const SessionManager = struct {
                 el.setTorrentDlLimit(tid, limit);
             }
         }
+
+        // Persist to DB
+        if (self.resume_db) |*db| {
+            db.saveRateLimits(session.info_hash, session.dl_limit, session.ul_limit) catch {};
+        }
     }
 
     /// Set per-torrent upload speed limit (bytes/sec). 0 = unlimited.
+    /// Persists to SQLite so the limit survives daemon restarts.
     pub fn setTorrentUlLimit(self: *SessionManager, hash: []const u8, limit: u64) !void {
         self.mutex.lock();
         defer self.mutex.unlock();
@@ -361,6 +599,51 @@ pub const SessionManager = struct {
                 el.setTorrentUlLimit(tid, limit);
             }
         }
+
+        // Persist to DB
+        if (self.resume_db) |*db| {
+            db.saveRateLimits(session.info_hash, session.dl_limit, session.ul_limit) catch {};
+        }
+    }
+
+    // ── Connection diagnostics ─────────────────────────────
+
+    /// Per-torrent connection health diagnostics.
+    pub const ConnDiagnostics = struct {
+        connection_attempts: u64 = 0,
+        connection_failures: u64 = 0,
+        timeout_failures: u64 = 0,
+        refused_failures: u64 = 0,
+        peers_connected: u16 = 0,
+        peers_half_open: u16 = 0,
+    };
+
+    /// Get connection diagnostics for a torrent.
+    pub fn getConnDiagnostics(self: *SessionManager, hash: []const u8) !ConnDiagnostics {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+
+        const session = self.sessions.get(hash) orelse return error.TorrentNotFound;
+
+        var diag = ConnDiagnostics{};
+
+        // Get peer count from event loop
+        if (self.shared_event_loop) |el| {
+            if (session.torrent_id_in_shared) |tid| {
+                diag.peers_connected = el.peerCountForTorrent(tid);
+                diag.peers_half_open = el.halfOpenCount();
+            }
+        } else if (session.event_loop) |*el| {
+            diag.peers_connected = el.peer_count;
+        }
+
+        // Get per-torrent connection stats from the session
+        diag.connection_attempts = session.conn_attempts;
+        diag.connection_failures = session.conn_failures;
+        diag.timeout_failures = session.conn_timeout_failures;
+        diag.refused_failures = session.conn_refused_failures;
+
+        return diag;
     }
 
     // ── Thread-safe data accessors for RPC handlers ────────────

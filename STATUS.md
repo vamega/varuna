@@ -32,6 +32,7 @@ Update it whenever a milestone lands, the near-term backlog changes, or a new op
 - Resume fast path: loads known-complete pieces from SQLite, skips SHA-1 rehashing.
 - Lifetime transfer stats: total_uploaded/total_downloaded persisted to SQLite, loaded as baseline on startup so share ratio survives daemon restarts.
 - Categories and tags persisted to SQLite (write-through on change, load at startup).
+- Per-torrent rate limits persisted to SQLite (saved on change, loaded at startup).
 - fdatasync, fallocate pre-allocation via io_uring.
 
 ### Configuration
@@ -44,18 +45,23 @@ Update it whenever a milestone lands, the near-term backlog changes, or a new op
 - **Auth**: login/logout with session cookies (SID), 1-hour timeout, configurable credentials.
 - **Core**: webapiVersion, preferences, setPreferences, transfer/info.
 - **Torrents**: info, add (multipart + raw), delete, pause, resume, properties, files, trackers.
-- **Controls**: filePrio, setSequentialDownload, setDownloadLimit, setUploadLimit, downloadLimit, uploadLimit, forceReannounce, recheck.
+- **Controls**: filePrio, setSequentialDownload, setDownloadLimit, setUploadLimit, downloadLimit, uploadLimit, forceReannounce, recheck, setLocation, connDiagnostics.
 - **Categories & Tags**: categories (create/edit/remove/list/setCategory), tags (create/delete/addTags/removeTags/list).
 - **Sync**: /api/v2/sync/maindata delta protocol (rid-based, Wyhash change detection, 100-snapshot circular buffer).
 - **Multipart form-data**: zero-copy parser for Flood/WebUI torrent uploads.
-- **varuna-ctl**: list, add (--save-path), pause, resume, delete, version, stats, speed limits (set/get), --username/--password auth.
+- **varuna-ctl**: list, add (--save-path), pause, resume, delete (--delete-files), move, conn-diag, version, stats, speed limits (set/get), --username/--password auth.
 
 ### Daemon Features
 - Graceful SIGINT/SIGTERM shutdown: flush resume DB, send tracker stopped, close connections.
 - systemd-notify: READY=1 / STOPPING=1 via AF_UNIX.
+- systemd socket activation: inherits listen fds from systemd via $LISTEN_FDS/$LISTEN_PID (sd_listen_fds protocol). Supports API server and peer listener sockets.
 - Daemon seeding after download: announces completed, creates listen socket, multi-torrent handshake matching.
 - ETA calculation and share ratio tracking (lifetime, persisted).
 - Download/upload speed tracking with 2-second rolling window.
+- Per-torrent rate limit persistence: dl_limit/ul_limit saved to SQLite, restored on daemon restart.
+- Torrent data relocation: move completed torrent data to a new path via API (setLocation endpoint).
+- Per-torrent connection diagnostics: connection attempts/failures/timeouts exposed via connDiagnostics API.
+- Partial download cleanup: delete torrent with --delete-files removes data files and empty directories.
 
 ### Performance & Hardening
 - **SHA-1 hardware acceleration**: runtime CPU detection for x86_64 SHA-NI (~2x to ~2.2 GB/s) and AArch64 SHA1 crypto extensions. Atomic-cached dispatch, automatic fallback to software.
@@ -76,7 +82,7 @@ Update it whenever a milestone lands, the near-term backlog changes, or a new op
 - Seed/read-path correctness: queued seed responses own exact block copies, async seed reads use unique IDs, and only successfully submitted reads/writes contribute to pending completion counts.
 
 ### Testing
-- 19 peer wire protocol tests, 10 BEP 10 extension tests, 31 uTP/LEDBAT tests, 5 categories tests, 8 resume DB tests.
+- 19 peer wire protocol tests, 10 BEP 10 extension tests, 31 uTP/LEDBAT tests, 5 categories tests, 9 resume DB tests (includes rate limit persistence).
 - Bencode fuzz + edge case tests, HTTP parser fuzz tests.
 - Fuzz tests for: multipart parser, tracker response, uTP packets, BEP 10 extensions, scrape response (18 fuzz tests total).
 - Regression tests for API partial-send progress, unique seed read IDs, seed block-copy batching, shared-event-loop detach on stop, shared-loop preservation on resume, and failed disk-write release.
@@ -96,8 +102,6 @@ Update it whenever a milestone lands, the near-term backlog changes, or a new op
 
 ### Operational
 - **Flood/qui WebUI validation**: test against real Flood or qui instance to find API gaps.
-- **systemd socket activation**: fd inheritance from systemd.
-- **Torrent data relocation**: move completed downloads to a different path via API.
 
 ## Known Issues
 

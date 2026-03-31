@@ -193,6 +193,14 @@ pub const ApiHandler = struct {
             return self.handleTorrentsRecheck(allocator, body);
         }
 
+        if (std.mem.eql(u8, action_name, "setLocation") and std.mem.eql(u8, method, "POST")) {
+            return self.handleTorrentsSetLocation(allocator, body);
+        }
+
+        if (std.mem.eql(u8, action_name, "connDiagnostics")) {
+            return self.handleTorrentsConnDiagnostics(allocator, params);
+        }
+
         // Category endpoints
         if (std.mem.eql(u8, action_name, "categories")) {
             return self.handleCategories(allocator);
@@ -310,11 +318,16 @@ pub const ApiHandler = struct {
     }
 
     fn handleTorrentsDelete(self: *const ApiHandler, allocator: std.mem.Allocator, body: []const u8) server.Response {
-        // Expect hash in body as form param: hashes=<hash>
+        // Expect hash in body as form param: hashes=<hash>&deleteFiles=true
         const hash = extractParam(body, "hashes") orelse
             return .{ .status = 400, .body = "{\"error\":\"missing hashes\"}" };
 
-        self.session_manager.removeTorrent(hash) catch |err| {
+        const delete_files = if (extractParam(body, "deleteFiles")) |v|
+            std.mem.eql(u8, v, "true")
+        else
+            false;
+
+        self.session_manager.removeTorrentEx(hash, delete_files) catch |err| {
             const msg = std.fmt.allocPrint(allocator, "{{\"error\":\"{s}\"}}", .{@errorName(err)}) catch
                 return .{ .status = 500, .body = "{\"error\":\"internal\"}" };
             return .{ .status = 404, .body = msg, .owned_body = msg };
@@ -637,6 +650,43 @@ pub const ApiHandler = struct {
         };
 
         return .{ .body = "{\"status\":\"ok\"}" };
+    }
+
+    fn handleTorrentsSetLocation(self: *const ApiHandler, allocator: std.mem.Allocator, body: []const u8) server.Response {
+        const hash = extractParam(body, "hashes") orelse
+            return .{ .status = 400, .body = "{\"error\":\"missing hashes\"}" };
+        const location = extractParam(body, "location") orelse
+            return .{ .status = 400, .body = "{\"error\":\"missing location\"}" };
+
+        if (location.len == 0) {
+            return .{ .status = 400, .body = "{\"error\":\"empty location\"}" };
+        }
+
+        self.session_manager.setLocation(hash, location) catch |err| {
+            const msg = std.fmt.allocPrint(allocator, "{{\"error\":\"{s}\"}}", .{@errorName(err)}) catch
+                return .{ .status = 500, .body = "{\"error\":\"internal\"}" };
+            return .{ .status = 409, .body = msg, .owned_body = msg };
+        };
+
+        return .{ .body = "{\"status\":\"ok\"}" };
+    }
+
+    fn handleTorrentsConnDiagnostics(self: *const ApiHandler, allocator: std.mem.Allocator, params: []const u8) server.Response {
+        const hash = extractParam(params, "hash") orelse
+            return .{ .status = 400, .body = "{\"error\":\"missing hash\"}" };
+
+        const diag = self.session_manager.getConnDiagnostics(hash) catch
+            return .{ .status = 404, .body = "{\"error\":\"torrent not found\"}" };
+
+        const body = std.fmt.allocPrint(allocator, "{{\"connection_attempts\":{},\"connection_failures\":{},\"timeout_failures\":{},\"refused_failures\":{},\"peers_connected\":{},\"peers_half_open\":{}}}", .{
+            diag.connection_attempts,
+            diag.connection_failures,
+            diag.timeout_failures,
+            diag.refused_failures,
+            diag.peers_connected,
+            diag.peers_half_open,
+        }) catch return .{ .status = 500, .body = "{\"error\":\"internal\"}" };
+        return .{ .body = body, .owned_body = body };
     }
 
     // ── Category endpoints ────────────────────────────────
