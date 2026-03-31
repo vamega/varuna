@@ -196,9 +196,10 @@ pub const EventLoop = struct {
     };
 
     /// A uTP packet waiting to be sent over the UDP socket.
+    /// Sized for a full UDP datagram (header + payload).
     pub const UtpQueuedPacket = struct {
-        data: [utp_mod.Header.size]u8,
-        len: usize,
+        data: [1500]u8 = undefined,
+        len: usize = 0,
         remote: std.net.Address,
     };
 
@@ -684,6 +685,57 @@ pub const EventLoop = struct {
         self.peer_count += 1;
         self.half_open_count += 1;
         return slot;
+    }
+
+    /// Initiate an outbound uTP connection to a peer. Creates the uTP
+    /// socket via the UtpManager, sends the SYN packet, and allocates a
+    /// peer slot in the event loop.
+    pub fn addUtpPeer(self: *EventLoop, address: std.net.Address, torrent_id: u8) !u16 {
+        // Ensure the UDP socket and manager are ready.
+        if (self.udp_fd < 0 or self.utp_manager == null) {
+            try self.startUtpListener();
+        }
+
+        const mgr = self.utp_manager orelse return error.NoUtpManager;
+
+        if (self.peer_count >= self.max_connections) {
+            return error.ConnectionLimitReached;
+        }
+        if (self.half_open_count >= self.max_half_open) {
+            return error.HalfOpenLimitReached;
+        }
+
+        const now_us = utp_handler.utpNowUs();
+        const conn = mgr.connect(address, now_us) catch |err| {
+            log.warn("uTP connect failed: {s}", .{@errorName(err)});
+            return error.UtpConnectFailed;
+        };
+
+        // Allocate a peer slot.
+        const peer_slot = self.allocSlot() orelse {
+            // Clean up the uTP connection.
+            _ = mgr.reset(conn.slot, now_us);
+            return error.TooManyPeers;
+        };
+
+        const peer = &self.peers[peer_slot];
+        peer.* = Peer{
+            .fd = -1,
+            .state = .connecting,
+            .mode = .download,
+            .transport = .utp,
+            .torrent_id = torrent_id,
+            .utp_slot = conn.slot,
+            .address = address,
+        };
+        self.peer_count += 1;
+        self.half_open_count += 1;
+
+        // Send the SYN packet via the UDP socket.
+        utp_handler.utpSendPacket(self, &conn.syn_packet, address);
+
+        log.info("initiating outbound uTP connection to {any}", .{address});
+        return peer_slot;
     }
 
     /// Start accepting inbound connections for seeding.

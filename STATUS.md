@@ -12,7 +12,7 @@ Update it whenever a milestone lands, the near-term backlog changes, or a new op
 - Private tracker support: private flag parsing and enforcement (BEP 27). Per-session key, numwant, compact=1. PEX disabled for private torrents.
 - IPv6 peer support (BEP 7): compact peers6, IPv6-aware connect.
 - BEP 10 Extension Protocol: handshake negotiation, extension message dispatch, advertises ut_metadata and ut_pex (ut_pex omitted for private torrents).
-- uTP (BEP 29): packet codec, UtpSocket state machine, LEDBAT congestion control, UtpManager multiplexer, io_uring event loop integration (UDP socket, RECVMSG/SENDMSG, inbound connection accept, peer wire protocol bridge, timeout processing). 30+ tests.
+- uTP (BEP 29): packet codec, UtpSocket state machine, LEDBAT congestion control, UtpManager multiplexer, io_uring event loop integration (UDP socket, RECVMSG/SENDMSG, inbound and outbound connections, peer wire protocol bridge, timeout processing, retransmission buffer with owned payload tracking, RTO-based retransmission with exponential backoff, fast retransmit on triple duplicate ACK). 40+ tests.
 - Multi-peer download: rarest-first piece selection, endgame mode, tit-for-tat choking, block pipelining (depth 5).
 - Multi-peer seeding: io_uring event loop, batched block sends, async disk reads with piece cache.
 - Selective file download: per-file priorities (normal/high/do_not_download), piece-mask filtering, boundary-piece handling, lazy file creation. Wired into daemon event loop piece picker.
@@ -94,7 +94,7 @@ Update it whenever a milestone lands, the near-term backlog changes, or a new op
 ## Next
 
 ### Protocol
-- **uTP outbound connections**: initiate uTP connections to peers (currently inbound-only).
+- ~~**uTP outbound connections**~~: (DONE) outbound uTP connections, retransmission buffer, RTO retransmission.
 - **PEX (BEP 11)**: peer exchange via BEP 10 extensions. Discover peers through existing connections.
 - **DHT (BEP 5)**: trackerless peer discovery (large feature).
 - **Magnet links (BEP 9)**: metadata download via ut_metadata extension.
@@ -108,7 +108,7 @@ Update it whenever a milestone lands, the near-term backlog changes, or a new op
 ## Known Issues
 
 - The packaged Ubuntu `opentracker` build requires explicit info-hash whitelisting (`--whitelist-hash`).
-- uTP supports inbound connections only; outbound uTP connect not yet implemented.
+- uTP send queue previously truncated data packets to header-only size (fixed).
 
 ## Last Verified Milestone
 
