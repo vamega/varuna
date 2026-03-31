@@ -264,6 +264,10 @@ pub const ApiHandler = struct {
             return self.handleTorrentsConnDiagnostics(allocator, params);
         }
 
+        if (std.mem.eql(u8, action_name, "webSeeds")) {
+            return self.handleTorrentsWebSeeds(allocator, params);
+        }
+
         // Category endpoints
         if (std.mem.eql(u8, action_name, "categories")) {
             return self.handleCategories(allocator);
@@ -717,7 +721,7 @@ pub const ApiHandler = struct {
         var json = std.ArrayList(u8).empty;
         defer json.deinit(allocator);
 
-        json.print(allocator, "{{\"save_path\":\"{f}\",\"download_path\":\"\",\"creation_date\":{},\"piece_size\":{},\"comment\":\"{f}\",\"created_by\":\"{f}\",\"total_size\":{},\"pieces_have\":{},\"pieces_num\":{},\"dl_speed\":{},\"dl_speed_avg\":0,\"up_speed\":{},\"up_speed_avg\":0,\"dl_limit\":{},\"up_limit\":{},\"eta\":{},\"hash\":\"{s}\",\"infohash_v1\":\"{s}\",\"infohash_v2\":\"\",\"name\":\"{f}\",\"ratio\":{d:.4},\"share_ratio\":{d:.4},\"time_elapsed\":{},\"time_active\":{},\"seeding_time\":{},\"nb_connections\":{},\"nb_connections_limit\":500,\"peers\":{},\"peers_total\":0,\"seeds\":0,\"seeds_total\":0,\"last_seen\":-1,\"reannounce\":0,\"addition_date\":{},\"completion_date\":-1,\"total_downloaded\":{},\"total_downloaded_session\":{},\"total_uploaded\":{},\"total_uploaded_session\":{},\"total_wasted\":0,\"is_private\":{s},\"seq_dl\":{s},\"super_seeding\":{}}}", .{
+        json.print(allocator, "{{\"save_path\":\"{f}\",\"download_path\":\"\",\"creation_date\":{},\"piece_size\":{},\"comment\":\"{f}\",\"created_by\":\"{f}\",\"total_size\":{},\"pieces_have\":{},\"pieces_num\":{},\"dl_speed\":{},\"dl_speed_avg\":0,\"up_speed\":{},\"up_speed_avg\":0,\"dl_limit\":{},\"up_limit\":{},\"eta\":{},\"hash\":\"{s}\",\"infohash_v1\":\"{s}\",\"infohash_v2\":\"\",\"name\":\"{f}\",\"ratio\":{d:.4},\"share_ratio\":{d:.4},\"time_elapsed\":{},\"time_active\":{},\"seeding_time\":{},\"nb_connections\":{},\"nb_connections_limit\":500,\"peers\":{},\"peers_total\":0,\"seeds\":0,\"seeds_total\":0,\"last_seen\":-1,\"reannounce\":0,\"addition_date\":{},\"completion_date\":-1,\"total_downloaded\":{},\"total_downloaded_session\":{},\"total_uploaded\":{},\"total_uploaded_session\":{},\"total_wasted\":0,\"is_private\":{s},\"seq_dl\":{s},\"super_seeding\":{},\"web_seeds_count\":{}}}", .{
             esc(info.save_path),
             info.creation_date,
             info.piece_size,
@@ -749,6 +753,7 @@ pub const ApiHandler = struct {
             @as([]const u8, if (info.is_private) "true" else "false"),
             @as([]const u8, if (info.sequential_download) "true" else "false"),
             @as(u8, if (info.super_seeding) 1 else 0),
+            info.web_seeds_count,
         }) catch return .{ .status = 500, .body = "{\"error\":\"internal\"}" };
 
         const result = json.toOwnedSlice(allocator) catch return .{ .status = 500, .body = "{\"error\":\"internal\"}" };
@@ -888,6 +893,32 @@ pub const ApiHandler = struct {
             diag.peers_connected,
             diag.peers_half_open,
         }) catch return .{ .status = 500, .body = "{\"error\":\"internal\"}" };
+        return .{ .body = body, .owned_body = body };
+    }
+
+    fn handleTorrentsWebSeeds(self: *const ApiHandler, allocator: std.mem.Allocator, params: []const u8) server.Response {
+        const hash = extractParam(params, "hash") orelse
+            return .{ .status = 400, .body = "{\"error\":\"missing hash\"}" };
+
+        const urls = self.session_manager.getWebSeedUrls(allocator, hash) catch
+            return .{ .status = 404, .body = "{\"error\":\"torrent not found\"}" };
+        defer {
+            for (urls) |u| allocator.free(u);
+            allocator.free(urls);
+        }
+
+        var json = std.ArrayList(u8).empty;
+        defer json.deinit(allocator);
+
+        const esc = json_mod.jsonSafe;
+        json.appendSlice(allocator, "[") catch return .{ .status = 500, .body = "{\"error\":\"internal\"}" };
+        for (urls, 0..) |url, i| {
+            if (i > 0) json.appendSlice(allocator, ",") catch return .{ .status = 500, .body = "{\"error\":\"internal\"}" };
+            json.print(allocator, "{{\"url\":\"{f}\"}}", .{esc(url)}) catch return .{ .status = 500, .body = "{\"error\":\"internal\"}" };
+        }
+        json.appendSlice(allocator, "]") catch return .{ .status = 500, .body = "{\"error\":\"internal\"}" };
+
+        const body = json.toOwnedSlice(allocator) catch return .{ .status = 500, .body = "{\"error\":\"internal\"}" };
         return .{ .body = body, .owned_body = body };
     }
 

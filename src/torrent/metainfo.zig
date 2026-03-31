@@ -29,6 +29,11 @@ pub const Metainfo = struct {
     private: bool = false,
     files: []File,
 
+    // BEP 19: GetRight-style web seed URLs (url-list key)
+    url_list: []const []const u8 = &.{},
+    // BEP 17: Hoffman-style HTTP seed URLs (httpseeds key)
+    http_seeds: []const []const u8 = &.{},
+
     // v2 fields (BEP 52)
     version: TorrentVersion = .v1,
     info_hash_v2: ?[32]u8 = null, // SHA-256 info-hash (null for pure v1)
@@ -182,10 +187,24 @@ pub fn parse(allocator: std.mem.Allocator, input: []const u8) !Metainfo {
     else
         try allocator.alloc([]const u8, 0);
 
+    // BEP 19: url-list (GetRight-style web seeds)
+    const url_list = if (bencode.dictGet(root_dict, "url-list")) |value|
+        try parseUrlList(allocator, value)
+    else
+        try allocator.alloc([]const u8, 0);
+
+    // BEP 17: httpseeds (Hoffman-style HTTP seeds)
+    const http_seeds = if (bencode.dictGet(root_dict, "httpseeds")) |value|
+        try parseStringList(allocator, value)
+    else
+        try allocator.alloc([]const u8, 0);
+
     return .{
         .info_hash = digest,
         .announce = if (bencode.dictGet(root_dict, "announce")) |value| try expectBytes(value) else null,
         .announce_list = announce_list,
+        .url_list = url_list,
+        .http_seeds = http_seeds,
         .comment = if (bencode.dictGet(root_dict, "comment")) |value| try expectBytes(value) else null,
         .created_by = if (bencode.dictGet(root_dict, "created by")) |value| try expectBytes(value) else null,
         .name = name,
@@ -217,6 +236,8 @@ fn parseAnnounceList(allocator: std.mem.Allocator, value: bencode.Value) ![]cons
 
 pub fn freeMetainfo(allocator: std.mem.Allocator, meta: Metainfo) void {
     if (meta.announce_list.len > 0) allocator.free(meta.announce_list);
+    if (meta.url_list.len > 0) allocator.free(meta.url_list);
+    if (meta.http_seeds.len > 0) allocator.free(meta.http_seeds);
     for (meta.files) |file| {
         allocator.free(file.path);
     }
@@ -224,6 +245,39 @@ pub fn freeMetainfo(allocator: std.mem.Allocator, meta: Metainfo) void {
     if (meta.file_tree_v2) |ft| {
         file_tree.freeV2Files(allocator, ft);
     }
+}
+
+/// Parse BEP 19 url-list: can be a single string or a list of strings.
+fn parseUrlList(allocator: std.mem.Allocator, value: bencode.Value) ![]const []const u8 {
+    switch (value) {
+        .bytes => |url| {
+            const result = try allocator.alloc([]const u8, 1);
+            result[0] = url;
+            return result;
+        },
+        .list => |list| {
+            var urls = std.ArrayList([]const u8).empty;
+            defer urls.deinit(allocator);
+            for (list) |item| {
+                const url = expectBytes(item) catch continue;
+                try urls.append(allocator, url);
+            }
+            return urls.toOwnedSlice(allocator);
+        },
+        else => return try allocator.alloc([]const u8, 0),
+    }
+}
+
+/// Parse a bencode list of strings (used for BEP 17 httpseeds).
+fn parseStringList(allocator: std.mem.Allocator, value: bencode.Value) ![]const []const u8 {
+    const list = expectList(value) catch return try allocator.alloc([]const u8, 0);
+    var urls = std.ArrayList([]const u8).empty;
+    defer urls.deinit(allocator);
+    for (list) |item| {
+        const url = expectBytes(item) catch continue;
+        try urls.append(allocator, url);
+    }
+    return urls.toOwnedSlice(allocator);
 }
 
 fn parseSingleFileList(
@@ -518,4 +572,51 @@ test "parse hybrid torrent" {
     try std.testing.expectEqual(@as(usize, 1), meta.files.len);
     try std.testing.expect(meta.hasV1());
     try std.testing.expect(meta.hasV2());
+}
+
+// ── BEP 19 / BEP 17 web seed tests ───────────────────────
+
+test "parse url-list as string" {
+    const input =
+        "d8:announce14:http://tracker4:infod6:lengthi5e4:name8:test.bin12:piece lengthi16384e6:pieces20:abcdefghijklmnopqrste8:url-list25:http://example.com/dl/filee";
+
+    const meta = try parse(std.testing.allocator, input);
+    defer freeMetainfo(std.testing.allocator, meta);
+
+    try std.testing.expectEqual(@as(usize, 1), meta.url_list.len);
+    try std.testing.expectEqualStrings("http://example.com/dl/file", meta.url_list[0]);
+}
+
+test "parse url-list as list" {
+    const input =
+        "d8:announce14:http://tracker4:infod6:lengthi5e4:name8:test.bin12:piece lengthi16384e6:pieces20:abcdefghijklmnopqrste8:url-listl25:http://example.com/dl/file26:http://mirror.com/dl2/fileeee";
+
+    const meta = try parse(std.testing.allocator, input);
+    defer freeMetainfo(std.testing.allocator, meta);
+
+    try std.testing.expectEqual(@as(usize, 2), meta.url_list.len);
+    try std.testing.expectEqualStrings("http://example.com/dl/file", meta.url_list[0]);
+    try std.testing.expectEqualStrings("http://mirror.com/dl2/filee", meta.url_list[1]);
+}
+
+test "parse httpseeds" {
+    const input =
+        "d8:announce14:http://tracker9:httpseedsl30:http://seed.example.com/seed1e4:infod6:lengthi5e4:name8:test.bin12:piece lengthi16384e6:pieces20:abcdefghijklmnopqrstee";
+
+    const meta = try parse(std.testing.allocator, input);
+    defer freeMetainfo(std.testing.allocator, meta);
+
+    try std.testing.expectEqual(@as(usize, 1), meta.http_seeds.len);
+    try std.testing.expectEqualStrings("http://seed.example.com/seed1", meta.http_seeds[0]);
+}
+
+test "no url-list or httpseeds produces empty slices" {
+    const input =
+        "d8:announce14:http://tracker4:infod6:lengthi5e4:name8:test.bin12:piece lengthi16384e6:pieces20:abcdefghijklmnopqrstee";
+
+    const meta = try parse(std.testing.allocator, input);
+    defer freeMetainfo(std.testing.allocator, meta);
+
+    try std.testing.expectEqual(@as(usize, 0), meta.url_list.len);
+    try std.testing.expectEqual(@as(usize, 0), meta.http_seeds.len);
 }

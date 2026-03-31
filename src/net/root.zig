@@ -11,3 +11,4 @@ pub const ut_metadata = @import("ut_metadata.zig");
 pub const utp = @import("utp.zig");
 pub const ledbat = @import("ledbat.zig");
 pub const utp_manager = @import("utp_manager.zig");
+pub const web_seed = @import("web_seed.zig");

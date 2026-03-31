@@ -997,6 +997,7 @@ pub const SessionManager = struct {
         created_by: []const u8, // owned, caller must free
         creation_date: i64,
         trackers_count: u32,
+        web_seeds_count: u32, // BEP 19 url-list + BEP 17 httpseeds
     };
 
     /// Free a PropertiesInfo returned by getSessionProperties().
@@ -1046,7 +1047,38 @@ pub const SessionManager = struct {
             .created_by = try allocator.dupe(u8, created_by),
             .creation_date = -1, // Not currently stored in metainfo
             .trackers_count = stats.trackers_count,
+            .web_seeds_count = if (meta_opt) |m| @intCast(m.url_list.len + m.http_seeds.len) else 0,
         };
+    }
+
+    /// Return web seed URLs (BEP 19 url-list + BEP 17 httpseeds) for a torrent.
+    /// Caller owns the returned slice and each string within it.
+    pub fn getWebSeedUrls(self: *SessionManager, allocator: std.mem.Allocator, hash: []const u8) ![][]const u8 {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+
+        const session = self.sessions.get(hash) orelse return error.TorrentNotFound;
+        const meta_opt = if (session.session) |*sess| &sess.metainfo else null;
+        const meta = meta_opt orelse return try allocator.alloc([]const u8, 0);
+
+        const total = meta.url_list.len + meta.http_seeds.len;
+        var urls = try allocator.alloc([]const u8, total);
+        errdefer {
+            for (urls) |u| allocator.free(u);
+            allocator.free(urls);
+        }
+
+        var i: usize = 0;
+        for (meta.url_list) |url| {
+            urls[i] = try allocator.dupe(u8, url);
+            i += 1;
+        }
+        for (meta.http_seeds) |url| {
+            urls[i] = try allocator.dupe(u8, url);
+            i += 1;
+        }
+
+        return urls;
     }
 
     /// Set global download speed limit (bytes/sec). 0 = unlimited.

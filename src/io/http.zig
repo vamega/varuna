@@ -34,17 +34,37 @@ pub const HttpClient = struct {
     /// When a DnsResolver is attached, results are cached across requests.
     /// Supports both http:// and https:// URLs.
     pub fn get(self: *HttpClient, url: []const u8) !HttpResponse {
+        return self.getWithHeaders(url, &.{});
+    }
+
+    /// Perform an HTTP GET with additional headers (e.g. Range for BEP 19 web seeds).
+    /// `extra_headers` is a slice of pre-formatted header lines (without trailing \r\n).
+    pub fn getWithHeaders(self: *HttpClient, url: []const u8, extra_headers: []const []const u8) !HttpResponse {
         const parsed = try parseUrl(url);
 
         if (parsed.is_https) {
-            return self.getHttps(parsed);
+            return self.getHttpsWithHeaders(parsed, extra_headers);
         }
 
-        return self.getHttp(parsed);
+        return self.getHttpWithHeaders(parsed, extra_headers);
+    }
+
+    /// Convenience: HTTP GET with a byte Range header (BEP 19 web seeding).
+    /// Returns the response; caller should check status == 206 for partial content.
+    pub fn getRange(self: *HttpClient, url: []const u8, range_start: u64, range_end: u64) !HttpResponse {
+        var range_hdr_buf: [128]u8 = undefined;
+        const range_hdr = std.fmt.bufPrint(&range_hdr_buf, "Range: bytes={}-{}", .{ range_start, range_end }) catch return error.RangeHeaderTooLong;
+        const headers = [_][]const u8{range_hdr};
+        return self.getWithHeaders(url, &headers);
     }
 
     /// Plain HTTP GET over io_uring.
     fn getHttp(self: *HttpClient, parsed: ParsedUrl) !HttpResponse {
+        return self.getHttpWithHeaders(parsed, &.{});
+    }
+
+    /// Plain HTTP GET over io_uring with additional headers.
+    fn getHttpWithHeaders(self: *HttpClient, parsed: ParsedUrl, extra_headers: []const []const u8) !HttpResponse {
         // Resolve DNS -- use shared cache if available, otherwise one-shot
         const address = if (self.dns_resolver) |r|
             try r.resolve(self.allocator, parsed.host, parsed.port)
@@ -68,10 +88,15 @@ pub const HttpClient = struct {
         var request_buf = std.ArrayList(u8).empty;
         defer request_buf.deinit(self.allocator);
 
-        try request_buf.print(self.allocator, "GET {s} HTTP/1.1\r\nHost: {s}\r\nConnection: close\r\n\r\n", .{
+        try request_buf.print(self.allocator, "GET {s} HTTP/1.1\r\nHost: {s}\r\n", .{
             parsed.path,
             parsed.host,
         });
+        for (extra_headers) |hdr| {
+            try request_buf.appendSlice(self.allocator, hdr);
+            try request_buf.appendSlice(self.allocator, "\r\n");
+        }
+        try request_buf.appendSlice(self.allocator, "Connection: close\r\n\r\n");
 
         try self.ring.send_all(fd, request_buf.items);
 
@@ -116,6 +141,11 @@ pub const HttpClient = struct {
     /// HTTPS GET: TLS handshake + HTTP tunneled through BoringSSL BIO pair,
     /// with all network I/O on io_uring.
     fn getHttps(self: *HttpClient, parsed: ParsedUrl) !HttpResponse {
+        return self.getHttpsWithHeaders(parsed, &.{});
+    }
+
+    /// HTTPS GET with additional headers.
+    fn getHttpsWithHeaders(self: *HttpClient, parsed: ParsedUrl, extra_headers: []const []const u8) !HttpResponse {
         if (build_options.tls_backend != .boringssl) {
             return error.HttpsNotSupported;
         }
@@ -150,10 +180,15 @@ pub const HttpClient = struct {
         var request_buf = std.ArrayList(u8).empty;
         defer request_buf.deinit(self.allocator);
 
-        try request_buf.print(self.allocator, "GET {s} HTTP/1.1\r\nHost: {s}\r\nConnection: close\r\n\r\n", .{
+        try request_buf.print(self.allocator, "GET {s} HTTP/1.1\r\nHost: {s}\r\n", .{
             parsed.path,
             parsed.host,
         });
+        for (extra_headers) |hdr| {
+            try request_buf.appendSlice(self.allocator, hdr);
+            try request_buf.appendSlice(self.allocator, "\r\n");
+        }
+        try request_buf.appendSlice(self.allocator, "Connection: close\r\n\r\n");
 
         // Send HTTP request through TLS
         try self.tlsSendAll(fd, &tls_stream, request_buf.items);
@@ -298,14 +333,14 @@ pub const HttpResponse = struct {
 
 // ── URL parsing ───────────────────────────────────────────
 
-const ParsedUrl = struct {
+pub const ParsedUrl = struct {
     host: []const u8,
     port: u16,
     path: []const u8,
     is_https: bool,
 };
 
-fn parseUrl(url: []const u8) !ParsedUrl {
+pub fn parseUrl(url: []const u8) !ParsedUrl {
     var is_https = false;
     var default_port: u16 = 80;
 
@@ -345,7 +380,7 @@ fn parseUrl(url: []const u8) !ParsedUrl {
 
 // ── HTTP response parsing ─────────────────────────────────
 
-fn findBodyStart(data: []const u8) ?usize {
+pub fn findBodyStart(data: []const u8) ?usize {
     const sep = "\r\n\r\n";
     if (std.mem.indexOf(u8, data, sep)) |pos| {
         return pos + sep.len;
@@ -353,7 +388,7 @@ fn findBodyStart(data: []const u8) ?usize {
     return null;
 }
 
-fn parseContentLength(headers: []const u8) ?usize {
+pub fn parseContentLength(headers: []const u8) ?usize {
     var iter = std.mem.splitSequence(u8, headers, "\r\n");
     while (iter.next()) |line| {
         if (std.ascii.startsWithIgnoreCase(line, "content-length:")) {
@@ -364,7 +399,7 @@ fn parseContentLength(headers: []const u8) ?usize {
     return null;
 }
 
-fn parseStatusCode(data: []const u8) ?u16 {
+pub fn parseStatusCode(data: []const u8) ?u16 {
     // "HTTP/1.1 200 OK\r\n"
     if (data.len < 12) return null;
     if (!std.mem.startsWith(u8, data, "HTTP/")) return null;
