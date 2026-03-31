@@ -50,7 +50,7 @@ pub fn run(
 
     if (std.mem.eql(u8, args[1], "seed")) {
         const options = try parseTransferOptions(args[2..], cfg);
-        try runSeed(allocator, options, writer);
+        try runSeed(allocator, options, writer, cfg);
         return;
     }
 
@@ -154,7 +154,10 @@ fn runDownload(
     const torrent_bytes = try std.fs.cwd().readFileAlloc(allocator, options.torrent_path, 16 * 1024 * 1024);
     defer allocator.free(torrent_bytes);
 
-    const peer_id = torrent.peer_id.generate();
+    const peer_id = torrent.peer_id.generate(cfg.network.masquerade_as) catch {
+        std.log.err("unsupported masquerade_as client: \"{s}\"", .{cfg.network.masquerade_as.?});
+        return error.UnsupportedMasquerade;
+    };
     const resume_db_z: ?[*:0]const u8 = if (cfg.storage.resume_db) |path| blk: {
         break :blk (try allocator.dupeZ(u8, path)).ptr;
     } else null;
@@ -187,11 +190,15 @@ fn runSeed(
     allocator: std.mem.Allocator,
     options: TransferOptions,
     writer: *std.Io.Writer,
+    cfg: Config,
 ) !void {
     const torrent_bytes = try std.fs.cwd().readFileAlloc(allocator, options.torrent_path, 16 * 1024 * 1024);
     defer allocator.free(torrent_bytes);
 
-    const peer_id = torrent.peer_id.generate();
+    const peer_id = torrent.peer_id.generate(cfg.network.masquerade_as) catch {
+        std.log.err("unsupported masquerade_as client: \"{s}\"", .{cfg.network.masquerade_as.?});
+        return error.UnsupportedMasquerade;
+    };
     const result = try torrent.client.seed(allocator, torrent_bytes, options.target_root, .{
         .peer_id = peer_id,
         .port = options.port,

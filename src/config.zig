@@ -45,6 +45,11 @@ pub const Config = struct {
         /// enabled  = allow both encryption and plaintext
         /// disabled = no MSE, plaintext only (default)
         encryption: []const u8 = "preferred",
+        /// Masquerade as a different client for peer ID generation.
+        /// Format: "ClientName X.Y.Z" e.g. "qBittorrent 5.1.4", "rTorrent 0.16".
+        /// Supported: qBittorrent, rTorrent, uTorrent, Deluge, Transmission.
+        /// When null (default), uses Varuna's own peer ID prefix (-VR0001-).
+        masquerade_as: ?[]const u8 = null,
     };
 
     pub const Performance = struct {

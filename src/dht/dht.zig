@@ -1,0 +1,735 @@
+const std = @import("std");
+const log = std.log.scoped(.dht);
+const node_id = @import("node_id.zig");
+const NodeId = node_id.NodeId;
+const NodeInfo = node_id.NodeInfo;
+const routing_table = @import("routing_table.zig");
+const RoutingTable = routing_table.RoutingTable;
+const krpc = @import("krpc.zig");
+const token_mod = @import("token.zig");
+const TokenManager = token_mod.TokenManager;
+const lookup_mod = @import("lookup.zig");
+const Lookup = lookup_mod.Lookup;
+const bootstrap_mod = @import("bootstrap.zig");
+
+/// Maximum number of concurrent lookups.
+const max_lookups: usize = 16;
+
+/// Maximum pending outbound queries.
+const max_pending: usize = 256;
+
+/// Query timeout in seconds.
+const query_timeout_secs: i64 = 15;
+
+/// DHT tick interval (seconds). The event loop calls dhtTick at this rate.
+pub const tick_interval_secs: i64 = 5;
+
+/// Announce refresh interval (seconds).
+const announce_refresh_secs: i64 = 30 * 60;
+
+/// Node save interval (seconds).
+const save_interval_secs: i64 = 30 * 60;
+
+/// Pending outbound query (awaiting response).
+const PendingQuery = struct {
+    transaction_id: u16,
+    target_id: NodeId, // node we queried
+    target_addr: std.net.Address,
+    sent_at: i64,
+    lookup_idx: ?usize = null, // index into active_lookups
+    method: krpc.Method,
+};
+
+/// An outbound packet queued for sending via io_uring.
+pub const OutboundPacket = struct {
+    data: [1500]u8 = undefined,
+    len: usize = 0,
+    remote: std.net.Address,
+};
+
+/// DHT engine (BEP 5). Manages the routing table, processes incoming
+/// KRPC messages, drives iterative lookups, and produces outbound packets
+/// for the event loop to send via io_uring SENDMSG.
+pub const DhtEngine = struct {
+    allocator: std.mem.Allocator,
+    own_id: NodeId,
+    table: RoutingTable,
+    tokens: TokenManager,
+    next_txn_id: u16 = 1,
+    pending: [max_pending]?PendingQuery = [_]?PendingQuery{null} ** max_pending,
+    active_lookups: [max_lookups]?Lookup = [_]?Lookup{null} ** max_lookups,
+    /// Outbound packet queue. The event loop drains this via dhtDrainSendQueue.
+    send_queue: std.ArrayList(OutboundPacket),
+    /// Peer results from completed get_peers lookups.
+    /// The event loop picks these up and feeds them into the peer pipeline.
+    peer_results: std.ArrayList(PeerResult),
+    /// Listen port for announce_peer (the daemon's peer listen port).
+    listen_port: u16 = 6881,
+    /// Bootstrapping state.
+    bootstrapped: bool = false,
+    bootstrap_pending: bool = false,
+    /// Timing.
+    last_refresh_check: i64 = 0,
+    last_save_time: i64 = 0,
+    /// Whether DHT is enabled (disabled for private-only sessions).
+    enabled: bool = true,
+
+    pub const PeerResult = struct {
+        info_hash: [20]u8,
+        peers: []std.net.Address,
+    };
+
+    pub fn init(allocator: std.mem.Allocator, own_id: NodeId) DhtEngine {
+        return .{
+            .allocator = allocator,
+            .own_id = own_id,
+            .table = RoutingTable.init(own_id),
+            .tokens = TokenManager.init(),
+            .send_queue = std.ArrayList(OutboundPacket).init(allocator),
+            .peer_results = std.ArrayList(PeerResult).init(allocator),
+        };
+    }
+
+    pub fn deinit(self: *DhtEngine) void {
+        for (self.peer_results.items) |result| {
+            self.allocator.free(result.peers);
+        }
+        self.peer_results.deinit();
+        self.send_queue.deinit();
+    }
+
+    /// Process an incoming UDP datagram that starts with 'd' (KRPC).
+    /// Called from the event loop's UDP recv handler.
+    pub fn handleIncoming(self: *DhtEngine, data: []const u8, sender: std.net.Address) void {
+        if (!self.enabled) return;
+        if (data.len < 2 or data[0] != 'd') return;
+
+        const msg = krpc.parse(data) catch {
+            log.debug("malformed KRPC from {any}", .{sender});
+            return;
+        };
+
+        switch (msg) {
+            .query => |q| self.handleQuery(q, sender),
+            .response => |r| self.handleResponse(r, sender),
+            .@"error" => |e| self.handleError(e, sender),
+        }
+    }
+
+    /// Periodic tick. Called every ~5 seconds from the event loop.
+    pub fn tick(self: *DhtEngine, now: i64) void {
+        if (!self.enabled) return;
+
+        // Rotate token secrets
+        self.tokens.maybeRotate(now);
+
+        // Check for query timeouts
+        self.checkTimeouts(now);
+
+        // Drive active lookups forward
+        self.driveLookups(now);
+
+        // Bootstrap if needed
+        if (!self.bootstrapped and !self.bootstrap_pending) {
+            if (self.table.nodeCount() < routing_table.K) {
+                self.startBootstrap(now);
+            } else {
+                self.bootstrapped = true;
+            }
+        }
+
+        // Bucket refresh
+        if (now - self.last_refresh_check >= tick_interval_secs) {
+            self.last_refresh_check = now;
+            if (self.table.needsRefresh(now)) |bucket_idx| {
+                self.refreshBucket(bucket_idx, now);
+            }
+        }
+    }
+
+    /// Start a get_peers lookup for a torrent info-hash.
+    /// Discovered peers will appear in peer_results.
+    pub fn getPeers(self: *DhtEngine, info_hash: [20]u8) !void {
+        if (!self.enabled) return error.DhtDisabled;
+
+        // Find a free lookup slot
+        const idx = for (0..max_lookups) |i| {
+            if (self.active_lookups[i] == null) break i;
+        } else return error.TooManyLookups;
+
+        var lk = Lookup.init(info_hash, .get_peers);
+        lk.seed(&self.table);
+
+        if (lk.candidate_count == 0) return error.NoNodes;
+
+        self.active_lookups[idx] = lk;
+        self.sendLookupQueries(idx);
+    }
+
+    /// Announce to the DHT that we have a torrent on the given port.
+    /// Performs a get_peers lookup first to collect tokens, then
+    /// sends announce_peer to the K closest nodes.
+    pub fn announcePeer(self: *DhtEngine, info_hash: [20]u8, port: u16) !void {
+        if (!self.enabled) return error.DhtDisabled;
+
+        // For now, just start a get_peers lookup. When it completes,
+        // we'll send announce_peer messages using the collected tokens.
+        // This is handled in completeLookup().
+        self.listen_port = port;
+        try self.getPeers(info_hash);
+    }
+
+    /// Drain the outbound send queue. Returns packets for the event loop to send.
+    pub fn drainSendQueue(self: *DhtEngine) []OutboundPacket {
+        const items = self.send_queue.items;
+        if (items.len == 0) return &.{};
+        // Move items out
+        const result = self.allocator.alloc(OutboundPacket, items.len) catch return &.{};
+        @memcpy(result, items);
+        self.send_queue.clearRetainingCapacity();
+        return result;
+    }
+
+    /// Drain peer results. Returns discovered peers for the event loop.
+    pub fn drainPeerResults(self: *DhtEngine) []PeerResult {
+        const items = self.peer_results.items;
+        if (items.len == 0) return &.{};
+        const result = self.allocator.alloc(PeerResult, items.len) catch return &.{};
+        @memcpy(result, items);
+        self.peer_results.clearRetainingCapacity();
+        return result;
+    }
+
+    /// Number of nodes in the routing table.
+    pub fn nodeCount(self: *const DhtEngine) usize {
+        return self.table.nodeCount();
+    }
+
+    // ── Query handling ──────────────────────────────────
+
+    fn handleQuery(self: *DhtEngine, q: krpc.Query, sender: std.net.Address) void {
+        const now = std.time.timestamp();
+
+        // Add the querying node to our routing table
+        _ = self.table.addNode(.{
+            .id = q.sender_id,
+            .address = sender,
+            .ever_responded = false, // they queried us, not responded
+        }, now);
+
+        switch (q.method) {
+            .ping => self.respondPing(q.transaction_id, sender),
+            .find_node => self.respondFindNode(q, sender),
+            .get_peers => self.respondGetPeers(q, sender),
+            .announce_peer => self.respondAnnouncePeer(q, sender),
+        }
+    }
+
+    fn respondPing(self: *DhtEngine, txn_id: []const u8, sender: std.net.Address) void {
+        var buf: [512]u8 = undefined;
+        const len = krpc.encodePingResponse(&buf, txn_id, self.own_id) catch return;
+        self.queueSend(buf[0..len], sender);
+    }
+
+    fn respondFindNode(self: *DhtEngine, q: krpc.Query, sender: std.net.Address) void {
+        const target = q.target orelse return;
+
+        var closest_buf: [routing_table.K]NodeInfo = undefined;
+        const count = self.table.findClosest(target, routing_table.K, &closest_buf);
+
+        // Encode compact nodes
+        var nodes_buf: [routing_table.K * 26]u8 = undefined;
+        for (0..count) |i| {
+            const compact = node_id.encodeCompactNode(closest_buf[i]);
+            @memcpy(nodes_buf[i * 26 ..][0..26], &compact);
+        }
+
+        var buf: [1024]u8 = undefined;
+        const len = krpc.encodeFindNodeResponse(
+            &buf,
+            q.transaction_id,
+            self.own_id,
+            nodes_buf[0 .. count * 26],
+        ) catch return;
+        self.queueSend(buf[0..len], sender);
+    }
+
+    fn respondGetPeers(self: *DhtEngine, q: krpc.Query, sender: std.net.Address) void {
+        const info_hash = q.target orelse return;
+
+        // Generate token for this querier
+        const ip_bytes = addressToBytes(sender);
+        const token = self.tokens.generateToken(&ip_bytes);
+
+        // We don't store peer lists ourselves (we're not a tracker).
+        // Return closest nodes instead.
+        var closest_buf: [routing_table.K]NodeInfo = undefined;
+        const count = self.table.findClosest(info_hash, routing_table.K, &closest_buf);
+
+        var nodes_buf: [routing_table.K * 26]u8 = undefined;
+        for (0..count) |i| {
+            const compact = node_id.encodeCompactNode(closest_buf[i]);
+            @memcpy(nodes_buf[i * 26 ..][0..26], &compact);
+        }
+
+        var buf: [1024]u8 = undefined;
+        const len = krpc.encodeGetPeersResponseNodes(
+            &buf,
+            q.transaction_id,
+            self.own_id,
+            &token,
+            nodes_buf[0 .. count * 26],
+        ) catch return;
+        self.queueSend(buf[0..len], sender);
+    }
+
+    fn respondAnnouncePeer(self: *DhtEngine, q: krpc.Query, sender: std.net.Address) void {
+        // Validate token
+        const token = q.token orelse {
+            self.sendError(q.transaction_id, @intFromEnum(krpc.ErrorCode.protocol), "missing token", sender);
+            return;
+        };
+
+        const ip_bytes = addressToBytes(sender);
+        if (!self.tokens.validateToken(token, &ip_bytes)) {
+            self.sendError(q.transaction_id, @intFromEnum(krpc.ErrorCode.protocol), "invalid token", sender);
+            return;
+        }
+
+        // Accept the announce (we just respond with our ID).
+        // In a full implementation, we'd store the peer info.
+        var buf: [512]u8 = undefined;
+        const len = krpc.encodePingResponse(&buf, q.transaction_id, self.own_id) catch return;
+        self.queueSend(buf[0..len], sender);
+
+        log.debug("accepted announce_peer from {any}", .{sender});
+    }
+
+    fn sendError(self: *DhtEngine, txn_id: []const u8, code: u32, message: []const u8, sender: std.net.Address) void {
+        var buf: [512]u8 = undefined;
+        const len = krpc.encodeError(&buf, txn_id, code, message) catch return;
+        self.queueSend(buf[0..len], sender);
+    }
+
+    // ── Response handling ───────────────────────────────
+
+    fn handleResponse(self: *DhtEngine, r: krpc.Response, sender: std.net.Address) void {
+        const now = std.time.timestamp();
+
+        // Find and remove the pending query
+        const pending = self.findAndRemovePending(r.transaction_id) orelse {
+            log.debug("response for unknown txn from {any}", .{sender});
+            return;
+        };
+
+        // Mark node as good in routing table
+        self.table.markResponded(r.sender_id, now);
+
+        // Add/update the responding node
+        _ = self.table.addNode(.{
+            .id = r.sender_id,
+            .address = sender,
+            .ever_responded = true,
+        }, now);
+
+        // If this was part of a bootstrap, check if we're done
+        if (self.bootstrap_pending and self.table.nodeCount() >= routing_table.K) {
+            self.bootstrapped = true;
+            self.bootstrap_pending = false;
+            log.info("DHT bootstrap complete: {d} nodes", .{self.table.nodeCount()});
+        }
+
+        // If this was part of a lookup, feed the response
+        if (pending.lookup_idx) |idx| {
+            if (self.active_lookups[idx]) |*lk| {
+                // Decode compact nodes
+                var new_nodes_buf: [routing_table.K]NodeInfo = undefined;
+                var new_node_count: usize = 0;
+                if (r.nodes) |nodes_data| {
+                    if (nodes_data.len % 26 == 0) {
+                        const count = nodes_data.len / 26;
+                        for (0..@min(count, routing_table.K)) |i| {
+                            new_nodes_buf[new_node_count] = node_id.decodeCompactNode(
+                                nodes_data[i * 26 ..][0..26],
+                            );
+                            new_node_count += 1;
+                        }
+                    }
+                }
+
+                // Add discovered nodes to routing table too
+                for (new_nodes_buf[0..new_node_count]) |info| {
+                    _ = self.table.addNode(info, now);
+                }
+
+                lk.handleResponse(
+                    r.sender_id,
+                    if (new_node_count > 0) new_nodes_buf[0..new_node_count] else null,
+                    null, // TODO: parse values for get_peers
+                    r.token,
+                );
+            }
+        }
+    }
+
+    fn handleError(self: *DhtEngine, e: krpc.Error, sender: std.net.Address) void {
+        _ = self;
+        log.debug("KRPC error from {any}: [{d}] {s}", .{ sender, e.code, e.message });
+    }
+
+    // ── Lookup driving ──────────────────────────────────
+
+    fn driveLookups(self: *DhtEngine, now: i64) void {
+        for (0..max_lookups) |i| {
+            if (self.active_lookups[i]) |*lk| {
+                if (lk.isDone()) {
+                    self.completeLookup(i, now);
+                    continue;
+                }
+                self.sendLookupQueries(i);
+            }
+        }
+    }
+
+    fn sendLookupQueries(self: *DhtEngine, lookup_idx: usize) void {
+        const lk = &(self.active_lookups[lookup_idx] orelse return);
+        var buf: [lookup_mod.alpha]NodeInfo = undefined;
+        const count = lk.nextToQuery(&buf);
+
+        for (0..count) |i| {
+            const info = buf[i];
+            const txn_id = self.allocTxnId();
+
+            // Send query
+            var pkt_buf: [1024]u8 = undefined;
+            const len = switch (lk.kind) {
+                .find_node => krpc.encodeFindNodeQuery(&pkt_buf, txn_id, self.own_id, lk.target) catch continue,
+                .get_peers => krpc.encodeGetPeersQuery(&pkt_buf, txn_id, self.own_id, lk.target) catch continue,
+            };
+
+            self.queueSend(pkt_buf[0..len], info.address);
+            self.addPending(.{
+                .transaction_id = txn_id,
+                .target_id = info.id,
+                .target_addr = info.address,
+                .sent_at = std.time.timestamp(),
+                .lookup_idx = lookup_idx,
+                .method = if (lk.kind == .find_node) .find_node else .get_peers,
+            });
+        }
+    }
+
+    fn completeLookup(self: *DhtEngine, idx: usize, now: i64) void {
+        const lk = self.active_lookups[idx] orelse return;
+
+        if (lk.kind == .get_peers) {
+            const peers = lk.getPeers();
+            if (peers.len > 0) {
+                // Copy peers and emit result
+                const peers_copy = self.allocator.alloc(std.net.Address, peers.len) catch {
+                    self.active_lookups[idx] = null;
+                    return;
+                };
+                @memcpy(peers_copy, peers);
+                self.peer_results.append(self.allocator, .{
+                    .info_hash = lk.target,
+                    .peers = peers_copy,
+                }) catch {
+                    self.allocator.free(peers_copy);
+                };
+            }
+
+            // Send announce_peer to the closest responded nodes
+            var closest: [lookup_mod.K]NodeInfo = undefined;
+            const closest_count = lk.getClosestResponded(&closest);
+            for (0..closest_count) |i| {
+                const tok = lk.getToken(closest[i].id) orelse continue;
+                var buf: [1024]u8 = undefined;
+                const len = krpc.encodeAnnouncePeerQuery(
+                    &buf,
+                    self.allocTxnId(),
+                    self.own_id,
+                    lk.target,
+                    self.listen_port,
+                    tok,
+                    true, // implied_port
+                ) catch continue;
+                self.queueSend(buf[0..len], closest[i].address);
+            }
+
+            log.info("get_peers for {x}: {d} peers, {d} nodes queried", .{
+                lk.target[0..4].*,
+                peers.len,
+                lk.candidate_count,
+            });
+        }
+
+        _ = now;
+        self.active_lookups[idx] = null;
+    }
+
+    // ── Bootstrap ───────────────────────────────────────
+
+    fn startBootstrap(self: *DhtEngine, now: i64) void {
+        self.bootstrap_pending = true;
+        _ = now;
+
+        // Send find_node for our own ID to bootstrap nodes.
+        // The actual DNS resolution of bootstrap hostnames should be done
+        // before the event loop starts. Here we just ping any nodes we have.
+        // If the routing table is empty, the event loop integration code
+        // should have seeded us with resolved bootstrap addresses.
+
+        // Do a find_node lookup for our own ID to populate nearby buckets
+        const idx = for (0..max_lookups) |i| {
+            if (self.active_lookups[i] == null) break i;
+        } else return;
+
+        var lk = Lookup.init(self.own_id, .find_node);
+        lk.seed(&self.table);
+
+        if (lk.candidate_count > 0) {
+            self.active_lookups[idx] = lk;
+            self.sendLookupQueries(idx);
+        }
+    }
+
+    /// Add bootstrap nodes to the routing table. Called by the event loop
+    /// after resolving bootstrap hostnames (blocking DNS on startup is OK).
+    pub fn addBootstrapNodes(self: *DhtEngine, addrs: []const std.net.Address) void {
+        const now = std.time.timestamp();
+        for (addrs) |addr| {
+            // Send a ping to each bootstrap node
+            const txn_id = self.allocTxnId();
+            var buf: [512]u8 = undefined;
+            const len = krpc.encodePingQuery(&buf, txn_id, self.own_id) catch continue;
+            self.queueSend(buf[0..len], addr);
+            self.addPending(.{
+                .transaction_id = txn_id,
+                .target_id = [_]u8{0} ** 20, // unknown ID
+                .target_addr = addr,
+                .sent_at = now,
+                .lookup_idx = null,
+                .method = .ping,
+            });
+        }
+    }
+
+    // ── Bucket refresh ──────────────────────────────────
+
+    fn refreshBucket(self: *DhtEngine, bucket_idx: u8, now: i64) void {
+        _ = now;
+        // Generate a random ID in the bucket range and do a find_node
+        const target = node_id.randomIdInBucket(self.own_id, bucket_idx);
+
+        const idx = for (0..max_lookups) |i| {
+            if (self.active_lookups[i] == null) break i;
+        } else return;
+
+        var lk = Lookup.init(target, .find_node);
+        lk.seed(&self.table);
+
+        if (lk.candidate_count > 0) {
+            self.active_lookups[idx] = lk;
+            self.sendLookupQueries(idx);
+        }
+    }
+
+    // ── Timeout handling ────────────────────────────────
+
+    fn checkTimeouts(self: *DhtEngine, now: i64) void {
+        for (&self.pending) |*slot| {
+            if (slot.*) |pending| {
+                if (now - pending.sent_at >= query_timeout_secs) {
+                    // Mark as failed in routing table
+                    self.table.markFailed(pending.target_id);
+
+                    // Notify lookup if applicable
+                    if (pending.lookup_idx) |idx| {
+                        if (self.active_lookups[idx]) |*lk| {
+                            lk.markFailed(pending.target_id);
+                        }
+                    }
+
+                    slot.* = null;
+                }
+            }
+        }
+    }
+
+    // ── Internal helpers ────────────────────────────────
+
+    fn queueSend(self: *DhtEngine, data: []const u8, remote: std.net.Address) void {
+        var pkt = OutboundPacket{ .remote = remote };
+        const len = @min(data.len, pkt.data.len);
+        @memcpy(pkt.data[0..len], data[0..len]);
+        pkt.len = len;
+        self.send_queue.append(self.allocator, pkt) catch {
+            log.warn("DHT send queue full, dropping packet", .{});
+        };
+    }
+
+    fn allocTxnId(self: *DhtEngine) u16 {
+        const id = self.next_txn_id;
+        self.next_txn_id +%= 1;
+        if (self.next_txn_id == 0) self.next_txn_id = 1;
+        return id;
+    }
+
+    fn addPending(self: *DhtEngine, query: PendingQuery) void {
+        for (&self.pending) |*slot| {
+            if (slot.* == null) {
+                slot.* = query;
+                return;
+            }
+        }
+        // No free slot -- drop the oldest
+        log.warn("DHT pending query table full", .{});
+    }
+
+    fn findAndRemovePending(self: *DhtEngine, txn_id_bytes: []const u8) ?PendingQuery {
+        if (txn_id_bytes.len != 2) return null;
+        const txn_id = std.mem.readInt(u16, txn_id_bytes[0..2], .big);
+
+        for (&self.pending) |*slot| {
+            if (slot.*) |pending| {
+                if (pending.transaction_id == txn_id) {
+                    const result = pending;
+                    slot.* = null;
+                    return result;
+                }
+            }
+        }
+        return null;
+    }
+};
+
+fn addressToBytes(addr: std.net.Address) [4]u8 {
+    return @bitCast(addr.in.sa.addr);
+}
+
+// ── Tests ──────────────────────────────────────────────
+
+test "DhtEngine init and deinit" {
+    const allocator = std.testing.allocator;
+    const own_id = node_id.generate();
+    var engine = DhtEngine.init(allocator, own_id);
+    defer engine.deinit();
+
+    try std.testing.expectEqual(own_id, engine.own_id);
+    try std.testing.expectEqual(@as(usize, 0), engine.nodeCount());
+}
+
+test "DhtEngine handles ping query" {
+    const allocator = std.testing.allocator;
+    const own_id = node_id.generate();
+    var engine = DhtEngine.init(allocator, own_id);
+    defer engine.deinit();
+
+    // Build a ping query
+    var query_buf: [512]u8 = undefined;
+    var sender_id: NodeId = undefined;
+    @memset(&sender_id, 0x42);
+    const len = try krpc.encodePingQuery(&query_buf, 0x1234, sender_id);
+
+    const sender_addr = std.net.Address.initIp4(.{ 10, 0, 0, 1 }, 6881);
+
+    engine.handleIncoming(query_buf[0..len], sender_addr);
+
+    // Should have queued a response
+    try std.testing.expectEqual(@as(usize, 1), engine.send_queue.items.len);
+
+    // Node should be in routing table
+    try std.testing.expectEqual(@as(usize, 1), engine.nodeCount());
+}
+
+test "DhtEngine handles find_node query" {
+    const allocator = std.testing.allocator;
+    const own_id = node_id.generate();
+    var engine = DhtEngine.init(allocator, own_id);
+    defer engine.deinit();
+
+    // Add some nodes to the table first
+    const now: i64 = 1000000;
+    for (0..5) |i| {
+        _ = engine.table.addNode(.{
+            .id = node_id.generate(),
+            .address = std.net.Address.initIp4(.{ 10, 0, 0, @intCast(i + 1) }, 6881),
+        }, now);
+    }
+
+    var query_buf: [512]u8 = undefined;
+    var sender_id: NodeId = undefined;
+    @memset(&sender_id, 0x42);
+    const target = node_id.generate();
+    const len = try krpc.encodeFindNodeQuery(&query_buf, 0x1234, sender_id, target);
+
+    const sender_addr = std.net.Address.initIp4(.{ 10, 0, 0, 99 }, 6881);
+
+    engine.handleIncoming(query_buf[0..len], sender_addr);
+
+    // Should have queued a response with nodes
+    try std.testing.expectEqual(@as(usize, 1), engine.send_queue.items.len);
+}
+
+test "DhtEngine disabled ignores messages" {
+    const allocator = std.testing.allocator;
+    var engine = DhtEngine.init(allocator, node_id.generate());
+    defer engine.deinit();
+    engine.enabled = false;
+
+    var query_buf: [512]u8 = undefined;
+    var sender_id: NodeId = undefined;
+    @memset(&sender_id, 0x42);
+    const len = try krpc.encodePingQuery(&query_buf, 0x1234, sender_id);
+
+    engine.handleIncoming(query_buf[0..len], std.net.Address.initIp4(.{ 10, 0, 0, 1 }, 6881));
+
+    try std.testing.expectEqual(@as(usize, 0), engine.send_queue.items.len);
+}
+
+test "DhtEngine tick rotates tokens" {
+    const allocator = std.testing.allocator;
+    var engine = DhtEngine.init(allocator, node_id.generate());
+    defer engine.deinit();
+
+    const ip = [_]u8{ 10, 0, 0, 1 };
+    const token_before = engine.tokens.generateToken(&ip);
+
+    // Tick past rotation interval
+    const now = std.time.timestamp() + TokenManager.rotation_interval_secs + 1;
+    engine.tick(now);
+
+    // Token should still validate (within rotation window)
+    try std.testing.expect(engine.tokens.validateToken(&token_before, &ip));
+}
+
+test "DhtEngine get_peers starts lookup" {
+    const allocator = std.testing.allocator;
+    var engine = DhtEngine.init(allocator, node_id.generate());
+    defer engine.deinit();
+
+    // Add nodes so lookup has candidates
+    const now: i64 = 1000000;
+    for (0..10) |i| {
+        _ = engine.table.addNode(.{
+            .id = node_id.generate(),
+            .address = std.net.Address.initIp4(.{ 10, 0, 0, @intCast(i + 1) }, 6881),
+        }, now);
+    }
+
+    var info_hash: [20]u8 = undefined;
+    @memset(&info_hash, 0xAA);
+    try engine.getPeers(info_hash);
+
+    // Should have an active lookup and queued some packets
+    var has_lookup = false;
+    for (engine.active_lookups) |lk| {
+        if (lk != null) {
+            has_lookup = true;
+            break;
+        }
+    }
+    try std.testing.expect(has_lookup);
+    try std.testing.expect(engine.send_queue.items.len > 0);
+}

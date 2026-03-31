@@ -119,14 +119,23 @@ pub fn handleUtpRecv(self: *EventLoop, cqe: linux.io_uring_cqe) void {
         return;
     }
 
-    const mgr = self.utp_manager orelse return;
     const datagram_len: usize = @intCast(cqe.res);
-    if (datagram_len < utp_mod.Header.size) return; // too short for a uTP header
+    if (datagram_len == 0) return;
 
     const data = self.utp_recv_buf[0..datagram_len];
 
     // Reconstruct the remote address from the msghdr
     const remote = std.net.Address{ .any = self.utp_recv_addr };
+
+    // Demux DHT vs uTP: bencode dicts start with 'd' (0x64), uTP starts with version nibble 0x01
+    if (data[0] == 'd') {
+        const dht_handler = @import("dht_handler.zig");
+        dht_handler.handleDhtRecv(self, data, remote);
+        return;
+    }
+
+    const mgr = self.utp_manager orelse return;
+    if (datagram_len < utp_mod.Header.size) return; // too short for a uTP header
 
     // Get microsecond timestamp for uTP
     const now_us = utpNowUs();
