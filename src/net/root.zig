@@ -1,4 +1,5 @@
 pub const extensions = @import("extensions.zig");
+pub const metadata_fetch = @import("metadata_fetch.zig");
 pub const peer_wire = @import("peer_wire.zig");
 pub const pex = @import("pex.zig");
 pub const socket = @import("socket.zig");

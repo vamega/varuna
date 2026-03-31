@@ -12,6 +12,7 @@ const signal = @import("../io/signal.zig");
 const peer_id_mod = @import("../torrent/peer_id.zig");
 const magnet_mod = @import("../torrent/magnet.zig");
 const ut_metadata = @import("../net/ut_metadata.zig");
+const metadata_fetch = @import("../net/metadata_fetch.zig");
 const ResumeWriter = storage.resume_state.ResumeWriter;
 const DnsResolver = @import("../io/dns.zig").DnsResolver;
 
@@ -63,6 +64,18 @@ pub const Stats = struct {
     category: []const u8 = "",
     /// Comma-separated tags assigned to this torrent (empty string if none).
     tags: []const u8 = "",
+
+    // ── Metadata fetch progress (BEP 9 magnet links) ────
+    /// Total metadata size in bytes (0 if not yet known).
+    metadata_size: u32 = 0,
+    /// Number of metadata pieces received so far.
+    metadata_pieces_received: u32 = 0,
+    /// Total number of metadata pieces needed.
+    metadata_pieces_total: u32 = 0,
+    /// Number of peers attempted for metadata download.
+    metadata_peers_attempted: u32 = 0,
+    /// Number of peers that support ut_metadata.
+    metadata_peers_with_metadata: u32 = 0,
 };
 
 pub const TorrentSession = struct {
@@ -158,6 +171,8 @@ pub const TorrentSession = struct {
     is_magnet: bool = false,
     magnet_trackers: ?[]const []const u8 = null,
     metadata_assembler: ?ut_metadata.MetadataAssembler = null,
+    /// Latest metadata fetch progress snapshot (updated during fetch).
+    metadata_fetch_progress: ?metadata_fetch.FetchProgress = null,
 
     pub fn createFromMagnet(
         allocator: std.mem.Allocator,
@@ -558,6 +573,11 @@ pub const TorrentSession = struct {
             .scrape_downloaded = if (self.scrape_result) |sr| sr.downloaded else 0,
             .category = self.category orelse "",
             .tags = self.getTagsString(),
+            .metadata_size = if (self.metadata_fetch_progress) |p| p.metadata_size else 0,
+            .metadata_pieces_received = if (self.metadata_fetch_progress) |p| p.pieces_received else 0,
+            .metadata_pieces_total = if (self.metadata_fetch_progress) |p| p.pieces_total else 0,
+            .metadata_peers_attempted = if (self.metadata_fetch_progress) |p| p.peers_attempted else 0,
+            .metadata_peers_with_metadata = if (self.metadata_fetch_progress) |p| p.peers_with_metadata else 0,
         };
     }
 
@@ -1044,9 +1064,8 @@ pub const TorrentSession = struct {
 
     /// Fetch metadata from peers for a magnet link.
     /// This runs on the background thread before the normal download path.
-    /// It announces to trackers (using only the info-hash), connects to
-    /// peers, performs BEP 10 + BEP 9 handshakes, and downloads the info
-    /// dictionary piece by piece.
+    /// Uses the resilient MetadataFetcher which handles multi-peer retry,
+    /// per-peer timeouts, and progress reporting.
     fn fetchMetadata(self: *TorrentSession) !void {
         const log = std.log.scoped(.metadata_fetch);
 
@@ -1061,10 +1080,18 @@ pub const TorrentSession = struct {
             return error.NoTrackers;
         };
 
-        // Announce to tracker to get peers (left=1 since we don't know total size)
-        var peers_list = std.ArrayList(std.net.Address).empty;
-        defer peers_list.deinit(self.allocator);
+        // Initialize the multi-peer metadata fetcher
+        var fetcher = metadata_fetch.MetadataFetcher.init(
+            self.allocator,
+            self.info_hash,
+            self.peer_id,
+            self.port,
+            self.is_private,
+        );
+        defer fetcher.deinit();
 
+        // Announce to all trackers to collect peers
+        self.metadata_fetch_progress = .{ .state = .announcing };
         for (tracker_urls) |url| {
             const resp = tracker.announce.fetchAuto(self.allocator, &ring, .{
                 .announce_url = url,
@@ -1080,44 +1107,19 @@ pub const TorrentSession = struct {
             defer tracker.announce.freeResponse(self.allocator, resp);
 
             for (resp.peers) |peer| {
-                peers_list.append(self.allocator, peer.address) catch {};
+                fetcher.addPeer(peer.address);
             }
-            if (peers_list.items.len > 0) break;
         }
 
-        if (peers_list.items.len == 0) {
-            self.error_message = std.fmt.allocPrint(self.allocator, "no peers found for metadata download", .{}) catch null;
-            return error.NoPeers;
-        }
-
-        // Initialize metadata assembler
-        var assembler = ut_metadata.MetadataAssembler.init(self.allocator, self.info_hash);
-        errdefer assembler.deinit();
-
-        const ext = @import("../net/extensions.zig");
-
-        // Try peers until we get the full metadata
-        for (peers_list.items) |addr| {
-            self.fetchMetadataFromPeer(&ring, &assembler, addr, ext, log) catch |err| {
-                log.debug("metadata fetch from peer failed: {s}", .{@errorName(err)});
-                if (assembler.isComplete()) break;
-                continue;
-            };
-            if (assembler.isComplete()) break;
-        }
-
-        if (!assembler.isComplete()) {
-            assembler.deinit();
-            self.error_message = std.fmt.allocPrint(self.allocator, "failed to download metadata from any peer", .{}) catch null;
+        // Run the fetcher (handles multi-peer retry, timeouts, progress)
+        const info_bytes = fetcher.fetch() catch |err| {
+            self.metadata_fetch_progress = fetcher.getProgress();
+            self.error_message = std.fmt.allocPrint(self.allocator, "metadata fetch failed: {s}", .{@errorName(err)}) catch null;
             return error.MetadataFetchFailed;
-        }
-
-        // Verify and build the .torrent bytes (wrap the info dict in a torrent envelope)
-        const info_bytes = assembler.verify() catch |err| {
-            assembler.deinit();
-            self.error_message = std.fmt.allocPrint(self.allocator, "metadata hash mismatch: {s}", .{@errorName(err)}) catch null;
-            return error.InfoHashMismatch;
         };
+
+        // Update progress snapshot
+        self.metadata_fetch_progress = fetcher.getProgress();
 
         // Build a minimal .torrent file: d8:announce<url>4:info<raw info dict>e
         const torrent_bytes = try self.buildTorrentBytes(info_bytes);
@@ -1125,7 +1127,6 @@ pub const TorrentSession = struct {
 
         // Update metadata now that we know the actual info
         const meta = @import("../torrent/metainfo.zig").parse(self.allocator, torrent_bytes) catch |err| {
-            assembler.deinit();
             self.error_message = std.fmt.allocPrint(self.allocator, "metadata parse failed: {s}", .{@errorName(err)}) catch null;
             return err;
         };
@@ -1143,182 +1144,7 @@ pub const TorrentSession = struct {
             }
         }
 
-        assembler.deinit();
         log.info("metadata downloaded successfully: {s} ({d} bytes)", .{ self.name, self.total_size });
-    }
-
-    /// Try to fetch metadata from a single peer using BEP 9.
-    fn fetchMetadataFromPeer(
-        self: *TorrentSession,
-        ring: *Ring,
-        assembler: *ut_metadata.MetadataAssembler,
-        addr: std.net.Address,
-        ext: anytype,
-        log: anytype,
-    ) !void {
-        // Connect via io_uring
-        const fd = try posix.socket(
-            addr.any.family,
-            posix.SOCK.STREAM | posix.SOCK.CLOEXEC,
-            posix.IPPROTO.TCP,
-        );
-        errdefer posix.close(fd);
-
-        // Connect with timeout (5 seconds)
-        ring.connect(fd, &addr.any, addr.getOsSockLen()) catch {
-            return error.ConnectFailed;
-        };
-
-        // Send BitTorrent handshake
-        var handshake: [68]u8 = undefined;
-        handshake[0] = 19;
-        @memcpy(handshake[1..20], "BitTorrent protocol");
-        @memset(handshake[20..28], 0);
-        ext.setExtensionBit(handshake[20..28]);
-        @memcpy(handshake[28..48], &self.info_hash);
-        @memcpy(handshake[48..68], &self.peer_id);
-
-        try ring.send_all(fd, &handshake);
-
-        // Receive peer's handshake
-        var peer_handshake: [68]u8 = undefined;
-        try ring.recv_exact(fd, &peer_handshake);
-
-        // Verify protocol
-        if (peer_handshake[0] != 19 or !std.mem.eql(u8, peer_handshake[1..20], "BitTorrent protocol")) {
-            return error.InvalidHandshake;
-        }
-
-        // Check BEP 10 support
-        if (!ext.supportsExtensions(peer_handshake[20..28].*)) {
-            return error.NoBEP10Support;
-        }
-
-        // Send our extension handshake
-        const ext_payload = try ext.encodeExtensionHandshake(self.allocator, self.port, false);
-        defer self.allocator.free(ext_payload);
-
-        const ext_frame = try ext.serializeExtensionMessage(self.allocator, ext.handshake_sub_id, ext_payload);
-        defer self.allocator.free(ext_frame);
-
-        try ring.send_all(fd, ext_frame);
-
-        // Read messages until we get the extension handshake
-        var peer_ut_metadata_id: u8 = 0;
-        var metadata_size: u32 = 0;
-
-        // Read messages looking for extension handshake
-        var msg_count: u32 = 0;
-        while (msg_count < 20) : (msg_count += 1) {
-            var len_buf: [4]u8 = undefined;
-            ring.recv_exact(fd, &len_buf) catch return error.RecvFailed;
-            const msg_len = std.mem.readInt(u32, &len_buf, .big);
-
-            if (msg_len == 0) continue; // keepalive
-
-            if (msg_len > 1024 * 1024) return error.MessageTooLarge;
-
-            const msg_buf = self.allocator.alloc(u8, msg_len) catch return error.OutOfMemory;
-            defer self.allocator.free(msg_buf);
-
-            ring.recv_exact(fd, msg_buf) catch return error.RecvFailed;
-
-            const msg_id = msg_buf[0];
-            if (msg_id == ext.msg_id and msg_buf.len >= 2) {
-                const sub_id = msg_buf[1];
-                const ext_data = msg_buf[2..];
-
-                if (sub_id == ext.handshake_sub_id) {
-                    // Parse extension handshake
-                    var result = ext.decodeExtensionHandshake(self.allocator, ext_data) catch continue;
-                    defer ext.freeDecoded(self.allocator, &result);
-
-                    peer_ut_metadata_id = result.handshake.extensions.ut_metadata;
-                    metadata_size = result.handshake.metadata_size;
-
-                    log.debug("peer ext handshake: ut_metadata={d} metadata_size={d}", .{
-                        peer_ut_metadata_id, metadata_size,
-                    });
-                    break;
-                }
-            }
-        }
-
-        if (peer_ut_metadata_id == 0) return error.PeerDoesNotSupportUtMetadata;
-        if (metadata_size == 0) return error.PeerDidNotReportMetadataSize;
-
-        // Set metadata size on assembler
-        assembler.setSize(metadata_size) catch return error.InvalidMetadataSize;
-
-        // Request metadata pieces one at a time
-        while (assembler.nextNeeded()) |piece_idx| {
-            // Send request
-            const req_payload = try ut_metadata.encodeRequest(self.allocator, piece_idx);
-            defer self.allocator.free(req_payload);
-
-            const req_frame = try ext.serializeExtensionMessage(self.allocator, peer_ut_metadata_id, req_payload);
-            defer self.allocator.free(req_frame);
-
-            try ring.send_all(fd, req_frame);
-
-            // Read response
-            var got_response = false;
-            var response_attempts: u32 = 0;
-            while (!got_response and response_attempts < 50) : (response_attempts += 1) {
-                var len_buf: [4]u8 = undefined;
-                ring.recv_exact(fd, &len_buf) catch return error.RecvFailed;
-                const msg_len = std.mem.readInt(u32, &len_buf, .big);
-
-                if (msg_len == 0) continue;
-                if (msg_len > 1024 * 1024) return error.MessageTooLarge;
-
-                const msg_buf = self.allocator.alloc(u8, msg_len) catch return error.OutOfMemory;
-                defer self.allocator.free(msg_buf);
-
-                ring.recv_exact(fd, msg_buf) catch return error.RecvFailed;
-
-                const msg_id = msg_buf[0];
-                if (msg_id != ext.msg_id or msg_buf.len < 2) continue;
-
-                const sub_id = msg_buf[1];
-                // Check if this is our ut_metadata response (use our local ID since
-                // the peer sends to our advertised ID)
-                if (sub_id != ext.local_ut_metadata_id) continue;
-
-                const ext_data = msg_buf[2..];
-
-                // Decode the ut_metadata message
-                const meta_msg = ut_metadata.decode(self.allocator, ext_data) catch continue;
-
-                switch (meta_msg.msg_type) {
-                    .data => {
-                        if (meta_msg.piece != piece_idx) continue;
-                        const piece_data = ext_data[meta_msg.data_offset..];
-                        _ = assembler.addPiece(piece_idx, piece_data) catch |err| {
-                            log.debug("failed to add metadata piece {d}: {s}", .{ piece_idx, @errorName(err) });
-                            return err;
-                        };
-                        got_response = true;
-                    },
-                    .reject => {
-                        log.debug("peer rejected metadata piece {d}", .{piece_idx});
-                        return error.PeerRejectedMetadata;
-                    },
-                    .request => {
-                        // Peer is requesting from us -- we don't have metadata yet, send reject
-                        const reject = ut_metadata.encodeReject(self.allocator, meta_msg.piece) catch continue;
-                        defer self.allocator.free(reject);
-                        const reject_frame = ext.serializeExtensionMessage(self.allocator, peer_ut_metadata_id, reject) catch continue;
-                        defer self.allocator.free(reject_frame);
-                        ring.send_all(fd, reject_frame) catch {};
-                    },
-                }
-            }
-
-            if (!got_response) return error.MetadataPieceTimeout;
-        }
-
-        posix.close(fd);
     }
 
     /// Build a minimal .torrent file wrapping the raw info dictionary.
