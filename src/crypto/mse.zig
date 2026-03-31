@@ -829,6 +829,697 @@ pub fn peerCryptoFromResult(result: *HandshakeResult) PeerCrypto {
     };
 }
 
+// ── Async MSE Handshake State Machine ─────────────────────
+//
+// The blocking handshakeInitiator/handshakeResponder functions work for
+// tools (varuna-ctl, varuna-tools) but the daemon event loop needs a
+// non-blocking version that integrates with the io_uring CQE dispatch.
+//
+// The async state machine tracks per-peer handshake progress. Each CQE
+// (send completion or recv completion) advances the state. The event loop
+// calls `feedSend` after a send CQE and `feedRecv` after a recv CQE.
+// The state machine returns an `Action` telling the caller what io_uring
+// operation to submit next, or `.complete` / `.failed` when done.
+
+/// What the event loop should do after a state transition.
+pub const MseAction = union(enum) {
+    /// Submit a send of the given buffer slice. The buffer is owned by
+    /// the MseHandshake and must not be freed by the caller.
+    send: []const u8,
+    /// Submit a recv into the given buffer slice.
+    recv: []u8,
+    /// MSE handshake completed successfully. The caller should extract
+    /// the PeerCrypto and (for responder) the matched info-hash.
+    complete,
+    /// MSE handshake failed. The caller should disconnect or fall back.
+    failed: MseError,
+};
+
+pub const MseError = enum {
+    invalid_shared_secret,
+    vc_not_found,
+    req1_not_found,
+    unknown_info_hash,
+    invalid_vc,
+    crypto_method_rejected,
+    invalid_crypto_select,
+    padding_too_large,
+    no_crypto_method_available,
+    connection_closed,
+    internal,
+};
+
+/// Initiator (outbound) async MSE handshake phases.
+pub const InitiatorPhase = enum {
+    send_dh_key, // send Ya + PadA
+    recv_dh_key, // recv Yb (96 bytes)
+    send_crypto_req, // send HASH(req1,S) || HASH(req2,SKEY)^HASH(req3,S) || encrypted(VC + crypto_provide + PadC + len(IA))
+    recv_vc_scan, // recv bytes scanning for decrypted VC (8 zero bytes)
+    recv_crypto_select, // recv crypto_select(4) + len(PadD)(2)
+    recv_pad_d, // recv PadD
+    done,
+};
+
+/// Responder (inbound) async MSE handshake phases.
+pub const ResponderPhase = enum {
+    recv_dh_key, // recv Ya (96 bytes)
+    send_dh_key, // send Yb + PadB
+    recv_req1_scan, // recv bytes scanning for HASH(req1, S)
+    recv_req2, // recv remaining HASH(req2,SKEY)^HASH(req3,S) bytes
+    recv_enc_header, // recv encrypted VC(8) + crypto_provide(4) + len(PadC)(2)
+    recv_pad_c_ia_len, // recv PadC + len(IA)(2)
+    recv_ia, // recv IA bytes
+    send_crypto_resp, // send encrypted VC + crypto_select + PadD
+    done,
+};
+
+/// Maximum size for the combined send buffer used during MSE handshake.
+/// DH key (96) + max padding (512) + hash msg (40) + encrypted portion
+/// (8+4+2+512+2 = 528) = ~1176. Round up for safety.
+const mse_send_buf_size = 1280;
+
+/// Maximum size for the recv/scan buffer.
+/// Max padding (512) + hash (40) + encrypted header (14) + padding + IA.
+const mse_recv_buf_size = 1088;
+
+/// Async MSE handshake state for initiator (outbound connections).
+pub const MseInitiatorHandshake = struct {
+    phase: InitiatorPhase = .send_dh_key,
+    private_key: [dh_key_size]u8 = undefined,
+    public_key: [dh_key_size]u8 = undefined,
+    shared_secret: [dh_key_size]u8 = undefined,
+    info_hash: [20]u8,
+    mode: EncryptionMode,
+
+    // Ciphers (initialized after DH exchange)
+    enc_cipher: ?Rc4 = null,
+    dec_cipher: ?Rc4 = null,
+
+    // Send buffer (holds outgoing data across phases)
+    send_buf: [mse_send_buf_size]u8 = undefined,
+    send_len: usize = 0,
+
+    // Recv state
+    peer_public_key: [dh_key_size]u8 = undefined,
+    recv_offset: usize = 0,
+
+    // VC scan state
+    vc_match_count: usize = 0,
+    scan_bytes: usize = 0,
+    scan_byte_buf: [1]u8 = undefined,
+
+    // crypto_select recv
+    cs_buf: [6]u8 = undefined,
+    cs_offset: usize = 0,
+
+    // PadD
+    pad_d_len: u16 = 0,
+    pad_d_offset: usize = 0,
+    pad_d_buf: [max_pad_len]u8 = undefined,
+
+    // Result
+    crypto_method: u32 = 0,
+    crypto_provide_val: u32 = 0,
+
+    /// Initialize and prepare the first send (DH public key + PadA).
+    pub fn init(info_hash: [20]u8, mode: EncryptionMode) MseInitiatorHandshake {
+        var self = MseInitiatorHandshake{
+            .info_hash = info_hash,
+            .mode = mode,
+        };
+
+        // Generate DH keypair
+        self.private_key = generatePrivateKey();
+        self.public_key = computePublicKey(self.private_key);
+
+        // Prepare send: Ya + PadA
+        var pad_a_len_bytes: [2]u8 = undefined;
+        std.crypto.random.bytes(&pad_a_len_bytes);
+        const pad_a_len: u16 = std.mem.readInt(u16, &pad_a_len_bytes, .big) % (max_pad_len + 1);
+
+        @memcpy(self.send_buf[0..dh_key_size], &self.public_key);
+        if (pad_a_len > 0) {
+            std.crypto.random.bytes(self.send_buf[dh_key_size .. dh_key_size + pad_a_len]);
+        }
+        self.send_len = dh_key_size + pad_a_len;
+
+        return self;
+    }
+
+    /// Get the initial action (always a send of the DH key).
+    pub fn start(self: *MseInitiatorHandshake) MseAction {
+        return .{ .send = self.send_buf[0..self.send_len] };
+    }
+
+    /// Called when a send completes. Returns the next action.
+    pub fn feedSend(self: *MseInitiatorHandshake) MseAction {
+        switch (self.phase) {
+            .send_dh_key => {
+                // DH key sent, now recv peer's DH key
+                self.phase = .recv_dh_key;
+                self.recv_offset = 0;
+                return .{ .recv = self.peer_public_key[0..] };
+            },
+            .send_crypto_req => {
+                // Crypto request sent, now scan for VC in response
+                self.phase = .recv_vc_scan;
+                self.vc_match_count = 0;
+                self.scan_bytes = 0;
+                return .{ .recv = self.scan_byte_buf[0..1] };
+            },
+            else => return .{ .failed = .internal },
+        }
+    }
+
+    /// Called when a recv completes with `n` bytes. Returns the next action.
+    pub fn feedRecv(self: *MseInitiatorHandshake, n: usize) MseAction {
+        if (n == 0) return .{ .failed = .connection_closed };
+
+        switch (self.phase) {
+            .recv_dh_key => {
+                self.recv_offset += n;
+                if (self.recv_offset < dh_key_size) {
+                    return .{ .recv = self.peer_public_key[self.recv_offset..] };
+                }
+                // DH key received -- derive shared secret and build crypto request
+                self.shared_secret = computeSharedSecret(self.private_key, self.peer_public_key);
+                const s_val = U768.fromBytes(self.shared_secret);
+                if (s_val.isZero()) return .{ .failed = .invalid_shared_secret };
+
+                // Set up RC4 ciphers
+                const skey = self.info_hash;
+                const key_a = deriveKeyA(self.shared_secret, skey);
+                const key_b = deriveKeyB(self.shared_secret, skey);
+                self.enc_cipher = Rc4.initDiscardBep6(&key_a);
+                self.dec_cipher = Rc4.initDiscardBep6(&key_b);
+
+                // Build send: HASH(req1,S) || HASH(req2,SKEY)^HASH(req3,S) || encrypted(VC + crypto_provide + PadC + len(IA))
+                const req1 = hashReq1(self.shared_secret);
+                const req2 = hashReq2(skey);
+                const req3 = hashReq3(self.shared_secret);
+                var req2_xor_req3: [20]u8 = undefined;
+                for (0..20) |i| {
+                    req2_xor_req3[i] = req2[i] ^ req3[i];
+                }
+
+                @memcpy(self.send_buf[0..20], &req1);
+                @memcpy(self.send_buf[20..40], &req2_xor_req3);
+
+                // Encrypted portion: VC(8) + crypto_provide(4) + len(PadC)(2) + PadC + len(IA)(2)
+                self.crypto_provide_val = cryptoProvideFromMode(self.mode);
+                var pad_c_len_bytes: [2]u8 = undefined;
+                std.crypto.random.bytes(&pad_c_len_bytes);
+                const pad_c_len: u16 = std.mem.readInt(u16, &pad_c_len_bytes, .big) % (max_pad_len + 1);
+
+                const enc_start: usize = 40;
+                const enc_len = 8 + 4 + 2 + pad_c_len + 2;
+                var enc_buf = self.send_buf[enc_start .. enc_start + enc_len];
+                @memcpy(enc_buf[0..8], &vc_bytes);
+                std.mem.writeInt(u32, enc_buf[8..12], self.crypto_provide_val, .big);
+                std.mem.writeInt(u16, enc_buf[12..14], pad_c_len, .big);
+                if (pad_c_len > 0) {
+                    std.crypto.random.bytes(enc_buf[14 .. 14 + pad_c_len]);
+                }
+                std.mem.writeInt(u16, enc_buf[14 + pad_c_len ..][0..2], 0, .big); // len(IA) = 0
+
+                // Encrypt in-place
+                if (self.enc_cipher) |*enc| {
+                    enc.process(enc_buf, enc_buf);
+                }
+
+                self.send_len = enc_start + enc_len;
+                self.phase = .send_crypto_req;
+                return .{ .send = self.send_buf[0..self.send_len] };
+            },
+            .recv_vc_scan => {
+                // Decrypt the received byte
+                if (self.dec_cipher) |*dec| {
+                    dec.process(&self.scan_byte_buf, &self.scan_byte_buf);
+                }
+
+                if (self.scan_byte_buf[0] == vc_bytes[self.vc_match_count]) {
+                    self.vc_match_count += 1;
+                    if (self.vc_match_count == 8) {
+                        // VC found! Now recv crypto_select + len(PadD)
+                        self.phase = .recv_crypto_select;
+                        self.cs_offset = 0;
+                        return .{ .recv = self.cs_buf[0..6] };
+                    }
+                } else {
+                    self.vc_match_count = 0;
+                    if (self.scan_byte_buf[0] == vc_bytes[0]) {
+                        self.vc_match_count = 1;
+                    }
+                }
+
+                self.scan_bytes += 1;
+                if (self.scan_bytes >= max_pad_len + 8) {
+                    return .{ .failed = .vc_not_found };
+                }
+                return .{ .recv = self.scan_byte_buf[0..1] };
+            },
+            .recv_crypto_select => {
+                self.cs_offset += n;
+                if (self.cs_offset < 6) {
+                    return .{ .recv = self.cs_buf[self.cs_offset..6] };
+                }
+                // Decrypt
+                if (self.dec_cipher) |*dec| {
+                    dec.process(&self.cs_buf, &self.cs_buf);
+                }
+
+                const crypto_select = std.mem.readInt(u32, self.cs_buf[0..4], .big);
+                self.pad_d_len = std.mem.readInt(u16, self.cs_buf[4..6], .big);
+
+                // Validate
+                if (crypto_select & self.crypto_provide_val == 0) return .{ .failed = .crypto_method_rejected };
+                if (crypto_select != crypto_plaintext and crypto_select != crypto_rc4) return .{ .failed = .invalid_crypto_select };
+                if (self.pad_d_len > max_pad_len) return .{ .failed = .padding_too_large };
+
+                self.crypto_method = crypto_select;
+
+                if (self.pad_d_len > 0) {
+                    self.phase = .recv_pad_d;
+                    self.pad_d_offset = 0;
+                    return .{ .recv = self.pad_d_buf[0..self.pad_d_len] };
+                }
+
+                // No padding -- done
+                self.phase = .done;
+                return .complete;
+            },
+            .recv_pad_d => {
+                self.pad_d_offset += n;
+                if (self.pad_d_offset < self.pad_d_len) {
+                    return .{ .recv = self.pad_d_buf[self.pad_d_offset..self.pad_d_len] };
+                }
+                // Decrypt PadD (consume cipher state even though we discard)
+                if (self.dec_cipher) |*dec| {
+                    dec.process(self.pad_d_buf[0..self.pad_d_len], self.pad_d_buf[0..self.pad_d_len]);
+                }
+                self.phase = .done;
+                return .complete;
+            },
+            else => return .{ .failed = .internal },
+        }
+    }
+
+    /// Extract the resulting PeerCrypto after a successful handshake.
+    pub fn result(self: *MseInitiatorHandshake) PeerCrypto {
+        if (self.crypto_method == crypto_plaintext) {
+            return PeerCrypto.plaintext;
+        }
+        return .{
+            .encrypt = self.enc_cipher,
+            .decrypt = self.dec_cipher,
+            .method = crypto_rc4,
+        };
+    }
+};
+
+/// Async MSE handshake state for responder (inbound connections).
+pub const MseResponderHandshake = struct {
+    phase: ResponderPhase = .recv_dh_key,
+    private_key: [dh_key_size]u8 = undefined,
+    public_key: [dh_key_size]u8 = undefined,
+    shared_secret: [dh_key_size]u8 = undefined,
+    mode: EncryptionMode,
+
+    // Known info-hashes we accept (borrowed slice, must outlive handshake)
+    known_hashes: []const [20]u8,
+    matched_hash: ?[20]u8 = null,
+
+    // Ciphers
+    enc_cipher: ?Rc4 = null,
+    dec_cipher: ?Rc4 = null,
+
+    // DH recv
+    peer_public_key: [dh_key_size]u8 = undefined,
+    recv_offset: usize = 0,
+
+    // Send buffer
+    send_buf: [mse_send_buf_size]u8 = undefined,
+    send_len: usize = 0,
+
+    // req1 scan state
+    expected_req1: [20]u8 = undefined,
+    expected_req3: [20]u8 = undefined,
+    scan_buf: [max_pad_len + 40]u8 = undefined,
+    scan_len: usize = 0,
+    scan_recv_buf: [64]u8 = undefined, // temp recv chunk
+    req1_found: bool = false,
+    req1_end: usize = 0,
+
+    // req2 xor req3
+    req2_xor_req3: [20]u8 = undefined,
+    req2_offset: usize = 0,
+
+    // Encrypted header recv
+    enc_header: [14]u8 = undefined,
+    enc_header_offset: usize = 0,
+
+    // PadC + len(IA)
+    pad_c_len: u16 = 0,
+    remaining_buf: [max_pad_len + 2]u8 = undefined,
+    remaining_len: usize = 0,
+    remaining_offset: usize = 0,
+
+    // IA
+    ia_len: u16 = 0,
+    ia_buf: [512]u8 = undefined, // max IA we expect
+    ia_offset: usize = 0,
+
+    // Result
+    crypto_method: u32 = 0,
+
+    /// Initialize and return the first action (recv DH key).
+    pub fn init(known_hashes: []const [20]u8, mode: EncryptionMode) MseResponderHandshake {
+        var self = MseResponderHandshake{
+            .mode = mode,
+            .known_hashes = known_hashes,
+        };
+
+        // Generate DH keypair
+        self.private_key = generatePrivateKey();
+        self.public_key = computePublicKey(self.private_key);
+
+        return self;
+    }
+
+    /// Get the initial action (recv peer's DH key).
+    pub fn start(self: *MseResponderHandshake) MseAction {
+        self.recv_offset = 0;
+        return .{ .recv = self.peer_public_key[0..] };
+    }
+
+    /// Called when a send completes.
+    pub fn feedSend(self: *MseResponderHandshake) MseAction {
+        switch (self.phase) {
+            .send_dh_key => {
+                // DH key sent, now scan for req1
+                self.phase = .recv_req1_scan;
+                self.scan_len = 0;
+                self.req1_found = false;
+                const chunk = @min(self.scan_recv_buf.len, max_pad_len + 40);
+                return .{ .recv = self.scan_recv_buf[0..chunk] };
+            },
+            .send_crypto_resp => {
+                self.phase = .done;
+                return .complete;
+            },
+            else => return .{ .failed = .internal },
+        }
+    }
+
+    /// Called when a recv completes with `n` bytes.
+    pub fn feedRecv(self: *MseResponderHandshake, n: usize) MseAction {
+        if (n == 0) return .{ .failed = .connection_closed };
+
+        switch (self.phase) {
+            .recv_dh_key => {
+                self.recv_offset += n;
+                if (self.recv_offset < dh_key_size) {
+                    return .{ .recv = self.peer_public_key[self.recv_offset..] };
+                }
+                // DH key received -- compute shared secret
+                self.shared_secret = computeSharedSecret(self.private_key, self.peer_public_key);
+                const s_val = U768.fromBytes(self.shared_secret);
+                if (s_val.isZero()) return .{ .failed = .invalid_shared_secret };
+
+                self.expected_req1 = hashReq1(self.shared_secret);
+                self.expected_req3 = hashReq3(self.shared_secret);
+
+                // Prepare send: Yb + PadB
+                var pad_b_len_bytes: [2]u8 = undefined;
+                std.crypto.random.bytes(&pad_b_len_bytes);
+                const pad_b_len: u16 = std.mem.readInt(u16, &pad_b_len_bytes, .big) % (max_pad_len + 1);
+
+                @memcpy(self.send_buf[0..dh_key_size], &self.public_key);
+                if (pad_b_len > 0) {
+                    std.crypto.random.bytes(self.send_buf[dh_key_size .. dh_key_size + pad_b_len]);
+                }
+                self.send_len = dh_key_size + pad_b_len;
+                self.phase = .send_dh_key;
+                return .{ .send = self.send_buf[0..self.send_len] };
+            },
+            .recv_req1_scan => {
+                // Copy received chunk into scan buffer
+                const copy_len = @min(n, self.scan_buf.len - self.scan_len);
+                @memcpy(self.scan_buf[self.scan_len .. self.scan_len + copy_len], self.scan_recv_buf[0..copy_len]);
+                self.scan_len += copy_len;
+
+                // Search for req1 hash in accumulated data
+                if (self.scan_len >= 20) {
+                    var check_start: usize = 0;
+                    if (self.scan_len > max_pad_len + 20) check_start = self.scan_len - max_pad_len - 20;
+                    while (check_start + 20 <= self.scan_len) : (check_start += 1) {
+                        if (std.mem.eql(u8, self.scan_buf[check_start .. check_start + 20], &self.expected_req1)) {
+                            self.req1_found = true;
+                            self.req1_end = check_start + 20;
+                            break;
+                        }
+                    }
+                }
+
+                if (self.req1_found) {
+                    // Now get req2_xor_req3 (20 bytes after req1)
+                    const already_have = self.scan_len - self.req1_end;
+                    if (already_have >= 20) {
+                        @memcpy(&self.req2_xor_req3, self.scan_buf[self.req1_end .. self.req1_end + 20]);
+                        return self.processReq2();
+                    }
+                    // Need more bytes for req2
+                    if (already_have > 0) {
+                        @memcpy(self.req2_xor_req3[0..already_have], self.scan_buf[self.req1_end..self.scan_len]);
+                    }
+                    self.req2_offset = already_have;
+                    self.phase = .recv_req2;
+                    return .{ .recv = self.req2_xor_req3[self.req2_offset..20] };
+                }
+
+                if (self.scan_len >= max_pad_len + 40) {
+                    return .{ .failed = .req1_not_found };
+                }
+                // Read more
+                const remaining = (max_pad_len + 40) - self.scan_len;
+                const chunk = @min(self.scan_recv_buf.len, remaining);
+                return .{ .recv = self.scan_recv_buf[0..chunk] };
+            },
+            .recv_req2 => {
+                self.req2_offset += n;
+                if (self.req2_offset < 20) {
+                    return .{ .recv = self.req2_xor_req3[self.req2_offset..20] };
+                }
+                return self.processReq2();
+            },
+            .recv_enc_header => {
+                self.enc_header_offset += n;
+                if (self.enc_header_offset < 14) {
+                    return .{ .recv = self.enc_header[self.enc_header_offset..14] };
+                }
+                // Decrypt
+                if (self.dec_cipher) |*dec| {
+                    dec.process(&self.enc_header, &self.enc_header);
+                }
+                // Verify VC
+                if (!std.mem.eql(u8, self.enc_header[0..8], &vc_bytes)) return .{ .failed = .invalid_vc };
+
+                const crypto_provide_val = std.mem.readInt(u32, self.enc_header[8..12], .big);
+                self.pad_c_len = std.mem.readInt(u16, self.enc_header[12..14], .big);
+
+                if (self.pad_c_len > max_pad_len) return .{ .failed = .padding_too_large };
+
+                // Select crypto method
+                const crypto_select = selectCryptoMethod(crypto_provide_val, self.mode) orelse
+                    return .{ .failed = .no_crypto_method_available };
+                self.crypto_method = crypto_select;
+
+                // Recv PadC + len(IA)
+                self.remaining_len = self.pad_c_len + 2;
+                self.remaining_offset = 0;
+                if (self.remaining_len > 0) {
+                    self.phase = .recv_pad_c_ia_len;
+                    return .{ .recv = self.remaining_buf[0..self.remaining_len] };
+                }
+                // No PadC, len(IA) = 0 (shouldn't happen, always 2 bytes)
+                return self.buildAndSendResponse();
+            },
+            .recv_pad_c_ia_len => {
+                self.remaining_offset += n;
+                if (self.remaining_offset < self.remaining_len) {
+                    return .{ .recv = self.remaining_buf[self.remaining_offset..self.remaining_len] };
+                }
+                // Decrypt PadC + len(IA)
+                if (self.dec_cipher) |*dec| {
+                    dec.process(self.remaining_buf[0..self.remaining_len], self.remaining_buf[0..self.remaining_len]);
+                }
+                self.ia_len = std.mem.readInt(u16, self.remaining_buf[self.pad_c_len..][0..2], .big);
+
+                if (self.ia_len > 0) {
+                    self.phase = .recv_ia;
+                    self.ia_offset = 0;
+                    const recv_len = @min(@as(usize, self.ia_len), self.ia_buf.len);
+                    return .{ .recv = self.ia_buf[0..recv_len] };
+                }
+                return self.buildAndSendResponse();
+            },
+            .recv_ia => {
+                self.ia_offset += n;
+                if (self.ia_offset < self.ia_len) {
+                    const recv_len = @min(@as(usize, self.ia_len) - self.ia_offset, self.ia_buf.len - self.ia_offset);
+                    return .{ .recv = self.ia_buf[self.ia_offset .. self.ia_offset + recv_len] };
+                }
+                // Decrypt IA
+                if (self.dec_cipher) |*dec| {
+                    dec.process(self.ia_buf[0..self.ia_len], self.ia_buf[0..self.ia_len]);
+                }
+                return self.buildAndSendResponse();
+            },
+            else => return .{ .failed = .internal },
+        }
+    }
+
+    /// Process req2_xor_req3 to identify the SKEY (info-hash).
+    fn processReq2(self: *MseResponderHandshake) MseAction {
+        // Recover HASH('req2', SKEY) = req2_xor_req3 ^ HASH('req3', S)
+        var target_req2: [20]u8 = undefined;
+        for (0..20) |i| {
+            target_req2[i] = self.req2_xor_req3[i] ^ self.expected_req3[i];
+        }
+
+        // Match against known hashes
+        self.matched_hash = null;
+        for (self.known_hashes) |hash| {
+            const candidate = hashReq2(hash);
+            if (std.mem.eql(u8, &candidate, &target_req2)) {
+                self.matched_hash = hash;
+                break;
+            }
+        }
+
+        const skey = self.matched_hash orelse return .{ .failed = .unknown_info_hash };
+
+        // Set up RC4 ciphers
+        const key_a = deriveKeyA(self.shared_secret, skey);
+        const key_b = deriveKeyB(self.shared_secret, skey);
+        self.dec_cipher = Rc4.initDiscardBep6(&key_a); // decrypt initiator's data
+        self.enc_cipher = Rc4.initDiscardBep6(&key_b); // encrypt our data
+
+        // Now recv encrypted header (VC + crypto_provide + len(PadC))
+        // Check if we have leftover data from the scan buffer
+        const enc_start = self.req1_end + 20;
+        if (enc_start < self.scan_len) {
+            // We have leftover bytes from the scan -- use them for enc_header
+            const leftover = self.scan_len - enc_start;
+            if (leftover >= 14) {
+                @memcpy(&self.enc_header, self.scan_buf[enc_start .. enc_start + 14]);
+                self.enc_header_offset = 14;
+                // Process enc_header immediately
+                if (self.dec_cipher) |*dec| {
+                    dec.process(&self.enc_header, &self.enc_header);
+                }
+                if (!std.mem.eql(u8, self.enc_header[0..8], &vc_bytes)) return .{ .failed = .invalid_vc };
+
+                const crypto_provide_val = std.mem.readInt(u32, self.enc_header[8..12], .big);
+                self.pad_c_len = std.mem.readInt(u16, self.enc_header[12..14], .big);
+                if (self.pad_c_len > max_pad_len) return .{ .failed = .padding_too_large };
+
+                const crypto_select = selectCryptoMethod(crypto_provide_val, self.mode) orelse
+                    return .{ .failed = .no_crypto_method_available };
+                self.crypto_method = crypto_select;
+
+                // Handle further leftover for PadC + len(IA)
+                const after_header = enc_start + 14;
+                const leftover2 = if (after_header < self.scan_len) self.scan_len - after_header else 0;
+                self.remaining_len = self.pad_c_len + 2;
+                self.remaining_offset = 0;
+
+                if (leftover2 >= self.remaining_len) {
+                    @memcpy(self.remaining_buf[0..self.remaining_len], self.scan_buf[after_header .. after_header + self.remaining_len]);
+                    self.remaining_offset = self.remaining_len;
+                    if (self.dec_cipher) |*dec| {
+                        dec.process(self.remaining_buf[0..self.remaining_len], self.remaining_buf[0..self.remaining_len]);
+                    }
+                    self.ia_len = std.mem.readInt(u16, self.remaining_buf[self.pad_c_len..][0..2], .big);
+                    if (self.ia_len > 0) {
+                        self.phase = .recv_ia;
+                        self.ia_offset = 0;
+                        return .{ .recv = self.ia_buf[0..@min(@as(usize, self.ia_len), self.ia_buf.len)] };
+                    }
+                    return self.buildAndSendResponse();
+                } else if (leftover2 > 0) {
+                    @memcpy(self.remaining_buf[0..leftover2], self.scan_buf[after_header..self.scan_len]);
+                    self.remaining_offset = leftover2;
+                }
+
+                self.phase = .recv_pad_c_ia_len;
+                return .{ .recv = self.remaining_buf[self.remaining_offset..self.remaining_len] };
+            } else {
+                // Partial enc_header from leftover
+                @memcpy(self.enc_header[0..leftover], self.scan_buf[enc_start..self.scan_len]);
+                self.enc_header_offset = leftover;
+            }
+        } else {
+            self.enc_header_offset = 0;
+        }
+
+        self.phase = .recv_enc_header;
+        return .{ .recv = self.enc_header[self.enc_header_offset..14] };
+    }
+
+    /// Build the crypto response and send it.
+    fn buildAndSendResponse(self: *MseResponderHandshake) MseAction {
+        // Build: encrypted(VC + crypto_select + len(PadD) + PadD)
+        var pad_d_len_bytes: [2]u8 = undefined;
+        std.crypto.random.bytes(&pad_d_len_bytes);
+        const pad_d_len: u16 = std.mem.readInt(u16, &pad_d_len_bytes, .big) % (max_pad_len + 1);
+
+        const resp_len = 8 + 4 + 2 + pad_d_len;
+        @memcpy(self.send_buf[0..8], &vc_bytes);
+        std.mem.writeInt(u32, self.send_buf[8..12], self.crypto_method, .big);
+        std.mem.writeInt(u16, self.send_buf[12..14], pad_d_len, .big);
+        if (pad_d_len > 0) {
+            std.crypto.random.bytes(self.send_buf[14 .. 14 + pad_d_len]);
+        }
+
+        // Encrypt
+        if (self.enc_cipher) |*enc| {
+            enc.process(self.send_buf[0..resp_len], self.send_buf[0..resp_len]);
+        }
+
+        self.send_len = resp_len;
+        self.phase = .send_crypto_resp;
+        return .{ .send = self.send_buf[0..resp_len] };
+    }
+
+    /// Extract the resulting PeerCrypto after a successful handshake.
+    pub fn result(self: *MseResponderHandshake) PeerCrypto {
+        if (self.crypto_method == crypto_plaintext) {
+            return PeerCrypto.plaintext;
+        }
+        return .{
+            .encrypt = self.enc_cipher,
+            .decrypt = self.dec_cipher,
+            .method = crypto_rc4,
+        };
+    }
+
+    /// Get the matched info-hash (valid only after successful handshake).
+    pub fn matchedInfoHash(self: *const MseResponderHandshake) ?[20]u8 {
+        return self.matched_hash;
+    }
+};
+
+/// Detect whether incoming bytes look like an MSE handshake.
+/// MSE starts with a 96-byte DH public key which looks like random data.
+/// A standard BT handshake starts with 0x13 'BitTorrent protocol'.
+/// Returns true if the first byte does NOT look like a BT protocol byte.
+pub fn looksLikeMse(first_bytes: []const u8) bool {
+    if (first_bytes.len == 0) return false;
+    // BT protocol handshake: first byte is 19 (0x13) = protocol string length
+    return first_bytes[0] != 19;
+}
+
 // ── Tests ──────────────────────────────────────────────────
 
 test "U768 from/to bytes roundtrip" {
@@ -1218,4 +1909,260 @@ test "threaded MSE handshake with plaintext fallback" {
     }
 
     responder_thread.join();
+}
+
+// ── Async MSE state machine tests ───────────────────────
+
+test "MseInitiatorHandshake init produces send action" {
+    const info_hash = [_]u8{0x42} ** 20;
+    var hs = MseInitiatorHandshake.init(info_hash, .preferred);
+    const action = hs.start();
+    switch (action) {
+        .send => |data| {
+            // Must start with 96-byte DH public key
+            try std.testing.expect(data.len >= dh_key_size);
+            try std.testing.expect(data.len <= dh_key_size + max_pad_len);
+        },
+        else => return error.ExpectedSend,
+    }
+}
+
+test "MseInitiatorHandshake send_dh_key transitions to recv_dh_key" {
+    const info_hash = [_]u8{0x42} ** 20;
+    var hs = MseInitiatorHandshake.init(info_hash, .preferred);
+    _ = hs.start();
+
+    // After DH key send completes, should recv peer's DH key
+    const action = hs.feedSend();
+    switch (action) {
+        .recv => |buf| {
+            try std.testing.expectEqual(@as(usize, dh_key_size), buf.len);
+        },
+        else => return error.ExpectedRecv,
+    }
+    try std.testing.expectEqual(InitiatorPhase.recv_dh_key, hs.phase);
+}
+
+test "MseInitiatorHandshake recv_dh_key partial recv continues" {
+    const info_hash = [_]u8{0x42} ** 20;
+    var hs = MseInitiatorHandshake.init(info_hash, .preferred);
+    _ = hs.start();
+    _ = hs.feedSend(); // -> recv_dh_key
+
+    // Simulate partial recv (only 32 bytes of 96)
+    const action = hs.feedRecv(32);
+    switch (action) {
+        .recv => |buf| {
+            // Should request the remaining 64 bytes
+            try std.testing.expectEqual(@as(usize, dh_key_size - 32), buf.len);
+        },
+        else => return error.ExpectedRecv,
+    }
+    try std.testing.expectEqual(InitiatorPhase.recv_dh_key, hs.phase);
+}
+
+test "MseInitiatorHandshake recv_dh_key complete transitions to send_crypto_req" {
+    const info_hash = [_]u8{0x42} ** 20;
+    var hs = MseInitiatorHandshake.init(info_hash, .preferred);
+    _ = hs.start();
+    _ = hs.feedSend(); // -> recv_dh_key
+
+    // Generate a valid peer public key
+    const peer_priv = generatePrivateKey();
+    const peer_pub = computePublicKey(peer_priv);
+    hs.peer_public_key = peer_pub;
+
+    // Full recv of DH key
+    const action = hs.feedRecv(dh_key_size);
+    switch (action) {
+        .send => |data| {
+            // Should send hash(req1) + hash(req2)^hash(req3) + encrypted portion
+            try std.testing.expect(data.len >= 40); // at least the two hashes
+        },
+        else => return error.ExpectedSend,
+    }
+    try std.testing.expectEqual(InitiatorPhase.send_crypto_req, hs.phase);
+    try std.testing.expect(hs.enc_cipher != null);
+    try std.testing.expect(hs.dec_cipher != null);
+}
+
+test "MseInitiatorHandshake zero recv is connection_closed" {
+    const info_hash = [_]u8{0x42} ** 20;
+    var hs = MseInitiatorHandshake.init(info_hash, .preferred);
+    _ = hs.start();
+    _ = hs.feedSend(); // -> recv_dh_key
+
+    const action = hs.feedRecv(0);
+    switch (action) {
+        .failed => |err| {
+            try std.testing.expectEqual(MseError.connection_closed, err);
+        },
+        else => return error.ExpectedFailed,
+    }
+}
+
+test "MseResponderHandshake init starts with recv" {
+    const info_hash = [_]u8{0x42} ** 20;
+    const known = [_][20]u8{info_hash};
+    var hs = MseResponderHandshake.init(&known, .preferred);
+    const action = hs.start();
+    switch (action) {
+        .recv => |buf| {
+            try std.testing.expectEqual(@as(usize, dh_key_size), buf.len);
+        },
+        else => return error.ExpectedRecv,
+    }
+}
+
+test "MseResponderHandshake recv_dh_key transitions to send_dh_key" {
+    const info_hash = [_]u8{0x42} ** 20;
+    const known = [_][20]u8{info_hash};
+    var hs = MseResponderHandshake.init(&known, .preferred);
+    _ = hs.start();
+
+    // Generate a valid initiator public key
+    const init_priv = generatePrivateKey();
+    const init_pub = computePublicKey(init_priv);
+    hs.peer_public_key = init_pub;
+
+    // Full recv of DH key
+    const action = hs.feedRecv(dh_key_size);
+    switch (action) {
+        .send => |data| {
+            // Yb + PadB
+            try std.testing.expect(data.len >= dh_key_size);
+        },
+        else => return error.ExpectedSend,
+    }
+    try std.testing.expectEqual(ResponderPhase.send_dh_key, hs.phase);
+}
+
+test "MseResponderHandshake send_dh_key transitions to recv_req1_scan" {
+    const info_hash = [_]u8{0x42} ** 20;
+    const known = [_][20]u8{info_hash};
+    var hs = MseResponderHandshake.init(&known, .preferred);
+    _ = hs.start();
+
+    // Simulate DH key recv
+    const init_priv = generatePrivateKey();
+    const init_pub = computePublicKey(init_priv);
+    hs.peer_public_key = init_pub;
+    _ = hs.feedRecv(dh_key_size); // -> send_dh_key
+
+    // DH key sent
+    const action = hs.feedSend();
+    switch (action) {
+        .recv => {
+            // Should start scanning for req1
+        },
+        else => return error.ExpectedRecv,
+    }
+    try std.testing.expectEqual(ResponderPhase.recv_req1_scan, hs.phase);
+}
+
+test "looksLikeMse detects BT vs MSE first byte" {
+    // BT handshake starts with 0x13 (19 = protocol string length)
+    try std.testing.expect(!looksLikeMse(&[_]u8{19}));
+
+    // MSE starts with random DH key -- not 0x13
+    try std.testing.expect(looksLikeMse(&[_]u8{0}));
+    try std.testing.expect(looksLikeMse(&[_]u8{0xFF}));
+    try std.testing.expect(looksLikeMse(&[_]u8{0x42}));
+
+    // Empty
+    try std.testing.expect(!looksLikeMse(&[_]u8{}));
+}
+
+test "MseInitiatorHandshake result returns plaintext for disabled mode" {
+    // When crypto_method is plaintext, result should be plaintext PeerCrypto
+    const info_hash = [_]u8{0x42} ** 20;
+    var hs = MseInitiatorHandshake.init(info_hash, .disabled);
+    hs.crypto_method = crypto_plaintext;
+    hs.phase = .done;
+
+    const pc = hs.result();
+    try std.testing.expect(!pc.isEncrypted());
+    try std.testing.expect(pc.encrypt == null);
+    try std.testing.expect(pc.decrypt == null);
+}
+
+test "MseResponderHandshake unknown info-hash fails" {
+    const info_hash = [_]u8{0x42} ** 20;
+    const wrong_hash = [_]u8{0xFF} ** 20;
+    const known = [_][20]u8{wrong_hash}; // doesn't match info_hash
+    var hs = MseResponderHandshake.init(&known, .preferred);
+
+    // Set up shared secret and expected values
+    const priv_a = generatePrivateKey();
+    const pub_a = computePublicKey(priv_a);
+    const priv_b = hs.private_key;
+
+    hs.peer_public_key = pub_a;
+    hs.shared_secret = computeSharedSecret(priv_b, pub_a);
+    hs.expected_req1 = hashReq1(hs.shared_secret);
+    hs.expected_req3 = hashReq3(hs.shared_secret);
+    hs.req1_end = 0;
+    hs.scan_len = 0;
+
+    // Build req2_xor_req3 for the actual info_hash (not the wrong one)
+    const req2 = hashReq2(info_hash);
+    const req3 = hashReq3(hs.shared_secret);
+    for (0..20) |i| {
+        hs.req2_xor_req3[i] = req2[i] ^ req3[i];
+    }
+
+    const action = hs.processReq2();
+    switch (action) {
+        .failed => |err| {
+            try std.testing.expectEqual(MseError.unknown_info_hash, err);
+        },
+        else => return error.ExpectedFailed,
+    }
+}
+
+test "encryption mode config: cryptoProvideFromMode coverage" {
+    // forced mode: only RC4
+    try std.testing.expect(cryptoProvideFromMode(.forced) == crypto_rc4);
+    // preferred mode: offer both
+    try std.testing.expect(cryptoProvideFromMode(.preferred) == (crypto_rc4 | crypto_plaintext));
+    // enabled mode: offer both
+    try std.testing.expect(cryptoProvideFromMode(.enabled) == (crypto_rc4 | crypto_plaintext));
+    // disabled mode: plaintext only
+    try std.testing.expect(cryptoProvideFromMode(.disabled) == crypto_plaintext);
+}
+
+test "MseInitiatorHandshake vc_scan exceeds limit returns vc_not_found" {
+    const info_hash = [_]u8{0x42} ** 20;
+    var hs = MseInitiatorHandshake.init(info_hash, .preferred);
+    _ = hs.start();
+    _ = hs.feedSend(); // -> recv_dh_key
+
+    // Provide valid DH key
+    const peer_priv = generatePrivateKey();
+    const peer_pub = computePublicKey(peer_priv);
+    hs.peer_public_key = peer_pub;
+    _ = hs.feedRecv(dh_key_size); // -> send_crypto_req
+    _ = hs.feedSend(); // -> recv_vc_scan
+
+    // Feed many bytes that never match VC
+    var i: usize = 0;
+    while (i < max_pad_len + 8) : (i += 1) {
+        // Make sure decoded byte is never 0 (VC is all zeros)
+        // We feed 1 byte at a time; the state machine decrypts it.
+        // Since we're not actually feeding real encrypted data, the
+        // decrypted value is unpredictable. Just run the scan loop
+        // until it exceeds the limit.
+        const action = hs.feedRecv(1);
+        switch (action) {
+            .recv => continue,
+            .complete => return, // unlikely but ok
+            .failed => |err| {
+                try std.testing.expectEqual(MseError.vc_not_found, err);
+                return;
+            },
+            .send => return,
+        }
+    }
+    // If we get here, the limit wasn't reached (shouldn't happen)
+    try std.testing.expect(false);
 }

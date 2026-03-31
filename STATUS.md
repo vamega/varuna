@@ -20,7 +20,7 @@ Update it whenever a milestone lands, the near-term backlog changes, or a new op
 - Multi-peer seeding: io_uring event loop, batched block sends, async disk reads with piece cache.
 - Selective file download: per-file priorities (normal/high/do_not_download), piece-mask filtering, boundary-piece handling, lazy file creation. Wired into daemon event loop piece picker.
 - Sequential download mode: per-torrent toggle for streaming playback.
-- MSE/PE (BEP 6): Message Stream Encryption with DH key exchange (768-bit prime), RC4 stream cipher with 1024-byte discard, SKEY identification from info-hash, crypto_provide/crypto_select negotiation, both initiator and responder roles, configurable modes (forced/preferred/enabled/disabled). Transparent encrypt/decrypt integrated into event loop send/recv paths.
+- MSE/PE (BEP 6): Message Stream Encryption with DH key exchange (768-bit prime), RC4 stream cipher with 1024-byte discard, SKEY identification from info-hash, crypto_provide/crypto_select negotiation, both initiator and responder roles, configurable modes (forced/preferred/enabled/disabled). Transparent encrypt/decrypt integrated into event loop send/recv paths. Async MSE handshake state machine (`MseInitiatorHandshake`/`MseResponderHandshake`) for non-blocking io_uring event loop integration. Auto-fallback: outbound "preferred" mode tries MSE then reconnects plaintext; inbound detects MSE vs BT by first-byte heuristic; per-peer `mse_rejected`/`mse_fallback` tracking prevents retry loops.
 - Super-seeding (BEP 16): initial seed optimization. Sends HAVE messages instead of bitfield, tracks per-peer piece distribution, advertises rarest-first to maximize piece diversity. API toggle via `/api/v2/torrents/setSuperSeeding`.
 
 ### Architecture
@@ -108,6 +108,7 @@ Update it whenever a milestone lands, the near-term backlog changes, or a new op
 
 ### Testing
 - 19 peer wire protocol tests, 10 BEP 10 extension tests, 15 PEX tests, 31 uTP/LEDBAT tests, 5 categories tests, 9 resume DB tests, 25 MSE/RC4 tests, 13 magnet URI tests, 13 ut_metadata tests, 12 metadata fetch resilience tests.
+- 13 async MSE state machine tests (initiator phases, responder phases, VC scan limit, fallback, first-byte detection).
 - Bencode fuzz + edge case tests, HTTP parser fuzz tests.
 - Fuzz tests for: multipart parser, tracker response, uTP packets, BEP 10 extensions, scrape response (18 fuzz tests total).
 - Regression tests for API partial-send progress, unique seed read IDs, seed block-copy batching, shared-event-loop detach on stop, shared-loop preservation on resume, and failed disk-write release.
@@ -147,5 +148,6 @@ Update it whenever a milestone lands, the near-term backlog changes, or a new op
 - BEP 52 (BitTorrent v2 / Hybrid) Phase 1-5
 - BEP 9 magnet link resilience: multi-peer retry, per-peer/overall timeouts, DHT stub, progress reporting
 - qBittorrent API: all stub fields populated with real data
+- MSE/PE (BEP 6) async handshake + auto-fallback
 - `zig build test`: all tests pass
 - `zig build`: clean build

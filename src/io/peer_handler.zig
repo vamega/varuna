@@ -7,9 +7,11 @@ const ext = @import("../net/extensions.zig");
 const mse = @import("../crypto/mse.zig");
 const EventLoop = @import("event_loop.zig").EventLoop;
 const Peer = @import("event_loop.zig").Peer;
+const PeerState = @import("event_loop.zig").PeerState;
 const encodeUserData = @import("event_loop.zig").encodeUserData;
 const decodeUserData = @import("event_loop.zig").decodeUserData;
 const protocol = @import("protocol.zig");
+const socket_util = @import("../net/socket.zig");
 
 // ── CQE dispatch handlers ──────────────────────────────
 
@@ -78,14 +80,69 @@ pub fn handleConnect(self: *EventLoop, slot: u16, cqe: linux.io_uring_cqe) void 
         self.removePeer(slot);
         return;
     }
-    peer.state = .handshake_send;
     peer.last_activity = std.time.timestamp();
 
-    // Build and send handshake using the peer's torrent context
+    // Determine if we should initiate MSE handshake
+    const should_mse = shouldInitiateMse(self, peer);
+    if (should_mse) {
+        startMseInitiator(self, slot) catch {
+            self.removePeer(slot);
+        };
+        return;
+    }
+
+    // No MSE -- go directly to BT handshake
+    sendBtHandshake(self, slot);
+}
+
+/// Start the async MSE initiator handshake for an outbound peer.
+fn startMseInitiator(self: *EventLoop, slot: u16) !void {
+    const peer = &self.peers[slot];
+    const tc = self.getTorrentContext(peer.torrent_id) orelse return error.TorrentNotFound;
+
+    // Allocate MSE initiator state
+    const mi = try self.allocator.create(mse.MseInitiatorHandshake);
+    mi.* = mse.MseInitiatorHandshake.init(tc.info_hash, self.encryption_mode);
+    peer.mse_initiator = mi;
+
+    // Get first action (send DH key)
+    const action = mi.start();
+    switch (action) {
+        .send => |data| {
+            peer.state = .mse_handshake_send;
+            const ud = encodeUserData(.{ .slot = slot, .op_type = .peer_send, .context = 0 });
+            _ = self.ring.send(ud, peer.fd, data, 0) catch {
+                return error.SubmitFailed;
+            };
+            peer.send_pending = true;
+        },
+        else => return error.UnexpectedAction,
+    }
+}
+
+/// Determine whether to initiate MSE on an outbound connection.
+fn shouldInitiateMse(self: *EventLoop, peer: *const Peer) bool {
+    // Never MSE if mode is disabled
+    if (self.encryption_mode == .disabled) return false;
+    // Don't retry MSE if this peer previously rejected it
+    if (peer.mse_rejected) return false;
+    // Don't MSE if we're in fallback mode (reconnecting without MSE)
+    if (peer.mse_fallback) return false;
+    // In "enabled" mode, don't initiate MSE -- only accept it
+    if (self.encryption_mode == .enabled) return false;
+    // "forced" and "preferred" modes: initiate MSE
+    return true;
+}
+
+/// Send a standard BitTorrent protocol handshake (no MSE).
+fn sendBtHandshake(self: *EventLoop, slot: u16) void {
+    const peer = &self.peers[slot];
     const tc = self.getTorrentContext(peer.torrent_id) orelse {
         self.removePeer(slot);
         return;
     };
+    peer.state = .handshake_send;
+
     var buf: [68]u8 = undefined;
     buf[0] = pw.protocol_length;
     @memcpy(buf[1 .. 1 + pw.protocol_string.len], pw.protocol_string);
@@ -95,7 +152,7 @@ pub fn handleConnect(self: *EventLoop, slot: u16, cqe: linux.io_uring_cqe) void 
     @memcpy(buf[28..48], tc.info_hash[0..]);
     @memcpy(buf[48..68], tc.peer_id[0..]);
     @memcpy(peer.handshake_buf[0..68], &buf);
-    // MSE/PE: encrypt handshake before sending
+    // MSE/PE: encrypt handshake before sending (if MSE was negotiated)
     peer.crypto.encryptBuf(peer.handshake_buf[0..68]);
 
     const ud = encodeUserData(.{ .slot = slot, .op_type = .peer_send, .context = 0 });
@@ -122,6 +179,12 @@ pub fn handleSend(self: *EventLoop, slot: u16, cqe: linux.io_uring_cqe) void {
         // Check if this was a tracked send buffer -- free it on error.
         // Only free ONE buffer: removePeer will clean up the rest.
         if (op.context != 0) self.freeOnePendingSend(slot, send_id);
+        // MSE fallback: if send failed during MSE handshake and mode is "preferred",
+        // try reconnecting without MSE
+        if (peer.state == .mse_handshake_send and self.encryption_mode == .preferred and !peer.mse_fallback) {
+            attemptMseFallback(self, slot);
+            return;
+        }
         self.removePeer(slot);
         return;
     }
@@ -139,6 +202,24 @@ pub fn handleSend(self: *EventLoop, slot: u16, cqe: linux.io_uring_cqe) void {
     peer.send_pending = false;
 
     switch (peer.state) {
+        .mse_handshake_send => {
+            // MSE initiator: send completed, advance state machine
+            if (peer.mse_initiator) |mi| {
+                const action = mi.feedSend();
+                executeMseAction(self, slot, action, true);
+            } else {
+                self.removePeer(slot);
+            }
+        },
+        .mse_resp_send => {
+            // MSE responder: send completed, advance state machine
+            if (peer.mse_responder) |mr| {
+                const action = mr.feedSend();
+                executeMseAction(self, slot, action, false);
+            } else {
+                self.removePeer(slot);
+            }
+        },
         .handshake_send => {
             // Now recv peer's handshake
             peer.state = .handshake_recv;
@@ -205,14 +286,42 @@ pub fn handleRecv(self: *EventLoop, slot: u16, cqe: linux.io_uring_cqe) void {
     if (peer.state == .free) return;
 
     if (cqe.res <= 0) {
+        // MSE fallback: if MSE handshake recv failed and mode is "preferred",
+        // reconnect without MSE
+        if (peer.state == .mse_handshake_recv or peer.state == .mse_resp_recv) {
+            if (self.encryption_mode == .preferred and !peer.mse_fallback) {
+                attemptMseFallback(self, slot);
+                return;
+            }
+        }
         self.removePeer(slot);
         return;
     }
     const n: usize = @intCast(cqe.res);
-    const tc_recv = self.getTorrentContext(peer.torrent_id) orelse {
-        self.removePeer(slot);
-        return;
-    };
+
+    // MSE handshake states: the async state machine manages its own
+    // encryption, so handle them before the crypto.decryptBuf block.
+    switch (peer.state) {
+        .mse_handshake_recv => {
+            if (peer.mse_initiator) |mi| {
+                const action = mi.feedRecv(n);
+                executeMseAction(self, slot, action, true);
+            } else {
+                self.removePeer(slot);
+            }
+            return;
+        },
+        .mse_resp_recv => {
+            if (peer.mse_responder) |mr| {
+                const action = mr.feedRecv(n);
+                executeMseAction(self, slot, action, false);
+            } else {
+                self.removePeer(slot);
+            }
+            return;
+        },
+        else => {},
+    }
 
     // MSE/PE (BEP 6): decrypt newly received bytes in-place when crypto is active.
     // This happens transparently before any protocol parsing.
@@ -235,6 +344,11 @@ pub fn handleRecv(self: *EventLoop, slot: u16, cqe: linux.io_uring_cqe) void {
             else => {},
         }
     }
+
+    const tc_recv = self.getTorrentContext(peer.torrent_id) orelse {
+        self.removePeer(slot);
+        return;
+    };
 
     switch (peer.state) {
         .handshake_recv => {
@@ -272,6 +386,20 @@ pub fn handleRecv(self: *EventLoop, slot: u16, cqe: linux.io_uring_cqe) void {
             }
         },
         .inbound_handshake_recv => {
+            // MSE detection: on the very first bytes of an inbound connection,
+            // check if this looks like an MSE handshake (not BT protocol).
+            if (peer.handshake_offset == 0 and n > 0) {
+                if (detectAndHandleInboundMse(self, slot, peer.handshake_buf[0])) {
+                    // MSE responder started -- it took ownership of the first byte
+                    return;
+                }
+                // If encryption is forced but first byte looks like BT, reject
+                if (self.encryption_mode == .forced and peer.handshake_buf[0] == pw.protocol_length) {
+                    log.debug("slot {d}: rejecting plaintext inbound (encryption=forced)", .{slot});
+                    self.removePeer(slot);
+                    return;
+                }
+            }
             // Seed mode: we received the peer's handshake
             peer.handshake_offset += n;
             if (peer.handshake_offset < 68) {
@@ -446,6 +574,259 @@ pub fn handleDiskWrite(self: *EventLoop, slot: u16, cqe: linux.io_uring_cqe) voi
             _ = self.pending_writes.remove(key);
         }
     }
+}
+
+// ── MSE async handshake helpers ──────────────────────────
+
+/// Execute an MseAction returned by the async state machine.
+/// `is_initiator` controls which state (mse_handshake_* vs mse_resp_*) to use.
+fn executeMseAction(self: *EventLoop, slot: u16, action: mse.MseAction, is_initiator: bool) void {
+    const peer = &self.peers[slot];
+    switch (action) {
+        .send => |data| {
+            const state: PeerState = if (is_initiator) .mse_handshake_send else .mse_resp_send;
+            peer.state = state;
+            const ud = encodeUserData(.{ .slot = slot, .op_type = .peer_send, .context = 0 });
+            _ = self.ring.send(ud, peer.fd, data, 0) catch {
+                handleMseFailure(self, slot, is_initiator);
+                return;
+            };
+            peer.send_pending = true;
+        },
+        .recv => |buf| {
+            const state: PeerState = if (is_initiator) .mse_handshake_recv else .mse_resp_recv;
+            peer.state = state;
+            const ud = encodeUserData(.{ .slot = slot, .op_type = .peer_recv, .context = 0 });
+            _ = self.ring.recv(ud, peer.fd, .{ .buffer = buf }, 0) catch {
+                handleMseFailure(self, slot, is_initiator);
+                return;
+            };
+        },
+        .complete => {
+            // MSE handshake succeeded -- extract crypto state and proceed to BT handshake
+            if (is_initiator) {
+                if (peer.mse_initiator) |mi| {
+                    peer.crypto = mi.result();
+                    self.allocator.destroy(mi);
+                    peer.mse_initiator = null;
+                    log.info("slot {d}: MSE handshake complete (initiator, method={s})", .{
+                        slot,
+                        if (peer.crypto.method == mse.crypto_rc4) "RC4" else "plaintext",
+                    });
+                    // Proceed to BT handshake
+                    sendBtHandshake(self, slot);
+                } else {
+                    self.removePeer(slot);
+                }
+            } else {
+                if (peer.mse_responder) |mr| {
+                    peer.crypto = mr.result();
+                    // Set the torrent_id based on matched info-hash
+                    if (mr.matchedInfoHash()) |hash| {
+                        var matched_tid: ?u8 = null;
+                        for (&self.torrents, 0..) |*tslot, ti| {
+                            if (tslot.*) |*tc| {
+                                if (tc.active and std.mem.eql(u8, &tc.info_hash, &hash)) {
+                                    matched_tid = @intCast(ti);
+                                    break;
+                                }
+                            }
+                        }
+                        if (matched_tid) |tid| {
+                            peer.torrent_id = tid;
+                        }
+                    }
+                    self.allocator.destroy(mr);
+                    peer.mse_responder = null;
+                    log.info("slot {d}: MSE handshake complete (responder, method={s})", .{
+                        slot,
+                        if (peer.crypto.method == mse.crypto_rc4) "RC4" else "plaintext",
+                    });
+                    // Now receive the BT handshake (which follows MSE)
+                    peer.state = .inbound_handshake_recv;
+                    peer.handshake_offset = 0;
+                    protocol.submitHandshakeRecv(self, slot) catch {
+                        self.removePeer(slot);
+                    };
+                } else {
+                    self.removePeer(slot);
+                }
+            }
+        },
+        .failed => |err| {
+            log.debug("slot {d}: MSE handshake failed: {s}", .{
+                slot, @tagName(err),
+            });
+            handleMseFailure(self, slot, is_initiator);
+        },
+    }
+}
+
+/// Handle MSE failure -- either fallback to plaintext or disconnect.
+fn handleMseFailure(self: *EventLoop, slot: u16, is_initiator: bool) void {
+    const peer = &self.peers[slot];
+
+    // Clean up MSE state
+    if (is_initiator) {
+        if (peer.mse_initiator) |mi| {
+            self.allocator.destroy(mi);
+            peer.mse_initiator = null;
+        }
+    } else {
+        if (peer.mse_responder) |mr| {
+            self.allocator.destroy(mr);
+            peer.mse_responder = null;
+        }
+    }
+
+    // If mode is "preferred" and we're the initiator, try reconnecting without MSE
+    if (is_initiator and self.encryption_mode == .preferred and !peer.mse_fallback) {
+        attemptMseFallback(self, slot);
+        return;
+    }
+
+    // If mode is "enabled" and we're the responder, fall back to treating
+    // the data as a plaintext BT handshake (handled in handleAccept)
+    if (!is_initiator and self.encryption_mode != .forced) {
+        // The connection is already established -- just switch to inbound BT handshake.
+        // Note: we already consumed some bytes during MSE scanning so we can't easily
+        // re-parse them. Disconnect and let the peer reconnect.
+        self.removePeer(slot);
+        return;
+    }
+
+    self.removePeer(slot);
+}
+
+/// Attempt to reconnect to a peer without MSE (plaintext fallback).
+fn attemptMseFallback(self: *EventLoop, slot: u16) void {
+    const peer = &self.peers[slot];
+    const address = peer.address;
+    const torrent_id = peer.torrent_id;
+
+    log.info("slot {d}: MSE failed, attempting plaintext fallback", .{slot});
+
+    // Mark that this peer rejected MSE so we don't retry
+    // We need to remember this across the reconnect
+    peer.mse_rejected = true;
+
+    // Close the current connection
+    if (peer.fd >= 0) {
+        posix.close(peer.fd);
+        peer.fd = -1;
+    }
+    // Clean up MSE state
+    if (peer.mse_initiator) |mi| {
+        self.allocator.destroy(mi);
+        peer.mse_initiator = null;
+    }
+    if (peer.mse_responder) |mr| {
+        self.allocator.destroy(mr);
+        peer.mse_responder = null;
+    }
+
+    // Reset peer state for reconnect
+    peer.state = .connecting;
+    peer.mse_fallback = true;
+    peer.crypto = mse.PeerCrypto.plaintext;
+    peer.handshake_offset = 0;
+
+    // Create new socket and reconnect
+    const family = address.any.family;
+    const fd = posix.socket(
+        family,
+        posix.SOCK.STREAM | posix.SOCK.CLOEXEC | posix.SOCK.NONBLOCK,
+        posix.IPPROTO.TCP,
+    ) catch {
+        self.removePeer(slot);
+        return;
+    };
+    peer.fd = fd;
+
+    // Apply bind configuration
+    socket_util.applyBindConfig(fd, self.bind_device, self.bind_address, 0) catch {
+        self.removePeer(slot);
+        return;
+    };
+
+    const ud = encodeUserData(.{ .slot = slot, .op_type = .peer_connect, .context = 0 });
+    _ = self.ring.connect(ud, fd, &peer.address.any, peer.address.getOsSockLen()) catch {
+        self.removePeer(slot);
+        return;
+    };
+    if (self.half_open_count < self.max_half_open) {
+        self.half_open_count += 1;
+    }
+    peer.torrent_id = torrent_id;
+}
+
+/// Start an inbound MSE responder handshake for a peer that sent
+/// non-BT-protocol bytes.
+fn startMseResponder(self: *EventLoop, slot: u16) void {
+    const peer = &self.peers[slot];
+
+    // Collect known info-hashes from all active torrents
+    var known_hashes: [64][20]u8 = undefined;
+    var hash_count: usize = 0;
+    for (&self.torrents) |*tslot| {
+        if (tslot.*) |*tc| {
+            if (tc.active and hash_count < known_hashes.len) {
+                known_hashes[hash_count] = tc.info_hash;
+                hash_count += 1;
+            }
+        }
+    }
+
+    if (hash_count == 0) {
+        self.removePeer(slot);
+        return;
+    }
+
+    // Allocate responder state
+    const mr = self.allocator.create(mse.MseResponderHandshake) catch {
+        self.removePeer(slot);
+        return;
+    };
+    mr.* = mse.MseResponderHandshake.init(known_hashes[0..hash_count], self.encryption_mode);
+    peer.mse_responder = mr;
+
+    // The first byte we already received is part of the DH key.
+    // We need to feed it to the state machine. The responder starts
+    // by receiving the DH key. We already have 1 byte in handshake_buf[0].
+    // Copy it into the responder's recv buffer and adjust offset.
+    mr.peer_public_key[0] = peer.handshake_buf[0];
+    mr.recv_offset = 1;
+
+    if (mr.recv_offset < mse.dh_key_size) {
+        peer.state = .mse_resp_recv;
+        const recv_buf = mr.peer_public_key[mr.recv_offset..];
+        const ud = encodeUserData(.{ .slot = slot, .op_type = .peer_recv, .context = 0 });
+        _ = self.ring.recv(ud, peer.fd, .{ .buffer = recv_buf }, 0) catch {
+            self.removePeer(slot);
+            return;
+        };
+    }
+}
+
+/// Detect whether the first received byte on an inbound connection looks
+/// like an MSE DH key exchange (not a BT protocol handshake).
+/// Called from handleRecv when we get the first bytes on an inbound peer.
+pub fn detectAndHandleInboundMse(self: *EventLoop, slot: u16, first_byte: u8) bool {
+    // If encryption is disabled, never try MSE detection
+    if (self.encryption_mode == .disabled) return false;
+
+    // BT handshake starts with 0x13 (protocol string length = 19)
+    if (first_byte == pw.protocol_length) return false;
+
+    // If encryption mode is not "forced", and first byte is 0x13,
+    // treat as plaintext. For non-0x13 first bytes, try MSE.
+    // In "forced" mode, all inbound connections must be MSE.
+    if (self.encryption_mode == .forced or mse.looksLikeMse(&[_]u8{first_byte})) {
+        startMseResponder(self, slot);
+        return true;
+    }
+
+    return false;
 }
 
 test "handleDiskWrite releases piece when any submit failed" {
