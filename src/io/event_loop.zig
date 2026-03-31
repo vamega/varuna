@@ -1097,6 +1097,15 @@ pub const EventLoop = struct {
         return self.global_rate_limiter.upload.rate;
     }
 
+    /// Get the number of nodes in the DHT routing table.
+    /// Returns 0 if DHT is not enabled.
+    pub fn getDhtNodeCount(self: *const EventLoop) usize {
+        if (self.dht_engine) |engine| {
+            return engine.table.nodeCount();
+        }
+        return 0;
+    }
+
     /// Set per-torrent download rate limit (bytes/sec). 0 = unlimited.
     pub fn setTorrentDlLimit(self: *EventLoop, torrent_id: u8, rate: u64) void {
         if (self.getTorrentContext(torrent_id)) |tc| {

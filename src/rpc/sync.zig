@@ -61,6 +61,7 @@ pub const SyncState = struct {
         const el = session_manager.shared_event_loop;
         const dl_limit: u64 = if (el) |e| e.getGlobalDlLimit() else 0;
         const ul_limit: u64 = if (el) |e| e.getGlobalUlLimit() else 0;
+        const dht_nodes: usize = if (el) |e| e.getDhtNodeCount() else 0;
 
         var total_dl_speed: u64 = 0;
         var total_ul_speed: u64 = 0;
@@ -160,7 +161,8 @@ pub const SyncState = struct {
         }
 
         // Server state (includes all fields qui's ServerState interface expects)
-        try json.print(allocator, ",\"server_state\":{{\"connection_status\":\"connected\",\"dht_nodes\":0,\"dl_info_speed\":{},\"up_info_speed\":{},\"dl_info_data\":{},\"up_info_data\":{},\"dl_rate_limit\":{},\"up_rate_limit\":{},\"alltime_dl\":{},\"alltime_ul\":{},\"queueing\":false,\"use_alt_speed_limits\":false,\"refresh_interval\":1500,\"free_space_on_disk\":0,\"total_peer_connections\":0}}", .{
+        try json.print(allocator, ",\"server_state\":{{\"connection_status\":\"connected\",\"dht_nodes\":{},\"dl_info_speed\":{},\"up_info_speed\":{},\"dl_info_data\":{},\"up_info_data\":{},\"dl_rate_limit\":{},\"up_rate_limit\":{},\"alltime_dl\":{},\"alltime_ul\":{},\"queueing\":false,\"use_alt_speed_limits\":false,\"refresh_interval\":1500,\"free_space_on_disk\":0,\"total_peer_connections\":0}}", .{
+            dht_nodes,
             total_dl_speed,
             total_ul_speed,
             total_dl_data,
@@ -255,14 +257,18 @@ fn serializeTorrentObject(allocator: std.mem.Allocator, json: *std.ArrayList(u8)
     const magnet_uri = compat.buildMagnetUri(allocator, &stat.info_hash_hex, stat.name, stat.tracker) catch "";
     defer if (magnet_uri.len > 0) allocator.free(magnet_uri);
 
+    const v2_hex = if (stat.info_hash_v2 != null) compat.formatInfoHashV2(stat.info_hash_v2) else [_]u8{0} ** 64;
+    const v2_str: []const u8 = if (stat.info_hash_v2 != null) &v2_hex else "";
+
     // Split into two print calls to stay under the 32-argument limit.
     try json.print(
         allocator,
-        "{{\"name\":\"{f}\",\"hash\":\"{s}\",\"infohash_v1\":\"{s}\",\"infohash_v2\":\"\",\"state\":\"{s}\",\"size\":{},\"total_size\":{},\"progress\":{d:.4},\"dlspeed\":{},\"upspeed\":{},\"num_seeds\":{},\"num_leechs\":{},\"num_complete\":{},\"num_incomplete\":{},\"added_on\":{},\"completion_on\":{},\"save_path\":\"{f}\",\"content_path\":\"{f}\",\"download_path\":\"\",\"pieces_have\":{},\"pieces_num\":{},\"dl_limit\":{},\"up_limit\":{},\"eta\":{},\"ratio\":{d:.4},\"seq_dl\":{s},\"private\":{s}",
+        "{{\"name\":\"{f}\",\"hash\":\"{s}\",\"infohash_v1\":\"{s}\",\"infohash_v2\":\"{s}\",\"state\":\"{s}\",\"size\":{},\"total_size\":{},\"progress\":{d:.4},\"dlspeed\":{},\"upspeed\":{},\"num_seeds\":{},\"num_leechs\":{},\"num_complete\":{},\"num_incomplete\":{},\"added_on\":{},\"completion_on\":{},\"save_path\":\"{f}\",\"content_path\":\"{f}\",\"download_path\":\"\",\"pieces_have\":{},\"pieces_num\":{},\"dl_limit\":{},\"up_limit\":{},\"eta\":{},\"ratio\":{d:.4},\"seq_dl\":{s},\"private\":{s}",
         .{
             esc(stat.name),
             stat.info_hash_hex,
             stat.info_hash_hex,
+            v2_str,
             qbt_state,
             stat.total_size,
             stat.total_size,

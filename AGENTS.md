@@ -75,6 +75,8 @@ See [docs/future-features.md](docs/future-features.md) for planned features: sys
 
 See [docs/dht-bep52-plan.md](docs/dht-bep52-plan.md) for the detailed implementation plan for DHT (BEP 5) and BitTorrent v2 / hybrid torrents (BEP 52).
 
+See [docs/api-compatibility.md](docs/api-compatibility.md) for the full qBittorrent WebAPI compatibility matrix: implemented endpoints, remaining placeholder fields, and explicitly unsupported endpoints.
+
 ## Coding Style & Naming Conventions
 Use `zig fmt` as the formatting authority. Prefer small modules, explicit ownership, and low-allocation designs. Default to arena or slab-backed allocation where dynamic memory is unavoidable. Use `snake_case` for files, functions, and local variables; `PascalCase` for types; and descriptive subsystem names like `piece_picker.zig` or `disk_scheduler.zig`. Keep Linux- and io_uring-specific code explicit rather than hidden behind generic abstractions.
 
