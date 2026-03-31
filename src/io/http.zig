@@ -1,12 +1,14 @@
 const std = @import("std");
 const posix = std.posix;
 const Ring = @import("ring.zig").Ring;
+const DnsResolver = @import("dns.zig").DnsResolver;
 
 /// Minimal HTTP/1.1 GET client over io_uring.
 /// Designed for tracker announces: simple GET requests with small responses.
 pub const HttpClient = struct {
     ring: *Ring,
     allocator: std.mem.Allocator,
+    dns_resolver: ?*DnsResolver = null,
 
     pub fn init(allocator: std.mem.Allocator, ring: *Ring) HttpClient {
         return .{
@@ -15,13 +17,26 @@ pub const HttpClient = struct {
         };
     }
 
+    /// Create an HttpClient with a shared DNS cache.
+    pub fn initWithDns(allocator: std.mem.Allocator, ring: *Ring, dns_resolver: *DnsResolver) HttpClient {
+        return .{
+            .ring = ring,
+            .allocator = allocator,
+            .dns_resolver = dns_resolver,
+        };
+    }
+
     /// Perform an HTTP GET request and return the response body.
     /// DNS resolution runs on a background thread to avoid blocking the ring.
+    /// When a DnsResolver is attached, results are cached across requests.
     pub fn get(self: *HttpClient, url: []const u8) !HttpResponse {
         const parsed = try parseUrl(url);
 
-        // Resolve DNS on a background thread
-        const address = try resolveDns(self.allocator, parsed.host, parsed.port);
+        // Resolve DNS -- use shared cache if available, otherwise one-shot
+        const address = if (self.dns_resolver) |r|
+            try r.resolve(self.allocator, parsed.host, parsed.port)
+        else
+            try @import("dns.zig").resolveOnce(self.allocator, parsed.host, parsed.port);
 
         // Connect via io_uring
         const fd = try self.ring.socket(
@@ -135,55 +150,6 @@ fn parseUrl(url: []const u8) !ParsedUrl {
         .port = 80,
         .path = path,
     };
-}
-
-// ── DNS resolution (threadpool) ───────────────────────────
-
-const DnsResult = struct {
-    address: ?std.net.Address = null,
-    err: ?anyerror = null,
-    done: std.Thread.ResetEvent = .{},
-};
-
-fn resolveDns(allocator: std.mem.Allocator, host: []const u8, port: u16) !std.net.Address {
-    // For numeric IPs, parse directly without DNS
-    if (std.net.Address.parseIp4(host, port)) |addr| {
-        return addr;
-    } else |_| {}
-    if (std.net.Address.parseIp6(host, port)) |addr| {
-        return addr;
-    } else |_| {}
-
-    // DNS resolution on a background thread
-    var result = DnsResult{};
-
-    const host_z = try allocator.dupeZ(u8, host);
-    defer allocator.free(host_z);
-
-    const thread = try std.Thread.spawn(.{}, dnsWorker, .{ host_z, port, &result });
-    defer thread.join();
-
-    // Wait for DNS result with timeout
-    result.done.timedWait(5 * std.time.ns_per_s) catch return error.DnsTimeout;
-
-    if (result.err) |err| return err;
-    return result.address orelse error.DnsResolutionFailed;
-}
-
-fn dnsWorker(host: [:0]const u8, port: u16, result: *DnsResult) void {
-    const list = std.net.getAddressList(std.heap.page_allocator, host, port) catch |err| {
-        result.err = err;
-        result.done.set();
-        return;
-    };
-    defer list.deinit();
-
-    if (list.addrs.len > 0) {
-        result.address = list.addrs[0];
-    } else {
-        result.err = error.DnsResolutionFailed;
-    }
-    result.done.set();
 }
 
 // ── HTTP response parsing ─────────────────────────────────

@@ -60,10 +60,25 @@ pub fn scrapeHttp(
     announce_url: []const u8,
     info_hash: [20]u8,
 ) !ScrapeResult {
+    return scrapeHttpWithDns(allocator, ring, null, announce_url, info_hash);
+}
+
+/// Perform an HTTP scrape with an optional shared DNS cache.
+pub fn scrapeHttpWithDns(
+    allocator: std.mem.Allocator,
+    ring: *Ring,
+    dns_resolver: ?*@import("../io/dns.zig").DnsResolver,
+    announce_url: []const u8,
+    info_hash: [20]u8,
+) !ScrapeResult {
     const url = try buildScrapeUrl(allocator, announce_url, info_hash);
     defer allocator.free(url);
 
-    var http_client = @import("../io/http.zig").HttpClient.init(allocator, ring);
+    const http_mod = @import("../io/http.zig");
+    var http_client = if (dns_resolver) |r|
+        http_mod.HttpClient.initWithDns(allocator, ring, r)
+    else
+        http_mod.HttpClient.init(allocator, ring);
     var http_response = try http_client.get(url);
     defer http_response.deinit();
 
@@ -158,10 +173,21 @@ pub fn scrapeAuto(
     announce_url: []const u8,
     info_hash: [20]u8,
 ) !ScrapeResult {
+    return scrapeAutoWithDns(allocator, ring, null, announce_url, info_hash);
+}
+
+/// Scrape a tracker with an optional shared DNS cache.
+pub fn scrapeAutoWithDns(
+    allocator: std.mem.Allocator,
+    ring: *Ring,
+    dns_resolver: ?*@import("../io/dns.zig").DnsResolver,
+    announce_url: []const u8,
+    info_hash: [20]u8,
+) !ScrapeResult {
     if (std.mem.startsWith(u8, announce_url, "udp://")) {
         return scrapeUdp(allocator, ring, announce_url, info_hash);
     }
-    return scrapeHttp(allocator, ring, announce_url, info_hash);
+    return scrapeHttpWithDns(allocator, ring, dns_resolver, announce_url, info_hash);
 }
 
 // ── Response parsing ─────────────────────────────────────

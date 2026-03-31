@@ -44,7 +44,7 @@ This document tracks which syscalls the `varuna` **daemon** uses, which are rout
 | `openat+read+close` | `app.zig` -- `.torrent` file read | Once at startup | Low value |
 | `openat+write+close` | `app.zig` -- `.torrent` file creation | Once per `varuna create` | Low value |
 | `uname` | `probe.zig` -- kernel detection | Once at startup | No equivalent |
-| HTTP stack (multiple) | `announce.zig` via `std.http.Client` | Initial + re-announce | **Biggest remaining blocker**: DNS + TCP + HTTP blocks main thread. Replace with async HTTP or dedicated tracker thread in event loop cycle. |
+| HTTP stack (multiple) | `announce.zig` via `io/http.zig` | Initial + re-announce | **Resolved**: HTTP I/O goes through io_uring. DNS resolution runs on background threads with TTL-based caching (`io/dns.zig`). |
 | `std.Thread.sleep` | ~~`client.zig` progress loop~~ | ~~2s polling~~ | **Resolved**: replaced with condvar + timedWait |
 
 ### Not yet implemented
@@ -140,18 +140,19 @@ Varuna's current minimum kernel is 6.6, which covers everything up to and includ
 
 ## DNS Resolution Notes
 
-`getaddrinfo()` is a blocking call with no io_uring equivalent. Current approach: `std.http.Client` calls it internally for tracker announces. Options for the future:
+`getaddrinfo()` is a blocking call with no io_uring equivalent. **Current approach**: `src/io/dns.zig` provides a `DnsResolver` that:
 
-1. **Threadpool offload**: Run `getaddrinfo()` in a background thread. Simplest approach. Use `io_uring_register_iowq_max_workers` to size the kernel's internal worker pool.
+1. **Short-circuits numeric IPs** (IPv4 and IPv6): parsed inline with no syscall.
+2. **Caches resolved addresses** with a 5-minute TTL and up to 64 entries. LRU eviction on overflow. Thread-safe via mutex.
+3. **Runs `getaddrinfo()` on a background thread** with a 5-second timeout on cache miss. This never blocks the io_uring event loop thread.
 
-2. **c-ares integration**: c-ares is an async DNS library that gives you fd-based sockets to watch. It doesn't use io_uring directly but can be integrated:
-   - c-ares gives you fds via `ares_getsock()`
-   - Submit `IORING_OP_POLL_ADD` on those fds via io_uring
-   - When the poll CQE fires (fd is readable), call `ares_process_fd()` to let c-ares read the response
-   - c-ares fires your callback with the resolved addresses
-   - This is a two-step approach: io_uring wakes you when the fd is readable, then c-ares does a normal `recvmsg` internally. You get io_uring as a poller but not true io_uring receive on the DNS socket.
+The daemon's `TorrentSession` owns a `DnsResolver` instance that is shared across all announce and scrape requests for that torrent. Since tracker hostnames rarely change, the cache eliminates nearly all DNS lookups after the first announce.
 
-3. **Build option**: Future configurable build option to build with c-ares. For now, threadpool offload is simpler and sufficient.
+For callers that don't need caching (e.g., one-off UDP tracker connections), `dns.resolveOnce()` provides the same background-thread-with-timeout pattern without a cache.
+
+**Future options** (not currently needed):
+- **c-ares integration**: async DNS via fd-based sockets, polled with `IORING_OP_POLL_ADD`. More complex, better for high-throughput DHT scenarios.
+- **Build option**: configurable c-ares build flag if the threadpool approach becomes a bottleneck.
 
 ## SHA Hardware Acceleration Notes
 

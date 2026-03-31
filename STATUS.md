@@ -7,7 +7,7 @@ Update it whenever a milestone lands, the near-term backlog changes, or a new op
 
 ### Core Protocol
 - `.torrent` ingestion, bencode parsing, metainfo parsing, info-hash calculation, piece/file layout mapping.
-- HTTP and UDP tracker announce (BEP 15) with compact peer lists, announce-list fallback (BEP 12).
+- HTTP and UDP tracker announce (BEP 15) with compact peer lists, announce-list fallback (BEP 12). Async DNS resolution with TTL-based caching (`src/io/dns.zig`).
 - Tracker scrape (HTTP + UDP): seeders/leechers/snatches queried every 30 minutes.
 - Private tracker support: private flag parsing and enforcement (BEP 27). Per-session key, numwant, compact=1. PEX disabled for private torrents.
 - IPv6 peer support (BEP 7): compact peers6, IPv6-aware connect.
