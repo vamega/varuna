@@ -69,6 +69,15 @@ pub fn percentEncode(allocator: std.mem.Allocator, buf: *std.ArrayList(u8), inpu
     }
 }
 
+/// Format a BEP 52 v2 info-hash (32-byte SHA-256) as a 64-character lowercase
+/// hex string. Returns "" if the hash is null (pure v1 torrent).
+pub fn formatInfoHashV2(v2: ?[32]u8) [64]u8 {
+    if (v2) |hash| {
+        return std.fmt.bytesToHex(hash, .lower);
+    }
+    return [_]u8{'0'} ** 64; // should not be used when null
+}
+
 // ── Tests ─────────────────────────────────────────────────
 
 test "downloading state maps correctly" {
@@ -139,6 +148,21 @@ test "buildMagnetUri without tracker" {
     defer allocator.free(uri);
 
     try std.testing.expectEqualStrings("magnet:?xt=urn:btih:da39a3ee5e6b4b0d3255bfef95601890afd80709&dn=Test", uri);
+}
+
+test "formatInfoHashV2 returns 64-char hex for non-null hash" {
+    var hash: [32]u8 = undefined;
+    // Set hash to 0x00..0x1f for a known pattern
+    for (&hash, 0..) |*b, i| {
+        b.* = @intCast(i);
+    }
+    const hex = formatInfoHashV2(hash);
+    try std.testing.expectEqualStrings("000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f", &hex);
+}
+
+test "formatInfoHashV2 returns zeros for null hash" {
+    const hex = formatInfoHashV2(null);
+    try std.testing.expectEqualStrings("0" ** 64, &hex);
 }
 
 test "percentEncode encodes special characters" {

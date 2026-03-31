@@ -76,6 +76,8 @@ pub const Stats = struct {
     metadata_peers_attempted: u32 = 0,
     /// Number of peers that support ut_metadata.
     metadata_peers_with_metadata: u32 = 0,
+    /// BEP 52: full v2 info-hash (32 bytes, SHA-256). null for pure v1.
+    info_hash_v2: ?[32]u8 = null,
     /// Primary tracker URL (first announce URL). Empty string if none.
     tracker: []const u8 = "",
     /// Total number of tracker URLs configured for this torrent.
@@ -619,6 +621,7 @@ pub const TorrentSession = struct {
             .sequential_download = self.sequential_download,
             .is_private = self.is_private,
             .super_seeding = self.super_seeding,
+            .info_hash_v2 = self.info_hash_v2,
             .scrape_complete = if (self.scrape_result) |sr| sr.complete else 0,
             .scrape_incomplete = if (self.scrape_result) |sr| sr.incomplete else 0,
             .scrape_downloaded = if (self.scrape_result) |sr| sr.downloaded else 0,

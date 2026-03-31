@@ -171,8 +171,9 @@ pub const ApiHandler = struct {
         const el = self.session_manager.shared_event_loop;
         const dl_limit: u64 = if (el) |e| e.getGlobalDlLimit() else 0;
         const ul_limit: u64 = if (el) |e| e.getGlobalUlLimit() else 0;
+        const dht_nodes: usize = if (el) |e| e.getDhtNodeCount() else 0;
 
-        const body = std.fmt.allocPrint(allocator, "{{\"connection_status\":\"connected\",\"dht_nodes\":0,\"dl_info_speed\":{},\"up_info_speed\":{},\"dl_info_data\":{},\"up_info_data\":{},\"dl_rate_limit\":{},\"up_rate_limit\":{}}}", .{ total_dl_speed, total_ul_speed, total_dl_data, total_ul_data, dl_limit, ul_limit }) catch
+        const body = std.fmt.allocPrint(allocator, "{{\"connection_status\":\"connected\",\"dht_nodes\":{},\"dl_info_speed\":{},\"up_info_speed\":{},\"dl_info_data\":{},\"up_info_data\":{},\"dl_rate_limit\":{},\"up_rate_limit\":{}}}", .{ dht_nodes, total_dl_speed, total_ul_speed, total_dl_data, total_ul_data, dl_limit, ul_limit }) catch
             return .{ .status = 500, .body = "{\"error\":\"internal\"}" };
         return .{ .body = body, .owned_body = body };
     }
@@ -714,10 +715,14 @@ pub const ApiHandler = struct {
         const seeding_time: i64 = if (info.state == .seeding) time_active else 0;
         const esc = json_mod.jsonSafe;
 
+        const v2_hex = if (info.info_hash_v2 != null) compat.formatInfoHashV2(info.info_hash_v2) else [_]u8{0} ** 64;
+        const v2_str: []const u8 = if (info.info_hash_v2 != null) &v2_hex else "";
+        const completion_date: i64 = if (info.state == .seeding) info.added_on else -1;
+
         var json = std.ArrayList(u8).empty;
         defer json.deinit(allocator);
 
-        json.print(allocator, "{{\"save_path\":\"{f}\",\"download_path\":\"\",\"creation_date\":{},\"piece_size\":{},\"comment\":\"{f}\",\"created_by\":\"{f}\",\"total_size\":{},\"pieces_have\":{},\"pieces_num\":{},\"dl_speed\":{},\"dl_speed_avg\":0,\"up_speed\":{},\"up_speed_avg\":0,\"dl_limit\":{},\"up_limit\":{},\"eta\":{},\"hash\":\"{s}\",\"infohash_v1\":\"{s}\",\"infohash_v2\":\"\",\"name\":\"{f}\",\"ratio\":{d:.4},\"share_ratio\":{d:.4},\"time_elapsed\":{},\"time_active\":{},\"seeding_time\":{},\"nb_connections\":{},\"nb_connections_limit\":500,\"peers\":{},\"peers_total\":0,\"seeds\":0,\"seeds_total\":0,\"last_seen\":-1,\"reannounce\":0,\"addition_date\":{},\"completion_date\":-1,\"total_downloaded\":{},\"total_downloaded_session\":{},\"total_uploaded\":{},\"total_uploaded_session\":{},\"total_wasted\":0,\"is_private\":{s},\"seq_dl\":{s},\"super_seeding\":{}}}", .{
+        json.print(allocator, "{{\"save_path\":\"{f}\",\"download_path\":\"\",\"creation_date\":{},\"piece_size\":{},\"comment\":\"{f}\",\"created_by\":\"{f}\",\"total_size\":{},\"pieces_have\":{},\"pieces_num\":{},\"dl_speed\":{},\"dl_speed_avg\":0,\"up_speed\":{},\"up_speed_avg\":0,\"dl_limit\":{},\"up_limit\":{},\"eta\":{},\"hash\":\"{s}\",\"infohash_v1\":\"{s}\",\"infohash_v2\":\"{s}\",\"name\":\"{f}\",\"ratio\":{d:.4},\"share_ratio\":{d:.4},\"time_elapsed\":{},\"time_active\":{},\"seeding_time\":{},\"nb_connections\":{},\"nb_connections_limit\":500,\"peers\":{},\"peers_total\":{},\"seeds\":{},\"seeds_total\":{},\"last_seen\":-1,\"reannounce\":0,\"addition_date\":{},\"completion_date\":{},\"total_downloaded\":{},\"total_downloaded_session\":{},\"total_uploaded\":{},\"total_uploaded_session\":{},\"total_wasted\":0,\"is_private\":{s},\"seq_dl\":{s},\"super_seeding\":{}}}", .{
             esc(info.save_path),
             info.creation_date,
             info.piece_size,
@@ -733,6 +738,7 @@ pub const ApiHandler = struct {
             info.eta,
             info.info_hash_hex,
             info.info_hash_hex,
+            v2_str,
             esc(info.name),
             info.ratio,
             info.ratio,
@@ -740,8 +746,11 @@ pub const ApiHandler = struct {
             time_active,
             seeding_time,
             info.peers_connected,
-            info.peers_connected,
+            info.scrape_incomplete,
+            info.scrape_complete,
+            info.scrape_complete,
             info.added_on,
+            completion_date,
             info.bytes_downloaded,
             info.bytes_downloaded,
             info.bytes_uploaded,
@@ -1335,13 +1344,16 @@ fn serializeTorrentInfo(allocator: std.mem.Allocator, json: *std.ArrayList(u8), 
     defer if (magnet_uri.len > 0) allocator.free(magnet_uri);
 
     // Split into two print calls to stay under the 32-argument limit.
+    const v2_hex = if (stat.info_hash_v2 != null) compat.formatInfoHashV2(stat.info_hash_v2) else [_]u8{0} ** 64;
+    const v2_str: []const u8 = if (stat.info_hash_v2 != null) &v2_hex else "";
     try json.print(
         allocator,
-        "{{\"name\":\"{f}\",\"hash\":\"{s}\",\"infohash_v1\":\"{s}\",\"infohash_v2\":\"\",\"state\":\"{s}\",\"size\":{},\"total_size\":{},\"progress\":{d:.4},\"dlspeed\":{},\"upspeed\":{},\"num_seeds\":{},\"num_leechs\":{},\"num_complete\":{},\"num_incomplete\":{},\"added_on\":{},\"completion_on\":{},\"save_path\":\"{f}\",\"content_path\":\"{f}\",\"download_path\":\"\",\"pieces_have\":{},\"pieces_num\":{},\"dl_limit\":{},\"up_limit\":{},\"eta\":{},\"ratio\":{d:.4},\"seq_dl\":{s},\"private\":{s}",
+        "{{\"name\":\"{f}\",\"hash\":\"{s}\",\"infohash_v1\":\"{s}\",\"infohash_v2\":\"{s}\",\"state\":\"{s}\",\"size\":{},\"total_size\":{},\"progress\":{d:.4},\"dlspeed\":{},\"upspeed\":{},\"num_seeds\":{},\"num_leechs\":{},\"num_complete\":{},\"num_incomplete\":{},\"added_on\":{},\"completion_on\":{},\"save_path\":\"{f}\",\"content_path\":\"{f}\",\"download_path\":\"\",\"pieces_have\":{},\"pieces_num\":{},\"dl_limit\":{},\"up_limit\":{},\"eta\":{},\"ratio\":{d:.4},\"seq_dl\":{s},\"private\":{s}",
         .{
             esc(stat.name),
             stat.info_hash_hex,
             stat.info_hash_hex,
+            v2_str,
             qbt_state,
             stat.total_size,
             stat.total_size,

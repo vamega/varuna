@@ -52,12 +52,12 @@ Update it whenever a milestone lands, the near-term backlog changes, or a new op
 
 ### API (qBittorrent v2 compatible)
 - **Auth**: login/logout with session cookies (SID), 1-hour timeout, configurable credentials.
-- **Core**: webapiVersion, version, buildInfo, preferences (40+ fields), setPreferences (form + JSON), transfer/info (with connection_status, dht_nodes), speedLimitsMode.
-- **Torrents**: info (40+ fields matching qui Torrent interface), add (multipart + raw), delete, pause, resume, properties (30+ fields with hash, name, created_by), files (with index, availability, real piece_range), trackers (with msg field).
+- **Core**: webapiVersion, version, buildInfo, preferences (40+ fields), setPreferences (form + JSON), transfer/info (with connection_status, real DHT node count from routing table), speedLimitsMode.
+- **Torrents**: info (40+ fields matching qui Torrent interface, real infohash_v2 for BEP 52 torrents), add (multipart + raw), delete, pause, resume, properties (30+ fields with hash, name, created_by, creation_date, scrape-based peers_total/seeds_total, v2 info-hash, completion_date), files (with index, availability, real piece_range), trackers (with msg field).
 - **Controls**: filePrio, setSequentialDownload, setDownloadLimit, setUploadLimit, downloadLimit, uploadLimit, forceReannounce, recheck, setLocation, connDiagnostics.
 - **Categories & Tags**: categories (create/edit/remove/list/setCategory), tags (create/delete/addTags/removeTags/list).
-- **Sync**: /api/v2/sync/maindata delta protocol (rid-based, Wyhash change detection, 100-snapshot circular buffer), sync/torrentPeers with real peer data (IP, flags, progress, transfer stats, per-peer dl/ul speed, client name from peer ID).
-- **Compatibility**: qBittorrent state strings (downloading/uploading/pausedDL/pausedUP/etc), CORS headers on all responses, OPTIONS preflight handler, magnet URI generation, percent-encoding, content_path building. Validated against qui (autobrr/qui) TypeScript interfaces.
+- **Sync**: /api/v2/sync/maindata delta protocol (rid-based, Wyhash change detection, 100-snapshot circular buffer, real DHT node count in server_state, infohash_v2 in torrent objects), sync/torrentPeers with real peer data (IP, flags, progress, transfer stats, per-peer dl/ul speed, client name from peer ID).
+- **Compatibility**: qBittorrent state strings (downloading/uploading/pausedDL/pausedUP/etc), CORS headers on all responses, OPTIONS preflight handler, magnet URI generation, percent-encoding, content_path building, HTTP 404 for unknown API paths. Validated against qui (autobrr/qui) TypeScript interfaces. See [docs/api-compatibility.md](docs/api-compatibility.md) for full endpoint coverage and known placeholder fields.
 - **Multipart form-data**: zero-copy parser for Flood/WebUI torrent uploads.
 - **varuna-ctl**: list, add (--save-path), pause, resume, delete (--delete-files), move, conn-diag, version, stats, speed limits (set/get), --username/--password auth.
 
@@ -159,6 +159,7 @@ Update it whenever a milestone lands, the near-term backlog changes, or a new op
 
 ### Operational
 - ~~**Flood/qui WebUI validation**~~: (DONE) populated remaining stub fields (tracker URL, trackers_count, piece_range, content_path, magnet_uri, super_seeding, properties hash/name/created_by), added real peer data to torrentPeers endpoint.
+- ~~**API placeholder cleanup**~~: (DONE) wired real DHT node count into transfer/info and sync/maindata, wired real infohash_v2 (BEP 52) into torrent info/properties/sync, wired scrape data into properties peers_total/seeds_total, parsed creation_date from .torrent files. Documented unsupported endpoints in `docs/api-compatibility.md`.
 
 ## Known Issues
 
@@ -171,6 +172,6 @@ Update it whenever a milestone lands, the near-term backlog changes, or a new op
 - DHT (BEP 5) Phases 1-3
 - BEP 52 (BitTorrent v2 / Hybrid) Phases 1-6 (including runtime Merkle tree cache)
 - MSE/PE (BEP 6) async handshake + auto-fallback
-- All protocol features merged, all API stubs populated
+- All protocol features merged, API placeholder values replaced with real data where available
 - `zig build test`: all tests pass
 - `zig build`: clean build (with `-Dtls=boringssl` default and `-Dtls=none`)

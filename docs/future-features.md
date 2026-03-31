@@ -110,6 +110,10 @@ Remaining work for full production readiness:
 - Automatic MSE fallback: try encrypted first, fall back to plaintext on failure
 - Connection-level MSE initiation before BT handshake in the event loop connect flow
 
+## API Compatibility
+
+See [api-compatibility.md](api-compatibility.md) for the full qBittorrent WebAPI compatibility matrix, including which endpoints are implemented, which return placeholder data, and which are explicitly unsupported or deferred.
+
 ## Will Not Implement
 
 ### Time-based alternative speed scheduling

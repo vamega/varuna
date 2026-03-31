@@ -993,10 +993,16 @@ pub const SessionManager = struct {
         comment: []const u8, // owned, caller must free
         piece_size: u32,
         info_hash_hex: [40]u8 = [_]u8{'0'} ** 40,
+        /// BEP 52: full v2 info-hash (32 bytes). null for pure v1.
+        info_hash_v2: ?[32]u8 = null,
         name: []const u8, // owned, caller must free
         created_by: []const u8, // owned, caller must free
         creation_date: i64,
         trackers_count: u32,
+        /// Tracker scrape: total seeders.
+        scrape_complete: u32 = 0,
+        /// Tracker scrape: total leechers.
+        scrape_incomplete: u32 = 0,
     };
 
     /// Free a PropertiesInfo returned by getSessionProperties().
@@ -1042,10 +1048,13 @@ pub const SessionManager = struct {
             .comment = try allocator.dupe(u8, comment),
             .piece_size = piece_size,
             .info_hash_hex = stats.info_hash_hex,
+            .info_hash_v2 = stats.info_hash_v2,
             .name = try allocator.dupe(u8, name),
             .created_by = try allocator.dupe(u8, created_by),
-            .creation_date = -1, // Not currently stored in metainfo
+            .creation_date = if (meta_opt) |m| m.creation_date else -1,
             .trackers_count = stats.trackers_count,
+            .scrape_complete = stats.scrape_complete,
+            .scrape_incomplete = stats.scrape_incomplete,
         };
     }
 

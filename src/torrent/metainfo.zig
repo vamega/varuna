@@ -23,6 +23,7 @@ pub const Metainfo = struct {
     announce_list: []const []const u8 = &.{},
     comment: ?[]const u8,
     created_by: ?[]const u8,
+    creation_date: i64 = -1,
     name: []const u8,
     piece_length: u32,
     pieces: []const u8 = "", // may be empty for pure v2
@@ -188,6 +189,7 @@ pub fn parse(allocator: std.mem.Allocator, input: []const u8) !Metainfo {
         .announce_list = announce_list,
         .comment = if (bencode.dictGet(root_dict, "comment")) |value| try expectBytes(value) else null,
         .created_by = if (bencode.dictGet(root_dict, "created by")) |value| try expectBytes(value) else null,
+        .creation_date = if (bencode.dictGet(root_dict, "creation date")) |value| @as(i64, @intCast(try expectPositiveU64(value))) else -1,
         .name = name,
         .piece_length = piece_length,
         .pieces = pieces,
