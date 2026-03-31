@@ -80,6 +80,10 @@ pub const Transport = enum {
 pub const PeerState = enum {
     free,
     connecting,
+    mse_handshake_send, // MSE/PE: sending during async MSE handshake (outbound)
+    mse_handshake_recv, // MSE/PE: receiving during async MSE handshake (outbound)
+    mse_resp_send, // MSE/PE: sending during async MSE handshake (inbound responder)
+    mse_resp_recv, // MSE/PE: receiving during async MSE handshake (inbound responder)
     handshake_send,
     handshake_recv,
     extension_handshake_send, // BEP 10: sending extension handshake after peer handshake
@@ -144,6 +148,13 @@ pub const Peer = struct {
 
     // MSE/PE (BEP 6) encryption state
     crypto: mse.PeerCrypto = mse.PeerCrypto.plaintext,
+    // Async MSE handshake state (heap-allocated, freed on completion/disconnect)
+    mse_initiator: ?*mse.MseInitiatorHandshake = null,
+    mse_responder: ?*mse.MseResponderHandshake = null,
+    // Track whether this peer previously rejected MSE (don't retry on reconnect)
+    mse_rejected: bool = false,
+    // Track whether we're in MSE fallback (reconnecting without MSE)
+    mse_fallback: bool = false,
 };
 
 // ── Torrent context (per-torrent state within shared event loop) ──
@@ -501,6 +512,9 @@ pub const EventLoop = struct {
             }
             if (peer.piece_buf) |buf| self.allocator.free(buf);
             if (peer.availability) |*bf| bf.deinit(self.allocator);
+            // Free async MSE handshake state
+            if (peer.mse_initiator) |mi| self.allocator.destroy(mi);
+            if (peer.mse_responder) |mr| self.allocator.destroy(mr);
         }
         self.allocator.free(self.peers);
         // Clean up torrent PEX state
@@ -1272,6 +1286,9 @@ pub const EventLoop = struct {
             ps.deinit(self.allocator);
             self.allocator.destroy(ps);
         }
+        // Free async MSE handshake state
+        if (peer.mse_initiator) |mi| self.allocator.destroy(mi);
+        if (peer.mse_responder) |mr| self.allocator.destroy(mr);
     }
 
     /// Issue shutdown(SHUT_RDWR) on a TCP peer fd for clean disconnect.
