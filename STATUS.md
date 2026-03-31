@@ -14,6 +14,7 @@ Update it whenever a milestone lands, the near-term backlog changes, or a new op
 - BEP 10 Extension Protocol: handshake negotiation, extension message dispatch, advertises ut_metadata and ut_pex (ut_pex omitted for private torrents). Extension handshake includes metadata_size (BEP 9).
 - BEP 11 Peer Exchange (PEX): parse incoming ut_pex messages (added/dropped IPv4/IPv6 peers with flags), build and send outbound PEX messages every ~60s with delta encoding, connect to PEX-discovered peers through existing connection machinery, private torrent enforcement (PEX completely disabled).
 - BEP 9 Magnet Links (ut_metadata): magnet URI parsing (hex + base32 info-hash, dn=, tr= params), metadata download from peers piece-by-piece with SHA-1 verification, metadata serving to peers via event loop, `metadata_fetching` state. CLI: `varuna-ctl add --magnet <uri>`. API: `urls=` param in `/api/v2/torrents/add`.
+- BEP 9 Magnet Link Resilience (`src/net/metadata_fetch.zig`): multi-peer retry (try next peer on disconnect/timeout/reject), per-peer 30s socket timeout (SO_RCVTIMEO/SO_SNDTIMEO), overall 5-minute fetch timeout, peer deduplication, failed-peer retry with backoff (up to 3 attempts), DHT peer provider interface stub (`PeerProvider`), metadata fetch progress reporting (pieces received/total, peers attempted/active/with-metadata, elapsed time, error messages) exposed through `Stats` and API.
 - uTP (BEP 29): packet codec, UtpSocket state machine, LEDBAT congestion control, UtpManager multiplexer, io_uring event loop integration (UDP socket, RECVMSG/SENDMSG, inbound and outbound connections, peer wire protocol bridge, timeout processing, retransmission buffer with owned payload tracking, RTO-based retransmission with exponential backoff, fast retransmit on triple duplicate ACK). 40+ tests.
 - Multi-peer download: rarest-first piece selection, endgame mode, tit-for-tat choking, block pipelining (depth 5).
 - Multi-peer seeding: io_uring event loop, batched block sends, async disk reads with piece cache.
@@ -106,7 +107,7 @@ Update it whenever a milestone lands, the near-term backlog changes, or a new op
 - BEP 52 hash exchange wire protocol (`src/net/hash_exchange.zig`): `hash request` (msg 21), `hashes` (msg 22), `hash reject` (msg 23) message encode/decode. Merkle proof building from tree. Integrated into `src/io/protocol.zig` message dispatch.
 
 ### Testing
-- 19 peer wire protocol tests, 10 BEP 10 extension tests, 15 PEX tests, 31 uTP/LEDBAT tests, 5 categories tests, 9 resume DB tests, 25 MSE/RC4 tests, 13 magnet URI tests, 13 ut_metadata tests.
+- 19 peer wire protocol tests, 10 BEP 10 extension tests, 15 PEX tests, 31 uTP/LEDBAT tests, 5 categories tests, 9 resume DB tests, 25 MSE/RC4 tests, 13 magnet URI tests, 13 ut_metadata tests, 12 metadata fetch resilience tests.
 - Bencode fuzz + edge case tests, HTTP parser fuzz tests.
 - Fuzz tests for: multipart parser, tracker response, uTP packets, BEP 10 extensions, scrape response (18 fuzz tests total).
 - Regression tests for API partial-send progress, unique seed read IDs, seed block-copy batching, shared-event-loop detach on stop, shared-loop preservation on resume, and failed disk-write release.
@@ -128,7 +129,7 @@ Update it whenever a milestone lands, the near-term backlog changes, or a new op
 - ~~**PEX (BEP 11)**~~: (DONE) peer exchange via BEP 10 extensions, delta encoding, private torrent enforcement.
 - **DHT (BEP 5)**: trackerless peer discovery (large feature).
 - ~~**Magnet links (BEP 9)**~~: (DONE) metadata download via ut_metadata extension.
-- **Magnet link resilience**: retry metadata from multiple peers, parallel piece requests, DHT fallback for trackerless magnets.
+- ~~**Magnet link resilience**~~: (DONE) multi-peer retry with per-peer/overall timeouts, DHT peer provider interface stub, metadata fetch progress reporting via Stats/API.
 - ~~**MSE encryption (BEP 6)**~~: (DONE) message stream encryption/obfuscation.
 - ~~**BEP 52 Phase 4**~~: (DONE) peer wire handshake dual info-hash matching, tracker announce with v2 info-hash, resume DB v2 info-hash column, TorrentSession v2 hash propagation.
 - ~~**BEP 52 Phase 5**~~: (DONE) hash request/hashes/hash reject message encode/decode, Merkle proof building from tree, protocol handler integration. Runtime Merkle tree caching for hash serving deferred.
@@ -144,5 +145,6 @@ Update it whenever a milestone lands, the near-term backlog changes, or a new op
 ## Last Verified Milestone
 
 - BEP 52 (BitTorrent v2 / Hybrid) Phase 1-5: version detection, file tree parsing, Merkle tree, v2 info-hash, file-aligned layout, dual-hash verification, dual info-hash handshake matching, tracker v2 announce, resume DB v2 hash, hash exchange wire protocol
+- BEP 9 magnet link resilience: multi-peer retry, per-peer/overall timeouts, DHT stub, progress reporting
 - `zig build test`: all tests pass
 - `zig build`: clean build
