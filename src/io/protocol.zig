@@ -6,6 +6,8 @@ const ext = @import("../net/extensions.zig");
 const pex_mod = @import("../net/pex.zig");
 const ut_metadata = @import("../net/ut_metadata.zig");
 const hash_exchange = @import("../net/hash_exchange.zig");
+const merkle = @import("../torrent/merkle.zig");
+const merkle_cache = @import("../torrent/merkle_cache.zig");
 const info_hash_mod = @import("../torrent/info_hash.zig");
 const Bitfield = @import("../bitfield.zig").Bitfield;
 const EventLoop = @import("event_loop.zig").EventLoop;
@@ -583,12 +585,184 @@ fn handleHashRequest(self: *EventLoop, slot: u16, payload: []const u8) void {
         return;
     }
 
-    // For now, send hash reject since we don't have per-file Merkle trees
-    // readily available at runtime (they would need to be built from piece
-    // data or cached). The Merkle tree construction infrastructure exists in
-    // src/torrent/merkle.zig but runtime caching is deferred.
-    // TODO: cache per-file Merkle trees in TorrentContext for hash serving.
-    sendHashReject(self, slot, req);
+    const file_tree_v2 = session.metainfo.file_tree_v2 orelse {
+        sendHashReject(self, slot, req);
+        return;
+    };
+
+    // Validate file index
+    if (req.file_index >= file_tree_v2.len) {
+        log.debug("slot {d}: hash request file_index {d} out of range (max {d})", .{
+            slot, req.file_index, file_tree_v2.len,
+        });
+        sendHashReject(self, slot, req);
+        return;
+    }
+
+    // Lazily initialize the Merkle cache if not yet created
+    if (tc.merkle_cache == null) {
+        self.initMerkleCache(peer.torrent_id);
+    }
+
+    const mc = tc.merkle_cache orelse {
+        sendHashReject(self, slot, req);
+        return;
+    };
+
+    // Check if we have a cached tree for this file
+    if (mc.getTree(req.file_index)) |tree| {
+        // Cache hit: build and send the hashes response
+        sendHashesFromTree(self, slot, tree, req);
+        return;
+    }
+
+    // Tree not cached yet. Check if all pieces for this file are complete.
+    const complete = tc.complete_pieces orelse {
+        sendHashReject(self, slot, req);
+        return;
+    };
+
+    if (!mc.isFileComplete(req.file_index, complete)) {
+        // File not complete -- cannot build tree
+        log.debug("slot {d}: hash request for incomplete file {d}", .{ slot, req.file_index });
+        sendHashReject(self, slot, req);
+        return;
+    }
+
+    // File is complete. Build piece hashes by reading piece data and hashing.
+    // We need the piece hashes for this file to build the Merkle tree.
+    const range = mc.filePieceRange(req.file_index) orelse {
+        sendHashReject(self, slot, req);
+        return;
+    };
+
+    // Compute SHA-256 piece hashes from the v2 piece hashes stored in the
+    // torrent metadata. For v2, the leaf hashes of the Merkle tree ARE the
+    // per-piece SHA-256 hashes. When we verified pieces during download, we
+    // computed these. We need to reconstruct them from disk or from cached
+    // verification data.
+    //
+    // Strategy: use the hasher infrastructure to read piece data from disk
+    // and compute hashes. However, this is a synchronous operation in the
+    // event loop context. For now, we compute hashes inline for files with
+    // a reasonable number of pieces (< 4096). For larger files, we reject
+    // and rely on pre-built cache.
+    if (range.count > 4096) {
+        log.debug("slot {d}: hash request for large file {d} ({d} pieces) -- too many for inline hashing", .{
+            slot, req.file_index, range.count,
+        });
+        sendHashReject(self, slot, req);
+        return;
+    }
+
+    // Build piece hashes from the layout's stored v2 piece hash data.
+    // For BEP 52, the leaf hashes in the Merkle tree are SHA-256 of piece data.
+    // We need to read piece data from disk and hash each piece.
+    // Since this is expensive, we build the tree once and cache it.
+    const piece_hashes = buildPieceHashesFromDisk(
+        self.allocator,
+        session,
+        tc.shared_fds,
+        range.first,
+        range.count,
+    ) orelse {
+        log.debug("slot {d}: failed to build piece hashes for file {d}", .{ slot, req.file_index });
+        sendHashReject(self, slot, req);
+        return;
+    };
+    defer self.allocator.free(piece_hashes);
+
+    // Build and cache the Merkle tree
+    const tree = mc.buildAndCache(req.file_index, piece_hashes) catch |err| {
+        log.debug("slot {d}: failed to build Merkle tree for file {d}: {s}", .{
+            slot, req.file_index, @errorName(err),
+        });
+        sendHashReject(self, slot, req);
+        return;
+    };
+
+    sendHashesFromTree(self, slot, tree, req);
+}
+
+/// Build SHA-256 piece hashes by reading piece data from disk.
+/// Returns an allocated slice of [32]u8 hashes, or null on failure.
+fn buildPieceHashesFromDisk(
+    allocator: std.mem.Allocator,
+    session: *const @import("../torrent/session.zig").Session,
+    shared_fds: []const std.posix.fd_t,
+    first_piece: u32,
+    piece_count: u32,
+) ?[][32]u8 {
+    const hashes = allocator.alloc([32]u8, piece_count) catch return null;
+    errdefer allocator.free(hashes);
+
+    const Sha256 = std.crypto.hash.sha2.Sha256;
+
+    for (0..piece_count) |i| {
+        const global_piece = first_piece + @as(u32, @intCast(i));
+        const piece_size = session.layout.pieceSize(global_piece) catch return null;
+
+        // Allocate a buffer for the piece data
+        const buf = allocator.alloc(u8, piece_size) catch return null;
+        defer allocator.free(buf);
+
+        // Read piece data from disk using pread (acceptable for one-time tree building)
+        var span_buf: [8]@import("../torrent/layout.zig").Layout.Span = undefined;
+        const spans = session.layout.mapPiece(global_piece, &span_buf) catch return null;
+
+        var total_read: usize = 0;
+        for (spans) |span| {
+            if (span.file_index >= shared_fds.len) return null;
+            const fd = shared_fds[span.file_index];
+            if (fd < 0) return null;
+
+            const dest = buf[span.piece_offset..][0..span.length];
+            const n = std.posix.pread(fd, dest, span.file_offset) catch return null;
+            if (n != span.length) return null;
+            total_read += n;
+        }
+
+        if (total_read != piece_size) return null;
+
+        // SHA-256 hash of the piece data
+        var digest: [32]u8 = undefined;
+        Sha256.hash(buf, &digest, .{});
+        hashes[i] = digest;
+    }
+
+    return hashes;
+}
+
+/// Build and send a hashes response from a cached Merkle tree.
+fn sendHashesFromTree(
+    self: *EventLoop,
+    slot: u16,
+    tree: *const merkle.MerkleTree,
+    req: hash_exchange.HashRequest,
+) void {
+    const resp = hash_exchange.buildHashesFromTree(self.allocator, tree, req) catch {
+        sendHashReject(self, slot, req);
+        return;
+    } orelse {
+        sendHashReject(self, slot, req);
+        return;
+    };
+    defer hash_exchange.freeHashesResponse(self.allocator, resp);
+
+    // Encode and send the hashes response
+    const resp_payload = hash_exchange.encodeHashesResponse(self.allocator, resp) catch {
+        sendHashReject(self, slot, req);
+        return;
+    };
+    defer self.allocator.free(resp_payload);
+
+    log.debug("slot {d}: sending hashes file={d} layer={d} index={d} count={d} proof={d}", .{
+        slot, resp.file_index, resp.base_layer, resp.index, resp.length, resp.proof_layers,
+    });
+
+    submitMessage(self, slot, hash_exchange.msg_hashes, resp_payload) catch {
+        log.debug("slot {d}: failed to send hashes response", .{slot});
+    };
 }
 
 /// Handle an incoming hashes response (msg_type 22).

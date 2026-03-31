@@ -16,6 +16,7 @@ const utp_mgr = @import("../net/utp_manager.zig");
 const mse = @import("../crypto/mse.zig");
 const SuperSeedState = @import("super_seed.zig").SuperSeedState;
 const HugePageCache = @import("../storage/huge_page_cache.zig").HugePageCache;
+const MerkleCache = @import("../torrent/merkle_cache.zig").MerkleCache;
 
 // Sub-modules: focused implementations that operate on *EventLoop
 const peer_handler = @import("peer_handler.zig");
@@ -200,6 +201,9 @@ pub const TorrentContext = struct {
 
     // BEP 16: super-seeding state (null if super-seeding is disabled)
     super_seed: ?*SuperSeedState = null,
+
+    // BEP 52: per-file Merkle tree cache for hash serving
+    merkle_cache: ?*MerkleCache = null,
 };
 
 // ── Event loop ────────────────────────────────────────────
@@ -636,6 +640,30 @@ pub const EventLoop = struct {
         self.complete_pieces = cp;
     }
 
+    /// Initialize the BEP 52 Merkle tree cache for a v2/hybrid torrent.
+    /// Must be called after the torrent is added and has a valid session.
+    /// Safe to call for v1 torrents (no-op) or multiple times (idempotent).
+    pub fn initMerkleCache(self: *EventLoop, torrent_id: u8) void {
+        const tc = self.getTorrentContext(torrent_id) orelse return;
+        if (tc.merkle_cache != null) return; // already initialized
+
+        const session = tc.session orelse return;
+        if (!session.metainfo.hasV2()) return;
+        const v2_files = session.metainfo.file_tree_v2 orelse return;
+
+        const mc = self.allocator.create(MerkleCache) catch return;
+        mc.* = MerkleCache.init(
+            self.allocator,
+            &session.layout,
+            v2_files,
+            32, // cache up to 32 trees by default
+        ) catch {
+            self.allocator.destroy(mc);
+            return;
+        };
+        tc.merkle_cache = mc;
+    }
+
     /// Ensure the event loop is accepting inbound connections.
     /// Safe to call multiple times -- only sets up accepting once.
     pub fn ensureAccepting(self: *EventLoop, listen_fd: posix.fd_t) !void {
@@ -702,6 +730,12 @@ pub const EventLoop = struct {
                 ss.deinit();
                 self.allocator.destroy(ss);
                 tc.super_seed = null;
+            }
+            // Clean up BEP 52 Merkle tree cache
+            if (tc.merkle_cache) |mc| {
+                mc.deinit();
+                self.allocator.destroy(mc);
+                tc.merkle_cache = null;
             }
         }
         self.torrents[torrent_id] = null;
