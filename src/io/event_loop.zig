@@ -1087,12 +1087,26 @@ pub const EventLoop = struct {
                 }
             }
         }
-        if (peer.fd >= 0) posix.close(peer.fd);
+        if (peer.fd >= 0) {
+            // Clean TCP shutdown before close -- signal peer we are done,
+            // allowing them to drain any buffered data (IORING_OP_SHUTDOWN).
+            if (peer.transport == .tcp) {
+                self.shutdownPeerFd(peer.fd);
+            }
+            posix.close(peer.fd);
+        }
         if (peer.body_is_heap) {
             if (peer.body_buf) |buf| self.allocator.free(buf);
         }
         if (peer.piece_buf) |buf| self.allocator.free(buf);
         if (peer.availability) |*bf| bf.deinit(self.allocator);
+    }
+
+    /// Issue shutdown(SHUT_RDWR) on a TCP peer fd for clean disconnect.
+    /// Uses conventional syscall since this is a cleanup path (not hot path).
+    /// Best-effort: errors do not prevent close().
+    fn shutdownPeerFd(_: *EventLoop, fd: posix.fd_t) void {
+        _ = linux.shutdown(fd, linux.SHUT.RDWR);
     }
 };
 

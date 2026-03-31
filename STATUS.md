@@ -33,6 +33,7 @@ Update it whenever a milestone lands, the near-term backlog changes, or a new op
 - Lifetime transfer stats: total_uploaded/total_downloaded persisted to SQLite, loaded as baseline on startup so share ratio survives daemon restarts.
 - Categories and tags persisted to SQLite (write-through on change, load at startup).
 - fdatasync, fallocate pre-allocation via io_uring.
+- io_uring op coverage: shutdown, statx, renameat, unlinkat, send_zc, cancel, timeout, link_timeout, fixed buffers (READ_FIXED/WRITE_FIXED with registered buffer pool).
 
 ### Configuration
 - TOML config file with daemon, storage, network, performance sections. XDG config path support.
@@ -81,6 +82,7 @@ Update it whenever a milestone lands, the near-term backlog changes, or a new op
 - Bencode fuzz + edge case tests, HTTP parser fuzz tests.
 - Fuzz tests for: multipart parser, tracker response, uTP packets, BEP 10 extensions, scrape response (18 fuzz tests total).
 - Regression tests for API partial-send progress, unique seed read IDs, seed block-copy batching, shared-event-loop detach on stop, shared-loop preservation on resume, and failed disk-write release.
+- 10 io_uring Ring tests: pread/pwrite roundtrip, short reads, probe, shutdown, statx, renameat, unlinkat, cancel, timeout, link_timeout, send_zc, fixed buffer roundtrip.
 - Transfer test matrix: 24 tests (1KB-100MB, 16KB/64KB/256KB pieces, multi-file torrents). All pass.
 - Daemon swarm integration test, daemon-to-peer seeding test, selective download integration test.
 - SHA-1 benchmarks: std vs SHA-NI vs direct vs memory bandwidth baseline.
