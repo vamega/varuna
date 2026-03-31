@@ -241,28 +241,21 @@ pub fn download(
     }
     if (tracker_urls.items.len == 0) return error.MissingAnnounceUrl;
 
-    // Try each tracker until one returns peers (using io_uring HTTP client)
-    var announce_url: []const u8 = tracker_urls.items[0];
-    var announce_response: ?tracker.announce.Response = null;
-    for (tracker_urls.items) |url| {
-        const resp = tracker.announce.fetchAuto(allocator, &ring, .{
-            .announce_url = url,
+    // BEP 12: announce to all tiers simultaneously. First successful response wins.
+    const multi_result = try tracker.multi_announce.announceParallel(
+        allocator,
+        tracker_urls.items,
+        .{
+            .announce_url = "", // overridden per-URL inside announceParallel
             .info_hash = session.metainfo.info_hash,
             .peer_id = options.peer_id,
             .port = options.port,
             .left = bytes_left,
             .key = session_key,
-        }) catch continue;
-
-        if (resp.peers.len > 0) {
-            announce_url = url;
-            announce_response = resp;
-            break;
-        }
-        tracker.announce.freeResponse(allocator, resp);
-    }
-
-    const response = announce_response orelse return error.NoPeersAvailable;
+        },
+    );
+    const response = multi_result.response;
+    const announce_url = tracker_urls.items[multi_result.url_index];
     defer tracker.announce.freeResponse(allocator, response);
 
     try logStatus(options.status_writer, "peers={}\n", .{response.peers.len});

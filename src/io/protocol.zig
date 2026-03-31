@@ -58,6 +58,17 @@ pub fn processMessage(self: *EventLoop, slot: u16) void {
                 peer.availability_known = true;
                 if (self.getTorrentContext(peer.torrent_id)) |tc| {
                     if (tc.piece_tracker) |pt| pt.addAvailability(piece_index);
+                    // BEP 16: track piece distribution for super-seeding
+                    if (tc.super_seed) |ss| {
+                        ss.recordPeerHave(piece_index);
+                        // After a peer reports having a piece, send them
+                        // the next piece they should download.
+                        if (ss.pickPieceForPeer(slot, peer.availability)) |next_piece| {
+                            var have_payload: [4]u8 = undefined;
+                            std.mem.writeInt(u32, &have_payload, next_piece, .big);
+                            submitMessage(self, slot, 4, &have_payload) catch {};
+                        }
+                    }
                 }
                 self.markIdle(slot);
             }
@@ -481,9 +492,38 @@ pub fn sendInterestedAndGoActive(self: *EventLoop, slot: u16) void {
 }
 
 /// Helper: send bitfield (if available) then unchoke for an inbound seed peer.
+/// In BEP 16 super-seed mode, sends individual HAVE messages instead of a
+/// full bitfield to control which pieces each peer sees.
 pub fn sendInboundBitfieldOrUnchoke(self: *EventLoop, slot: u16) void {
     const peer = &self.peers[slot];
     const tc_bp = self.getTorrentContext(peer.torrent_id);
+
+    // BEP 16: super-seed mode -- send a single HAVE instead of bitfield
+    if (tc_bp) |tc| {
+        if (tc.super_seed) |ss| {
+            ss.addPeer(slot);
+            if (ss.pickPieceForPeer(slot, peer.availability)) |piece_idx| {
+                // Send HAVE message (id=4, 4-byte big-endian piece index)
+                var have_payload: [4]u8 = undefined;
+                std.mem.writeInt(u32, &have_payload, piece_idx, .big);
+                peer.state = .inbound_bitfield_send; // reuse state for flow
+                submitMessage(self, slot, 4, &have_payload) catch {
+                    self.removePeer(slot);
+                    return;
+                };
+            } else {
+                // No useful piece to advertise, go straight to unchoke
+                peer.state = .inbound_unchoke_send;
+                peer.am_choking = false;
+                submitMessage(self, slot, 1, &.{}) catch {
+                    self.removePeer(slot);
+                };
+            }
+            return;
+        }
+    }
+
+    // Normal mode: send full bitfield
     if ((if (tc_bp) |t| t.complete_pieces else null) orelse self.complete_pieces) |cp| {
         peer.state = .inbound_bitfield_send;
         submitMessage(self, slot, 5, cp.bits) catch {

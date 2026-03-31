@@ -378,6 +378,15 @@ pub const SessionManager = struct {
         _ = session.applyFilePriorities();
     }
 
+    /// Enable or disable BEP 16 super-seeding for a torrent.
+    pub fn setSuperSeeding(self: *SessionManager, hash: []const u8, enabled: bool) !void {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+
+        const session = self.sessions.get(hash) orelse return error.TorrentNotFound;
+        session.setSuperSeeding(enabled);
+    }
+
     /// Force re-announce to tracker for a torrent.
     pub fn forceReannounce(self: *SessionManager, hash: []const u8) !void {
         self.mutex.lock();
@@ -862,6 +871,7 @@ pub const SessionManager = struct {
         bytes_uploaded: u64,
         sequential_download: bool,
         is_private: bool,
+        super_seeding: bool,
         save_path: []const u8, // owned, caller must free
         comment: []const u8, // owned, caller must free
         piece_size: u32,
@@ -900,6 +910,7 @@ pub const SessionManager = struct {
             .bytes_uploaded = stats.bytes_uploaded,
             .sequential_download = stats.sequential_download,
             .is_private = stats.is_private,
+            .super_seeding = stats.super_seeding,
             .save_path = try allocator.dupe(u8, stats.save_path),
             .comment = try allocator.dupe(u8, comment),
             .piece_size = piece_size,

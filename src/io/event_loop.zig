@@ -14,6 +14,8 @@ const socket_util = @import("../net/socket.zig");
 const utp_mod = @import("../net/utp.zig");
 const utp_mgr = @import("../net/utp_manager.zig");
 const mse = @import("../crypto/mse.zig");
+const SuperSeedState = @import("super_seed.zig").SuperSeedState;
+const HugePageCache = @import("../storage/huge_page_cache.zig").HugePageCache;
 
 // Sub-modules: focused implementations that operate on *EventLoop
 const peer_handler = @import("peer_handler.zig");
@@ -178,6 +180,9 @@ pub const TorrentContext = struct {
 
     // BEP 11 PEX state (per-torrent, tracks currently connected peers)
     pex_state: ?*pex_mod.TorrentPexState = null,
+
+    // BEP 16: super-seeding state (null if super-seeding is disabled)
+    super_seed: ?*SuperSeedState = null,
 };
 
 // ── Event loop ────────────────────────────────────────────
@@ -238,6 +243,7 @@ pub const EventLoop = struct {
         read_buf: []u8,
         piece_size: u32,
         reads_remaining: u32, // number of successfully submitted read CQEs still pending
+        from_pool: bool = false, // true if read_buf is from huge page pool (don't free)
     };
 
     ring: linux.IoUring,
@@ -304,6 +310,12 @@ pub const EventLoop = struct {
     cached_piece_index: ?u32 = null,
     cached_piece_data: ?[]u8 = null,
     cached_piece_len: usize = 0,
+    cached_piece_from_pool: bool = false, // true if from huge page pool (don't free)
+
+    // Huge page piece cache buffer pool (optional, configured at init time).
+    // When allocated, piece read buffers are served from this pool instead
+    // of the general-purpose allocator. Reduces TLB pressure for large torrents.
+    huge_page_cache: ?HugePageCache = null,
 
     // Queued piece block responses (batched per tick, flushed after CQE dispatch)
     queued_responses: std.ArrayList(QueuedBlockResponse),
@@ -455,7 +467,12 @@ pub const EventLoop = struct {
         // ── Phase 3: Free all buffers ────────────────────────────
         // Now that the kernel has completed all pending operations,
         // it is safe to free the buffers they referenced.
-        if (self.cached_piece_data) |d| self.allocator.free(d);
+        // Free piece cache (only if not from huge page pool)
+        if (self.cached_piece_data) |d| {
+            if (!self.cached_piece_from_pool) self.allocator.free(d);
+        }
+        // Free huge page cache pool
+        if (self.huge_page_cache) |*hpc| hpc.deinit();
         {
             var it = self.pending_writes.valueIterator();
             while (it.next()) |pending| {
@@ -468,7 +485,7 @@ pub const EventLoop = struct {
         }
         self.pending_sends.deinit(self.allocator);
         for (self.pending_reads.items) |pr| {
-            self.allocator.free(pr.read_buf);
+            if (!pr.from_pool) self.allocator.free(pr.read_buf);
         }
         self.pending_reads.deinit(self.allocator);
         for (self.queued_responses.items) |resp| {
@@ -646,6 +663,12 @@ pub const EventLoop = struct {
             if (tc.pex_state) |tps| {
                 tps.deinit(self.allocator);
                 self.allocator.destroy(tps);
+            }
+            // Clean up BEP 16 super-seed state
+            if (tc.super_seed) |ss| {
+                ss.deinit();
+                self.allocator.destroy(ss);
+                tc.super_seed = null;
             }
         }
         self.torrents[torrent_id] = null;
@@ -832,6 +855,10 @@ pub const EventLoop = struct {
                 }
             }
         }
+        // BEP 16: clean up super-seed tracking for this peer
+        if (self.getTorrentContext(peer.torrent_id)) |tc| {
+            if (tc.super_seed) |ss| ss.removePeer(slot);
+        }
         self.unmarkIdle(slot);
 
         // Free any tracked send buffers before closing the fd.  After
@@ -968,6 +995,51 @@ pub const EventLoop = struct {
         if (torrent_id >= max_torrents) return 0;
         const tc = self.torrents[torrent_id] orelse return 0;
         return tc.rate_limiter.upload.rate;
+    }
+
+    /// Enable BEP 16 super-seeding for a torrent. The seeder will send
+    /// individual HAVE messages instead of a full bitfield, tracking
+    /// which pieces each peer has seen to maximize piece diversity.
+    pub fn enableSuperSeed(self: *EventLoop, torrent_id: u8) !void {
+        const tc = self.getTorrentContext(torrent_id) orelse return error.TorrentNotFound;
+        if (tc.super_seed != null) return; // already enabled
+        const sess = tc.session orelse return error.NoSession;
+
+        const ss = try self.allocator.create(SuperSeedState);
+        ss.* = try SuperSeedState.init(self.allocator, try sess.metainfo.pieceCount());
+        tc.super_seed = ss;
+    }
+
+    /// Disable BEP 16 super-seeding for a torrent.
+    pub fn disableSuperSeed(self: *EventLoop, torrent_id: u8) void {
+        const tc = self.getTorrentContext(torrent_id) orelse return;
+        if (tc.super_seed) |ss| {
+            ss.deinit();
+            self.allocator.destroy(ss);
+            tc.super_seed = null;
+        }
+    }
+
+    /// Check if super-seeding is enabled for a torrent.
+    pub fn isSuperSeedEnabled(self: *const EventLoop, torrent_id: u8) bool {
+        if (torrent_id >= max_torrents) return false;
+        const tc = self.torrents[torrent_id] orelse return false;
+        return tc.super_seed != null;
+    }
+
+    /// Configure the huge page piece cache. Call after init, before tick.
+    /// `capacity` is the desired cache size in bytes (0 = default 64 MB).
+    /// `use_huge_pages` controls whether MAP_HUGETLB is attempted.
+    pub fn initHugePageCache(self: *EventLoop, capacity: u64, use_huge_pages: bool) void {
+        const default_cache_size: usize = 64 * 1024 * 1024; // 64 MB
+        const size: usize = if (capacity > 0) @intCast(@min(capacity, 1 << 32)) else default_cache_size;
+        self.huge_page_cache = HugePageCache.init(size, use_huge_pages);
+        if (self.huge_page_cache.?.isAllocated()) {
+            log.info("piece cache: {d} MB ({s})", .{
+                self.huge_page_cache.?.capacity / (1024 * 1024),
+                if (self.huge_page_cache.?.using_huge_pages) "huge pages" else "regular pages",
+            });
+        }
     }
 
     /// Check if a download of `amount` bytes is allowed by both per-torrent

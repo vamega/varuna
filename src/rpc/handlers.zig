@@ -229,6 +229,10 @@ pub const ApiHandler = struct {
             return self.handleTorrentsForceReannounce(allocator, body);
         }
 
+        if (std.mem.eql(u8, action_name, "setSuperSeeding") and std.mem.eql(u8, method, "POST")) {
+            return self.handleTorrentsSetSuperSeeding(allocator, body);
+        }
+
         if (std.mem.eql(u8, action_name, "recheck") and std.mem.eql(u8, method, "POST")) {
             return self.handleTorrentsRecheck(allocator, body);
         }
@@ -447,6 +451,10 @@ pub const ApiHandler = struct {
             .disabled => 2,
         } else 0;
 
+        const has_hpc = if (el) |e| e.huge_page_cache != null else false;
+        const hpc_allocated = if (el) |e| (if (e.huge_page_cache) |*hpc| hpc.isAllocated() else false) else false;
+        const hpc_using_huge = if (el) |e| (if (e.huge_page_cache) |hpc| hpc.using_huge_pages else false) else false;
+
         const body = std.fmt.allocPrint(allocator,
             \\{{"dl_limit":{},"up_limit":{},"alt_dl_limit":0,"alt_up_limit":0,
             \\"save_path":"{f}","temp_path":"","temp_path_enabled":false,
@@ -470,8 +478,9 @@ pub const ApiHandler = struct {
             \\"max_seeding_time_enabled":false,"max_seeding_time":-1,
             \\"auto_tmm_enabled":false,"save_resume_data_interval":60,
             \\"start_paused_enabled":false,
-            \\"dht":false,"pex":false,"lsd":false,"encryption":{},"anonymous_mode":false}}
-        , .{ dl_limit, ul_limit, esc(save_path), enc_mode }) catch
+            \\"dht":false,"pex":false,"lsd":false,"encryption":{},"anonymous_mode":false,
+            \\"piece_cache_enabled":{},"piece_cache_allocated":{},"piece_cache_huge_pages":{}}}
+        , .{ dl_limit, ul_limit, esc(save_path), enc_mode, @as(u8, if (has_hpc) 1 else 0), @as(u8, if (hpc_allocated) 1 else 0), @as(u8, if (hpc_using_huge) 1 else 0) }) catch
             return .{ .status = 500, .body = "{\"error\":\"internal\"}" };
         return .{ .body = body, .owned_body = body };
     }
@@ -652,7 +661,7 @@ pub const ApiHandler = struct {
         var json = std.ArrayList(u8).empty;
         defer json.deinit(allocator);
 
-        json.print(allocator, "{{\"save_path\":\"{f}\",\"download_path\":\"\",\"creation_date\":-1,\"piece_size\":{},\"comment\":\"{f}\",\"created_by\":\"\",\"total_size\":{},\"pieces_have\":{},\"pieces_num\":{},\"dl_speed\":{},\"dl_speed_avg\":0,\"up_speed\":{},\"up_speed_avg\":0,\"dl_limit\":{},\"up_limit\":{},\"eta\":{},\"hash\":\"\",\"infohash_v1\":\"\",\"infohash_v2\":\"\",\"name\":\"\",\"ratio\":{d:.4},\"share_ratio\":{d:.4},\"time_elapsed\":{},\"time_active\":{},\"seeding_time\":{},\"nb_connections\":{},\"nb_connections_limit\":500,\"peers\":{},\"peers_total\":0,\"seeds\":0,\"seeds_total\":0,\"last_seen\":-1,\"reannounce\":0,\"addition_date\":{},\"completion_date\":-1,\"total_downloaded\":{},\"total_downloaded_session\":{},\"total_uploaded\":{},\"total_uploaded_session\":{},\"total_wasted\":0,\"is_private\":{s},\"seq_dl\":{s}}}", .{
+        json.print(allocator, "{{\"save_path\":\"{f}\",\"download_path\":\"\",\"creation_date\":-1,\"piece_size\":{},\"comment\":\"{f}\",\"created_by\":\"\",\"total_size\":{},\"pieces_have\":{},\"pieces_num\":{},\"dl_speed\":{},\"dl_speed_avg\":0,\"up_speed\":{},\"up_speed_avg\":0,\"dl_limit\":{},\"up_limit\":{},\"eta\":{},\"hash\":\"\",\"infohash_v1\":\"\",\"infohash_v2\":\"\",\"name\":\"\",\"ratio\":{d:.4},\"share_ratio\":{d:.4},\"time_elapsed\":{},\"time_active\":{},\"seeding_time\":{},\"nb_connections\":{},\"nb_connections_limit\":500,\"peers\":{},\"peers_total\":0,\"seeds\":0,\"seeds_total\":0,\"last_seen\":-1,\"reannounce\":0,\"addition_date\":{},\"completion_date\":-1,\"total_downloaded\":{},\"total_downloaded_session\":{},\"total_uploaded\":{},\"total_uploaded_session\":{},\"total_wasted\":0,\"is_private\":{s},\"seq_dl\":{s},\"super_seeding\":{}}}", .{
             esc(info.save_path),
             info.piece_size,
             esc(info.comment),
@@ -678,6 +687,7 @@ pub const ApiHandler = struct {
             info.bytes_uploaded,
             @as([]const u8, if (info.is_private) "true" else "false"),
             @as([]const u8, if (info.sequential_download) "true" else "false"),
+            @as(u8, if (info.super_seeding) 1 else 0),
         }) catch return .{ .status = 500, .body = "{\"error\":\"internal\"}" };
 
         const result = json.toOwnedSlice(allocator) catch return .{ .status = 500, .body = "{\"error\":\"internal\"}" };
@@ -732,6 +742,23 @@ pub const ApiHandler = struct {
         const enabled = std.mem.eql(u8, value_str, "true");
 
         self.session_manager.setSequentialDownload(hash, enabled) catch |err| {
+            const msg = std.fmt.allocPrint(allocator, "{{\"error\":\"{s}\"}}", .{@errorName(err)}) catch
+                return .{ .status = 500, .body = "{\"error\":\"internal\"}" };
+            return .{ .status = 404, .body = msg, .owned_body = msg };
+        };
+
+        return .{ .body = "{\"status\":\"ok\"}" };
+    }
+
+    fn handleTorrentsSetSuperSeeding(self: *const ApiHandler, allocator: std.mem.Allocator, body: []const u8) server.Response {
+        const hash = extractParam(body, "hashes") orelse (extractParam(body, "hash") orelse
+            return .{ .status = 400, .body = "{\"error\":\"missing hash\"}" });
+        const value_str = extractParam(body, "value") orelse
+            return .{ .status = 400, .body = "{\"error\":\"missing value\"}" };
+
+        const enabled = std.mem.eql(u8, value_str, "true");
+
+        self.session_manager.setSuperSeeding(hash, enabled) catch |err| {
             const msg = std.fmt.allocPrint(allocator, "{{\"error\":\"{s}\"}}", .{@errorName(err)}) catch
                 return .{ .status = 500, .body = "{\"error\":\"internal\"}" };
             return .{ .status = 404, .body = msg, .owned_body = msg };

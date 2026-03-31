@@ -3,6 +3,7 @@ pub const event_loop = @import("event_loop.zig");
 pub const peer_handler = @import("peer_handler.zig");
 pub const protocol = @import("protocol.zig");
 pub const seed_handler = @import("seed_handler.zig");
+pub const super_seed = @import("super_seed.zig");
 pub const peer_policy = @import("peer_policy.zig");
 pub const utp_handler = @import("utp_handler.zig");
 pub const hasher = @import("hasher.zig");
