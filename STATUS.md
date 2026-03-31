@@ -7,7 +7,7 @@ Update it whenever a milestone lands, the near-term backlog changes, or a new op
 
 ### Core Protocol
 - `.torrent` ingestion, bencode parsing, metainfo parsing, info-hash calculation, piece/file layout mapping.
-- HTTP and UDP tracker announce (BEP 15) with compact peer lists, announce-list fallback (BEP 12).
+- HTTP and UDP tracker announce (BEP 15) with compact peer lists, multi-tracker simultaneous announce (BEP 12). All tiers queried in parallel; first successful response wins.
 - Tracker scrape (HTTP + UDP): seeders/leechers/snatches queried every 30 minutes.
 - Private tracker support: private flag parsing and enforcement (BEP 27). Per-session key, numwant, compact=1. PEX disabled for private torrents.
 - IPv6 peer support (BEP 7): compact peers6, IPv6-aware connect.
@@ -17,6 +17,7 @@ Update it whenever a milestone lands, the near-term backlog changes, or a new op
 - Multi-peer seeding: io_uring event loop, batched block sends, async disk reads with piece cache.
 - Selective file download: per-file priorities (normal/high/do_not_download), piece-mask filtering, boundary-piece handling, lazy file creation. Wired into daemon event loop piece picker.
 - Sequential download mode: per-torrent toggle for streaming playback.
+- Super-seeding (BEP 16): initial seed optimization. Sends HAVE messages instead of bitfield, tracks per-peer piece distribution, advertises rarest-first to maximize piece diversity. API toggle via `/api/v2/torrents/setSuperSeeding`.
 
 ### Architecture
 - **Single-threaded io_uring event loop**: all peer I/O, disk I/O, HTTP API, tracker HTTP through io_uring. Split into focused sub-modules: event_loop.zig (core), peer_handler.zig, protocol.zig, seed_handler.zig, peer_policy.zig, utp_handler.zig.
@@ -74,6 +75,7 @@ Update it whenever a milestone lands, the near-term backlog changes, or a new op
 - Partial send buffer matching: monotonic send_id in CQE context to match correct in-flight buffer.
 - RPC server partial-send handling: API responses now track send progress until the full body is written.
 - Seed/read-path correctness: queued seed responses own exact block copies, async seed reads use unique IDs, and only successfully submitted reads/writes contribute to pending completion counts.
+- **Huge page piece cache**: optional `mmap(MAP_HUGETLB)` buffer pool for seed piece reads. Falls back to `madvise(MADV_HUGEPAGE)` (transparent huge pages), then regular pages. Config: `performance.use_huge_pages`, `performance.piece_cache_size`. Reduces TLB pressure for large torrents.
 
 ### Testing
 - 19 peer wire protocol tests, 10 BEP 10 extension tests, 31 uTP/LEDBAT tests, 5 categories tests, 8 resume DB tests.
@@ -84,6 +86,7 @@ Update it whenever a milestone lands, the near-term backlog changes, or a new op
 - Daemon swarm integration test, daemon-to-peer seeding test, selective download integration test.
 - SHA-1 benchmarks: std vs SHA-NI vs direct vs memory bandwidth baseline.
 - Profiling workflow: strace, perf, bpftrace build helpers.
+- 5 super-seed (BEP 16) tests, 2 multi-announce tests, 5 huge page cache tests.
 
 ## Next
 

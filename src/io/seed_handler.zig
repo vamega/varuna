@@ -99,7 +99,10 @@ pub fn servePieceRequest(self: *EventLoop, slot: u16, payload: []const u8) void 
 
     if (plan.spans.len == 0) return;
 
-    const read_buf = self.allocator.alloc(u8, piece_size) catch return;
+    // Try huge page cache pool first, fall back to general allocator.
+    const pool_buf = if (self.huge_page_cache) |*hpc| hpc.alloc(piece_size) else null;
+    const from_pool = pool_buf != null;
+    const read_buf = pool_buf orelse (self.allocator.alloc(u8, piece_size) catch return);
     const read_id = nextSeedReadId(self);
 
     self.pending_reads.append(self.allocator, .{
@@ -111,8 +114,9 @@ pub fn servePieceRequest(self: *EventLoop, slot: u16, payload: []const u8) void 
         .read_buf = read_buf,
         .piece_size = piece_size,
         .reads_remaining = 0,
+        .from_pool = from_pool,
     }) catch {
-        self.allocator.free(read_buf);
+        if (!from_pool) self.allocator.free(read_buf);
         return;
     };
 
@@ -147,7 +151,7 @@ pub fn handleSeedDiskRead(self: *EventLoop, cqe: @import("std").os.linux.io_urin
     var pending = self.pending_reads.items[idx];
 
     if (cqe.res <= 0) {
-        self.allocator.free(pending.read_buf);
+        if (!pending.from_pool) self.allocator.free(pending.read_buf);
         _ = self.pending_reads.swapRemove(idx);
         return;
     }
@@ -162,10 +166,13 @@ pub fn handleSeedDiskRead(self: *EventLoop, cqe: @import("std").os.linux.io_urin
     _ = self.pending_reads.swapRemove(idx);
 
     // Update cache
-    if (self.cached_piece_data) |old| self.allocator.free(old);
+    if (self.cached_piece_data) |old| {
+        if (!self.cached_piece_from_pool) self.allocator.free(old);
+    }
     self.cached_piece_data = pending.read_buf;
     self.cached_piece_index = pending.piece_index;
     self.cached_piece_len = pending.piece_size;
+    self.cached_piece_from_pool = pending.from_pool;
 
     // Queue for batched send (flushed after CQE dispatch)
     queuePieceBlockResponse(

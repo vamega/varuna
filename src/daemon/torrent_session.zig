@@ -49,6 +49,8 @@ pub const Stats = struct {
     sequential_download: bool = false,
     /// Whether this is a private torrent (BEP 27).
     is_private: bool = false,
+    /// Whether BEP 16 super-seeding is enabled.
+    super_seeding: bool = false,
     /// Tracker scrape result: seeders, leechers, snatches.
     scrape_complete: u32 = 0,
     scrape_incomplete: u32 = 0,
@@ -117,6 +119,9 @@ pub const TorrentSession = struct {
 
     // Sequential download mode (stored, but actual piece picking depends on workstream B)
     sequential_download: bool = false,
+
+    // BEP 16: super-seeding mode (initial seed optimization)
+    super_seeding: bool = false,
 
     // Per-file priorities: 0=skip, 1=normal, 6=high, 7=max (stored, actual selective
     // download depends on workstream B). null means all files are normal priority.
@@ -357,6 +362,30 @@ pub const TorrentSession = struct {
         }
     }
 
+    /// Enable or disable BEP 16 super-seeding mode. Only meaningful when
+    /// the torrent is in seeding state. The event loop manages the actual
+    /// super-seed protocol behavior.
+    pub fn setSuperSeeding(self: *TorrentSession, enabled: bool) void {
+        self.super_seeding = enabled;
+        const el = self.shared_event_loop orelse {
+            if (self.event_loop) |*own_el| {
+                if (enabled) {
+                    own_el.enableSuperSeed(0) catch {};
+                } else {
+                    own_el.disableSuperSeed(0);
+                }
+            }
+            return;
+        };
+        if (self.torrent_id_in_shared) |tid| {
+            if (enabled) {
+                el.enableSuperSeed(tid) catch {};
+            } else {
+                el.disableSuperSeed(tid);
+            }
+        }
+    }
+
     /// Returns the pre-computed comma-separated tags string.
     fn getTagsString(self: *const TorrentSession) []const u8 {
         return self.tags_string orelse "";
@@ -451,6 +480,7 @@ pub const TorrentSession = struct {
             .ratio = ratio,
             .sequential_download = self.sequential_download,
             .is_private = self.is_private,
+            .super_seeding = self.super_seeding,
             .scrape_complete = if (self.scrape_result) |sr| sr.complete else 0,
             .scrape_incomplete = if (self.scrape_result) |sr| sr.incomplete else 0,
             .scrape_downloaded = if (self.scrape_result) |sr| sr.downloaded else 0,
@@ -603,31 +633,26 @@ pub const TorrentSession = struct {
             return;
         }
 
-        var announce_response: ?tracker.announce.Response = null;
-        var announce_url: []const u8 = tracker_urls[0];
-        for (tracker_urls) |url| {
-            const resp = tracker.announce.fetchAuto(self.allocator, &self.ring.?, .{
-                .announce_url = url,
+        // BEP 12: announce to all tiers simultaneously. First successful
+        // response with peers wins; the rest are discarded.
+        const multi_result = tracker.multi_announce.announceParallel(
+            self.allocator,
+            tracker_urls,
+            .{
+                .announce_url = "", // overridden per-URL inside announceParallel
                 .info_hash = session.metainfo.info_hash,
                 .peer_id = self.peer_id,
                 .port = self.port,
                 .left = session.totalSize() - recheck.bytes_complete,
                 .key = self.tracker_key,
-            }) catch continue;
-
-            if (resp.peers.len > 0) {
-                announce_url = url;
-                announce_response = resp;
-                break;
-            }
-            tracker.announce.freeResponse(self.allocator, resp);
-        }
-
-        const announce_resp = announce_response orelse {
+            },
+        ) catch {
             self.state = .@"error";
             self.error_message = std.fmt.allocPrint(self.allocator, "tracker announce failed for all URLs", .{}) catch null;
             return;
         };
+        const announce_resp = multi_result.response;
+        const announce_url: []const u8 = tracker_urls[multi_result.url_index];
         defer tracker.announce.freeResponse(self.allocator, announce_resp);
 
         // Get shared file handles
