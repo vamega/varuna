@@ -157,6 +157,10 @@ pub const Peer = struct {
     extensions_supported: bool = false, // peer advertised BEP 10 support
     extension_ids: ?ext.ExtensionIds = null, // peer's extension ID mapping
 
+    // BEP 21: partial seed (upload_only) — peer has some pieces and is
+    // willing to upload but not interested in downloading from us.
+    upload_only: bool = false,
+
     // BEP 11 PEX state (per-peer, tracks what we have sent to this peer)
     pex_state: ?*pex_mod.PexState = null,
 
@@ -213,6 +217,10 @@ pub const TorrentContext = struct {
 
     // BEP 16: super-seeding state (null if super-seeding is disabled)
     super_seed: ?*SuperSeedState = null,
+
+    // BEP 21: we are a partial seed (upload_only). All wanted pieces are complete
+    // but not all pieces in the torrent. We upload what we have but don't download.
+    upload_only: bool = false,
 
     // BEP 52: per-file Merkle tree cache for hash serving
     merkle_cache: ?*MerkleCache = null,
@@ -1012,6 +1020,7 @@ pub const EventLoop = struct {
         peer_policy.tryAssignPieces(self);
         peer_policy.updateSpeedCounters(self);
         peer_policy.checkPex(self);
+        peer_policy.checkPartialSeed(self);
         utp_handler.utpTick(self);
         dht_handler.dhtTick(self);
 

@@ -22,6 +22,7 @@ Update it whenever a milestone lands, the near-term backlog changes, or a new op
 - Sequential download mode: per-torrent toggle for streaming playback.
 - MSE/PE (BEP 6): Message Stream Encryption with DH key exchange (768-bit prime), RC4 stream cipher with 1024-byte discard, SKEY identification from info-hash, crypto_provide/crypto_select negotiation, both initiator and responder roles, configurable modes (forced/preferred/enabled/disabled). Transparent encrypt/decrypt integrated into event loop send/recv paths. Async MSE handshake state machine (`MseInitiatorHandshake`/`MseResponderHandshake`) for non-blocking io_uring event loop integration. Auto-fallback: outbound "preferred" mode tries MSE then reconnects plaintext; inbound detects MSE vs BT by first-byte heuristic; per-peer `mse_rejected`/`mse_fallback` tracking prevents retry loops.
 - Super-seeding (BEP 16): initial seed optimization. Sends HAVE messages instead of bitfield, tracks per-peer piece distribution, advertises rarest-first to maximize piece diversity. API toggle via `/api/v2/torrents/setSuperSeeding`.
+- Partial seeds (BEP 21): `upload_only` extension in BEP 10 handshake. Parse and store `upload_only` flag from peers. Advertise `upload_only: 1` when we are a partial seed (selective download complete but torrent incomplete). Automatic partial seed detection from piece tracker. Skip piece assignment when upload_only. Re-send extension handshake to all peers on state transition. Exposed in API (torrentPeers, properties, maindata).
 
 ### Architecture
 - **Single-threaded io_uring event loop**: all peer I/O, disk I/O, HTTP API, tracker HTTP through io_uring. Split into focused sub-modules: event_loop.zig (core), peer_handler.zig, protocol.zig, seed_handler.zig, peer_policy.zig, utp_handler.zig.
@@ -123,7 +124,7 @@ Update it whenever a milestone lands, the near-term backlog changes, or a new op
 - Event loop integration (`src/io/dht_handler.zig`): DHT/uTP demux by first byte ('d' for KRPC, else uTP). DHT tick in event loop. Outbound packets sent via shared UDP socket. Discovered peers fed into existing peer connection pipeline via addPeerForTorrent.
 
 ### Testing
-- 19 peer wire protocol tests, 10 BEP 10 extension tests, 15 PEX tests, 31 uTP/LEDBAT tests, 5 categories tests, 9 resume DB tests, 25 MSE/RC4 tests, 13 magnet URI tests, 13 ut_metadata tests, 12 metadata fetch resilience tests.
+- 19 peer wire protocol tests, 16 BEP 10 extension tests (including 6 BEP 21 upload_only tests), 15 PEX tests, 31 uTP/LEDBAT tests, 5 categories tests, 9 resume DB tests, 25 MSE/RC4 tests, 13 magnet URI tests, 13 ut_metadata tests, 12 metadata fetch resilience tests.
 - 13 async MSE state machine tests (initiator phases, responder phases, VC scan limit, fallback, first-byte detection).
 - Bencode fuzz + edge case tests, HTTP parser fuzz tests.
 - Fuzz tests for: multipart parser, tracker response, uTP packets, BEP 10 extensions, scrape response (18 fuzz tests total).
@@ -136,7 +137,7 @@ Update it whenever a milestone lands, the near-term backlog changes, or a new op
 - Adversarial peer tests (35 tests): oversized messages, invalid IDs, wrong lengths, malformed handshake, unrequested pieces, OOB piece indices, garbage extension bencode, bitfield bounds, connection limit sanity.
 - Private tracker simulation tests (25 tests): required announce fields (compact, numwant, key, event), per-session key generation, private flag enforcement (no ut_pex), tracker error responses (failure reason, missing fields, invalid formats, negative interval), compact peer parsing.
 - Soak test framework (`zig build soak-test`): multi-torrent piece tracker stress, allocator leak detection (GPA), FD leak monitoring, tick latency tracking, bitfield stress cycles.
-- 5 super-seed (BEP 16) tests, 2 multi-announce tests, 5 huge page cache tests.
+- 5 super-seed (BEP 16) tests, 4 partial seed (BEP 21) tests, 2 multi-announce tests, 5 huge page cache tests.
 - BEP 52 tests: 11 Merkle tree tests, 8 file tree parser tests, 7 v2 metainfo tests, 4 v2 layout tests, 1 v2 info-hash test, 8 hash exchange tests, 2 v2 announce URL tests, 2 v2 resume DB tests, 11 Merkle cache tests, 2 async Merkle hasher tests.
 - DHT tests: 7 node_id tests, 8 routing_table tests, 8 krpc tests, 8 token tests, 7 lookup tests, 5 dht_engine tests, 1 persistence test (44 total).
 - 10 peer ID client identification tests (Azureus-style, Shadow-style, Mainline, unknown).

@@ -44,6 +44,13 @@ pub fn tryAssignPieces(self: *EventLoop) void {
             _ = self.idle_peers.swapRemove(i);
             continue;
         };
+
+        // BEP 21: when we are a partial seed (upload_only), don't request pieces
+        if (tc.upload_only) {
+            i += 1;
+            continue;
+        }
+
         const pt = tc.piece_tracker orelse {
             _ = self.idle_peers.swapRemove(i);
             continue;
@@ -645,7 +652,7 @@ pub fn checkPex(self: *EventLoop) void {
             if (peer.state != .active_recv_header and peer.state != .active_recv_body) continue;
 
             const flags = pex_mod.PeerFlags{
-                .seed = peer.mode == .seed,
+                .seed = peer.mode == .seed or peer.upload_only,
                 .utp = peer.transport == .utp,
             };
             torrent_pex.addPeer(self.allocator, peer.address, flags);
@@ -739,5 +746,46 @@ pub fn updateSpeedCounters(self: *EventLoop) void {
         tc.last_speed_check = now;
         tc.last_dl_bytes = dl_total;
         tc.last_ul_bytes = ul_total;
+    }
+}
+
+// ── BEP 21: Partial Seed Detection ──────────────────────
+
+/// Check if any torrent has transitioned to partial seed state (all wanted
+/// pieces complete but not all pieces in the torrent). When detected, set
+/// the torrent's `upload_only` flag and re-send extension handshakes to
+/// all connected peers so they know we are upload_only.
+pub fn checkPartialSeed(self: *EventLoop) void {
+    for (&self.torrents, 0..) |*slot, idx| {
+        const tc = &(slot.* orelse continue);
+        const tid: u8 = @intCast(idx);
+        const pt = tc.piece_tracker orelse continue;
+
+        const should_be_upload_only = pt.isPartialSeed();
+
+        // Only act on transitions (false -> true or true -> false)
+        if (tc.upload_only == should_be_upload_only) continue;
+
+        tc.upload_only = should_be_upload_only;
+
+        if (should_be_upload_only) {
+            log.info("torrent {d}: became partial seed (upload_only)", .{tid});
+        } else {
+            log.info("torrent {d}: no longer partial seed", .{tid});
+        }
+
+        // Re-send extension handshake to all connected peers for this torrent
+        // so they learn about our upload_only state change.
+        for (self.peers, 0..) |*peer, pi| {
+            if (peer.state == .free or peer.state == .disconnecting) continue;
+            if (peer.torrent_id != tid) continue;
+            if (peer.state != .active_recv_header and peer.state != .active_recv_body) continue;
+            if (!peer.extensions_supported) continue;
+            if (peer.send_pending) continue;
+
+            protocol.submitExtensionHandshake(self, @intCast(pi)) catch |err| {
+                log.debug("BEP 21 ext handshake resend to slot {d}: {s}", .{ pi, @errorName(err) });
+            };
+        }
     }
 }
