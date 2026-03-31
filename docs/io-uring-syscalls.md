@@ -18,6 +18,15 @@ This document tracks which syscalls the `varuna` **daemon** uses, which are rout
 | `socket()` | `IORING_OP_SOCKET` | `transport.tcpConnect` via `Ring.socket` | Done |
 | `fdatasync()` | `IORING_OP_FSYNC` + `DATASYNC` | `PieceStore.sync` via `Ring.fdatasync` | Done |
 | `fallocate()` | `IORING_OP_FALLOCATE` | `PieceStore.init` via `Ring.fallocate` | Done |
+| `shutdown()` | `IORING_OP_SHUTDOWN` | `Ring.shutdown` -- clean peer disconnects | Done |
+| `statx()` | `IORING_OP_STATX` | `Ring.statx` -- async file stat for resume checks | Done |
+| `renameat()` | `IORING_OP_RENAMEAT` | `Ring.renameat` -- async file rename for data relocation | Done |
+| `unlinkat()` | `IORING_OP_UNLINKAT` | `Ring.unlinkat` -- async file deletion for partial cleanup | Done |
+| `send()` (zero-copy) | `IORING_OP_SEND_ZC` | `Ring.send_zc` / `Ring.send_zc_all` -- zero-copy piece sends | Done |
+| cancel | `IORING_OP_ASYNC_CANCEL` | `Ring.cancel` -- cancel stalled peer operations | Done |
+| timeout | `IORING_OP_TIMEOUT` | `Ring.timeout` -- native io_uring timers | Done |
+| linked timeout | `IORING_OP_LINK_TIMEOUT` | `Ring.link_timeout` -- per-operation deadlines | Done |
+| fixed buffers | `IORING_OP_READ_FIXED` / `WRITE_FIXED` | `Ring.pread_fixed` / `Ring.pwrite_fixed` with registered buffer pool | Done |
 
 ### Remaining conventional I/O (not hot path)
 
@@ -42,24 +51,13 @@ This document tracks which syscalls the `varuna` **daemon** uses, which are rout
 
 | Syscall | io_uring Op | Kernel | Potential use in Varuna |
 |---------|------------|--------|------------------------|
-| `fallocate()` | `IORING_OP_FALLOCATE` | 5.6 | Pre-allocating file space on download start |
-| `fdatasync()` | `IORING_OP_FSYNC` + `IORING_FSYNC_DATASYNC` | 5.1 | Flush data without metadata (faster than fsync) |
-| `statx()` | `IORING_OP_STATX` | 5.6 | Checking file size/existence for resume |
-| `renameat()` | `IORING_OP_RENAMEAT` | 5.11 | Finalizing completed downloads |
-| `unlinkat()` | `IORING_OP_UNLINKAT` | 5.11 | Deleting partial downloads |
 | `splice()` | `IORING_OP_SPLICE` | 5.7 | Zero-copy between fds |
 | `sendmsg()` | `IORING_OP_SENDMSG` | 5.3 | Scatter/gather for DHT UDP |
 | `recvmsg()` | `IORING_OP_RECVMSG` | 5.3 | Scatter/gather for DHT UDP |
-| `send()` (zero-copy) | `IORING_OP_SEND_ZC` | 6.0 | Zero-copy piece sends to peers |
-| `shutdown()` | `IORING_OP_SHUTDOWN` | 5.11 | Clean peer disconnects |
-| timeout | `IORING_OP_TIMEOUT` | 5.4 | Choke/unchoke cycles, announce intervals, keep-alives |
-| linked timeout | `IORING_OP_LINK_TIMEOUT` | 5.5 | Per-operation deadlines (peer connect timeout) |
-| cancel | `IORING_OP_ASYNC_CANCEL` | 5.5 | Cancelling stalled peer ops |
 | `setsockopt()` | `IORING_OP_SETSOCKOPT` | 6.7 | Socket buffer sizes, TCP options |
 | `getsockopt()` | `IORING_OP_GETSOCKOPT` | 6.7 | Reading socket state |
 | `epoll_ctl()` | `IORING_OP_EPOLL_CTL` | 5.6 | Managing fd watch sets (unlikely needed if io_uring is primary) |
 | `madvise()` | `IORING_OP_MADVISE` | 5.6 | Hinting huge page usage on piece cache |
-| fixed buffers | `IORING_OP_READ_FIXED` / `IORING_OP_WRITE_FIXED` | 5.1 | Read/write into pinned huge-page buffers |
 
 ## Replaceable with io_uring (full reference)
 
