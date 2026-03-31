@@ -241,6 +241,64 @@ pub fn main() !void {
             try path_buf.print(allocator, "/api/v2/torrents/connDiagnostics?hash={s}", .{args[cmd_start + 1]});
             try doGet(allocator, stdout, api_host, api_port, path_buf.items, sid);
         }
+    } else if (std.mem.eql(u8, command, "ban")) {
+        if (cmd_start + 1 >= args.len) {
+            try stdout.print("usage: varuna-ctl ban <ip> [--reason <text>]\n", .{});
+        } else {
+            const ip = args[cmd_start + 1];
+            // Parse optional --reason flag (reserved for future use)
+            var i: usize = cmd_start + 2;
+            while (i < args.len) : (i += 1) {
+                if (std.mem.eql(u8, args[i], "--reason") and i + 1 < args.len) {
+                    i += 1; // skip the reason value
+                }
+            }
+            var body_buf = std.ArrayList(u8).empty;
+            defer body_buf.deinit(allocator);
+            try body_buf.print(allocator, "peers={s}:0", .{ip});
+            try doPost(allocator, stdout, api_host, api_port, "/api/v2/transfer/banPeers", body_buf.items, sid);
+        }
+    } else if (std.mem.eql(u8, command, "unban")) {
+        if (cmd_start + 1 >= args.len) {
+            try stdout.print("usage: varuna-ctl unban <ip>\n", .{});
+        } else {
+            var body_buf = std.ArrayList(u8).empty;
+            defer body_buf.deinit(allocator);
+            try body_buf.print(allocator, "ips={s}", .{args[cmd_start + 1]});
+            try doPost(allocator, stdout, api_host, api_port, "/api/v2/transfer/unbanPeers", body_buf.items, sid);
+        }
+    } else if (std.mem.eql(u8, command, "banlist")) {
+        // Always outputs JSON from API (--json flag accepted for compatibility)
+        try doGet(allocator, stdout, api_host, api_port, "/api/v2/transfer/bannedPeers", sid);
+    } else if (std.mem.eql(u8, command, "import-banlist")) {
+        if (cmd_start + 1 >= args.len) {
+            try stdout.print("usage: varuna-ctl import-banlist <file> [--format auto|dat|p2p|cidr]\n", .{});
+        } else {
+            const file_path = args[cmd_start + 1];
+            var format: []const u8 = "auto";
+            var i: usize = cmd_start + 2;
+            while (i < args.len) : (i += 1) {
+                if (std.mem.eql(u8, args[i], "--format") and i + 1 < args.len) {
+                    format = args[i + 1];
+                    i += 1;
+                }
+            }
+
+            // Read the file and POST it
+            const file_data = std.fs.cwd().readFileAlloc(allocator, file_path, 64 * 1024 * 1024) catch |err| {
+                try stdout.print("error: could not read file: {s}\n", .{@errorName(err)});
+                try stdout.flush();
+                return;
+            };
+            defer allocator.free(file_data);
+
+            // Build body with format parameter followed by file content
+            var body_buf = std.ArrayList(u8).empty;
+            defer body_buf.deinit(allocator);
+            try body_buf.print(allocator, "format={s}&file=", .{format});
+            try body_buf.appendSlice(allocator, file_data);
+            try doPost(allocator, stdout, api_host, api_port, "/api/v2/transfer/importBanList", body_buf.items, sid);
+        }
     } else {
         try stdout.print("unknown command: {s}\n\n", .{command});
         try printUsage(stdout, api_host, api_port);
@@ -464,6 +522,10 @@ fn printUsage(stdout: *std.Io.Writer, host: []const u8, port: u16) !void {
     try stdout.print("  get-ul-limit <hash|global>     get upload limit\n", .{});
     try stdout.print("  move <hash> <path>             move torrent data to new path\n", .{});
     try stdout.print("  conn-diag <hash>               connection diagnostics\n", .{});
+    try stdout.print("  ban <ip> [--reason <text>]      ban a peer IP\n", .{});
+    try stdout.print("  unban <ip>                     unban a peer IP\n", .{});
+    try stdout.print("  banlist [--json]               list banned peers\n", .{});
+    try stdout.print("  import-banlist <file>           import ipfilter file\n", .{});
     try stdout.print("  version                        daemon API version\n", .{});
     try stdout.print("  stats                          global transfer stats\n", .{});
     try stdout.print("\ndaemon: http://{s}:{}\n", .{ host, port });

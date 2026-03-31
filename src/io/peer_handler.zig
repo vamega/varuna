@@ -12,6 +12,7 @@ const encodeUserData = @import("event_loop.zig").encodeUserData;
 const decodeUserData = @import("event_loop.zig").decodeUserData;
 const protocol = @import("protocol.zig");
 const socket_util = @import("../net/socket.zig");
+const BanList = @import("../net/ban_list.zig").BanList;
 
 // ── CQE dispatch handlers ──────────────────────────────
 
@@ -25,6 +26,22 @@ pub fn handleAccept(self: *EventLoop, cqe: linux.io_uring_cqe) void {
         return;
     }
     const new_fd: posix.fd_t = @intCast(cqe.res);
+
+    // Extract peer address and check ban list before allocating a slot
+    if (self.ban_list) |bl| {
+        var peer_addr: posix.sockaddr.storage = undefined;
+        var addr_len: posix.socklen_t = @sizeOf(posix.sockaddr.storage);
+        const rc = std.os.linux.getpeername(new_fd, @ptrCast(&peer_addr), &addr_len);
+        if (@as(i32, @bitCast(@as(u32, @truncate(rc)))) >= 0) {
+            const net_addr = std.net.Address{ .any = @as(*posix.sockaddr, @ptrCast(&peer_addr)).* };
+            if (bl.isBanned(net_addr)) {
+                log.debug("rejected banned inbound peer", .{});
+                posix.close(new_fd);
+                self.submitAccept() catch {};
+                return;
+            }
+        }
+    }
 
     // Enforce global connection limit on inbound connections
     if (self.peer_count >= self.max_connections) {

@@ -9,6 +9,8 @@ const mse = @import("../crypto/mse.zig");
 const SessionManager = @import("../daemon/session_manager.zig").SessionManager;
 const TorrentSession = @import("../daemon/torrent_session.zig");
 const metainfo_mod = @import("../torrent/metainfo.zig");
+const BanList = @import("../net/ban_list.zig").BanList;
+const ipfilter_parser = @import("../net/ipfilter_parser.zig");
 
 /// API handler that routes requests to the appropriate endpoint.
 /// Holds a reference to the SessionManager for state access.
@@ -87,6 +89,23 @@ pub const ApiHandler = struct {
 
         if (std.mem.eql(u8, request.path, "/api/v2/transfer/speedLimitsMode")) {
             return withCors(self.handleSpeedLimitsMode(allocator));
+        }
+
+        // ── Ban management endpoints ──────────────────────────
+        if (std.mem.eql(u8, request.path, "/api/v2/transfer/banPeers") and std.mem.eql(u8, request.method, "POST")) {
+            return withCors(self.handleBanPeers(allocator, request.body));
+        }
+
+        if (std.mem.eql(u8, request.path, "/api/v2/transfer/unbanPeers") and std.mem.eql(u8, request.method, "POST")) {
+            return withCors(self.handleUnbanPeers(allocator, request.body));
+        }
+
+        if (std.mem.eql(u8, request.path, "/api/v2/transfer/bannedPeers")) {
+            return withCors(self.handleBannedPeers(allocator));
+        }
+
+        if (std.mem.eql(u8, request.path, "/api/v2/transfer/importBanList") and std.mem.eql(u8, request.method, "POST")) {
+            return withCors(self.handleImportBanList(allocator, request.body, request.content_type));
         }
 
         if (std.mem.startsWith(u8, request.path, "/api/v2/torrents/")) {
@@ -455,6 +474,13 @@ pub const ApiHandler = struct {
         const hpc_allocated = if (el) |e| (if (e.huge_page_cache) |*hpc| hpc.isAllocated() else false) else false;
         const hpc_using_huge = if (el) |e| (if (e.huge_page_cache) |hpc| hpc.using_huge_pages else false) else false;
 
+        // Build banned_IPs string for preferences
+        const banned_ips_str: []const u8 = if (self.session_manager.ban_list) |bl|
+            bl.getBannedIpsString(allocator) catch ""
+        else
+            "";
+        defer if (banned_ips_str.len > 0 and self.session_manager.ban_list != null) allocator.free(banned_ips_str);
+
         const body = std.fmt.allocPrint(allocator,
             \\{{"dl_limit":{},"up_limit":{},"alt_dl_limit":0,"alt_up_limit":0,
             \\"save_path":"{f}","temp_path":"","temp_path_enabled":false,
@@ -479,8 +505,13 @@ pub const ApiHandler = struct {
             \\"auto_tmm_enabled":false,"save_resume_data_interval":60,
             \\"start_paused_enabled":false,
             \\"dht":false,"pex":false,"lsd":false,"encryption":{},"anonymous_mode":false,
-            \\"piece_cache_enabled":{},"piece_cache_allocated":{},"piece_cache_huge_pages":{}}}
-        , .{ dl_limit, ul_limit, esc(save_path), enc_mode, @as(u8, if (has_hpc) 1 else 0), @as(u8, if (hpc_allocated) 1 else 0), @as(u8, if (hpc_using_huge) 1 else 0) }) catch
+            \\"piece_cache_enabled":{},"piece_cache_allocated":{},"piece_cache_huge_pages":{},
+            \\"ip_filter_enabled":false,"ip_filter_path":"","ip_filter_trackers":false,
+            \\"banned_IPs":"{f}"}}
+        , .{
+            dl_limit,                       ul_limit,                             esc(save_path),                        enc_mode,
+            @as(u8, if (has_hpc) 1 else 0), @as(u8, if (hpc_allocated) 1 else 0), @as(u8, if (hpc_using_huge) 1 else 0), esc(banned_ips_str),
+        }) catch
             return .{ .status = 500, .body = "{\"error\":\"internal\"}" };
         return .{ .body = body, .owned_body = body };
     }
@@ -505,6 +536,29 @@ pub const ApiHandler = struct {
             } else |_| {}
         } else if (extractJsonInt(body, "up_limit")) |ul| {
             el.setGlobalUlLimit(ul);
+        }
+
+        // Handle banned_IPs: newline-separated list of IPs and CIDRs
+        if (extractParam(body, "banned_IPs")) |banned_str| {
+            if (self.session_manager.ban_list) |bl| {
+                // URL-decode newlines: %0A -> \n
+                const alloc = self.session_manager.allocator;
+                var decoded = std.ArrayList(u8).empty;
+                defer decoded.deinit(alloc);
+                var i: usize = 0;
+                while (i < banned_str.len) {
+                    if (i + 2 < banned_str.len and banned_str[i] == '%' and banned_str[i + 1] == '0' and (banned_str[i + 2] == 'A' or banned_str[i + 2] == 'a')) {
+                        decoded.append(alloc, '\n') catch break;
+                        i += 3;
+                    } else {
+                        decoded.append(alloc, banned_str[i]) catch break;
+                        i += 1;
+                    }
+                }
+                bl.setBannedIpsFromString(decoded.items) catch {};
+                el.ban_list_dirty.store(true, .release);
+                self.session_manager.persistBanList();
+            }
         }
 
         return .{ .body = "{\"status\":\"ok\"}" };
@@ -1100,6 +1154,167 @@ pub const ApiHandler = struct {
         ) catch
             return .{ .status = 500, .body = "{\"error\":\"internal\"}" };
         return .{ .body = body, .owned_body = body };
+    }
+
+    // ── Ban management handlers ────────────────────────────
+
+    /// POST /api/v2/transfer/banPeers -- qBittorrent-compatible ban endpoint.
+    /// peers=ip:port|ip:port|... (pipe-separated)
+    fn handleBanPeers(self: *const ApiHandler, allocator: std.mem.Allocator, body: []const u8) server.Response {
+        _ = allocator;
+        const bl = self.session_manager.ban_list orelse
+            return .{ .status = 500, .body = "{\"error\":\"ban list not initialized\"}" };
+
+        const peers_str = extractParam(body, "peers") orelse
+            return .{ .status = 400, .body = "{\"error\":\"missing peers parameter\"}" };
+
+        // Parse pipe-separated peer list
+        var iter = std.mem.splitScalar(u8, peers_str, '|');
+        while (iter.next()) |peer_str| {
+            const trimmed = std.mem.trim(u8, peer_str, " \t");
+            if (trimmed.len == 0) continue;
+
+            const addr = BanList.parseIpPort(trimmed) orelse continue;
+            _ = bl.banIp(addr, null, .manual) catch continue;
+        }
+
+        // Signal event loop to enforce bans on existing peers
+        if (self.session_manager.shared_event_loop) |el| {
+            el.ban_list_dirty.store(true, .release);
+        }
+
+        // Persist to SQLite (background thread)
+        self.session_manager.persistBanList();
+
+        return .{ .body = "" };
+    }
+
+    /// POST /api/v2/transfer/unbanPeers -- Varuna extension.
+    /// ips=ip|ip|... (pipe-separated)
+    fn handleUnbanPeers(self: *const ApiHandler, allocator: std.mem.Allocator, body: []const u8) server.Response {
+        const bl = self.session_manager.ban_list orelse
+            return .{ .status = 500, .body = "{\"error\":\"ban list not initialized\"}" };
+
+        const ips_str = extractParam(body, "ips") orelse
+            return .{ .status = 400, .body = "{\"error\":\"missing ips parameter\"}" };
+
+        var removed: usize = 0;
+        var iter = std.mem.splitScalar(u8, ips_str, '|');
+        while (iter.next()) |ip_str| {
+            const trimmed = std.mem.trim(u8, ip_str, " \t");
+            if (trimmed.len == 0) continue;
+
+            if (bl.unbanIpStr(trimmed)) {
+                removed += 1;
+            }
+        }
+
+        // Persist to SQLite (background thread)
+        self.session_manager.persistBanList();
+
+        const resp = std.fmt.allocPrint(allocator, "{{\"removed\":{}}}", .{removed}) catch
+            return .{ .status = 500, .body = "{\"error\":\"internal\"}" };
+        return .{ .body = resp, .owned_body = resp };
+    }
+
+    /// GET /api/v2/transfer/bannedPeers -- list all bans.
+    fn handleBannedPeers(self: *const ApiHandler, allocator: std.mem.Allocator) server.Response {
+        const bl = self.session_manager.ban_list orelse
+            return .{ .body = "{\"individual\":[],\"ranges\":[],\"total_rules\":0}" };
+
+        const bans = bl.listBans(allocator) catch
+            return .{ .status = 500, .body = "{\"error\":\"internal\"}" };
+        defer {
+            for (bans) |info| {
+                allocator.free(info.ip_str);
+                if (info.reason) |r| allocator.free(r);
+            }
+            allocator.free(bans);
+        }
+
+        const ranges = bl.listRanges(allocator) catch
+            return .{ .status = 500, .body = "{\"error\":\"internal\"}" };
+        defer {
+            for (ranges) |info| {
+                allocator.free(info.start_str);
+                allocator.free(info.end_str);
+            }
+            allocator.free(ranges);
+        }
+
+        const esc = json_mod.jsonSafe;
+        var json_buf = std.ArrayList(u8).empty;
+        defer json_buf.deinit(allocator);
+
+        json_buf.appendSlice(allocator, "{\"individual\":[") catch
+            return .{ .status = 500, .body = "{\"error\":\"internal\"}" };
+
+        for (bans, 0..) |info, idx| {
+            if (idx > 0) json_buf.append(allocator, ',') catch {};
+            const source_str: []const u8 = if (info.source == .manual) "manual" else "ipfilter";
+            if (info.reason) |r| {
+                json_buf.writer(allocator).print("{{\"ip\":\"{f}\",\"source\":\"{s}\",\"reason\":\"{f}\",\"created_at\":{}}}", .{
+                    esc(info.ip_str), source_str, esc(r), info.created_at,
+                }) catch {};
+            } else {
+                json_buf.writer(allocator).print("{{\"ip\":\"{f}\",\"source\":\"{s}\",\"reason\":null,\"created_at\":{}}}", .{
+                    esc(info.ip_str), source_str, info.created_at,
+                }) catch {};
+            }
+        }
+
+        json_buf.appendSlice(allocator, "],\"ranges\":[") catch {};
+
+        for (ranges, 0..) |info, idx| {
+            if (idx > 0) json_buf.append(allocator, ',') catch {};
+            const source_str: []const u8 = if (info.source == .manual) "manual" else "ipfilter";
+            json_buf.writer(allocator).print("{{\"start\":\"{f}\",\"end\":\"{f}\",\"source\":\"{s}\",\"created_at\":{}}}", .{
+                esc(info.start_str), esc(info.end_str), source_str, info.created_at,
+            }) catch {};
+        }
+
+        const total = bl.ruleCount();
+        json_buf.writer(allocator).print("],\"total_rules\":{}}}", .{total}) catch {};
+
+        const resp_body = json_buf.toOwnedSlice(allocator) catch
+            return .{ .status = 500, .body = "{\"error\":\"internal\"}" };
+        return .{ .body = resp_body, .owned_body = resp_body };
+    }
+
+    /// POST /api/v2/transfer/importBanList -- import an ipfilter file.
+    /// Accepts either raw body content or form-encoded with file= parameter.
+    fn handleImportBanList(self: *const ApiHandler, allocator: std.mem.Allocator, body: []const u8, content_type: ?[]const u8) server.Response {
+        _ = content_type;
+        const bl = self.session_manager.ban_list orelse
+            return .{ .status = 500, .body = "{\"error\":\"ban list not initialized\"}" };
+
+        // Extract file content: try form-encoded file= parameter first, then raw body
+        const file_data: []const u8 = extractParam(body, "file") orelse body;
+
+        // Determine format from form-encoded format= parameter
+        const format_str = extractParam(body, "format") orelse "auto";
+        const format: ipfilter_parser.Format = if (std.mem.eql(u8, format_str, "dat"))
+            .dat
+        else if (std.mem.eql(u8, format_str, "p2p"))
+            .p2p
+        else if (std.mem.eql(u8, format_str, "cidr"))
+            .cidr
+        else
+            .auto;
+
+        const result = ipfilter_parser.parseFile(bl, file_data, format);
+
+        // Signal event loop to enforce bans
+        if (self.session_manager.shared_event_loop) |el| {
+            el.ban_list_dirty.store(true, .release);
+        }
+
+        // Persist to SQLite
+        self.session_manager.persistBanList();
+
+        const resp = std.fmt.allocPrint(allocator, "{{\"imported\":{},\"errors\":{}}}", .{ result.imported, result.errors }) catch
+            return .{ .status = 500, .body = "{\"error\":\"internal\"}" };
+        return .{ .body = resp, .owned_body = resp };
     }
 };
 

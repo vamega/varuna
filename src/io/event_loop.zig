@@ -16,6 +16,7 @@ const utp_mgr = @import("../net/utp_manager.zig");
 const mse = @import("../crypto/mse.zig");
 const SuperSeedState = @import("super_seed.zig").SuperSeedState;
 const HugePageCache = @import("../storage/huge_page_cache.zig").HugePageCache;
+const BanList = @import("../net/ban_list.zig").BanList;
 
 // Sub-modules: focused implementations that operate on *EventLoop
 const peer_handler = @import("peer_handler.zig");
@@ -378,6 +379,11 @@ pub const EventLoop = struct {
     // Global rate limiter (applies across all torrents, 0 = unlimited)
     global_rate_limiter: RateLimiter = RateLimiter.initComptime(0, 0),
 
+    // Peer banning: shared ban list (owned by SessionManager, shared with API handlers)
+    ban_list: ?*BanList = null,
+    // Atomic flag set by API handlers when bans change; checked in tick()
+    ban_list_dirty: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
+
     // Background hasher for SHA verification (off event loop thread)
     last_unchoke_recalc: i64 = 0,
     hasher: ?*Hasher = null,
@@ -732,6 +738,13 @@ pub const EventLoop = struct {
             return error.InvalidAddressFamily;
         }
 
+        // Check ban list before creating socket
+        if (self.ban_list) |bl| {
+            if (bl.isBanned(address)) {
+                return error.BannedPeer;
+            }
+        }
+
         if (self.torrents[torrent_id] == null) return error.TorrentNotFound;
 
         // Enforce global connection limit
@@ -793,6 +806,13 @@ pub const EventLoop = struct {
     /// socket via the UtpManager, sends the SYN packet, and allocates a
     /// peer slot in the event loop.
     pub fn addUtpPeer(self: *EventLoop, address: std.net.Address, torrent_id: u8) !u16 {
+        // Check ban list before allocating uTP socket
+        if (self.ban_list) |bl| {
+            if (bl.isBanned(address)) {
+                return error.BannedPeer;
+            }
+        }
+
         // Ensure the UDP socket and manager are ready.
         if (self.udp_fd < 0 or self.utp_manager == null) {
             try self.startUtpListener();
@@ -937,6 +957,11 @@ pub const EventLoop = struct {
     }
 
     pub fn tick(self: *EventLoop) !void {
+        // Check if ban list was updated by API handlers
+        if (self.ban_list_dirty.swap(false, .acquire)) {
+            self.enforceBans();
+        }
+
         peer_policy.processHashResults(self);
         peer_policy.checkPeerTimeouts(self);
         peer_policy.checkReannounce(self);
@@ -990,6 +1015,21 @@ pub const EventLoop = struct {
     /// Public wrapper for external callers (e.g. torrent_session).
     pub fn processHashResults(self: *EventLoop) void {
         peer_policy.processHashResults(self);
+    }
+
+    // ── Peer banning ────────────────────────────────────
+
+    /// Scan all connected peers and disconnect any that are banned.
+    /// Called from tick() when the ban_list_dirty flag is set.
+    pub fn enforceBans(self: *EventLoop) void {
+        const bl = self.ban_list orelse return;
+        for (self.peers, 0..) |*peer, i| {
+            if (peer.state == .free) continue;
+            if (bl.isBanned(peer.address)) {
+                log.info("disconnecting banned peer: {any}", .{peer.address});
+                self.removePeer(@intCast(i));
+            }
+        }
     }
 
     // ── Rate limiting ────────────────────────────────────

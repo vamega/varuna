@@ -163,6 +163,58 @@ pub const ResumeDb = struct {
             return error.SqliteSchemaFailed;
         }
 
+        // Create banned_ips table for individual IP bans
+        if (sqlite.sqlite3_exec(
+            d,
+            "CREATE TABLE IF NOT EXISTS banned_ips (" ++
+                "address TEXT NOT NULL PRIMARY KEY, " ++
+                "source INTEGER NOT NULL DEFAULT 0, " ++
+                "reason TEXT, " ++
+                "created_at INTEGER NOT NULL DEFAULT (strftime('%s','now'))" ++
+                ")",
+            null,
+            null,
+            null,
+        ) != sqlite.SQLITE_OK) {
+            _ = sqlite.sqlite3_close(d);
+            return error.SqliteSchemaFailed;
+        }
+
+        // Create banned_ranges table for CIDR range bans
+        if (sqlite.sqlite3_exec(
+            d,
+            "CREATE TABLE IF NOT EXISTS banned_ranges (" ++
+                "id INTEGER PRIMARY KEY AUTOINCREMENT, " ++
+                "start_addr TEXT NOT NULL, " ++
+                "end_addr TEXT NOT NULL, " ++
+                "source INTEGER NOT NULL DEFAULT 0, " ++
+                "created_at INTEGER NOT NULL DEFAULT (strftime('%s','now'))" ++
+                ")",
+            null,
+            null,
+            null,
+        ) != sqlite.SQLITE_OK) {
+            _ = sqlite.sqlite3_close(d);
+            return error.SqliteSchemaFailed;
+        }
+
+        // Create ipfilter_config table (singleton)
+        if (sqlite.sqlite3_exec(
+            d,
+            "CREATE TABLE IF NOT EXISTS ipfilter_config (" ++
+                "id INTEGER PRIMARY KEY CHECK (id = 1), " ++
+                "path TEXT, " ++
+                "enabled INTEGER NOT NULL DEFAULT 0, " ++
+                "rule_count INTEGER NOT NULL DEFAULT 0" ++
+                ")",
+            null,
+            null,
+            null,
+        ) != sqlite.SQLITE_OK) {
+            _ = sqlite.sqlite3_close(d);
+            return error.SqliteSchemaFailed;
+        }
+
         // Prepare statements
         var insert_stmt: ?*sqlite.Stmt = null;
         if (sqlite.sqlite3_prepare_v2(
@@ -605,6 +657,190 @@ pub const ResumeDb = struct {
         _ = sqlite.sqlite3_bind_text(stmt, 1, tag.ptr, @intCast(tag.len), sqlite.SQLITE_TRANSIENT);
         try stepAndFinalize(stmt);
     }
+
+    // ── Ban persistence ──────────────────────────────────────
+
+    /// Save an individual IP ban (upsert).
+    pub fn saveBannedIp(self: *ResumeDb, address: []const u8, source: u8, reason: ?[]const u8, created_at: i64) !void {
+        const stmt = try self.execOneShot(
+            "INSERT INTO banned_ips (address, source, reason, created_at) VALUES (?1, ?2, ?3, ?4) " ++
+                "ON CONFLICT(address) DO UPDATE SET source = ?2, reason = ?3",
+        );
+        _ = sqlite.sqlite3_bind_text(stmt, 1, address.ptr, @intCast(address.len), sqlite.SQLITE_TRANSIENT);
+        _ = sqlite.sqlite3_bind_int(stmt, 2, @intCast(source));
+        if (reason) |r| {
+            _ = sqlite.sqlite3_bind_text(stmt, 3, r.ptr, @intCast(r.len), sqlite.SQLITE_TRANSIENT);
+        } else {
+            _ = sqlite.sqlite3_bind_null(stmt, 3);
+        }
+        _ = sqlite.sqlite3_bind_int64(stmt, 4, @intCast(created_at));
+        try stepAndFinalize(stmt);
+    }
+
+    /// Remove an individual IP ban.
+    pub fn removeBannedIp(self: *ResumeDb, address: []const u8) !void {
+        const stmt = try self.execOneShot("DELETE FROM banned_ips WHERE address = ?1");
+        _ = sqlite.sqlite3_bind_text(stmt, 1, address.ptr, @intCast(address.len), sqlite.SQLITE_TRANSIENT);
+        try stepAndFinalize(stmt);
+    }
+
+    /// Remove all bans with the given source.
+    pub fn clearBannedBySource(self: *ResumeDb, source: u8) !void {
+        const stmt1 = try self.execOneShot("DELETE FROM banned_ips WHERE source = ?1");
+        _ = sqlite.sqlite3_bind_int(stmt1, 1, @intCast(source));
+        try stepAndFinalize(stmt1);
+
+        const stmt2 = try self.execOneShot("DELETE FROM banned_ranges WHERE source = ?1");
+        _ = sqlite.sqlite3_bind_int(stmt2, 1, @intCast(source));
+        try stepAndFinalize(stmt2);
+    }
+
+    /// A banned IP loaded from the DB.
+    pub const SavedBannedIp = struct {
+        address: []const u8,
+        source: u8,
+        reason: ?[]const u8,
+        created_at: i64,
+    };
+
+    /// Load all individual banned IPs. Caller owns the returned slices.
+    pub fn loadBannedIps(self: *ResumeDb, allocator: std.mem.Allocator) ![]SavedBannedIp {
+        const stmt = try self.execOneShot("SELECT address, source, reason, created_at FROM banned_ips");
+        defer _ = sqlite.sqlite3_finalize(stmt);
+
+        var result = std.ArrayList(SavedBannedIp).empty;
+        errdefer {
+            for (result.items) |item| {
+                allocator.free(item.address);
+                if (item.reason) |r| allocator.free(r);
+            }
+            result.deinit(allocator);
+        }
+
+        while (sqlite.sqlite3_step(stmt) == sqlite.SQLITE_ROW) {
+            const addr_ptr = sqlite.sqlite3_column_text(stmt, 0) orelse continue;
+            const addr_len: usize = @intCast(sqlite.sqlite3_column_bytes(stmt, 0));
+            const source: u8 = @intCast(sqlite.sqlite3_column_int(stmt, 1));
+
+            const reason_ptr = sqlite.sqlite3_column_text(stmt, 2);
+            const reason_len: usize = @intCast(sqlite.sqlite3_column_bytes(stmt, 2));
+            const created_at: i64 = sqlite.sqlite3_column_int64(stmt, 3);
+
+            const address = try allocator.dupe(u8, addr_ptr[0..addr_len]);
+            errdefer allocator.free(address);
+            const reason: ?[]const u8 = if (reason_ptr != null and reason_len > 0)
+                try allocator.dupe(u8, reason_ptr.?[0..reason_len])
+            else
+                null;
+
+            try result.append(allocator, .{
+                .address = address,
+                .source = source,
+                .reason = reason,
+                .created_at = created_at,
+            });
+        }
+        return result.toOwnedSlice(allocator);
+    }
+
+    /// Save a banned range.
+    pub fn saveBannedRange(self: *ResumeDb, start_addr: []const u8, end_addr: []const u8, source: u8) !void {
+        const stmt = try self.execOneShot(
+            "INSERT INTO banned_ranges (start_addr, end_addr, source) VALUES (?1, ?2, ?3)",
+        );
+        _ = sqlite.sqlite3_bind_text(stmt, 1, start_addr.ptr, @intCast(start_addr.len), sqlite.SQLITE_TRANSIENT);
+        _ = sqlite.sqlite3_bind_text(stmt, 2, end_addr.ptr, @intCast(end_addr.len), sqlite.SQLITE_TRANSIENT);
+        _ = sqlite.sqlite3_bind_int(stmt, 3, @intCast(source));
+        try stepAndFinalize(stmt);
+    }
+
+    /// A banned range loaded from the DB.
+    pub const SavedBannedRange = struct {
+        start_addr: []const u8,
+        end_addr: []const u8,
+        source: u8,
+        created_at: i64,
+    };
+
+    /// Load all banned ranges. Caller owns the returned slices.
+    pub fn loadBannedRanges(self: *ResumeDb, allocator: std.mem.Allocator) ![]SavedBannedRange {
+        const stmt = try self.execOneShot("SELECT start_addr, end_addr, source, created_at FROM banned_ranges");
+        defer _ = sqlite.sqlite3_finalize(stmt);
+
+        var result = std.ArrayList(SavedBannedRange).empty;
+        errdefer {
+            for (result.items) |item| {
+                allocator.free(item.start_addr);
+                allocator.free(item.end_addr);
+            }
+            result.deinit(allocator);
+        }
+
+        while (sqlite.sqlite3_step(stmt) == sqlite.SQLITE_ROW) {
+            const start_ptr = sqlite.sqlite3_column_text(stmt, 0) orelse continue;
+            const start_len: usize = @intCast(sqlite.sqlite3_column_bytes(stmt, 0));
+            const end_ptr = sqlite.sqlite3_column_text(stmt, 1) orelse continue;
+            const end_len: usize = @intCast(sqlite.sqlite3_column_bytes(stmt, 1));
+            const source: u8 = @intCast(sqlite.sqlite3_column_int(stmt, 2));
+            const created_at: i64 = sqlite.sqlite3_column_int64(stmt, 3);
+
+            const start_addr = try allocator.dupe(u8, start_ptr[0..start_len]);
+            errdefer allocator.free(start_addr);
+            const end_addr = try allocator.dupe(u8, end_ptr[0..end_len]);
+
+            try result.append(allocator, .{
+                .start_addr = start_addr,
+                .end_addr = end_addr,
+                .source = source,
+                .created_at = created_at,
+            });
+        }
+        return result.toOwnedSlice(allocator);
+    }
+
+    /// IP filter config loaded from the DB.
+    pub const IpFilterConfig = struct {
+        path: ?[]const u8 = null,
+        enabled: bool = false,
+        rule_count: u32 = 0,
+    };
+
+    /// Load the ipfilter configuration (singleton).
+    pub fn loadIpFilterConfig(self: *ResumeDb, allocator: std.mem.Allocator) !IpFilterConfig {
+        const stmt = self.execOneShot("SELECT path, enabled, rule_count FROM ipfilter_config WHERE id = 1") catch return .{};
+        defer _ = sqlite.sqlite3_finalize(stmt);
+
+        if (sqlite.sqlite3_step(stmt) == sqlite.SQLITE_ROW) {
+            const path_ptr = sqlite.sqlite3_column_text(stmt, 0);
+            const path_len: usize = @intCast(sqlite.sqlite3_column_bytes(stmt, 0));
+            const enabled = sqlite.sqlite3_column_int(stmt, 1) != 0;
+            const rule_count: u32 = @intCast(sqlite.sqlite3_column_int(stmt, 2));
+
+            const path: ?[]const u8 = if (path_ptr != null and path_len > 0)
+                try allocator.dupe(u8, path_ptr.?[0..path_len])
+            else
+                null;
+
+            return .{ .path = path, .enabled = enabled, .rule_count = rule_count };
+        }
+        return .{};
+    }
+
+    /// Save the ipfilter configuration (upsert singleton).
+    pub fn saveIpFilterConfig(self: *ResumeDb, config: IpFilterConfig) !void {
+        const stmt = try self.execOneShot(
+            "INSERT INTO ipfilter_config (id, path, enabled, rule_count) VALUES (1, ?1, ?2, ?3) " ++
+                "ON CONFLICT(id) DO UPDATE SET path = ?1, enabled = ?2, rule_count = ?3",
+        );
+        if (config.path) |p| {
+            _ = sqlite.sqlite3_bind_text(stmt, 1, p.ptr, @intCast(p.len), sqlite.SQLITE_TRANSIENT);
+        } else {
+            _ = sqlite.sqlite3_bind_null(stmt, 1);
+        }
+        _ = sqlite.sqlite3_bind_int(stmt, 2, if (config.enabled) 1 else 0);
+        _ = sqlite.sqlite3_bind_int(stmt, 3, @intCast(config.rule_count));
+        try stepAndFinalize(stmt);
+    }
 };
 
 /// Background resume writer that batches piece completions.
@@ -1042,4 +1278,118 @@ test "resume db v2 info hash isolated per torrent" {
     // Pure v1 torrent should return null
     const hash_c = [_]u8{0xCC} ** 20;
     try std.testing.expect(db.loadInfoHashV2(hash_c) == null);
+}
+
+test "resume db save and load banned ips" {
+    const allocator = std.testing.allocator;
+    var db = ResumeDb.open(":memory:") catch return error.SkipZigTest;
+    defer db.close();
+
+    // Initially empty
+    const empty = try db.loadBannedIps(allocator);
+    defer allocator.free(empty);
+    try std.testing.expectEqual(@as(usize, 0), empty.len);
+
+    // Add bans
+    try db.saveBannedIp("192.168.1.1", 0, "bad peer", std.time.timestamp());
+    try db.saveBannedIp("10.0.0.5", 1, null, std.time.timestamp());
+
+    const loaded = try db.loadBannedIps(allocator);
+    defer {
+        for (loaded) |item| {
+            allocator.free(item.address);
+            if (item.reason) |r| allocator.free(r);
+        }
+        allocator.free(loaded);
+    }
+    try std.testing.expectEqual(@as(usize, 2), loaded.len);
+
+    // Remove one
+    try db.removeBannedIp("192.168.1.1");
+    const after_remove = try db.loadBannedIps(allocator);
+    defer {
+        for (after_remove) |item| {
+            allocator.free(item.address);
+            if (item.reason) |r| allocator.free(r);
+        }
+        allocator.free(after_remove);
+    }
+    try std.testing.expectEqual(@as(usize, 1), after_remove.len);
+}
+
+test "resume db save and load banned ranges" {
+    const allocator = std.testing.allocator;
+    var db = ResumeDb.open(":memory:") catch return error.SkipZigTest;
+    defer db.close();
+
+    try db.saveBannedRange("10.0.0.0", "10.255.255.255", 1);
+    try db.saveBannedRange("192.168.0.0", "192.168.255.255", 0);
+
+    const loaded = try db.loadBannedRanges(allocator);
+    defer {
+        for (loaded) |item| {
+            allocator.free(item.start_addr);
+            allocator.free(item.end_addr);
+        }
+        allocator.free(loaded);
+    }
+    try std.testing.expectEqual(@as(usize, 2), loaded.len);
+}
+
+test "resume db clear banned by source" {
+    const allocator = std.testing.allocator;
+    var db = ResumeDb.open(":memory:") catch return error.SkipZigTest;
+    defer db.close();
+
+    try db.saveBannedIp("1.1.1.1", 0, null, std.time.timestamp());
+    try db.saveBannedIp("2.2.2.2", 1, null, std.time.timestamp());
+    try db.saveBannedRange("10.0.0.0", "10.255.255.255", 1);
+
+    // Clear ipfilter source (1)
+    try db.clearBannedBySource(1);
+
+    const ips = try db.loadBannedIps(allocator);
+    defer {
+        for (ips) |item| {
+            allocator.free(item.address);
+            if (item.reason) |r| allocator.free(r);
+        }
+        allocator.free(ips);
+    }
+    try std.testing.expectEqual(@as(usize, 1), ips.len);
+
+    const ranges = try db.loadBannedRanges(allocator);
+    defer {
+        for (ranges) |item| {
+            allocator.free(item.start_addr);
+            allocator.free(item.end_addr);
+        }
+        allocator.free(ranges);
+    }
+    try std.testing.expectEqual(@as(usize, 0), ranges.len);
+}
+
+test "resume db ipfilter config persistence" {
+    const allocator = std.testing.allocator;
+    var db = ResumeDb.open(":memory:") catch return error.SkipZigTest;
+    defer db.close();
+
+    // Initially empty
+    const empty = try db.loadIpFilterConfig(allocator);
+    try std.testing.expect(!empty.enabled);
+    try std.testing.expect(empty.path == null);
+
+    // Save config
+    try db.saveIpFilterConfig(.{
+        .path = "/etc/ipfilter.dat",
+        .enabled = true,
+        .rule_count = 1500,
+    });
+
+    const loaded = try db.loadIpFilterConfig(allocator);
+    defer if (loaded.path) |p| allocator.free(p);
+
+    try std.testing.expect(loaded.enabled);
+    try std.testing.expectEqual(@as(u32, 1500), loaded.rule_count);
+    try std.testing.expectEqualStrings("/etc/ipfilter.dat", loaded.path.?);
 }
