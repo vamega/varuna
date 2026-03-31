@@ -129,7 +129,9 @@ pub fn hashPair(left: [32]u8, right: [32]u8) [32]u8 {
 /// SHA-256 of empty data.
 pub const zero_hash: [32]u8 = blk: {
     @setEvalBranchQuota(10000);
-    break :blk Sha256.hash(&.{}, .{});
+    var digest: [32]u8 = undefined;
+    Sha256.hash(&.{}, &digest, .{});
+    break :blk digest;
 };
 
 /// Round up to the next power of 2 (minimum 1).

@@ -108,6 +108,7 @@ Update it whenever a milestone lands, the near-term backlog changes, or a new op
 - Resume DB v2 info-hash (`src/storage/resume.zig`): `info_hash_v2` table stores the full 32-byte SHA-256 hash, `saveInfoHashV2`/`loadInfoHashV2` methods.
 - `TorrentSession.info_hash_v2` field: v2 hash propagated from metainfo to session, persisted to and loaded from resume DB, passed in all announce calls.
 - BEP 52 hash exchange wire protocol (`src/net/hash_exchange.zig`): `hash request` (msg 21), `hashes` (msg 22), `hash reject` (msg 23) message encode/decode. Merkle proof building from tree. Integrated into `src/io/protocol.zig` message dispatch.
+- Runtime Merkle tree cache (`src/torrent/merkle_cache.zig`): per-file Merkle tree cache with LRU eviction (`TorrentContext.merkle_cache`). Trees built lazily on first hash request by reading piece data from disk and computing SHA-256 hashes. Cache validated against `pieces_root` from torrent metadata. Protocol handler (`handleHashRequest` in `src/io/protocol.zig`) now serves real hashes from cache instead of always rejecting. 8 tests.
 
 ### DHT (BEP 5) — Distributed Hash Table
 - 160-bit node ID generation, XOR distance, bucket index calculation (`src/dht/node_id.zig`). Compact node info encode/decode (26-byte BEP 5 format). Random ID generation within bucket range for refresh.
@@ -135,7 +136,7 @@ Update it whenever a milestone lands, the near-term backlog changes, or a new op
 - Private tracker simulation tests (25 tests): required announce fields (compact, numwant, key, event), per-session key generation, private flag enforcement (no ut_pex), tracker error responses (failure reason, missing fields, invalid formats, negative interval), compact peer parsing.
 - Soak test framework (`zig build soak-test`): multi-torrent piece tracker stress, allocator leak detection (GPA), FD leak monitoring, tick latency tracking, bitfield stress cycles.
 - 5 super-seed (BEP 16) tests, 2 multi-announce tests, 5 huge page cache tests.
-- BEP 52 tests: 11 Merkle tree tests, 8 file tree parser tests, 7 v2 metainfo tests, 4 v2 layout tests, 1 v2 info-hash test, 8 hash exchange tests, 2 v2 announce URL tests, 2 v2 resume DB tests.
+- BEP 52 tests: 11 Merkle tree tests, 8 file tree parser tests, 7 v2 metainfo tests, 4 v2 layout tests, 1 v2 info-hash test, 8 hash exchange tests, 2 v2 announce URL tests, 2 v2 resume DB tests, 8 Merkle cache tests.
 - DHT tests: 7 node_id tests, 8 routing_table tests, 8 krpc tests, 8 token tests, 7 lookup tests, 5 dht_engine tests, 1 persistence test (44 total).
 - 10 peer ID client identification tests (Azureus-style, Shadow-style, Mainline, unknown).
 - 17 peer ID masquerading tests: all 5 client formats, case insensitivity, malformed input, unsupported client error, random suffix validation.
@@ -151,7 +152,8 @@ Update it whenever a milestone lands, the near-term backlog changes, or a new op
 - ~~**Magnet link resilience**~~: (DONE) multi-peer retry with per-peer/overall timeouts, DHT peer provider interface stub, metadata fetch progress reporting via Stats/API.
 - ~~**MSE encryption (BEP 6)**~~: (DONE) message stream encryption/obfuscation.
 - ~~**BEP 52 Phase 4**~~: (DONE) peer wire handshake dual info-hash matching, tracker announce with v2 info-hash, resume DB v2 info-hash column, TorrentSession v2 hash propagation.
-- ~~**BEP 52 Phase 5**~~: (DONE) hash request/hashes/hash reject message encode/decode, Merkle proof building from tree, protocol handler integration. Runtime Merkle tree caching for hash serving deferred.
+- ~~**BEP 52 Phase 5**~~: (DONE) hash request/hashes/hash reject message encode/decode, Merkle proof building from tree, protocol handler integration.
+- ~~**BEP 52 Phase 6**~~: (DONE) runtime Merkle tree caching for hash serving. Per-file trees built lazily from disk, LRU eviction, `handleHashRequest` serves real hashes.
 
 ### Operational
 - ~~**Flood/qui WebUI validation**~~: (DONE) populated remaining stub fields (tracker URL, trackers_count, piece_range, content_path, magnet_uri, super_seeding, properties hash/name/created_by), added real peer data to torrentPeers endpoint.
@@ -164,7 +166,7 @@ Update it whenever a milestone lands, the near-term backlog changes, or a new op
 ## Last Verified Milestone
 
 - DHT (BEP 5) Phases 1-3
-- BEP 52 (BitTorrent v2 / Hybrid) Phases 1-5
+- BEP 52 (BitTorrent v2 / Hybrid) Phases 1-6 (including runtime Merkle tree cache)
 - MSE/PE (BEP 6) async handshake + auto-fallback
 - All protocol features merged, all API stubs populated
 - `zig build test`: all tests pass
