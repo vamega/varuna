@@ -1,4 +1,5 @@
 pub const auth = @import("auth.zig");
+pub const compat = @import("compat.zig");
 pub const handlers = @import("handlers.zig");
 pub const json = @import("json.zig");
 pub const multipart = @import("multipart.zig");
