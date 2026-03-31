@@ -78,6 +78,12 @@ Uses `IORING_OP_SENDMSG` / `IORING_OP_RECVMSG` for io_uring integration.
 
 Distributed Hash Table for trackerless peer discovery. Peer Exchange for discovering peers through existing connections. Both essential for public torrents.
 
+See [dht-bep52-plan.md](dht-bep52-plan.md) for the detailed implementation plan covering DHT module layout, routing table design, KRPC protocol, io_uring integration, and phasing.
+
+## 7a. BEP 52 (BitTorrent v2 / Hybrid Torrents)
+
+Per-file Merkle tree piece verification (SHA-256), v2 info-hash, file-aligned pieces, and hybrid torrent support. See [dht-bep52-plan.md](dht-bep52-plan.md) for the full plan.
+
 ## 8. Magnet links (BEP 9)
 
 Download torrent metadata from peers via the extension protocol. Most users interact with magnet links, not .torrent files.
