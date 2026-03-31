@@ -1055,16 +1055,20 @@ pub const SessionManager = struct {
                 break :blk @as(f64, @floatFromInt(bf.count)) / @as(f64, @floatFromInt(total_pieces));
             } else 0.0;
 
-            // Client ID from peer handshake (not stored in Peer struct, use empty)
-            const client_str = try allocator.dupe(u8, "");
+            // Client ID from peer handshake peer ID
+            const peer_id_mod = @import("../net/peer_id.zig");
+            const client_str = if (peer.has_peer_id)
+                peer_id_mod.peerIdToClientName(allocator, &peer.remote_peer_id) catch try allocator.dupe(u8, "")
+            else
+                try allocator.dupe(u8, "");
 
             try result.append(allocator, .{
                 .ip = ip_str,
                 .port = port,
                 .client = client_str,
                 .flags = flags_str,
-                .dl_speed = 0, // per-peer speed not tracked currently
-                .ul_speed = 0,
+                .dl_speed = peer.current_dl_speed,
+                .ul_speed = peer.current_ul_speed,
                 .downloaded = peer.bytes_downloaded_from,
                 .uploaded = peer.bytes_uploaded_to,
                 .progress = progress,

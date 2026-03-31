@@ -54,7 +54,7 @@ Update it whenever a milestone lands, the near-term backlog changes, or a new op
 - **Torrents**: info (40+ fields matching qui Torrent interface), add (multipart + raw), delete, pause, resume, properties (30+ fields with hash, name, created_by), files (with index, availability, real piece_range), trackers (with msg field).
 - **Controls**: filePrio, setSequentialDownload, setDownloadLimit, setUploadLimit, downloadLimit, uploadLimit, forceReannounce, recheck, setLocation, connDiagnostics.
 - **Categories & Tags**: categories (create/edit/remove/list/setCategory), tags (create/delete/addTags/removeTags/list).
-- **Sync**: /api/v2/sync/maindata delta protocol (rid-based, Wyhash change detection, 100-snapshot circular buffer), sync/torrentPeers with real peer data (IP, flags, progress, transfer stats).
+- **Sync**: /api/v2/sync/maindata delta protocol (rid-based, Wyhash change detection, 100-snapshot circular buffer), sync/torrentPeers with real peer data (IP, flags, progress, transfer stats, per-peer dl/ul speed, client name from peer ID).
 - **Compatibility**: qBittorrent state strings (downloading/uploading/pausedDL/pausedUP/etc), CORS headers on all responses, OPTIONS preflight handler, magnet URI generation, percent-encoding, content_path building. Validated against qui (autobrr/qui) TypeScript interfaces.
 - **Multipart form-data**: zero-copy parser for Flood/WebUI torrent uploads.
 - **varuna-ctl**: list, add (--save-path), pause, resume, delete (--delete-files), move, conn-diag, version, stats, speed limits (set/get), --username/--password auth.
@@ -65,7 +65,8 @@ Update it whenever a milestone lands, the near-term backlog changes, or a new op
 - systemd socket activation: inherits listen fds from systemd via $LISTEN_FDS/$LISTEN_PID (sd_listen_fds protocol). Supports API server and peer listener sockets.
 - Daemon seeding after download: announces completed, creates listen socket, multi-torrent handshake matching.
 - ETA calculation and share ratio tracking (lifetime, persisted).
-- Download/upload speed tracking with 2-second rolling window.
+- Download/upload speed tracking with 2-second rolling window (torrent-level and per-peer).
+- Per-peer client identification from peer ID (Azureus-style, Shadow-style, Mainline formats).
 - Per-torrent rate limit persistence: dl_limit/ul_limit saved to SQLite, restored on daemon restart.
 - Torrent data relocation: move completed torrent data to a new path via API (setLocation endpoint).
 - Per-torrent connection diagnostics: connection attempts/failures/timeouts exposed via connDiagnostics API.
@@ -135,6 +136,7 @@ Update it whenever a milestone lands, the near-term backlog changes, or a new op
 - 5 super-seed (BEP 16) tests, 2 multi-announce tests, 5 huge page cache tests.
 - BEP 52 tests: 11 Merkle tree tests, 8 file tree parser tests, 7 v2 metainfo tests, 4 v2 layout tests, 1 v2 info-hash test, 8 hash exchange tests, 2 v2 announce URL tests, 2 v2 resume DB tests.
 - DHT tests: 7 node_id tests, 8 routing_table tests, 8 krpc tests, 8 token tests, 7 lookup tests, 5 dht_engine tests, 1 persistence test (44 total).
+- 10 peer ID client identification tests (Azureus-style, Shadow-style, Mainline, unknown).
 
 ## Next
 

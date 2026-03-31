@@ -127,10 +127,21 @@ pub const Peer = struct {
     availability_known: bool = false,
     availability: ?Bitfield = null,
 
+    // Remote peer identification (from handshake)
+    remote_peer_id: [20]u8 = [_]u8{0} ** 20,
+    has_peer_id: bool = false,
+
     // Timing and stats
     last_activity: i64 = 0,
     bytes_downloaded_from: u64 = 0, // bytes we received from this peer
     bytes_uploaded_to: u64 = 0, // bytes we sent to this peer
+
+    // Per-peer speed tracking (rolling window, updated every ~2s in tick)
+    last_speed_check: i64 = 0,
+    last_dl_bytes: u64 = 0,
+    last_ul_bytes: u64 = 0,
+    current_dl_speed: u64 = 0,
+    current_ul_speed: u64 = 0,
 
     // Piece download state
     current_piece: ?u32 = null,

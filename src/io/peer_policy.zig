@@ -605,10 +605,37 @@ pub fn checkPex(self: *EventLoop) void {
     }
 }
 
-/// Update speed counters for all active torrents (called from tick).
+/// Update speed counters for all active torrents and individual peers (called from tick).
 pub fn updateSpeedCounters(self: *EventLoop) void {
     const now = std.time.timestamp();
 
+    // Update per-peer speed counters
+    for (self.peers) |*peer| {
+        if (peer.state == .free) continue;
+
+        if (peer.last_speed_check == 0) {
+            // First check: initialize baselines, no speed yet
+            peer.last_speed_check = now;
+            peer.last_dl_bytes = peer.bytes_downloaded_from;
+            peer.last_ul_bytes = peer.bytes_uploaded_to;
+            continue;
+        }
+
+        const peer_elapsed = now - peer.last_speed_check;
+        if (peer_elapsed < 2) continue;
+
+        const peer_elapsed_u: u64 = @intCast(peer_elapsed);
+        const peer_dl_delta = peer.bytes_downloaded_from -| peer.last_dl_bytes;
+        const peer_ul_delta = peer.bytes_uploaded_to -| peer.last_ul_bytes;
+
+        peer.current_dl_speed = peer_dl_delta / peer_elapsed_u;
+        peer.current_ul_speed = peer_ul_delta / peer_elapsed_u;
+        peer.last_speed_check = now;
+        peer.last_dl_bytes = peer.bytes_downloaded_from;
+        peer.last_ul_bytes = peer.bytes_uploaded_to;
+    }
+
+    // Update per-torrent speed counters
     for (&self.torrents, 0..) |*slot, idx| {
         const tc = &(slot.* orelse continue);
         const tid: u8 = @intCast(idx);

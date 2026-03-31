@@ -391,6 +391,9 @@ fn processUtpOutboundHandshake(self: *EventLoop, peer_slot: u16) void {
         self.removePeer(peer_slot);
         return;
     }
+    // Store remote peer ID for client identification
+    @memcpy(&peer.remote_peer_id, peer.handshake_buf[48..68]);
+    peer.has_peer_id = true;
 
     // BEP 10: check if peer supports extensions.
     const recv_reserved = peer.handshake_buf[20..28];
@@ -443,6 +446,9 @@ fn processUtpInboundHandshake(self: *EventLoop, peer_slot: u16) void {
         return;
     }
     peer.torrent_id = resp_tid;
+    // Store remote peer ID for client identification
+    @memcpy(&peer.remote_peer_id, peer.handshake_buf[48..68]);
+    peer.has_peer_id = true;
 
     // BEP 10: check if inbound peer supports extensions
     const inbound_reserved = peer.handshake_buf[20..28];
