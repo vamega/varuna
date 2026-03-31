@@ -248,6 +248,13 @@ fn serializeTorrentObject(allocator: std.mem.Allocator, json: *std.ArrayList(u8)
     const amount_left: u64 = if (stat.total_size > stat.bytes_downloaded) stat.total_size - stat.bytes_downloaded else 0;
     const completion_on: i64 = if (stat.progress >= 1.0) stat.added_on else -1;
 
+    // Build content_path and magnet_uri
+    const content_path = compat.buildContentPath(allocator, stat.save_path, stat.name) catch stat.save_path;
+    defer if (content_path.ptr != stat.save_path.ptr) allocator.free(content_path);
+
+    const magnet_uri = compat.buildMagnetUri(allocator, &stat.info_hash_hex, stat.name, stat.tracker) catch "";
+    defer if (magnet_uri.len > 0) allocator.free(magnet_uri);
+
     // Split into two print calls to stay under the 32-argument limit.
     try json.print(
         allocator,
@@ -269,7 +276,7 @@ fn serializeTorrentObject(allocator: std.mem.Allocator, json: *std.ArrayList(u8)
             stat.added_on,
             completion_on,
             esc(stat.save_path),
-            esc(stat.save_path),
+            esc(content_path),
             stat.pieces_have,
             stat.pieces_total,
             stat.dl_limit,
@@ -283,10 +290,13 @@ fn serializeTorrentObject(allocator: std.mem.Allocator, json: *std.ArrayList(u8)
 
     try json.print(
         allocator,
-        ",\"f_l_piece_prio\":false,\"force_start\":false,\"super_seeding\":false,\"auto_tmm\":false,\"category\":\"{f}\",\"tags\":\"{f}\",\"tracker\":\"\",\"trackers_count\":0,\"amount_left\":{},\"completed\":{},\"downloaded\":{},\"downloaded_session\":{},\"uploaded\":{},\"uploaded_session\":{},\"time_active\":{},\"seeding_time\":{},\"last_activity\":{},\"seen_complete\":-1,\"priority\":0,\"availability\":-1,\"max_ratio\":-1,\"max_seeding_time\":-1,\"ratio_limit\":-1,\"seeding_time_limit\":-1,\"popularity\":0,\"magnet_uri\":\"\",\"reannounce\":0}}",
+        ",\"f_l_piece_prio\":false,\"force_start\":false,\"super_seeding\":{s},\"auto_tmm\":false,\"category\":\"{f}\",\"tags\":\"{f}\",\"tracker\":\"{f}\",\"trackers_count\":{},\"amount_left\":{},\"completed\":{},\"downloaded\":{},\"downloaded_session\":{},\"uploaded\":{},\"uploaded_session\":{},\"time_active\":{},\"seeding_time\":{},\"last_activity\":{},\"seen_complete\":-1,\"priority\":0,\"availability\":-1,\"max_ratio\":-1,\"max_seeding_time\":-1,\"ratio_limit\":-1,\"seeding_time_limit\":-1,\"popularity\":0,\"magnet_uri\":\"{f}\",\"reannounce\":0}}",
         .{
+            @as([]const u8, if (stat.super_seeding) "true" else "false"),
             esc(stat.category),
             esc(stat.tags),
+            esc(stat.tracker),
+            stat.trackers_count,
             amount_left,
             stat.bytes_downloaded,
             stat.bytes_downloaded,
@@ -296,6 +306,7 @@ fn serializeTorrentObject(allocator: std.mem.Allocator, json: *std.ArrayList(u8)
             time_active,
             @as(i64, if (stat.state == .seeding) time_active else 0),
             now,
+            esc(magnet_uri),
         },
     );
 }

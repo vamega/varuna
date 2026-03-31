@@ -63,6 +63,15 @@ pub const Stats = struct {
     category: []const u8 = "",
     /// Comma-separated tags assigned to this torrent (empty string if none).
     tags: []const u8 = "",
+    /// Primary tracker URL (first announce URL). Empty string if none.
+    tracker: []const u8 = "",
+    /// Total number of tracker URLs configured for this torrent.
+    trackers_count: u32 = 0,
+    /// Content path: for single-file torrents the full file path,
+    /// for multi-file torrents the directory path.
+    content_path: []const u8 = "",
+    /// Number of files in this torrent.
+    num_files: u32 = 0,
 };
 
 pub const TorrentSession = struct {
@@ -530,6 +539,33 @@ pub const TorrentSession = struct {
         else
             0.0;
 
+        // Extract tracker and file metadata from parsed session (if available)
+        const meta_opt = if (self.session) |*s| s.metainfo else null;
+        const tracker_url: []const u8 = if (meta_opt) |m| (m.announce orelse "") else "";
+        const trackers_count: u32 = if (meta_opt) |m| blk: {
+            var count: u32 = 0;
+            if (m.announce != null) count += 1;
+            for (m.announce_list) |url| {
+                if (m.announce) |primary| {
+                    if (!std.mem.eql(u8, url, primary)) count += 1;
+                } else {
+                    count += 1;
+                }
+            }
+            break :blk count;
+        } else 0;
+
+        // content_path: single-file = save_path/name, multi-file = save_path/torrent_name
+        const content_path: []const u8 = if (meta_opt) |m|
+            (if (m.files.len == 1) self.save_path else self.save_path)
+        else
+            self.save_path;
+
+        const num_files: u32 = if (meta_opt) |m|
+            @intCast(m.files.len)
+        else
+            0;
+
         return .{
             .state = self.state,
             .progress = progress,
@@ -558,6 +594,10 @@ pub const TorrentSession = struct {
             .scrape_downloaded = if (self.scrape_result) |sr| sr.downloaded else 0,
             .category = self.category orelse "",
             .tags = self.getTagsString(),
+            .tracker = tracker_url,
+            .trackers_count = trackers_count,
+            .content_path = content_path,
+            .num_files = num_files,
         };
     }
 

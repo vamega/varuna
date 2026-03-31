@@ -49,11 +49,11 @@ Update it whenever a milestone lands, the near-term backlog changes, or a new op
 ### API (qBittorrent v2 compatible)
 - **Auth**: login/logout with session cookies (SID), 1-hour timeout, configurable credentials.
 - **Core**: webapiVersion, version, buildInfo, preferences (40+ fields), setPreferences (form + JSON), transfer/info (with connection_status, dht_nodes), speedLimitsMode.
-- **Torrents**: info (35+ fields matching qui Torrent interface), add (multipart + raw), delete, pause, resume, properties (25+ fields), files (with index, availability, piece_range), trackers (with msg field).
+- **Torrents**: info (40+ fields matching qui Torrent interface), add (multipart + raw), delete, pause, resume, properties (30+ fields with hash, name, created_by), files (with index, availability, real piece_range), trackers (with msg field).
 - **Controls**: filePrio, setSequentialDownload, setDownloadLimit, setUploadLimit, downloadLimit, uploadLimit, forceReannounce, recheck, setLocation, connDiagnostics.
 - **Categories & Tags**: categories (create/edit/remove/list/setCategory), tags (create/delete/addTags/removeTags/list).
-- **Sync**: /api/v2/sync/maindata delta protocol (rid-based, Wyhash change detection, 100-snapshot circular buffer), sync/torrentPeers stub.
-- **Compatibility**: qBittorrent state strings (downloading/uploading/pausedDL/pausedUP/etc), CORS headers on all responses, OPTIONS preflight handler. Validated against qui (autobrr/qui) TypeScript interfaces.
+- **Sync**: /api/v2/sync/maindata delta protocol (rid-based, Wyhash change detection, 100-snapshot circular buffer), sync/torrentPeers with real peer data (IP, flags, progress, transfer stats).
+- **Compatibility**: qBittorrent state strings (downloading/uploading/pausedDL/pausedUP/etc), CORS headers on all responses, OPTIONS preflight handler, magnet URI generation, percent-encoding, content_path building. Validated against qui (autobrr/qui) TypeScript interfaces.
 - **Multipart form-data**: zero-copy parser for Flood/WebUI torrent uploads.
 - **varuna-ctl**: list, add (--save-path), pause, resume, delete (--delete-files), move, conn-diag, version, stats, speed limits (set/get), --username/--password auth.
 
@@ -128,7 +128,7 @@ Update it whenever a milestone lands, the near-term backlog changes, or a new op
 - **BEP 52 Phase 5 (deferred)**: hash request/hashes/hash reject message exchange, Merkle proof exchange with peers.
 
 ### Operational
-- **Flood/qui WebUI validation**: populate remaining stub fields (tracker URL, trackers_count, piece_range, content_path for multi-file, magnet_uri), add real peer data to torrentPeers endpoint.
+- ~~**Flood/qui WebUI validation**~~: (DONE) populated remaining stub fields (tracker URL, trackers_count, piece_range, content_path, magnet_uri, super_seeding, properties hash/name/created_by), added real peer data to torrentPeers endpoint.
 
 ## Known Issues
 
@@ -137,6 +137,6 @@ Update it whenever a milestone lands, the near-term backlog changes, or a new op
 
 ## Last Verified Milestone
 
-- BEP 52 (BitTorrent v2 / Hybrid) Phase 1-3: version detection, file tree parsing, Merkle tree, v2 info-hash, file-aligned layout, dual-hash verification
+- qBittorrent API stub population: tracker URL, trackers_count, piece_range, content_path, magnet_uri, super_seeding, properties hash/name/created_by, real torrentPeers endpoint
 - `zig build test`: all tests pass
 - `zig build`: clean build
