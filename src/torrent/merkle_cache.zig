@@ -2,6 +2,7 @@ const std = @import("std");
 const merkle = @import("merkle.zig");
 const metainfo = @import("metainfo.zig");
 const layout_mod = @import("layout.zig");
+const hash_exchange = @import("../net/hash_exchange.zig");
 const Bitfield = @import("../bitfield.zig").Bitfield;
 const Sha256 = std.crypto.hash.sha2.Sha256;
 
@@ -16,6 +17,12 @@ const log = std.log.scoped(.merkle_cache);
 /// Memory usage: each cached tree stores O(2N) hashes of 32 bytes each, where
 /// N is the number of pieces in the file (padded to next power of 2). A file
 /// with 1024 pieces uses ~64 KiB for its tree.
+///
+/// Async Merkle tree building: when a hash request arrives for an uncached file,
+/// the work is submitted to the Hasher threadpool instead of blocking the event
+/// loop. Pending requests are tracked here so that when the async result arrives,
+/// all waiting peers can be served. Multiple peers requesting the same file's
+/// tree while it is being built are coalesced -- only one build job is submitted.
 pub const MerkleCache = struct {
     allocator: std.mem.Allocator,
 
@@ -40,6 +47,21 @@ pub const MerkleCache = struct {
     /// v2 file metadata (for pieces_root validation).
     v2_files: []const metainfo.V2File,
 
+    /// Pending hash requests waiting for async Merkle tree builds.
+    pending_requests: std.ArrayList(PendingHashRequest),
+
+    /// Set of file indices currently being built on the hasher threadpool.
+    /// Used to coalesce multiple requests for the same file.
+    /// Small set -- linear scan is fine (typically < 10 concurrent builds).
+    building_files: std.ArrayList(u32),
+
+    /// A hash request waiting for a Merkle tree to be built asynchronously.
+    pub const PendingHashRequest = struct {
+        slot: u16,
+        file_index: u32,
+        request: hash_exchange.HashRequest,
+    };
+
     pub fn init(
         allocator: std.mem.Allocator,
         layout: *const layout_mod.Layout,
@@ -59,6 +81,8 @@ pub const MerkleCache = struct {
             .max_cached_trees = if (max_cached == 0) @intCast(@max(file_count, 1)) else max_cached,
             .layout = layout,
             .v2_files = v2_files,
+            .pending_requests = std.ArrayList(PendingHashRequest).empty,
+            .building_files = std.ArrayList(u32).empty,
         };
     }
 
@@ -70,7 +94,76 @@ pub const MerkleCache = struct {
         }
         self.allocator.free(self.trees);
         self.allocator.free(self.access_order);
+        self.pending_requests.deinit(self.allocator);
+        self.building_files.deinit(self.allocator);
+
         self.* = undefined;
+    }
+
+    /// Add a pending hash request that will be served when the Merkle tree
+    /// for `file_index` is built. Returns true if a build job should be
+    /// submitted (i.e., this is the first request for this file).
+    pub fn addPendingRequest(self: *MerkleCache, slot: u16, req: hash_exchange.HashRequest) !bool {
+        try self.pending_requests.append(self.allocator, .{
+            .slot = slot,
+            .file_index = req.file_index,
+            .request = req,
+        });
+
+        if (self.isFileBuilding(req.file_index)) {
+            // Already building -- just queue the request
+            return false;
+        }
+
+        // Mark as building
+        try self.building_files.append(self.allocator, req.file_index);
+        return true;
+    }
+
+    /// Remove all pending requests for a given file index and return them.
+    /// Called when the Merkle tree build completes (success or failure).
+    pub fn takePendingRequests(
+        self: *MerkleCache,
+        file_index: u32,
+        out: *std.ArrayList(PendingHashRequest),
+    ) void {
+        // Remove from building set
+        for (self.building_files.items, 0..) |fi, idx| {
+            if (fi == file_index) {
+                _ = self.building_files.swapRemove(idx);
+                break;
+            }
+        }
+
+        // Collect matching requests (iterate backwards for safe removal)
+        var i: usize = self.pending_requests.items.len;
+        while (i > 0) {
+            i -= 1;
+            if (self.pending_requests.items[i].file_index == file_index) {
+                out.append(self.allocator, self.pending_requests.items[i]) catch continue;
+                _ = self.pending_requests.swapRemove(i);
+            }
+        }
+    }
+
+    /// Remove all pending requests for a given peer slot.
+    /// Called when a peer disconnects before its requests are served.
+    pub fn removePendingRequestsForSlot(self: *MerkleCache, slot: u16) void {
+        var i: usize = self.pending_requests.items.len;
+        while (i > 0) {
+            i -= 1;
+            if (self.pending_requests.items[i].slot == slot) {
+                _ = self.pending_requests.swapRemove(i);
+            }
+        }
+    }
+
+    /// Check if a file is currently being built on the hasher threadpool.
+    pub fn isFileBuilding(self: *const MerkleCache, file_index: u32) bool {
+        for (self.building_files.items) |fi| {
+            if (fi == file_index) return true;
+        }
+        return false;
     }
 
     /// Get or build the Merkle tree for a file. Returns null if the file's
@@ -553,7 +646,6 @@ test "merkle cache filePieceRange" {
 
 test "merkle cache serves hashes via buildHashesFromTree" {
     const allocator = std.testing.allocator;
-    const hash_exchange = @import("../net/hash_exchange.zig");
 
     const h0 = merkle.hashLeaf("piece0");
     const h1 = merkle.hashLeaf("piece1");
@@ -602,4 +694,162 @@ test "merkle cache serves hashes via buildHashesFromTree" {
     try std.testing.expectEqual(h1, resp.hashes[1]);
     try std.testing.expectEqual(h2, resp.hashes[2]);
     try std.testing.expectEqual(h3, resp.hashes[3]);
+}
+
+test "merkle cache pending request tracking" {
+    const allocator = std.testing.allocator;
+
+    var files = [_]layout_mod.Layout.File{
+        .{ .length = 1024, .torrent_offset = 0, .first_piece = 0, .end_piece_exclusive = 2, .path = &.{}, .v2_piece_offset = 0 },
+    };
+    var v2_files = [_]metainfo.V2File{
+        .{ .path = &.{}, .length = 1024, .pieces_root = [_]u8{0} ** 32 },
+    };
+    var lo = layout_mod.Layout{
+        .piece_length = 512,
+        .piece_count = 2,
+        .total_size = 1024,
+        .files = &files,
+        .piece_hashes = "",
+        .version = .v2,
+        .v2_files = &v2_files,
+    };
+
+    var cache = try MerkleCache.init(allocator, &lo, &v2_files, 8);
+    defer cache.deinit();
+
+    const req = hash_exchange.HashRequest{
+        .file_index = 0,
+        .base_layer = 0,
+        .index = 0,
+        .length = 2,
+        .proof_layers = 0,
+    };
+
+    // First request should return true (need to submit build job)
+    const need_submit1 = try cache.addPendingRequest(0, req);
+    try std.testing.expect(need_submit1);
+    try std.testing.expect(cache.isFileBuilding(0));
+
+    // Second request for same file should return false (coalesced)
+    const need_submit2 = try cache.addPendingRequest(1, req);
+    try std.testing.expect(!need_submit2);
+
+    // Take pending requests
+    var out = std.ArrayList(MerkleCache.PendingHashRequest).empty;
+    defer out.deinit(allocator);
+    cache.takePendingRequests(0, &out);
+
+    try std.testing.expectEqual(@as(usize, 2), out.items.len);
+    try std.testing.expect(!cache.isFileBuilding(0));
+}
+
+test "merkle cache pending request removal on disconnect" {
+    const allocator = std.testing.allocator;
+
+    var files = [_]layout_mod.Layout.File{
+        .{ .length = 1024, .torrent_offset = 0, .first_piece = 0, .end_piece_exclusive = 2, .path = &.{}, .v2_piece_offset = 0 },
+        .{ .length = 512, .torrent_offset = 1024, .first_piece = 2, .end_piece_exclusive = 3, .path = &.{}, .v2_piece_offset = 2 },
+    };
+    var v2_files = [_]metainfo.V2File{
+        .{ .path = &.{}, .length = 1024, .pieces_root = [_]u8{0} ** 32 },
+        .{ .path = &.{}, .length = 512, .pieces_root = [_]u8{0} ** 32 },
+    };
+    var lo = layout_mod.Layout{
+        .piece_length = 512,
+        .piece_count = 3,
+        .total_size = 1536,
+        .files = &files,
+        .piece_hashes = "",
+        .version = .v2,
+        .v2_files = &v2_files,
+    };
+
+    var cache = try MerkleCache.init(allocator, &lo, &v2_files, 8);
+    defer cache.deinit();
+
+    const req0 = hash_exchange.HashRequest{
+        .file_index = 0,
+        .base_layer = 0,
+        .index = 0,
+        .length = 2,
+        .proof_layers = 0,
+    };
+    const req1 = hash_exchange.HashRequest{
+        .file_index = 1,
+        .base_layer = 0,
+        .index = 0,
+        .length = 1,
+        .proof_layers = 0,
+    };
+
+    // Slot 5 requests file 0, slot 7 requests file 0, slot 5 requests file 1
+    _ = try cache.addPendingRequest(5, req0);
+    _ = try cache.addPendingRequest(7, req0);
+    _ = try cache.addPendingRequest(5, req1);
+
+    // Disconnect slot 5 -- should remove both of its requests
+    cache.removePendingRequestsForSlot(5);
+
+    // Only slot 7's request for file 0 should remain
+    var out = std.ArrayList(MerkleCache.PendingHashRequest).empty;
+    defer out.deinit(allocator);
+    cache.takePendingRequests(0, &out);
+
+    try std.testing.expectEqual(@as(usize, 1), out.items.len);
+    try std.testing.expectEqual(@as(u16, 7), out.items[0].slot);
+}
+
+test "merkle cache coalesces multiple peers requesting same file" {
+    const allocator = std.testing.allocator;
+
+    var files = [_]layout_mod.Layout.File{
+        .{ .length = 2048, .torrent_offset = 0, .first_piece = 0, .end_piece_exclusive = 4, .path = &.{}, .v2_piece_offset = 0 },
+    };
+    var v2_files = [_]metainfo.V2File{
+        .{ .path = &.{}, .length = 2048, .pieces_root = [_]u8{0} ** 32 },
+    };
+    var lo = layout_mod.Layout{
+        .piece_length = 512,
+        .piece_count = 4,
+        .total_size = 2048,
+        .files = &files,
+        .piece_hashes = "",
+        .version = .v2,
+        .v2_files = &v2_files,
+    };
+
+    var cache = try MerkleCache.init(allocator, &lo, &v2_files, 8);
+    defer cache.deinit();
+
+    const req = hash_exchange.HashRequest{
+        .file_index = 0,
+        .base_layer = 0,
+        .index = 0,
+        .length = 4,
+        .proof_layers = 0,
+    };
+
+    // 4 peers request the same file
+    const submit1 = try cache.addPendingRequest(10, req);
+    try std.testing.expect(submit1); // first: submit
+
+    const submit2 = try cache.addPendingRequest(20, req);
+    try std.testing.expect(!submit2); // coalesced
+
+    const submit3 = try cache.addPendingRequest(30, req);
+    try std.testing.expect(!submit3); // coalesced
+
+    const submit4 = try cache.addPendingRequest(40, req);
+    try std.testing.expect(!submit4); // coalesced
+
+    try std.testing.expect(cache.isFileBuilding(0));
+
+    // All 4 should be returned when taking
+    var out = std.ArrayList(MerkleCache.PendingHashRequest).empty;
+    defer out.deinit(allocator);
+    cache.takePendingRequests(0, &out);
+
+    try std.testing.expectEqual(@as(usize, 4), out.items.len);
+    try std.testing.expect(!cache.isFileBuilding(0));
 }

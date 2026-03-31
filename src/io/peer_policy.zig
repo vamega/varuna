@@ -11,6 +11,8 @@ const TorrentContext = @import("event_loop.zig").TorrentContext;
 const encodeUserData = @import("event_loop.zig").encodeUserData;
 const max_peers = @import("event_loop.zig").max_peers;
 const protocol = @import("protocol.zig");
+const MerkleCache = @import("../torrent/merkle_cache.zig").MerkleCache;
+const Hasher = @import("hasher.zig").Hasher;
 
 const pipeline_depth: u32 = 5;
 const peer_timeout_secs: i64 = 60;
@@ -353,6 +355,73 @@ pub fn processHashResults(self: *EventLoop) void {
     }
     // Results are already swapped out of the hasher -- no clearResults needed.
     self.hash_result_swap.clearRetainingCapacity();
+}
+
+/// Process completed Merkle tree building results from the background hasher.
+/// Called each tick from the event loop, after processHashResults.
+pub fn processMerkleResults(self: *EventLoop) void {
+    const h = self.hasher orelse return;
+    const merkle_results = h.drainMerkleResultsInto(&self.merkle_result_swap);
+
+    for (merkle_results) |result| {
+        const tc = self.getTorrentContext(result.torrent_id) orelse {
+            if (result.piece_hashes) |hashes| self.allocator.free(hashes);
+            continue;
+        };
+
+        const mc = tc.merkle_cache orelse {
+            if (result.piece_hashes) |hashes| self.allocator.free(hashes);
+            continue;
+        };
+
+        // Collect pending requests for this file
+        var pending_reqs = std.ArrayList(MerkleCache.PendingHashRequest).empty;
+        defer pending_reqs.deinit(self.allocator);
+        mc.takePendingRequests(result.file_index, &pending_reqs);
+
+        if (result.piece_hashes) |piece_hashes| {
+            defer self.allocator.free(piece_hashes);
+
+            // Build and cache the Merkle tree
+            const tree = mc.buildAndCache(result.file_index, piece_hashes) catch |err| {
+                log.debug("merkle: failed to build tree for file {d}: {s}", .{
+                    result.file_index, @errorName(err),
+                });
+                // Send hash reject to all pending requesters
+                for (pending_reqs.items) |pending| {
+                    // Check that the peer is still connected
+                    if (self.peers[pending.slot].state == .free) continue;
+                    if (self.peers[pending.slot].torrent_id != result.torrent_id) continue;
+                    protocol.sendHashReject(self, pending.slot, pending.request);
+                }
+                continue;
+            };
+
+            log.debug("merkle: built tree for file {d}, serving {d} pending request(s)", .{
+                result.file_index, pending_reqs.items.len,
+            });
+
+            // Serve all pending requests from the now-cached tree
+            for (pending_reqs.items) |pending| {
+                // Check that the peer is still connected and belongs to same torrent
+                if (self.peers[pending.slot].state == .free) continue;
+                if (self.peers[pending.slot].torrent_id != result.torrent_id) continue;
+                protocol.sendHashesFromTree(self, pending.slot, tree, pending.request);
+            }
+        } else {
+            // Build failed -- reject all pending requests
+            log.debug("merkle: async hash build failed for file {d}, rejecting {d} request(s)", .{
+                result.file_index, pending_reqs.items.len,
+            });
+            for (pending_reqs.items) |pending| {
+                if (self.peers[pending.slot].state == .free) continue;
+                if (self.peers[pending.slot].torrent_id != result.torrent_id) continue;
+                protocol.sendHashReject(self, pending.slot, pending.request);
+            }
+        }
+    }
+
+    self.merkle_result_swap.clearRetainingCapacity();
 }
 
 // ── Peer timeout ───────────────────────────────────────

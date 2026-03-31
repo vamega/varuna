@@ -386,6 +386,7 @@ pub const EventLoop = struct {
     last_unchoke_recalc: i64 = 0,
     hasher: ?*Hasher = null,
     hash_result_swap: std.ArrayList(Hasher.Result) = std.ArrayList(Hasher.Result).empty,
+    merkle_result_swap: std.ArrayList(Hasher.MerkleResult) = std.ArrayList(Hasher.MerkleResult).empty,
 
     // Compact list of peer slots that are idle (active, unchoked, have
     // availability, and need a piece assignment).  Avoids scanning all
@@ -428,7 +429,7 @@ pub const EventLoop = struct {
         const peers = try allocator.alloc(Peer, max_peers);
         @memset(peers, Peer{});
 
-        // Only create hasher for download mode (seed doesn't need SHA verification)
+        // Create hasher for SHA verification (download) and Merkle tree building (seed/BEP 52)
         const hasher = if (hasher_threads > 0)
             Hasher.create(allocator, hasher_threads) catch null
         else
@@ -531,6 +532,11 @@ pub const EventLoop = struct {
         self.queued_responses.deinit(self.allocator);
         self.idle_peers.deinit(self.allocator);
         self.hash_result_swap.deinit(self.allocator);
+        // Free any unclaimed Merkle results (piece_hashes ownership)
+        for (self.merkle_result_swap.items) |mr| {
+            if (mr.piece_hashes) |h| self.allocator.free(h);
+        }
+        self.merkle_result_swap.deinit(self.allocator);
         for (self.peers) |*peer| {
             // fd already closed in Phase 1; free remaining heap buffers
             if (peer.body_is_heap) {
@@ -936,6 +942,8 @@ pub const EventLoop = struct {
         // BEP 16: clean up super-seed tracking for this peer
         if (self.getTorrentContext(peer.torrent_id)) |tc| {
             if (tc.super_seed) |ss| ss.removePeer(slot);
+            // BEP 52: discard pending Merkle hash requests for this peer
+            if (tc.merkle_cache) |mc| mc.removePendingRequestsForSlot(slot);
         }
         self.unmarkIdle(slot);
 
@@ -972,6 +980,7 @@ pub const EventLoop = struct {
 
     pub fn tick(self: *EventLoop) !void {
         peer_policy.processHashResults(self);
+        peer_policy.processMerkleResults(self);
         peer_policy.checkPeerTimeouts(self);
         peer_policy.checkReannounce(self);
         peer_policy.recalculateUnchokes(self);

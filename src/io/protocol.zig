@@ -629,112 +629,58 @@ fn handleHashRequest(self: *EventLoop, slot: u16, payload: []const u8) void {
         return;
     }
 
-    // File is complete. Build piece hashes by reading piece data and hashing.
-    // We need the piece hashes for this file to build the Merkle tree.
+    // File is complete. Submit async Merkle tree building to the hasher
+    // threadpool so we don't block the event loop with disk reads + SHA-256.
     const range = mc.filePieceRange(req.file_index) orelse {
         sendHashReject(self, slot, req);
         return;
     };
 
-    // Compute SHA-256 piece hashes from the v2 piece hashes stored in the
-    // torrent metadata. For v2, the leaf hashes of the Merkle tree ARE the
-    // per-piece SHA-256 hashes. When we verified pieces during download, we
-    // computed these. We need to reconstruct them from disk or from cached
-    // verification data.
-    //
-    // Strategy: use the hasher infrastructure to read piece data from disk
-    // and compute hashes. However, this is a synchronous operation in the
-    // event loop context. For now, we compute hashes inline for files with
-    // a reasonable number of pieces (< 4096). For larger files, we reject
-    // and rely on pre-built cache.
-    if (range.count > 4096) {
-        log.debug("slot {d}: hash request for large file {d} ({d} pieces) -- too many for inline hashing", .{
+    // Queue the pending request. addPendingRequest returns true if we need
+    // to submit a new build job (first request for this file), false if a
+    // build is already in progress (coalesced with existing request).
+    const need_submit = mc.addPendingRequest(slot, req) catch {
+        sendHashReject(self, slot, req);
+        return;
+    };
+
+    if (need_submit) {
+        const hasher = self.hasher orelse {
+            // No hasher available -- cannot build async. Remove the pending
+            // request and reject.
+            mc.removePendingRequestsForSlot(slot);
+            sendHashReject(self, slot, req);
+            return;
+        };
+
+        hasher.submitMerkleJob(
+            peer.torrent_id,
+            req.file_index,
+            range.first,
+            range.count,
+            &session.layout,
+            tc.shared_fds,
+        ) catch {
+            // Failed to submit job -- clean up and reject
+            var discard_buf = std.ArrayList(merkle_cache.MerkleCache.PendingHashRequest).empty;
+            defer discard_buf.deinit(self.allocator);
+            mc.takePendingRequests(req.file_index, &discard_buf);
+            sendHashReject(self, slot, req);
+            return;
+        };
+
+        log.debug("slot {d}: submitted async Merkle build for file {d} ({d} pieces)", .{
             slot, req.file_index, range.count,
         });
-        sendHashReject(self, slot, req);
-        return;
-    }
-
-    // Build piece hashes from the layout's stored v2 piece hash data.
-    // For BEP 52, the leaf hashes in the Merkle tree are SHA-256 of piece data.
-    // We need to read piece data from disk and hash each piece.
-    // Since this is expensive, we build the tree once and cache it.
-    const piece_hashes = buildPieceHashesFromDisk(
-        self.allocator,
-        session,
-        tc.shared_fds,
-        range.first,
-        range.count,
-    ) orelse {
-        log.debug("slot {d}: failed to build piece hashes for file {d}", .{ slot, req.file_index });
-        sendHashReject(self, slot, req);
-        return;
-    };
-    defer self.allocator.free(piece_hashes);
-
-    // Build and cache the Merkle tree
-    const tree = mc.buildAndCache(req.file_index, piece_hashes) catch |err| {
-        log.debug("slot {d}: failed to build Merkle tree for file {d}: {s}", .{
-            slot, req.file_index, @errorName(err),
+    } else {
+        log.debug("slot {d}: hash request for file {d} coalesced with in-progress build", .{
+            slot, req.file_index,
         });
-        sendHashReject(self, slot, req);
-        return;
-    };
-
-    sendHashesFromTree(self, slot, tree, req);
-}
-
-/// Build SHA-256 piece hashes by reading piece data from disk.
-/// Returns an allocated slice of [32]u8 hashes, or null on failure.
-fn buildPieceHashesFromDisk(
-    allocator: std.mem.Allocator,
-    session: *const @import("../torrent/session.zig").Session,
-    shared_fds: []const std.posix.fd_t,
-    first_piece: u32,
-    piece_count: u32,
-) ?[][32]u8 {
-    const hashes = allocator.alloc([32]u8, piece_count) catch return null;
-    errdefer allocator.free(hashes);
-
-    const Sha256 = std.crypto.hash.sha2.Sha256;
-
-    for (0..piece_count) |i| {
-        const global_piece = first_piece + @as(u32, @intCast(i));
-        const piece_size = session.layout.pieceSize(global_piece) catch return null;
-
-        // Allocate a buffer for the piece data
-        const buf = allocator.alloc(u8, piece_size) catch return null;
-        defer allocator.free(buf);
-
-        // Read piece data from disk using pread (acceptable for one-time tree building)
-        var span_buf: [8]@import("../torrent/layout.zig").Layout.Span = undefined;
-        const spans = session.layout.mapPiece(global_piece, &span_buf) catch return null;
-
-        var total_read: usize = 0;
-        for (spans) |span| {
-            if (span.file_index >= shared_fds.len) return null;
-            const fd = shared_fds[span.file_index];
-            if (fd < 0) return null;
-
-            const dest = buf[span.piece_offset..][0..span.length];
-            const n = std.posix.pread(fd, dest, span.file_offset) catch return null;
-            if (n != span.length) return null;
-            total_read += n;
-        }
-
-        if (total_read != piece_size) return null;
-
-        // SHA-256 hash of the piece data
-        var digest: [32]u8 = undefined;
-        Sha256.hash(buf, &digest, .{});
-        hashes[i] = digest;
     }
-
-    return hashes;
 }
 
 /// Build and send a hashes response from a cached Merkle tree.
-fn sendHashesFromTree(
+pub fn sendHashesFromTree(
     self: *EventLoop,
     slot: u16,
     tree: *const merkle.MerkleTree,
@@ -821,7 +767,7 @@ fn handleHashReject(self: *EventLoop, slot: u16, payload: []const u8) void {
 }
 
 /// Send a hash reject message (echo back the request parameters).
-fn sendHashReject(self: *EventLoop, slot: u16, req: hash_exchange.HashRequest) void {
+pub fn sendHashReject(self: *EventLoop, slot: u16, req: hash_exchange.HashRequest) void {
     const reject_payload = hash_exchange.encodeHashRequest(req);
     submitMessage(self, slot, hash_exchange.msg_hash_reject, &reject_payload) catch {};
 }

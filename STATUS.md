@@ -108,7 +108,7 @@ Update it whenever a milestone lands, the near-term backlog changes, or a new op
 - Resume DB v2 info-hash (`src/storage/resume.zig`): `info_hash_v2` table stores the full 32-byte SHA-256 hash, `saveInfoHashV2`/`loadInfoHashV2` methods.
 - `TorrentSession.info_hash_v2` field: v2 hash propagated from metainfo to session, persisted to and loaded from resume DB, passed in all announce calls.
 - BEP 52 hash exchange wire protocol (`src/net/hash_exchange.zig`): `hash request` (msg 21), `hashes` (msg 22), `hash reject` (msg 23) message encode/decode. Merkle proof building from tree. Integrated into `src/io/protocol.zig` message dispatch.
-- Runtime Merkle tree cache (`src/torrent/merkle_cache.zig`): per-file Merkle tree cache with LRU eviction (`TorrentContext.merkle_cache`). Trees built lazily on first hash request by reading piece data from disk and computing SHA-256 hashes. Cache validated against `pieces_root` from torrent metadata. Protocol handler (`handleHashRequest` in `src/io/protocol.zig`) now serves real hashes from cache instead of always rejecting. 8 tests.
+- Runtime Merkle tree cache (`src/torrent/merkle_cache.zig`): per-file Merkle tree cache with LRU eviction (`TorrentContext.merkle_cache`). Trees built lazily on first hash request via async hasher threadpool (no event loop blocking). No piece-count limit (removed previous 4096-piece cap). Multiple peers requesting the same file's tree are coalesced into a single build job. Pending requests cleaned up on peer disconnect. Cache validated against `pieces_root` from torrent metadata. Protocol handler (`handleHashRequest` in `src/io/protocol.zig`) serves hashes from cache or submits async build. 11 merkle cache tests, 2 async hasher merkle tests.
 
 ### DHT (BEP 5) — Distributed Hash Table
 - 160-bit node ID generation, XOR distance, bucket index calculation (`src/dht/node_id.zig`). Compact node info encode/decode (26-byte BEP 5 format). Random ID generation within bucket range for refresh.
@@ -136,7 +136,7 @@ Update it whenever a milestone lands, the near-term backlog changes, or a new op
 - Private tracker simulation tests (25 tests): required announce fields (compact, numwant, key, event), per-session key generation, private flag enforcement (no ut_pex), tracker error responses (failure reason, missing fields, invalid formats, negative interval), compact peer parsing.
 - Soak test framework (`zig build soak-test`): multi-torrent piece tracker stress, allocator leak detection (GPA), FD leak monitoring, tick latency tracking, bitfield stress cycles.
 - 5 super-seed (BEP 16) tests, 2 multi-announce tests, 5 huge page cache tests.
-- BEP 52 tests: 11 Merkle tree tests, 8 file tree parser tests, 7 v2 metainfo tests, 4 v2 layout tests, 1 v2 info-hash test, 8 hash exchange tests, 2 v2 announce URL tests, 2 v2 resume DB tests, 8 Merkle cache tests.
+- BEP 52 tests: 11 Merkle tree tests, 8 file tree parser tests, 7 v2 metainfo tests, 4 v2 layout tests, 1 v2 info-hash test, 8 hash exchange tests, 2 v2 announce URL tests, 2 v2 resume DB tests, 11 Merkle cache tests, 2 async Merkle hasher tests.
 - DHT tests: 7 node_id tests, 8 routing_table tests, 8 krpc tests, 8 token tests, 7 lookup tests, 5 dht_engine tests, 1 persistence test (44 total).
 - 10 peer ID client identification tests (Azureus-style, Shadow-style, Mainline, unknown).
 - 17 peer ID masquerading tests: all 5 client formats, case insensitivity, malformed input, unsupported client error, random suffix validation.
