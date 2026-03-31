@@ -6,7 +6,7 @@ Use [STATUS.md](STATUS.md) for the running list of completed work, next work, an
 
 ## Active Constraints
 
-- Minimal client ingestion is `.torrent` files only. Magnet, DHT, PEX, LSD, and uTP are not in scope yet.
+- Client ingestion supports `.torrent` files and magnet links (BEP 9). DHT, PEX, LSD are not in scope yet.
 - The currently verified tracker path is HTTP announce with compact peer lists.
 - The current peer strategy is one active peer at a time, sequential piece download, and a single inbound seed connection.
 - Seeder behavior is minimal: announce as complete, accept one inbound peer, serve requests sequentially, and exit after that peer disconnects.
@@ -206,3 +206,27 @@ Follow-up triggers:
 - Add alternative speed mode (qBittorrent's "alt speed" with scheduler) if needed.
 - Consider SO_MAX_PACING_RATE for kernel-level pacing if application-level throttling proves too coarse.
 - Add rate limit persistence across daemon restarts (currently only in-memory and config file).
+
+### 2026-03-30: Magnet Link Support (BEP 9)
+
+Context:
+Magnet links are the dominant way users share torrents. The daemon already advertised ut_metadata in BEP 10 handshakes but did not implement the metadata download protocol.
+
+Decision:
+- Implement BEP 9 metadata download as a synchronous background thread operation, not through the async event loop.
+- Metadata fetch runs before the normal download path: announce to trackers with just the info-hash, connect to peers one at a time, perform BEP 10 + BEP 9 handshake, download metadata pieces sequentially.
+- Once metadata is verified (SHA-1 matches info-hash), synthesize a minimal .torrent file and fall through to the normal Session.load/download path.
+- Serve metadata to peers who request it via the event loop's protocol handler (using tracked sends for io_uring buffer safety).
+- Extension handshake now includes metadata_size when we have torrent data.
+- API follows qBittorrent convention: `urls=` parameter in the add endpoint accepts magnet URIs.
+
+Reasoning:
+- Running metadata fetch on a background thread (blocking Ring) keeps the code simple and avoids adding metadata assembly state to every peer slot in the event loop. Metadata download is a one-time operation per torrent.
+- Synthesizing .torrent bytes from the info dictionary allows the rest of the codebase (Session, PieceStore, tracker announces) to work unchanged.
+- Serving metadata to other peers via the event loop is important for swarm health and is a relatively small addition.
+- The 10 MiB metadata size cap guards against malicious peers.
+
+Follow-up triggers:
+- Add parallel metadata piece requests when multiple peers are available.
+- Add retry logic across peers if metadata hash verification fails.
+- Support trackerless magnets once DHT is implemented.

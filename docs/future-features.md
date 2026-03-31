@@ -78,9 +78,9 @@ Uses `IORING_OP_SENDMSG` / `IORING_OP_RECVMSG` for io_uring integration.
 
 Distributed Hash Table for trackerless peer discovery. Peer Exchange for discovering peers through existing connections. Both essential for public torrents.
 
-## 8. Magnet links (BEP 9)
+## 8. Magnet links (BEP 9) -- IMPLEMENTED
 
-Download torrent metadata from peers via the extension protocol. Most users interact with magnet links, not .torrent files.
+Download torrent metadata from peers via the extension protocol. Implemented: magnet URI parsing, metadata download via ut_metadata, metadata serving to peers, CLI and API support. Remaining: parallel piece requests, trackerless magnet support (needs DHT).
 
 ## 9. Encryption (BEP 6 / MSE)
 

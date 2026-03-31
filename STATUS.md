@@ -11,7 +11,8 @@ Update it whenever a milestone lands, the near-term backlog changes, or a new op
 - Tracker scrape (HTTP + UDP): seeders/leechers/snatches queried every 30 minutes.
 - Private tracker support: private flag parsing and enforcement (BEP 27). Per-session key, numwant, compact=1. PEX disabled for private torrents.
 - IPv6 peer support (BEP 7): compact peers6, IPv6-aware connect.
-- BEP 10 Extension Protocol: handshake negotiation, extension message dispatch, advertises ut_metadata and ut_pex (ut_pex omitted for private torrents).
+- BEP 10 Extension Protocol: handshake negotiation, extension message dispatch, advertises ut_metadata and ut_pex (ut_pex omitted for private torrents). Extension handshake includes metadata_size (BEP 9).
+- BEP 9 Magnet Links (ut_metadata): magnet URI parsing (hex + base32 info-hash, dn=, tr= params), metadata download from peers piece-by-piece with SHA-1 verification, metadata serving to peers via event loop, `metadata_fetching` state. CLI: `varuna-ctl add --magnet <uri>`. API: `urls=` param in `/api/v2/torrents/add`.
 - uTP (BEP 29): packet codec, UtpSocket state machine, LEDBAT congestion control, UtpManager multiplexer, io_uring event loop integration (UDP socket, RECVMSG/SENDMSG, inbound connection accept, peer wire protocol bridge, timeout processing). 30+ tests.
 - Multi-peer download: rarest-first piece selection, endgame mode, tit-for-tat choking, block pipelining (depth 5).
 - Multi-peer seeding: io_uring event loop, batched block sends, async disk reads with piece cache.
@@ -76,7 +77,7 @@ Update it whenever a milestone lands, the near-term backlog changes, or a new op
 - Seed/read-path correctness: queued seed responses own exact block copies, async seed reads use unique IDs, and only successfully submitted reads/writes contribute to pending completion counts.
 
 ### Testing
-- 19 peer wire protocol tests, 10 BEP 10 extension tests, 31 uTP/LEDBAT tests, 5 categories tests, 8 resume DB tests.
+- 19 peer wire protocol tests, 10 BEP 10 extension tests, 31 uTP/LEDBAT tests, 5 categories tests, 8 resume DB tests, 13 magnet URI tests, 13 ut_metadata tests.
 - Bencode fuzz + edge case tests, HTTP parser fuzz tests.
 - Fuzz tests for: multipart parser, tracker response, uTP packets, BEP 10 extensions, scrape response (18 fuzz tests total).
 - Regression tests for API partial-send progress, unique seed read IDs, seed block-copy batching, shared-event-loop detach on stop, shared-loop preservation on resume, and failed disk-write release.
@@ -91,7 +92,7 @@ Update it whenever a milestone lands, the near-term backlog changes, or a new op
 - **uTP outbound connections**: initiate uTP connections to peers (currently inbound-only).
 - **PEX (BEP 11)**: peer exchange via BEP 10 extensions. Discover peers through existing connections.
 - **DHT (BEP 5)**: trackerless peer discovery (large feature).
-- **Magnet links (BEP 9)**: metadata download via ut_metadata extension.
+- **Magnet link resilience**: retry metadata from multiple peers, parallel piece requests, DHT fallback for trackerless magnets.
 - **MSE encryption (BEP 6)**: message stream encryption/obfuscation (deferred).
 
 ### Operational
