@@ -203,6 +203,8 @@ Reasoning:
 - Dropping upload requests when throttled is simpler and more efficient than queuing them. Peers implement retry logic per the BitTorrent protocol.
 
 Follow-up triggers:
-- Add alternative speed mode (qBittorrent's "alt speed" with scheduler) if needed.
 - Consider SO_MAX_PACING_RATE for kernel-level pacing if application-level throttling proves too coarse.
 - Add rate limit persistence across daemon restarts (currently only in-memory and config file).
+
+Explicitly out of scope:
+- Time-based alternative speed scheduling (qBittorrent's "alt speed" scheduler). Varuna will not implement automatic time-of-day speed switching. Users who need scheduled rate changes should use external tooling (cron + varuna-ctl) to set limits at desired times.

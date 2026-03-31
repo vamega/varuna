@@ -85,3 +85,9 @@ Download torrent metadata from peers via the extension protocol. Most users inte
 ## 9. Encryption (BEP 6 / MSE)
 
 Message Stream Encryption for obfuscating BitTorrent traffic. Required by some private trackers and useful for avoiding ISP throttling.
+
+## Will Not Implement
+
+### Time-based alternative speed scheduling
+
+qBittorrent offers an "alt speed" scheduler that automatically switches between normal and reduced speed limits based on time of day. Varuna will not implement this. Users who need scheduled rate changes should use external tooling (e.g., `cron` + `varuna-ctl setDownloadLimit`/`setUploadLimit`) to adjust limits at desired times. This keeps the daemon simpler and avoids embedding a scheduler for a feature that cron handles better.
