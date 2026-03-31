@@ -147,6 +147,22 @@ pub const ResumeDb = struct {
             return error.SqliteSchemaFailed;
         }
 
+        // BEP 52: v2 info-hash mapping table. For hybrid torrents, maps the v1
+        // info-hash (used as primary key elsewhere) to the full 32-byte v2 SHA-256 hash.
+        if (sqlite.sqlite3_exec(
+            d,
+            "CREATE TABLE IF NOT EXISTS info_hash_v2 (" ++
+                "info_hash BLOB NOT NULL PRIMARY KEY, " ++
+                "info_hash_v2 BLOB NOT NULL" ++
+                ")",
+            null,
+            null,
+            null,
+        ) != sqlite.SQLITE_OK) {
+            _ = sqlite.sqlite3_close(d);
+            return error.SqliteSchemaFailed;
+        }
+
         // Prepare statements
         var insert_stmt: ?*sqlite.Stmt = null;
         if (sqlite.sqlite3_prepare_v2(
@@ -552,6 +568,37 @@ pub const ResumeDb = struct {
         try stepAndFinalize(stmt);
     }
 
+    // ── BEP 52: v2 info-hash persistence ────────────────────
+
+    /// Save the v2 info-hash for a hybrid/v2 torrent (upsert).
+    pub fn saveInfoHashV2(self: *ResumeDb, info_hash: [20]u8, info_hash_v2: [32]u8) !void {
+        const stmt = try self.execOneShot(
+            "INSERT INTO info_hash_v2 (info_hash, info_hash_v2) VALUES (?1, ?2) " ++
+                "ON CONFLICT(info_hash) DO UPDATE SET info_hash_v2 = ?2",
+        );
+        _ = sqlite.sqlite3_bind_blob(stmt, 1, &info_hash, 20, sqlite.SQLITE_TRANSIENT);
+        _ = sqlite.sqlite3_bind_blob(stmt, 2, &info_hash_v2, 32, sqlite.SQLITE_TRANSIENT);
+        try stepAndFinalize(stmt);
+    }
+
+    /// Load the v2 info-hash for a torrent. Returns null if not stored (pure v1).
+    pub fn loadInfoHashV2(self: *ResumeDb, info_hash: [20]u8) ?[32]u8 {
+        const stmt = self.execOneShot("SELECT info_hash_v2 FROM info_hash_v2 WHERE info_hash = ?1") catch return null;
+        defer _ = sqlite.sqlite3_finalize(stmt);
+        _ = sqlite.sqlite3_bind_blob(stmt, 1, &info_hash, 20, sqlite.SQLITE_TRANSIENT);
+
+        if (sqlite.sqlite3_step(stmt) == sqlite.SQLITE_ROW) {
+            const blob = sqlite.sqlite3_column_blob(stmt, 0);
+            const len: usize = @intCast(sqlite.sqlite3_column_bytes(stmt, 0));
+            if (blob != null and len == 32) {
+                var result: [32]u8 = undefined;
+                @memcpy(&result, @as([*]const u8, @ptrCast(blob.?))[0..32]);
+                return result;
+            }
+        }
+        return null;
+    }
+
     /// Remove a tag from all torrents (used when deleting a global tag).
     pub fn removeTagFromTorrents(self: *ResumeDb, tag: []const u8) !void {
         const stmt = try self.execOneShot("DELETE FROM torrent_tags WHERE tag = ?1");
@@ -946,4 +993,53 @@ test "resume db remove tag from all torrents" {
         allocator.free(tags_b);
     }
     try std.testing.expectEqual(@as(usize, 0), tags_b.len);
+}
+
+test "resume db save and load v2 info hash" {
+    var db = ResumeDb.open(":memory:") catch return error.SkipZigTest;
+    defer db.close();
+
+    const v1_hash = [_]u8{0xAA} ** 20;
+    var v2_hash: [32]u8 = undefined;
+    for (&v2_hash, 0..) |*b, i| b.* = @intCast(i);
+
+    // Initially, no v2 hash should be stored
+    try std.testing.expect(db.loadInfoHashV2(v1_hash) == null);
+
+    // Save and load
+    try db.saveInfoHashV2(v1_hash, v2_hash);
+    const loaded = db.loadInfoHashV2(v1_hash) orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqual(v2_hash, loaded);
+
+    // Update (upsert)
+    var v2_hash_new: [32]u8 = undefined;
+    @memset(&v2_hash_new, 0xFF);
+    try db.saveInfoHashV2(v1_hash, v2_hash_new);
+    const loaded2 = db.loadInfoHashV2(v1_hash) orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqual(v2_hash_new, loaded2);
+}
+
+test "resume db v2 info hash isolated per torrent" {
+    var db = ResumeDb.open(":memory:") catch return error.SkipZigTest;
+    defer db.close();
+
+    const hash_a = [_]u8{0xAA} ** 20;
+    const hash_b = [_]u8{0xBB} ** 20;
+    var v2_a: [32]u8 = undefined;
+    @memset(&v2_a, 0x11);
+    var v2_b: [32]u8 = undefined;
+    @memset(&v2_b, 0x22);
+
+    try db.saveInfoHashV2(hash_a, v2_a);
+    try db.saveInfoHashV2(hash_b, v2_b);
+
+    const loaded_a = db.loadInfoHashV2(hash_a) orelse return error.TestUnexpectedResult;
+    const loaded_b = db.loadInfoHashV2(hash_b) orelse return error.TestUnexpectedResult;
+
+    try std.testing.expectEqual(v2_a, loaded_a);
+    try std.testing.expectEqual(v2_b, loaded_b);
+
+    // Pure v1 torrent should return null
+    const hash_c = [_]u8{0xCC} ** 20;
+    try std.testing.expect(db.loadInfoHashV2(hash_c) == null);
 }

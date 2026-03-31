@@ -374,8 +374,11 @@ fn processUtpOutboundHandshake(self: *EventLoop, peer_slot: u16) void {
         return;
     };
 
-    // Validate info_hash matches what we expected.
-    if (!std.mem.eql(u8, peer.handshake_buf[28..48], tc.info_hash[0..])) {
+    // Validate info_hash matches what we expected (v1 or v2 for BEP 52).
+    const recv_hash = peer.handshake_buf[28..48];
+    const v1_match = std.mem.eql(u8, recv_hash, tc.info_hash[0..]);
+    const v2_match = if (tc.info_hash_v2) |v2| std.mem.eql(u8, recv_hash, v2[0..]) else false;
+    if (!v1_match and !v2_match) {
         self.removePeer(peer_slot);
         return;
     }
@@ -403,15 +406,26 @@ fn processUtpInboundHandshake(self: *EventLoop, peer_slot: u16) void {
     const peer = &self.peers[peer_slot];
     const inbound_hash = peer.handshake_buf[28..48];
 
-    // Match info_hash against all registered torrents
+    // Match info_hash against all registered torrents.
+    // BEP 52: also match on the truncated v2 info-hash for hybrid torrents.
     var matched = false;
     var resp_tid: u8 = 0;
     for (&self.torrents, 0..) |*tslot, ti| {
         if (tslot.*) |*tc_match| {
-            if (tc_match.active and std.mem.eql(u8, &tc_match.info_hash, inbound_hash)) {
-                resp_tid = @intCast(ti);
-                matched = true;
-                break;
+            if (tc_match.active) {
+                if (std.mem.eql(u8, &tc_match.info_hash, inbound_hash)) {
+                    resp_tid = @intCast(ti);
+                    matched = true;
+                    break;
+                }
+                // BEP 52: check v2 info-hash for hybrid torrents
+                if (tc_match.info_hash_v2) |v2_hash| {
+                    if (std.mem.eql(u8, &v2_hash, inbound_hash)) {
+                        resp_tid = @intCast(ti);
+                        matched = true;
+                        break;
+                    }
+                }
             }
         }
     }

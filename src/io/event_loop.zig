@@ -168,6 +168,11 @@ pub const TorrentContext = struct {
     active: bool = true,
     is_private: bool = false,
 
+    // BEP 52: v2 info-hash (SHA-256, truncated to 20 bytes for handshake matching).
+    // null for pure v1 torrents. For hybrid torrents, inbound peers may connect
+    // using either the v1 or v2 info-hash.
+    info_hash_v2: ?[20]u8 = null,
+
     // Speed tracking (updated every ~2 seconds in tick)
     last_speed_check: i64 = 0,
     last_dl_bytes: u64 = 0,
@@ -565,6 +570,13 @@ pub const EventLoop = struct {
         tracker_key: ?[8]u8,
         is_private: bool,
     ) !u8 {
+        // BEP 52: derive truncated v2 info-hash for handshake matching
+        const v2_hash: ?[20]u8 = if (session.metainfo.info_hash_v2) |full_v2| blk: {
+            var truncated: [20]u8 = undefined;
+            @memcpy(&truncated, full_v2[0..20]);
+            break :blk truncated;
+        } else null;
+
         for (&self.torrents, 0..) |*slot, i| {
             if (slot.* == null) {
                 slot.* = .{
@@ -575,6 +587,7 @@ pub const EventLoop = struct {
                     .peer_id = peer_id,
                     .tracker_key = tracker_key,
                     .is_private = is_private,
+                    .info_hash_v2 = v2_hash,
                 };
                 self.torrent_count += 1;
                 return @intCast(i);

@@ -13,6 +13,11 @@ pub const Request = struct {
     key: ?[8]u8 = null,
     numwant: u32 = 50,
 
+    // BEP 52: full v2 info-hash for hybrid/v2 torrents. When set, an additional
+    // `info_hash` parameter with the truncated v2 hash is appended to the announce
+    // URL. Some trackers use this to return v2-capable peers.
+    info_hash_v2: ?[32]u8 = null,
+
     pub const Event = enum {
         started,
         completed,
@@ -142,6 +147,12 @@ pub fn buildUrl(allocator: std.mem.Allocator, request: Request) ![]u8 {
         try appendQueryString(allocator, &url, "key", &key);
     }
     try appendQueryInt(allocator, &url, "numwant", request.numwant);
+
+    // BEP 52: for hybrid torrents, include the truncated v2 info-hash as a
+    // second info_hash parameter so v2-aware trackers can match both swarms.
+    if (request.info_hash_v2) |v2_hash| {
+        try appendQueryBytes(allocator, &url, "info_hash", v2_hash[0..20]);
+    }
 
     return url.toOwnedSlice(allocator);
 }
@@ -501,6 +512,46 @@ test "announce parser handles truncated compact response" {
             freeResponse(std.testing.allocator, response);
         } else |_| {}
     }
+}
+
+test "build url includes v2 info_hash when provided" {
+    var v2_hash: [32]u8 = undefined;
+    for (&v2_hash, 0..) |*b, i| b.* = @intCast(i);
+    const url = try buildUrl(std.testing.allocator, .{
+        .announce_url = "http://tracker.example/announce",
+        .info_hash = [_]u8{0xAA} ** 20,
+        .peer_id = "ABCDEFGHIJKLMNOPQRST".*,
+        .port = 6881,
+        .left = 100,
+        .info_hash_v2 = v2_hash,
+    });
+    defer std.testing.allocator.free(url);
+
+    // The URL should contain two info_hash parameters
+    // First: the v1 hash (all 0xAA)
+    try std.testing.expect(std.mem.indexOf(u8, url, "info_hash=%AA%AA") != null);
+    // Second: the truncated v2 hash (first 20 bytes of 0x00..0x13)
+    try std.testing.expect(std.mem.indexOf(u8, url, "info_hash=%00%01%02") != null);
+}
+
+test "build url omits v2 info_hash when not provided" {
+    const url = try buildUrl(std.testing.allocator, .{
+        .announce_url = "http://tracker.example/announce",
+        .info_hash = [_]u8{0} ** 20,
+        .peer_id = "ABCDEFGHIJKLMNOPQRST".*,
+        .port = 6881,
+        .left = 100,
+    });
+    defer std.testing.allocator.free(url);
+
+    // Count info_hash occurrences -- should be exactly 1
+    var count: usize = 0;
+    var idx: usize = 0;
+    while (std.mem.indexOfPos(u8, url, idx, "info_hash=")) |pos| {
+        count += 1;
+        idx = pos + 10;
+    }
+    try std.testing.expectEqual(@as(usize, 1), count);
 }
 
 test "announce parser handles odd-length compact peers" {

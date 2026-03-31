@@ -98,6 +98,12 @@ Update it whenever a milestone lands, the near-term backlog changes, or a new op
 - File-aligned piece layout (`src/torrent/layout.zig`): v2 pieces never cross file boundaries, each file has its own piece range, `mapPieceV2` always returns single-file spans.
 - Dual-hash verification (`src/storage/verify.zig`): `PiecePlan.hash_type` selects SHA-1 or SHA-256, `verifyPieceBuffer` supports both.
 - Hasher thread pool SHA-256 support (`src/io/hasher.zig`): `Job.hash_type` field, worker function dispatches to SHA-1 or SHA-256.
+- Dual info-hash handshake matching (`src/io/peer_handler.zig`, `src/io/utp_handler.zig`): inbound and outbound peers matched on v1 or truncated v2 info-hash for hybrid torrents.
+- `TorrentContext.info_hash_v2` field: truncated 20-byte v2 hash stored per-torrent in the event loop for handshake matching.
+- Tracker announce v2 info-hash (`src/tracker/announce.zig`): `Request.info_hash_v2` field adds a second `info_hash` parameter with truncated v2 hash for v2-aware trackers.
+- Resume DB v2 info-hash (`src/storage/resume.zig`): `info_hash_v2` table stores the full 32-byte SHA-256 hash, `saveInfoHashV2`/`loadInfoHashV2` methods.
+- `TorrentSession.info_hash_v2` field: v2 hash propagated from metainfo to session, persisted to and loaded from resume DB, passed in all announce calls.
+- BEP 52 hash exchange wire protocol (`src/net/hash_exchange.zig`): `hash request` (msg 21), `hashes` (msg 22), `hash reject` (msg 23) message encode/decode. Merkle proof building from tree. Integrated into `src/io/protocol.zig` message dispatch.
 
 ### Testing
 - 19 peer wire protocol tests, 10 BEP 10 extension tests, 15 PEX tests, 31 uTP/LEDBAT tests, 5 categories tests, 9 resume DB tests, 25 MSE/RC4 tests, 13 magnet URI tests, 13 ut_metadata tests.
@@ -113,7 +119,7 @@ Update it whenever a milestone lands, the near-term backlog changes, or a new op
 - Private tracker simulation tests (25 tests): required announce fields (compact, numwant, key, event), per-session key generation, private flag enforcement (no ut_pex), tracker error responses (failure reason, missing fields, invalid formats, negative interval), compact peer parsing.
 - Soak test framework (`zig build soak-test`): multi-torrent piece tracker stress, allocator leak detection (GPA), FD leak monitoring, tick latency tracking, bitfield stress cycles.
 - 5 super-seed (BEP 16) tests, 2 multi-announce tests, 5 huge page cache tests.
-- BEP 52 tests: 11 Merkle tree tests, 8 file tree parser tests, 7 v2 metainfo tests, 4 v2 layout tests, 1 v2 info-hash test.
+- BEP 52 tests: 11 Merkle tree tests, 8 file tree parser tests, 7 v2 metainfo tests, 4 v2 layout tests, 1 v2 info-hash test, 8 hash exchange tests, 2 v2 announce URL tests, 2 v2 resume DB tests.
 
 ## Next
 
@@ -124,8 +130,8 @@ Update it whenever a milestone lands, the near-term backlog changes, or a new op
 - ~~**Magnet links (BEP 9)**~~: (DONE) metadata download via ut_metadata extension.
 - **Magnet link resilience**: retry metadata from multiple peers, parallel piece requests, DHT fallback for trackerless magnets.
 - ~~**MSE encryption (BEP 6)**~~: (DONE) message stream encryption/obfuscation.
-- **BEP 52 Phase 4**: peer wire handshake dual info-hash matching, tracker announce with v2 info-hash, resume DB v2 info-hash column.
-- **BEP 52 Phase 5 (deferred)**: hash request/hashes/hash reject message exchange, Merkle proof exchange with peers.
+- ~~**BEP 52 Phase 4**~~: (DONE) peer wire handshake dual info-hash matching, tracker announce with v2 info-hash, resume DB v2 info-hash column, TorrentSession v2 hash propagation.
+- ~~**BEP 52 Phase 5**~~: (DONE) hash request/hashes/hash reject message encode/decode, Merkle proof building from tree, protocol handler integration. Runtime Merkle tree caching for hash serving deferred.
 
 ### Operational
 - **Flood/qui WebUI validation**: populate remaining stub fields (tracker URL, trackers_count, piece_range, content_path for multi-file, magnet_uri), add real peer data to torrentPeers endpoint.
@@ -137,6 +143,6 @@ Update it whenever a milestone lands, the near-term backlog changes, or a new op
 
 ## Last Verified Milestone
 
-- BEP 52 (BitTorrent v2 / Hybrid) Phase 1-3: version detection, file tree parsing, Merkle tree, v2 info-hash, file-aligned layout, dual-hash verification
+- BEP 52 (BitTorrent v2 / Hybrid) Phase 1-5: version detection, file tree parsing, Merkle tree, v2 info-hash, file-aligned layout, dual-hash verification, dual info-hash handshake matching, tracker v2 announce, resume DB v2 hash, hash exchange wire protocol
 - `zig build test`: all tests pass
 - `zig build`: clean build

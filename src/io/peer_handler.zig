@@ -245,8 +245,11 @@ pub fn handleRecv(self: *EventLoop, slot: u16, cqe: linux.io_uring_cqe) void {
                 };
                 return;
             }
-            // Validate handshake
-            if (!std.mem.eql(u8, peer.handshake_buf[28..48], tc_recv.info_hash[0..])) {
+            // Validate handshake: accept v1 or v2 (BEP 52) info-hash
+            const recv_hash = peer.handshake_buf[28..48];
+            const v1_match = std.mem.eql(u8, recv_hash, tc_recv.info_hash[0..]);
+            const v2_match = if (tc_recv.info_hash_v2) |v2| std.mem.eql(u8, recv_hash, v2[0..]) else false;
+            if (!v1_match and !v2_match) {
                 self.removePeer(slot);
                 return;
             }
@@ -277,18 +280,31 @@ pub fn handleRecv(self: *EventLoop, slot: u16, cqe: linux.io_uring_cqe) void {
                 };
                 return;
             }
-            // Match info_hash against all registered torrents
+            // Match info_hash against all registered torrents.
+            // BEP 52: for hybrid torrents, also match on the truncated v2 info-hash
+            // since v2-capable peers may use the SHA-256 info-hash in the handshake.
             const inbound_hash = peer.handshake_buf[28..48];
             var resp_tc: *const @import("event_loop.zig").TorrentContext = tc_recv;
             var resp_tid: u8 = peer.torrent_id;
             var matched = false;
             for (&self.torrents, 0..) |*tslot, ti| {
                 if (tslot.*) |*tc_match| {
-                    if (tc_match.active and std.mem.eql(u8, &tc_match.info_hash, inbound_hash)) {
-                        resp_tc = tc_match;
-                        resp_tid = @intCast(ti);
-                        matched = true;
-                        break;
+                    if (tc_match.active) {
+                        if (std.mem.eql(u8, &tc_match.info_hash, inbound_hash)) {
+                            resp_tc = tc_match;
+                            resp_tid = @intCast(ti);
+                            matched = true;
+                            break;
+                        }
+                        // BEP 52: check v2 info-hash for hybrid torrents
+                        if (tc_match.info_hash_v2) |v2_hash| {
+                            if (std.mem.eql(u8, &v2_hash, inbound_hash)) {
+                                resp_tc = tc_match;
+                                resp_tid = @intCast(ti);
+                                matched = true;
+                                break;
+                            }
+                        }
                     }
                 }
             }

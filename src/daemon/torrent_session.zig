@@ -81,6 +81,9 @@ pub const TorrentSession = struct {
     peer_id: [20]u8,
     tracker_key: [8]u8,
 
+    // BEP 52: full v2 info-hash (32 bytes, SHA-256). null for pure v1.
+    info_hash_v2: ?[32]u8 = null,
+
     // Runtime state (created on start, freed on stop)
     session: ?session_mod.Session = null,
     piece_tracker: ?PieceTracker = null,
@@ -231,6 +234,7 @@ pub const TorrentSession = struct {
             .peer_id = peer_id_mod.generate(),
             .tracker_key = tracker.announce.Request.generateKey(),
             .is_private = meta.isPrivate(),
+            .info_hash_v2 = meta.info_hash_v2,
         };
     }
 
@@ -633,6 +637,19 @@ pub const TorrentSession = struct {
                         self.rebuildTagsString();
                     } else |_| {}
                 }
+
+                // BEP 52: persist v2 info-hash if this is a hybrid/v2 torrent
+                if (session.metainfo.info_hash_v2) |v2_hash| {
+                    self.resume_writer.?.db.saveInfoHashV2(session.metainfo.info_hash, v2_hash) catch {};
+                }
+                // If we have a v2 hash from metainfo, use it; otherwise try loading from DB
+                if (self.info_hash_v2 == null) {
+                    if (session.metainfo.info_hash_v2) |v2_hash| {
+                        self.info_hash_v2 = v2_hash;
+                    } else {
+                        self.info_hash_v2 = self.resume_writer.?.db.loadInfoHashV2(session.metainfo.info_hash);
+                    }
+                }
             } else |_| {}
         }
 
@@ -731,6 +748,7 @@ pub const TorrentSession = struct {
                 .port = self.port,
                 .left = session.totalSize() - recheck.bytes_complete,
                 .key = self.tracker_key,
+                .info_hash_v2 = self.info_hash_v2,
             },
         ) catch {
             self.state = .@"error";
@@ -836,6 +854,7 @@ pub const TorrentSession = struct {
                     .left = 0,
                     .event = .completed,
                     .key = self.tracker_key,
+                    .info_hash_v2 = self.info_hash_v2,
                 })) |resp| {
                     tracker.announce.freeResponse(self.allocator, resp);
                 } else |_| {}
@@ -963,6 +982,7 @@ pub const TorrentSession = struct {
             .left = 0,
             .event = .completed,
             .key = self.tracker_key,
+            .info_hash_v2 = self.info_hash_v2,
         })) |resp| {
             tracker.announce.freeResponse(self.allocator, resp);
         } else |_| {}
@@ -990,6 +1010,7 @@ pub const TorrentSession = struct {
             .left = 0,
             .event = .completed,
             .key = self.tracker_key,
+            .info_hash_v2 = self.info_hash_v2,
         })) |resp| {
             tracker.announce.freeResponse(self.allocator, resp);
         } else |_| {}

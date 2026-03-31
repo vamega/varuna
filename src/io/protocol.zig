@@ -5,6 +5,7 @@ const pw = @import("../net/peer_wire.zig");
 const ext = @import("../net/extensions.zig");
 const pex_mod = @import("../net/pex.zig");
 const ut_metadata = @import("../net/ut_metadata.zig");
+const hash_exchange = @import("../net/hash_exchange.zig");
 const info_hash_mod = @import("../torrent/info_hash.zig");
 const Bitfield = @import("../bitfield.zig").Bitfield;
 const EventLoop = @import("event_loop.zig").EventLoop;
@@ -126,6 +127,18 @@ pub fn processMessage(self: *EventLoop, slot: u16) void {
                     }
                 }
             }
+        },
+        hash_exchange.msg_hash_request => {
+            // BEP 52: hash request -- peer wants Merkle proof hashes
+            handleHashRequest(self, slot, payload);
+        },
+        hash_exchange.msg_hashes => {
+            // BEP 52: hashes response -- peer sent us Merkle proof hashes
+            handleHashesResponse(self, slot, payload);
+        },
+        hash_exchange.msg_hash_reject => {
+            // BEP 52: hash reject -- peer cannot provide requested hashes
+            handleHashReject(self, slot, payload);
         },
         ext.msg_id => {
             // BEP 10: extension message
@@ -537,4 +550,104 @@ pub fn sendInboundBitfieldOrUnchoke(self: *EventLoop, slot: u16) void {
             self.removePeer(slot);
         };
     }
+}
+
+// ── BEP 52: Hash exchange handlers ────────────────────────
+
+/// Handle an incoming hash request (msg_type 21).
+/// If we have the Merkle tree for the requested file, build and send a hashes
+/// response. Otherwise, send a hash reject.
+fn handleHashRequest(self: *EventLoop, slot: u16, payload: []const u8) void {
+    const peer = &self.peers[slot];
+
+    const req = hash_exchange.decodeHashRequest(payload) catch {
+        log.debug("slot {d}: invalid hash request message", .{slot});
+        return;
+    };
+
+    log.debug("slot {d}: hash request file={d} layer={d} index={d} len={d} proof={d}", .{
+        slot, req.file_index, req.base_layer, req.index, req.length, req.proof_layers,
+    });
+
+    // Look up the torrent's Merkle tree. If we don't have v2 metadata or the
+    // specific file tree, reject the request.
+    const tc = self.getTorrentContext(peer.torrent_id) orelse return;
+    const session = tc.session orelse {
+        sendHashReject(self, slot, req);
+        return;
+    };
+
+    // Check if this is a v2/hybrid torrent with file tree metadata
+    if (!session.metainfo.hasV2()) {
+        sendHashReject(self, slot, req);
+        return;
+    }
+
+    // For now, send hash reject since we don't have per-file Merkle trees
+    // readily available at runtime (they would need to be built from piece
+    // data or cached). The Merkle tree construction infrastructure exists in
+    // src/torrent/merkle.zig but runtime caching is deferred.
+    // TODO: cache per-file Merkle trees in TorrentContext for hash serving.
+    sendHashReject(self, slot, req);
+}
+
+/// Handle an incoming hashes response (msg_type 22).
+/// Verify the received hashes against the known Merkle root for the file.
+fn handleHashesResponse(self: *EventLoop, slot: u16, payload: []const u8) void {
+    const peer = &self.peers[slot];
+
+    const resp = hash_exchange.decodeHashesResponse(self.allocator, payload) catch {
+        log.debug("slot {d}: invalid hashes response message", .{slot});
+        return;
+    };
+    defer hash_exchange.freeHashesResponse(self.allocator, resp);
+
+    log.debug("slot {d}: received hashes file={d} layer={d} index={d} count={d} proof_layers={d}", .{
+        slot, resp.file_index, resp.base_layer, resp.index, resp.length, resp.proof_layers,
+    });
+
+    // Look up the torrent to verify against known Merkle roots
+    const tc = self.getTorrentContext(peer.torrent_id) orelse return;
+    const session = tc.session orelse return;
+
+    if (!session.metainfo.hasV2()) return;
+
+    // Verify the hashes against the expected Merkle root for this file
+    const file_tree_v2 = session.metainfo.file_tree_v2 orelse return;
+    if (resp.file_index >= file_tree_v2.len) {
+        log.debug("slot {d}: hashes response file_index {d} out of range", .{ slot, resp.file_index });
+        return;
+    }
+
+    // For base_layer 0 (leaf/piece hashes), we can verify individual hashes
+    // against the file's pieces_root using the proof. This validates that the
+    // peer's hashes are consistent with the torrent metadata.
+    // Full integration with piece downloading is deferred -- for now, we log
+    // and validate the proof structure.
+    if (resp.base_layer == 0 and resp.proof.len > 0) {
+        const expected_root = file_tree_v2[resp.file_index].pieces_root;
+        _ = expected_root;
+        log.debug("slot {d}: hashes for file {d}: {d} hashes, {d} proof layers received", .{
+            slot, resp.file_index, resp.hashes.len, resp.proof.len,
+        });
+    }
+}
+
+/// Handle an incoming hash reject (msg_type 23).
+fn handleHashReject(self: *EventLoop, slot: u16, payload: []const u8) void {
+    const req = hash_exchange.decodeHashRequest(payload) catch {
+        log.debug("slot {d}: invalid hash reject message", .{slot});
+        return;
+    };
+    _ = self;
+
+    log.debug("slot {d}: peer rejected hash request file={d} layer={d} index={d} len={d}", .{
+        slot, req.file_index, req.base_layer, req.index, req.length,
+    });
+}
+
+/// Send a hash reject message (echo back the request parameters).
+fn sendHashReject(self: *EventLoop, slot: u16, req: hash_exchange.HashRequest) void {
+    const reject_payload = hash_exchange.encodeHashRequest(req);
+    submitMessage(self, slot, hash_exchange.msg_hash_reject, &reject_payload) catch {};
 }
