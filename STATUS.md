@@ -87,6 +87,9 @@ Update it whenever a milestone lands, the near-term backlog changes, or a new op
 - Daemon swarm integration test, daemon-to-peer seeding test, selective download integration test.
 - SHA-1 benchmarks: std vs SHA-NI vs direct vs memory bandwidth baseline.
 - Profiling workflow: strace, perf, bpftrace build helpers.
+- Adversarial peer tests (35 tests): oversized messages, invalid IDs, wrong lengths, malformed handshake, unrequested pieces, OOB piece indices, garbage extension bencode, bitfield bounds, connection limit sanity.
+- Private tracker simulation tests (25 tests): required announce fields (compact, numwant, key, event), per-session key generation, private flag enforcement (no ut_pex), tracker error responses (failure reason, missing fields, invalid formats, negative interval), compact peer parsing.
+- Soak test framework (`zig build soak-test`): multi-torrent piece tracker stress, allocator leak detection (GPA), FD leak monitoring, tick latency tracking, bitfield stress cycles.
 
 ## Next
 

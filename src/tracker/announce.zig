@@ -105,7 +105,7 @@ pub fn freeResponse(allocator: std.mem.Allocator, response: Response) void {
     allocator.free(response.peers);
 }
 
-fn buildUrl(allocator: std.mem.Allocator, request: Request) ![]u8 {
+pub fn buildUrl(allocator: std.mem.Allocator, request: Request) ![]u8 {
     var url = std.ArrayList(u8).empty;
     defer url.deinit(allocator);
 
@@ -130,7 +130,7 @@ fn buildUrl(allocator: std.mem.Allocator, request: Request) ![]u8 {
     return url.toOwnedSlice(allocator);
 }
 
-fn parseResponse(allocator: std.mem.Allocator, input: []const u8) !Response {
+pub fn parseResponse(allocator: std.mem.Allocator, input: []const u8) !Response {
     const root = try bencode.parse(allocator, input);
     defer bencode.freeValue(allocator, root);
 
