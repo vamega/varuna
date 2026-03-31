@@ -6,6 +6,7 @@ const categories_mod = @import("categories.zig");
 pub const CategoryStore = categories_mod.CategoryStore;
 pub const TagStore = categories_mod.TagStore;
 const ResumeDb = @import("../storage/resume.zig").ResumeDb;
+const BanList = @import("../net/ban_list.zig").BanList;
 
 /// Manages multiple torrent sessions for the daemon.
 /// Thread-safe: the API server and event loop can access concurrently.
@@ -31,6 +32,10 @@ pub const SessionManager = struct {
     /// Shared resume DB for category/tag persistence. Opened once, shared
     /// with all sessions. null if no resume_db_path is configured.
     resume_db: ?ResumeDb = null,
+
+    /// Shared ban list for peer IP filtering. Owned by SessionManager,
+    /// shared with EventLoop (read-only ban checks) and API handlers (mutations).
+    ban_list: ?*BanList = null,
 
     pub fn init(allocator: std.mem.Allocator) SessionManager {
         return .{
@@ -69,6 +74,9 @@ pub const SessionManager = struct {
         } else |_| {}
 
         self.resume_db = db;
+
+        // Load ban list from SQLite
+        self.loadBanList();
     }
 
     pub fn deinit(self: *SessionManager) void {
@@ -80,6 +88,10 @@ pub const SessionManager = struct {
         self.sessions.deinit();
         self.category_store.deinit();
         self.tag_store.deinit();
+        if (self.ban_list) |bl| {
+            bl.deinit();
+            self.allocator.destroy(bl);
+        }
         if (self.resume_db) |*db| db.close();
     }
 
@@ -256,6 +268,99 @@ pub const SessionManager = struct {
 
             // Clean up empty directories (bottom-up)
             cleanupEmptyDirs(save_path, torrent_name);
+        }
+    }
+
+    // ── Ban list management ──────────────────────────────
+
+    /// Initialize the ban list and load persisted bans from SQLite.
+    fn loadBanList(self: *SessionManager) void {
+        const bl = self.allocator.create(BanList) catch return;
+        bl.* = BanList.init(self.allocator);
+
+        // Load individual bans
+        if (self.resume_db) |*db| {
+            if (db.loadBannedIps(self.allocator)) |bans| {
+                defer {
+                    for (bans) |item| {
+                        self.allocator.free(item.address);
+                        if (item.reason) |r| self.allocator.free(r);
+                    }
+                    self.allocator.free(bans);
+                }
+                for (bans) |item| {
+                    const source: BanList.BanSource = if (item.source == 1) .ipfilter else .manual;
+                    _ = bl.banIpStr(item.address, item.reason, source, item.created_at) catch continue;
+                }
+            } else |_| {}
+
+            // Load ranges
+            if (db.loadBannedRanges(self.allocator)) |ranges| {
+                defer {
+                    for (ranges) |item| {
+                        self.allocator.free(item.start_addr);
+                        self.allocator.free(item.end_addr);
+                    }
+                    self.allocator.free(ranges);
+                }
+                for (ranges) |item| {
+                    const source: BanList.BanSource = if (item.source == 1) .ipfilter else .manual;
+                    const range_str_buf = std.fmt.allocPrint(self.allocator, "{s}-{s}", .{ item.start_addr, item.end_addr }) catch continue;
+                    defer self.allocator.free(range_str_buf);
+                    if (BanList.parseRange(range_str_buf)) |range| {
+                        switch (range) {
+                            .v4 => |r| bl.banRangeV4(r.start, r.end, source) catch {},
+                            .v6 => |r| bl.banRangeV6(r.start, r.end, source) catch {},
+                        }
+                    }
+                }
+            } else |_| {}
+        }
+
+        self.ban_list = bl;
+
+        // Also set ban list on event loop if already running
+        if (self.shared_event_loop) |el| {
+            el.ban_list = bl;
+        }
+    }
+
+    /// Persist the current ban list to SQLite (called from API handlers).
+    /// Runs the SQLite operations on the calling thread; since ban changes are
+    /// infrequent (user-driven), this is acceptable. For frequent changes, the
+    /// ResumeWriter batching pattern could be used.
+    pub fn persistBanList(self: *SessionManager) void {
+        var db = self.resume_db orelse return;
+        const bl = self.ban_list orelse return;
+
+        // Clear existing DB entries and re-write all
+        db.clearBannedBySource(0) catch {}; // manual
+        db.clearBannedBySource(1) catch {}; // ipfilter
+
+        // Save individual bans
+        const bans = bl.listBans(self.allocator) catch return;
+        defer {
+            for (bans) |info| {
+                self.allocator.free(info.ip_str);
+                if (info.reason) |r| self.allocator.free(r);
+            }
+            self.allocator.free(bans);
+        }
+        for (bans) |info| {
+            db.saveBannedIp(info.ip_str, @intFromEnum(info.source), info.reason, info.created_at) catch {};
+        }
+
+        // Save ranges
+        const ranges = bl.listRanges(self.allocator) catch return;
+        defer {
+            for (ranges) |info| {
+                self.allocator.free(info.start_str);
+                self.allocator.free(info.end_str);
+            }
+            self.allocator.free(ranges);
+        }
+        for (ranges) |info| {
+            db.saveBannedRange(info.start_str, info.end_str, @intFromEnum(info.source)) catch {};
         }
     }
 

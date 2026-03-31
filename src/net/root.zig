@@ -1,5 +1,7 @@
+pub const ban_list = @import("ban_list.zig");
 pub const extensions = @import("extensions.zig");
 pub const hash_exchange = @import("hash_exchange.zig");
+pub const ipfilter_parser = @import("ipfilter_parser.zig");
 pub const metadata_fetch = @import("metadata_fetch.zig");
 pub const peer_id = @import("peer_id.zig");
 pub const peer_wire = @import("peer_wire.zig");
