@@ -99,6 +99,17 @@ Update it whenever a milestone lands, the near-term backlog changes, or a new op
 - Dual-hash verification (`src/storage/verify.zig`): `PiecePlan.hash_type` selects SHA-1 or SHA-256, `verifyPieceBuffer` supports both.
 - Hasher thread pool SHA-256 support (`src/io/hasher.zig`): `Job.hash_type` field, worker function dispatches to SHA-1 or SHA-256.
 
+### DHT (BEP 5) — Distributed Hash Table
+- 160-bit node ID generation, XOR distance, bucket index calculation (`src/dht/node_id.zig`). Compact node info encode/decode (26-byte BEP 5 format). Random ID generation within bucket range for refresh.
+- Routing table with 160 k-buckets (K=8), node classification (good/questionable/bad per BEP 5 section 2), eviction of bad nodes, bucket staleness detection for 15-minute refresh (`src/dht/routing_table.zig`). findClosest returns K nodes sorted by XOR distance.
+- Zero-allocation KRPC protocol layer (`src/dht/krpc.zig`): manual bencode parse/encode for ping, find_node, get_peers, announce_peer queries and responses, error messages. No heap allocation for parsing incoming UDP datagrams.
+- Token management (`src/dht/token.zig`): SipHash-2-4 HMAC tokens bound to querier IP, 5-minute secret rotation with overlap window for announce_peer security.
+- Iterative lookup state machine (`src/dht/lookup.zig`): alpha=3 concurrent queries, candidate tracking sorted by XOR distance, peer collection for get_peers, token saving for announce_peer follow-up.
+- Bootstrap from hard-coded nodes (router.bittorrent.com, dht.transmissionbt.com, router.utorrent.com, dht.libtorrent.org). DNS resolution at startup before event loop.
+- DHT engine (`src/dht/dht.zig`): main coordinator tying routing table, KRPC, lookups, tokens, and bootstrap together. Responds to incoming queries (ping, find_node, get_peers, announce_peer). Drives iterative lookups. Sends announce_peer after get_peers completes. Outbound packet queue for event loop integration.
+- SQLite persistence (`src/dht/persistence.zig`): dht_config and dht_nodes tables. Saves/loads node ID and up to 300 routing table nodes. Runs on background thread.
+- Event loop integration (`src/io/dht_handler.zig`): DHT/uTP demux by first byte ('d' for KRPC, else uTP). DHT tick in event loop. Outbound packets sent via shared UDP socket. Discovered peers fed into existing peer connection pipeline via addPeerForTorrent.
+
 ### Testing
 - 19 peer wire protocol tests, 10 BEP 10 extension tests, 15 PEX tests, 31 uTP/LEDBAT tests, 5 categories tests, 9 resume DB tests, 25 MSE/RC4 tests, 13 magnet URI tests, 13 ut_metadata tests.
 - Bencode fuzz + edge case tests, HTTP parser fuzz tests.
@@ -114,13 +125,15 @@ Update it whenever a milestone lands, the near-term backlog changes, or a new op
 - Soak test framework (`zig build soak-test`): multi-torrent piece tracker stress, allocator leak detection (GPA), FD leak monitoring, tick latency tracking, bitfield stress cycles.
 - 5 super-seed (BEP 16) tests, 2 multi-announce tests, 5 huge page cache tests.
 - BEP 52 tests: 11 Merkle tree tests, 8 file tree parser tests, 7 v2 metainfo tests, 4 v2 layout tests, 1 v2 info-hash test.
+- DHT tests: 7 node_id tests (XOR distance, bucket index, compact encode/decode, randomIdInBucket), 8 routing_table tests (add/update/evict/findClosest/refresh/classification), 8 krpc tests (ping/find_node/get_peers/response/error roundtrips, rejection of invalid input), 8 token tests (generation/validation/rotation), 7 lookup tests (seed/query/response/completion/dedup), 5 dht_engine tests (init/ping/find_node/disabled/get_peers), 1 persistence test.
 
 ## Next
 
 ### Protocol
 - ~~**uTP outbound connections**~~: (DONE) outbound uTP connections, retransmission buffer, RTO retransmission.
 - ~~**PEX (BEP 11)**~~: (DONE) peer exchange via BEP 10 extensions, delta encoding, private torrent enforcement.
-- **DHT (BEP 5)**: trackerless peer discovery (large feature).
+- ~~**DHT (BEP 5)**~~: (DONE) trackerless peer discovery — Phases 1-3 (core protocol, active lookups, announce and persistence).
+- **DHT Phase 4**: rate limiting outbound queries, IPv6 support (BEP 32), fuzz tests for incoming KRPC messages.
 - ~~**Magnet links (BEP 9)**~~: (DONE) metadata download via ut_metadata extension.
 - **Magnet link resilience**: retry metadata from multiple peers, parallel piece requests, DHT fallback for trackerless magnets.
 - ~~**MSE encryption (BEP 6)**~~: (DONE) message stream encryption/obfuscation.
@@ -137,6 +150,6 @@ Update it whenever a milestone lands, the near-term backlog changes, or a new op
 
 ## Last Verified Milestone
 
-- BEP 52 (BitTorrent v2 / Hybrid) Phase 1-3: version detection, file tree parsing, Merkle tree, v2 info-hash, file-aligned layout, dual-hash verification
+- DHT (BEP 5) Phases 1-3: node ID, routing table, KRPC, token management, iterative lookups, announce_peer, SQLite persistence, event loop integration with uTP/DHT demux
 - `zig build test`: all tests pass
 - `zig build`: clean build

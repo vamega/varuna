@@ -23,6 +23,7 @@ const protocol = @import("protocol.zig");
 const seed_handler = @import("seed_handler.zig");
 const peer_policy = @import("peer_policy.zig");
 const utp_handler = @import("utp_handler.zig");
+const dht_handler = @import("dht_handler.zig");
 
 pub const max_peers: u16 = 4096;
 const cqe_batch_size = 64;
@@ -285,6 +286,11 @@ pub const EventLoop = struct {
     utp_send_pending: bool = false,
     // Outbound packet queue (when a send is already in flight)
     utp_send_queue: std.ArrayList(UtpQueuedPacket) = std.ArrayList(UtpQueuedPacket).empty,
+
+    // DHT (BEP 5): distributed hash table engine for trackerless peer discovery.
+    // Shares the UDP socket with uTP. Incoming datagrams starting with 'd'
+    // (bencode dict) are routed to DHT; others go to uTP.
+    dht_engine: ?*@import("../dht/dht.zig").DhtEngine = null,
 
     // Complete pieces bitfield (for seeding -- which pieces we can serve)
     complete_pieces: ?*const Bitfield = null,
@@ -901,6 +907,7 @@ pub const EventLoop = struct {
         peer_policy.updateSpeedCounters(self);
         peer_policy.checkPex(self);
         utp_handler.utpTick(self);
+        dht_handler.dhtTick(self);
 
         // Flush any queued SQEs before waiting
         _ = self.ring.submit() catch |err| {

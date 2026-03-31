@@ -1,3 +1,4 @@
+pub const dht_handler = @import("dht_handler.zig");
 pub const dns = @import("dns.zig");
 pub const event_loop = @import("event_loop.zig");
 pub const peer_handler = @import("peer_handler.zig");
