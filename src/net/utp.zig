@@ -168,15 +168,31 @@ const min_rto_us: u32 = 500_000; // 500 ms
 const max_rto_us: u32 = 60_000_000; // 60 s
 const initial_rto_us: u32 = 1_000_000; // 1 s
 
+/// Maximum payload size per uTP packet (MTU - IP - UDP - uTP header).
+pub const max_payload: u16 = 1400 - Header.size;
+
 /// An outbound packet waiting for acknowledgement.
+/// Owns a copy of the payload for retransmission.
 pub const OutPacket = struct {
     seq_nr: u16,
-    data: []const u8,
+    /// Owned copy of the full UDP datagram (header + payload) for retransmission.
+    /// Null for slots that have been acked and reclaimed.
+    packet_buf: ?[]u8 = null,
+    /// Length of the payload portion (excluding header).
+    payload_len: u16 = 0,
     send_time_us: u32,
     retransmit_count: u8 = 0,
     acked: bool = false,
-    /// Whether this is payload-bearing (ST_DATA) vs control-only.
+    /// Whether this packet needs retransmission (set on timeout/loss detection).
     needs_resend: bool = false,
+
+    /// Free the owned packet buffer.
+    pub fn deinit(self: *OutPacket, allocator: std.mem.Allocator) void {
+        if (self.packet_buf) |buf| {
+            allocator.free(buf);
+            self.packet_buf = null;
+        }
+    }
 };
 
 /// An entry in the receive reorder buffer.
@@ -241,9 +257,21 @@ pub const UtpSocket = struct {
     /// Remote address (set on connect/accept).
     remote_addr: std.net.Address = undefined,
 
+    /// Allocator for owned packet buffers in the retransmission buffer.
+    allocator: ?std.mem.Allocator = null,
+
     // ── Public API ───────────────────────────────────────
 
-    /// Begin an outbound connection. Generates a SYN packet.
+    /// Free all owned outbound packet buffers. Call on socket teardown.
+    pub fn deinit(self: *UtpSocket) void {
+        const alloc = self.allocator orelse return;
+        for (&self.out_buf) |*pkt| {
+            pkt.deinit(alloc);
+        }
+    }
+
+    /// Begin an outbound connection. Generates a SYN packet and stores
+    /// it in the outbound buffer for retransmission on timeout.
     /// Returns the encoded SYN packet to send.
     pub fn connect(self: *UtpSocket, now_us: u32) [Header.size]u8 {
         // Generate random connection_id.
@@ -267,9 +295,14 @@ pub const UtpSocket = struct {
             .ack_nr = 0,
         };
 
+        const encoded = hdr.encode();
+
+        // Store SYN in outbound buffer for retransmission.
+        self.bufferOutPacket(self.seq_nr, &encoded, 0, now_us);
+
         self.seq_nr +%= 1;
         self.last_send_time_us = now_us;
-        return hdr.encode();
+        return encoded;
     }
 
     /// Process a received SYN (called by the manager for inbound connections).
@@ -371,11 +404,13 @@ pub const UtpSocket = struct {
         }
     }
 
-    /// Create a data packet. Returns header bytes and advances seq_nr.
+    /// Create a data packet header and buffer the full packet (header + payload)
+    /// for retransmission. Returns header bytes and advances seq_nr.
     /// The caller is responsible for sending header ++ payload over UDP.
-    /// Returns null if the send window is exhausted.
+    /// Returns null if the send window is exhausted or the outbound buffer is full.
     pub fn createDataPacket(self: *UtpSocket, payload_len: u16, now_us: u32) ?[Header.size]u8 {
         if (self.state != .connected) return null;
+        if (self.out_buf_count >= max_outbuf) return null;
 
         // Check congestion window.
         const bytes_in_flight = self.bytesInFlight();
@@ -394,9 +429,17 @@ pub const UtpSocket = struct {
             .ack_nr = self.ack_nr,
         };
 
+        const encoded = hdr.encode();
         self.seq_nr +%= 1;
         self.last_send_time_us = now_us;
-        return hdr.encode();
+        return encoded;
+    }
+
+    /// Buffer a sent data packet for retransmission. Must be called after
+    /// createDataPacket with the full datagram (header + payload).
+    /// This stores an owned copy so the original buffer can be reused.
+    pub fn bufferSentPacket(self: *UtpSocket, seq_nr: u16, datagram: []const u8, payload_len: u16, now_us: u32) void {
+        self.bufferOutPacket(seq_nr, datagram, payload_len, now_us);
     }
 
     /// Create a FIN packet to initiate graceful shutdown.
@@ -441,24 +484,65 @@ pub const UtpSocket = struct {
 
     /// Returns estimated bytes currently in flight (unacknowledged).
     pub fn bytesInFlight(self: *const UtpSocket) u32 {
-        // Approximate: count of unacked packets * MSS.
-        // In a real implementation we would track actual payload sizes.
-        const unacked = seqDiff(self.seq_nr, self.out_seq_start);
-        if (unacked <= 0) return 0;
-        return @as(u32, @intCast(unacked)) * Ledbat.mss;
+        var total: u32 = 0;
+        var i: u16 = 0;
+        while (i < self.out_buf_count) : (i += 1) {
+            const idx = (self.out_seq_start +% i) % max_outbuf;
+            const pkt = &self.out_buf[idx];
+            if (!pkt.acked) {
+                total += @as(u32, pkt.payload_len) + @as(u32, Header.size);
+            }
+        }
+        return total;
     }
 
     /// Check if a retransmission timeout has elapsed.
     pub fn isTimedOut(self: *const UtpSocket, now_us: u32) bool {
         if (self.last_send_time_us == 0) return false;
+        if (self.state == .idle or self.state == .closed or self.state == .reset) return false;
         return (now_us -% self.last_send_time_us) >= self.rto;
     }
 
-    /// Handle a retransmission timeout event.
+    /// Handle a retransmission timeout event. Marks the oldest unacked
+    /// packet for retransmission and applies exponential backoff.
     pub fn handleTimeout(self: *UtpSocket) void {
         self.ledbat.onTimeout();
         // Double the RTO (exponential backoff).
         self.rto = @min(self.rto *| 2, max_rto_us);
+
+        // Mark the oldest unacked packet for resend.
+        if (self.out_buf_count > 0) {
+            const idx = self.out_seq_start % max_outbuf;
+            var pkt = &self.out_buf[idx];
+            if (!pkt.acked) {
+                pkt.needs_resend = true;
+            }
+        }
+    }
+
+    /// Collect packets that need retransmission. Returns the number of
+    /// packets written to `out`. Each entry is the packet buffer slice
+    /// that should be re-sent over UDP.
+    pub fn collectRetransmits(self: *UtpSocket, out: []RetransmitEntry, now_us: u32) u16 {
+        var count: u16 = 0;
+        var i: u16 = 0;
+        while (i < self.out_buf_count and count < out.len) : (i += 1) {
+            const idx = (self.out_seq_start +% i) % max_outbuf;
+            var pkt = &self.out_buf[idx];
+            if (pkt.needs_resend and !pkt.acked) {
+                if (pkt.packet_buf) |buf| {
+                    // Update the timestamp in the header before retransmitting.
+                    std.mem.writeInt(u32, buf[4..8], now_us, .big);
+                    out[count] = .{ .data = buf, .seq_nr = pkt.seq_nr };
+                    pkt.needs_resend = false;
+                    pkt.retransmit_count += 1;
+                    pkt.send_time_us = now_us;
+                    count += 1;
+                }
+            }
+        }
+        self.last_send_time_us = now_us;
+        return count;
     }
 
     // ── Internal ─────────────────────────────────────────
@@ -470,19 +554,24 @@ pub const UtpSocket = struct {
 
         while (self.out_buf_count > 0) {
             const idx = self.out_seq_start % max_outbuf;
-            const pkt = &self.out_buf[idx];
+            var pkt = &self.out_buf[idx];
 
             if (seqLessThan(ack_nr, pkt.seq_nr)) break;
 
             // This packet is acknowledged.
             if (!pkt.acked) {
                 pkt.acked = true;
-                newly_acked_bytes += @intCast(pkt.data.len);
+                newly_acked_bytes += @as(u32, pkt.payload_len) + @as(u32, Header.size);
 
                 // RTT sample (skip retransmitted packets per Karn's algorithm).
                 if (pkt.retransmit_count == 0) {
                     self.updateRtt(now_us -% pkt.send_time_us);
                 }
+            }
+
+            // Free the owned packet buffer now that it is acked.
+            if (self.allocator) |alloc| {
+                pkt.deinit(alloc);
             }
 
             self.out_seq_start +%= 1;
@@ -497,6 +586,9 @@ pub const UtpSocket = struct {
             // Duplicate ACK.
             self.dup_ack_count += 1;
             if (self.dup_ack_count >= 3) {
+                // Mark oldest unacked for fast retransmit.
+                const fast_idx = self.out_seq_start % max_outbuf;
+                self.out_buf[fast_idx].needs_resend = true;
                 self.ledbat.onLoss();
                 self.dup_ack_count = 0;
             }
@@ -543,6 +635,32 @@ pub const UtpSocket = struct {
         return self.recv_wnd_size - self.recv_buf_bytes;
     }
 
+    /// Store a packet in the outbound buffer for retransmission.
+    /// `header_data` is the encoded header (or full datagram for control packets).
+    /// `payload_len` is the length of payload following the header (0 for control).
+    fn bufferOutPacket(self: *UtpSocket, seq_nr: u16, header_data: []const u8, payload_len: u16, now_us: u32) void {
+        if (self.out_buf_count >= max_outbuf) return;
+
+        const idx = (self.out_seq_start +% self.out_buf_count) % max_outbuf;
+
+        // Allocate owned copy if we have an allocator.
+        var owned_buf: ?[]u8 = null;
+        if (self.allocator) |alloc| {
+            owned_buf = alloc.alloc(u8, header_data.len) catch null;
+            if (owned_buf) |buf| {
+                @memcpy(buf, header_data);
+            }
+        }
+
+        self.out_buf[idx] = .{
+            .seq_nr = seq_nr,
+            .packet_buf = owned_buf,
+            .payload_len = payload_len,
+            .send_time_us = now_us,
+        };
+        self.out_buf_count += 1;
+    }
+
     fn bufferReorder(self: *UtpSocket, seq: u16, data: []const u8) void {
         const offset = seqDiff(seq, self.ack_nr +% 1);
         if (offset <= 0 or offset >= max_reorder_buf) return;
@@ -578,6 +696,13 @@ pub const ProcessResult = struct {
     data_len: u16 = 0,
     /// Number of additional packets delivered from the reorder buffer.
     reorder_delivered: u16 = 0,
+};
+
+/// An entry returned by collectRetransmits -- a packet that needs resending.
+pub const RetransmitEntry = struct {
+    /// Full datagram (header + payload) to re-send over UDP.
+    data: []u8,
+    seq_nr: u16,
 };
 
 // ── Tests ─────────────────────────────────────────────────
@@ -1007,4 +1132,225 @@ test "uTP selective ack decode edge cases" {
     // Valid: len=4 with enough data
     const valid = SelectiveAck.decode(&[_]u8{ 0, 4, 0xFF, 0, 0, 0 });
     try std.testing.expect(valid != null);
+}
+
+// ── Outbound connection tests ────────────────────────────
+
+test "connect stores SYN in outbound buffer for retransmission" {
+    const allocator = std.testing.allocator;
+    var sock = UtpSocket{};
+    sock.allocator = allocator;
+    defer sock.deinit();
+
+    _ = sock.connect(1_000_000);
+
+    // SYN should be stored in the outbound buffer.
+    try std.testing.expectEqual(@as(u16, 1), sock.out_buf_count);
+    const pkt = &sock.out_buf[sock.out_seq_start % max_outbuf];
+    try std.testing.expect(pkt.packet_buf != null);
+    try std.testing.expectEqual(@as(u16, 0), pkt.payload_len);
+
+    // Verify the stored packet is a valid SYN.
+    const stored_hdr = Header.decode(pkt.packet_buf.?) orelse return error.DecodeFailed;
+    try std.testing.expectEqual(PacketType.st_syn, stored_hdr.packet_type);
+}
+
+test "outbound data packet is buffered for retransmission" {
+    const allocator = std.testing.allocator;
+    var sock = UtpSocket{};
+    sock.allocator = allocator;
+    sock.state = .connected;
+    sock.send_id = 42;
+    sock.seq_nr = 10;
+    sock.out_seq_start = 10;
+    defer sock.deinit();
+
+    const hdr_bytes = sock.createDataPacket(100, 2_000_000) orelse
+        return error.WindowBlocked;
+    try std.testing.expect(Header.decode(&hdr_bytes) != null);
+
+    // Now buffer the full datagram.
+    var datagram: [Header.size + 100]u8 = undefined;
+    @memcpy(datagram[0..Header.size], &hdr_bytes);
+    @memset(datagram[Header.size..], 0xAB);
+    sock.bufferSentPacket(10, &datagram, 100, 2_000_000);
+
+    try std.testing.expectEqual(@as(u16, 1), sock.out_buf_count);
+    const pkt = &sock.out_buf[10 % max_outbuf];
+    try std.testing.expect(pkt.packet_buf != null);
+    try std.testing.expectEqual(@as(u16, 100), pkt.payload_len);
+}
+
+test "timeout marks oldest unacked packet for retransmission" {
+    const allocator = std.testing.allocator;
+    var sock = UtpSocket{};
+    sock.allocator = allocator;
+    sock.state = .connected;
+    sock.send_id = 42;
+    sock.seq_nr = 10;
+    sock.out_seq_start = 10;
+    defer sock.deinit();
+
+    // Create and buffer a data packet.
+    const hdr_bytes = sock.createDataPacket(50, 1_000_000) orelse
+        return error.WindowBlocked;
+    var datagram: [Header.size + 50]u8 = undefined;
+    @memcpy(datagram[0..Header.size], &hdr_bytes);
+    @memset(datagram[Header.size..], 0xCD);
+    sock.bufferSentPacket(10, &datagram, 50, 1_000_000);
+
+    // Trigger timeout.
+    sock.handleTimeout();
+
+    try std.testing.expect(sock.out_buf[10 % max_outbuf].needs_resend);
+
+    // Collect retransmits.
+    var entries: [8]RetransmitEntry = undefined;
+    const count = sock.collectRetransmits(&entries, 2_000_000);
+    try std.testing.expectEqual(@as(u16, 1), count);
+    try std.testing.expectEqual(@as(u16, 10), entries[0].seq_nr);
+}
+
+test "acked packets are freed from outbound buffer" {
+    const allocator = std.testing.allocator;
+    var sock = UtpSocket{};
+    sock.allocator = allocator;
+    sock.state = .connected;
+    sock.send_id = 42;
+    sock.seq_nr = 10;
+    sock.out_seq_start = 10;
+    defer sock.deinit();
+
+    // Buffer two data packets.
+    const hdr1 = sock.createDataPacket(50, 1_000_000) orelse return error.WindowBlocked;
+    var d1: [Header.size + 50]u8 = undefined;
+    @memcpy(d1[0..Header.size], &hdr1);
+    @memset(d1[Header.size..], 0x01);
+    sock.bufferSentPacket(10, &d1, 50, 1_000_000);
+
+    const hdr2 = sock.createDataPacket(60, 1_001_000) orelse return error.WindowBlocked;
+    var d2: [Header.size + 60]u8 = undefined;
+    @memcpy(d2[0..Header.size], &hdr2);
+    @memset(d2[Header.size..], 0x02);
+    sock.bufferSentPacket(11, &d2, 60, 1_001_000);
+
+    try std.testing.expectEqual(@as(u16, 2), sock.out_buf_count);
+
+    // ACK the first packet (ack_nr = 10 means seq 10 is acked).
+    const ack_hdr = Header{
+        .packet_type = .st_state,
+        .extension = .none,
+        .connection_id = sock.recv_id,
+        .timestamp_us = 1_100_000,
+        .timestamp_diff_us = 100_000,
+        .wnd_size = 65536,
+        .seq_nr = 1,
+        .ack_nr = 10,
+    };
+    _ = sock.processPacket(ack_hdr, &.{}, 1_200_000);
+
+    // First packet should be freed.
+    try std.testing.expectEqual(@as(u16, 1), sock.out_buf_count);
+    try std.testing.expectEqual(@as(u16, 11), sock.out_seq_start);
+}
+
+test "triple duplicate ACK triggers fast retransmit" {
+    const allocator = std.testing.allocator;
+    var sock = UtpSocket{};
+    sock.allocator = allocator;
+    sock.state = .connected;
+    sock.send_id = 42;
+    sock.recv_id = 41;
+    sock.seq_nr = 12;
+    sock.out_seq_start = 10;
+    defer sock.deinit();
+
+    // Buffer two data packets.
+    var d1: [Header.size + 50]u8 = undefined;
+    @memset(&d1, 0x01);
+    sock.bufferSentPacket(10, &d1, 50, 1_000_000);
+    var d2: [Header.size + 50]u8 = undefined;
+    @memset(&d2, 0x02);
+    sock.bufferSentPacket(11, &d2, 50, 1_001_000);
+
+    sock.out_buf_count = 2;
+
+    // Send 3 duplicate ACKs for seq 9 (meaning seq 10 is not acked).
+    const make_dup_ack = struct {
+        fn f(recv_id: u16) Header {
+            return Header{
+                .packet_type = .st_state,
+                .extension = .none,
+                .connection_id = recv_id,
+                .timestamp_us = 1_100_000,
+                .timestamp_diff_us = 100_000,
+                .wnd_size = 65536,
+                .seq_nr = 1,
+                .ack_nr = 9,
+            };
+        }
+    }.f;
+
+    _ = sock.processPacket(make_dup_ack(sock.recv_id), &.{}, 1_200_000);
+    _ = sock.processPacket(make_dup_ack(sock.recv_id), &.{}, 1_300_000);
+    _ = sock.processPacket(make_dup_ack(sock.recv_id), &.{}, 1_400_000);
+
+    // After 3 dup acks, the oldest packet should be marked for resend.
+    try std.testing.expect(sock.out_buf[10 % max_outbuf].needs_resend);
+}
+
+test "three-way handshake with retransmission buffer" {
+    const allocator = std.testing.allocator;
+
+    // Client initiates outbound connection.
+    var client = UtpSocket{};
+    client.allocator = allocator;
+    defer client.deinit();
+    const syn_pkt = client.connect(1_000_000);
+    const syn_hdr = Header.decode(&syn_pkt).?;
+
+    try std.testing.expectEqual(State.syn_sent, client.state);
+    try std.testing.expectEqual(@as(u16, 1), client.out_buf_count);
+
+    // Server receives SYN and responds with SYN-ACK.
+    var server = UtpSocket{};
+    server.allocator = allocator;
+    defer server.deinit();
+    const syn_ack_pkt = server.acceptSyn(syn_hdr, 1_001_000);
+    const syn_ack_hdr = Header.decode(&syn_ack_pkt).?;
+
+    try std.testing.expectEqual(State.connected, server.state);
+
+    // Client receives SYN-ACK -- transitions to connected.
+    // The SYN-ACK acks the client's SYN (ack_nr should match client's SYN seq_nr).
+    _ = client.processPacket(syn_ack_hdr, &.{}, 1_002_000);
+
+    try std.testing.expectEqual(State.connected, client.state);
+    // SYN should be acked and freed from outbound buffer.
+    try std.testing.expectEqual(@as(u16, 0), client.out_buf_count);
+
+    // Connection IDs complementary.
+    try std.testing.expectEqual(client.recv_id, server.send_id);
+    try std.testing.expectEqual(client.send_id, server.recv_id);
+}
+
+test "bytesInFlight tracks actual payload sizes" {
+    const allocator = std.testing.allocator;
+    var sock = UtpSocket{};
+    sock.allocator = allocator;
+    sock.state = .connected;
+    sock.send_id = 42;
+    sock.seq_nr = 10;
+    sock.out_seq_start = 10;
+    defer sock.deinit();
+
+    try std.testing.expectEqual(@as(u32, 0), sock.bytesInFlight());
+
+    // Buffer a 100-byte payload packet.
+    const hdr = sock.createDataPacket(100, 1_000_000) orelse return error.WindowBlocked;
+    var d: [Header.size + 100]u8 = undefined;
+    @memcpy(d[0..Header.size], &hdr);
+    sock.bufferSentPacket(10, &d, 100, 1_000_000);
+
+    try std.testing.expectEqual(@as(u32, 100 + Header.size), sock.bytesInFlight());
 }

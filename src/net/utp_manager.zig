@@ -44,6 +44,7 @@ pub const UtpManager = struct {
         var sock = &self.connections[slot];
         sock.* = .{};
         sock.remote_addr = remote;
+        sock.allocator = self.allocator;
 
         const syn_pkt = sock.connect(now_us);
 
@@ -153,6 +154,30 @@ pub const UtpManager = struct {
         return count;
     }
 
+    /// Collect retransmission packets from all connections that timed out.
+    /// Returns entries with the data to resend and the remote address.
+    pub fn collectRetransmits(self: *UtpManager, now_us: u32, out: []RetransmitResult) u16 {
+        var count: u16 = 0;
+        for (0..max_connections) |i| {
+            if (!self.slot_active[i]) continue;
+            const slot: u16 = @intCast(i);
+            var sock = &self.connections[slot];
+
+            var entries: [8]utp.RetransmitEntry = undefined;
+            const n = sock.collectRetransmits(&entries, now_us);
+            for (entries[0..n]) |entry| {
+                if (count >= out.len) return count;
+                out[count] = .{
+                    .slot = slot,
+                    .data = entry.data,
+                    .remote = sock.remote_addr,
+                };
+                count += 1;
+            }
+        }
+        return count;
+    }
+
     /// Returns the number of active connections.
     pub fn connectionCount(self: *const UtpManager) u16 {
         return self.active_count;
@@ -180,6 +205,7 @@ pub const UtpManager = struct {
         var sock = &self.connections[slot];
         sock.* = .{};
         sock.remote_addr = remote;
+        sock.allocator = self.allocator;
 
         const syn_ack = sock.acceptSyn(hdr, now_us);
 
@@ -242,9 +268,17 @@ pub const UtpManager = struct {
 
     fn freeSlot(self: *UtpManager, slot: u16) void {
         if (slot >= max_connections or !self.slot_active[slot]) return;
+        self.connections[slot].deinit();
         self.slot_active[slot] = false;
         self.active_count -= 1;
     }
+};
+
+/// Result of collectRetransmits: a packet that needs re-sending.
+pub const RetransmitResult = struct {
+    slot: u16,
+    data: []u8,
+    remote: std.net.Address,
 };
 
 /// Result of a connect() call.
@@ -390,5 +424,104 @@ test "manager connection count tracks correctly" {
     try std.testing.expectEqual(@as(u16, 1), mgr.connectionCount());
 
     _ = mgr.reset(c2.slot, 2_000_000);
+    try std.testing.expectEqual(@as(u16, 0), mgr.connectionCount());
+}
+
+test "manager connect sets allocator on socket" {
+    var mgr = UtpManager.init(std.testing.allocator);
+    const remote = std.net.Address.initIp4(.{ 127, 0, 0, 1 }, 6881);
+
+    const conn = try mgr.connect(remote, 1_000_000);
+    const sock = mgr.getSocket(conn.slot).?;
+    try std.testing.expect(sock.allocator != null);
+
+    // Clean up.
+    _ = mgr.reset(conn.slot, 2_000_000);
+}
+
+test "manager handshake with retransmission and data exchange" {
+    var client_mgr = UtpManager.init(std.testing.allocator);
+    var server_mgr = UtpManager.init(std.testing.allocator);
+    const client_addr = std.net.Address.initIp4(.{ 127, 0, 0, 1 }, 5000);
+    const server_addr = std.net.Address.initIp4(.{ 127, 0, 0, 1 }, 6000);
+
+    // Client connects.
+    const conn = try client_mgr.connect(server_addr, 1_000_000);
+    const client_sock = client_mgr.getSocket(conn.slot).?;
+    try std.testing.expectEqual(@as(u16, 1), client_sock.out_buf_count);
+
+    // Server receives SYN.
+    const srv_result = server_mgr.processPacket(&conn.syn_packet, client_addr, 1_001_000).?;
+    try std.testing.expect(srv_result.new_connection);
+    _ = server_mgr.accept().?;
+
+    // Client receives SYN-ACK -- SYN should be acked.
+    _ = client_mgr.processPacket(&srv_result.response.?, server_addr, 1_002_000);
+    try std.testing.expectEqual(utp.State.connected, client_sock.state);
+    try std.testing.expectEqual(@as(u16, 0), client_sock.out_buf_count);
+
+    // Client sends data.
+    const payload = "hello";
+    const hdr_bytes = client_mgr.createDataPacket(conn.slot, @intCast(payload.len), 1_003_000);
+    try std.testing.expect(hdr_bytes != null);
+
+    // Buffer the data packet for retransmission.
+    const pkt_seq = std.mem.readInt(u16, hdr_bytes.?[16..18], .big);
+    var datagram: [utp.Header.size + payload.len]u8 = undefined;
+    @memcpy(datagram[0..utp.Header.size], &hdr_bytes.?);
+    @memcpy(datagram[utp.Header.size..], payload);
+    client_sock.bufferSentPacket(pkt_seq, &datagram, @intCast(payload.len), 1_003_000);
+
+    try std.testing.expectEqual(@as(u16, 1), client_sock.out_buf_count);
+
+    // Clean up.
+    _ = client_mgr.reset(conn.slot, 3_000_000);
+}
+
+test "manager collectRetransmits returns timed-out packets" {
+    var mgr = UtpManager.init(std.testing.allocator);
+    const remote = std.net.Address.initIp4(.{ 127, 0, 0, 1 }, 6881);
+
+    const conn = try mgr.connect(remote, 1_000_000);
+    const sock = mgr.getSocket(conn.slot).?;
+
+    // Manually transition to connected and buffer a data packet.
+    sock.state = .connected;
+    sock.seq_nr = 10;
+    sock.out_seq_start = 10;
+    const hdr = sock.createDataPacket(50, 2_000_000) orelse return error.WindowBlocked;
+    var datagram: [utp.Header.size + 50]u8 = undefined;
+    @memcpy(datagram[0..utp.Header.size], &hdr);
+    @memset(datagram[utp.Header.size..], 0xAA);
+    sock.bufferSentPacket(10, &datagram, 50, 2_000_000);
+
+    // Simulate timeout.
+    var timeout_buf: [64]u16 = undefined;
+    // Advance time past RTO (initial 1s).
+    const timeout_count = mgr.checkTimeouts(3_500_000, &timeout_buf);
+    try std.testing.expect(timeout_count > 0);
+
+    // Collect retransmits.
+    var retransmits: [16]RetransmitResult = undefined;
+    const retx_count = mgr.collectRetransmits(3_500_000, &retransmits);
+    try std.testing.expect(retx_count > 0);
+    try std.testing.expectEqual(conn.slot, retransmits[0].slot);
+
+    // Clean up.
+    _ = mgr.reset(conn.slot, 4_000_000);
+}
+
+test "manager freeSlot cleans up outbound buffers" {
+    var mgr = UtpManager.init(std.testing.allocator);
+    const remote = std.net.Address.initIp4(.{ 127, 0, 0, 1 }, 6881);
+
+    const conn = try mgr.connect(remote, 1_000_000);
+
+    // SYN is buffered with allocator-owned data.
+    const sock = mgr.getSocket(conn.slot).?;
+    try std.testing.expect(sock.out_buf[sock.out_seq_start % 128].packet_buf != null);
+
+    // Reset frees the slot and the outbound buffers.
+    _ = mgr.reset(conn.slot, 2_000_000);
     try std.testing.expectEqual(@as(u16, 0), mgr.connectionCount());
 }

@@ -36,12 +36,13 @@ Core protocol implemented in `src/net/utp.zig`, `src/net/ledbat.zig`, `src/net/u
 - Receive reorder buffer for out-of-order packets
 - UtpManager multiplexer: routes packets by connection_id, accept queue for inbound connections
 
-**Remaining work for full integration:**
-- Register UDP socket with io_uring event loop (`IORING_OP_RECVMSG` / `IORING_OP_SENDMSG`)
-- Add `utp_recv` / `utp_send` OpType variants to event_loop.zig
-- Wire UtpManager into PeerState so uTP and TCP peers coexist in the same session
-- Outbound retransmission buffer with actual payload tracking
-- Timer integration for RTO-based retransmission
+**All integration items completed:**
+- ~~Register UDP socket with io_uring event loop (`IORING_OP_RECVMSG` / `IORING_OP_SENDMSG`)~~ DONE
+- ~~Add `utp_recv` / `utp_send` OpType variants to event_loop.zig~~ DONE
+- ~~Wire UtpManager into PeerState so uTP and TCP peers coexist in the same session~~ DONE
+- ~~Outbound retransmission buffer with actual payload tracking~~ DONE
+- ~~Timer integration for RTO-based retransmission~~ DONE
+- ~~Outbound uTP connections (connect, handshake, peer wire bridge)~~ DONE
 
 ## 4. ~~SO_BINDTODEVICE support~~ (DONE)
 

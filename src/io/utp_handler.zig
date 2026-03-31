@@ -81,8 +81,7 @@ pub fn utpSendPacket(self: *EventLoop, data: []const u8, remote: std.net.Address
     if (self.utp_send_pending) {
         // Queue for later
         var pkt = UtpQueuedPacket{
-            .data = undefined,
-            .len = @min(data.len, utp_mod.Header.size),
+            .len = @min(data.len, 1500),
             .remote = remote,
         };
         @memcpy(pkt.data[0..pkt.len], data[0..pkt.len]);
@@ -145,6 +144,12 @@ pub fn handleUtpRecv(self: *EventLoop, cqe: linux.io_uring_cqe) void {
         acceptUtpConnection(self, mgr);
     }
 
+    // Check if an outbound connection just completed the handshake
+    // (SYN-ACK received, socket transitioned to connected).
+    if (!result.new_connection) {
+        checkOutboundUtpConnect(self, result.slot, mgr);
+    }
+
     // Handle delivered data for existing connections
     if (result.data) |utp_data| {
         deliverUtpData(self, result.slot, utp_data);
@@ -161,6 +166,48 @@ pub fn handleUtpSend(self: *EventLoop, cqe: linux.io_uring_cqe) void {
 
     // Drain the send queue
     utpDrainSendQueue(self);
+}
+
+/// Check if an outbound uTP connection just completed the three-way
+/// handshake (peer was in .connecting state, socket is now .connected).
+/// If so, begin the peer wire protocol handshake over uTP.
+fn checkOutboundUtpConnect(self: *EventLoop, utp_slot: u16, mgr: *utp_mgr.UtpManager) void {
+    const peer_slot = findPeerByUtpSlot(self, utp_slot) orelse return;
+    const peer = &self.peers[peer_slot];
+
+    if (peer.state != .connecting) return;
+
+    const sock = mgr.getSocket(utp_slot) orelse return;
+    if (sock.state != .connected) return;
+
+    // uTP handshake complete -- connection is established.
+    if (self.half_open_count > 0) self.half_open_count -= 1;
+    peer.state = .handshake_send;
+    peer.last_activity = std.time.timestamp();
+
+    log.info("outbound uTP connection established to {any}", .{peer.address});
+
+    // Build and send BitTorrent handshake over uTP.
+    const tc = self.getTorrentContext(peer.torrent_id) orelse {
+        self.removePeer(peer_slot);
+        return;
+    };
+    var buf: [68]u8 = undefined;
+    buf[0] = pw.protocol_length;
+    @memcpy(buf[1 .. 1 + pw.protocol_string.len], pw.protocol_string);
+    @memset(buf[20..28], 0);
+    buf[20 + ext.reserved_byte] |= ext.reserved_mask;
+    @memcpy(buf[28..48], &tc.info_hash);
+    @memcpy(buf[48..68], &tc.peer_id);
+
+    utpSendData(self, peer_slot, &buf) catch {
+        self.removePeer(peer_slot);
+        return;
+    };
+
+    // Transition to waiting for the peer's handshake response.
+    peer.state = .handshake_recv;
+    peer.handshake_offset = 0;
 }
 
 /// Accept pending inbound uTP connections and create Peer entries.
@@ -219,6 +266,21 @@ fn deliverUtpData(self: *EventLoop, utp_slot: u16, data: []const u8) void {
     if (peer.state == .free) return;
 
     switch (peer.state) {
+        .handshake_recv => {
+            // Outbound uTP peer: receiving the peer's handshake response.
+            const remaining = 68 - peer.handshake_offset;
+            const to_copy = @min(data.len, remaining);
+            @memcpy(peer.handshake_buf[peer.handshake_offset .. peer.handshake_offset + to_copy], data[0..to_copy]);
+            peer.handshake_offset += to_copy;
+
+            if (peer.handshake_offset >= 68) {
+                processUtpOutboundHandshake(self, peer_slot);
+                // Feed any remaining data.
+                if (to_copy < data.len) {
+                    deliverUtpData(self, utp_slot, data[to_copy..]);
+                }
+            }
+        },
         .inbound_handshake_recv => {
             // Feed data into handshake buffer
             const remaining = 68 - peer.handshake_offset;
@@ -229,6 +291,10 @@ fn deliverUtpData(self: *EventLoop, utp_slot: u16, data: []const u8) void {
             if (peer.handshake_offset >= 68) {
                 // Process the completed handshake
                 processUtpInboundHandshake(self, peer_slot);
+                // Feed any remaining data.
+                if (to_copy < data.len) {
+                    deliverUtpData(self, utp_slot, data[to_copy..]);
+                }
             }
         },
         .active_recv_header => {
@@ -299,6 +365,39 @@ fn deliverUtpData(self: *EventLoop, utp_slot: u16, data: []const u8) void {
     }
 }
 
+/// Process a completed outbound handshake response from a uTP peer.
+/// This is the uTP equivalent of the TCP handshake_recv path.
+fn processUtpOutboundHandshake(self: *EventLoop, peer_slot: u16) void {
+    const peer = &self.peers[peer_slot];
+    const tc = self.getTorrentContext(peer.torrent_id) orelse {
+        self.removePeer(peer_slot);
+        return;
+    };
+
+    // Validate info_hash matches what we expected.
+    if (!std.mem.eql(u8, peer.handshake_buf[28..48], tc.info_hash[0..])) {
+        self.removePeer(peer_slot);
+        return;
+    }
+
+    // BEP 10: check if peer supports extensions.
+    const recv_reserved = peer.handshake_buf[20..28];
+    peer.extensions_supported = ext.supportsExtensions(recv_reserved[0..8].*);
+
+    if (peer.extensions_supported) {
+        // Send extension handshake over uTP.
+        peer.state = .extension_handshake_send;
+        submitUtpExtensionHandshake(self, peer_slot) catch {
+            // Extension handshake failed; fall through to interested.
+            sendUtpInterestedAndGoActive(self, peer_slot);
+            return;
+        };
+        handleUtpSendComplete(self, peer_slot);
+    } else {
+        sendUtpInterestedAndGoActive(self, peer_slot);
+    }
+}
+
 /// Process a completed inbound handshake from a uTP peer.
 fn processUtpInboundHandshake(self: *EventLoop, peer_slot: u16) void {
     const peer = &self.peers[peer_slot];
@@ -350,6 +449,7 @@ fn processUtpInboundHandshake(self: *EventLoop, peer_slot: u16) void {
 }
 
 /// Send data over a uTP connection (wraps it in uTP DATA packets).
+/// Stores the packet in the outbound buffer for retransmission.
 fn utpSendData(self: *EventLoop, peer_slot: u16, data: []const u8) !void {
     const peer = &self.peers[peer_slot];
     const utp_slot = peer.utp_slot orelse return error.NotUtpPeer;
@@ -361,12 +461,19 @@ fn utpSendData(self: *EventLoop, peer_slot: u16, data: []const u8) !void {
     const hdr_bytes = mgr.createDataPacket(utp_slot, @intCast(data.len), now_us) orelse
         return error.WindowFull;
 
+    // Extract the seq_nr from the header we just created (before it was incremented).
+    const pkt_seq_nr = std.mem.readInt(u16, hdr_bytes[16..18], .big);
+
     // Send header + payload as a single UDP datagram
     var send_buf: [1500]u8 = undefined;
     const total = utp_mod.Header.size + data.len;
     if (total > send_buf.len) return error.PacketTooLarge;
     @memcpy(send_buf[0..utp_mod.Header.size], &hdr_bytes);
     @memcpy(send_buf[utp_mod.Header.size .. utp_mod.Header.size + data.len], data);
+
+    // Buffer the full datagram for retransmission.
+    const sock = mgr.getSocket(utp_slot) orelse return error.NoSocket;
+    sock.bufferSentPacket(pkt_seq_nr, send_buf[0..total], @intCast(data.len), now_us);
 
     const remote = mgr.getRemoteAddress(utp_slot) orelse return error.NoRemoteAddress;
     utpSendPacket(self, send_buf[0..total], remote);
@@ -378,6 +485,12 @@ fn handleUtpSendComplete(self: *EventLoop, peer_slot: u16) void {
     const peer = &self.peers[peer_slot];
 
     switch (peer.state) {
+        // ── Outbound connection flow ──
+        .extension_handshake_send => {
+            // BEP 10: extension handshake sent. Now send interested and go active.
+            sendUtpInterestedAndGoActive(self, peer_slot);
+        },
+        // ── Inbound connection flow ──
         .inbound_handshake_send => {
             if (peer.extensions_supported) {
                 peer.state = .inbound_extension_handshake_send;
@@ -405,8 +518,27 @@ fn handleUtpSendComplete(self: *EventLoop, peer_slot: u16) void {
             peer.header_offset = 0;
             // uTP peers don't need a recv SQE -- data arrives via deliverUtpData
         },
+        .active_recv_header, .active_recv_body => {
+            // Outbound data (piece request, etc.) sent. Nothing to do here
+            // for uTP -- pipeline filling is handled by the policy layer.
+        },
         else => {},
     }
+}
+
+/// Send interested message and transition an outbound uTP peer to active
+/// download mode. This is the uTP equivalent of protocol.sendInterestedAndGoActive.
+fn sendUtpInterestedAndGoActive(self: *EventLoop, peer_slot: u16) void {
+    const peer = &self.peers[peer_slot];
+    peer.am_interested = true;
+    // Message ID 2 = interested
+    utpSendMessage(self, peer_slot, 2, &.{}) catch {
+        self.removePeer(peer_slot);
+        return;
+    };
+    peer.state = .active_recv_header;
+    peer.header_offset = 0;
+    // uTP peers don't need a recv SQE -- data arrives via deliverUtpData
 }
 
 /// Send a BEP 10 extension handshake over uTP.
@@ -474,7 +606,8 @@ pub fn findPeerByUtpSlot(self: *const EventLoop, utp_slot: u16) ?u16 {
     return null;
 }
 
-/// Process uTP timeouts for all active connections.
+/// Process uTP timeouts for all active connections. Retransmits packets
+/// that have timed out and closes connections that have backed off too much.
 pub fn utpTick(self: *EventLoop) void {
     const mgr = self.utp_manager orelse return;
     const now_us = utpNowUs();
@@ -482,11 +615,9 @@ pub fn utpTick(self: *EventLoop) void {
     var timeout_buf: [64]u16 = undefined;
     const timeout_count = mgr.checkTimeouts(now_us, &timeout_buf);
 
-    // For timed-out connections, we could retransmit or close.
-    // For now, close connections that have timed out.
+    // Close connections that have backed off too much.
     for (timeout_buf[0..timeout_count]) |utp_slot| {
         const sock = mgr.getSocket(utp_slot) orelse continue;
-        // If the socket has backed off too much, close it
         if (sock.rto >= 30_000_000) { // 30 seconds
             if (mgr.reset(utp_slot, now_us)) |rst| {
                 if (mgr.getRemoteAddress(utp_slot)) |remote| {
@@ -498,6 +629,13 @@ pub fn utpTick(self: *EventLoop) void {
                 self.removePeer(peer_slot);
             }
         }
+    }
+
+    // Collect and retransmit packets marked for resend.
+    var retransmit_buf: [32]utp_mgr.RetransmitResult = undefined;
+    const retransmit_count = mgr.collectRetransmits(now_us, &retransmit_buf);
+    for (retransmit_buf[0..retransmit_count]) |entry| {
+        utpSendPacket(self, entry.data, entry.remote);
     }
 }
 
