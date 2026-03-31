@@ -42,11 +42,12 @@ Update it whenever a milestone lands, the near-term backlog changes, or a new op
 
 ### API (qBittorrent v2 compatible)
 - **Auth**: login/logout with session cookies (SID), 1-hour timeout, configurable credentials.
-- **Core**: webapiVersion, preferences, setPreferences, transfer/info.
-- **Torrents**: info, add (multipart + raw), delete, pause, resume, properties, files, trackers.
+- **Core**: webapiVersion, version, buildInfo, preferences (40+ fields), setPreferences (form + JSON), transfer/info (with connection_status, dht_nodes), speedLimitsMode.
+- **Torrents**: info (35+ fields matching qui Torrent interface), add (multipart + raw), delete, pause, resume, properties (25+ fields), files (with index, availability, piece_range), trackers (with msg field).
 - **Controls**: filePrio, setSequentialDownload, setDownloadLimit, setUploadLimit, downloadLimit, uploadLimit, forceReannounce, recheck.
 - **Categories & Tags**: categories (create/edit/remove/list/setCategory), tags (create/delete/addTags/removeTags/list).
-- **Sync**: /api/v2/sync/maindata delta protocol (rid-based, Wyhash change detection, 100-snapshot circular buffer).
+- **Sync**: /api/v2/sync/maindata delta protocol (rid-based, Wyhash change detection, 100-snapshot circular buffer), sync/torrentPeers stub.
+- **Compatibility**: qBittorrent state strings (downloading/uploading/pausedDL/pausedUP/etc), CORS headers on all responses, OPTIONS preflight handler. Validated against qui (autobrr/qui) TypeScript interfaces.
 - **Multipart form-data**: zero-copy parser for Flood/WebUI torrent uploads.
 - **varuna-ctl**: list, add (--save-path), pause, resume, delete, version, stats, speed limits (set/get), --username/--password auth.
 
@@ -95,7 +96,7 @@ Update it whenever a milestone lands, the near-term backlog changes, or a new op
 - **MSE encryption (BEP 6)**: message stream encryption/obfuscation (deferred).
 
 ### Operational
-- **Flood/qui WebUI validation**: test against real Flood or qui instance to find API gaps.
+- **Flood/qui WebUI validation**: populate remaining stub fields (tracker URL, trackers_count, piece_range, content_path for multi-file, magnet_uri), add real peer data to torrentPeers endpoint.
 - **systemd socket activation**: fd inheritance from systemd.
 - **Torrent data relocation**: move completed downloads to a different path via API.
 
@@ -106,8 +107,6 @@ Update it whenever a milestone lands, the near-term backlog changes, or a new op
 
 ## Last Verified Milestone
 
-- Working tree bugfix pass: shared-event-loop lifetime, seed read/response correctness, RPC accessor safety, API partial-send handling
-- Transfer test matrix: 24/24 pass
+- qui API compatibility audit: qBittorrent state strings, 25+ missing torrent fields, CORS headers, expanded preferences/properties/files/trackers, new endpoints (version/buildInfo/torrentPeers)
 - `zig build test`: all tests pass
 - `zig build`: clean build
-- `scripts/demo_swarm.sh`: standalone swarm passes

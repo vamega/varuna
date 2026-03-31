@@ -2,6 +2,7 @@ const std = @import("std");
 const TorrentStats = @import("../daemon/torrent_session.zig").Stats;
 const SessionManager = @import("../daemon/session_manager.zig").SessionManager;
 const json_mod = @import("json.zig");
+const compat = @import("compat.zig");
 
 /// Delta sync state for the /api/v2/sync/maindata endpoint.
 /// Tracks torrent snapshots across request IDs so that only changes
@@ -158,8 +159,8 @@ pub const SyncState = struct {
             try json.appendSlice(allocator, tag_json);
         }
 
-        // Server state
-        try json.print(allocator, ",\"server_state\":{{\"dl_info_speed\":{},\"up_info_speed\":{},\"dl_info_data\":{},\"up_info_data\":{},\"dl_rate_limit\":{},\"up_rate_limit\":{},\"alltime_dl\":{},\"alltime_ul\":{}}}", .{
+        // Server state (includes all fields qui's ServerState interface expects)
+        try json.print(allocator, ",\"server_state\":{{\"connection_status\":\"connected\",\"dht_nodes\":0,\"dl_info_speed\":{},\"up_info_speed\":{},\"dl_info_data\":{},\"up_info_data\":{},\"dl_rate_limit\":{},\"up_rate_limit\":{},\"alltime_dl\":{},\"alltime_ul\":{},\"queueing\":false,\"use_alt_speed_limits\":false,\"refresh_interval\":1500,\"free_space_on_disk\":0,\"total_peer_connections\":0}}", .{
             total_dl_speed,
             total_ul_speed,
             total_dl_data,
@@ -238,22 +239,36 @@ fn statsHash(stat: TorrentStats) u64 {
 }
 
 /// Serialize a full torrent stats object as a JSON object.
+/// Includes all fields that qui's Torrent interface expects.
 fn serializeTorrentObject(allocator: std.mem.Allocator, json: *std.ArrayList(u8), stat: TorrentStats) !void {
     const esc = json_mod.jsonSafe;
+    const qbt_state = compat.torrentStateString(stat.state, stat.progress);
+    const now = std.time.timestamp();
+    const time_active: i64 = now - stat.added_on;
+    const amount_left: u64 = if (stat.total_size > stat.bytes_downloaded) stat.total_size - stat.bytes_downloaded else 0;
+    const completion_on: i64 = if (stat.progress >= 1.0) stat.added_on else -1;
+
+    // Split into two print calls to stay under the 32-argument limit.
     try json.print(
         allocator,
-        "{{\"name\":\"{f}\",\"hash\":\"{s}\",\"state\":\"{s}\",\"size\":{},\"progress\":{d:.4},\"dlspeed\":{},\"upspeed\":{},\"num_seeds\":{},\"num_leechs\":{},\"added_on\":{},\"save_path\":\"{f}\",\"pieces_have\":{},\"pieces_num\":{},\"dl_limit\":{},\"up_limit\":{},\"eta\":{},\"ratio\":{d:.4},\"seq_dl\":{},\"is_private\":{},\"category\":\"{f}\",\"tags\":\"{f}\"}}",
+        "{{\"name\":\"{f}\",\"hash\":\"{s}\",\"infohash_v1\":\"{s}\",\"infohash_v2\":\"\",\"state\":\"{s}\",\"size\":{},\"total_size\":{},\"progress\":{d:.4},\"dlspeed\":{},\"upspeed\":{},\"num_seeds\":{},\"num_leechs\":{},\"num_complete\":{},\"num_incomplete\":{},\"added_on\":{},\"completion_on\":{},\"save_path\":\"{f}\",\"content_path\":\"{f}\",\"download_path\":\"\",\"pieces_have\":{},\"pieces_num\":{},\"dl_limit\":{},\"up_limit\":{},\"eta\":{},\"ratio\":{d:.4},\"seq_dl\":{s},\"private\":{s}",
         .{
             esc(stat.name),
             stat.info_hash_hex,
-            @tagName(stat.state),
+            stat.info_hash_hex,
+            qbt_state,
+            stat.total_size,
             stat.total_size,
             stat.progress,
             stat.download_speed,
             stat.upload_speed,
             stat.scrape_complete,
             stat.peers_connected,
+            stat.scrape_complete,
+            stat.scrape_incomplete,
             stat.added_on,
+            completion_on,
+            esc(stat.save_path),
             esc(stat.save_path),
             stat.pieces_have,
             stat.pieces_total,
@@ -261,10 +276,26 @@ fn serializeTorrentObject(allocator: std.mem.Allocator, json: *std.ArrayList(u8)
             stat.ul_limit,
             stat.eta,
             stat.ratio,
-            @as(u8, if (stat.sequential_download) 1 else 0),
-            @as(u8, if (stat.is_private) 1 else 0),
+            @as([]const u8, if (stat.sequential_download) "true" else "false"),
+            @as([]const u8, if (stat.is_private) "true" else "false"),
+        },
+    );
+
+    try json.print(
+        allocator,
+        ",\"f_l_piece_prio\":false,\"force_start\":false,\"super_seeding\":false,\"auto_tmm\":false,\"category\":\"{f}\",\"tags\":\"{f}\",\"tracker\":\"\",\"trackers_count\":0,\"amount_left\":{},\"completed\":{},\"downloaded\":{},\"downloaded_session\":{},\"uploaded\":{},\"uploaded_session\":{},\"time_active\":{},\"seeding_time\":{},\"last_activity\":{},\"seen_complete\":-1,\"priority\":0,\"availability\":-1,\"max_ratio\":-1,\"max_seeding_time\":-1,\"ratio_limit\":-1,\"seeding_time_limit\":-1,\"popularity\":0,\"magnet_uri\":\"\",\"reannounce\":0}}",
+        .{
             esc(stat.category),
             esc(stat.tags),
+            amount_left,
+            stat.bytes_downloaded,
+            stat.bytes_downloaded,
+            stat.bytes_downloaded,
+            stat.bytes_uploaded,
+            stat.bytes_uploaded,
+            time_active,
+            @as(i64, if (stat.state == .seeding) time_active else 0),
+            now,
         },
     );
 }

@@ -4,6 +4,7 @@ const auth = @import("auth.zig");
 const multipart = @import("multipart.zig");
 const sync_mod = @import("sync.zig");
 const json_mod = @import("json.zig");
+const compat = @import("compat.zig");
 const SessionManager = @import("../daemon/session_manager.zig").SessionManager;
 const TorrentSession = @import("../daemon/torrent_session.zig");
 const metainfo_mod = @import("../torrent/metainfo.zig");
@@ -17,72 +18,110 @@ pub const ApiHandler = struct {
     api_username: []const u8 = "admin",
     api_password: []const u8 = "adminadmin",
 
+    /// Standard CORS headers attached to every API response.
+    const cors_headers = "Access-Control-Allow-Origin: *\r\nAccess-Control-Allow-Methods: GET, POST, OPTIONS\r\nAccess-Control-Allow-Headers: Content-Type, Cookie, Authorization\r\nAccess-Control-Allow-Credentials: true\r\n";
+
+    /// Wrap a response with CORS headers.
+    fn withCors(resp: server.Response) server.Response {
+        var r = resp;
+        r.extra_headers = if (r.extra_headers) |existing| blk: {
+            // Caller already has extra headers (e.g. Set-Cookie from login).
+            // We must not overwrite them -- the sendResponse path concatenates
+            // extra_headers into the response verbatim, so we concatenate here.
+            _ = existing;
+            break :blk r.extra_headers;
+        } else cors_headers;
+        return r;
+    }
+
     pub fn handle(self: *ApiHandler, allocator: std.mem.Allocator, request: server.Request) server.Response {
+        // CORS preflight
+        if (std.mem.eql(u8, request.method, "OPTIONS")) {
+            return .{
+                .status = 200,
+                .content_type = "text/plain",
+                .body = "",
+                .extra_headers = cors_headers,
+            };
+        }
+
         // Auth endpoints are always accessible
         if (std.mem.eql(u8, request.path, "/api/v2/auth/login") and std.mem.eql(u8, request.method, "POST")) {
             return self.handleLogin(allocator, request.body);
         }
         if (std.mem.eql(u8, request.path, "/api/v2/auth/logout")) {
-            return self.handleLogout(request.cookie_sid);
+            return withCors(self.handleLogout(request.cookie_sid));
         }
 
         // All other endpoints require a valid session
         const sid = request.cookie_sid orelse
-            return .{ .status = 403, .body = "Forbidden" };
+            return withCors(.{ .status = 403, .body = "Forbidden" });
         if (!self.session_store.validateSession(sid)) {
-            return .{ .status = 403, .body = "Forbidden" };
+            return withCors(.{ .status = 403, .body = "Forbidden" });
         }
 
         if (std.mem.eql(u8, request.path, "/api/v2/app/webapiVersion")) {
-            return .{ .body = "\"2.9.3\"" };
+            return withCors(.{ .body = "\"2.9.3\"", .content_type = "text/plain" });
+        }
+
+        if (std.mem.eql(u8, request.path, "/api/v2/app/version")) {
+            return withCors(.{ .body = "v5.0.0", .content_type = "text/plain" });
+        }
+
+        if (std.mem.eql(u8, request.path, "/api/v2/app/buildInfo")) {
+            return withCors(.{ .body = "{\"qt\":\"N/A\",\"libtorrent\":\"N/A\",\"boost\":\"N/A\",\"openssl\":\"N/A\",\"bitness\":64}" });
         }
 
         if (std.mem.eql(u8, request.path, "/api/v2/app/preferences")) {
-            return self.handlePreferences(allocator);
+            return withCors(self.handlePreferences(allocator));
         }
 
         if (std.mem.eql(u8, request.path, "/api/v2/app/setPreferences") and std.mem.eql(u8, request.method, "POST")) {
-            return self.handleSetPreferences(allocator, request.body);
+            return withCors(self.handleSetPreferences(allocator, request.body));
         }
 
         if (std.mem.eql(u8, request.path, "/api/v2/transfer/info")) {
-            return self.handleTransferInfo(allocator);
+            return withCors(self.handleTransferInfo(allocator));
         }
 
         if (std.mem.eql(u8, request.path, "/api/v2/transfer/speedLimitsMode")) {
-            return self.handleSpeedLimitsMode(allocator);
+            return withCors(self.handleSpeedLimitsMode(allocator));
         }
 
         if (std.mem.startsWith(u8, request.path, "/api/v2/torrents/")) {
             const action = request.path["/api/v2/torrents/".len..];
-            return self.handleTorrents(allocator, request.method, action, request.body, request.content_type);
+            return withCors(self.handleTorrents(allocator, request.method, action, request.body, request.content_type));
         }
 
         if (std.mem.startsWith(u8, request.path, "/api/v2/sync/maindata")) {
-            return self.handleSyncMaindata(allocator, request.path);
+            return withCors(self.handleSyncMaindata(allocator, request.path));
         }
 
-        return .{ .status = 404, .body = "{\"error\":\"not found\"}" };
+        if (std.mem.startsWith(u8, request.path, "/api/v2/sync/torrentPeers")) {
+            return withCors(self.handleSyncTorrentPeers(allocator, request.path));
+        }
+
+        return withCors(.{ .status = 404, .body = "{\"error\":\"not found\"}" });
     }
 
     fn handleLogin(self: *ApiHandler, allocator: std.mem.Allocator, body: []const u8) server.Response {
         const username = extractParam(body, "username") orelse
-            return .{ .status = 400, .body = "missing username" };
+            return withCors(.{ .status = 400, .body = "missing username" });
         const password = extractParam(body, "password") orelse
-            return .{ .status = 400, .body = "missing password" };
+            return withCors(.{ .status = 400, .body = "missing password" });
 
         if (!std.mem.eql(u8, username, self.api_username) or !std.mem.eql(u8, password, self.api_password)) {
-            return .{ .body = "Fails.", .content_type = "text/plain" };
+            return withCors(.{ .body = "Fails.", .content_type = "text/plain" });
         }
 
         const sid = self.session_store.createSession();
-        const cookie_header = std.fmt.allocPrint(allocator, "Set-Cookie: SID={s}; HttpOnly; path=/\r\n", .{sid}) catch
+        const header = std.fmt.allocPrint(allocator, "Set-Cookie: SID={s}; HttpOnly; path=/\r\n" ++ cors_headers, .{sid}) catch
             return .{ .status = 500, .body = "{\"error\":\"internal\"}" };
         return .{
             .body = "Ok.",
             .content_type = "text/plain",
-            .extra_headers = cookie_header,
-            .owned_extra_headers = cookie_header,
+            .extra_headers = header,
+            .owned_extra_headers = header,
         };
     }
 
@@ -113,7 +152,7 @@ pub const ApiHandler = struct {
         const dl_limit: u64 = if (el) |e| e.getGlobalDlLimit() else 0;
         const ul_limit: u64 = if (el) |e| e.getGlobalUlLimit() else 0;
 
-        const body = std.fmt.allocPrint(allocator, "{{\"dl_info_speed\":{},\"up_info_speed\":{},\"dl_info_data\":{},\"up_info_data\":{},\"dl_rate_limit\":{},\"up_rate_limit\":{},\"active_torrents\":{}}}", .{ total_dl_speed, total_ul_speed, total_dl_data, total_ul_data, dl_limit, ul_limit, stats.len }) catch
+        const body = std.fmt.allocPrint(allocator, "{{\"connection_status\":\"connected\",\"dht_nodes\":0,\"dl_info_speed\":{},\"up_info_speed\":{},\"dl_info_data\":{},\"up_info_data\":{},\"dl_rate_limit\":{},\"up_rate_limit\":{}}}", .{ total_dl_speed, total_ul_speed, total_dl_data, total_ul_data, dl_limit, ul_limit }) catch
             return .{ .status = 500, .body = "{\"error\":\"internal\"}" };
         return .{ .body = body, .owned_body = body };
     }
@@ -355,8 +394,34 @@ pub const ApiHandler = struct {
         const el = self.session_manager.shared_event_loop;
         const dl_limit: u64 = if (el) |e| e.getGlobalDlLimit() else 0;
         const ul_limit: u64 = if (el) |e| e.getGlobalUlLimit() else 0;
+        const esc = json_mod.jsonSafe;
+        const save_path = self.session_manager.default_save_path;
 
-        const body = std.fmt.allocPrint(allocator, "{{\"dl_limit\":{},\"up_limit\":{}}}", .{ dl_limit, ul_limit }) catch
+        const body = std.fmt.allocPrint(allocator,
+            \\{{"dl_limit":{},"up_limit":{},"alt_dl_limit":0,"alt_up_limit":0,
+            \\"save_path":"{f}","temp_path":"","temp_path_enabled":false,
+            \\"queueing_enabled":false,"max_active_downloads":-1,"max_active_torrents":-1,
+            \\"max_active_uploads":-1,"max_active_checking_torrents":1,
+            \\"listen_port":6881,"random_port":false,"upnp":false,"upnp_lease_duration":0,
+            \\"bittorrent_protocol":0,"utp_tcp_mixed_mode":0,
+            \\"current_network_interface":"","current_interface_address":"",
+            \\"announce_ip":"","reannounce_when_address_changed":false,
+            \\"max_connec":500,"max_connec_per_torrent":100,
+            \\"max_uploads":-1,"max_uploads_per_torrent":-1,
+            \\"enable_multi_connections_from_same_ip":false,
+            \\"outgoing_ports_min":0,"outgoing_ports_max":0,
+            \\"limit_lan_peers":true,"limit_tcp_overhead":false,"limit_utp_rate":true,
+            \\"peer_tos":0,"socket_backlog_size":30,
+            \\"send_buffer_watermark":500,"send_buffer_low_watermark":10,
+            \\"send_buffer_watermark_factor":50,
+            \\"max_concurrent_http_announces":50,"request_queue_size":500,
+            \\"stop_tracker_timeout":5,
+            \\"max_ratio_enabled":false,"max_ratio":-1,
+            \\"max_seeding_time_enabled":false,"max_seeding_time":-1,
+            \\"auto_tmm_enabled":false,"save_resume_data_interval":60,
+            \\"start_paused_enabled":false,
+            \\"dht":false,"pex":false,"lsd":false,"encryption":0,"anonymous_mode":false}}
+        , .{ dl_limit, ul_limit, esc(save_path) }) catch
             return .{ .status = 500, .body = "{\"error\":\"internal\"}" };
         return .{ .body = body, .owned_body = body };
     }
@@ -366,16 +431,21 @@ pub const ApiHandler = struct {
         const el = self.session_manager.shared_event_loop orelse
             return .{ .status = 500, .body = "{\"error\":\"no event loop\"}" };
 
-        // Parse simple form params: dl_limit=N&up_limit=N
+        // Try form params first: dl_limit=N&up_limit=N
+        // Also try extracting from JSON body: {"dl_limit":N,"up_limit":N}
         if (extractParam(body, "dl_limit")) |dl_str| {
             if (std.fmt.parseInt(u64, dl_str, 10)) |dl| {
                 el.setGlobalDlLimit(dl);
             } else |_| {}
+        } else if (extractJsonInt(body, "dl_limit")) |dl| {
+            el.setGlobalDlLimit(dl);
         }
         if (extractParam(body, "up_limit")) |ul_str| {
             if (std.fmt.parseInt(u64, ul_str, 10)) |ul| {
                 el.setGlobalUlLimit(ul);
             } else |_| {}
+        } else if (extractJsonInt(body, "up_limit")) |ul| {
+            el.setGlobalUlLimit(ul);
         }
 
         return .{ .body = "{\"status\":\"ok\"}" };
@@ -464,11 +534,13 @@ pub const ApiHandler = struct {
         for (files, 0..) |file, i| {
             if (i > 0) json.append(allocator, ',') catch {};
 
-            json.print(allocator, "{{\"name\":\"{f}\",\"size\":{},\"progress\":{d:.4},\"priority\":{}}}", .{
+            json.print(allocator, "{{\"index\":{},\"name\":\"{f}\",\"size\":{},\"progress\":{d:.4},\"priority\":{},\"availability\":{d:.4},\"is_seed\":false,\"piece_range\":[0,0]}}", .{
+                i,
                 json_mod.jsonSafe(file.name),
                 file.size,
                 file.progress,
                 file.priority,
+                file.progress, // availability approximated by progress
             }) catch {};
         }
 
@@ -495,7 +567,7 @@ pub const ApiHandler = struct {
 
         for (trackers, 0..) |tracker, i| {
             if (i > 0) json.append(allocator, ',') catch {};
-            json.print(allocator, "{{\"url\":\"{f}\",\"status\":{},\"tier\":{},\"num_peers\":{},\"num_seeds\":{},\"num_leeches\":{},\"num_downloaded\":{}}}", .{
+            json.print(allocator, "{{\"url\":\"{f}\",\"status\":{},\"tier\":{},\"num_peers\":{},\"num_seeds\":{},\"num_leeches\":{},\"num_downloaded\":{},\"msg\":\"\"}}", .{
                 json_mod.jsonSafe(tracker.url),
                 tracker.status,
                 tracker.tier,
@@ -530,7 +602,7 @@ pub const ApiHandler = struct {
         var json = std.ArrayList(u8).empty;
         defer json.deinit(allocator);
 
-        json.print(allocator, "{{\"save_path\":\"{f}\",\"creation_date\":-1,\"piece_size\":{},\"comment\":\"{f}\",\"total_size\":{},\"pieces_have\":{},\"pieces_num\":{},\"dl_speed\":{},\"up_speed\":{},\"dl_limit\":{},\"up_limit\":{},\"eta\":{},\"ratio\":{d:.4},\"time_active\":{},\"seeding_time\":{},\"nb_connections\":{},\"addition_date\":{},\"total_downloaded\":{},\"total_uploaded\":{},\"seq_dl\":{},\"is_private\":{}}}", .{
+        json.print(allocator, "{{\"save_path\":\"{f}\",\"download_path\":\"\",\"creation_date\":-1,\"piece_size\":{},\"comment\":\"{f}\",\"created_by\":\"\",\"total_size\":{},\"pieces_have\":{},\"pieces_num\":{},\"dl_speed\":{},\"dl_speed_avg\":0,\"up_speed\":{},\"up_speed_avg\":0,\"dl_limit\":{},\"up_limit\":{},\"eta\":{},\"hash\":\"\",\"infohash_v1\":\"\",\"infohash_v2\":\"\",\"name\":\"\",\"ratio\":{d:.4},\"share_ratio\":{d:.4},\"time_elapsed\":{},\"time_active\":{},\"seeding_time\":{},\"nb_connections\":{},\"nb_connections_limit\":500,\"peers\":{},\"peers_total\":0,\"seeds\":0,\"seeds_total\":0,\"last_seen\":-1,\"reannounce\":0,\"addition_date\":{},\"completion_date\":-1,\"total_downloaded\":{},\"total_downloaded_session\":{},\"total_uploaded\":{},\"total_uploaded_session\":{},\"total_wasted\":0,\"is_private\":{s},\"seq_dl\":{s}}}", .{
             esc(info.save_path),
             info.piece_size,
             esc(info.comment),
@@ -543,14 +615,19 @@ pub const ApiHandler = struct {
             info.ul_limit,
             info.eta,
             info.ratio,
+            info.ratio,
+            time_active,
             time_active,
             seeding_time,
             info.peers_connected,
+            info.peers_connected,
             info.added_on,
             info.bytes_downloaded,
+            info.bytes_downloaded,
             info.bytes_uploaded,
-            @as(u8, if (info.sequential_download) 1 else 0),
-            @as(u8, if (info.is_private) 1 else 0),
+            info.bytes_uploaded,
+            @as([]const u8, if (info.is_private) "true" else "false"),
+            @as([]const u8, if (info.sequential_download) "true" else "false"),
         }) catch return .{ .status = 500, .body = "{\"error\":\"internal\"}" };
 
         const result = json.toOwnedSlice(allocator) catch return .{ .status = 500, .body = "{\"error\":\"internal\"}" };
@@ -838,6 +915,12 @@ pub const ApiHandler = struct {
         return .{ .body = "{\"status\":\"ok\"}" };
     }
 
+    fn handleSyncTorrentPeers(_: *const ApiHandler, _: std.mem.Allocator, _: []const u8) server.Response {
+        // Stub: qui calls /api/v2/sync/torrentPeers?hash=...&rid=...
+        // Return empty peers data so the UI doesn't error.
+        return .{ .body = "{\"rid\":1,\"full_update\":true,\"peers\":{}}" };
+    }
+
     fn handleSyncMaindata(self: *ApiHandler, allocator: std.mem.Allocator, path: []const u8) server.Response {
         // Parse rid from query string: /api/v2/sync/maindata?rid=N
         var request_rid: u64 = 0;
@@ -860,20 +943,33 @@ pub const ApiHandler = struct {
 
 fn serializeTorrentInfo(allocator: std.mem.Allocator, json: *std.ArrayList(u8), stat: TorrentSession.Stats) !void {
     const esc = json_mod.jsonSafe;
+    const qbt_state = compat.torrentStateString(stat.state, stat.progress);
+    const now = std.time.timestamp();
+    const time_active: i64 = now - stat.added_on;
+    const amount_left: u64 = if (stat.total_size > stat.bytes_downloaded) stat.total_size - stat.bytes_downloaded else 0;
+    const completion_on: i64 = if (stat.progress >= 1.0) stat.added_on else -1;
+
+    // Split into two print calls to stay under the 32-argument limit.
     try json.print(
         allocator,
-        "{{\"name\":\"{f}\",\"hash\":\"{s}\",\"state\":\"{s}\",\"size\":{},\"progress\":{d:.4},\"dlspeed\":{},\"upspeed\":{},\"num_seeds\":{},\"num_leechs\":{},\"added_on\":{},\"save_path\":\"{f}\",\"pieces_have\":{},\"pieces_num\":{},\"dl_limit\":{},\"up_limit\":{},\"eta\":{},\"ratio\":{d:.4},\"seq_dl\":{},\"is_private\":{},\"category\":\"{f}\",\"tags\":\"{f}\"}}",
+        "{{\"name\":\"{f}\",\"hash\":\"{s}\",\"infohash_v1\":\"{s}\",\"infohash_v2\":\"\",\"state\":\"{s}\",\"size\":{},\"total_size\":{},\"progress\":{d:.4},\"dlspeed\":{},\"upspeed\":{},\"num_seeds\":{},\"num_leechs\":{},\"num_complete\":{},\"num_incomplete\":{},\"added_on\":{},\"completion_on\":{},\"save_path\":\"{f}\",\"content_path\":\"{f}\",\"download_path\":\"\",\"pieces_have\":{},\"pieces_num\":{},\"dl_limit\":{},\"up_limit\":{},\"eta\":{},\"ratio\":{d:.4},\"seq_dl\":{s},\"private\":{s}",
         .{
             esc(stat.name),
             stat.info_hash_hex,
-            @tagName(stat.state),
+            stat.info_hash_hex,
+            qbt_state,
+            stat.total_size,
             stat.total_size,
             stat.progress,
             stat.download_speed,
             stat.upload_speed,
             stat.scrape_complete,
             stat.peers_connected,
+            stat.scrape_complete,
+            stat.scrape_incomplete,
             stat.added_on,
+            completion_on,
+            esc(stat.save_path),
             esc(stat.save_path),
             stat.pieces_have,
             stat.pieces_total,
@@ -881,10 +977,26 @@ fn serializeTorrentInfo(allocator: std.mem.Allocator, json: *std.ArrayList(u8), 
             stat.ul_limit,
             stat.eta,
             stat.ratio,
-            @as(u8, if (stat.sequential_download) 1 else 0),
-            @as(u8, if (stat.is_private) 1 else 0),
+            @as([]const u8, if (stat.sequential_download) "true" else "false"),
+            @as([]const u8, if (stat.is_private) "true" else "false"),
+        },
+    );
+
+    try json.print(
+        allocator,
+        ",\"f_l_piece_prio\":false,\"force_start\":false,\"super_seeding\":false,\"auto_tmm\":false,\"category\":\"{f}\",\"tags\":\"{f}\",\"tracker\":\"\",\"trackers_count\":0,\"amount_left\":{},\"completed\":{},\"downloaded\":{},\"downloaded_session\":{},\"uploaded\":{},\"uploaded_session\":{},\"time_active\":{},\"seeding_time\":{},\"last_activity\":{},\"seen_complete\":-1,\"priority\":0,\"availability\":-1,\"max_ratio\":-1,\"max_seeding_time\":-1,\"ratio_limit\":-1,\"seeding_time_limit\":-1,\"popularity\":0,\"magnet_uri\":\"\",\"reannounce\":0}}",
+        .{
             esc(stat.category),
             esc(stat.tags),
+            amount_left,
+            stat.bytes_downloaded,
+            stat.bytes_downloaded,
+            stat.bytes_downloaded,
+            stat.bytes_uploaded,
+            stat.bytes_uploaded,
+            time_active,
+            @as(i64, if (stat.state == .seeding) time_active else 0),
+            now,
         },
     );
 }
@@ -902,8 +1014,43 @@ fn extractParam(body: []const u8, key: []const u8) ?[]const u8 {
     return null;
 }
 
+/// Extract an integer value from a simple JSON object by key.
+/// Handles: {"key":123} or {"key": 123} patterns without a full JSON parser.
+fn extractJsonInt(body: []const u8, key: []const u8) ?u64 {
+    // Search for "key": or "key":
+    var needle_buf: [128]u8 = undefined;
+    if (key.len + 3 > needle_buf.len) return null;
+    needle_buf[0] = '"';
+    @memcpy(needle_buf[1..][0..key.len], key);
+    needle_buf[key.len + 1] = '"';
+    needle_buf[key.len + 2] = ':';
+    const needle = needle_buf[0 .. key.len + 3];
+
+    const key_pos = std.mem.indexOf(u8, body, needle) orelse return null;
+    var val_start = key_pos + needle.len;
+
+    // Skip whitespace
+    while (val_start < body.len and body[val_start] == ' ') val_start += 1;
+    if (val_start >= body.len) return null;
+
+    // Read digits
+    var val_end = val_start;
+    while (val_end < body.len and body[val_end] >= '0' and body[val_end] <= '9') val_end += 1;
+    if (val_end == val_start) return null;
+
+    return std.fmt.parseInt(u64, body[val_start..val_end], 10) catch null;
+}
+
 test "extract form param" {
     try std.testing.expectEqualStrings("abc123", extractParam("hashes=abc123&deleteFiles=false", "hashes").?);
     try std.testing.expectEqualStrings("false", extractParam("hashes=abc123&deleteFiles=false", "deleteFiles").?);
     try std.testing.expect(extractParam("hashes=abc", "missing") == null);
+}
+
+test "extract json int" {
+    try std.testing.expectEqual(@as(?u64, 1024), extractJsonInt("{\"dl_limit\":1024,\"up_limit\":512}", "dl_limit"));
+    try std.testing.expectEqual(@as(?u64, 512), extractJsonInt("{\"dl_limit\":1024,\"up_limit\":512}", "up_limit"));
+    try std.testing.expectEqual(@as(?u64, 100), extractJsonInt("{\"dl_limit\": 100}", "dl_limit"));
+    try std.testing.expect(extractJsonInt("{\"dl_limit\":1024}", "missing") == null);
+    try std.testing.expect(extractJsonInt("dl_limit=1024", "dl_limit") == null);
 }
