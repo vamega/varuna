@@ -106,6 +106,42 @@ pub fn build(b: *std.Build) void {
     test_step.dependOn(&run_mod_tests.step);
     test_step.dependOn(&run_daemon_tests.step);
 
+    // ── Hardening tests (adversarial peer, private tracker) ─
+    const adversarial_tests = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("tests/adversarial_peer_test.zig"),
+            .target = target,
+            .optimize = optimize,
+            .imports = &varuna_import,
+        }),
+    });
+    const run_adversarial_tests = b.addRunArtifact(adversarial_tests);
+    test_step.dependOn(&run_adversarial_tests.step);
+
+    const private_tracker_tests = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("tests/private_tracker_test.zig"),
+            .target = target,
+            .optimize = optimize,
+            .imports = &varuna_import,
+        }),
+    });
+    const run_private_tracker_tests = b.addRunArtifact(private_tracker_tests);
+    test_step.dependOn(&run_private_tracker_tests.step);
+
+    // ── Soak test (long-running resource leak detection) ──
+    const soak_exe = b.addExecutable(.{
+        .name = "varuna-soak-test",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("tests/soak_test.zig"),
+            .target = target,
+            .optimize = optimize,
+            .imports = &varuna_import,
+        }),
+    });
+    const soak_step = b.step("soak-test", "Run long-running soak test for resource leak detection");
+    soak_step.dependOn(&b.addRunArtifact(soak_exe).step);
+
     // ── Benchmarks ────────────────────────────────────────
     const bench_exe = b.addExecutable(.{
         .name = "varuna-bench",
