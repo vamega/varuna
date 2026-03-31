@@ -117,6 +117,22 @@ pub const ResumeDb = struct {
             return error.SqliteSchemaFailed;
         }
 
+        // Create rate_limits table for per-torrent speed limits
+        if (sqlite.sqlite3_exec(
+            d,
+            "CREATE TABLE IF NOT EXISTS rate_limits (" ++
+                "info_hash BLOB NOT NULL PRIMARY KEY, " ++
+                "dl_limit INTEGER NOT NULL DEFAULT 0, " ++
+                "ul_limit INTEGER NOT NULL DEFAULT 0" ++
+                ")",
+            null,
+            null,
+            null,
+        ) != sqlite.SQLITE_OK) {
+            _ = sqlite.sqlite3_close(d);
+            return error.SqliteSchemaFailed;
+        }
+
         // Create global_tags table (all known tags, independent of torrents)
         if (sqlite.sqlite3_exec(
             d,
@@ -495,6 +511,47 @@ pub const ResumeDb = struct {
         return result.toOwnedSlice(allocator);
     }
 
+    // ── Rate limit persistence ────────────────────────────
+
+    /// Save per-torrent rate limits (upsert). Both values are bytes/sec, 0 = unlimited.
+    pub fn saveRateLimits(self: *ResumeDb, info_hash: [20]u8, dl_limit: u64, ul_limit: u64) !void {
+        const stmt = try self.execOneShot(
+            "INSERT INTO rate_limits (info_hash, dl_limit, ul_limit) VALUES (?1, ?2, ?3) " ++
+                "ON CONFLICT(info_hash) DO UPDATE SET dl_limit = ?2, ul_limit = ?3",
+        );
+        _ = sqlite.sqlite3_bind_blob(stmt, 1, &info_hash, 20, sqlite.SQLITE_TRANSIENT);
+        _ = sqlite.sqlite3_bind_int64(stmt, 2, @intCast(dl_limit));
+        _ = sqlite.sqlite3_bind_int64(stmt, 3, @intCast(ul_limit));
+        try stepAndFinalize(stmt);
+    }
+
+    /// Load per-torrent rate limits. Returns (dl_limit, ul_limit) or (0, 0) if not set.
+    pub const RateLimits = struct {
+        dl_limit: u64 = 0,
+        ul_limit: u64 = 0,
+    };
+
+    pub fn loadRateLimits(self: *ResumeDb, info_hash: [20]u8) RateLimits {
+        const stmt = self.execOneShot("SELECT dl_limit, ul_limit FROM rate_limits WHERE info_hash = ?1") catch return .{};
+        defer _ = sqlite.sqlite3_finalize(stmt);
+        _ = sqlite.sqlite3_bind_blob(stmt, 1, &info_hash, 20, sqlite.SQLITE_TRANSIENT);
+
+        if (sqlite.sqlite3_step(stmt) == sqlite.SQLITE_ROW) {
+            return .{
+                .dl_limit = @intCast(sqlite.sqlite3_column_int64(stmt, 0)),
+                .ul_limit = @intCast(sqlite.sqlite3_column_int64(stmt, 1)),
+            };
+        }
+        return .{};
+    }
+
+    /// Clear rate limits for a torrent.
+    pub fn clearRateLimits(self: *ResumeDb, info_hash: [20]u8) !void {
+        const stmt = try self.execOneShot("DELETE FROM rate_limits WHERE info_hash = ?1");
+        _ = sqlite.sqlite3_bind_blob(stmt, 1, &info_hash, 20, sqlite.SQLITE_TRANSIENT);
+        try stepAndFinalize(stmt);
+    }
+
     /// Remove a tag from all torrents (used when deleting a global tag).
     pub fn removeTagFromTorrents(self: *ResumeDb, tag: []const u8) !void {
         const stmt = try self.execOneShot("DELETE FROM torrent_tags WHERE tag = ?1");
@@ -826,6 +883,38 @@ test "resume db clear category from torrents" {
     try std.testing.expect(cat_a == null);
     const cat_b = try db.loadTorrentCategory(allocator, hash_b);
     try std.testing.expect(cat_b == null);
+}
+
+test "resume db save and load rate limits" {
+    var db = ResumeDb.open(":memory:") catch return error.SkipZigTest;
+    defer db.close();
+
+    const info_hash = [_]u8{0xDD} ** 20;
+
+    // Initially empty -- should return zeros
+    const empty = db.loadRateLimits(info_hash);
+    try std.testing.expectEqual(@as(u64, 0), empty.dl_limit);
+    try std.testing.expectEqual(@as(u64, 0), empty.ul_limit);
+
+    // Save some limits
+    try db.saveRateLimits(info_hash, 1024000, 512000);
+
+    const loaded = db.loadRateLimits(info_hash);
+    try std.testing.expectEqual(@as(u64, 1024000), loaded.dl_limit);
+    try std.testing.expectEqual(@as(u64, 512000), loaded.ul_limit);
+
+    // Update (upsert)
+    try db.saveRateLimits(info_hash, 2048000, 0);
+
+    const updated = db.loadRateLimits(info_hash);
+    try std.testing.expectEqual(@as(u64, 2048000), updated.dl_limit);
+    try std.testing.expectEqual(@as(u64, 0), updated.ul_limit);
+
+    // Clear
+    try db.clearRateLimits(info_hash);
+    const cleared = db.loadRateLimits(info_hash);
+    try std.testing.expectEqual(@as(u64, 0), cleared.dl_limit);
+    try std.testing.expectEqual(@as(u64, 0), cleared.ul_limit);
 }
 
 test "resume db remove tag from all torrents" {

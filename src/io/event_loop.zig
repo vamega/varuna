@@ -605,6 +605,11 @@ pub const EventLoop = struct {
         return count;
     }
 
+    /// Return the current half-open (connecting) peer count.
+    pub fn halfOpenCount(self: *const EventLoop) u16 {
+        return @intCast(@min(self.half_open_count, std.math.maxInt(u16)));
+    }
+
     /// Get speed and total byte stats for a specific torrent.
     pub fn getSpeedStats(self: *const EventLoop, torrent_id: u8) SpeedStats {
         if (torrent_id >= max_torrents) return .{};

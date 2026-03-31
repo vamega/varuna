@@ -135,6 +135,12 @@ pub const TorrentSession = struct {
     /// Pre-computed comma-separated tags string for Stats serialization.
     tags_string: ?[]const u8 = null,
 
+    // Connection diagnostics (updated from event loop callbacks)
+    conn_attempts: u64 = 0,
+    conn_failures: u64 = 0,
+    conn_timeout_failures: u64 = 0,
+    conn_refused_failures: u64 = 0,
+
     // Scrape state
     scrape_result: ?tracker.scrape.ScrapeResult = null,
     last_scrape_time: i64 = 0,
@@ -285,7 +291,11 @@ pub const TorrentSession = struct {
 
         var added: u32 = 0;
         for (peers) |addr| {
-            _ = sel.addPeerForTorrent(addr, tid) catch continue;
+            self.conn_attempts += 1;
+            _ = sel.addPeerForTorrent(addr, tid) catch {
+                self.conn_failures += 1;
+                continue;
+            };
             added += 1;
         }
         return added > 0;
@@ -506,6 +516,13 @@ pub const TorrentSession = struct {
                 self.baseline_uploaded = transfer_stats.total_uploaded;
                 self.baseline_downloaded = transfer_stats.total_downloaded;
 
+                // Load persisted rate limits for this torrent
+                {
+                    const limits = self.resume_writer.?.db.loadRateLimits(session.metainfo.info_hash);
+                    if (limits.dl_limit > 0) self.dl_limit = limits.dl_limit;
+                    if (limits.ul_limit > 0) self.ul_limit = limits.ul_limit;
+                }
+
                 // Load persisted category and tags for this torrent
                 if (self.category == null) {
                     if (self.resume_writer.?.db.loadTorrentCategory(self.allocator, session.metainfo.info_hash)) |cat| {
@@ -681,7 +698,11 @@ pub const TorrentSession = struct {
         var peers_added: u32 = 0;
         for (announce_resp.peers) |peer| {
             if (peers_added >= self.max_peers) break;
-            _ = self.event_loop.?.addPeer(peer.address) catch continue;
+            self.conn_attempts += 1;
+            _ = self.event_loop.?.addPeer(peer.address) catch {
+                self.conn_failures += 1;
+                continue;
+            };
             peers_added += 1;
         }
 

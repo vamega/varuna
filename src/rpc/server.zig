@@ -23,6 +23,18 @@ pub const ApiServer = struct {
         return initWithDevice(allocator, bind_addr, port, null);
     }
 
+    /// Create an API server using a pre-existing listen socket (e.g. from
+    /// systemd socket activation). The caller retains ownership of the fd;
+    /// deinit() will close it.
+    pub fn initWithFd(allocator: std.mem.Allocator, listen_fd: posix.fd_t) !ApiServer {
+        const ring = try Ring.init(64);
+        return .{
+            .ring = ring,
+            .allocator = allocator,
+            .listen_fd = listen_fd,
+        };
+    }
+
     pub fn initWithDevice(allocator: std.mem.Allocator, bind_addr: []const u8, port: u16, bind_device: ?[]const u8) !ApiServer {
         const ring = try Ring.init(64);
         errdefer {
