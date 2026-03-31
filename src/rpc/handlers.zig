@@ -593,13 +593,15 @@ pub const ApiHandler = struct {
         for (files, 0..) |file, i| {
             if (i > 0) json.append(allocator, ',') catch {};
 
-            json.print(allocator, "{{\"index\":{},\"name\":\"{f}\",\"size\":{},\"progress\":{d:.4},\"priority\":{},\"availability\":{d:.4},\"is_seed\":false,\"piece_range\":[0,0]}}", .{
+            json.print(allocator, "{{\"index\":{},\"name\":\"{f}\",\"size\":{},\"progress\":{d:.4},\"priority\":{},\"availability\":{d:.4},\"is_seed\":false,\"piece_range\":[{},{}]}}", .{
                 i,
                 json_mod.jsonSafe(file.name),
                 file.size,
                 file.progress,
                 file.priority,
                 file.progress, // availability approximated by progress
+                file.first_piece,
+                file.last_piece,
             }) catch {};
         }
 
@@ -661,10 +663,12 @@ pub const ApiHandler = struct {
         var json = std.ArrayList(u8).empty;
         defer json.deinit(allocator);
 
-        json.print(allocator, "{{\"save_path\":\"{f}\",\"download_path\":\"\",\"creation_date\":-1,\"piece_size\":{},\"comment\":\"{f}\",\"created_by\":\"\",\"total_size\":{},\"pieces_have\":{},\"pieces_num\":{},\"dl_speed\":{},\"dl_speed_avg\":0,\"up_speed\":{},\"up_speed_avg\":0,\"dl_limit\":{},\"up_limit\":{},\"eta\":{},\"hash\":\"\",\"infohash_v1\":\"\",\"infohash_v2\":\"\",\"name\":\"\",\"ratio\":{d:.4},\"share_ratio\":{d:.4},\"time_elapsed\":{},\"time_active\":{},\"seeding_time\":{},\"nb_connections\":{},\"nb_connections_limit\":500,\"peers\":{},\"peers_total\":0,\"seeds\":0,\"seeds_total\":0,\"last_seen\":-1,\"reannounce\":0,\"addition_date\":{},\"completion_date\":-1,\"total_downloaded\":{},\"total_downloaded_session\":{},\"total_uploaded\":{},\"total_uploaded_session\":{},\"total_wasted\":0,\"is_private\":{s},\"seq_dl\":{s},\"super_seeding\":{}}}", .{
+        json.print(allocator, "{{\"save_path\":\"{f}\",\"download_path\":\"\",\"creation_date\":{},\"piece_size\":{},\"comment\":\"{f}\",\"created_by\":\"{f}\",\"total_size\":{},\"pieces_have\":{},\"pieces_num\":{},\"dl_speed\":{},\"dl_speed_avg\":0,\"up_speed\":{},\"up_speed_avg\":0,\"dl_limit\":{},\"up_limit\":{},\"eta\":{},\"hash\":\"{s}\",\"infohash_v1\":\"{s}\",\"infohash_v2\":\"\",\"name\":\"{f}\",\"ratio\":{d:.4},\"share_ratio\":{d:.4},\"time_elapsed\":{},\"time_active\":{},\"seeding_time\":{},\"nb_connections\":{},\"nb_connections_limit\":500,\"peers\":{},\"peers_total\":0,\"seeds\":0,\"seeds_total\":0,\"last_seen\":-1,\"reannounce\":0,\"addition_date\":{},\"completion_date\":-1,\"total_downloaded\":{},\"total_downloaded_session\":{},\"total_uploaded\":{},\"total_uploaded_session\":{},\"total_wasted\":0,\"is_private\":{s},\"seq_dl\":{s},\"super_seeding\":{}}}", .{
             esc(info.save_path),
+            info.creation_date,
             info.piece_size,
             esc(info.comment),
+            esc(info.created_by),
             info.total_size,
             info.pieces_have,
             info.pieces_total,
@@ -673,6 +677,9 @@ pub const ApiHandler = struct {
             info.dl_limit,
             info.ul_limit,
             info.eta,
+            info.info_hash_hex,
+            info.info_hash_hex,
+            esc(info.name),
             info.ratio,
             info.ratio,
             time_active,
@@ -1029,10 +1036,51 @@ pub const ApiHandler = struct {
         return .{ .body = "{\"status\":\"ok\"}" };
     }
 
-    fn handleSyncTorrentPeers(_: *const ApiHandler, _: std.mem.Allocator, _: []const u8) server.Response {
-        // Stub: qui calls /api/v2/sync/torrentPeers?hash=...&rid=...
-        // Return empty peers data so the UI doesn't error.
-        return .{ .body = "{\"rid\":1,\"full_update\":true,\"peers\":{}}" };
+    fn handleSyncTorrentPeers(self: *const ApiHandler, allocator: std.mem.Allocator, path: []const u8) server.Response {
+        // Parse hash from query string: /api/v2/sync/torrentPeers?hash=...&rid=...
+        var hash: ?[]const u8 = null;
+        if (std.mem.indexOf(u8, path, "?")) |q| {
+            const query = path[q + 1 ..];
+            hash = extractParam(query, "hash");
+        }
+
+        const hash_val = hash orelse
+            return .{ .body = "{\"rid\":1,\"full_update\":true,\"peers\":{}}" };
+
+        const peers = self.session_manager.getTorrentPeers(allocator, hash_val) catch
+            return .{ .body = "{\"rid\":1,\"full_update\":true,\"peers\":{}}" };
+        defer SessionManager.freePeerInfos(allocator, peers);
+
+        var json = std.ArrayList(u8).empty;
+        defer json.deinit(allocator);
+
+        json.appendSlice(allocator, "{\"rid\":1,\"full_update\":true,\"peers\":{") catch
+            return .{ .status = 500, .body = "{\"error\":\"internal\"}" };
+
+        const esc = json_mod.jsonSafe;
+
+        for (peers, 0..) |peer, i| {
+            if (i > 0) json.append(allocator, ',') catch {};
+            // Key is ip:port, value is peer object
+            json.print(allocator, "\"{f}\":{{\"client\":\"{f}\",\"connection\":\"\",\"country\":\"\",\"country_code\":\"\",\"dl_speed\":{},\"downloaded\":{},\"files\":\"\",\"flags\":\"{f}\",\"flags_desc\":\"\",\"ip\":\"{f}\",\"port\":{},\"progress\":{d:.4},\"relevance\":1,\"up_speed\":{},\"uploaded\":{}}}", .{
+                esc(peer.ip),
+                esc(peer.client),
+                peer.dl_speed,
+                peer.downloaded,
+                esc(peer.flags),
+                esc(peer.ip),
+                peer.port,
+                peer.progress,
+                peer.ul_speed,
+                peer.uploaded,
+            }) catch {};
+        }
+
+        json.appendSlice(allocator, "}}") catch {};
+
+        const body = json.toOwnedSlice(allocator) catch
+            return .{ .status = 500, .body = "{\"error\":\"internal\"}" };
+        return .{ .body = body, .owned_body = body };
     }
 
     fn handleSyncMaindata(self: *ApiHandler, allocator: std.mem.Allocator, path: []const u8) server.Response {
@@ -1063,6 +1111,14 @@ fn serializeTorrentInfo(allocator: std.mem.Allocator, json: *std.ArrayList(u8), 
     const amount_left: u64 = if (stat.total_size > stat.bytes_downloaded) stat.total_size - stat.bytes_downloaded else 0;
     const completion_on: i64 = if (stat.progress >= 1.0) stat.added_on else -1;
 
+    // Build content_path: save_path + "/" + name for the full path
+    const content_path = buildContentPath(allocator, stat.save_path, stat.name) catch stat.save_path;
+    defer if (content_path.ptr != stat.save_path.ptr) allocator.free(content_path);
+
+    // Build magnet URI: magnet:?xt=urn:btih:<hex>&dn=<name>&tr=<tracker>
+    const magnet_uri = buildMagnetUri(allocator, &stat.info_hash_hex, stat.name, stat.tracker) catch "";
+    defer if (magnet_uri.len > 0) allocator.free(magnet_uri);
+
     // Split into two print calls to stay under the 32-argument limit.
     try json.print(
         allocator,
@@ -1084,7 +1140,7 @@ fn serializeTorrentInfo(allocator: std.mem.Allocator, json: *std.ArrayList(u8), 
             stat.added_on,
             completion_on,
             esc(stat.save_path),
-            esc(stat.save_path),
+            esc(content_path),
             stat.pieces_have,
             stat.pieces_total,
             stat.dl_limit,
@@ -1098,10 +1154,13 @@ fn serializeTorrentInfo(allocator: std.mem.Allocator, json: *std.ArrayList(u8), 
 
     try json.print(
         allocator,
-        ",\"f_l_piece_prio\":false,\"force_start\":false,\"super_seeding\":false,\"auto_tmm\":false,\"category\":\"{f}\",\"tags\":\"{f}\",\"tracker\":\"\",\"trackers_count\":0,\"amount_left\":{},\"completed\":{},\"downloaded\":{},\"downloaded_session\":{},\"uploaded\":{},\"uploaded_session\":{},\"time_active\":{},\"seeding_time\":{},\"last_activity\":{},\"seen_complete\":-1,\"priority\":0,\"availability\":-1,\"max_ratio\":-1,\"max_seeding_time\":-1,\"ratio_limit\":-1,\"seeding_time_limit\":-1,\"popularity\":0,\"magnet_uri\":\"\",\"reannounce\":0}}",
+        ",\"f_l_piece_prio\":false,\"force_start\":false,\"super_seeding\":{s},\"auto_tmm\":false,\"category\":\"{f}\",\"tags\":\"{f}\",\"tracker\":\"{f}\",\"trackers_count\":{},\"amount_left\":{},\"completed\":{},\"downloaded\":{},\"downloaded_session\":{},\"uploaded\":{},\"uploaded_session\":{},\"time_active\":{},\"seeding_time\":{},\"last_activity\":{},\"seen_complete\":-1,\"priority\":0,\"availability\":-1,\"max_ratio\":-1,\"max_seeding_time\":-1,\"ratio_limit\":-1,\"seeding_time_limit\":-1,\"popularity\":0,\"magnet_uri\":\"{f}\",\"reannounce\":0}}",
         .{
+            @as([]const u8, if (stat.super_seeding) "true" else "false"),
             esc(stat.category),
             esc(stat.tags),
+            esc(stat.tracker),
+            stat.trackers_count,
             amount_left,
             stat.bytes_downloaded,
             stat.bytes_downloaded,
@@ -1111,9 +1170,14 @@ fn serializeTorrentInfo(allocator: std.mem.Allocator, json: *std.ArrayList(u8), 
             time_active,
             @as(i64, if (stat.state == .seeding) time_active else 0),
             now,
+            esc(magnet_uri),
         },
     );
 }
+
+// buildContentPath and buildMagnetUri are in compat.zig (shared with sync.zig).
+const buildContentPath = compat.buildContentPath;
+const buildMagnetUri = compat.buildMagnetUri;
 
 fn extractParam(body: []const u8, key: []const u8) ?[]const u8 {
     // Simple form-encoded parameter extraction: key=value&key2=value2

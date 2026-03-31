@@ -701,6 +701,8 @@ pub const SessionManager = struct {
         size: u64,
         progress: f64,
         priority: u8,
+        first_piece: u32,
+        last_piece: u32,
     };
 
     /// Free a FileInfo slice returned by getSessionFiles().
@@ -760,11 +762,19 @@ pub const SessionManager = struct {
             else
                 1;
 
+            // Piece range from layout (end_piece_exclusive - 1 = last piece index)
+            const last_piece: u32 = if (layout_file.end_piece_exclusive > layout_file.first_piece)
+                layout_file.end_piece_exclusive - 1
+            else
+                layout_file.first_piece;
+
             result[i] = .{
                 .name = name_buf,
                 .size = file.length,
                 .progress = file_progress,
                 .priority = priority,
+                .first_piece = layout_file.first_piece,
+                .last_piece = last_piece,
             };
             built += 1;
         }
@@ -875,12 +885,19 @@ pub const SessionManager = struct {
         save_path: []const u8, // owned, caller must free
         comment: []const u8, // owned, caller must free
         piece_size: u32,
+        info_hash_hex: [40]u8 = [_]u8{'0'} ** 40,
+        name: []const u8, // owned, caller must free
+        created_by: []const u8, // owned, caller must free
+        creation_date: i64,
+        trackers_count: u32,
     };
 
     /// Free a PropertiesInfo returned by getSessionProperties().
     pub fn freePropertiesInfo(allocator: std.mem.Allocator, info: PropertiesInfo) void {
         allocator.free(info.save_path);
         allocator.free(info.comment);
+        allocator.free(info.name);
+        allocator.free(info.created_by);
     }
 
     /// Return torrent properties, copying all data under the mutex.
@@ -890,8 +907,11 @@ pub const SessionManager = struct {
 
         const session = self.sessions.get(hash) orelse return error.TorrentNotFound;
         const stats = session.getStats();
-        const comment: []const u8 = if (session.session) |*sess| (sess.metainfo.comment orelse "") else "";
-        const piece_size: u32 = if (session.session) |*sess| sess.metainfo.piece_length else 0;
+        const meta_opt = if (session.session) |*sess| &sess.metainfo else null;
+        const comment: []const u8 = if (meta_opt) |m| (m.comment orelse "") else "";
+        const piece_size: u32 = if (meta_opt) |m| m.piece_length else 0;
+        const created_by: []const u8 = if (meta_opt) |m| (m.created_by orelse "") else "";
+        const name = stats.name;
 
         return .{
             .state = stats.state,
@@ -914,6 +934,11 @@ pub const SessionManager = struct {
             .save_path = try allocator.dupe(u8, stats.save_path),
             .comment = try allocator.dupe(u8, comment),
             .piece_size = piece_size,
+            .info_hash_hex = stats.info_hash_hex,
+            .name = try allocator.dupe(u8, name),
+            .created_by = try allocator.dupe(u8, created_by),
+            .creation_date = -1, // Not currently stored in metainfo
+            .trackers_count = stats.trackers_count,
         };
     }
 
@@ -929,6 +954,124 @@ pub const SessionManager = struct {
         if (self.shared_event_loop) |el| {
             el.setGlobalUlLimit(limit);
         }
+    }
+
+    /// Peer information returned by getTorrentPeers().
+    pub const PeerInfo = struct {
+        /// IP:port string, owned by caller.
+        ip: []const u8,
+        port: u16,
+        /// Peer client identification string (from peer ID convention).
+        client: []const u8,
+        /// Connection flags: D=downloading, U=uploading, d=interested, u=peer interested,
+        /// E=encrypted, X=extension protocol, I=incoming, O=outbound, u=uTP.
+        flags: []const u8,
+        dl_speed: u64,
+        ul_speed: u64,
+        downloaded: u64,
+        uploaded: u64,
+        /// Peer progress (0.0-1.0).
+        progress: f64,
+    };
+
+    pub fn freePeerInfos(allocator: std.mem.Allocator, infos: []const PeerInfo) void {
+        for (infos) |pi| {
+            allocator.free(pi.ip);
+            allocator.free(pi.client);
+            allocator.free(pi.flags);
+        }
+        allocator.free(infos);
+    }
+
+    /// Return peer info for a torrent, copying all data under the mutex.
+    pub fn getTorrentPeers(self: *SessionManager, allocator: std.mem.Allocator, hash: []const u8) ![]const PeerInfo {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+
+        const session = self.sessions.get(hash) orelse return error.TorrentNotFound;
+        // Get the event loop and torrent ID
+        const el: *EventLoop = session.shared_event_loop orelse
+            (if (session.event_loop) |*solo| solo else return try allocator.alloc(PeerInfo, 0));
+        const tid: u8 = session.torrent_id_in_shared orelse 0;
+
+        var result = std.ArrayList(PeerInfo).empty;
+        errdefer {
+            for (result.items) |pi| {
+                allocator.free(pi.ip);
+                allocator.free(pi.client);
+                allocator.free(pi.flags);
+            }
+            result.deinit(allocator);
+        }
+
+        for (el.peers) |*peer| {
+            if (peer.state == .free) continue;
+            if (peer.torrent_id != tid) continue;
+
+            // Format IP address
+            const ip_str = try std.fmt.allocPrint(allocator, "{any}", .{peer.address});
+            errdefer allocator.free(ip_str);
+
+            const port: u16 = peer.address.getPort();
+
+            // Build flags string
+            var flags_buf: [16]u8 = undefined;
+            var fpos: usize = 0;
+            if (!peer.peer_choking and peer.am_interested) {
+                flags_buf[fpos] = 'D';
+                fpos += 1;
+            }
+            if (!peer.am_choking and peer.peer_interested) {
+                flags_buf[fpos] = 'U';
+                fpos += 1;
+            }
+            if (peer.am_interested) {
+                flags_buf[fpos] = 'd';
+                fpos += 1;
+            }
+            if (peer.peer_interested) {
+                flags_buf[fpos] = 'u';
+                fpos += 1;
+            }
+            if (peer.crypto.isEncrypted()) {
+                flags_buf[fpos] = 'E';
+                fpos += 1;
+            }
+            if (peer.extensions_supported) {
+                flags_buf[fpos] = 'X';
+                fpos += 1;
+            }
+            if (peer.transport == .utp) {
+                flags_buf[fpos] = 'P'; // uTP protocol
+                fpos += 1;
+            }
+            const flags_str = try allocator.dupe(u8, flags_buf[0..fpos]);
+            errdefer allocator.free(flags_str);
+
+            // Peer progress from bitfield
+            const progress: f64 = if (peer.availability) |*bf| blk: {
+                const total_pieces = bf.piece_count;
+                if (total_pieces == 0) break :blk 0.0;
+                break :blk @as(f64, @floatFromInt(bf.count)) / @as(f64, @floatFromInt(total_pieces));
+            } else 0.0;
+
+            // Client ID from peer handshake (not stored in Peer struct, use empty)
+            const client_str = try allocator.dupe(u8, "");
+
+            try result.append(allocator, .{
+                .ip = ip_str,
+                .port = port,
+                .client = client_str,
+                .flags = flags_str,
+                .dl_speed = 0, // per-peer speed not tracked currently
+                .ul_speed = 0,
+                .downloaded = peer.bytes_downloaded_from,
+                .uploaded = peer.bytes_uploaded_to,
+                .progress = progress,
+            });
+        }
+
+        return result.toOwnedSlice(allocator);
     }
 };
 
