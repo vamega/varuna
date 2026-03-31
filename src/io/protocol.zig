@@ -192,6 +192,8 @@ pub fn submitMessage(self: *EventLoop, slot: u16, id: u8, payload: []const u8) !
         @memcpy(combined[5 .. 5 + payload.len], payload);
         // Store in handshake_buf (reused as small send buffer)
         @memcpy(peer.handshake_buf[0 .. 5 + payload.len], combined[0 .. 5 + payload.len]);
+        // MSE/PE: encrypt in-place before sending
+        peer.crypto.encryptBuf(peer.handshake_buf[0 .. 5 + payload.len]);
         const ud = encodeUserData(.{ .slot = slot, .op_type = .peer_send, .context = 0 });
         _ = try self.ring.send(ud, peer.fd, peer.handshake_buf[0 .. 5 + payload.len], 0);
         peer.send_pending = true;
@@ -201,6 +203,8 @@ pub fn submitMessage(self: *EventLoop, slot: u16, id: u8, payload: []const u8) !
         const send_buf = try self.allocator.alloc(u8, total_len);
         @memcpy(send_buf[0..5], &header);
         @memcpy(send_buf[5..total_len], payload);
+        // MSE/PE: encrypt in-place before sending
+        peer.crypto.encryptBuf(send_buf);
 
         // Track for cleanup with unique send_id
         const ts = self.nextTrackedSendUserData(slot);
@@ -222,6 +226,8 @@ pub fn submitExtensionHandshake(self: *EventLoop, slot: u16) !void {
 
     // Build the full framed message: 4-byte len | msg_id=20 | sub_id=0 | payload
     const frame = try ext.serializeExtensionMessage(self.allocator, ext.handshake_sub_id, ext_payload);
+    // MSE/PE: encrypt in-place before sending
+    peer.crypto.encryptBuf(frame);
 
     // Track for cleanup with unique send_id
     const ts = self.nextTrackedSendUserData(slot);

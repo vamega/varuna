@@ -12,6 +12,7 @@ const RateLimiter = @import("rate_limiter.zig").RateLimiter;
 const socket_util = @import("../net/socket.zig");
 const utp_mod = @import("../net/utp.zig");
 const utp_mgr = @import("../net/utp_manager.zig");
+const mse = @import("../crypto/mse.zig");
 
 // Sub-modules: focused implementations that operate on *EventLoop
 const peer_handler = @import("peer_handler.zig");
@@ -134,6 +135,9 @@ pub const Peer = struct {
     // BEP 10 extension protocol state
     extensions_supported: bool = false, // peer advertised BEP 10 support
     extension_ids: ?ext.ExtensionIds = null, // peer's extension ID mapping
+
+    // MSE/PE (BEP 6) encryption state
+    crypto: mse.PeerCrypto = mse.PeerCrypto.plaintext,
 };
 
 // ── Torrent context (per-torrent state within shared event loop) ──
@@ -244,6 +248,9 @@ pub const EventLoop = struct {
     // Bind configuration for outbound sockets
     bind_device: ?[]const u8 = null,
     bind_address: ?[]const u8 = null,
+
+    // MSE/PE (BEP 6) encryption mode
+    encryption_mode: mse.EncryptionMode = .preferred,
 
     // Accept socket for seeding (-1 if not seeding)
     listen_fd: posix.fd_t = -1,

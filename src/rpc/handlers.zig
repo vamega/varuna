@@ -4,6 +4,7 @@ const auth = @import("auth.zig");
 const multipart = @import("multipart.zig");
 const sync_mod = @import("sync.zig");
 const json_mod = @import("json.zig");
+const mse = @import("../crypto/mse.zig");
 const SessionManager = @import("../daemon/session_manager.zig").SessionManager;
 const TorrentSession = @import("../daemon/torrent_session.zig");
 const metainfo_mod = @import("../torrent/metainfo.zig");
@@ -355,8 +356,15 @@ pub const ApiHandler = struct {
         const el = self.session_manager.shared_event_loop;
         const dl_limit: u64 = if (el) |e| e.getGlobalDlLimit() else 0;
         const ul_limit: u64 = if (el) |e| e.getGlobalUlLimit() else 0;
+        // qBittorrent encryption: 0 = prefer, 1 = force, 2 = disable
+        const enc_mode: u8 = if (el) |e| switch (e.encryption_mode) {
+            .forced => 1,
+            .preferred => 0,
+            .enabled => 0,
+            .disabled => 2,
+        } else 0;
 
-        const body = std.fmt.allocPrint(allocator, "{{\"dl_limit\":{},\"up_limit\":{}}}", .{ dl_limit, ul_limit }) catch
+        const body = std.fmt.allocPrint(allocator, "{{\"dl_limit\":{},\"up_limit\":{},\"encryption\":{}}}", .{ dl_limit, ul_limit, enc_mode }) catch
             return .{ .status = 500, .body = "{\"error\":\"internal\"}" };
         return .{ .body = body, .owned_body = body };
     }

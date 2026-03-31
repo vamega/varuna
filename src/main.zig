@@ -69,6 +69,9 @@ pub fn main() !void {
     shared_el.bind_device = cfg.network.bind_device;
     shared_el.bind_address = cfg.network.bind_address;
 
+    // Apply MSE/PE encryption mode from config
+    shared_el.encryption_mode = varuna.config.parseEncryptionMode(cfg.network.encryption);
+
     // Apply connection limits from config
     shared_el.max_connections = cfg.network.max_connections;
     shared_el.max_peers_per_torrent = cfg.network.max_peers_per_torrent;

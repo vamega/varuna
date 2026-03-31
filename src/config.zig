@@ -1,5 +1,6 @@
 const std = @import("std");
 const toml = @import("toml");
+const mse = @import("crypto/mse.zig");
 
 pub const Config = struct {
     daemon: Daemon = .{},
@@ -38,6 +39,12 @@ pub const Config = struct {
         bind_device: ?[]const u8 = null,
         /// Local IP address to bind to (e.g. "10.0.0.1").
         bind_address: ?[]const u8 = null,
+        /// MSE encryption mode: "forced", "preferred", "enabled", "disabled".
+        /// forced   = only encrypted connections (RC4)
+        /// preferred = prefer encryption, allow plaintext fallback
+        /// enabled  = allow both encryption and plaintext
+        /// disabled = no MSE, plaintext only (default)
+        encryption: []const u8 = "preferred",
     };
 
     pub const Performance = struct {
@@ -91,6 +98,16 @@ pub fn loadDefault(allocator: std.mem.Allocator) Config {
     return Config{};
 }
 
+/// Parse the encryption config string into an EncryptionMode enum.
+pub fn parseEncryptionMode(value: []const u8) mse.EncryptionMode {
+    if (std.mem.eql(u8, value, "forced")) return .forced;
+    if (std.mem.eql(u8, value, "preferred")) return .preferred;
+    if (std.mem.eql(u8, value, "enabled")) return .enabled;
+    if (std.mem.eql(u8, value, "disabled")) return .disabled;
+    // Default to preferred for unknown values
+    return .preferred;
+}
+
 test "default config has sensible values" {
     const config = Config{};
     try std.testing.expectEqual(@as(u16, 6881), config.network.port_min);
@@ -108,4 +125,18 @@ test "default config has sensible values" {
 test "load missing file returns defaults" {
     const config = load(std.testing.allocator, "nonexistent.toml") catch Config{};
     try std.testing.expectEqual(@as(u16, 6881), config.network.port_min);
+}
+
+test "parseEncryptionMode recognizes all modes" {
+    try std.testing.expectEqual(mse.EncryptionMode.forced, parseEncryptionMode("forced"));
+    try std.testing.expectEqual(mse.EncryptionMode.preferred, parseEncryptionMode("preferred"));
+    try std.testing.expectEqual(mse.EncryptionMode.enabled, parseEncryptionMode("enabled"));
+    try std.testing.expectEqual(mse.EncryptionMode.disabled, parseEncryptionMode("disabled"));
+    // Unknown defaults to preferred
+    try std.testing.expectEqual(mse.EncryptionMode.preferred, parseEncryptionMode("unknown"));
+}
+
+test "default encryption config is preferred" {
+    const config = Config{};
+    try std.testing.expectEqualSlices(u8, "preferred", config.network.encryption);
 }

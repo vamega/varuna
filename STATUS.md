@@ -17,6 +17,7 @@ Update it whenever a milestone lands, the near-term backlog changes, or a new op
 - Multi-peer seeding: io_uring event loop, batched block sends, async disk reads with piece cache.
 - Selective file download: per-file priorities (normal/high/do_not_download), piece-mask filtering, boundary-piece handling, lazy file creation. Wired into daemon event loop piece picker.
 - Sequential download mode: per-torrent toggle for streaming playback.
+- MSE/PE (BEP 6): Message Stream Encryption with DH key exchange (768-bit prime), RC4 stream cipher with 1024-byte discard, SKEY identification from info-hash, crypto_provide/crypto_select negotiation, both initiator and responder roles, configurable modes (forced/preferred/enabled/disabled). Transparent encrypt/decrypt integrated into event loop send/recv paths.
 
 ### Architecture
 - **Single-threaded io_uring event loop**: all peer I/O, disk I/O, HTTP API, tracker HTTP through io_uring. Split into focused sub-modules: event_loop.zig (core), peer_handler.zig, protocol.zig, seed_handler.zig, peer_policy.zig, utp_handler.zig.
@@ -76,7 +77,7 @@ Update it whenever a milestone lands, the near-term backlog changes, or a new op
 - Seed/read-path correctness: queued seed responses own exact block copies, async seed reads use unique IDs, and only successfully submitted reads/writes contribute to pending completion counts.
 
 ### Testing
-- 19 peer wire protocol tests, 10 BEP 10 extension tests, 31 uTP/LEDBAT tests, 5 categories tests, 8 resume DB tests.
+- 19 peer wire protocol tests, 10 BEP 10 extension tests, 31 uTP/LEDBAT tests, 5 categories tests, 8 resume DB tests, 25 MSE/RC4 tests.
 - Bencode fuzz + edge case tests, HTTP parser fuzz tests.
 - Fuzz tests for: multipart parser, tracker response, uTP packets, BEP 10 extensions, scrape response (18 fuzz tests total).
 - Regression tests for API partial-send progress, unique seed read IDs, seed block-copy batching, shared-event-loop detach on stop, shared-loop preservation on resume, and failed disk-write release.
@@ -92,7 +93,7 @@ Update it whenever a milestone lands, the near-term backlog changes, or a new op
 - **PEX (BEP 11)**: peer exchange via BEP 10 extensions. Discover peers through existing connections.
 - **DHT (BEP 5)**: trackerless peer discovery (large feature).
 - **Magnet links (BEP 9)**: metadata download via ut_metadata extension.
-- **MSE encryption (BEP 6)**: message stream encryption/obfuscation (deferred).
+- ~~**MSE encryption (BEP 6)**: message stream encryption/obfuscation~~ (DONE).
 
 ### Operational
 - **Flood/qui WebUI validation**: test against real Flood or qui instance to find API gaps.
@@ -106,8 +107,6 @@ Update it whenever a milestone lands, the near-term backlog changes, or a new op
 
 ## Last Verified Milestone
 
-- Working tree bugfix pass: shared-event-loop lifetime, seed read/response correctness, RPC accessor safety, API partial-send handling
-- Transfer test matrix: 24/24 pass
-- `zig build test`: all tests pass
+- MSE/PE (BEP 6): message stream encryption with DH, RC4, mode negotiation, event loop integration
+- `zig build test`: all tests pass (including 25 new MSE/RC4 tests)
 - `zig build`: clean build
-- `scripts/demo_swarm.sh`: standalone swarm passes

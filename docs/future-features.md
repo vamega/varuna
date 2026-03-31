@@ -82,6 +82,26 @@ Distributed Hash Table for trackerless peer discovery. Peer Exchange for discove
 
 Download torrent metadata from peers via the extension protocol. Most users interact with magnet links, not .torrent files.
 
-## 9. Encryption (BEP 6 / MSE)
+## 9. ~~Encryption (BEP 6 / MSE)~~ (DONE)
 
-Message Stream Encryption for obfuscating BitTorrent traffic. Required by some private trackers and useful for avoiding ISP throttling.
+Implemented in `src/crypto/mse.zig` and `src/crypto/rc4.zig`:
+
+- **DH key exchange**: 768-bit prime from BEP 6, custom big-integer arithmetic (U768), modular exponentiation
+- **RC4 stream cipher**: KSA + PRGA, 1024-byte discard per BEP 6
+- **SKEY identification**: HASH('req1', S), HASH('req2', SKEY) ^ HASH('req3', S) pattern
+- **Crypto negotiation**: crypto_provide/crypto_select bitmask, supports plaintext (0x01) and RC4 (0x02)
+- **Both roles**: initiator (outbound) and responder (inbound) handshake implementations
+- **Configurable modes**: forced (RC4 only), preferred (RC4 > plaintext), enabled (both), disabled (plaintext only)
+- **Event loop integration**: transparent encrypt/decrypt in peer_handler.zig recv path, protocol.zig and seed_handler.zig send paths
+- **API**: encryption mode exposed via qBittorrent-compatible preferences endpoint
+
+Config:
+```toml
+[network]
+encryption = "preferred"  # forced, preferred, enabled, disabled
+```
+
+Remaining work for full production readiness:
+- Async MSE handshake state machine in the event loop (currently has blocking Ring-based handshake for tools)
+- Automatic MSE fallback: try encrypted first, fall back to plaintext on failure
+- Connection-level MSE initiation before BT handshake in the event loop connect flow
