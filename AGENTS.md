@@ -22,7 +22,7 @@ SQLite3 is required for resume state persistence. Install `libsqlite3-dev` on Ub
 
 Ensure local developer documentation is available before doing substantial Linux or `io_uring` work. On Ubuntu 24.04 this means keeping `man-db`, `manpages`, `manpages-dev`, `manpages-posix`, `manpages-posix-dev`, and `liburing-dev` installed so syscall, POSIX, and `io_uring` man pages are locally searchable. `liburing-dev` specifically provides the `io_uring_*` man pages and the `io_uring_setup(2)` / `io_uring_enter(2)` / `io_uring_register(2)` pages.
 
-The repositories under `reference-codebases/` are git submodules. Initialize them with `git submodule update --init` after cloning.
+The repositories under `reference-codebases/` and `vendor/` are git submodules. Initialize them with `git submodule update --init` after cloning. In particular, `vendor/boringssl` **must** be initialized for the build to succeed (it provides the TLS library for HTTPS tracker support). If you see a `failed to open file` panic from `build/boringssl.zig` during `zig build`, run `git submodule update --init vendor/boringssl`.
 
 Reference repositories:
 - `reference-codebases/libtorrent` — arvidn/libtorrent (C++ BitTorrent library)
