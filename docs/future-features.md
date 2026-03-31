@@ -78,9 +78,9 @@ See [dht-bep52-plan.md](dht-bep52-plan.md) for the detailed implementation plan 
 
 Per-file Merkle tree piece verification (SHA-256), v2 info-hash, file-aligned pieces, and hybrid torrent support. See [dht-bep52-plan.md](dht-bep52-plan.md) for the full plan.
 
-## 8. Magnet links (BEP 9)
+## 8. ~~Magnet links (BEP 9)~~ (DONE)
 
-Download torrent metadata from peers via the extension protocol. Most users interact with magnet links, not .torrent files.
+Download torrent metadata from peers via the extension protocol. Implemented: magnet URI parsing, metadata download via ut_metadata, metadata serving to peers, CLI and API support. Remaining: parallel piece requests, trackerless magnet support (needs DHT).
 
 ## 9. ~~Encryption (BEP 6 / MSE)~~ (DONE)
 

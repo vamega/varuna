@@ -65,28 +65,57 @@ pub fn main() !void {
         }
     } else if (std.mem.eql(u8, command, "add")) {
         if (cmd_start + 1 >= args.len) {
-            try stdout.print("usage: varuna-ctl add <torrent-file> [--save-path <dir>]\n", .{});
+            try stdout.print("usage: varuna-ctl add <torrent-file|--magnet URI> [--save-path <dir>]\n", .{});
         } else {
-            const torrent_bytes = try std.fs.cwd().readFileAlloc(allocator, args[cmd_start + 1], 16 * 1024 * 1024);
-            defer allocator.free(torrent_bytes);
-
-            // Parse --save-path
+            // Parse flags
             var save_path: ?[]const u8 = null;
-            var i: usize = cmd_start + 2;
+            var magnet_uri: ?[]const u8 = null;
+            var torrent_file: ?[]const u8 = null;
+
+            var i: usize = cmd_start + 1;
             while (i < args.len) : (i += 1) {
                 if (std.mem.eql(u8, args[i], "--save-path") and i + 1 < args.len) {
                     save_path = args[i + 1];
                     i += 1;
+                } else if (std.mem.eql(u8, args[i], "--magnet") and i + 1 < args.len) {
+                    magnet_uri = args[i + 1];
+                    i += 1;
+                } else if (std.mem.startsWith(u8, args[i], "magnet:")) {
+                    // Direct magnet URI without --magnet flag
+                    magnet_uri = args[i];
+                } else if (torrent_file == null) {
+                    torrent_file = args[i];
                 }
             }
 
-            var path = std.ArrayList(u8).empty;
-            defer path.deinit(allocator);
-            try path.appendSlice(allocator, "/api/v2/torrents/add");
-            if (save_path) |sp| {
-                try path.print(allocator, "?savepath={s}", .{sp});
+            if (magnet_uri) |magnet| {
+                // Add via magnet link
+                var body_buf = std.ArrayList(u8).empty;
+                defer body_buf.deinit(allocator);
+                try body_buf.print(allocator, "urls={s}", .{magnet});
+
+                var path = std.ArrayList(u8).empty;
+                defer path.deinit(allocator);
+                try path.appendSlice(allocator, "/api/v2/torrents/add");
+                if (save_path) |sp| {
+                    try path.print(allocator, "?savepath={s}", .{sp});
+                }
+                try doPost(allocator, stdout, api_host, api_port, path.items, body_buf.items, sid);
+            } else if (torrent_file) |tf| {
+                // Add via .torrent file
+                const torrent_bytes = try std.fs.cwd().readFileAlloc(allocator, tf, 16 * 1024 * 1024);
+                defer allocator.free(torrent_bytes);
+
+                var path = std.ArrayList(u8).empty;
+                defer path.deinit(allocator);
+                try path.appendSlice(allocator, "/api/v2/torrents/add");
+                if (save_path) |sp| {
+                    try path.print(allocator, "?savepath={s}", .{sp});
+                }
+                try doPost(allocator, stdout, api_host, api_port, path.items, torrent_bytes, sid);
+            } else {
+                try stdout.print("usage: varuna-ctl add <torrent-file|--magnet URI> [--save-path <dir>]\n", .{});
             }
-            try doPost(allocator, stdout, api_host, api_port, path.items, torrent_bytes, sid);
         }
     } else if (std.mem.eql(u8, command, "pause")) {
         if (cmd_start + 1 >= args.len) {

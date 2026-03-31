@@ -74,9 +74,17 @@ pub fn setExtensionBit(reserved: *[8]u8) void {
 /// When `is_private` is true, ut_pex is omitted from the extension map
 /// because BEP 27 forbids peer exchange for private torrents.
 ///
+/// When `metadata_size` is non-zero, it is included in the handshake
+/// so peers know the size of our info dictionary (BEP 9).
+///
 /// The returned slice is allocated with `allocator` and must be freed
 /// by the caller.
 pub fn encodeExtensionHandshake(allocator: std.mem.Allocator, listen_port: u16, is_private: bool) ![]u8 {
+    return encodeExtensionHandshakeWithMetadata(allocator, listen_port, is_private, 0);
+}
+
+/// Encode extension handshake with optional metadata_size (BEP 9).
+pub fn encodeExtensionHandshakeWithMetadata(allocator: std.mem.Allocator, listen_port: u16, is_private: bool, metadata_size: u32) ![]u8 {
     // Build the "m" dictionary entries: extension name -> our local ID.
     // For private torrents, don't advertise ut_pex (BEP 27).
     const m_count: usize = if (is_private) 1 else 2;
@@ -90,13 +98,21 @@ pub fn encodeExtensionHandshake(allocator: std.mem.Allocator, listen_port: u16, 
     }
 
     // Top-level dictionary entries.  Bencode dictionaries should have
-    // keys in sorted order: "m" < "p" < "v".
-    var entries = try allocator.alloc(bencode.Value.Entry, 3);
+    // keys in sorted order: "m" < "metadata_size" < "p" < "v".
+    const entry_count: usize = if (metadata_size > 0) 4 else 3;
+    var entries = try allocator.alloc(bencode.Value.Entry, entry_count);
     defer allocator.free(entries);
 
-    entries[0] = .{ .key = "m", .value = .{ .dict = m_entries } };
-    entries[1] = .{ .key = "p", .value = .{ .integer = @as(i64, listen_port) } };
-    entries[2] = .{ .key = "v", .value = .{ .bytes = client_version } };
+    var idx: usize = 0;
+    entries[idx] = .{ .key = "m", .value = .{ .dict = m_entries } };
+    idx += 1;
+    if (metadata_size > 0) {
+        entries[idx] = .{ .key = "metadata_size", .value = .{ .integer = @as(i64, metadata_size) } };
+        idx += 1;
+    }
+    entries[idx] = .{ .key = "p", .value = .{ .integer = @as(i64, listen_port) } };
+    idx += 1;
+    entries[idx] = .{ .key = "v", .value = .{ .bytes = client_version } };
 
     return bencode_encode.encode(allocator, .{ .dict = entries });
 }

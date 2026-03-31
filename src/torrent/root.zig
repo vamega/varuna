@@ -6,6 +6,7 @@ pub const client = @import("client.zig");
 pub const file_priority = @import("file_priority.zig");
 pub const info_hash = @import("info_hash.zig");
 pub const layout = @import("layout.zig");
+pub const magnet = @import("magnet.zig");
 pub const metainfo = @import("metainfo.zig");
 pub const peer_id = @import("peer_id.zig");
 pub const piece_tracker = @import("piece_tracker.zig");

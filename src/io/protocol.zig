@@ -4,6 +4,8 @@ const log = std.log.scoped(.event_loop);
 const pw = @import("../net/peer_wire.zig");
 const ext = @import("../net/extensions.zig");
 const pex_mod = @import("../net/pex.zig");
+const ut_metadata = @import("../net/ut_metadata.zig");
+const info_hash_mod = @import("../torrent/info_hash.zig");
 const Bitfield = @import("../bitfield.zig").Bitfield;
 const EventLoop = @import("event_loop.zig").EventLoop;
 const Peer = @import("event_loop.zig").Peer;
@@ -148,6 +150,11 @@ pub fn processMessage(self: *EventLoop, slot: u16) void {
                         return;
                     }
                 }
+                // BEP 9: handle ut_metadata messages (serve metadata to peers)
+                if (sub_id == ext.local_ut_metadata_id) {
+                    handleUtMetadata(self, slot, ext_payload);
+                    return;
+                }
                 // Extension-specific message -- stub for future handlers
                 log.debug("slot {d}: unhandled extension message sub_id={d} len={d}", .{
                     slot, sub_id, ext_payload.len,
@@ -156,6 +163,107 @@ pub fn processMessage(self: *EventLoop, slot: u16) void {
         },
         else => {},
     }
+}
+
+// ── BEP 9: ut_metadata handler ──────────────────────────
+
+/// Handle an incoming ut_metadata extension message.
+/// Only request messages are handled (we serve metadata to peers).
+/// Data and reject messages are only relevant during metadata fetch
+/// which runs on a background thread, not through the event loop.
+pub fn handleUtMetadata(self: *EventLoop, slot: u16, ext_payload: []const u8) void {
+    const peer = &self.peers[slot];
+
+    const msg = ut_metadata.decode(self.allocator, ext_payload) catch {
+        log.debug("slot {d}: failed to decode ut_metadata message", .{slot});
+        return;
+    };
+
+    switch (msg.msg_type) {
+        .request => {
+            // Peer is requesting a metadata piece from us.
+            // We can only serve if we have the torrent's info dictionary.
+            const tc = self.getTorrentContext(peer.torrent_id) orelse return;
+            const session = tc.session orelse return;
+
+            // Find the raw info dictionary bytes from our torrent data
+            const info_bytes = info_hash_mod.findInfoBytes(session.torrent_bytes) catch {
+                // We don't have valid info bytes -- send reject
+                sendUtMetadataReject(self, slot, peer, msg.piece);
+                return;
+            };
+
+            const total_size: u32 = @intCast(info_bytes.len);
+            const piece_count = (total_size + ut_metadata.metadata_piece_size - 1) / ut_metadata.metadata_piece_size;
+
+            if (msg.piece >= piece_count) {
+                sendUtMetadataReject(self, slot, peer, msg.piece);
+                return;
+            }
+
+            // Calculate piece data bounds
+            const offset = @as(usize, msg.piece) * ut_metadata.metadata_piece_size;
+            const end = @min(offset + ut_metadata.metadata_piece_size, total_size);
+            const piece_data = info_bytes[offset..end];
+
+            // Encode data message header + piece data
+            const header_bytes = ut_metadata.encodeData(self.allocator, msg.piece, total_size) catch return;
+            defer self.allocator.free(header_bytes);
+
+            // Combine header + piece data into the extension payload
+            const combined = self.allocator.alloc(u8, header_bytes.len + piece_data.len) catch return;
+            defer self.allocator.free(combined);
+            @memcpy(combined[0..header_bytes.len], header_bytes);
+            @memcpy(combined[header_bytes.len..], piece_data);
+
+            // Send as extension message to peer's ut_metadata ID
+            const peer_ut_id = if (peer.extension_ids) |ids| ids.ut_metadata else 0;
+            if (peer_ut_id == 0) return;
+
+            // Allocate the frame for tracked send (io_uring is async, buffer must persist)
+            const frame = ext.serializeExtensionMessage(self.allocator, peer_ut_id, combined) catch return;
+
+            const ts = self.nextTrackedSendUserData(slot);
+            self.pending_sends.append(self.allocator, .{ .buf = frame, .slot = slot, .send_id = ts.send_id }) catch {
+                self.allocator.free(frame);
+                return;
+            };
+
+            _ = self.ring.send(ts.ud, peer.fd, frame, 0) catch {
+                // Send failed; the buffer will be freed when pending_sends is cleaned up
+                return;
+            };
+            peer.send_pending = true;
+        },
+        .data, .reject => {
+            // These are only relevant during metadata fetch (background thread).
+            // In the event loop context, ignore them.
+            log.debug("slot {d}: unexpected ut_metadata {s} message", .{
+                slot,
+                if (msg.msg_type == .data) "data" else "reject",
+            });
+        },
+    }
+}
+
+fn sendUtMetadataReject(self: *EventLoop, slot: u16, peer: *Peer, piece: u32) void {
+    const peer_ut_id = if (peer.extension_ids) |ids| ids.ut_metadata else return;
+    if (peer_ut_id == 0) return;
+
+    const reject_payload = ut_metadata.encodeReject(self.allocator, piece) catch return;
+    defer self.allocator.free(reject_payload);
+
+    // Allocate frame for tracked send
+    const frame = ext.serializeExtensionMessage(self.allocator, peer_ut_id, reject_payload) catch return;
+
+    const ts = self.nextTrackedSendUserData(slot);
+    self.pending_sends.append(self.allocator, .{ .buf = frame, .slot = slot, .send_id = ts.send_id }) catch {
+        self.allocator.free(frame);
+        return;
+    };
+
+    _ = self.ring.send(ts.ud, peer.fd, frame, 0) catch return;
+    peer.send_pending = true;
 }
 
 // ── SQE helpers ───────────────────────────────────────
@@ -220,12 +328,23 @@ pub fn submitMessage(self: *EventLoop, slot: u16, id: u8, payload: []const u8) !
 }
 
 /// Send our BEP 10 extension handshake as a tracked (heap-allocated) send.
+/// Includes metadata_size (BEP 9) if we have the torrent's info dictionary.
 pub fn submitExtensionHandshake(self: *EventLoop, slot: u16) !void {
     const peer = &self.peers[slot];
     // Check if the torrent is private (BEP 27: don't advertise ut_pex)
-    const is_private = if (self.getTorrentContext(peer.torrent_id)) |tc| tc.is_private else false;
+    const tc = self.getTorrentContext(peer.torrent_id);
+    const is_private = if (tc) |t| t.is_private else false;
+    // Compute metadata_size from the info dictionary (BEP 9)
+    const metadata_size: u32 = if (tc) |t| blk: {
+        if (t.session) |session| {
+            if (info_hash_mod.findInfoBytes(session.torrent_bytes)) |info_bytes| {
+                break :blk @intCast(info_bytes.len);
+            } else |_| {}
+        }
+        break :blk 0;
+    } else 0;
     // Encode the bencoded extension handshake payload
-    const ext_payload = try ext.encodeExtensionHandshake(self.allocator, self.port, is_private);
+    const ext_payload = try ext.encodeExtensionHandshakeWithMetadata(self.allocator, self.port, is_private, metadata_size);
     defer self.allocator.free(ext_payload);
 
     // Build the full framed message: 4-byte len | msg_id=20 | sub_id=0 | payload

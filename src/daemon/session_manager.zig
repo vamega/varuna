@@ -116,6 +116,42 @@ pub const SessionManager = struct {
         return session;
     }
 
+    /// Add a torrent from a magnet URI (BEP 9).
+    /// Metadata will be fetched from peers before the download begins.
+    pub fn addMagnet(
+        self: *SessionManager,
+        magnet_uri: []const u8,
+        save_path: []const u8,
+    ) !*TorrentSession {
+        const session = try self.allocator.create(TorrentSession);
+        errdefer self.allocator.destroy(session);
+
+        session.* = try TorrentSession.createFromMagnet(self.allocator, magnet_uri, save_path);
+        errdefer session.deinit();
+
+        session.port = self.port;
+        session.max_peers = self.max_peers;
+        session.hasher_threads = self.hasher_threads;
+        session.resume_db_path = self.resume_db_path;
+
+        self.mutex.lock();
+        defer self.mutex.unlock();
+
+        // Check for duplicate
+        if (self.sessions.get(&session.info_hash_hex)) |_| {
+            session.deinit();
+            self.allocator.destroy(session);
+            return error.TorrentAlreadyExists;
+        }
+
+        try self.sessions.put(&session.info_hash_hex, session);
+
+        // Auto-start (with shared event loop if available)
+        session.startWithEventLoop(self.shared_event_loop);
+
+        return session;
+    }
+
     /// Remove a torrent by info hash hex string.
     pub fn removeTorrent(self: *SessionManager, hash: []const u8) !void {
         return self.removeTorrentEx(hash, false);
@@ -774,7 +810,7 @@ pub const SessionManager = struct {
         var tier: u32 = 0;
 
         if (meta.announce) |url| {
-            const status: u8 = if (session.state == .downloading or session.state == .seeding) 2 else 1;
+            const status: u8 = if (session.state == .downloading or session.state == .seeding or session.state == .metadata_fetching) 2 else 1;
             result[built] = .{
                 .url = try allocator.dupe(u8, url),
                 .status = status,

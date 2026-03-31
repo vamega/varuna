@@ -309,6 +309,7 @@ pub const ApiHandler = struct {
         var torrent_data: []const u8 = body;
         var save_path: []const u8 = extractParam(query, "savepath") orelse self.session_manager.default_save_path;
         var category_param: ?[]const u8 = extractParam(query, "category");
+        var magnet_url: ?[]const u8 = extractParam(query, "urls") orelse extractParam(body, "urls");
 
         // Parse multipart/form-data if that's the content type (qBittorrent/Flood WebUI)
         if (multipart.isMultipart(content_type)) {
@@ -317,11 +318,19 @@ pub const ApiHandler = struct {
             };
             defer multipart.freeParts(allocator, parts);
 
-            // Extract torrent file data
-            const torrent_part = multipart.findPart(parts, "torrents") orelse {
-                return .{ .status = 400, .body = "{\"error\":\"no torrents part in multipart\"}" };
-            };
-            torrent_data = torrent_part.data;
+            // Check for magnet URL in multipart "urls" field
+            if (multipart.findPart(parts, "urls")) |urls_part| {
+                if (urls_part.data.len > 0 and std.mem.startsWith(u8, urls_part.data, "magnet:")) {
+                    magnet_url = urls_part.data;
+                }
+            }
+
+            // Extract torrent file data (may be absent for magnet links)
+            if (multipart.findPart(parts, "torrents")) |torrent_part| {
+                torrent_data = torrent_part.data;
+            } else {
+                torrent_data = "";
+            }
 
             // Extract optional parameters from form fields
             if (multipart.findPart(parts, "savepath")) |sp| {
@@ -334,6 +343,25 @@ pub const ApiHandler = struct {
             // Also check body for form-encoded category param
             if (category_param == null) {
                 category_param = extractParam(body, "category");
+            }
+        }
+
+        // Handle magnet link (BEP 9)
+        if (magnet_url) |magnet| {
+            if (std.mem.startsWith(u8, magnet, "magnet:")) {
+                const session = self.session_manager.addMagnet(magnet, save_path) catch |err| {
+                    const msg = std.fmt.allocPrint(allocator, "{{\"error\":\"{s}\"}}", .{@errorName(err)}) catch
+                        return .{ .status = 500, .body = "{\"error\":\"internal\"}" };
+                    return .{ .status = 400, .body = msg, .owned_body = msg };
+                };
+
+                if (category_param) |cat| {
+                    if (cat.len > 0) {
+                        self.session_manager.setTorrentCategory(&session.info_hash_hex, cat) catch {};
+                    }
+                }
+
+                return .{ .body = "{\"status\":\"ok\"}" };
             }
         }
 
