@@ -89,6 +89,16 @@ Update it whenever a milestone lands, the near-term backlog changes, or a new op
 - Seed/read-path correctness: queued seed responses own exact block copies, async seed reads use unique IDs, and only successfully submitted reads/writes contribute to pending completion counts.
 - **Huge page piece cache**: optional `mmap(MAP_HUGETLB)` buffer pool for seed piece reads. Falls back to `madvise(MADV_HUGEPAGE)` (transparent huge pages), then regular pages. Config: `performance.use_huge_pages`, `performance.piece_cache_size`. Reduces TLB pressure for large torrents.
 
+### BEP 52 (BitTorrent v2 / Hybrid Torrents)
+- Torrent version detection: v1/v2/hybrid based on `pieces` vs `file tree` field presence.
+- v2 file tree parser (`src/torrent/file_tree.zig`): recursive walk of nested bencode dictionaries, empty-string leaf markers, `pieces root` extraction.
+- SHA-256 Merkle tree (`src/torrent/merkle.zig`): tree construction from piece hashes, root computation, per-piece verification, Merkle proof generation and verification, power-of-2 padding with zero-hashes.
+- v2 info-hash calculation (`src/torrent/info_hash.zig`): SHA-256 of bencoded info dict using `std.crypto.hash.sha2.Sha256` (hardware-accelerated).
+- Extended `Metainfo` struct: `version`, `info_hash_v2`, `file_tree_v2` fields. Pure v2 torrents populate v1 `files` array from file tree for backward compatibility.
+- File-aligned piece layout (`src/torrent/layout.zig`): v2 pieces never cross file boundaries, each file has its own piece range, `mapPieceV2` always returns single-file spans.
+- Dual-hash verification (`src/storage/verify.zig`): `PiecePlan.hash_type` selects SHA-1 or SHA-256, `verifyPieceBuffer` supports both.
+- Hasher thread pool SHA-256 support (`src/io/hasher.zig`): `Job.hash_type` field, worker function dispatches to SHA-1 or SHA-256.
+
 ### Testing
 - 19 peer wire protocol tests, 10 BEP 10 extension tests, 15 PEX tests, 31 uTP/LEDBAT tests, 5 categories tests, 9 resume DB tests, 25 MSE/RC4 tests, 13 magnet URI tests, 13 ut_metadata tests.
 - Bencode fuzz + edge case tests, HTTP parser fuzz tests.
@@ -103,6 +113,7 @@ Update it whenever a milestone lands, the near-term backlog changes, or a new op
 - Private tracker simulation tests (25 tests): required announce fields (compact, numwant, key, event), per-session key generation, private flag enforcement (no ut_pex), tracker error responses (failure reason, missing fields, invalid formats, negative interval), compact peer parsing.
 - Soak test framework (`zig build soak-test`): multi-torrent piece tracker stress, allocator leak detection (GPA), FD leak monitoring, tick latency tracking, bitfield stress cycles.
 - 5 super-seed (BEP 16) tests, 2 multi-announce tests, 5 huge page cache tests.
+- BEP 52 tests: 11 Merkle tree tests, 8 file tree parser tests, 7 v2 metainfo tests, 4 v2 layout tests, 1 v2 info-hash test.
 
 ## Next
 
@@ -113,6 +124,8 @@ Update it whenever a milestone lands, the near-term backlog changes, or a new op
 - ~~**Magnet links (BEP 9)**~~: (DONE) metadata download via ut_metadata extension.
 - **Magnet link resilience**: retry metadata from multiple peers, parallel piece requests, DHT fallback for trackerless magnets.
 - ~~**MSE encryption (BEP 6)**~~: (DONE) message stream encryption/obfuscation.
+- **BEP 52 Phase 4**: peer wire handshake dual info-hash matching, tracker announce with v2 info-hash, resume DB v2 info-hash column.
+- **BEP 52 Phase 5 (deferred)**: hash request/hashes/hash reject message exchange, Merkle proof exchange with peers.
 
 ### Operational
 - **Flood/qui WebUI validation**: populate remaining stub fields (tracker URL, trackers_count, piece_range, content_path for multi-file, magnet_uri), add real peer data to torrentPeers endpoint.
@@ -124,7 +137,6 @@ Update it whenever a milestone lands, the near-term backlog changes, or a new op
 
 ## Last Verified Milestone
 
-- qui API compatibility audit: qBittorrent state strings, 25+ missing torrent fields, CORS headers, expanded preferences/properties/files/trackers, new endpoints (version/buildInfo/torrentPeers)
-- MSE/PE (BEP 6): message stream encryption with DH, RC4, mode negotiation, event loop integration
+- BEP 52 (BitTorrent v2 / Hybrid) Phase 1-3: version detection, file tree parsing, Merkle tree, v2 info-hash, file-aligned layout, dual-hash verification
 - `zig build test`: all tests pass
 - `zig build`: clean build

@@ -1,11 +1,23 @@
 const std = @import("std");
 const Sha1 = @import("../crypto/sha1.zig");
+const Sha256 = std.crypto.hash.sha2.Sha256;
 
+/// Compute the v1 info-hash (SHA-1 of the bencoded info dict).
 pub fn compute(torrent_bytes: []const u8) ![20]u8 {
     const info_bytes = try findInfoBytes(torrent_bytes);
 
     var digest: [20]u8 = undefined;
     Sha1.hash(info_bytes, &digest, .{});
+    return digest;
+}
+
+/// Compute the v2 info-hash (SHA-256 of the bencoded info dict).
+/// Used for BEP 52 v2 and hybrid torrents.
+pub fn computeV2(torrent_bytes: []const u8) ![32]u8 {
+    const info_bytes = try findInfoBytes(torrent_bytes);
+
+    var digest: [32]u8 = undefined;
+    Sha256.hash(info_bytes, &digest, .{});
     return digest;
 }
 
@@ -131,4 +143,15 @@ test "compute info hash matches direct sha1 of raw info bytes" {
     Sha1.hash(expected_info, &expected, .{});
 
     try std.testing.expectEqual(expected, try compute(input));
+}
+
+test "compute v2 info hash matches direct sha256 of raw info bytes" {
+    const input =
+        "d8:announce14:http://tracker" ++ "4:infod6:lengthi5e4:name8:test.bin12:piece lengthi16384e6:pieces20:abcdefghijklmnopqrstee";
+
+    const expected_info = "d6:lengthi5e4:name8:test.bin12:piece lengthi16384e6:pieces20:abcdefghijklmnopqrste";
+    var expected: [32]u8 = undefined;
+    Sha256.hash(expected_info, &expected, .{});
+
+    try std.testing.expectEqual(expected, try computeV2(input));
 }

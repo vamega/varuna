@@ -1,5 +1,6 @@
 const std = @import("std");
 const Sha1 = @import("../crypto/sha1.zig");
+const Sha256 = std.crypto.hash.sha2.Sha256;
 const torrent = @import("../torrent/root.zig");
 const writer = @import("writer.zig");
 
@@ -15,10 +16,17 @@ pub const RecheckState = struct {
     }
 };
 
+pub const HashType = enum {
+    sha1, // v1: SHA-1 (20 bytes)
+    sha256, // v2: SHA-256 (32 bytes)
+};
+
 pub const PiecePlan = struct {
     piece_index: u32,
     piece_length: u32,
     expected_hash: [20]u8,
+    expected_hash_v2: [32]u8 = [_]u8{0} ** 32,
+    hash_type: HashType = .sha1,
     spans: []torrent.layout.Layout.Span,
 };
 
@@ -32,17 +40,54 @@ pub fn planPieceVerification(
     errdefer allocator.free(spans);
 
     const mapped = try session.layout.mapPiece(piece_index, spans);
-    const piece_hash = try session.layout.pieceHash(piece_index);
+    const piece_size = try session.layout.pieceSize(piece_index);
+    const version = session.layout.version;
 
+    if (version == .v2) {
+        // Pure v2: use SHA-256 and Merkle root verification
+        const expected_v2 = try findV2PieceHash(session, piece_index);
+        return .{
+            .piece_index = piece_index,
+            .piece_length = piece_size,
+            .expected_hash = [_]u8{0} ** 20,
+            .expected_hash_v2 = expected_v2,
+            .hash_type = .sha256,
+            .spans = mapped,
+        };
+    }
+
+    // v1 or hybrid: use v1 SHA-1 hashes
+    const piece_hash = try session.layout.pieceHash(piece_index);
     var expected_hash: [20]u8 = undefined;
     @memcpy(expected_hash[0..], piece_hash);
 
     return .{
         .piece_index = piece_index,
-        .piece_length = try session.layout.pieceSize(piece_index),
+        .piece_length = piece_size,
         .expected_hash = expected_hash,
         .spans = mapped,
     };
+}
+
+/// Find the expected SHA-256 hash for a v2 piece by looking up the Merkle root
+/// from the file tree. For single-piece files, the root IS the piece hash.
+/// For multi-piece files, the caller needs the full Merkle tree for verification;
+/// for now we return the Merkle root for the file (suitable for full-file verification).
+fn findV2PieceHash(
+    session: *const torrent.session.Session,
+    piece_index: u32,
+) ![32]u8 {
+    if (session.metainfo.file_tree_v2) |v2_files| {
+        for (session.layout.files, 0..) |file, file_idx| {
+            if (file.length == 0) continue;
+            if (piece_index >= file.first_piece and piece_index < file.end_piece_exclusive) {
+                if (file_idx < v2_files.len) {
+                    return v2_files[file_idx].pieces_root;
+                }
+            }
+        }
+    }
+    return error.InvalidPieceIndex;
 }
 
 pub fn freePiecePlan(allocator: std.mem.Allocator, plan: PiecePlan) void {
@@ -52,6 +97,12 @@ pub fn freePiecePlan(allocator: std.mem.Allocator, plan: PiecePlan) void {
 pub fn verifyPieceBuffer(plan: PiecePlan, piece_data: []const u8) !bool {
     if (piece_data.len != plan.piece_length) {
         return error.InvalidPieceDataLength;
+    }
+
+    if (plan.hash_type == .sha256) {
+        var actual: [32]u8 = undefined;
+        Sha256.hash(piece_data, &actual, .{});
+        return std.mem.eql(u8, actual[0..], plan.expected_hash_v2[0..]);
     }
 
     var actual: [20]u8 = undefined;

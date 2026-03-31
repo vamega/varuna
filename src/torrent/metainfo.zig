@@ -1,18 +1,38 @@
 const std = @import("std");
 const bencode = @import("bencode.zig");
 const info_hash = @import("info_hash.zig");
+const file_tree = @import("file_tree.zig");
+
+/// Torrent version: v1 (BEP 3), v2 (BEP 52), or hybrid (both).
+pub const TorrentVersion = enum {
+    v1, // traditional: has "pieces" but no "file tree"
+    v2, // pure v2: has "file tree" but no "pieces"
+    hybrid, // both v1 and v2 metadata present
+};
+
+/// Per-file metadata from BEP 52 v2 file tree.
+pub const V2File = struct {
+    path: []const []const u8,
+    length: u64,
+    pieces_root: [32]u8, // SHA-256 Merkle root for this file
+};
 
 pub const Metainfo = struct {
     info_hash: [20]u8,
     announce: ?[]const u8,
-    announce_list: []const []const u8,
+    announce_list: []const []const u8 = &.{},
     comment: ?[]const u8,
     created_by: ?[]const u8,
     name: []const u8,
     piece_length: u32,
-    pieces: []const u8,
-    private: bool,
+    pieces: []const u8 = "", // may be empty for pure v2
+    private: bool = false,
     files: []File,
+
+    // v2 fields (BEP 52)
+    version: TorrentVersion = .v1,
+    info_hash_v2: ?[32]u8 = null, // SHA-256 info-hash (null for pure v1)
+    file_tree_v2: ?[]V2File = null, // v2 per-file metadata
 
     pub const File = struct {
         length: u64,
@@ -20,7 +40,30 @@ pub const Metainfo = struct {
     };
 
     pub fn pieceCount(self: Metainfo) !u32 {
+        if (self.version == .v2) {
+            // For v2, piece count is derived from file sizes and piece_length
+            return self.pieceCountFromFiles();
+        }
         return std.math.cast(u32, self.pieces.len / 20) orelse error.PieceCountOverflow;
+    }
+
+    /// Compute piece count for v2 torrents from file tree metadata.
+    /// In v2, pieces are file-aligned, so each file contributes ceil(length / piece_length) pieces.
+    pub fn pieceCountFromFiles(self: Metainfo) !u32 {
+        if (self.file_tree_v2) |v2_files| {
+            var total: u64 = 0;
+            for (v2_files) |f| {
+                if (f.length > 0) {
+                    total += (f.length + self.piece_length - 1) / self.piece_length;
+                }
+            }
+            return std.math.cast(u32, total) orelse error.PieceCountOverflow;
+        }
+        // Fallback to v1 method for files array
+        const total = self.totalSize();
+        if (total == 0) return error.PieceCountOverflow;
+        const count = (total + self.piece_length - 1) / self.piece_length;
+        return std.math.cast(u32, count) orelse error.PieceCountOverflow;
     }
 
     pub fn pieceHash(self: Metainfo, piece_index: u32) ![]const u8 {
@@ -47,7 +90,26 @@ pub const Metainfo = struct {
     pub fn isPrivate(self: Metainfo) bool {
         return self.private;
     }
+
+    /// Returns true if this torrent has v2 metadata (pure v2 or hybrid).
+    pub fn hasV2(self: Metainfo) bool {
+        return self.version == .v2 or self.version == .hybrid;
+    }
+
+    /// Returns true if this torrent has v1 metadata (pure v1 or hybrid).
+    pub fn hasV1(self: Metainfo) bool {
+        return self.version == .v1 or self.version == .hybrid;
+    }
 };
+
+/// Detect torrent version based on the presence of v1 and v2 fields.
+pub fn detectVersion(info: []const bencode.Value.Entry) TorrentVersion {
+    const has_pieces = bencode.dictGet(info, "pieces") != null;
+    const has_file_tree = bencode.dictGet(info, "file tree") != null;
+    if (has_pieces and has_file_tree) return .hybrid;
+    if (has_file_tree) return .v2;
+    return .v1;
+}
 
 pub fn parse(allocator: std.mem.Allocator, input: []const u8) !Metainfo {
     const digest = try info_hash.compute(input);
@@ -57,17 +119,63 @@ pub fn parse(allocator: std.mem.Allocator, input: []const u8) !Metainfo {
     const root_dict = try expectDict(root);
     const info = try expectDict(try getRequired(root_dict, "info"));
 
+    const version = detectVersion(info);
     const name = try expectBytes(try getRequired(info, "name"));
-    const pieces = try expectBytes(try getRequired(info, "pieces"));
-    if (pieces.len == 0 or pieces.len % 20 != 0) {
-        return error.InvalidPiecesField;
+    const piece_length = try expectPositiveU32(try getRequired(info, "piece length"));
+
+    // v1 pieces field: required for v1 and hybrid, absent for pure v2
+    var pieces: []const u8 = "";
+    if (version == .v1 or version == .hybrid) {
+        pieces = try expectBytes(try getRequired(info, "pieces"));
+        if (pieces.len == 0 or pieces.len % 20 != 0) {
+            return error.InvalidPiecesField;
+        }
     }
 
-    const piece_length = try expectPositiveU32(try getRequired(info, "piece length"));
-    const files = if (bencode.dictGet(info, "files")) |value|
-        try parseMultiFileList(allocator, try expectList(value))
-    else
-        try parseSingleFileList(allocator, try expectPositiveU64(try getRequired(info, "length")), name);
+    // v1 file list: required for v1, populated from v1 fields for hybrid
+    var files: []Metainfo.File = &.{};
+    if (version == .v1 or version == .hybrid) {
+        files = if (bencode.dictGet(info, "files")) |value|
+            try parseMultiFileList(allocator, try expectList(value))
+        else
+            try parseSingleFileList(allocator, try expectPositiveU64(try getRequired(info, "length")), name);
+    }
+    errdefer {
+        for (files) |f| allocator.free(f.path);
+        if (files.len > 0) allocator.free(files);
+    }
+
+    // v2 file tree: required for v2 and hybrid
+    var file_tree_v2: ?[]V2File = null;
+    if (version == .v2 or version == .hybrid) {
+        const ft_val = try getRequired(info, "file tree");
+        const ft_dict = try expectDict(ft_val);
+        file_tree_v2 = try file_tree.parseFileTree(allocator, ft_dict);
+    }
+    errdefer {
+        if (file_tree_v2) |ft| file_tree.freeV2Files(allocator, ft);
+    }
+
+    // For pure v2, populate the v1 files array from the file tree for compatibility
+    if (version == .v2) {
+        if (file_tree_v2) |ft| {
+            files = try allocator.alloc(Metainfo.File, ft.len);
+            for (ft, 0..) |v2f, i| {
+                const path_copy = try allocator.alloc([]const u8, v2f.path.len);
+                @memcpy(path_copy, v2f.path);
+                files[i] = .{
+                    .length = v2f.length,
+                    .path = path_copy,
+                };
+            }
+        }
+    }
+
+    // v2 info-hash (SHA-256)
+    var info_hash_v2: ?[32]u8 = null;
+    if (version == .v2 or version == .hybrid) {
+        info_hash_v2 = try info_hash.computeV2(input);
+    }
 
     const announce_list = if (bencode.dictGet(root_dict, "announce-list")) |value|
         try parseAnnounceList(allocator, value)
@@ -85,6 +193,9 @@ pub fn parse(allocator: std.mem.Allocator, input: []const u8) !Metainfo {
         .pieces = pieces,
         .private = if (bencode.dictGet(info, "private")) |v| (try expectPositiveU64(v)) == 1 else false,
         .files = files,
+        .version = version,
+        .info_hash_v2 = info_hash_v2,
+        .file_tree_v2 = file_tree_v2,
     };
 }
 
@@ -105,11 +216,14 @@ fn parseAnnounceList(allocator: std.mem.Allocator, value: bencode.Value) ![]cons
 }
 
 pub fn freeMetainfo(allocator: std.mem.Allocator, meta: Metainfo) void {
-    allocator.free(meta.announce_list);
+    if (meta.announce_list.len > 0) allocator.free(meta.announce_list);
     for (meta.files) |file| {
         allocator.free(file.path);
     }
-    allocator.free(meta.files);
+    if (meta.files.len > 0) allocator.free(meta.files);
+    if (meta.file_tree_v2) |ft| {
+        file_tree.freeV2Files(allocator, ft);
+    }
 }
 
 fn parseSingleFileList(
@@ -319,4 +433,89 @@ test "reject negative file length" {
         error.NegativeInteger,
         parse(std.testing.allocator, input),
     );
+}
+
+// ── v2 / BEP 52 tests ─────────────────────────────────────
+
+test "detect v1 version" {
+    const info_entries = [_]bencode.Value.Entry{
+        .{ .key = "pieces", .value = .{ .bytes = "12345678901234567890" } },
+    };
+    try std.testing.expectEqual(TorrentVersion.v1, detectVersion(&info_entries));
+}
+
+test "detect v2 version" {
+    const info_entries = [_]bencode.Value.Entry{
+        .{ .key = "file tree", .value = .{ .dict = &.{} } },
+    };
+    try std.testing.expectEqual(TorrentVersion.v2, detectVersion(&info_entries));
+}
+
+test "detect hybrid version" {
+    const info_entries = [_]bencode.Value.Entry{
+        .{ .key = "pieces", .value = .{ .bytes = "12345678901234567890" } },
+        .{ .key = "file tree", .value = .{ .dict = &.{} } },
+    };
+    try std.testing.expectEqual(TorrentVersion.hybrid, detectVersion(&info_entries));
+}
+
+test "v1 torrent has correct version field" {
+    const input =
+        "d4:infod6:lengthi5e4:name8:test.bin12:piece lengthi16384e6:pieces20:abcdefghijklmnopqrstee";
+
+    const meta = try parse(std.testing.allocator, input);
+    defer freeMetainfo(std.testing.allocator, meta);
+
+    try std.testing.expectEqual(TorrentVersion.v1, meta.version);
+    try std.testing.expect(meta.info_hash_v2 == null);
+    try std.testing.expect(meta.file_tree_v2 == null);
+    try std.testing.expect(meta.hasV1());
+    try std.testing.expect(!meta.hasV2());
+}
+
+test "parse pure v2 torrent" {
+    const pr = [_]u8{0xAA} ** 32;
+    // Pure v2: has "file tree" but no "pieces"
+    // info dict: { "name": "test", "piece length": 16384, "file tree": { "test.bin": { "": { "length": 5, "pieces root": <32 bytes> } } } }
+    const input = "d4:infod9:file treed8:test.bind0:d6:lengthi5e11:pieces root32:" ++ pr ++ "eee4:name4:test12:piece lengthi16384eee";
+
+    const meta = try parse(std.testing.allocator, input);
+    defer freeMetainfo(std.testing.allocator, meta);
+
+    try std.testing.expectEqual(TorrentVersion.v2, meta.version);
+    try std.testing.expect(meta.info_hash_v2 != null);
+    try std.testing.expect(meta.file_tree_v2 != null);
+    try std.testing.expectEqual(@as(usize, 1), meta.file_tree_v2.?.len);
+    try std.testing.expectEqual(@as(u64, 5), meta.file_tree_v2.?[0].length);
+    try std.testing.expectEqual(pr, meta.file_tree_v2.?[0].pieces_root);
+    try std.testing.expectEqualStrings("test.bin", meta.file_tree_v2.?[0].path[0]);
+
+    // v1 files array should be populated from file tree
+    try std.testing.expectEqual(@as(usize, 1), meta.files.len);
+    try std.testing.expectEqual(@as(u64, 5), meta.files[0].length);
+    try std.testing.expectEqualStrings("test.bin", meta.files[0].path[0]);
+
+    // pieces should be empty for pure v2
+    try std.testing.expectEqualStrings("", meta.pieces);
+
+    try std.testing.expect(!meta.hasV1());
+    try std.testing.expect(meta.hasV2());
+}
+
+test "parse hybrid torrent" {
+    const pr = [_]u8{0xCC} ** 32;
+    // Hybrid: has both "pieces" and "file tree"
+    const input = "d4:infod9:file treed8:test.bind0:d6:lengthi5e11:pieces root32:" ++ pr ++ "eee6:lengthi5e4:name8:test.bin12:piece lengthi16384e6:pieces20:abcdefghijklmnopqrstee";
+
+    const meta = try parse(std.testing.allocator, input);
+    defer freeMetainfo(std.testing.allocator, meta);
+
+    try std.testing.expectEqual(TorrentVersion.hybrid, meta.version);
+    try std.testing.expect(meta.info_hash_v2 != null);
+    try std.testing.expect(meta.file_tree_v2 != null);
+    try std.testing.expectEqual(@as(usize, 1), meta.file_tree_v2.?.len);
+    try std.testing.expectEqualStrings("abcdefghijklmnopqrst", meta.pieces);
+    try std.testing.expectEqual(@as(usize, 1), meta.files.len);
+    try std.testing.expect(meta.hasV1());
+    try std.testing.expect(meta.hasV2());
 }

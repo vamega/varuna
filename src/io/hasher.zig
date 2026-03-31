@@ -2,6 +2,8 @@ const std = @import("std");
 const posix = std.posix;
 const linux = std.os.linux;
 const Sha1 = @import("../crypto/sha1.zig");
+const Sha256 = std.crypto.hash.sha2.Sha256;
+const HashType = @import("../storage/verify.zig").HashType;
 
 const default_thread_count = 4;
 
@@ -35,6 +37,8 @@ pub const Hasher = struct {
         piece_buf: []u8,
         piece_length: u32,
         expected_hash: [20]u8,
+        expected_hash_v2: [32]u8 = [_]u8{0} ** 32,
+        hash_type: HashType = .sha1,
         torrent_id: u8,
     };
 
@@ -198,9 +202,18 @@ pub const Hasher = struct {
             self.queue_mutex.unlock();
 
             // Hash the piece (CPU-intensive, runs in parallel across pool)
-            var actual: [20]u8 = undefined;
-            Sha1.hash(job.piece_buf[0..job.piece_length], &actual, .{});
-            const valid = std.mem.eql(u8, actual[0..], job.expected_hash[0..]);
+            const valid = switch (job.hash_type) {
+                .sha256 => blk: {
+                    var actual_v2: [32]u8 = undefined;
+                    Sha256.hash(job.piece_buf[0..job.piece_length], &actual_v2, .{});
+                    break :blk std.mem.eql(u8, actual_v2[0..], job.expected_hash_v2[0..]);
+                },
+                .sha1 => blk: {
+                    var actual: [20]u8 = undefined;
+                    Sha1.hash(job.piece_buf[0..job.piece_length], &actual, .{});
+                    break :blk std.mem.eql(u8, actual[0..], job.expected_hash[0..]);
+                },
+            };
 
             // Push result
             self.result_mutex.lock();

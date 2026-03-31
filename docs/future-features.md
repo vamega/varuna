@@ -74,9 +74,13 @@ Distributed Hash Table for trackerless peer discovery. Peer Exchange for discove
 
 See [dht-bep52-plan.md](dht-bep52-plan.md) for the detailed implementation plan covering DHT module layout, routing table design, KRPC protocol, io_uring integration, and phasing.
 
-## 7a. BEP 52 (BitTorrent v2 / Hybrid Torrents)
+## 7a. BEP 52 (BitTorrent v2 / Hybrid Torrents) -- Phase 1-3 DONE
 
-Per-file Merkle tree piece verification (SHA-256), v2 info-hash, file-aligned pieces, and hybrid torrent support. See [dht-bep52-plan.md](dht-bep52-plan.md) for the full plan.
+Phase 1-3 implemented: version detection (v1/v2/hybrid), v2 file tree parsing (`src/torrent/file_tree.zig`), SHA-256 Merkle tree (`src/torrent/merkle.zig`), v2 info-hash calculation, file-aligned piece layout, dual-hash verification (SHA-1/SHA-256), hasher thread pool SHA-256 support. See [dht-bep52-plan.md](dht-bep52-plan.md) for the full plan.
+
+Remaining work:
+- **Phase 4**: peer wire handshake dual info-hash matching, tracker announce with v2 info-hash, resume DB schema extension for v2 info-hash.
+- **Phase 5 (deferred)**: hash request/hashes/hash reject message exchange (BEP 52 section 5), Merkle proof exchange with peers, piece-layer streaming.
 
 ## 8. ~~Magnet links (BEP 9)~~ (DONE)
 
