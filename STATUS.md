@@ -65,6 +65,7 @@ Update it whenever a milestone lands, the near-term backlog changes, or a new op
 - Hasher TOCTOU fix (atomic drainResultsInto), proper drain loop, endgame duplicate write skip.
 - timeout_pending tracking, write error checking in handleDiskWrite, error logging for silent catches.
 - io_uring send buffer UAF fix: split free-one vs free-all pending sends, stale-CQE guards, SQE-submit-failure fix.
+- EventLoop deinit UAF fix: phased shutdown (close fds, drain CQEs, then free buffers) prevents GPA debug-poison UAF.
 - IORING_OP_CLOSE for hot-path fd cleanup in RPC server.
 - Session use-after-free fix: RPC handlers copy data under mutex instead of holding raw session pointers.
 - Shared event loop lifetime hardening: pause/stop/resume now detach torrents from the shared EventLoop before freeing runtime state, and resume preserves daemon/shared-loop integration.

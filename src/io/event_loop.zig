@@ -400,9 +400,47 @@ pub const EventLoop = struct {
             h.deinit();
             self.allocator.destroy(h);
         }
-        // Free piece cache
+
+        // ── Phase 1: Close all file descriptors ──────────────────
+        // Close peer fds, listen fd, and UDP fd so the kernel cancels
+        // pending io_uring operations that reference our buffers.
+        // Do NOT free buffers yet -- the kernel may still be
+        // completing cancelled SQEs that reference them.
+        for (self.peers) |*peer| {
+            // Clean up uTP slot state
+            if (peer.transport == .utp) {
+                if (peer.utp_slot) |utp_slot| {
+                    if (self.utp_manager) |mgr| {
+                        const now_us = @import("utp_handler.zig").utpNowUs();
+                        _ = mgr.reset(utp_slot, now_us);
+                    }
+                }
+            }
+            if (peer.fd >= 0) {
+                posix.close(peer.fd);
+                peer.fd = -1;
+            }
+        }
+        if (self.listen_fd >= 0) {
+            posix.close(self.listen_fd);
+            self.listen_fd = -1;
+        }
+        if (self.udp_fd >= 0) {
+            posix.close(self.udp_fd);
+            self.udp_fd = -1;
+        }
+
+        // ── Phase 2: Drain the ring ──────────────────────────────
+        // After closing fds, any in-flight SQEs will complete with
+        // errors. Drain all remaining CQEs so the kernel is finished
+        // touching our buffer memory before we free it. This prevents
+        // use-after-free under GPA (debug poison 0xAA fill on free).
+        self.drainRemainingCqes();
+
+        // ── Phase 3: Free all buffers ────────────────────────────
+        // Now that the kernel has completed all pending operations,
+        // it is safe to free the buffers they referenced.
         if (self.cached_piece_data) |d| self.allocator.free(d);
-        // Free any pending write/send buffers
         {
             var it = self.pending_writes.valueIterator();
             while (it.next()) |pending| {
@@ -425,7 +463,12 @@ pub const EventLoop = struct {
         self.idle_peers.deinit(self.allocator);
         self.hash_result_swap.deinit(self.allocator);
         for (self.peers) |*peer| {
-            self.cleanupPeer(peer);
+            // fd already closed in Phase 1; free remaining heap buffers
+            if (peer.body_is_heap) {
+                if (peer.body_buf) |buf| self.allocator.free(buf);
+            }
+            if (peer.piece_buf) |buf| self.allocator.free(buf);
+            if (peer.availability) |*bf| bf.deinit(self.allocator);
         }
         self.allocator.free(self.peers);
         // Clean up shared announce ring (created once, reused across announces)
@@ -433,9 +476,29 @@ pub const EventLoop = struct {
         if (self.announce_result_peers) |peers| self.allocator.free(peers);
         // Clean up uTP resources
         if (self.utp_manager) |mgr| self.allocator.destroy(mgr);
-        if (self.udp_fd >= 0) posix.close(self.udp_fd);
         self.utp_send_queue.deinit(self.allocator);
+
+        // ── Phase 4: Tear down the ring ──────────────────────────
         self.ring.deinit();
+    }
+
+    /// Drain all remaining CQEs from the ring after fds are closed.
+    /// Used during deinit to ensure the kernel is done with our buffers
+    /// before we free them.
+    fn drainRemainingCqes(self: *EventLoop) void {
+        // Submit any queued SQEs so they complete (with errors, since fds are closed)
+        _ = self.ring.submit() catch {};
+
+        // Drain CQEs in batches until none remain.  Use a bounded loop
+        // to avoid hanging if the ring keeps producing completions.
+        var drain_rounds: u32 = 0;
+        while (drain_rounds < 64) : (drain_rounds += 1) {
+            var cqes: [cqe_batch_size]linux.io_uring_cqe = undefined;
+            const count = self.ring.copy_cqes(&cqes, 0) catch break;
+            if (count == 0) break;
+            // Discard all completions -- we only care that the kernel
+            // has finished touching the buffer memory.
+        }
     }
 
     // ── Torrent management ─────────────────────────────────
