@@ -21,6 +21,8 @@ pub const SessionManager = struct {
     max_peers: u32 = 50,
     hasher_threads: u32 = 4,
     resume_db_path: ?[*:0]const u8 = null,
+    /// Masquerade as a different client for peer ID generation (e.g. "qBittorrent 5.1.4").
+    masquerade_as: ?[]const u8 = null,
 
     /// In-memory category and tag stores.
     category_store: CategoryStore,
@@ -90,7 +92,7 @@ pub const SessionManager = struct {
         const session = try self.allocator.create(TorrentSession);
         errdefer self.allocator.destroy(session);
 
-        session.* = try TorrentSession.create(self.allocator, torrent_bytes, save_path);
+        session.* = try TorrentSession.create(self.allocator, torrent_bytes, save_path, self.masquerade_as);
         errdefer session.deinit();
 
         session.port = self.port;
@@ -126,7 +128,7 @@ pub const SessionManager = struct {
         const session = try self.allocator.create(TorrentSession);
         errdefer self.allocator.destroy(session);
 
-        session.* = try TorrentSession.createFromMagnet(self.allocator, magnet_uri, save_path);
+        session.* = try TorrentSession.createFromMagnet(self.allocator, magnet_uri, save_path, self.masquerade_as);
         errdefer session.deinit();
 
         session.port = self.port;

@@ -47,6 +47,7 @@ Update it whenever a milestone lands, the near-term backlog changes, or a new op
 - Download/upload speed limits (per-torrent + global), connection limits, hasher threads, pipeline depth.
 - API credentials (api_username, api_password).
 - Build options: `-Dsqlite=system|bundled`, `-Ddns=threadpool|c-ares`.
+- Peer ID masquerading: `network.masquerade_as` config option to identify as qBittorrent, rTorrent, uTorrent, Deluge, or Transmission. Useful for private trackers with client whitelists.
 
 ### API (qBittorrent v2 compatible)
 - **Auth**: login/logout with session cookies (SID), 1-hour timeout, configurable credentials.
@@ -137,6 +138,7 @@ Update it whenever a milestone lands, the near-term backlog changes, or a new op
 - BEP 52 tests: 11 Merkle tree tests, 8 file tree parser tests, 7 v2 metainfo tests, 4 v2 layout tests, 1 v2 info-hash test, 8 hash exchange tests, 2 v2 announce URL tests, 2 v2 resume DB tests.
 - DHT tests: 7 node_id tests, 8 routing_table tests, 8 krpc tests, 8 token tests, 7 lookup tests, 5 dht_engine tests, 1 persistence test (44 total).
 - 10 peer ID client identification tests (Azureus-style, Shadow-style, Mainline, unknown).
+- 17 peer ID masquerading tests: all 5 client formats, case insensitivity, malformed input, unsupported client error, random suffix validation.
 
 ## Next
 

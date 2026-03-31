@@ -93,6 +93,7 @@ pub fn main() !void {
     session_manager.max_peers = cfg.network.max_peers;
     session_manager.hasher_threads = cfg.performance.hasher_threads;
     session_manager.resume_db_path = resume_db_path;
+    session_manager.masquerade_as = cfg.network.masquerade_as;
     if (cfg.storage.data_dir) |dir| session_manager.default_save_path = dir;
     // Load persisted categories and tags from the resume DB
     session_manager.loadCategoriesAndTags();

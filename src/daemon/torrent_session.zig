@@ -190,6 +190,7 @@ pub const TorrentSession = struct {
         allocator: std.mem.Allocator,
         magnet_uri: []const u8,
         save_path: []const u8,
+        masquerade_as: ?[]const u8,
     ) !TorrentSession {
         const parsed = try magnet_mod.parse(allocator, magnet_uri);
         errdefer parsed.deinit(allocator);
@@ -221,7 +222,7 @@ pub const TorrentSession = struct {
             .total_size = 0, // unknown until metadata fetched
             .piece_count = 0, // unknown until metadata fetched
             .added_on = std.time.timestamp(),
-            .peer_id = peer_id_mod.generate(),
+            .peer_id = try peer_id_mod.generate(masquerade_as),
             .tracker_key = tracker.announce.Request.generateKey(),
             .is_magnet = true,
             .magnet_trackers = if (trackers.len > 0) trackers else null,
@@ -232,6 +233,7 @@ pub const TorrentSession = struct {
         allocator: std.mem.Allocator,
         torrent_bytes: []const u8,
         save_path: []const u8,
+        masquerade_as: ?[]const u8,
     ) !TorrentSession {
         const owned_bytes = try allocator.dupe(u8, torrent_bytes);
         errdefer allocator.free(owned_bytes);
@@ -255,7 +257,7 @@ pub const TorrentSession = struct {
             .total_size = meta.totalSize(),
             .piece_count = try meta.pieceCount(),
             .added_on = std.time.timestamp(),
-            .peer_id = peer_id_mod.generate(),
+            .peer_id = try peer_id_mod.generate(masquerade_as),
             .tracker_key = tracker.announce.Request.generateKey(),
             .is_private = meta.isPrivate(),
             .info_hash_v2 = meta.info_hash_v2,
