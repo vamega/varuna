@@ -3,6 +3,7 @@ const posix = std.posix;
 const log = std.log.scoped(.event_loop);
 const pw = @import("../net/peer_wire.zig");
 const ext = @import("../net/extensions.zig");
+const pex_mod = @import("../net/pex.zig");
 const Bitfield = @import("../bitfield.zig").Bitfield;
 const EventLoop = @import("event_loop.zig").EventLoop;
 const Peer = @import("event_loop.zig").Peer;
@@ -142,6 +143,9 @@ pub fn processMessage(self: *EventLoop, slot: u16) void {
                             log.debug("slot {d}: ignoring ut_pex message for private torrent", .{slot});
                             return;
                         }
+                        // BEP 11: handle PEX message
+                        handlePexMessage(self, slot, ext_payload);
+                        return;
                     }
                 }
                 // Extension-specific message -- stub for future handlers
@@ -229,6 +233,111 @@ pub fn submitExtensionHandshake(self: *EventLoop, slot: u16) !void {
 
     _ = try self.ring.send(ts.ud, peer.fd, frame, 0);
     peer.send_pending = true;
+}
+
+// ── BEP 11: PEX message handling ────────────────────────
+
+/// Handle an incoming ut_pex message from a peer.
+/// Parses the PEX message and attempts to connect to newly discovered peers.
+fn handlePexMessage(self: *EventLoop, slot: u16, payload: []const u8) void {
+    const peer = &self.peers[slot];
+
+    var msg = pex_mod.parsePexMessage(self.allocator, payload) catch {
+        log.debug("slot {d}: failed to parse PEX message", .{slot});
+        return;
+    };
+    defer msg.deinit(self.allocator);
+
+    if (msg.added.len == 0 and msg.dropped.len == 0) return;
+
+    log.debug("slot {d}: PEX message: {d} added, {d} dropped", .{
+        slot, msg.added.len, msg.dropped.len,
+    });
+
+    // BEP 11: attempt connections to newly discovered peers.
+    // Only for non-private torrents (already checked by caller).
+    const torrent_id = peer.torrent_id;
+    for (msg.added) |pex_peer| {
+        // Check connection limits before attempting
+        if (self.peer_count >= self.max_connections) break;
+        if (self.peerCountForTorrent(torrent_id) >= self.max_peers_per_torrent) break;
+        if (self.half_open_count >= self.max_half_open) break;
+
+        // Don't connect to peers we already have
+        if (isPeerAlreadyConnected(self, torrent_id, pex_peer.address)) continue;
+
+        _ = self.addPeerForTorrent(pex_peer.address, torrent_id) catch continue;
+    }
+}
+
+/// Check if we already have a connection to the given address for this torrent.
+fn isPeerAlreadyConnected(self: *EventLoop, torrent_id: u8, addr: std.net.Address) bool {
+    for (self.peers) |*p| {
+        if (p.state == .free) continue;
+        if (p.torrent_id != torrent_id) continue;
+        // Compare address family, IP, and port
+        if (addressesEqual(p.address, addr)) return true;
+    }
+    return false;
+}
+
+fn addressesEqual(a: std.net.Address, b: std.net.Address) bool {
+    if (a.any.family != b.any.family) return false;
+    return switch (a.any.family) {
+        posix.AF.INET => blk: {
+            const a4 = @as(*const posix.sockaddr.in, @ptrCast(@alignCast(&a.any)));
+            const b4 = @as(*const posix.sockaddr.in, @ptrCast(@alignCast(&b.any)));
+            break :blk a4.addr == b4.addr and a4.port == b4.port;
+        },
+        posix.AF.INET6 => blk: {
+            const a6 = @as(*const posix.sockaddr.in6, @ptrCast(@alignCast(&a.any)));
+            const b6 = @as(*const posix.sockaddr.in6, @ptrCast(@alignCast(&b.any)));
+            break :blk std.mem.eql(u8, std.mem.asBytes(&a6.addr), std.mem.asBytes(&b6.addr)) and a6.port == b6.port;
+        },
+        else => false,
+    };
+}
+
+/// Build and send a PEX message to the given peer slot.
+/// Called periodically from peer_policy.checkPex.
+pub fn submitPexMessage(self: *EventLoop, slot: u16) !void {
+    const peer = &self.peers[slot];
+    if (peer.state == .free or peer.state == .disconnecting) return;
+
+    // Need the peer's ut_pex ID to send to them
+    const peer_pex_id = if (peer.extension_ids) |ids| ids.ut_pex else 0;
+    if (peer_pex_id == 0) return;
+
+    const tc = self.getTorrentContext(peer.torrent_id) orelse return;
+
+    // Private torrents must not exchange peers
+    if (tc.is_private) return;
+
+    const torrent_pex = tc.pex_state orelse return;
+
+    // Lazily allocate PEX state for this peer
+    if (peer.pex_state == null) {
+        const ps = try self.allocator.create(pex_mod.PexState);
+        ps.* = pex_mod.PexState{};
+        peer.pex_state = ps;
+    }
+    const peer_pex = peer.pex_state.?;
+
+    // Build the PEX payload
+    const payload = try pex_mod.buildPexMessage(self.allocator, torrent_pex, peer_pex) orelse return;
+    defer self.allocator.free(payload);
+
+    // Frame as BEP 10 extension message and send
+    const frame = try ext.serializeExtensionMessage(self.allocator, peer_pex_id, payload);
+
+    const ts = self.nextTrackedSendUserData(slot);
+    try self.pending_sends.append(self.allocator, .{ .buf = frame, .slot = slot, .send_id = ts.send_id });
+
+    _ = try self.ring.send(ts.ud, peer.fd, frame, 0);
+    peer.send_pending = true;
+    peer_pex.last_pex_time = std.time.timestamp();
+
+    log.debug("slot {d}: sent PEX message", .{slot});
 }
 
 /// Helper: send interested and transition to active recv (outbound download peer).

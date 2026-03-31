@@ -3,6 +3,7 @@ const posix = std.posix;
 const log = std.log.scoped(.event_loop);
 const Sha1 = @import("../crypto/sha1.zig");
 const Bitfield = @import("../bitfield.zig").Bitfield;
+const pex_mod = @import("../net/pex.zig");
 const storage = @import("../storage/root.zig");
 const EventLoop = @import("event_loop.zig").EventLoop;
 const Peer = @import("event_loop.zig").Peer;
@@ -543,6 +544,65 @@ fn generateAnnounceJitter(self: *const EventLoop) i32 {
     const raw: u32 = @truncate(hsh >> 33);
     const jitter: i32 = @as(i32, @intCast(raw % @as(u32, @intCast(jitter_range + 1)))) - @divTrunc(jitter_range, 2);
     return jitter;
+}
+
+// ── BEP 11: Peer Exchange ─────────────────────────────
+
+/// Send PEX messages to all eligible peers at the BEP 11 interval.
+/// Also ensures torrent PEX state is initialized for non-private torrents.
+pub fn checkPex(self: *EventLoop) void {
+    const now = std.time.timestamp();
+
+    for (&self.torrents, 0..) |*slot, idx| {
+        const tc = &(slot.* orelse continue);
+        const tid: u8 = @intCast(idx);
+
+        // PEX is disabled for private torrents (BEP 27)
+        if (tc.is_private) continue;
+
+        // Lazily allocate torrent PEX state
+        if (tc.pex_state == null) {
+            const tps = self.allocator.create(pex_mod.TorrentPexState) catch continue;
+            tps.* = pex_mod.TorrentPexState{};
+            tc.pex_state = tps;
+        }
+        const torrent_pex = tc.pex_state.?;
+
+        // Update the torrent's connected peers set
+        for (self.peers) |*peer| {
+            if (peer.state == .free or peer.state == .connecting or peer.state == .disconnecting) continue;
+            if (peer.torrent_id != tid) continue;
+            // Only include peers that have completed the handshake
+            if (peer.state != .active_recv_header and peer.state != .active_recv_body) continue;
+
+            const flags = pex_mod.PeerFlags{
+                .seed = peer.mode == .seed,
+                .utp = peer.transport == .utp,
+            };
+            torrent_pex.addPeer(self.allocator, peer.address, flags);
+        }
+
+        // Send PEX messages to each eligible peer for this torrent
+        for (self.peers, 0..) |*peer, pi| {
+            if (peer.state == .free or peer.state == .disconnecting) continue;
+            if (peer.torrent_id != tid) continue;
+            if (peer.state != .active_recv_header and peer.state != .active_recv_body) continue;
+            if (peer.send_pending) continue;
+
+            // Check if peer supports ut_pex
+            const peer_pex_id = if (peer.extension_ids) |ids| ids.ut_pex else 0;
+            if (peer_pex_id == 0) continue;
+
+            // Rate-limit PEX messages per peer
+            if (peer.pex_state) |ps| {
+                if (now - ps.last_pex_time < pex_mod.pex_interval_secs) continue;
+            }
+
+            protocol.submitPexMessage(self, @intCast(pi)) catch |err| {
+                log.debug("PEX send to slot {d}: {s}", .{ pi, @errorName(err) });
+            };
+        }
+    }
 }
 
 /// Update speed counters for all active torrents (called from tick).

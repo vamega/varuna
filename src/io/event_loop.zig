@@ -9,6 +9,7 @@ const pw = @import("../net/peer_wire.zig");
 const ext = @import("../net/extensions.zig");
 const Hasher = @import("hasher.zig").Hasher;
 const RateLimiter = @import("rate_limiter.zig").RateLimiter;
+const pex_mod = @import("../net/pex.zig");
 const socket_util = @import("../net/socket.zig");
 const utp_mod = @import("../net/utp.zig");
 const utp_mgr = @import("../net/utp_manager.zig");
@@ -134,6 +135,9 @@ pub const Peer = struct {
     // BEP 10 extension protocol state
     extensions_supported: bool = false, // peer advertised BEP 10 support
     extension_ids: ?ext.ExtensionIds = null, // peer's extension ID mapping
+
+    // BEP 11 PEX state (per-peer, tracks what we have sent to this peer)
+    pex_state: ?*pex_mod.PexState = null,
 };
 
 // ── Torrent context (per-torrent state within shared event loop) ──
@@ -167,6 +171,9 @@ pub const TorrentContext = struct {
 
     // Per-torrent rate limiters (0 = unlimited)
     rate_limiter: RateLimiter = RateLimiter.initComptime(0, 0),
+
+    // BEP 11 PEX state (per-torrent, tracks currently connected peers)
+    pex_state: ?*pex_mod.TorrentPexState = null,
 };
 
 // ── Event loop ────────────────────────────────────────────
@@ -428,6 +435,15 @@ pub const EventLoop = struct {
             self.cleanupPeer(peer);
         }
         self.allocator.free(self.peers);
+        // Clean up torrent PEX state
+        for (&self.torrents) |*tslot| {
+            if (tslot.*) |*tc| {
+                if (tc.pex_state) |tps| {
+                    tps.deinit(self.allocator);
+                    self.allocator.destroy(tps);
+                }
+            }
+        }
         // Clean up shared announce ring (created once, reused across announces)
         if (self.announce_ring) |*r| r.deinit();
         if (self.announce_result_peers) |peers| self.allocator.free(peers);
@@ -547,6 +563,13 @@ pub const EventLoop = struct {
         for (self.peers, 0..) |*peer, i| {
             if (peer.state != .free and peer.torrent_id == torrent_id) {
                 self.removePeer(@intCast(i));
+            }
+        }
+        // Clean up PEX state
+        if (self.torrents[torrent_id]) |*tc| {
+            if (tc.pex_state) |tps| {
+                tps.deinit(self.allocator);
+                self.allocator.destroy(tps);
             }
         }
         self.torrents[torrent_id] = null;
@@ -674,6 +697,14 @@ pub const EventLoop = struct {
                 if (tc.piece_tracker) |pt| pt.releasePiece(piece_index);
             }
         }
+        // BEP 11: notify torrent PEX state that this peer disconnected
+        if (peer.state != .free and peer.state != .connecting) {
+            if (self.getTorrentContext(peer.torrent_id)) |tc| {
+                if (tc.pex_state) |tps| {
+                    tps.removePeer(peer.address);
+                }
+            }
+        }
         self.unmarkIdle(slot);
 
         // Free any tracked send buffers before closing the fd.  After
@@ -714,6 +745,7 @@ pub const EventLoop = struct {
         peer_policy.recalculateUnchokes(self);
         peer_policy.tryAssignPieces(self);
         peer_policy.updateSpeedCounters(self);
+        peer_policy.checkPex(self);
         utp_handler.utpTick(self);
 
         // Flush any queued SQEs before waiting
@@ -1030,6 +1062,10 @@ pub const EventLoop = struct {
         }
         if (peer.piece_buf) |buf| self.allocator.free(buf);
         if (peer.availability) |*bf| bf.deinit(self.allocator);
+        if (peer.pex_state) |ps| {
+            ps.deinit(self.allocator);
+            self.allocator.destroy(ps);
+        }
     }
 };
 
