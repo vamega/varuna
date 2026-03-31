@@ -101,7 +101,7 @@ pub const TorrentSession = struct {
     // Shared DNS resolver with TTL-based caching. Avoids spawning a thread
     // for every DNS lookup during tracker announce/scrape. Created lazily
     // on the first tracker operation.
-    dns_resolver: DnsResolver = DnsResolver.init(),
+    dns_resolver: ?DnsResolver = null,
 
     // Resume state persistence (runs on background thread)
     resume_writer: ?ResumeWriter = null,
@@ -236,7 +236,7 @@ pub const TorrentSession = struct {
 
     pub fn deinit(self: *TorrentSession) void {
         self.stop();
-        self.dns_resolver.deinit(self.allocator);
+        if (self.dns_resolver) |*r| r.deinit(self.allocator);
         if (self.announce_ring) |*r| {
             r.deinit();
             self.announce_ring = null;
@@ -257,6 +257,15 @@ pub const TorrentSession = struct {
             self.allocator.free(trackers);
         }
         if (self.metadata_assembler) |*ma| ma.deinit();
+    }
+
+    /// Get a pointer to the DNS resolver, lazily initializing it on first use.
+    /// Returns null if initialization fails.
+    fn getDnsResolver(self: *TorrentSession) ?*DnsResolver {
+        if (self.dns_resolver == null) {
+            self.dns_resolver = DnsResolver.init(self.allocator) catch return null;
+        }
+        return &self.dns_resolver.?;
     }
 
     /// Start with own event loop (for varuna-tools, backwards compat).
@@ -828,7 +837,7 @@ pub const TorrentSession = struct {
                 self.persistNewCompletions();
                 self.flushResume();
 
-                if (tracker.announce.fetchAutoWithDns(self.allocator, &self.ring.?, &self.dns_resolver, .{
+                if (tracker.announce.fetchAutoWithDns(self.allocator, &self.ring.?, self.getDnsResolver(), .{
                     .announce_url = announce_url,
                     .info_hash = session.metainfo.info_hash,
                     .peer_id = self.peer_id,
@@ -955,7 +964,7 @@ pub const TorrentSession = struct {
         const session = &(self.session orelse return);
         const announce_url = session.metainfo.announce orelse return;
 
-        if (tracker.announce.fetchAutoWithDns(self.allocator, &self.ring.?, &self.dns_resolver, .{
+        if (tracker.announce.fetchAutoWithDns(self.allocator, &self.ring.?, self.getDnsResolver(), .{
             .announce_url = announce_url,
             .info_hash = session.metainfo.info_hash,
             .peer_id = self.peer_id,
@@ -982,7 +991,7 @@ pub const TorrentSession = struct {
         const session = &(self.session orelse return);
         const announce_url = session.metainfo.announce orelse return;
 
-        if (tracker.announce.fetchAutoWithDns(self.allocator, &self.announce_ring.?, &self.dns_resolver, .{
+        if (tracker.announce.fetchAutoWithDns(self.allocator, &self.announce_ring.?, self.getDnsResolver(), .{
             .announce_url = announce_url,
             .info_hash = session.metainfo.info_hash,
             .peer_id = self.peer_id,
@@ -1032,7 +1041,7 @@ pub const TorrentSession = struct {
         if (tracker.scrape.scrapeAutoWithDns(
             self.allocator,
             &self.announce_ring.?,
-            &self.dns_resolver,
+            self.getDnsResolver(),
             announce_url,
             session.metainfo.info_hash,
         )) |result| {

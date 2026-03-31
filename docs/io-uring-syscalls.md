@@ -140,19 +140,46 @@ Varuna's current minimum kernel is 6.6, which covers everything up to and includ
 
 ## DNS Resolution Notes
 
-`getaddrinfo()` is a blocking call with no io_uring equivalent. **Current approach**: `src/io/dns.zig` provides a `DnsResolver` that:
+`getaddrinfo()` is a blocking call with no io_uring equivalent. `src/io/dns.zig` provides a unified `DnsResolver` interface with **two build-time configurable backends**:
+
+### Backend selection
+
+Build with `-Ddns=threadpool` (default) or `-Ddns=c-ares`:
+
+| Backend | Flag | Library | How it resolves |
+|---------|------|---------|-----------------|
+| Threadpool | `-Ddns=threadpool` | None (glibc) | `getaddrinfo()` on a background thread, 5-second timeout |
+| c-ares | `-Ddns=c-ares` | `libc-ares-dev` | c-ares async DNS with epoll fd monitoring, 5-second timeout |
+
+### Shared behavior (both backends)
 
 1. **Short-circuits numeric IPs** (IPv4 and IPv6): parsed inline with no syscall.
 2. **Caches resolved addresses** with a 5-minute TTL and up to 64 entries. LRU eviction on overflow. Thread-safe via mutex.
-3. **Runs `getaddrinfo()` on a background thread** with a 5-second timeout on cache miss. This never blocks the io_uring event loop thread.
+3. **5-second timeout** on cache miss.
 
-The daemon's `TorrentSession` owns a `DnsResolver` instance that is shared across all announce and scrape requests for that torrent. Since tracker hostnames rarely change, the cache eliminates nearly all DNS lookups after the first announce.
+The daemon's `TorrentSession` lazily creates a `DnsResolver` on first tracker operation. The resolver is shared across all announce and scrape requests for that torrent. Since tracker hostnames rarely change, the cache eliminates nearly all DNS lookups after the first announce.
 
-For callers that don't need caching (e.g., one-off UDP tracker connections), `dns.resolveOnce()` provides the same background-thread-with-timeout pattern without a cache.
+For callers that don't need caching (e.g., one-off UDP tracker connections), `dns.resolveOnce()` provides the same pattern without a cache.
 
-**Future options** (not currently needed):
-- **c-ares integration**: async DNS via fd-based sockets, polled with `IORING_OP_POLL_ADD`. More complex, better for high-throughput DHT scenarios.
-- **Build option**: configurable c-ares build flag if the threadpool approach becomes a bottleneck.
+### Threadpool backend (default)
+
+Implementation: `src/io/dns_threadpool.zig`. Spawns a background thread per cache miss to call `getaddrinfo()`. Simple, no extra dependencies. Suitable for typical torrent workloads with a small number of tracker hostnames.
+
+### c-ares backend
+
+Implementation: `src/io/dns_cares.zig`. Uses the c-ares async DNS library. On cache miss, c-ares issues DNS queries on its own UDP/TCP sockets. The resolver uses `epoll_wait()` on c-ares's fds to wait for responses without blocking the io_uring event loop thread.
+
+**When to use c-ares**: high-throughput DHT scenarios with hundreds of concurrent DNS lookups, where thread-per-lookup overhead becomes significant. For typical private tracker usage, the threadpool backend is sufficient.
+
+**Requirements**: `libc-ares-dev` (Debian/Ubuntu) or `c-ares-devel` (RHEL/Fedora).
+
+### Architecture
+
+```
+src/io/dns.zig           -- public interface (dispatches based on build_options)
+src/io/dns_threadpool.zig -- threadpool backend (getaddrinfo + background thread)
+src/io/dns_cares.zig     -- c-ares backend (async DNS + epoll fd monitoring)
+```
 
 ## SHA Hardware Acceleration Notes
 
