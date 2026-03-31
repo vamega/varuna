@@ -989,6 +989,7 @@ pub const SessionManager = struct {
         sequential_download: bool,
         is_private: bool,
         super_seeding: bool,
+        partial_seed: bool,
         save_path: []const u8, // owned, caller must free
         comment: []const u8, // owned, caller must free
         piece_size: u32,
@@ -1045,6 +1046,7 @@ pub const SessionManager = struct {
             .sequential_download = stats.sequential_download,
             .is_private = stats.is_private,
             .super_seeding = stats.super_seeding,
+            .partial_seed = stats.partial_seed,
             .save_path = try allocator.dupe(u8, stats.save_path),
             .comment = try allocator.dupe(u8, comment),
             .piece_size = piece_size,
@@ -1120,6 +1122,8 @@ pub const SessionManager = struct {
         uploaded: u64,
         /// Peer progress (0.0-1.0).
         progress: f64,
+        /// BEP 21: peer is a partial seed (upload_only).
+        upload_only: bool = false,
     };
 
     pub fn freePeerInfos(allocator: std.mem.Allocator, infos: []const PeerInfo) void {
@@ -1220,6 +1224,7 @@ pub const SessionManager = struct {
                 .downloaded = peer.bytes_downloaded_from,
                 .uploaded = peer.bytes_uploaded_to,
                 .progress = progress,
+                .upload_only = peer.upload_only,
             });
         }
 

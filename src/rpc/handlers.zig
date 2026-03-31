@@ -752,7 +752,7 @@ pub const ApiHandler = struct {
             seeding_time,
             info.peers_connected,
         }) catch return .{ .status = 500, .body = "{\"error\":\"internal\"}" };
-        json.print(allocator, "\"peers\":{},\"peers_total\":{},\"seeds\":{},\"seeds_total\":{},\"last_seen\":-1,\"reannounce\":0,\"addition_date\":{},\"completion_date\":{},\"total_downloaded\":{},\"total_downloaded_session\":{},\"total_uploaded\":{},\"total_uploaded_session\":{},\"total_wasted\":0,\"is_private\":{s},\"seq_dl\":{s},\"super_seeding\":{},\"web_seeds_count\":{}}}", .{
+        json.print(allocator, "\"peers\":{},\"peers_total\":{},\"seeds\":{},\"seeds_total\":{},\"last_seen\":-1,\"reannounce\":0,\"addition_date\":{},\"completion_date\":{},\"total_downloaded\":{},\"total_downloaded_session\":{},\"total_uploaded\":{},\"total_uploaded_session\":{},\"total_wasted\":0,\"is_private\":{s},\"seq_dl\":{s},\"super_seeding\":{},\"web_seeds_count\":{},\"partial_seed\":{s}}}", .{
             info.scrape_incomplete,
             info.scrape_complete,
             info.scrape_complete,
@@ -767,6 +767,7 @@ pub const ApiHandler = struct {
             @as([]const u8, if (info.sequential_download) "true" else "false"),
             @as(u8, if (info.super_seeding) 1 else 0),
             info.web_seeds_count,
+            @as([]const u8, if (info.partial_seed) "true" else "false"),
         }) catch return .{ .status = 500, .body = "{\"error\":\"internal\"}" };
 
         const result = json.toOwnedSlice(allocator) catch return .{ .status = 500, .body = "{\"error\":\"internal\"}" };
@@ -1160,7 +1161,7 @@ pub const ApiHandler = struct {
         for (peers, 0..) |peer, i| {
             if (i > 0) json.append(allocator, ',') catch {};
             // Key is ip:port, value is peer object
-            json.print(allocator, "\"{f}\":{{\"client\":\"{f}\",\"connection\":\"\",\"country\":\"\",\"country_code\":\"\",\"dl_speed\":{},\"downloaded\":{},\"files\":\"\",\"flags\":\"{f}\",\"flags_desc\":\"\",\"ip\":\"{f}\",\"port\":{},\"progress\":{d:.4},\"relevance\":1,\"up_speed\":{},\"uploaded\":{}}}", .{
+            json.print(allocator, "\"{f}\":{{\"client\":\"{f}\",\"connection\":\"\",\"country\":\"\",\"country_code\":\"\",\"dl_speed\":{},\"downloaded\":{},\"files\":\"\",\"flags\":\"{f}\",\"flags_desc\":\"\",\"ip\":\"{f}\",\"port\":{},\"progress\":{d:.4},\"relevance\":1,\"up_speed\":{},\"uploaded\":{},\"upload_only\":{}}}", .{
                 esc(peer.ip),
                 esc(peer.client),
                 peer.dl_speed,
@@ -1171,6 +1172,7 @@ pub const ApiHandler = struct {
                 peer.progress,
                 peer.ul_speed,
                 peer.uploaded,
+                peer.upload_only,
             }) catch {};
         }
 
@@ -1416,9 +1418,10 @@ fn serializeTorrentInfo(allocator: std.mem.Allocator, json: *std.ArrayList(u8), 
 
     try json.print(
         allocator,
-        ",\"f_l_piece_prio\":false,\"force_start\":false,\"super_seeding\":{s},\"auto_tmm\":false,\"category\":\"{f}\",\"tags\":\"{f}\",\"tracker\":\"{f}\",\"trackers_count\":{},\"amount_left\":{},\"completed\":{},\"downloaded\":{},\"downloaded_session\":{},\"uploaded\":{},\"uploaded_session\":{},\"time_active\":{},\"seeding_time\":{},\"last_activity\":{},\"seen_complete\":-1,\"priority\":0,\"availability\":-1,\"max_ratio\":-1,\"max_seeding_time\":-1,\"ratio_limit\":-1,\"seeding_time_limit\":-1,\"popularity\":0,\"magnet_uri\":\"{f}\",\"reannounce\":0}}",
+        ",\"f_l_piece_prio\":false,\"force_start\":false,\"super_seeding\":{s},\"partial_seed\":{s},\"auto_tmm\":false,\"category\":\"{f}\",\"tags\":\"{f}\",\"tracker\":\"{f}\",\"trackers_count\":{},\"amount_left\":{},\"completed\":{},\"downloaded\":{},\"downloaded_session\":{},\"uploaded\":{},\"uploaded_session\":{},\"time_active\":{},\"seeding_time\":{},\"last_activity\":{},\"seen_complete\":-1,\"priority\":0,\"availability\":-1,\"max_ratio\":-1,\"max_seeding_time\":-1,\"ratio_limit\":-1,\"seeding_time_limit\":-1,\"popularity\":0,\"magnet_uri\":\"{f}\",\"reannounce\":0}}",
         .{
             @as([]const u8, if (stat.super_seeding) "true" else "false"),
+            @as([]const u8, if (stat.partial_seed) "true" else "false"),
             esc(stat.category),
             esc(stat.tags),
             esc(stat.tracker),

@@ -350,6 +350,20 @@ pub const PieceTracker = struct {
         return self.wantedRemaining() == 0;
     }
 
+    /// BEP 21: returns true when all *wanted* pieces are complete but there are
+    /// pieces in the torrent we don't have (i.e., we have a selective download
+    /// mask and all masked-in pieces are done, but the torrent is not fully
+    /// complete). This makes us a "partial seed".
+    pub fn isPartialSeed(self: *PieceTracker) bool {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        // Must have a wanted mask with fewer pieces than the full torrent
+        const w = self.wanted orelse return false;
+        if (w.count >= self.piece_count) return false;
+        // All wanted pieces must be complete
+        return self.wantedRemaining() == 0 and self.complete.count < self.piece_count;
+    }
+
     pub fn completedCount(self: *PieceTracker) u32 {
         self.mutex.lock();
         defer self.mutex.unlock();
@@ -674,4 +688,94 @@ test "isComplete with wanted mask ignores unwanted pieces" {
 
     // Pieces 1, 2, 3 are not complete but also not wanted
     try std.testing.expectEqual(@as(u32, 1), tracker.completedCount());
+}
+
+// ── BEP 21: Partial Seed Tests ─────────────────────────
+
+test "isPartialSeed returns false without wanted mask" {
+    var bf = try Bitfield.init(std.testing.allocator, 4);
+    defer bf.deinit(std.testing.allocator);
+
+    var tracker = try PieceTracker.init(std.testing.allocator, 4, 4, 16, &bf, 0);
+    defer tracker.deinit(std.testing.allocator);
+
+    // No wanted mask -- even if all pieces complete, not a partial seed
+    _ = tracker.completePiece(0, 4);
+    _ = tracker.completePiece(1, 4);
+    _ = tracker.completePiece(2, 4);
+    _ = tracker.completePiece(3, 4);
+    try std.testing.expect(!tracker.isPartialSeed());
+}
+
+test "isPartialSeed returns false when wanted mask covers all pieces" {
+    var bf = try Bitfield.init(std.testing.allocator, 4);
+    defer bf.deinit(std.testing.allocator);
+
+    var tracker = try PieceTracker.init(std.testing.allocator, 4, 4, 16, &bf, 0);
+    defer tracker.deinit(std.testing.allocator);
+
+    // Want all 4 pieces -- full seed, not partial
+    var wanted = try Bitfield.init(std.testing.allocator, 4);
+    try wanted.set(0);
+    try wanted.set(1);
+    try wanted.set(2);
+    try wanted.set(3);
+    tracker.setWanted(wanted);
+
+    _ = tracker.completePiece(0, 4);
+    _ = tracker.completePiece(1, 4);
+    _ = tracker.completePiece(2, 4);
+    _ = tracker.completePiece(3, 4);
+    try std.testing.expect(!tracker.isPartialSeed());
+}
+
+test "isPartialSeed returns true when wanted pieces complete but torrent incomplete" {
+    var bf = try Bitfield.init(std.testing.allocator, 4);
+    defer bf.deinit(std.testing.allocator);
+
+    var tracker = try PieceTracker.init(std.testing.allocator, 4, 4, 16, &bf, 0);
+    defer tracker.deinit(std.testing.allocator);
+
+    // Want only pieces 0 and 1 (selective download)
+    var wanted = try Bitfield.init(std.testing.allocator, 4);
+    try wanted.set(0);
+    try wanted.set(1);
+    tracker.setWanted(wanted);
+
+    // Complete only the wanted pieces
+    _ = tracker.completePiece(0, 4);
+    try std.testing.expect(!tracker.isPartialSeed()); // not yet -- piece 1 still missing
+
+    _ = tracker.completePiece(1, 4);
+    try std.testing.expect(tracker.isPartialSeed()); // all wanted done, 2 & 3 missing
+
+    // Also verify isComplete returns true (all wanted are done)
+    try std.testing.expect(tracker.isComplete());
+    // But total completion is only 2 of 4
+    try std.testing.expectEqual(@as(u32, 2), tracker.completedCount());
+}
+
+test "isPartialSeed transitions to false when all pieces complete" {
+    var bf = try Bitfield.init(std.testing.allocator, 4);
+    defer bf.deinit(std.testing.allocator);
+
+    var tracker = try PieceTracker.init(std.testing.allocator, 4, 4, 16, &bf, 0);
+    defer tracker.deinit(std.testing.allocator);
+
+    // Want only pieces 0 and 1
+    var wanted = try Bitfield.init(std.testing.allocator, 4);
+    try wanted.set(0);
+    try wanted.set(1);
+    tracker.setWanted(wanted);
+
+    _ = tracker.completePiece(0, 4);
+    _ = tracker.completePiece(1, 4);
+    try std.testing.expect(tracker.isPartialSeed());
+
+    // Complete remaining pieces (e.g., user changed file priorities)
+    _ = tracker.completePiece(2, 4);
+    _ = tracker.completePiece(3, 4);
+    // Still partial seed because wanted mask only covers 2 pieces
+    // but all pieces are complete, so complete.count == piece_count
+    try std.testing.expect(!tracker.isPartialSeed());
 }

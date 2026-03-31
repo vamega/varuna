@@ -155,10 +155,13 @@ pub fn processMessage(self: *EventLoop, slot: u16) void {
                     return;
                 };
                 peer.extension_ids = result.handshake.extensions;
-                log.debug("slot {d}: peer extensions: ut_metadata={d} ut_pex={d} client={s}", .{
+                // BEP 21: store upload_only (partial seed) flag
+                peer.upload_only = result.handshake.upload_only;
+                log.debug("slot {d}: peer extensions: ut_metadata={d} ut_pex={d} upload_only={} client={s}", .{
                     slot,
                     result.handshake.extensions.ut_metadata,
                     result.handshake.extensions.ut_pex,
+                    result.handshake.upload_only,
                     result.handshake.client,
                 });
                 ext.freeDecoded(self.allocator, &result);
@@ -355,6 +358,7 @@ pub fn submitMessage(self: *EventLoop, slot: u16, id: u8, payload: []const u8) !
 
 /// Send our BEP 10 extension handshake as a tracked (heap-allocated) send.
 /// Includes metadata_size (BEP 9) if we have the torrent's info dictionary.
+/// Includes upload_only (BEP 21) if we are a partial seed.
 pub fn submitExtensionHandshake(self: *EventLoop, slot: u16) !void {
     const peer = &self.peers[slot];
     // Check if the torrent is private (BEP 27: don't advertise ut_pex)
@@ -369,8 +373,10 @@ pub fn submitExtensionHandshake(self: *EventLoop, slot: u16) !void {
         }
         break :blk 0;
     } else 0;
+    // BEP 21: advertise upload_only when we are a partial seed
+    const am_upload_only = if (tc) |t| t.upload_only else false;
     // Encode the bencoded extension handshake payload
-    const ext_payload = try ext.encodeExtensionHandshakeWithMetadata(self.allocator, self.port, is_private, metadata_size);
+    const ext_payload = try ext.encodeExtensionHandshakeFull(self.allocator, self.port, is_private, metadata_size, am_upload_only);
     defer self.allocator.free(ext_payload);
 
     // Build the full framed message: 4-byte len | msg_id=20 | sub_id=0 | payload

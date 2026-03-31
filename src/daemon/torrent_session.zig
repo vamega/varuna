@@ -56,6 +56,9 @@ pub const Stats = struct {
     is_private: bool = false,
     /// Whether BEP 16 super-seeding is enabled.
     super_seeding: bool = false,
+    /// BEP 21: whether we are a partial seed (upload_only). All wanted
+    /// files are complete but not all pieces in the torrent.
+    partial_seed: bool = false,
     /// Tracker scrape result: seeders, leechers, snatches.
     scrape_complete: u32 = 0,
     scrape_incomplete: u32 = 0,
@@ -543,6 +546,14 @@ pub const TorrentSession = struct {
             self.state = .seeding;
         }
 
+        // BEP 21: detect partial seed state (selective download complete)
+        if (self.piece_tracker) |*pt| {
+            const is_ps = pt.isPartialSeed();
+            if (is_ps and self.state == .downloading) {
+                self.state = .seeding;
+            }
+        }
+
         // Read speed stats from the event loop
         const speed_stats = if (self.shared_event_loop) |sel|
             if (self.torrent_id_in_shared) |tid| sel.getSpeedStats(tid) else @import("../io/event_loop.zig").SpeedStats{}
@@ -622,6 +633,7 @@ pub const TorrentSession = struct {
             .is_private = self.is_private,
             .super_seeding = self.super_seeding,
             .info_hash_v2 = self.info_hash_v2,
+            .partial_seed = if (self.piece_tracker) |*pt| pt.isPartialSeed() else false,
             .scrape_complete = if (self.scrape_result) |sr| sr.complete else 0,
             .scrape_incomplete = if (self.scrape_result) |sr| sr.incomplete else 0,
             .scrape_downloaded = if (self.scrape_result) |sr| sr.downloaded else 0,

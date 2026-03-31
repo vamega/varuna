@@ -56,6 +56,9 @@ pub const ExtensionHandshake = struct {
     client: []const u8 = "",
     /// Size of the info dictionary (for ut_metadata / BEP 9).
     metadata_size: u32 = 0,
+    /// BEP 21: peer is a partial seed (upload_only). When true, the peer has
+    /// some pieces and is willing to upload but is not interested in downloading.
+    upload_only: bool = false,
 };
 
 /// Check whether a peer's reserved bytes indicate BEP 10 support.
@@ -83,8 +86,14 @@ pub fn encodeExtensionHandshake(allocator: std.mem.Allocator, listen_port: u16, 
     return encodeExtensionHandshakeWithMetadata(allocator, listen_port, is_private, 0);
 }
 
-/// Encode extension handshake with optional metadata_size (BEP 9).
+/// Encode extension handshake with optional metadata_size (BEP 9) and upload_only (BEP 21).
 pub fn encodeExtensionHandshakeWithMetadata(allocator: std.mem.Allocator, listen_port: u16, is_private: bool, metadata_size: u32) ![]u8 {
+    return encodeExtensionHandshakeFull(allocator, listen_port, is_private, metadata_size, false);
+}
+
+/// Encode extension handshake with all optional fields.
+/// When `upload_only` is true, the handshake includes `upload_only: 1` (BEP 21).
+pub fn encodeExtensionHandshakeFull(allocator: std.mem.Allocator, listen_port: u16, is_private: bool, metadata_size: u32, upload_only: bool) ![]u8 {
     // Build the "m" dictionary entries: extension name -> our local ID.
     // For private torrents, don't advertise ut_pex (BEP 27).
     const m_count: usize = if (is_private) 1 else 2;
@@ -98,8 +107,10 @@ pub fn encodeExtensionHandshakeWithMetadata(allocator: std.mem.Allocator, listen
     }
 
     // Top-level dictionary entries.  Bencode dictionaries should have
-    // keys in sorted order: "m" < "metadata_size" < "p" < "v".
-    const entry_count: usize = if (metadata_size > 0) 4 else 3;
+    // keys in sorted order: "m" < "metadata_size" < "p" < "upload_only" < "v".
+    var entry_count: usize = 3; // m, p, v (always present)
+    if (metadata_size > 0) entry_count += 1;
+    if (upload_only) entry_count += 1;
     var entries = try allocator.alloc(bencode.Value.Entry, entry_count);
     defer allocator.free(entries);
 
@@ -112,6 +123,10 @@ pub fn encodeExtensionHandshakeWithMetadata(allocator: std.mem.Allocator, listen
     }
     entries[idx] = .{ .key = "p", .value = .{ .integer = @as(i64, listen_port) } };
     idx += 1;
+    if (upload_only) {
+        entries[idx] = .{ .key = "upload_only", .value = .{ .integer = 1 } };
+        idx += 1;
+    }
     entries[idx] = .{ .key = "v", .value = .{ .bytes = client_version } };
 
     return bencode_encode.encode(allocator, .{ .dict = entries });
@@ -174,6 +189,13 @@ pub fn decodeExtensionHandshake(allocator: std.mem.Allocator, data: []const u8) 
     if (bencode.dictGet(dict, "metadata_size")) |v| {
         if (v == .integer and v.integer >= 0 and v.integer <= std.math.maxInt(u32)) {
             result.metadata_size = @intCast(v.integer);
+        }
+    }
+
+    // Parse "upload_only" (BEP 21: partial seed)
+    if (bencode.dictGet(dict, "upload_only")) |v| {
+        if (v == .integer) {
+            result.upload_only = v.integer != 0;
         }
     }
 
@@ -411,4 +433,67 @@ test "extension handshake decoder handles truncated valid input" {
         var result = decodeExtensionHandshake(std.testing.allocator, valid[0..i]) catch continue;
         freeDecoded(std.testing.allocator, &result);
     }
+}
+
+// ── BEP 21: upload_only / partial seed tests ────────────
+
+test "decode extension handshake with upload_only=1" {
+    const input = "d1:md11:ut_metadatai1ee1:pi6881e11:upload_onlyi1e1:v6:varunae";
+    var result = try decodeExtensionHandshake(std.testing.allocator, input);
+    defer freeDecoded(std.testing.allocator, &result);
+
+    try std.testing.expect(result.handshake.upload_only);
+    try std.testing.expectEqual(@as(u8, 1), result.handshake.extensions.ut_metadata);
+    try std.testing.expectEqual(@as(u16, 6881), result.handshake.port);
+}
+
+test "decode extension handshake with upload_only=0" {
+    const input = "d1:md11:ut_metadatai1ee11:upload_onlyi0ee";
+    var result = try decodeExtensionHandshake(std.testing.allocator, input);
+    defer freeDecoded(std.testing.allocator, &result);
+
+    try std.testing.expect(!result.handshake.upload_only);
+}
+
+test "decode extension handshake without upload_only defaults to false" {
+    const input = "d1:md11:ut_metadatai1ee1:pi6881ee";
+    var result = try decodeExtensionHandshake(std.testing.allocator, input);
+    defer freeDecoded(std.testing.allocator, &result);
+
+    try std.testing.expect(!result.handshake.upload_only);
+}
+
+test "encode extension handshake with upload_only" {
+    const payload = try encodeExtensionHandshakeFull(std.testing.allocator, 6881, false, 0, true);
+    defer std.testing.allocator.free(payload);
+
+    var result = try decodeExtensionHandshake(std.testing.allocator, payload);
+    defer freeDecoded(std.testing.allocator, &result);
+
+    try std.testing.expect(result.handshake.upload_only);
+    try std.testing.expectEqual(@as(u16, 6881), result.handshake.port);
+}
+
+test "encode extension handshake without upload_only omits key" {
+    const payload = try encodeExtensionHandshakeFull(std.testing.allocator, 6881, false, 0, false);
+    defer std.testing.allocator.free(payload);
+
+    // The bencoded output should not contain "upload_only"
+    try std.testing.expect(std.mem.indexOf(u8, payload, "upload_only") == null);
+
+    var result = try decodeExtensionHandshake(std.testing.allocator, payload);
+    defer freeDecoded(std.testing.allocator, &result);
+    try std.testing.expect(!result.handshake.upload_only);
+}
+
+test "encode extension handshake with upload_only and metadata_size" {
+    const payload = try encodeExtensionHandshakeFull(std.testing.allocator, 6881, false, 42000, true);
+    defer std.testing.allocator.free(payload);
+
+    var result = try decodeExtensionHandshake(std.testing.allocator, payload);
+    defer freeDecoded(std.testing.allocator, &result);
+
+    try std.testing.expect(result.handshake.upload_only);
+    try std.testing.expectEqual(@as(u32, 42000), result.handshake.metadata_size);
+    try std.testing.expectEqual(@as(u16, 6881), result.handshake.port);
 }
