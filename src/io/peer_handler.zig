@@ -4,6 +4,7 @@ const linux = std.os.linux;
 const log = std.log.scoped(.event_loop);
 const pw = @import("../net/peer_wire.zig");
 const ext = @import("../net/extensions.zig");
+const mse = @import("../crypto/mse.zig");
 const EventLoop = @import("event_loop.zig").EventLoop;
 const Peer = @import("event_loop.zig").Peer;
 const encodeUserData = @import("event_loop.zig").encodeUserData;
@@ -94,6 +95,8 @@ pub fn handleConnect(self: *EventLoop, slot: u16, cqe: linux.io_uring_cqe) void 
     @memcpy(buf[28..48], tc.info_hash[0..]);
     @memcpy(buf[48..68], tc.peer_id[0..]);
     @memcpy(peer.handshake_buf[0..68], &buf);
+    // MSE/PE: encrypt handshake before sending
+    peer.crypto.encryptBuf(peer.handshake_buf[0..68]);
 
     const ud = encodeUserData(.{ .slot = slot, .op_type = .peer_send, .context = 0 });
     _ = self.ring.send(ud, peer.fd, peer.handshake_buf[0..68], 0) catch {
@@ -211,6 +214,28 @@ pub fn handleRecv(self: *EventLoop, slot: u16, cqe: linux.io_uring_cqe) void {
         return;
     };
 
+    // MSE/PE (BEP 6): decrypt newly received bytes in-place when crypto is active.
+    // This happens transparently before any protocol parsing.
+    if (peer.crypto.isEncrypted()) {
+        switch (peer.state) {
+            .handshake_recv, .inbound_handshake_recv => {
+                const start = peer.handshake_offset;
+                peer.crypto.decryptBuf(peer.handshake_buf[start .. start + n]);
+            },
+            .active_recv_header => {
+                const start = peer.header_offset;
+                peer.crypto.decryptBuf(peer.header_buf[start .. start + n]);
+            },
+            .active_recv_body => {
+                if (peer.body_buf) |buf| {
+                    const start = peer.body_offset;
+                    peer.crypto.decryptBuf(buf[start .. start + n]);
+                }
+            },
+            else => {},
+        }
+    }
+
     switch (peer.state) {
         .handshake_recv => {
             peer.handshake_offset += n;
@@ -286,6 +311,8 @@ pub fn handleRecv(self: *EventLoop, slot: u16, cqe: linux.io_uring_cqe) void {
             @memcpy(buf[28..48], &resp_tc.info_hash);
             @memcpy(buf[48..68], &resp_tc.peer_id);
             @memcpy(peer.handshake_buf[0..68], &buf);
+            // MSE/PE: encrypt handshake before sending
+            peer.crypto.encryptBuf(peer.handshake_buf[0..68]);
             const ud = encodeUserData(.{ .slot = slot, .op_type = .peer_send, .context = 0 });
             _ = self.ring.send(ud, peer.fd, peer.handshake_buf[0..68], 0) catch {
                 self.removePeer(slot);

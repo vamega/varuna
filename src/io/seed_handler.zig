@@ -254,6 +254,9 @@ pub fn flushQueuedResponses(self: *EventLoop) void {
 
         peer.bytes_uploaded_to += total_uploaded;
 
+        // MSE/PE: encrypt the entire batch buffer before sending
+        peer.crypto.encryptBuf(send_buf);
+
         const ts = self.nextTrackedSendUserData(current_slot);
         self.pending_sends.append(self.allocator, .{
             .buf = send_buf,
@@ -307,6 +310,9 @@ fn sendPieceBlockData(self: *EventLoop, slot: u16, piece_index: u32, block_offse
     // Consume upload tokens
     _ = self.consumeUploadTokens(peer.torrent_id, block_length);
     peer.bytes_uploaded_to += block_length;
+
+    // MSE/PE: encrypt the send buffer before sending
+    peer.crypto.encryptBuf(send_buf);
 
     const ts = self.nextTrackedSendUserData(slot);
     self.pending_sends.append(self.allocator, .{

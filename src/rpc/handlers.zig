@@ -5,6 +5,7 @@ const multipart = @import("multipart.zig");
 const sync_mod = @import("sync.zig");
 const json_mod = @import("json.zig");
 const compat = @import("compat.zig");
+const mse = @import("../crypto/mse.zig");
 const SessionManager = @import("../daemon/session_manager.zig").SessionManager;
 const TorrentSession = @import("../daemon/torrent_session.zig");
 const metainfo_mod = @import("../torrent/metainfo.zig");
@@ -397,6 +398,14 @@ pub const ApiHandler = struct {
         const esc = json_mod.jsonSafe;
         const save_path = self.session_manager.default_save_path;
 
+        // qBittorrent encryption: 0 = prefer, 1 = force, 2 = disable
+        const enc_mode: u8 = if (el) |e| switch (e.encryption_mode) {
+            .forced => 1,
+            .preferred => 0,
+            .enabled => 0,
+            .disabled => 2,
+        } else 0;
+
         const body = std.fmt.allocPrint(allocator,
             \\{{"dl_limit":{},"up_limit":{},"alt_dl_limit":0,"alt_up_limit":0,
             \\"save_path":"{f}","temp_path":"","temp_path_enabled":false,
@@ -420,8 +429,8 @@ pub const ApiHandler = struct {
             \\"max_seeding_time_enabled":false,"max_seeding_time":-1,
             \\"auto_tmm_enabled":false,"save_resume_data_interval":60,
             \\"start_paused_enabled":false,
-            \\"dht":false,"pex":false,"lsd":false,"encryption":0,"anonymous_mode":false}}
-        , .{ dl_limit, ul_limit, esc(save_path) }) catch
+            \\"dht":false,"pex":false,"lsd":false,"encryption":{},"anonymous_mode":false}}
+        , .{ dl_limit, ul_limit, esc(save_path), enc_mode }) catch
             return .{ .status = 500, .body = "{\"error\":\"internal\"}" };
         return .{ .body = body, .owned_body = body };
     }
