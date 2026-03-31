@@ -20,6 +20,7 @@ pub fn torrentStateString(state: TorrentState, progress: f64) []const u8 {
         .paused => if (progress >= 1.0) "pausedUP" else "pausedDL",
         .stopped => if (progress >= 1.0) "stoppedUP" else "stoppedDL",
         .checking => if (progress >= 1.0) "checkingUP" else "checkingDL",
+        .metadata_fetching => "metaDL",
         .@"error" => "error",
     };
 }
