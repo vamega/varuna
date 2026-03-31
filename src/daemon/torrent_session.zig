@@ -85,7 +85,6 @@ pub const Stats = struct {
     content_path: []const u8 = "",
     /// Number of files in this torrent.
     num_files: u32 = 0,
->>>>>>> worktree-agent-a67f0ce6
 };
 
 pub const TorrentSession = struct {
