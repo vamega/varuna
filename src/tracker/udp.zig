@@ -134,16 +134,7 @@ pub fn parseUdpUrl(url: []const u8) ?ParsedUdpUrl {
 }
 
 pub fn resolveAddress(allocator: std.mem.Allocator, host: []const u8, port: u16) !std.net.Address {
-    if (std.net.Address.parseIp4(host, port)) |addr| return addr else |_| {}
-    if (std.net.Address.parseIp6(host, port)) |addr| return addr else |_| {}
-
-    const host_z = try allocator.dupeZ(u8, host);
-    defer allocator.free(host_z);
-
-    const list = try std.net.getAddressList(std.heap.page_allocator, host_z, port);
-    defer list.deinit();
-    if (list.addrs.len == 0) return error.DnsResolutionFailed;
-    return list.addrs[0];
+    return @import("../io/dns.zig").resolveOnce(allocator, host, port);
 }
 
 fn eventToInt(event: ?announce_mod.Request.Event) u32 {
