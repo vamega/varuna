@@ -441,7 +441,7 @@ fn handlePexMessage(self: *EventLoop, slot: u16, payload: []const u8) void {
 }
 
 /// Check if we already have a connection to the given address for this torrent.
-fn isPeerAlreadyConnected(self: *EventLoop, torrent_id: EventLoop.TorrentId, addr: std.net.Address) bool {
+fn isPeerAlreadyConnected(self: *EventLoop, torrent_id: u32, addr: std.net.Address) bool {
     for (self.active_peer_slots.items) |slot| {
         const p = &self.peers[slot];
         if (p.state == .free) continue;

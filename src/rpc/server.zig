@@ -16,6 +16,7 @@ pub const ApiServer = struct {
     allocator: std.mem.Allocator,
     listen_fd: posix.fd_t = -1,
     clients: [max_api_clients]ApiClient = [_]ApiClient{.{}} ** max_api_clients,
+    client_generations: [max_api_clients]u32 = [_]u32{0} ** max_api_clients,
     handler: *const fn (std.mem.Allocator, Request) Response = defaultHandler,
     running: bool = true,
 
@@ -27,9 +28,8 @@ pub const ApiServer = struct {
     /// systemd socket activation). The caller retains ownership of the fd;
     /// deinit() will close it.
     pub fn initWithFd(allocator: std.mem.Allocator, listen_fd: posix.fd_t) !ApiServer {
-        const ring = try Ring.init(64);
         return .{
-            .ring = ring,
+            .ring = try Ring.init(64),
             .allocator = allocator,
             .listen_fd = listen_fd,
         };
@@ -127,48 +127,43 @@ pub const ApiServer = struct {
 
     // ── CQE dispatch ──────────────────────────────────────
 
-    // user_data encoding: bits[63:8] = slot, bits[7:0] = op
+    // user_data encoding: bits[63:16] = generation, bits[15:8] = slot, bits[7:0] = op
     const OP_ACCEPT: u8 = 1;
     const OP_RECV: u8 = 2;
     const OP_SEND: u8 = 3;
 
-    fn encodeUd(slot: u8, op: u8) u64 {
-        return (@as(u64, slot) << 8) | op;
+    fn encodeUd(slot: u8, generation: u32, op: u8) u64 {
+        return (@as(u64, generation) << 16) | (@as(u64, slot) << 8) | op;
     }
 
     fn dispatch(self: *ApiServer, cqe: linux.io_uring_cqe) void {
         const op: u8 = @intCast(cqe.user_data & 0xFF);
         const slot: u8 = @intCast((cqe.user_data >> 8) & 0xFF);
-
+        const generation: u32 = @intCast(cqe.user_data >> 16);
         switch (op) {
             OP_ACCEPT => self.handleAccept(cqe),
-            OP_RECV => self.handleRecv(slot, cqe),
-            OP_SEND => self.handleSend(slot, cqe),
+            OP_RECV => self.handleRecv(slot, generation, cqe),
+            OP_SEND => self.handleSend(slot, generation, cqe),
             else => {},
         }
     }
 
     fn handleAccept(self: *ApiServer, cqe: linux.io_uring_cqe) void {
+        const more = (cqe.flags & linux.IORING_CQE_F_MORE) != 0;
         if (cqe.res < 0) {
-            self.submitAccept() catch {};
+            if (!more) self.submitAccept() catch {};
             return;
         }
         const new_fd: posix.fd_t = @intCast(cqe.res);
 
         const slot = self.allocClientSlot() orelse {
             _ = self.ring.inner.close(0, new_fd) catch {};
-            self.submitAccept() catch {};
+            if (!more) self.submitAccept() catch {};
             return;
         };
 
-        var client = &self.clients[slot];
+        const client = &self.clients[slot];
         client.fd = new_fd;
-        client.recv_buf = self.allocator.alloc(u8, recv_buf_size) catch {
-            _ = self.ring.inner.close(0, new_fd) catch {};
-            client.fd = -1;
-            self.submitAccept() catch {};
-            return;
-        };
         client.recv_offset = 0;
 
         // Submit recv for request
@@ -176,27 +171,33 @@ pub const ApiServer = struct {
             self.closeClient(slot);
         };
 
-        // Re-submit accept
-        self.submitAccept() catch {};
+        if (!more) self.submitAccept() catch {};
     }
 
-    fn handleRecv(self: *ApiServer, slot: u8, cqe: linux.io_uring_cqe) void {
+    fn handleRecv(self: *ApiServer, slot: u8, generation: u32, cqe: linux.io_uring_cqe) void {
+        if (!self.isLiveClient(slot, generation)) return;
+        const client = &self.clients[slot];
         if (cqe.res <= 0) {
             self.closeClient(slot);
             return;
         }
-        var client = &self.clients[slot];
-        const n: usize = @intCast(cqe.res);
-        client.recv_offset += n;
+        client.recv_offset += @intCast(cqe.res);
 
-        const data = client.recv_buf.?[0..client.recv_offset];
+        const data = recvData(client);
 
         // First, we need the headers (terminated by \r\n\r\n)
         const header_end = std.mem.indexOf(u8, data, "\r\n\r\n") orelse {
             // Haven't received complete headers yet
-            if (client.recv_offset >= data.len) {
+            if (client.recv_offset >= max_request_size) {
                 self.sendErrorResponse(slot, 413, "Request Too Large");
             } else {
+                if (client.recv_offset == recvStorage(client).len) {
+                    const next_capacity = @min(max_request_size, recvStorage(client).len * 2);
+                    ensureRecvCapacity(self, client, next_capacity) catch {
+                        self.sendErrorResponse(slot, 500, "Internal Server Error");
+                        return;
+                    };
+                }
                 self.submitRecv(slot) catch {
                     self.closeClient(slot);
                 };
@@ -224,14 +225,13 @@ pub const ApiServer = struct {
                     return;
                 }
 
-                if (total_needed > client.recv_buf.?.len) {
-                    // Grow the buffer
-                    const new_buf = self.allocator.realloc(client.recv_buf.?, total_needed) catch {
-                        self.sendErrorResponse(slot, 500, "Internal Server Error");
-                        return;
-                    };
-                    client.recv_buf = new_buf;
-                }
+                ensureRecvCapacity(self, client, total_needed) catch |err| {
+                    switch (err) {
+                        error.RequestTooLarge => self.sendErrorResponse(slot, 413, "Request Too Large"),
+                        else => self.sendErrorResponse(slot, 500, "Internal Server Error"),
+                    }
+                    return;
+                };
 
                 self.submitRecv(slot) catch {
                     self.closeClient(slot);
@@ -250,7 +250,8 @@ pub const ApiServer = struct {
         self.sendResponse(slot, response);
     }
 
-    fn handleSend(self: *ApiServer, slot: u8, cqe: linux.io_uring_cqe) void {
+    fn handleSend(self: *ApiServer, slot: u8, generation: u32, cqe: linux.io_uring_cqe) void {
+        if (!self.isLiveClient(slot, generation)) return;
         if (cqe.res <= 0) {
             self.closeClient(slot);
             return;
@@ -275,15 +276,16 @@ pub const ApiServer = struct {
     // ── SQE helpers ───────────────────────────────────────
 
     pub fn submitAccept(self: *ApiServer) !void {
-        const ud = encodeUd(0, OP_ACCEPT);
-        _ = try self.ring.inner.accept(ud, self.listen_fd, null, null, posix.SOCK.CLOEXEC);
+        const ud = encodeUd(0, 0, OP_ACCEPT);
+        _ = try self.ring.inner.accept_multishot(ud, self.listen_fd, null, null, posix.SOCK.CLOEXEC);
     }
 
     fn submitRecv(self: *ApiServer, slot: u8) !void {
         const client = &self.clients[slot];
-        const buf = client.recv_buf orelse return;
-        const ud = encodeUd(slot, OP_RECV);
-        _ = try self.ring.inner.recv(ud, client.fd, .{ .buffer = buf[client.recv_offset..] }, 0);
+        if (client.fd < 0) return error.InvalidClientSlot;
+        const ud = encodeUd(slot, self.client_generations[slot], OP_RECV);
+        const storage = recvStorage(client);
+        _ = try self.ring.inner.recv(ud, client.fd, .{ .buffer = storage[client.recv_offset..] }, 0);
     }
 
     fn submitSend(self: *ApiServer, slot: u8) !void {
@@ -316,7 +318,7 @@ pub const ApiServer = struct {
             .controllen = 0,
             .flags = 0,
         };
-        const ud = encodeUd(slot, OP_SEND);
+        const ud = encodeUd(slot, self.client_generations[slot], OP_SEND);
         _ = try self.ring.inner.sendmsg(ud, client.fd, &client.send_msg, 0);
     }
 
@@ -379,9 +381,17 @@ pub const ApiServer = struct {
 
     fn allocClientSlot(self: *ApiServer) ?u8 {
         for (&self.clients, 0..) |*client, i| {
-            if (client.fd < 0) return @intCast(i);
+            if (client.fd < 0) {
+                self.client_generations[i] +%= 1;
+                if (self.client_generations[i] == 0) self.client_generations[i] = 1;
+                return @intCast(i);
+            }
         }
         return null;
+    }
+
+    fn isLiveClient(self: *const ApiServer, slot: u8, generation: u32) bool {
+        return self.client_generations[slot] == generation and self.clients[slot].fd >= 0;
     }
 };
 
@@ -407,6 +417,7 @@ pub const Response = struct {
 pub const ApiClient = struct {
     fd: posix.fd_t = -1,
     recv_buf: ?[]u8 = null,
+    recv_inline: [recv_buf_size]u8 = undefined,
     recv_offset: usize = 0,
     header_buf: ?[]u8 = null,
     header_offset: usize = 0,
@@ -416,6 +427,29 @@ pub const ApiClient = struct {
     send_iov: [2]posix.iovec_const = undefined,
     send_msg: posix.msghdr_const = std.mem.zeroes(posix.msghdr_const),
 };
+
+fn recvStorage(client: *ApiClient) []u8 {
+    return if (client.recv_buf) |buf| buf else client.recv_inline[0..];
+}
+
+fn recvData(client: *ApiClient) []u8 {
+    return recvStorage(client)[0..client.recv_offset];
+}
+
+fn ensureRecvCapacity(self: *ApiServer, client: *ApiClient, min_capacity: usize) !void {
+    if (min_capacity > max_request_size) return error.RequestTooLarge;
+    if (min_capacity <= recvStorage(client).len) return;
+
+    if (client.recv_buf) |buf| {
+        client.recv_buf = try self.allocator.realloc(buf, min_capacity);
+        return;
+    }
+
+    const new_capacity = @max(min_capacity, recv_buf_size * 2);
+    const new_buf = try self.allocator.alloc(u8, new_capacity);
+    @memcpy(new_buf[0..client.recv_offset], client.recv_inline[0..client.recv_offset]);
+    client.recv_buf = new_buf;
+}
 
 fn parseRequest(data: []const u8) ?Request {
     const header_end = std.mem.indexOf(u8, data, "\r\n\r\n") orelse return null;

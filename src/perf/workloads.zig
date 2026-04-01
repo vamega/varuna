@@ -1,4 +1,6 @@
 const std = @import("std");
+const posix = std.posix;
+const linux = std.os.linux;
 const varuna = @import("varuna");
 const CountingAllocator = @import("counting_allocator.zig").CountingAllocator;
 const Stats = @import("counting_allocator.zig").Stats;
@@ -6,6 +8,8 @@ const Stats = @import("counting_allocator.zig").Stats;
 const blocks = varuna.torrent.blocks;
 const rpc_server = varuna.rpc.server;
 const sync_mod = varuna.rpc.sync;
+const event_loop_mod = varuna.io.event_loop;
+const peer_handler = varuna.io.peer_handler;
 const SessionManager = varuna.daemon.session_manager.SessionManager;
 const TorrentSession = varuna.daemon.torrent_session.TorrentSession;
 
@@ -14,6 +18,8 @@ pub const Config = struct {
     scale: usize = 1,
     peers: usize = varuna.io.event_loop.max_peers,
     torrents: usize = 64,
+    clients: usize = 1,
+    body_bytes: usize = 0,
 };
 
 pub const Result = struct {
@@ -26,9 +32,12 @@ pub const Result = struct {
 
 pub const Scenario = enum {
     peer_scan,
+    peer_accept_burst,
     request_batch,
     seed_batch,
     http_response,
+    api_get_burst,
+    api_upload_burst,
     extension_decode,
     ut_metadata_decode,
     session_load,
@@ -54,9 +63,12 @@ pub fn run(
 
     return switch (scenario) {
         .peer_scan => runPeerScan(allocator, alloc_counter, iterations, config),
+        .peer_accept_burst => runPeerAcceptBurst(allocator, alloc_counter, iterations, config),
         .request_batch => runRequestBatch(allocator, alloc_counter, iterations, config),
         .seed_batch => runSeedBatch(allocator, alloc_counter, iterations, config),
         .http_response => runHttpResponse(allocator, alloc_counter, iterations, config),
+        .api_get_burst => runApiBurst(allocator, alloc_counter, iterations, config, .get),
+        .api_upload_burst => runApiBurst(allocator, alloc_counter, iterations, config, .upload),
         .extension_decode => runExtensionDecode(allocator, alloc_counter, iterations),
         .ut_metadata_decode => runUtMetadataDecode(allocator, alloc_counter, iterations),
         .session_load => runSessionLoad(allocator, alloc_counter, iterations),
@@ -208,6 +220,124 @@ fn runRequestBatch(
     return makeResult("request_batch", iterations, &timer, checksum, alloc_counter);
 }
 
+const PeerConnectWork = struct {
+    address: std.net.Address,
+    connects: usize,
+    remaining_workers: *std.atomic.Value(usize),
+    checksum: u64 = 0,
+};
+
+fn runPeerAcceptBurst(
+    allocator: std.mem.Allocator,
+    alloc_counter: *CountingAllocator,
+    iterations: usize,
+    config: Config,
+) !Result {
+    var event_loop = try event_loop_mod.EventLoop.initBare(allocator, 0);
+    defer event_loop.deinit();
+    event_loop.max_connections = @intCast(@max(iterations + config.clients * 4, 512));
+
+    const listen_fd = try createLoopbackListener();
+    try event_loop.ensureAccepting(listen_fd);
+    const port = try getListenPort(listen_fd);
+    const address = try std.net.Address.parseIp4("127.0.0.1", port);
+
+    const worker_count = @max(@min(config.clients, 32), 1);
+    const workers = try allocator.alloc(PeerConnectWork, worker_count);
+    defer allocator.free(workers);
+    const threads = try allocator.alloc(std.Thread, worker_count);
+    defer allocator.free(threads);
+
+    var remaining_workers = std.atomic.Value(usize).init(worker_count);
+
+    const base_connects = iterations / worker_count;
+    var remainder = iterations % worker_count;
+    for (workers) |*worker| {
+        worker.* = .{
+            .address = address,
+            .connects = base_connects + @intFromBool(remainder > 0),
+            .remaining_workers = &remaining_workers,
+        };
+        if (remainder > 0) remainder -= 1;
+    }
+
+    alloc_counter.stats = .{};
+    var timer = try std.time.Timer.start();
+
+    for (threads, workers) |*thread, *worker| {
+        thread.* = try std.Thread.spawn(.{}, peerConnectWorker, .{worker});
+    }
+
+    var accepted: usize = 0;
+    var recv_eof: usize = 0;
+    var idle_ticks: usize = 0;
+    var cqes: [64]linux.io_uring_cqe = undefined;
+
+    while (accepted < iterations or event_loop.peer_count != 0 or remaining_workers.load(.acquire) != 0) {
+        try event_loop.submitTimeout(1 * std.time.ns_per_ms);
+        _ = try event_loop.ring.submit_and_wait(1);
+
+        const count = try event_loop.ring.copy_cqes(&cqes, 0);
+        if (count == 0) {
+            idle_ticks += 1;
+        } else {
+            idle_ticks = 0;
+        }
+
+        for (cqes[0..count]) |cqe| {
+            const op = event_loop_mod.decodeUserData(cqe.user_data);
+            switch (op.op_type) {
+                .accept => {
+                    if (cqe.res >= 0) accepted += 1;
+                    peer_handler.handleAccept(&event_loop, cqe);
+                },
+                .peer_recv => {
+                    if (cqe.res == 0) recv_eof += 1;
+                    peer_handler.handleRecv(&event_loop, op.slot, cqe);
+                },
+                .peer_send => peer_handler.handleSend(&event_loop, op.slot, cqe),
+                .timeout => {
+                    event_loop.timeout_pending = false;
+                },
+                else => {},
+            }
+        }
+
+        _ = event_loop.ring.submit() catch {};
+
+        if (idle_ticks > 20_000) return error.BenchmarkTimeout;
+    }
+
+    var checksum: u64 = accepted;
+    checksum +%= recv_eof;
+    for (threads, workers) |*thread, *worker| {
+        thread.join();
+        checksum +%= worker.checksum;
+    }
+
+    return makeResult("peer_accept_burst", iterations, &timer, checksum, alloc_counter);
+}
+
+fn peerConnectWorker(work: *PeerConnectWork) void {
+    defer _ = work.remaining_workers.fetchSub(1, .acq_rel);
+
+    var checksum: u64 = 0;
+    for (0..work.connects) |_| {
+        const fd = posix.socket(posix.AF.INET, posix.SOCK.STREAM | posix.SOCK.CLOEXEC, posix.IPPROTO.TCP) catch |err| {
+            std.debug.panic("peer benchmark socket failed: {}", .{err});
+        };
+
+        posix.connect(fd, &work.address.any, work.address.getOsSockLen()) catch |err| {
+            posix.close(fd);
+            std.debug.panic("peer benchmark connect failed: {}", .{err});
+        };
+        checksum +%= @intCast(fd);
+        posix.close(fd);
+    }
+
+    work.checksum = checksum;
+}
+
 fn runSeedBatch(
     allocator: std.mem.Allocator,
     alloc_counter: *CountingAllocator,
@@ -349,6 +479,197 @@ fn runUtMetadataDecode(
     }
 
     return makeResult("ut_metadata_decode", iterations, &timer, checksum, alloc_counter);
+}
+
+const ApiBurstMode = enum {
+    get,
+    upload,
+};
+
+const ApiClientWork = struct {
+    address: std.net.Address,
+    requests: usize,
+    body: []const u8,
+    mode: ApiBurstMode,
+    checksum: u64 = 0,
+};
+
+fn runApiBurst(
+    allocator: std.mem.Allocator,
+    alloc_counter: *CountingAllocator,
+    iterations: usize,
+    config: Config,
+    mode: ApiBurstMode,
+) !Result {
+    var server = try rpc_server.ApiServer.init(allocator, "127.0.0.1", 0);
+    defer server.deinit();
+
+    server.setHandler(struct {
+        fn handle(_: std.mem.Allocator, request: rpc_server.Request) rpc_server.Response {
+            _ = request;
+            return .{
+                .status = 200,
+                .content_type = "application/json",
+                .body = "{\"ok\":true}",
+            };
+        }
+    }.handle);
+
+    const port = try getListenPort(server.listen_fd);
+    const address = try std.net.Address.parseIp4("127.0.0.1", port);
+    const client_threads = @max(@min(config.clients, 32), 1);
+    const upload_body_len = if (mode == .upload) blk: {
+        if (config.body_bytes != 0) break :blk config.body_bytes;
+        break :blk 64 * 1024 * @max(config.scale, 1);
+    } else 0;
+
+    var upload_body: []u8 = &.{};
+    if (upload_body_len > 0) {
+        upload_body = try std.heap.page_allocator.alloc(u8, upload_body_len);
+        for (upload_body, 0..) |*byte, idx| byte.* = @truncate(idx *% 31 +% 7);
+    }
+    defer if (upload_body_len > 0) std.heap.page_allocator.free(upload_body);
+
+    const workers = try allocator.alloc(ApiClientWork, client_threads);
+    defer allocator.free(workers);
+    const threads = try allocator.alloc(std.Thread, client_threads);
+    defer allocator.free(threads);
+
+    const base_requests = iterations / client_threads;
+    var remainder = iterations % client_threads;
+    for (workers) |*worker| {
+        worker.* = .{
+            .address = address,
+            .requests = base_requests + @intFromBool(remainder > 0),
+            .body = upload_body,
+            .mode = mode,
+        };
+        if (remainder > 0) remainder -= 1;
+    }
+
+    const server_thread = try std.Thread.spawn(.{}, struct {
+        fn run(api_server: *rpc_server.ApiServer) void {
+            api_server.run() catch |err| std.debug.panic("api server benchmark thread failed: {}", .{err});
+        }
+    }.run, .{&server});
+    defer {
+        server.stop();
+        wakeApiServer(address) catch {};
+        server_thread.join();
+    }
+
+    std.Thread.sleep(10 * std.time.ns_per_ms);
+    alloc_counter.stats = .{};
+
+    var timer = try std.time.Timer.start();
+    for (threads, workers) |*thread, *worker| {
+        thread.* = try std.Thread.spawn(.{}, apiClientWorker, .{worker});
+    }
+
+    var checksum: u64 = 0;
+    for (threads, workers) |*thread, *worker| {
+        thread.join();
+        checksum +%= worker.checksum;
+    }
+
+    return makeResult(
+        if (mode == .get) "api_get_burst" else "api_upload_burst",
+        iterations,
+        &timer,
+        checksum,
+        alloc_counter,
+    );
+}
+
+fn apiClientWorker(work: *ApiClientWork) void {
+    var response_buf: [4096]u8 = undefined;
+    var header_buf: [256]u8 = undefined;
+    var checksum: u64 = 0;
+
+    for (0..work.requests) |_| {
+        const fd = posix.socket(posix.AF.INET, posix.SOCK.STREAM | posix.SOCK.CLOEXEC, posix.IPPROTO.TCP) catch |err| {
+            std.debug.panic("api benchmark client socket failed: {}", .{err});
+        };
+        defer posix.close(fd);
+
+        posix.connect(fd, &work.address.any, work.address.getOsSockLen()) catch |err| {
+            std.debug.panic("api benchmark client connect failed: {}", .{err});
+        };
+
+        switch (work.mode) {
+            .get => writeAll(fd, "GET /api/v2/app/webapiVersion HTTP/1.1\r\nHost: localhost\r\n\r\n") catch |err| {
+                std.debug.panic("api benchmark GET write failed: {}", .{err});
+            },
+            .upload => {
+                const header = std.fmt.bufPrint(
+                    &header_buf,
+                    "POST /api/v2/torrents/add HTTP/1.1\r\nHost: localhost\r\nContent-Type: application/octet-stream\r\nContent-Length: {}\r\n\r\n",
+                    .{work.body.len},
+                ) catch |err| {
+                    std.debug.panic("api benchmark header build failed: {}", .{err});
+                };
+                writeAll(fd, header) catch |err| {
+                    std.debug.panic("api benchmark upload header write failed: {}", .{err});
+                };
+                writeAll(fd, work.body) catch |err| {
+                    std.debug.panic("api benchmark upload body write failed: {}", .{err});
+                };
+            },
+        }
+
+        const n = readUntilClose(fd, &response_buf) catch |err| {
+            std.debug.panic("api benchmark response read failed: {}", .{err});
+        };
+        checksum +%= std.hash.Wyhash.hash(0, response_buf[0..n]);
+    }
+
+    work.checksum = checksum;
+}
+
+fn writeAll(fd: posix.fd_t, data: []const u8) !void {
+    var written: usize = 0;
+    while (written < data.len) {
+        written += try posix.write(fd, data[written..]);
+    }
+}
+
+fn createLoopbackListener() !posix.fd_t {
+    const address = try std.net.Address.parseIp4("127.0.0.1", 0);
+    const fd = try posix.socket(
+        posix.AF.INET,
+        posix.SOCK.STREAM | posix.SOCK.CLOEXEC | posix.SOCK.NONBLOCK,
+        posix.IPPROTO.TCP,
+    );
+    errdefer posix.close(fd);
+
+    const enable: u32 = 1;
+    try posix.setsockopt(fd, posix.SOL.SOCKET, posix.SO.REUSEADDR, std.mem.asBytes(&enable));
+    try posix.bind(fd, &address.any, address.getOsSockLen());
+    try posix.listen(fd, 4096);
+    return fd;
+}
+
+fn readUntilClose(fd: posix.fd_t, buffer: []u8) !usize {
+    var total: usize = 0;
+    while (total < buffer.len) {
+        const n = try posix.read(fd, buffer[total..]);
+        if (n == 0) return total;
+        total += n;
+    }
+    return error.ResponseTooLarge;
+}
+
+fn getListenPort(fd: posix.fd_t) !u16 {
+    var addr: posix.sockaddr = undefined;
+    var addr_len: posix.socklen_t = @sizeOf(posix.sockaddr);
+    try posix.getsockname(fd, &addr, &addr_len);
+    return (std.net.Address{ .any = addr }).getPort();
+}
+
+fn wakeApiServer(address: std.net.Address) !void {
+    const fd = try posix.socket(posix.AF.INET, posix.SOCK.STREAM | posix.SOCK.CLOEXEC, posix.IPPROTO.TCP);
+    defer posix.close(fd);
+    posix.connect(fd, &address.any, address.getOsSockLen()) catch {};
 }
 
 fn runSessionLoad(

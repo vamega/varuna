@@ -38,6 +38,14 @@ pub fn main() !void {
             config.torrents = try std.fmt.parseUnsigned(usize, arg["--torrents=".len..], 10);
             continue;
         }
+        if (std.mem.startsWith(u8, arg, "--clients=")) {
+            config.clients = try std.fmt.parseUnsigned(usize, arg["--clients=".len..], 10);
+            continue;
+        }
+        if (std.mem.startsWith(u8, arg, "--body-bytes=")) {
+            config.body_bytes = try std.fmt.parseUnsigned(usize, arg["--body-bytes=".len..], 10);
+            continue;
+        }
         scenario = workloads.Scenario.parse(arg) orelse {
             std.debug.print("unknown scenario: {s}\n", .{arg});
             try printScenarioList();

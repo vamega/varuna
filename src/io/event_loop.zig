@@ -1439,7 +1439,7 @@ pub const EventLoop = struct {
     pub fn submitAccept(self: *EventLoop) !void {
         if (self.listen_fd < 0) return;
         const ud = encodeUserData(.{ .slot = 0, .op_type = .accept, .context = 0 });
-        _ = try self.ring.accept(ud, self.listen_fd, null, null, posix.SOCK.CLOEXEC | posix.SOCK.NONBLOCK);
+        _ = try self.ring.accept_multishot(ud, self.listen_fd, null, null, posix.SOCK.CLOEXEC | posix.SOCK.NONBLOCK);
     }
 
     /// Allocate a unique send_id for a new PendingSend and return the

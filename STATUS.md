@@ -31,7 +31,9 @@ Update it whenever a milestone lands, the near-term backlog changes, or a new op
 - **Dynamic shared-torrent registry**: the shared EventLoop now uses dynamic slot storage, free-list reuse, `u32` torrent IDs, and hashed info-hash lookup instead of the old fixed 64-slot table.
 - **Shared announce ring**: tracker announces reuse a single ring instead of spawning per-announce threads.
 - **Connection limits**: global (500), per-torrent (100), half-open (50). Announce jitter ±10% with initial stagger.
+- **Peer listener multishot accept**: the shared `EventLoop` listener now uses `accept_multishot` and only re-arms when the kernel ends the multishot stream.
 - **API vectored-send path**: the HTTP API server now sends headers and body as separate iovecs through `io_uring` `sendmsg` instead of concatenating them into one response buffer first.
+- **API listener multishot accept**: the RPC server now keeps one `accept_multishot` armed and uses inline per-client request storage for the common short-request case instead of heap-allocating an `8 KiB` receive buffer up front.
 - **Reference codebases as git submodules**: libtorrent (arvidn), libtorrent-rakshasa, qBittorrent, rtorrent, vortex, qui (autobrr).
 - **BoringSSL TLS**: vendored BoringSSL built as static libraries via pure Zig build (`build/boringssl.zig`). BIO pair transport decouples TLS record processing from socket I/O, keeping all network I/O on io_uring. TlsStream provides feedRecv/pendingSend interface for ciphertext shuttle.
 
@@ -103,6 +105,8 @@ Update it whenever a milestone lands, the near-term backlog changes, or a new op
 - Seed/read-path correctness: queued seed responses own exact block copies, async seed reads use unique IDs, and only successfully submitted reads/writes contribute to pending completion counts.
 - **Huge page piece cache**: optional `mmap(MAP_HUGETLB)` buffer pool for seed piece reads. Falls back to `madvise(MADV_HUGEPAGE)` (transparent huge pages), then regular pages. Config: `performance.use_huge_pages`, `performance.piece_cache_size`. Reduces TLB pressure for large torrents.
 - **Synthetic memory baseline harness**: `varuna-perf` with allocator-counting scenarios for peer scans, request batching, seed batching, extension parsing, session loading, and `/sync/maindata`. Supports stable before/after comparisons without a live swarm.
+- **Synthetic API burst harness**: `varuna-perf` now includes `api_get_burst` and `api_upload_burst`, which drive the real RPC server over loopback sockets with configurable client concurrency and upload body size.
+- **Synthetic peer accept harness**: `varuna-perf` now includes `peer_accept_burst`, which drives the real shared `EventLoop` listener with inbound loopback TCP connects and measures accept-slot-recv-EOF teardown cost.
 - **First allocation-reduction pass**: request batches now avoid heap allocation, seed batching no longer heap-copies each queued block, `/sync/maindata` uses fixed-size snapshot keys plus a request arena, BEP 9/BEP 10 decode paths are allocation-free, and scan-heavy peer-policy paths use dense active-slot lists.
 
 ### BEP 52 (BitTorrent v2 / Hybrid Torrents)
@@ -178,7 +182,8 @@ Update it whenever a milestone lands, the near-term backlog changes, or a new op
 - **Peer hot/cold split / partial SoA**: the active-slot pass removes a lot of wasted scans, but the `Peer` struct is still wide. The next performance step is separating hot scheduling/state fields from cold crypto/buffering state.
 - **Torrent hot-summary registry**: now that the shared EventLoop can hold far more than 64 torrents, `/sync` and periodic torrent housekeeping should move toward a denser hot-state registry instead of pulling data from full `TorrentSession` objects on demand.
 - **Broader RPC arena coverage**: `/sync/maindata` now uses an arena for transient work; the other list-heavy endpoints still allocate temporary object graphs and strings.
-- **API request-body growth / reuse**: the response path is vectored now, but request buffers still grow with `realloc` and are freed on disconnect. A per-client arena or growth policy is still available if API polling or uploads show allocator churn.
+- **API request-body growth / reuse**: the short-request path now uses inline storage, but large request bodies still allocate on demand and are freed on disconnect. A per-client arena or reuse pool is still available if API uploads remain allocator-heavy.
+- **uTP multishot receive**: `recvmsg_multishot` plus a provided-buffer strategy still needs a workload and a measured implementation before it should land.
 
 ## Known Issues
 
@@ -201,3 +206,6 @@ Update it whenever a milestone lands, the near-term backlog changes, or a new op
 - `zig build`: clean build (with `-Dtls=boringssl` default and `-Dtls=none`)
 - `zig build -Doptimize=ReleaseFast perf-workload -- http_response --iterations=5000`: `5,001` allocs, `648 KB` transient bytes, `4.63e7 ns`
 - `zig build -Doptimize=ReleaseFast perf-workload -- session_load --iterations=1000`: `2,004` allocs, `1.33e7 ns`
+- `zig build -Doptimize=ReleaseFast perf-workload -- api_get_burst --iterations=4000 --clients=8`: `4,000` allocs, `512 KB` transient bytes, `~2.20e8 ns`
+- `zig build -Doptimize=ReleaseFast perf-workload -- api_upload_burst --iterations=1000 --clients=8 --body-bytes=65536`: `2,000` allocs, `65.8 MB` transient bytes, `~1.26e8 ns`
+- `zig build -Doptimize=ReleaseFast perf-workload -- peer_accept_burst --iterations=4000 --clients=1`: multishot listener `~6.91e8 ns` vs one-shot A/B baseline `~7.34e8 ns`

@@ -17,10 +17,11 @@ const BanList = @import("../net/ban_list.zig").BanList;
 // ── CQE dispatch handlers ──────────────────────────────
 
 pub fn handleAccept(self: *EventLoop, cqe: linux.io_uring_cqe) void {
+    const more = (cqe.flags & linux.IORING_CQE_F_MORE) != 0;
     if (cqe.res < 0) {
         // Accept failed, try again
         log.warn("accept failed: errno={d}", .{-cqe.res});
-        self.submitAccept() catch |err| {
+        if (!more) self.submitAccept() catch |err| {
             log.err("re-submit accept after failure: {s}", .{@errorName(err)});
         };
         return;
@@ -37,7 +38,7 @@ pub fn handleAccept(self: *EventLoop, cqe: linux.io_uring_cqe) void {
             if (bl.isBanned(net_addr)) {
                 log.debug("rejected banned inbound peer", .{});
                 posix.close(new_fd);
-                self.submitAccept() catch {};
+                if (!more) self.submitAccept() catch {};
                 return;
             }
         }
@@ -50,7 +51,7 @@ pub fn handleAccept(self: *EventLoop, cqe: linux.io_uring_cqe) void {
             self.max_connections,
         });
         posix.close(new_fd);
-        self.submitAccept() catch |err| {
+        if (!more) self.submitAccept() catch |err| {
             log.err("re-submit accept after connection limit: {s}", .{@errorName(err)});
         };
         return;
@@ -59,7 +60,7 @@ pub fn handleAccept(self: *EventLoop, cqe: linux.io_uring_cqe) void {
     // Allocate a peer slot for the inbound connection
     const slot = self.allocSlot() orelse {
         posix.close(new_fd);
-        self.submitAccept() catch |err| {
+        if (!more) self.submitAccept() catch |err| {
             log.err("re-submit accept after slot exhaustion: {s}", .{@errorName(err)});
         };
         return;
@@ -80,8 +81,8 @@ pub fn handleAccept(self: *EventLoop, cqe: linux.io_uring_cqe) void {
         self.removePeer(slot);
     };
 
-    // Re-submit accept for more connections
-    self.submitAccept() catch |err| {
+    // Re-submit accept only if the multishot stream ended.
+    if (!more) self.submitAccept() catch |err| {
         log.err("re-submit accept: {s}", .{@errorName(err)});
     };
 }

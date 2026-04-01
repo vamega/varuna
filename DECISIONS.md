@@ -14,6 +14,60 @@ Use [STATUS.md](STATUS.md) for the running list of completed work, next work, an
 
 ## Decision Entries
 
+### 2026-04-01: Keep Peer Listener `accept_multishot`, But Only On Measured Low-Concurrency Evidence
+
+Context:
+The shared peer listener still submitted one accept SQE per inbound connection. Earlier review suggested `accept_multishot` should be an easy `io_uring` win, but unlike the API path there was no workload that exercised the real `EventLoop` accept handler, peer-slot allocation, and handshake-recv arming sequence.
+
+Decision:
+- Add a real `peer_accept_burst` workload to `varuna-perf` that drives loopback inbound TCP connections through the production `EventLoop` listener path.
+- Change the peer listener from one-shot `accept` to `accept_multishot`.
+- Only re-arm accept from `handleAccept()` when the kernel drops `IORING_CQE_F_MORE` or returns an error that terminates the multishot stream.
+
+Reasoning:
+- The peer listener change is small and does not alter peer ownership or handshake state.
+- A loopback inbound benchmark is sufficient to answer the narrow question of whether repeated accept re-submission is measurable on this host.
+- The measured improvement is workload-dependent: it shows up when connections arrive more serially, which is closer to the expected “mostly idle seeding torrent” pattern than a dense 8-thread connection flood.
+
+Measured effect:
+- `peer_accept_burst --iterations=4000 --clients=1`
+  one-shot baseline: `727995472 ns`, `739372927 ns`
+  multishot: `699668951 ns`, `715792574 ns`, `657787147 ns`
+  average improvement vs the one-shot baseline used for the A/B check: about `5.8%`
+- `peer_accept_burst --iterations=4000 --clients=8`
+  one-shot baseline: `150735516 ns`, `158715184 ns`
+  multishot: `151998395 ns`, `164377673 ns`
+  result: effectively flat/noisy on this host
+
+Follow-up triggers:
+- If inbound peer bursts in real swarm traces are often highly concurrent, do not assume this listener change is a large end-to-end win by itself.
+- The next `io_uring` network experiments should focus on uTP receive and large seed sends, where the remaining syscall and copy costs are more substantial than accept re-submission.
+
+### 2026-03-31: Keep API `accept_multishot`, Reject API `recv_multishot` For Now
+
+Context:
+The API server still paid one heap allocation per client request for its receive buffer and re-submitted a fresh accept SQE after every incoming connection. Earlier profiling suggested `accept_multishot`, `recv_multishot`, and provided-buffer rings were the next obvious `io_uring` wins, but they needed end-to-end measurement instead of assuming the newer opcodes would help automatically.
+
+Decision:
+- Add two real socket-level API burst workloads to `varuna-perf`: `api_get_burst` for short request/response traffic and `api_upload_burst` for upload-sized request bodies.
+- Keep `accept_multishot` on the API listener.
+- Replace the per-client initial heap receive buffer with an inline `8 KiB` request buffer and only allocate heap storage when a request actually outgrows it.
+- Do not keep the API `recv_multishot` + provided-buffer implementation in this pass.
+
+Reasoning:
+- `accept_multishot` is low-risk and directly removes one accept re-submission per inbound connection.
+- The inline receive buffer removes the dominant short-request allocation without adding lifecycle complexity.
+- The `recv_multishot` prototype did reduce allocator churn, but on this workload it required extra shutdown/cancel bookkeeping on teardown and did not deliver a convincing latency win once the full request lifecycle was measured.
+- Keeping only the measured win is better than landing a more complex receive path on faith.
+
+Measured effect:
+- `api_get_burst --iterations=4000 --clients=8` stayed effectively flat on wall time (`~220.29 ms` before vs `~220.43 ms` average after) while dropping alloc calls from `8000` to `4000` and transient bytes from `33.28 MB` to `512 KB`.
+- `api_upload_burst --iterations=1000 --clients=8 --body-bytes=65536` improved from `~129.54 ms` to `~126.19 ms` average while dropping alloc calls from `3000` to `2000` and transient bytes from `73.97 MB` to `65.78 MB`.
+
+Follow-up triggers:
+- Revisit API `recv_multishot` only if a broader HTTP design change also removes the teardown cost, for example persistent connections or a request parser that does not rely on connection close.
+- The next `io_uring` networking pass should target the peer listener accept path and then uTP `recvmsg_multishot`, each behind its own benchmark.
+
 ### 2026-03-31: Shared Event Loop Torrent Registry Uses Dynamic `u32` IDs
 
 Context:

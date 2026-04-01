@@ -44,16 +44,22 @@ Use `varuna-perf` when you need deterministic allocator and cache comparisons wi
 - `zig build perf-workload -- list`
 - `zig build -Doptimize=ReleaseFast perf-workload -- peer_scan --iterations=20000`
 - `zig build -Doptimize=ReleaseFast perf-workload -- peer_scan --iterations=20000 --peers=4096 --scale=8`
+- `zig build -Doptimize=ReleaseFast perf-workload -- peer_accept_burst --iterations=4000 --clients=1`
 - `zig build -Doptimize=ReleaseFast perf-workload -- request_batch --iterations=100000`
 - `zig build -Doptimize=ReleaseFast perf-workload -- seed_batch --iterations=5000`
+- `zig build -Doptimize=ReleaseFast perf-workload -- api_get_burst --iterations=4000 --clients=8`
+- `zig build -Doptimize=ReleaseFast perf-workload -- api_upload_burst --iterations=1000 --clients=8 --body-bytes=65536`
 - `zig build -Doptimize=ReleaseFast perf-workload -- sync_delta --iterations=200 --torrents=64`
 
 Current scenarios:
 
 - `peer_scan`
+- `peer_accept_burst`
 - `request_batch`
 - `seed_batch`
 - `http_response`
+- `api_get_burst`
+- `api_upload_burst`
 - `extension_decode`
 - `ut_metadata_decode`
 - `session_load`
@@ -62,7 +68,10 @@ Current scenarios:
 Scenario-specific notes:
 
 - `peer_scan`: `--scale` controls active-slot density. `--scale=1` keeps the table dense; larger values keep fewer slots active and are more representative when you want to measure scan cost instead of connection-state churn.
+- `peer_accept_burst`: drives the real shared `EventLoop` listener with inbound loopback TCP connects that immediately disconnect. `--clients` controls concurrent connector threads. Very high iteration counts may hit loopback ephemeral-port limits on some hosts.
 - `http_response`: models the API response assembly path, including header formatting and body ownership.
+- `api_get_burst`: drives the real RPC server over loopback with one short request per connection. `--clients` controls concurrent client threads.
+- `api_upload_burst`: drives the real RPC server with upload-sized POST bodies. `--clients` controls concurrent client threads and `--body-bytes` controls request size.
 - `session_load`: measures immutable torrent-session metadata setup and teardown.
 
 High-count active-torrent validation currently lives in unit tests rather than `varuna-perf`:
@@ -204,6 +213,34 @@ Interpretation:
 
 - `http_response` improved because the server now keeps handler-owned bodies in place and only allocates a header buffer before issuing `sendmsg`.
 - `session_load` improved because immutable session metadata now shares one arena-backed lifetime instead of many independent frees.
+
+## API Listener Snapshot (ReleaseFast, 2026-03-31)
+
+Measured with the real loopback RPC server workloads:
+
+| Scenario | Before | After |
+|----------|--------|-------|
+| `api_get_burst --iterations=4000 --clients=8` | 8,000 allocs, 33.28 MB transient bytes, ~2.20e8 ns | 4,000 allocs, 512 KB transient bytes, ~2.20e8 ns |
+| `api_upload_burst --iterations=1000 --clients=8 --body-bytes=65536` | 3,000 allocs, 73.97 MB transient bytes, ~1.30e8 ns | 2,000 allocs, 65.78 MB transient bytes, ~1.26e8 ns |
+
+Interpretation:
+
+- The measured win that held up was `accept_multishot` plus inline per-client request storage.
+- A prototype API `recv_multishot` + provided-buffer path was tested and rejected in this pass because teardown overhead erased the latency gain on these workloads.
+
+## Peer Listener Snapshot (ReleaseFast, 2026-04-01)
+
+Measured with the real `EventLoop` inbound listener workload:
+
+| Scenario | Before | After |
+|----------|--------|-------|
+| `peer_accept_burst --iterations=4000 --clients=1` | `727995472 ns`, `739372927 ns` | `699668951 ns`, `715792574 ns`, `657787147 ns` |
+| `peer_accept_burst --iterations=4000 --clients=8` | `150735516 ns`, `158715184 ns` | `151998395 ns`, `164377673 ns` |
+
+Interpretation:
+
+- `accept_multishot` produced a modest but repeatable improvement for the low-concurrency inbound case on this host, roughly `5.8%` against the direct one-shot A/B baseline.
+- The more concurrent 8-thread burst was effectively flat/noisy, so do not treat this change as a broad listener throughput breakthrough by itself.
 
 ## Interpretation Notes
 
