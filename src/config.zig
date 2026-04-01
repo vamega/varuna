@@ -13,6 +13,16 @@ pub const Config = struct {
         api_bind: []const u8 = "127.0.0.1",
         api_username: []const u8 = "admin",
         api_password: []const u8 = "adminadmin",
+        /// Enable global share ratio limit enforcement.
+        max_ratio_enabled: bool = false,
+        /// Target share ratio (e.g. 2.0 = upload 2x download). -1 = disabled.
+        max_ratio: f64 = -1.0,
+        /// Action when ratio limit reached: 0 = pause, 1 = remove torrent.
+        max_ratio_act: u8 = 0,
+        /// Enable global seeding time limit enforcement.
+        max_seeding_time_enabled: bool = false,
+        /// Maximum minutes to seed after completion. -1 = disabled.
+        max_seeding_time: i64 = -1,
     };
 
     pub const Storage = struct {
@@ -149,4 +159,13 @@ test "parseEncryptionMode recognizes all modes" {
 test "default encryption config is preferred" {
     const config = Config{};
     try std.testing.expectEqualSlices(u8, "preferred", config.network.encryption);
+}
+
+test "default share ratio limits are disabled" {
+    const config = Config{};
+    try std.testing.expect(!config.daemon.max_ratio_enabled);
+    try std.testing.expect(config.daemon.max_ratio == -1.0);
+    try std.testing.expectEqual(@as(u8, 0), config.daemon.max_ratio_act);
+    try std.testing.expect(!config.daemon.max_seeding_time_enabled);
+    try std.testing.expectEqual(@as(i64, -1), config.daemon.max_seeding_time);
 }

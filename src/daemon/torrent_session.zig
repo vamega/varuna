@@ -81,6 +81,14 @@ pub const Stats = struct {
     metadata_peers_with_metadata: u32 = 0,
     /// BEP 52: full v2 info-hash (32 bytes, SHA-256). null for pure v1.
     info_hash_v2: ?[32]u8 = null,
+    /// Per-torrent ratio limit override (-2 = use global, -1 = no limit, >=0 = specific).
+    ratio_limit: f64 = -2.0,
+    /// Per-torrent seeding time limit override in minutes (-2 = use global, -1 = no limit, >=0 = specific).
+    seeding_time_limit: i64 = -2,
+    /// Timestamp when the torrent completed downloading (0 if not yet complete).
+    completion_on: i64 = 0,
+    /// Seeding time in seconds (time since completion, 0 if not seeding).
+    seeding_time: i64 = 0,
     /// Primary tracker URL (first announce URL). Empty string if none.
     tracker: []const u8 = "",
     /// Total number of tracker URLs configured for this torrent.
@@ -154,6 +162,16 @@ pub const TorrentSession = struct {
     // Per-torrent speed limits (bytes/sec, 0 = unlimited)
     dl_limit: u64 = 0,
     ul_limit: u64 = 0,
+
+    // Per-torrent share limits (-2 = use global, -1 = disabled, >=0 = override)
+    /// Ratio limit override. -2 = use global setting, -1 = no limit, >=0 = specific limit.
+    ratio_limit: f64 = -2.0,
+    /// Seeding time limit override in minutes. -2 = use global, -1 = no limit, >=0 = specific.
+    seeding_time_limit: i64 = -2,
+
+    /// Timestamp when the torrent completed downloading (all pieces have).
+    /// 0 means not yet completed. Used to compute seeding time accurately.
+    completion_on: i64 = 0,
 
     // Sequential download mode (stored, but actual piece picking depends on workstream B)
     sequential_download: bool = false,
@@ -544,6 +562,9 @@ pub const TorrentSession = struct {
         // Auto-transition to seeding when all pieces are complete
         if (self.state == .downloading and pieces_have == self.piece_count and self.piece_count > 0) {
             self.state = .seeding;
+            if (self.completion_on == 0) {
+                self.completion_on = std.time.timestamp();
+            }
         }
 
         // BEP 21: detect partial seed state (selective download complete)
@@ -551,6 +572,9 @@ pub const TorrentSession = struct {
             const is_ps = pt.isPartialSeed();
             if (is_ps and self.state == .downloading) {
                 self.state = .seeding;
+                if (self.completion_on == 0) {
+                    self.completion_on = std.time.timestamp();
+                }
             }
         }
 
@@ -644,6 +668,10 @@ pub const TorrentSession = struct {
             .metadata_pieces_total = if (self.metadata_fetch_progress) |p| p.pieces_total else 0,
             .metadata_peers_attempted = if (self.metadata_fetch_progress) |p| p.peers_attempted else 0,
             .metadata_peers_with_metadata = if (self.metadata_fetch_progress) |p| p.peers_with_metadata else 0,
+            .ratio_limit = self.ratio_limit,
+            .seeding_time_limit = self.seeding_time_limit,
+            .completion_on = self.completion_on,
+            .seeding_time = if (self.state == .seeding and self.completion_on > 0) std.time.timestamp() - self.completion_on else 0,
             .tracker = tracker_url,
             .trackers_count = trackers_count,
             .content_path = content_path,
@@ -704,6 +732,14 @@ pub const TorrentSession = struct {
                     const limits = self.resume_writer.?.db.loadRateLimits(session.metainfo.info_hash);
                     if (limits.dl_limit > 0) self.dl_limit = limits.dl_limit;
                     if (limits.ul_limit > 0) self.ul_limit = limits.ul_limit;
+                }
+
+                // Load persisted share limits (ratio/seeding time overrides + completion_on)
+                {
+                    const share = self.resume_writer.?.db.loadShareLimits(session.metainfo.info_hash);
+                    self.ratio_limit = share.ratio_limit;
+                    self.seeding_time_limit = share.seeding_time_limit;
+                    if (share.completion_on > 0) self.completion_on = share.completion_on;
                 }
 
                 // Load persisted category and tags for this torrent
@@ -777,6 +813,9 @@ pub const TorrentSession = struct {
             self.shared_fds = shared_fds;
 
             self.state = .seeding;
+            if (self.completion_on == 0) {
+                self.completion_on = std.time.timestamp();
+            }
             if (self.shared_event_loop != null) {
                 // Daemon mode: signal main thread to set up seed mode
                 self.pending_seed_setup = true;
@@ -1036,6 +1075,9 @@ pub const TorrentSession = struct {
 
         // Transition to seeding
         self.state = .seeding;
+        if (self.completion_on == 0) {
+            self.completion_on = std.time.timestamp();
+        }
         self.persistNewCompletions();
         self.flushResume();
 

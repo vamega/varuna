@@ -25,6 +25,18 @@ pub const SessionManager = struct {
     /// Masquerade as a different client for peer ID generation (e.g. "qBittorrent 5.1.4").
     masquerade_as: ?[]const u8 = null,
 
+    // ── Global share ratio / seeding time limits ──────────
+    /// Whether global ratio limit enforcement is enabled.
+    max_ratio_enabled: bool = false,
+    /// Target share ratio. -1 = disabled.
+    max_ratio: f64 = -1.0,
+    /// Action when limit reached: 0 = pause, 1 = remove.
+    max_ratio_act: u8 = 0,
+    /// Whether global seeding time limit enforcement is enabled.
+    max_seeding_time_enabled: bool = false,
+    /// Maximum minutes to seed after completion. -1 = disabled.
+    max_seeding_time: i64 = -1,
+
     /// In-memory category and tag stores.
     category_store: CategoryStore,
     tag_store: TagStore,
@@ -246,6 +258,7 @@ pub const SessionManager = struct {
         if (self.resume_db) |*db| {
             db.clearTorrent(info_hash) catch {};
             db.clearRateLimits(info_hash) catch {};
+            db.clearShareLimits(info_hash) catch {};
             db.clearTorrentTags(info_hash) catch {};
             db.saveTorrentCategory(info_hash, "") catch {};
         }
@@ -758,6 +771,125 @@ pub const SessionManager = struct {
         }
     }
 
+    // ── Share limit management ─────────────────────────────
+
+    /// Set per-torrent share limits (ratio and seeding time).
+    /// ratio_limit: -2 = use global, -1 = no limit, >=0 = specific ratio.
+    /// seeding_time_limit: -2 = use global, -1 = no limit, >=0 = minutes.
+    pub fn setShareLimits(self: *SessionManager, hash: []const u8, ratio_limit: f64, seeding_time_limit: i64) !void {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+
+        const session = self.sessions.get(hash) orelse return error.TorrentNotFound;
+        session.ratio_limit = ratio_limit;
+        session.seeding_time_limit = seeding_time_limit;
+
+        // Persist to DB
+        if (self.resume_db) |*db| {
+            db.saveShareLimits(session.info_hash, ratio_limit, seeding_time_limit, session.completion_on) catch {};
+        }
+    }
+
+    /// Check all seeding torrents against share ratio and seeding time limits.
+    /// Pauses or removes torrents that exceed their limits.
+    /// Called periodically from the main loop (~every 30 seconds).
+    /// Returns the number of torrents acted upon.
+    pub fn checkShareLimits(self: *SessionManager) u32 {
+        self.mutex.lock();
+
+        // Collect hashes of torrents that need action (we can't modify sessions
+        // map while iterating, and pauseTorrent/removeTorrent need to lock mutex).
+        var to_pause: [64][40]u8 = undefined;
+        var to_remove: [64][40]u8 = undefined;
+        var pause_count: u32 = 0;
+        var remove_count: u32 = 0;
+
+        var iter = self.sessions.iterator();
+        while (iter.next()) |entry| {
+            const session = entry.value_ptr.*;
+            if (session.state != .seeding) continue;
+
+            const stats = session.getStats();
+            const act = self.checkTorrentShareLimit(session, stats);
+            switch (act) {
+                .none => {},
+                .pause => {
+                    if (pause_count < to_pause.len) {
+                        to_pause[pause_count] = stats.info_hash_hex;
+                        pause_count += 1;
+                    }
+                },
+                .remove => {
+                    if (remove_count < to_remove.len) {
+                        to_remove[remove_count] = stats.info_hash_hex;
+                        remove_count += 1;
+                    }
+                },
+            }
+        }
+
+        self.mutex.unlock();
+
+        // Apply actions outside the lock
+        var acted: u32 = 0;
+        for (to_pause[0..pause_count]) |*hash_hex| {
+            self.pauseTorrent(hash_hex) catch continue;
+            std.log.info("share limit: paused torrent {s}", .{hash_hex});
+            acted += 1;
+        }
+        for (to_remove[0..remove_count]) |*hash_hex| {
+            self.removeTorrent(hash_hex) catch continue;
+            std.log.info("share limit: removed torrent {s}", .{hash_hex});
+            acted += 1;
+        }
+
+        return acted;
+    }
+
+    const ShareLimitAction = enum { none, pause, remove };
+
+    /// Determine what action (if any) should be taken for a single torrent
+    /// based on its effective share limits.
+    fn checkTorrentShareLimit(self: *const SessionManager, session: *const TorrentSession, stats: Stats) ShareLimitAction {
+        // Determine effective ratio limit for this torrent
+        const effective_ratio: f64 = if (session.ratio_limit >= -1.0 and session.ratio_limit != -2.0)
+            session.ratio_limit // per-torrent override
+        else if (self.max_ratio_enabled and self.max_ratio >= 0.0)
+            self.max_ratio // global setting
+        else
+            -1.0; // disabled
+
+        // Determine effective seeding time limit (in minutes)
+        const effective_seeding_time: i64 = if (session.seeding_time_limit >= -1 and session.seeding_time_limit != -2)
+            session.seeding_time_limit // per-torrent override
+        else if (self.max_seeding_time_enabled and self.max_seeding_time >= 0)
+            self.max_seeding_time // global setting
+        else
+            -1; // disabled
+
+        // Check ratio limit
+        if (effective_ratio >= 0.0 and stats.ratio >= effective_ratio) {
+            return if (self.max_ratio_act == 1) .remove else .pause;
+        }
+
+        // Check seeding time limit (compare seconds vs minutes)
+        if (effective_seeding_time >= 0 and stats.seeding_time > 0) {
+            const limit_secs = effective_seeding_time * 60;
+            if (stats.seeding_time >= limit_secs) {
+                return if (self.max_ratio_act == 1) .remove else .pause;
+            }
+        }
+
+        return .none;
+    }
+
+    /// Persist completion_on timestamp for a torrent (called when transitioning to seeding).
+    pub fn persistCompletionOn(self: *SessionManager, info_hash: [20]u8, ratio_limit: f64, seeding_time_limit: i64, completion_on: i64) void {
+        if (self.resume_db) |*db| {
+            db.saveShareLimits(info_hash, ratio_limit, seeding_time_limit, completion_on) catch {};
+        }
+    }
+
     // ── Connection diagnostics ─────────────────────────────
 
     /// Per-torrent connection health diagnostics.
@@ -1005,6 +1137,14 @@ pub const SessionManager = struct {
         scrape_complete: u32 = 0,
         /// Tracker scrape: total leechers.
         scrape_incomplete: u32 = 0,
+        /// Per-torrent ratio limit (-2 = use global, -1 = no limit, >=0 = specific).
+        ratio_limit: f64 = -2.0,
+        /// Per-torrent seeding time limit in minutes (-2 = use global, -1 = no limit, >=0 = minutes).
+        seeding_time_limit: i64 = -2,
+        /// Seeding time in seconds (since completion).
+        seeding_time: i64 = 0,
+        /// Timestamp when the torrent completed downloading.
+        completion_on: i64 = 0,
     };
 
     /// Free a PropertiesInfo returned by getSessionProperties().
@@ -1059,6 +1199,10 @@ pub const SessionManager = struct {
             .web_seeds_count = if (meta_opt) |m| @intCast(m.url_list.len + m.http_seeds.len) else 0,
             .scrape_complete = stats.scrape_complete,
             .scrape_incomplete = stats.scrape_incomplete,
+            .ratio_limit = stats.ratio_limit,
+            .seeding_time_limit = stats.seeding_time_limit,
+            .seeding_time = stats.seeding_time,
+            .completion_on = stats.completion_on,
         };
     }
 
@@ -1236,4 +1380,145 @@ test "session manager add and list" {
     // This test needs io_uring for PieceStore, so skip if unavailable
     const Ring = @import("../io/ring.zig").Ring;
     _ = Ring.init(4) catch return error.SkipZigTest;
+}
+
+test "checkTorrentShareLimit ratio enforcement" {
+    var sm = SessionManager.init(std.testing.allocator);
+    defer sm.deinit();
+
+    // Global ratio limit: 2.0, action = pause
+    sm.max_ratio_enabled = true;
+    sm.max_ratio = 2.0;
+    sm.max_ratio_act = 0;
+
+    // Simulated torrent session with no per-torrent override
+    var session = TorrentSession{
+        .allocator = std.testing.allocator,
+        .torrent_bytes = &.{},
+        .save_path = "",
+        .info_hash = [_]u8{0} ** 20,
+        .info_hash_hex = [_]u8{'0'} ** 40,
+        .name = "test",
+        .total_size = 1000,
+        .piece_count = 10,
+        .added_on = 0,
+        .peer_id = [_]u8{0} ** 20,
+        .tracker_key = [_]u8{0} ** 8,
+    };
+
+    // Ratio below limit: no action
+    var stats = Stats{ .state = .seeding, .progress = 1.0, .ratio = 1.5, .seeding_time = 0 };
+    try std.testing.expectEqual(SessionManager.ShareLimitAction.none, sm.checkTorrentShareLimit(&session, stats));
+
+    // Ratio at limit: should pause
+    stats.ratio = 2.0;
+    try std.testing.expectEqual(SessionManager.ShareLimitAction.pause, sm.checkTorrentShareLimit(&session, stats));
+
+    // Ratio above limit: should pause
+    stats.ratio = 3.0;
+    try std.testing.expectEqual(SessionManager.ShareLimitAction.pause, sm.checkTorrentShareLimit(&session, stats));
+
+    // Change action to remove
+    sm.max_ratio_act = 1;
+    try std.testing.expectEqual(SessionManager.ShareLimitAction.remove, sm.checkTorrentShareLimit(&session, stats));
+}
+
+test "checkTorrentShareLimit seeding time enforcement" {
+    var sm = SessionManager.init(std.testing.allocator);
+    defer sm.deinit();
+
+    // Global seeding time limit: 60 minutes, action = pause
+    sm.max_seeding_time_enabled = true;
+    sm.max_seeding_time = 60;
+    sm.max_ratio_act = 0;
+
+    var session = TorrentSession{
+        .allocator = std.testing.allocator,
+        .torrent_bytes = &.{},
+        .save_path = "",
+        .info_hash = [_]u8{0} ** 20,
+        .info_hash_hex = [_]u8{'0'} ** 40,
+        .name = "test",
+        .total_size = 1000,
+        .piece_count = 10,
+        .added_on = 0,
+        .peer_id = [_]u8{0} ** 20,
+        .tracker_key = [_]u8{0} ** 8,
+    };
+
+    // Seeding time below limit: no action
+    var stats = Stats{ .state = .seeding, .progress = 1.0, .ratio = 0.5, .seeding_time = 30 * 60 }; // 30 min
+    try std.testing.expectEqual(SessionManager.ShareLimitAction.none, sm.checkTorrentShareLimit(&session, stats));
+
+    // Seeding time at limit: should pause (60 min = 3600 sec)
+    stats.seeding_time = 60 * 60;
+    try std.testing.expectEqual(SessionManager.ShareLimitAction.pause, sm.checkTorrentShareLimit(&session, stats));
+
+    // Seeding time above limit
+    stats.seeding_time = 90 * 60;
+    try std.testing.expectEqual(SessionManager.ShareLimitAction.pause, sm.checkTorrentShareLimit(&session, stats));
+}
+
+test "checkTorrentShareLimit per-torrent override" {
+    var sm = SessionManager.init(std.testing.allocator);
+    defer sm.deinit();
+
+    // Global ratio limit: 2.0
+    sm.max_ratio_enabled = true;
+    sm.max_ratio = 2.0;
+    sm.max_ratio_act = 0;
+
+    var session = TorrentSession{
+        .allocator = std.testing.allocator,
+        .torrent_bytes = &.{},
+        .save_path = "",
+        .info_hash = [_]u8{0} ** 20,
+        .info_hash_hex = [_]u8{'0'} ** 40,
+        .name = "test",
+        .total_size = 1000,
+        .piece_count = 10,
+        .added_on = 0,
+        .peer_id = [_]u8{0} ** 20,
+        .tracker_key = [_]u8{0} ** 8,
+    };
+
+    // Per-torrent override: ratio_limit = 5.0 (higher than global)
+    session.ratio_limit = 5.0;
+
+    // Ratio 3.0 exceeds global (2.0) but not per-torrent (5.0): no action
+    var stats = Stats{ .state = .seeding, .progress = 1.0, .ratio = 3.0, .seeding_time = 0 };
+    try std.testing.expectEqual(SessionManager.ShareLimitAction.none, sm.checkTorrentShareLimit(&session, stats));
+
+    // Ratio 5.0 meets per-torrent limit: should pause
+    stats.ratio = 5.0;
+    try std.testing.expectEqual(SessionManager.ShareLimitAction.pause, sm.checkTorrentShareLimit(&session, stats));
+
+    // Per-torrent override: -1 = no limit (disables even global)
+    session.ratio_limit = -1.0;
+    stats.ratio = 100.0;
+    try std.testing.expectEqual(SessionManager.ShareLimitAction.none, sm.checkTorrentShareLimit(&session, stats));
+}
+
+test "checkTorrentShareLimit disabled by default" {
+    var sm = SessionManager.init(std.testing.allocator);
+    defer sm.deinit();
+
+    // Both limits disabled (default)
+    var session = TorrentSession{
+        .allocator = std.testing.allocator,
+        .torrent_bytes = &.{},
+        .save_path = "",
+        .info_hash = [_]u8{0} ** 20,
+        .info_hash_hex = [_]u8{'0'} ** 40,
+        .name = "test",
+        .total_size = 1000,
+        .piece_count = 10,
+        .added_on = 0,
+        .peer_id = [_]u8{0} ** 20,
+        .tracker_key = [_]u8{0} ** 8,
+    };
+
+    // Even with high ratio and long seeding time, no action
+    const stats = Stats{ .state = .seeding, .progress = 1.0, .ratio = 100.0, .seeding_time = 999999 };
+    try std.testing.expectEqual(SessionManager.ShareLimitAction.none, sm.checkTorrentShareLimit(&session, stats));
 }

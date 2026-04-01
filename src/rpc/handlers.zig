@@ -265,6 +265,10 @@ pub const ApiHandler = struct {
             return self.handleTorrentsConnDiagnostics(allocator, params);
         }
 
+        if (std.mem.eql(u8, action_name, "setShareLimits") and std.mem.eql(u8, method, "POST")) {
+            return self.handleSetShareLimits(allocator, body);
+        }
+
         if (std.mem.eql(u8, action_name, "webSeeds")) {
             return self.handleTorrentsWebSeeds(allocator, params);
         }
@@ -461,11 +465,12 @@ pub const ApiHandler = struct {
     // ── Speed limit handlers ─────────────────────────────
 
     fn handlePreferences(self: *const ApiHandler, allocator: std.mem.Allocator) server.Response {
-        const el = self.session_manager.shared_event_loop;
+        const sm = self.session_manager;
+        const el = sm.shared_event_loop;
         const dl_limit: u64 = if (el) |e| e.getGlobalDlLimit() else 0;
         const ul_limit: u64 = if (el) |e| e.getGlobalUlLimit() else 0;
         const esc = json_mod.jsonSafe;
-        const save_path = self.session_manager.default_save_path;
+        const save_path = sm.default_save_path;
 
         // qBittorrent encryption: 0 = prefer, 1 = force, 2 = disable
         const enc_mode: u8 = if (el) |e| switch (e.encryption_mode) {
@@ -480,11 +485,11 @@ pub const ApiHandler = struct {
         const hpc_using_huge = if (el) |e| (if (e.huge_page_cache) |hpc| hpc.using_huge_pages else false) else false;
 
         // Build banned_IPs string for preferences
-        const banned_ips_str: []const u8 = if (self.session_manager.ban_list) |bl|
+        const banned_ips_str: []const u8 = if (sm.ban_list) |bl|
             bl.getBannedIpsString(allocator) catch ""
         else
             "";
-        defer if (banned_ips_str.len > 0 and self.session_manager.ban_list != null) allocator.free(banned_ips_str);
+        defer if (banned_ips_str.len > 0 and sm.ban_list != null) allocator.free(banned_ips_str);
 
         const body = std.fmt.allocPrint(allocator,
             \\{{"dl_limit":{},"up_limit":{},"alt_dl_limit":0,"alt_up_limit":0,
@@ -505,8 +510,8 @@ pub const ApiHandler = struct {
             \\"send_buffer_watermark_factor":50,
             \\"max_concurrent_http_announces":50,"request_queue_size":500,
             \\"stop_tracker_timeout":5,
-            \\"max_ratio_enabled":false,"max_ratio":-1,
-            \\"max_seeding_time_enabled":false,"max_seeding_time":-1,
+            \\"max_ratio_enabled":{s},"max_ratio":{d:.4},"max_ratio_act":{},
+            \\"max_seeding_time_enabled":{s},"max_seeding_time":{},
             \\"auto_tmm_enabled":false,"save_resume_data_interval":60,
             \\"start_paused_enabled":false,
             \\"dht":false,"pex":false,"lsd":false,"encryption":{},"anonymous_mode":false,
@@ -514,8 +519,19 @@ pub const ApiHandler = struct {
             \\"ip_filter_enabled":false,"ip_filter_path":"","ip_filter_trackers":false,
             \\"banned_IPs":"{f}"}}
         , .{
-            dl_limit,                       ul_limit,                             esc(save_path),                        enc_mode,
-            @as(u8, if (has_hpc) 1 else 0), @as(u8, if (hpc_allocated) 1 else 0), @as(u8, if (hpc_using_huge) 1 else 0), esc(banned_ips_str),
+            dl_limit,
+            ul_limit,
+            esc(save_path),
+            @as([]const u8, if (sm.max_ratio_enabled) "true" else "false"),
+            sm.max_ratio,
+            sm.max_ratio_act,
+            @as([]const u8, if (sm.max_seeding_time_enabled) "true" else "false"),
+            sm.max_seeding_time,
+            enc_mode,
+            @as(u8, if (has_hpc) 1 else 0),
+            @as(u8, if (hpc_allocated) 1 else 0),
+            @as(u8, if (hpc_using_huge) 1 else 0),
+            esc(banned_ips_str),
         }) catch
             return .{ .status = 500, .body = "{\"error\":\"internal\"}" };
         return .{ .body = body, .owned_body = body };
@@ -541,6 +557,46 @@ pub const ApiHandler = struct {
             } else |_| {}
         } else if (extractJsonInt(body, "up_limit")) |ul| {
             el.setGlobalUlLimit(ul);
+        }
+
+        // Handle share ratio and seeding time limits
+        {
+            const sm = self.session_manager;
+
+            // max_ratio_enabled: bool
+            if (extractParam(body, "max_ratio_enabled")) |v| {
+                sm.max_ratio_enabled = std.mem.eql(u8, v, "true");
+            } else if (extractJsonBool(body, "max_ratio_enabled")) |v| {
+                sm.max_ratio_enabled = v;
+            }
+
+            // max_ratio: float
+            if (extractParam(body, "max_ratio")) |v| {
+                sm.max_ratio = std.fmt.parseFloat(f64, v) catch sm.max_ratio;
+            } else if (extractJsonFloat(body, "max_ratio")) |v| {
+                sm.max_ratio = v;
+            }
+
+            // max_ratio_act: 0=pause, 1=remove
+            if (extractParam(body, "max_ratio_act")) |v| {
+                sm.max_ratio_act = std.fmt.parseInt(u8, v, 10) catch sm.max_ratio_act;
+            } else if (extractJsonInt(body, "max_ratio_act")) |v| {
+                sm.max_ratio_act = @intCast(@min(v, 1));
+            }
+
+            // max_seeding_time_enabled: bool
+            if (extractParam(body, "max_seeding_time_enabled")) |v| {
+                sm.max_seeding_time_enabled = std.mem.eql(u8, v, "true");
+            } else if (extractJsonBool(body, "max_seeding_time_enabled")) |v| {
+                sm.max_seeding_time_enabled = v;
+            }
+
+            // max_seeding_time: minutes (-1=disabled)
+            if (extractParam(body, "max_seeding_time")) |v| {
+                sm.max_seeding_time = std.fmt.parseInt(i64, v, 10) catch sm.max_seeding_time;
+            } else if (extractJsonInt(body, "max_seeding_time")) |v| {
+                sm.max_seeding_time = @intCast(v);
+            }
         }
 
         // Handle banned_IPs: newline-separated list of IPs and CIDRs
@@ -716,12 +772,11 @@ pub const ApiHandler = struct {
         // Time active since added
         const now = std.time.timestamp();
         const time_active: i64 = now - info.added_on;
-        const seeding_time: i64 = if (info.state == .seeding) time_active else 0;
         const esc = json_mod.jsonSafe;
 
         const v2_hex = if (info.info_hash_v2 != null) compat.formatInfoHashV2(info.info_hash_v2) else [_]u8{0} ** 64;
         const v2_str: []const u8 = if (info.info_hash_v2 != null) &v2_hex else "";
-        const completion_date: i64 = if (info.state == .seeding) info.added_on else -1;
+        const completion_date: i64 = if (info.completion_on > 0) info.completion_on else if (info.state == .seeding) info.added_on else -1;
 
         var json = std.ArrayList(u8).empty;
         defer json.deinit(allocator);
@@ -749,10 +804,10 @@ pub const ApiHandler = struct {
             info.ratio,
             time_active,
             time_active,
-            seeding_time,
+            info.seeding_time,
             info.peers_connected,
         }) catch return .{ .status = 500, .body = "{\"error\":\"internal\"}" };
-        json.print(allocator, "\"peers\":{},\"peers_total\":{},\"seeds\":{},\"seeds_total\":{},\"last_seen\":-1,\"reannounce\":0,\"addition_date\":{},\"completion_date\":{},\"total_downloaded\":{},\"total_downloaded_session\":{},\"total_uploaded\":{},\"total_uploaded_session\":{},\"total_wasted\":0,\"is_private\":{s},\"seq_dl\":{s},\"super_seeding\":{},\"web_seeds_count\":{},\"partial_seed\":{s}}}", .{
+        json.print(allocator, "\"peers\":{},\"peers_total\":{},\"seeds\":{},\"seeds_total\":{},\"last_seen\":-1,\"reannounce\":0,\"addition_date\":{},\"completion_date\":{},\"total_downloaded\":{},\"total_downloaded_session\":{},\"total_uploaded\":{},\"total_uploaded_session\":{},\"total_wasted\":0,\"is_private\":{s},\"seq_dl\":{s},\"super_seeding\":{},\"web_seeds_count\":{},\"partial_seed\":{s},\"ratio_limit\":{d:.4},\"seeding_time_limit\":{}}}", .{
             info.scrape_incomplete,
             info.scrape_complete,
             info.scrape_complete,
@@ -768,6 +823,8 @@ pub const ApiHandler = struct {
             @as(u8, if (info.super_seeding) 1 else 0),
             info.web_seeds_count,
             @as([]const u8, if (info.partial_seed) "true" else "false"),
+            info.ratio_limit,
+            info.seeding_time_limit,
         }) catch return .{ .status = 500, .body = "{\"error\":\"internal\"}" };
 
         const result = json.toOwnedSlice(allocator) catch return .{ .status = 500, .body = "{\"error\":\"internal\"}" };
@@ -908,6 +965,36 @@ pub const ApiHandler = struct {
             diag.peers_half_open,
         }) catch return .{ .status = 500, .body = "{\"error\":\"internal\"}" };
         return .{ .body = body, .owned_body = body };
+    }
+
+    fn handleSetShareLimits(self: *const ApiHandler, allocator: std.mem.Allocator, body: []const u8) server.Response {
+        // hashes=<hash1>|<hash2>&ratioLimit=<float>&seedingTimeLimit=<int>
+        const hashes_str = extractParam(body, "hashes") orelse
+            return .{ .status = 400, .body = "{\"error\":\"missing hashes\"}" };
+
+        // Parse ratio limit (-2 = use global, -1 = no limit, >=0 = specific)
+        const ratio_limit: f64 = if (extractParam(body, "ratioLimit")) |v|
+            std.fmt.parseFloat(f64, v) catch -2.0
+        else
+            -2.0;
+
+        // Parse seeding time limit in minutes (-2 = use global, -1 = no limit, >=0 = minutes)
+        const seeding_time_limit: i64 = if (extractParam(body, "seedingTimeLimit")) |v|
+            std.fmt.parseInt(i64, v, 10) catch -2
+        else
+            -2;
+
+        // Apply to each hash (pipe-separated)
+        var hash_iter = std.mem.splitScalar(u8, hashes_str, '|');
+        while (hash_iter.next()) |hash| {
+            if (hash.len == 0) continue;
+            self.session_manager.setShareLimits(hash, ratio_limit, seeding_time_limit) catch |err| {
+                const msg = std.fmt.allocPrint(allocator, "{{\"error\":\"{s}\"}}", .{@errorName(err)}) catch
+                    return .{ .status = 500, .body = "{\"error\":\"internal\"}" };
+                return .{ .status = 404, .body = msg, .owned_body = msg };
+            };
+        }
+        return .{ .body = "{\"status\":\"ok\"}" };
     }
 
     fn handleTorrentsWebSeeds(self: *const ApiHandler, allocator: std.mem.Allocator, params: []const u8) server.Response {
@@ -1425,7 +1512,7 @@ fn serializeTorrentInfo(allocator: std.mem.Allocator, json: *std.ArrayList(u8), 
 
     try json.print(
         allocator,
-        ",\"f_l_piece_prio\":false,\"force_start\":false,\"super_seeding\":{s},\"partial_seed\":{s},\"auto_tmm\":false,\"category\":\"{f}\",\"tags\":\"{f}\",\"tracker\":\"{f}\",\"trackers_count\":{},\"amount_left\":{},\"completed\":{},\"downloaded\":{},\"downloaded_session\":{},\"uploaded\":{},\"uploaded_session\":{},\"time_active\":{},\"seeding_time\":{},\"last_activity\":{},\"seen_complete\":-1,\"priority\":0,\"availability\":-1,\"max_ratio\":-1,\"max_seeding_time\":-1,\"ratio_limit\":-1,\"seeding_time_limit\":-1,\"popularity\":0,\"magnet_uri\":\"{f}\",\"reannounce\":0}}",
+        ",\"f_l_piece_prio\":false,\"force_start\":false,\"super_seeding\":{s},\"partial_seed\":{s},\"auto_tmm\":false,\"category\":\"{f}\",\"tags\":\"{f}\",\"tracker\":\"{f}\",\"trackers_count\":{},\"amount_left\":{},\"completed\":{},\"downloaded\":{},\"downloaded_session\":{},\"uploaded\":{},\"uploaded_session\":{},\"time_active\":{},\"seeding_time\":{},\"last_activity\":{},\"seen_complete\":-1,\"priority\":0,\"availability\":-1,\"max_ratio\":-1,\"max_seeding_time\":-1,\"ratio_limit\":{d:.4},\"seeding_time_limit\":{},\"popularity\":0,\"magnet_uri\":\"{f}\",\"reannounce\":0}}",
         .{
             @as([]const u8, if (stat.super_seeding) "true" else "false"),
             @as([]const u8, if (stat.partial_seed) "true" else "false"),
@@ -1440,8 +1527,10 @@ fn serializeTorrentInfo(allocator: std.mem.Allocator, json: *std.ArrayList(u8), 
             stat.bytes_uploaded,
             stat.bytes_uploaded,
             time_active,
-            @as(i64, if (stat.state == .seeding) time_active else 0),
+            stat.seeding_time,
             now,
+            stat.ratio_limit,
+            stat.seeding_time_limit,
             esc(magnet_uri),
         },
     );
@@ -1491,6 +1580,55 @@ fn extractJsonInt(body: []const u8, key: []const u8) ?u64 {
     return std.fmt.parseInt(u64, body[val_start..val_end], 10) catch null;
 }
 
+/// Extract a boolean value from a simple JSON object by key.
+/// Handles: {"key":true} or {"key": false} patterns.
+fn extractJsonBool(body: []const u8, key: []const u8) ?bool {
+    var needle_buf: [128]u8 = undefined;
+    if (key.len + 3 > needle_buf.len) return null;
+    needle_buf[0] = '"';
+    @memcpy(needle_buf[1..][0..key.len], key);
+    needle_buf[key.len + 1] = '"';
+    needle_buf[key.len + 2] = ':';
+    const needle = needle_buf[0 .. key.len + 3];
+
+    const key_pos = std.mem.indexOf(u8, body, needle) orelse return null;
+    var val_start = key_pos + needle.len;
+
+    // Skip whitespace
+    while (val_start < body.len and body[val_start] == ' ') val_start += 1;
+    if (val_start >= body.len) return null;
+
+    if (val_start + 4 <= body.len and std.mem.eql(u8, body[val_start..][0..4], "true")) return true;
+    if (val_start + 5 <= body.len and std.mem.eql(u8, body[val_start..][0..5], "false")) return false;
+    return null;
+}
+
+/// Extract a float value from a simple JSON object by key.
+/// Handles: {"key":1.5} or {"key": -1} patterns.
+fn extractJsonFloat(body: []const u8, key: []const u8) ?f64 {
+    var needle_buf: [128]u8 = undefined;
+    if (key.len + 3 > needle_buf.len) return null;
+    needle_buf[0] = '"';
+    @memcpy(needle_buf[1..][0..key.len], key);
+    needle_buf[key.len + 1] = '"';
+    needle_buf[key.len + 2] = ':';
+    const needle = needle_buf[0 .. key.len + 3];
+
+    const key_pos = std.mem.indexOf(u8, body, needle) orelse return null;
+    var val_start = key_pos + needle.len;
+
+    // Skip whitespace
+    while (val_start < body.len and body[val_start] == ' ') val_start += 1;
+    if (val_start >= body.len) return null;
+
+    // Read number characters (digits, minus, dot)
+    var val_end = val_start;
+    while (val_end < body.len and (body[val_end] == '-' or body[val_end] == '.' or (body[val_end] >= '0' and body[val_end] <= '9'))) val_end += 1;
+    if (val_end == val_start) return null;
+
+    return std.fmt.parseFloat(f64, body[val_start..val_end]) catch null;
+}
+
 test "extract form param" {
     try std.testing.expectEqualStrings("abc123", extractParam("hashes=abc123&deleteFiles=false", "hashes").?);
     try std.testing.expectEqualStrings("false", extractParam("hashes=abc123&deleteFiles=false", "deleteFiles").?);
@@ -1503,4 +1641,23 @@ test "extract json int" {
     try std.testing.expectEqual(@as(?u64, 100), extractJsonInt("{\"dl_limit\": 100}", "dl_limit"));
     try std.testing.expect(extractJsonInt("{\"dl_limit\":1024}", "missing") == null);
     try std.testing.expect(extractJsonInt("dl_limit=1024", "dl_limit") == null);
+}
+
+test "extract json bool" {
+    try std.testing.expectEqual(@as(?bool, true), extractJsonBool("{\"max_ratio_enabled\":true}", "max_ratio_enabled"));
+    try std.testing.expectEqual(@as(?bool, false), extractJsonBool("{\"max_ratio_enabled\":false}", "max_ratio_enabled"));
+    try std.testing.expectEqual(@as(?bool, true), extractJsonBool("{\"max_ratio_enabled\": true}", "max_ratio_enabled"));
+    try std.testing.expect(extractJsonBool("{\"max_ratio_enabled\":1}", "max_ratio_enabled") == null);
+    try std.testing.expect(extractJsonBool("{}", "max_ratio_enabled") == null);
+}
+
+test "extract json float" {
+    const eps = 0.0001;
+    const v1 = extractJsonFloat("{\"max_ratio\":2.5}", "max_ratio").?;
+    try std.testing.expect(@abs(v1 - 2.5) < eps);
+    const v2 = extractJsonFloat("{\"max_ratio\":-1}", "max_ratio").?;
+    try std.testing.expect(@abs(v2 - (-1.0)) < eps);
+    const v3 = extractJsonFloat("{\"max_ratio\": 0.75}", "max_ratio").?;
+    try std.testing.expect(@abs(v3 - 0.75) < eps);
+    try std.testing.expect(extractJsonFloat("{}", "max_ratio") == null);
 }

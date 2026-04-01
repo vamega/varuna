@@ -58,7 +58,7 @@ Update it whenever a milestone lands, the near-term backlog changes, or a new op
 - **Auth**: login/logout with session cookies (SID), 1-hour timeout, configurable credentials.
 - **Core**: webapiVersion, version, buildInfo, preferences (40+ fields), setPreferences (form + JSON), transfer/info (with connection_status, real DHT node count from routing table), speedLimitsMode.
 - **Torrents**: info (40+ fields matching qui Torrent interface, real infohash_v2 for BEP 52 torrents), add (multipart + raw), delete, pause, resume, properties (30+ fields with hash, name, created_by, creation_date, scrape-based peers_total/seeds_total, v2 info-hash, completion_date), files (with index, availability, real piece_range), trackers (with msg field).
-- **Controls**: filePrio, setSequentialDownload, setDownloadLimit, setUploadLimit, downloadLimit, uploadLimit, forceReannounce, recheck, setLocation, connDiagnostics.
+- **Controls**: filePrio, setSequentialDownload, setDownloadLimit, setUploadLimit, downloadLimit, uploadLimit, forceReannounce, recheck, setLocation, connDiagnostics, setShareLimits.
 - **Categories & Tags**: categories (create/edit/remove/list/setCategory), tags (create/delete/addTags/removeTags/list).
 - **Sync**: /api/v2/sync/maindata delta protocol (rid-based, Wyhash change detection, 100-snapshot circular buffer, real DHT node count in server_state, infohash_v2 in torrent objects), sync/torrentPeers with real peer data (IP, flags, progress, transfer stats, per-peer dl/ul speed, client name from peer ID).
 - **Compatibility**: qBittorrent state strings (downloading/uploading/pausedDL/pausedUP/etc), CORS headers on all responses, OPTIONS preflight handler, magnet URI generation, percent-encoding, content_path building, HTTP 404 for unknown API paths. Validated against qui (autobrr/qui) TypeScript interfaces. See [docs/api-compatibility.md](docs/api-compatibility.md) for full endpoint coverage and known placeholder fields.
@@ -77,6 +77,7 @@ Update it whenever a milestone lands, the near-term backlog changes, or a new op
 - Torrent data relocation: move completed torrent data to a new path via API (setLocation endpoint).
 - Per-torrent connection diagnostics: connection attempts/failures/timeouts exposed via connDiagnostics API.
 - Partial download cleanup: delete torrent with --delete-files removes data files and empty directories.
+- Share ratio limits: automatic pause or remove when torrents reach a target upload/download ratio or seeding time. Global limits configurable via TOML config and preferences API. Per-torrent overrides via `setShareLimits` endpoint. Limits and completion timestamps persisted to SQLite. Enforcement runs every ~30 seconds in the main loop.
 
 ### Performance & Hardening
 - **SHA-1 hardware acceleration**: runtime CPU detection for x86_64 SHA-NI (~2x to ~2.2 GB/s) and AArch64 SHA1 crypto extensions. Atomic-cached dispatch, automatic fallback to software.
@@ -129,7 +130,7 @@ Update it whenever a milestone lands, the near-term backlog changes, or a new op
 - Event loop integration (`src/io/dht_handler.zig`): DHT/uTP demux by first byte ('d' for KRPC, else uTP). DHT tick in event loop. Outbound packets sent via shared UDP socket. Discovered peers fed into existing peer connection pipeline via addPeerForTorrent.
 
 ### Testing
-- 19 peer wire protocol tests, 16 BEP 10 extension tests (including 6 BEP 21 upload_only tests), 15 PEX tests, 31 uTP/LEDBAT tests, 5 categories tests, 9 resume DB tests, 25 MSE/RC4 tests, 13 magnet URI tests, 13 ut_metadata tests, 12 metadata fetch resilience tests.
+- 19 peer wire protocol tests, 16 BEP 10 extension tests (including 6 BEP 21 upload_only tests), 15 PEX tests, 31 uTP/LEDBAT tests, 5 categories tests, 10 resume DB tests, 25 MSE/RC4 tests, 13 magnet URI tests, 13 ut_metadata tests, 12 metadata fetch resilience tests.
 - 13 async MSE state machine tests (initiator phases, responder phases, VC scan limit, fallback, first-byte detection).
 - Bencode fuzz + edge case tests, HTTP parser fuzz tests.
 - Fuzz tests for: multipart parser, tracker response, uTP packets, BEP 10 extensions, scrape response (18 fuzz tests total).

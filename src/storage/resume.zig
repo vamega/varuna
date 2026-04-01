@@ -198,6 +198,23 @@ pub const ResumeDb = struct {
             return error.SqliteSchemaFailed;
         }
 
+        // Create share_limits table for per-torrent ratio and seeding time limits
+        if (sqlite.sqlite3_exec(
+            d,
+            "CREATE TABLE IF NOT EXISTS share_limits (" ++
+                "info_hash BLOB NOT NULL PRIMARY KEY, " ++
+                "ratio_limit REAL NOT NULL DEFAULT -2.0, " ++
+                "seeding_time_limit INTEGER NOT NULL DEFAULT -2, " ++
+                "completion_on INTEGER NOT NULL DEFAULT 0" ++
+                ")",
+            null,
+            null,
+            null,
+        ) != sqlite.SQLITE_OK) {
+            _ = sqlite.sqlite3_close(d);
+            return error.SqliteSchemaFailed;
+        }
+
         // Create ipfilter_config table (singleton)
         if (sqlite.sqlite3_exec(
             d,
@@ -616,6 +633,54 @@ pub const ResumeDb = struct {
     /// Clear rate limits for a torrent.
     pub fn clearRateLimits(self: *ResumeDb, info_hash: [20]u8) !void {
         const stmt = try self.execOneShot("DELETE FROM rate_limits WHERE info_hash = ?1");
+        _ = sqlite.sqlite3_bind_blob(stmt, 1, &info_hash, 20, sqlite.SQLITE_TRANSIENT);
+        try stepAndFinalize(stmt);
+    }
+
+    // ── Share limit persistence ────────────────────────────
+
+    /// Per-torrent share limits loaded from DB.
+    pub const ShareLimits = struct {
+        /// -2 = use global, -1 = no limit, >=0 = specific ratio limit.
+        ratio_limit: f64 = -2.0,
+        /// -2 = use global, -1 = no limit, >=0 = specific minutes limit.
+        seeding_time_limit: i64 = -2,
+        /// Timestamp when the torrent completed downloading. 0 = not yet.
+        completion_on: i64 = 0,
+    };
+
+    /// Save per-torrent share limits (upsert).
+    pub fn saveShareLimits(self: *ResumeDb, info_hash: [20]u8, ratio_limit: f64, seeding_time_limit: i64, completion_on: i64) !void {
+        const stmt = try self.execOneShot(
+            "INSERT INTO share_limits (info_hash, ratio_limit, seeding_time_limit, completion_on) VALUES (?1, ?2, ?3, ?4) " ++
+                "ON CONFLICT(info_hash) DO UPDATE SET ratio_limit = ?2, seeding_time_limit = ?3, completion_on = ?4",
+        );
+        _ = sqlite.sqlite3_bind_blob(stmt, 1, &info_hash, 20, sqlite.SQLITE_TRANSIENT);
+        _ = sqlite.sqlite3_bind_double(stmt, 2, ratio_limit);
+        _ = sqlite.sqlite3_bind_int64(stmt, 3, @intCast(seeding_time_limit));
+        _ = sqlite.sqlite3_bind_int64(stmt, 4, @intCast(completion_on));
+        try stepAndFinalize(stmt);
+    }
+
+    /// Load per-torrent share limits. Returns defaults if not set.
+    pub fn loadShareLimits(self: *ResumeDb, info_hash: [20]u8) ShareLimits {
+        const stmt = self.execOneShot("SELECT ratio_limit, seeding_time_limit, completion_on FROM share_limits WHERE info_hash = ?1") catch return .{};
+        defer _ = sqlite.sqlite3_finalize(stmt);
+        _ = sqlite.sqlite3_bind_blob(stmt, 1, &info_hash, 20, sqlite.SQLITE_TRANSIENT);
+
+        if (sqlite.sqlite3_step(stmt) == sqlite.SQLITE_ROW) {
+            return .{
+                .ratio_limit = sqlite.sqlite3_column_double(stmt, 0),
+                .seeding_time_limit = sqlite.sqlite3_column_int64(stmt, 1),
+                .completion_on = sqlite.sqlite3_column_int64(stmt, 2),
+            };
+        }
+        return .{};
+    }
+
+    /// Clear share limits for a torrent.
+    pub fn clearShareLimits(self: *ResumeDb, info_hash: [20]u8) !void {
+        const stmt = try self.execOneShot("DELETE FROM share_limits WHERE info_hash = ?1");
         _ = sqlite.sqlite3_bind_blob(stmt, 1, &info_hash, 20, sqlite.SQLITE_TRANSIENT);
         try stepAndFinalize(stmt);
     }
@@ -1367,6 +1432,38 @@ test "resume db clear banned by source" {
         allocator.free(ranges);
     }
     try std.testing.expectEqual(@as(usize, 0), ranges.len);
+}
+
+test "resume db save and load share limits" {
+    var db = ResumeDb.open(":memory:") catch return error.SkipZigTest;
+    defer db.close();
+
+    const info_hash = [_]u8{0xAB} ** 20;
+
+    // Default values when not set
+    const default_limits = db.loadShareLimits(info_hash);
+    try std.testing.expect(default_limits.ratio_limit == -2.0);
+    try std.testing.expectEqual(@as(i64, -2), default_limits.seeding_time_limit);
+    try std.testing.expectEqual(@as(i64, 0), default_limits.completion_on);
+
+    // Save custom limits
+    try db.saveShareLimits(info_hash, 2.5, 120, 1711900000);
+
+    const loaded = db.loadShareLimits(info_hash);
+    try std.testing.expect(loaded.ratio_limit == 2.5);
+    try std.testing.expectEqual(@as(i64, 120), loaded.seeding_time_limit);
+    try std.testing.expectEqual(@as(i64, 1711900000), loaded.completion_on);
+
+    // Upsert (update existing)
+    try db.saveShareLimits(info_hash, -1.0, -1, 1711900000);
+    const updated = db.loadShareLimits(info_hash);
+    try std.testing.expect(updated.ratio_limit == -1.0);
+    try std.testing.expectEqual(@as(i64, -1), updated.seeding_time_limit);
+
+    // Clear
+    try db.clearShareLimits(info_hash);
+    const cleared = db.loadShareLimits(info_hash);
+    try std.testing.expect(cleared.ratio_limit == -2.0);
 }
 
 test "resume db ipfilter config persistence" {

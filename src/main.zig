@@ -95,6 +95,13 @@ pub fn main() !void {
     session_manager.resume_db_path = resume_db_path;
     session_manager.masquerade_as = cfg.network.masquerade_as;
     if (cfg.storage.data_dir) |dir| session_manager.default_save_path = dir;
+
+    // Apply share ratio / seeding time limits from config
+    session_manager.max_ratio_enabled = cfg.daemon.max_ratio_enabled;
+    session_manager.max_ratio = cfg.daemon.max_ratio;
+    session_manager.max_ratio_act = cfg.daemon.max_ratio_act;
+    session_manager.max_seeding_time_enabled = cfg.daemon.max_seeding_time_enabled;
+    session_manager.max_seeding_time = cfg.daemon.max_seeding_time;
     // Load persisted categories and tags from the resume DB
     session_manager.loadCategoriesAndTags();
     defer session_manager.deinit();
@@ -236,9 +243,23 @@ pub fn main() !void {
                     sess.persistNewCompletions();
                     sess.flushResume();
                     sess.maybeScrape();
+                    // Persist completion_on if it was set but not yet saved
+                    if (sess.completion_on > 0) {
+                        session_manager.persistCompletionOn(
+                            sess.info_hash,
+                            sess.ratio_limit,
+                            sess.seeding_time_limit,
+                            sess.completion_on,
+                        );
+                    }
                 }
             }
             session_manager.mutex.unlock();
+        }
+
+        // Check share ratio / seeding time limits (~every 30s at 100ms tick)
+        if (resume_tick_counter % 300 == 150) {
+            _ = session_manager.checkShareLimits();
         }
 
         // Tick shared event loop (non-blocking poll)
