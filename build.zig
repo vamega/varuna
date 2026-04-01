@@ -206,6 +206,23 @@ pub fn build(b: *std.Build) void {
     const bench_step = b.step("bench", "Run bootstrap microbenchmarks");
     bench_step.dependOn(&b.addRunArtifact(bench_exe).step);
 
+    const perf_workload_exe = b.addExecutable(.{
+        .name = "varuna-perf",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/perf/main.zig"),
+            .target = target,
+            .optimize = optimize,
+            .imports = &varuna_import,
+        }),
+    });
+    b.installArtifact(perf_workload_exe);
+
+    const perf_workload_step = b.step("perf-workload", "Run synthetic allocation and cache workload scenarios");
+    const perf_workload_run = b.addRunArtifact(perf_workload_exe);
+    perf_workload_run.step.dependOn(b.getInstallStep());
+    if (b.args) |args| perf_workload_run.addArgs(args);
+    perf_workload_step.dependOn(&perf_workload_run.step);
+
     // ── Profiling helpers ─────────────────────────────────
     const installed_exe_path = b.getInstallPath(.bin, "varuna");
     const perf_exe_path = resolvePerfExecutable(b);

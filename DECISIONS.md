@@ -14,6 +14,31 @@ Use [STATUS.md](STATUS.md) for the running list of completed work, next work, an
 
 ## Decision Entries
 
+### 2026-03-31: Second Memory Pass Uses Session Arenas And API Vectored Sends
+
+Context:
+The first allocation pass removed most of the short-lived churn in request batching, seed batching, extension decode, and `/sync/maindata`, but two obvious ownership costs remained:
+- `Session.load` still spread long-lived torrent metadata across many small general-allocator allocations.
+- The API server still concatenated HTTP headers and body into a fresh response buffer even when the handler already owned the body.
+
+Decision:
+- Make `Session.load` allocate the session-owned torrent bytes, metainfo, layout, and manifest from a session-local `ArenaAllocator`, and tear the whole session down by destroying that arena.
+- Change the API server send path to build only the HTTP header buffer, then send header and body as separate iovecs via `io_uring` `sendmsg`.
+- Extend the synthetic `peer_scan` workload so active density can be varied with `--scale`, which makes sparse-table scan behavior measurable instead of assuming a dense active set.
+
+Reasoning:
+- Session metadata is immutable after load and naturally shares a lifetime, so an arena removes allocator bookkeeping and fragmentation without complicating ownership.
+- The API server was paying for one avoidable full-body copy per response. Keeping handler-owned bodies alive until send completion is simpler and cheaper than rebuilding the entire response payload.
+- Sparse active-peer density is the case where the earlier active-slot scan change should help most, so the harness needs a direct way to exercise it.
+
+Measured effect:
+- `http_response` fell from `10,001` allocs / `48.6 MB` transient bytes / `9.93e7 ns` to `5,001` allocs / `648 KB` transient bytes / `4.63e7 ns`.
+- `session_load` fell from `14,004` allocs / `5.05e7 ns` to `2,004` allocs / `1.33e7 ns`.
+
+Follow-up triggers:
+- If API polling still shows up in end-to-end profiles, add per-client request arenas and reuse for request-body growth.
+- The peer path still needs a real hot/cold split or SoA conversion if scan-side cache pressure remains measurable after the active-slot pass.
+
 ### 2026-03-24: Minimal Client Contract
 
 Context:
@@ -237,6 +262,32 @@ Decision:
 - Implement BEP 11 with delta encoding: each PEX message contains only peers added/dropped since the last exchange with that particular peer.
 - Use per-peer PexState to track previously sent peer sets, and per-torrent TorrentPexState for the current connected peer set.
 - Allocate PEX state lazily (on first use) so private torrents and non-PEX peers have zero overhead.
+
+### 2026-03-31: Memory Baseline Workflow And First Allocation Reduction Pass
+
+Context:
+The daemon had several clear allocation-heavy paths, but there was no repeatable way to compare them without live swarm traffic. The current host is WSL2, and `perf stat` / `perf record` are blocked until the matching `linux-tools-6.6.87.2-microsoft-standard-WSL2` package is installed.
+
+Decision:
+- Add a dedicated synthetic workload binary, `varuna-perf`, for stable before/after measurements of peer scans, request batching, seed batching, `/sync/maindata`, metadata parsing, and session loading.
+- Measure allocation churn in that binary with an in-process counting allocator.
+- On WSL hosts where `perf` is unavailable, use `cachegrind` for cache-miss comparisons and `heaptrack` for stack-attributed allocation traces.
+- Land the first low-risk memory pass before attempting a full peer/uTP hot/cold split:
+  - piece-verification planning now accepts caller scratch spans with heap fallback,
+  - tracked sends use a fixed small-send pool for small async buffers,
+  - seed batching keeps block descriptors into the piece buffer instead of heap-copying every block,
+  - `/sync/maindata` uses fixed `[40]u8` snapshot keys and a request arena for transient JSON work,
+  - BEP 10 and BEP 9 control-message decoders use fixed-shape parsers instead of allocating bencode trees,
+  - scan-heavy peer-policy code iterates dense active-slot lists instead of walking every peer slot.
+
+Reasoning:
+- The synthetic harness makes the allocator and cache effects reproducible without needing a real swarm or WebUI client in the loop.
+- The WSL `perf` limitation is an environment issue, not a code issue, so the workflow needs a documented fallback instead of blocking optimization work.
+- These changes target the highest-yield short-lived allocations first and reduce memory traffic without changing public behavior.
+
+Follow-up triggers:
+- If the peer-policy scans are still prominent after the active-slot pass, split hot peer state from cold per-peer storage and benchmark a fuller SoA layout.
+- Apply the same request-arena pattern to other RPC endpoints that still materialize temporary object graphs.
 - Connect to PEX-discovered peers through the existing addPeerForTorrent machinery, respecting all connection limits.
 - Cap added/dropped lists at 50 peers per message and enforce 60-second intervals per peer, as recommended by BEP 11.
 

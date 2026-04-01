@@ -80,6 +80,7 @@ pub const ApiServer = struct {
                 self.allocator.free(buf);
                 client.recv_buf = null;
             }
+            releaseClientResponse(self, client);
         }
         if (self.listen_fd >= 0) posix.close(self.listen_fd);
         self.ring.deinit();
@@ -287,18 +288,46 @@ pub const ApiServer = struct {
 
     fn submitSend(self: *ApiServer, slot: u8) !void {
         const client = &self.clients[slot];
-        const buf = client.recv_buf orelse return error.NoSendBuffer;
-        if (client.send_offset >= buf.len) return error.NoSendBuffer;
+        const header = client.header_buf orelse return error.NoSendBuffer;
+        var iov_len: usize = 0;
+        if (client.header_offset < header.len) {
+            const remaining = header[client.header_offset..];
+            client.send_iov[iov_len] = .{
+                .base = remaining.ptr,
+                .len = remaining.len,
+            };
+            iov_len += 1;
+        }
+        if (client.body_offset < client.body.len) {
+            const remaining = client.body[client.body_offset..];
+            client.send_iov[iov_len] = .{
+                .base = remaining.ptr,
+                .len = remaining.len,
+            };
+            iov_len += 1;
+        }
+        if (iov_len == 0) return error.NoSendBuffer;
+        client.send_msg = .{
+            .name = null,
+            .namelen = 0,
+            .iov = @ptrCast(&client.send_iov),
+            .iovlen = iov_len,
+            .control = null,
+            .controllen = 0,
+            .flags = 0,
+        };
         const ud = encodeUd(slot, OP_SEND);
-        _ = try self.ring.inner.send(ud, client.fd, buf[client.send_offset..], 0);
+        _ = try self.ring.inner.sendmsg(ud, client.fd, &client.send_msg, 0);
     }
 
     fn sendResponse(self: *ApiServer, slot: u8, response: Response) void {
         const client = &self.clients[slot];
-        defer freeOwnedResponse(self.allocator, response);
+        var owned_body = response.owned_body;
+        errdefer if (owned_body) |owned| self.allocator.free(owned);
+        defer if (response.owned_extra_headers) |owned| self.allocator.free(owned);
 
-        // Build the full response first, then swap it into the client only
-        // after ownership transfer succeeds.
+        // Build the headers only; the body stays in its original storage and is
+        // sent as the second iovec.
         var buf = std.ArrayList(u8).empty;
         defer buf.deinit(self.allocator);
 
@@ -312,17 +341,16 @@ pub const ApiServer = struct {
             buf.appendSlice(self.allocator, hdrs) catch return;
         }
         buf.appendSlice(self.allocator, "\r\n") catch return;
-        buf.appendSlice(self.allocator, response.body) catch return;
 
-        const response_buf = buf.toOwnedSlice(self.allocator) catch return;
+        const header_buf = buf.toOwnedSlice(self.allocator) catch return;
 
-        // Store response in a buffer the client owns
-        if (client.recv_buf) |old_buf| {
-            self.allocator.free(old_buf);
-        }
-        client.recv_buf = response_buf;
-        client.recv_offset = 0;
-        client.send_offset = 0;
+        releaseClientResponse(self, client);
+        client.header_buf = header_buf;
+        client.header_offset = 0;
+        client.body = response.body;
+        client.body_offset = 0;
+        client.owned_body = owned_body;
+        owned_body = null;
 
         self.submitSend(slot) catch {
             self.closeClient(slot);
@@ -345,6 +373,7 @@ pub const ApiServer = struct {
             client.fd = -1;
         }
         if (client.recv_buf) |buf| self.allocator.free(buf);
+        releaseClientResponse(self, client);
         client.* = .{};
     }
 
@@ -379,7 +408,13 @@ pub const ApiClient = struct {
     fd: posix.fd_t = -1,
     recv_buf: ?[]u8 = null,
     recv_offset: usize = 0,
-    send_offset: usize = 0,
+    header_buf: ?[]u8 = null,
+    header_offset: usize = 0,
+    body: []const u8 = "",
+    owned_body: ?[]u8 = null,
+    body_offset: usize = 0,
+    send_iov: [2]posix.iovec_const = undefined,
+    send_msg: posix.msghdr_const = std.mem.zeroes(posix.msghdr_const),
 };
 
 fn parseRequest(data: []const u8) ?Request {
@@ -450,21 +485,39 @@ fn defaultHandler(_: std.mem.Allocator, request: Request) Response {
     return .{ .status = 404, .body = "{\"error\":\"not found\"}" };
 }
 
-fn freeOwnedResponse(allocator: std.mem.Allocator, response: Response) void {
-    if (response.owned_body) |owned| allocator.free(owned);
-    if (response.owned_extra_headers) |owned| allocator.free(owned);
+fn releaseOwnedResponseBody(allocator: std.mem.Allocator, client: *ApiClient) void {
+    if (client.owned_body) |owned| allocator.free(owned);
+    client.owned_body = null;
 }
 
 fn advanceSendProgress(client: *ApiClient, sent: usize) !bool {
     if (sent == 0) return error.InvalidSendLength;
-    const buf = client.recv_buf orelse return error.NoSendBuffer;
-    if (client.send_offset > buf.len) return error.InvalidSendLength;
+    const header = client.header_buf orelse return error.NoSendBuffer;
+    if (client.header_offset > header.len or client.body_offset > client.body.len) {
+        return error.InvalidSendLength;
+    }
 
-    const remaining = buf.len - client.send_offset;
-    if (sent > remaining) return error.InvalidSendLength;
+    const header_remaining = header.len - client.header_offset;
+    if (sent < header_remaining) {
+        client.header_offset += sent;
+        return false;
+    }
 
-    client.send_offset += sent;
-    return client.send_offset == buf.len;
+    client.header_offset = header.len;
+    const body_sent = sent - header_remaining;
+    const body_remaining = client.body.len - client.body_offset;
+    if (body_sent > body_remaining) return error.InvalidSendLength;
+    client.body_offset += body_sent;
+    return client.header_offset == header.len and client.body_offset == client.body.len;
+}
+
+fn releaseClientResponse(self: *ApiServer, client: *ApiClient) void {
+    if (client.header_buf) |buf| self.allocator.free(buf);
+    client.header_buf = null;
+    client.header_offset = 0;
+    client.body = "";
+    client.body_offset = 0;
+    releaseOwnedResponseBody(self.allocator, client);
 }
 
 fn statusText(status: u16) []const u8 {
@@ -584,22 +637,26 @@ test "api server handles request via io_uring" {
 
 test "advanceSendProgress tracks partial sends" {
     var client = ApiClient{
-        .recv_buf = "hello"[0..],
+        .header_buf = "he"[0..],
+        .body = "llo"[0..],
     };
 
     try std.testing.expect(!(try advanceSendProgress(&client, 2)));
-    try std.testing.expectEqual(@as(usize, 2), client.send_offset);
+    try std.testing.expectEqual(@as(usize, 2), client.header_offset);
+    try std.testing.expectEqual(@as(usize, 0), client.body_offset);
     try std.testing.expect(try advanceSendProgress(&client, 3));
-    try std.testing.expectEqual(@as(usize, 5), client.send_offset);
+    try std.testing.expectEqual(@as(usize, 2), client.header_offset);
+    try std.testing.expectEqual(@as(usize, 3), client.body_offset);
 }
 
 test "advanceSendProgress rejects invalid completions" {
     var client = ApiClient{
-        .recv_buf = "abc"[0..],
+        .header_buf = "ab"[0..],
+        .body = "c"[0..],
     };
 
     try std.testing.expectError(error.InvalidSendLength, advanceSendProgress(&client, 0));
     try std.testing.expectError(error.InvalidSendLength, advanceSendProgress(&client, 4));
-    client.recv_buf = null;
+    client.header_buf = null;
     try std.testing.expectError(error.NoSendBuffer, advanceSendProgress(&client, 1));
 }

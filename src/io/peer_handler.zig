@@ -73,6 +73,7 @@ pub fn handleAccept(self: *EventLoop, cqe: linux.io_uring_cqe) void {
     };
     peer.handshake_offset = 0;
     self.peer_count += 1;
+    self.markActivePeer(slot);
 
     // Start receiving the peer's handshake
     protocol.submitHandshakeRecv(self, slot) catch {

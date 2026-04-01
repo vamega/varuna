@@ -5,6 +5,7 @@ const metainfo = @import("metainfo.zig");
 const manifest = @import("../storage/manifest.zig");
 
 pub const Session = struct {
+    arena_state: ?std.heap.ArenaAllocator = null,
     torrent_bytes: []const u8,
     metainfo: metainfo.Metainfo,
     layout: layout.Layout,
@@ -16,19 +17,19 @@ pub const Session = struct {
         torrent_bytes: []const u8,
         target_root: []const u8,
     ) !Session {
-        const owned_torrent_bytes = try allocator.dupe(u8, torrent_bytes);
-        errdefer allocator.free(owned_torrent_bytes);
+        var arena_state = std.heap.ArenaAllocator.init(allocator);
+        errdefer arena_state.deinit();
+        const arena = arena_state.allocator();
 
-        const parsed = try metainfo.parse(allocator, owned_torrent_bytes);
-        errdefer metainfo.freeMetainfo(allocator, parsed);
+        const owned_torrent_bytes = try arena.dupe(u8, torrent_bytes);
+        const parsed = try metainfo.parse(arena, owned_torrent_bytes);
 
-        const built_layout = try layout.build(allocator, &parsed);
-        errdefer layout.freeLayout(allocator, built_layout);
+        const built_layout = try layout.build(arena, &parsed);
 
-        const built_manifest = try manifest.build(allocator, target_root, parsed, built_layout);
-        errdefer manifest.freeManifest(allocator, built_manifest);
+        const built_manifest = try manifest.build(arena, target_root, parsed, built_layout);
 
         return .{
+            .arena_state = arena_state,
             .torrent_bytes = owned_torrent_bytes,
             .metainfo = parsed,
             .layout = built_layout,
@@ -37,10 +38,15 @@ pub const Session = struct {
     }
 
     pub fn deinit(self: Session, allocator: std.mem.Allocator) void {
-        manifest.freeManifest(allocator, self.manifest);
-        layout.freeLayout(allocator, self.layout);
-        metainfo.freeMetainfo(allocator, self.metainfo);
-        allocator.free(self.torrent_bytes);
+        if (self.arena_state) |arena_state| {
+            var arena = arena_state;
+            arena.deinit();
+        } else {
+            manifest.freeManifest(allocator, self.manifest);
+            layout.freeLayout(allocator, self.layout);
+            metainfo.freeMetainfo(allocator, self.metainfo);
+            allocator.free(self.torrent_bytes);
+        }
     }
 
     pub fn geometry(self: *const Session) blocks.Geometry {

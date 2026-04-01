@@ -229,6 +229,9 @@ pub const TorrentContext = struct {
 // ── Event loop ────────────────────────────────────────────
 
 pub const EventLoop = struct {
+    pub const small_send_capacity: usize = 256;
+    const small_send_slots: usize = max_peers * 2;
+
     pub const PendingWriteKey = struct {
         piece_index: u32,
         torrent_id: u8,
@@ -250,6 +253,55 @@ pub const EventLoop = struct {
         /// Unique ID for matching CQEs to the correct PendingSend when
         /// multiple sends are in-flight for the same slot.
         send_id: u32,
+        small_slot: ?u16 = null,
+    };
+
+    const SmallSendPool = struct {
+        storage: []u8,
+        free: []bool,
+
+        fn init(allocator: std.mem.Allocator) !SmallSendPool {
+            const storage = try allocator.alloc(u8, small_send_slots * small_send_capacity);
+            errdefer allocator.free(storage);
+
+            const free = try allocator.alloc(bool, small_send_slots);
+            @memset(free, true);
+
+            return .{
+                .storage = storage,
+                .free = free,
+            };
+        }
+
+        fn deinit(self: *SmallSendPool, allocator: std.mem.Allocator) void {
+            allocator.free(self.storage);
+            allocator.free(self.free);
+            self.* = undefined;
+        }
+
+        fn alloc(self: *SmallSendPool, bytes: []const u8) ?struct { slot: u16, buf: []u8 } {
+            if (bytes.len > small_send_capacity) return null;
+
+            for (self.free, 0..) |is_free, idx| {
+                if (!is_free) continue;
+                self.free[idx] = false;
+
+                const start = idx * small_send_capacity;
+                const slot_buf = self.storage[start .. start + bytes.len];
+                @memcpy(slot_buf, bytes);
+
+                return .{
+                    .slot = @intCast(idx),
+                    .buf = slot_buf,
+                };
+            }
+
+            return null;
+        }
+
+        fn release(self: *SmallSendPool, slot: u16) void {
+            self.free[slot] = true;
+        }
     };
 
     /// A uTP packet waiting to be sent over the UDP socket.
@@ -262,14 +314,17 @@ pub const EventLoop = struct {
 
     /// Queued piece block response for batched sending.
     /// Multiple blocks queued in the same tick are combined into one send.
-    /// Each entry owns an exact copy of the block bytes to keep batching
-    /// correct even if the piece cache changes before flush.
     pub const QueuedBlockResponse = struct {
         slot: u16,
         piece_index: u32,
         block_offset: u32,
         block_length: u32,
-        block_data: []u8,
+        piece_data: []const u8,
+    };
+
+    const DeferredPieceBuffer = struct {
+        buf: []u8,
+        from_pool: bool,
     };
 
     /// Tracks an async piece read for seed mode.
@@ -344,6 +399,7 @@ pub const EventLoop = struct {
 
     // Pending sends: track allocated send buffers (for seed piece responses).
     pending_sends: std.ArrayList(PendingSend),
+    small_send_pool: SmallSendPool,
     // Monotonic counter for unique PendingSend identification across CQEs.
     // Starts at 1 because context=0 means "untracked send" (no PendingSend entry).
     next_send_id: u32 = 1,
@@ -365,6 +421,7 @@ pub const EventLoop = struct {
 
     // Queued piece block responses (batched per tick, flushed after CQE dispatch)
     queued_responses: std.ArrayList(QueuedBlockResponse),
+    deferred_piece_buffers: std.ArrayList(DeferredPieceBuffer),
 
     // Connection limits
     max_connections: u32 = 500,
@@ -406,6 +463,7 @@ pub const EventLoop = struct {
     // availability, and need a piece assignment).  Avoids scanning all
     // max_peers slots every tick in tryAssignPieces.
     idle_peers: std.ArrayList(u16),
+    active_peer_slots: std.ArrayList(u16),
 
     // ── Lifecycle ──────────────────────────────────────────
 
@@ -425,9 +483,12 @@ pub const EventLoop = struct {
             .peers = peers,
             .pending_writes = .empty,
             .pending_sends = std.ArrayList(PendingSend).empty,
+            .small_send_pool = try SmallSendPool.init(allocator),
             .pending_reads = std.ArrayList(PendingPieceRead).empty,
             .queued_responses = try std.ArrayList(QueuedBlockResponse).initCapacity(allocator, 256),
+            .deferred_piece_buffers = std.ArrayList(DeferredPieceBuffer).empty,
             .idle_peers = std.ArrayList(u16).empty,
+            .active_peer_slots = std.ArrayList(u16).empty,
             .hasher = hasher,
         };
     }
@@ -455,9 +516,12 @@ pub const EventLoop = struct {
             .peers = peers,
             .pending_writes = .empty,
             .pending_sends = std.ArrayList(PendingSend).empty,
+            .small_send_pool = try SmallSendPool.init(allocator),
             .pending_reads = std.ArrayList(PendingPieceRead).empty,
             .queued_responses = try std.ArrayList(QueuedBlockResponse).initCapacity(allocator, 256),
+            .deferred_piece_buffers = std.ArrayList(DeferredPieceBuffer).empty,
             .idle_peers = std.ArrayList(u16).empty,
+            .active_peer_slots = std.ArrayList(u16).empty,
             .hasher = hasher,
         };
 
@@ -533,18 +597,21 @@ pub const EventLoop = struct {
         }
         self.pending_writes.deinit(self.allocator);
         for (self.pending_sends.items) |ps| {
-            self.allocator.free(ps.buf);
+            self.releasePendingSend(ps);
         }
         self.pending_sends.deinit(self.allocator);
+        self.small_send_pool.deinit(self.allocator);
         for (self.pending_reads.items) |pr| {
             if (!pr.from_pool) self.allocator.free(pr.read_buf);
         }
         self.pending_reads.deinit(self.allocator);
-        for (self.queued_responses.items) |resp| {
-            self.allocator.free(resp.block_data);
+        for (self.deferred_piece_buffers.items) |piece_buf| {
+            if (!piece_buf.from_pool) self.allocator.free(piece_buf.buf);
         }
+        self.deferred_piece_buffers.deinit(self.allocator);
         self.queued_responses.deinit(self.allocator);
         self.idle_peers.deinit(self.allocator);
+        self.active_peer_slots.deinit(self.allocator);
         self.hash_result_swap.deinit(self.allocator);
         // Free any unclaimed Merkle results (piece_hashes ownership)
         for (self.merkle_result_swap.items) |mr| {
@@ -706,7 +773,8 @@ pub const EventLoop = struct {
     /// Count the number of active peers for a specific torrent.
     pub fn peerCountForTorrent(self: *const EventLoop, torrent_id: u8) u16 {
         var count: u16 = 0;
-        for (self.peers) |*peer| {
+        for (self.active_peer_slots.items) |slot| {
+            const peer = &self.peers[slot];
             if (peer.state != .free and peer.torrent_id == torrent_id) {
                 count += 1;
             }
@@ -727,7 +795,8 @@ pub const EventLoop = struct {
         // Sum current totals from all peers for this torrent
         var dl_total: u64 = 0;
         var ul_total: u64 = 0;
-        for (self.peers) |*peer| {
+        for (self.active_peer_slots.items) |slot| {
+            const peer = &self.peers[slot];
             if (peer.state != .free and peer.torrent_id == torrent_id) {
                 dl_total += peer.bytes_downloaded_from;
                 ul_total += peer.bytes_uploaded_to;
@@ -745,11 +814,16 @@ pub const EventLoop = struct {
     /// Remove a torrent context and disconnect all its peers.
     pub fn removeTorrent(self: *EventLoop, torrent_id: u8) void {
         // Disconnect all peers for this torrent
-        for (self.peers, 0..) |*peer, i| {
+        var to_remove = std.ArrayList(u16).empty;
+        defer to_remove.deinit(self.allocator);
+
+        for (self.active_peer_slots.items) |slot| {
+            const peer = &self.peers[slot];
             if (peer.state != .free and peer.torrent_id == torrent_id) {
-                self.removePeer(@intCast(i));
+                to_remove.append(self.allocator, slot) catch break;
             }
         }
+        for (to_remove.items) |slot| self.removePeer(slot);
         // Clean up PEX state
         if (self.torrents[torrent_id]) |*tc| {
             if (tc.pex_state) |tps| {
@@ -847,6 +921,7 @@ pub const EventLoop = struct {
 
         self.peer_count += 1;
         self.half_open_count += 1;
+        self.markActivePeer(slot);
         return slot;
     }
 
@@ -900,6 +975,7 @@ pub const EventLoop = struct {
         };
         self.peer_count += 1;
         self.half_open_count += 1;
+        self.markActivePeer(peer_slot);
 
         // Send the SYN packet via the UDP socket.
         utp_handler.utpSendPacket(self, &conn.syn_packet, address);
@@ -974,6 +1050,7 @@ pub const EventLoop = struct {
             if (tc.merkle_cache) |mc| mc.removePendingRequestsForSlot(slot);
         }
         self.unmarkIdle(slot);
+        self.unmarkActivePeer(slot);
 
         // Free any tracked send buffers before closing the fd.  After
         // close, stale CQEs will arrive for this slot -- the guard in
@@ -1302,6 +1379,24 @@ pub const EventLoop = struct {
         }
     }
 
+    pub fn markActivePeer(self: *EventLoop, slot: u16) void {
+        for (self.active_peer_slots.items) |active_slot| {
+            if (active_slot == slot) return;
+        }
+        self.active_peer_slots.append(self.allocator, slot) catch |err| {
+            log.debug("active_peer_slots append for slot {d}: {s}", .{ slot, @errorName(err) });
+        };
+    }
+
+    pub fn unmarkActivePeer(self: *EventLoop, slot: u16) void {
+        for (self.active_peer_slots.items, 0..) |active_slot, idx| {
+            if (active_slot == slot) {
+                _ = self.active_peer_slots.swapRemove(idx);
+                return;
+            }
+        }
+    }
+
     // ── Internal helpers ─────────────────────────────────
 
     pub fn submitAccept(self: *EventLoop) !void {
@@ -1356,7 +1451,7 @@ pub const EventLoop = struct {
     pub fn freeOnePendingSend(self: *EventLoop, slot: u16, send_id: u32) void {
         for (self.pending_sends.items, 0..) |ps, i| {
             if (ps.slot == slot and ps.send_id == send_id) {
-                self.allocator.free(ps.buf);
+                self.releasePendingSend(ps);
                 _ = self.pending_sends.swapRemove(i);
                 return;
             }
@@ -1371,12 +1466,64 @@ pub const EventLoop = struct {
         var i: usize = 0;
         while (i < self.pending_sends.items.len) {
             if (self.pending_sends.items[i].slot == slot) {
-                self.allocator.free(self.pending_sends.items[i].buf);
+                self.releasePendingSend(self.pending_sends.items[i]);
                 _ = self.pending_sends.swapRemove(i);
                 continue;
             }
             i += 1;
         }
+    }
+
+    fn releasePendingSend(self: *EventLoop, pending_send: PendingSend) void {
+        if (pending_send.small_slot) |small_slot| {
+            self.small_send_pool.release(small_slot);
+        } else {
+            self.allocator.free(pending_send.buf);
+        }
+    }
+
+    pub fn trackPendingSendCopy(self: *EventLoop, slot: u16, send_id: u32, data: []const u8) ![]const u8 {
+        if (self.small_send_pool.alloc(data)) |entry| {
+            errdefer self.small_send_pool.release(entry.slot);
+            try self.pending_sends.append(self.allocator, .{
+                .buf = entry.buf,
+                .slot = slot,
+                .send_id = send_id,
+                .small_slot = entry.slot,
+            });
+            return self.pending_sends.items[self.pending_sends.items.len - 1].buf;
+        }
+
+        const heap_buf = try self.allocator.dupe(u8, data);
+        errdefer self.allocator.free(heap_buf);
+        try self.pending_sends.append(self.allocator, .{
+            .buf = heap_buf,
+            .slot = slot,
+            .send_id = send_id,
+        });
+        return self.pending_sends.items[self.pending_sends.items.len - 1].buf;
+    }
+
+    pub fn trackPendingSendOwned(self: *EventLoop, slot: u16, send_id: u32, buf: []u8) ![]const u8 {
+        if (self.small_send_pool.alloc(buf)) |entry| {
+            errdefer self.small_send_pool.release(entry.slot);
+
+            try self.pending_sends.append(self.allocator, .{
+                .buf = entry.buf,
+                .slot = slot,
+                .send_id = send_id,
+                .small_slot = entry.slot,
+            });
+            self.allocator.free(buf);
+            return self.pending_sends.items[self.pending_sends.items.len - 1].buf;
+        }
+
+        try self.pending_sends.append(self.allocator, .{
+            .buf = buf,
+            .slot = slot,
+            .send_id = send_id,
+        });
+        return self.pending_sends.items[self.pending_sends.items.len - 1].buf;
     }
 
     pub fn getTorrentContext(self: *EventLoop, torrent_id: u8) ?*TorrentContext {

@@ -136,82 +136,165 @@ pub fn encodeExtensionHandshakeFull(allocator: std.mem.Allocator, listen_port: u
 /// after the sub-ID byte).
 ///
 /// The returned struct references no heap memory beyond what the caller
-/// already holds in `data`; no allocations are made for the result
-/// itself, but the bencode parser allocates internally and the caller
-/// must free with `freeDecoded`.
+/// already holds in `data`; no allocations are made for the result.
 pub fn decodeExtensionHandshake(allocator: std.mem.Allocator, data: []const u8) !DecodeResult {
-    const root = try bencode.parse(allocator, data);
-
-    const dict = switch (root) {
-        .dict => |d| d,
-        else => {
-            bencode.freeValue(allocator, root);
-            return error.InvalidExtensionHandshake;
-        },
-    };
+    _ = allocator;
+    var parser = Parser{ .input = data };
+    try parser.expectByte('d');
 
     var result = ExtensionHandshake{};
 
-    // Parse "m" dictionary
-    if (bencode.dictGet(dict, "m")) |m_val| {
-        switch (m_val) {
-            .dict => |m_dict| {
-                if (bencode.dictGet(m_dict, ext_ut_metadata)) |v| {
-                    if (v == .integer and v.integer >= 0 and v.integer <= 255) {
-                        result.extensions.ut_metadata = @intCast(v.integer);
-                    }
-                }
-                if (bencode.dictGet(m_dict, ext_ut_pex)) |v| {
-                    if (v == .integer and v.integer >= 0 and v.integer <= 255) {
-                        result.extensions.ut_pex = @intCast(v.integer);
-                    }
-                }
-            },
-            else => {},
+    while (true) {
+        const next = parser.peek() orelse return error.InvalidExtensionHandshake;
+        if (next == 'e') {
+            parser.index += 1;
+            break;
+        }
+
+        const key = try parser.parseBytes();
+        if (std.mem.eql(u8, key, "m")) {
+            try parseExtensionMap(&parser, &result.extensions);
+        } else if (std.mem.eql(u8, key, "p")) {
+            const port = try parser.parseInteger();
+            if (port >= 0 and port <= 65535) {
+                result.port = @intCast(port);
+            }
+        } else if (std.mem.eql(u8, key, "v")) {
+            result.client = try parser.parseBytes();
+        } else if (std.mem.eql(u8, key, "metadata_size")) {
+            const metadata_size = try parser.parseInteger();
+            if (metadata_size >= 0 and metadata_size <= std.math.maxInt(u32)) {
+                result.metadata_size = @intCast(metadata_size);
+            }
+        } else if (std.mem.eql(u8, key, "upload_only")) {
+            result.upload_only = (try parser.parseInteger()) != 0;
+        } else {
+            try parser.skipValue();
         }
     }
 
-    // Parse "p" (port)
-    if (bencode.dictGet(dict, "p")) |v| {
-        if (v == .integer and v.integer >= 0 and v.integer <= 65535) {
-            result.port = @intCast(v.integer);
-        }
-    }
-
-    // Parse "v" (client version)
-    if (bencode.dictGet(dict, "v")) |v| {
-        if (v == .bytes) {
-            result.client = v.bytes;
-        }
-    }
-
-    // Parse "metadata_size"
-    if (bencode.dictGet(dict, "metadata_size")) |v| {
-        if (v == .integer and v.integer >= 0 and v.integer <= std.math.maxInt(u32)) {
-            result.metadata_size = @intCast(v.integer);
-        }
-    }
-
-    // Parse "upload_only" (BEP 21: partial seed)
-    if (bencode.dictGet(dict, "upload_only")) |v| {
-        if (v == .integer) {
-            result.upload_only = v.integer != 0;
-        }
-    }
-
-    return .{ .handshake = result, .root = root };
+    if (!parser.isAtEnd()) return error.InvalidExtensionHandshake;
+    return .{ .handshake = result };
 }
 
 /// Result of decoding an extension handshake.  Holds ownership of the
 /// parsed bencode tree so that string slices in `handshake` remain valid.
 pub const DecodeResult = struct {
     handshake: ExtensionHandshake,
-    root: bencode.Value,
 };
 
 pub fn freeDecoded(allocator: std.mem.Allocator, result: *DecodeResult) void {
-    bencode.freeValue(allocator, result.root);
+    _ = allocator;
     result.* = undefined;
+}
+
+const Parser = struct {
+    input: []const u8,
+    index: usize = 0,
+
+    fn peek(self: *const Parser) ?u8 {
+        if (self.index >= self.input.len) return null;
+        return self.input[self.index];
+    }
+
+    fn isAtEnd(self: *const Parser) bool {
+        return self.index == self.input.len;
+    }
+
+    fn expectByte(self: *Parser, byte: u8) !void {
+        if (self.peek() != byte) return error.InvalidExtensionHandshake;
+        self.index += 1;
+    }
+
+    fn parseBytes(self: *Parser) ![]const u8 {
+        const start = self.index;
+        while (self.peek()) |byte| {
+            if (byte == ':') break;
+            if (!std.ascii.isDigit(byte)) return error.InvalidExtensionHandshake;
+            self.index += 1;
+        }
+        if (self.peek() != ':') return error.InvalidExtensionHandshake;
+
+        const len_slice = self.input[start..self.index];
+        if (len_slice.len == 0) return error.InvalidExtensionHandshake;
+
+        self.index += 1;
+        const len = std.fmt.parseUnsigned(usize, len_slice, 10) catch return error.InvalidExtensionHandshake;
+        const end = self.index + len;
+        if (end > self.input.len) return error.InvalidExtensionHandshake;
+
+        defer self.index = end;
+        return self.input[self.index..end];
+    }
+
+    fn parseInteger(self: *Parser) !i64 {
+        try self.expectByte('i');
+        const start = self.index;
+        while (self.peek()) |byte| {
+            if (byte == 'e') break;
+            self.index += 1;
+        }
+        if (self.peek() != 'e') return error.InvalidExtensionHandshake;
+
+        const digits = self.input[start..self.index];
+        if (digits.len == 0) return error.InvalidExtensionHandshake;
+
+        self.index += 1;
+        return std.fmt.parseInt(i64, digits, 10) catch error.InvalidExtensionHandshake;
+    }
+
+    fn skipValue(self: *Parser) !void {
+        const next = self.peek() orelse return error.InvalidExtensionHandshake;
+        switch (next) {
+            'i' => _ = try self.parseInteger(),
+            'l' => {
+                self.index += 1;
+                while (true) {
+                    const item = self.peek() orelse return error.InvalidExtensionHandshake;
+                    if (item == 'e') {
+                        self.index += 1;
+                        return;
+                    }
+                    try self.skipValue();
+                }
+            },
+            'd' => {
+                self.index += 1;
+                while (true) {
+                    const item = self.peek() orelse return error.InvalidExtensionHandshake;
+                    if (item == 'e') {
+                        self.index += 1;
+                        return;
+                    }
+                    _ = try self.parseBytes();
+                    try self.skipValue();
+                }
+            },
+            '0'...'9' => _ = try self.parseBytes(),
+            else => return error.InvalidExtensionHandshake,
+        }
+    }
+};
+
+fn parseExtensionMap(parser: *Parser, ids: *ExtensionIds) !void {
+    try parser.expectByte('d');
+    while (true) {
+        const next = parser.peek() orelse return error.InvalidExtensionHandshake;
+        if (next == 'e') {
+            parser.index += 1;
+            return;
+        }
+
+        const key = try parser.parseBytes();
+        const value = try parser.parseInteger();
+        if (value < 0 or value > 255) continue;
+
+        if (std.mem.eql(u8, key, ext_ut_metadata)) {
+            ids.ut_metadata = @intCast(value);
+        } else if (std.mem.eql(u8, key, ext_ut_pex)) {
+            ids.ut_pex = @intCast(value);
+        }
+    }
 }
 
 /// Serialize a complete extension message frame ready for the wire:

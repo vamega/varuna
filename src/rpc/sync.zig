@@ -20,14 +20,10 @@ pub const SyncState = struct {
         /// The rid this snapshot was created for.
         rid: u64,
         /// Map of info_hash_hex -> hash of the serialized stats, for cheap change detection.
-        torrent_hashes: std.StringHashMap(u64),
+        torrent_hashes: std.AutoHashMap([40]u8, u64),
 
         fn deinit(self: *Snapshot, allocator: std.mem.Allocator) void {
-            // Keys are owned copies
-            var iter = self.torrent_hashes.iterator();
-            while (iter.next()) |entry| {
-                allocator.free(entry.key_ptr.*);
-            }
+            _ = allocator;
             self.torrent_hashes.deinit();
         }
     };
@@ -79,10 +75,10 @@ pub const SyncState = struct {
         const full_update = request_rid == 0 or prev_snapshot == null;
 
         // Build current torrent hash map for change detection
-        var current_hashes = std.StringHashMap(u64).init(allocator);
+        var current_hashes = std.AutoHashMap([40]u8, u64).init(allocator);
         defer current_hashes.deinit();
         for (stats) |stat| {
-            try current_hashes.put(&stat.info_hash_hex, statsHash(stat));
+            try current_hashes.put(stat.info_hash_hex, statsHash(stat));
         }
 
         // Bump rid
@@ -106,7 +102,7 @@ pub const SyncState = struct {
             const include = if (full_update)
                 true
             else if (prev_snapshot) |prev| blk: {
-                const prev_hash = prev.torrent_hashes.get(&stat.info_hash_hex);
+                const prev_hash = prev.torrent_hashes.get(stat.info_hash_hex);
                 break :blk prev_hash == null or prev_hash.? != statsHash(stat);
             } else true;
 
@@ -132,7 +128,7 @@ pub const SyncState = struct {
                         if (!first_removed) try json.append(allocator, ',');
                         first_removed = false;
                         try json.append(allocator, '"');
-                        try json.appendSlice(allocator, entry.key_ptr.*);
+                        try json.appendSlice(allocator, entry.key_ptr.*[0..]);
                         try json.append(allocator, '"');
                     }
                 }
@@ -200,13 +196,9 @@ pub const SyncState = struct {
             old.deinit(self.allocator);
         }
 
-        var hashes = std.StringHashMap(u64).init(self.allocator);
+        var hashes = std.AutoHashMap([40]u8, u64).init(self.allocator);
         for (stats) |stat| {
-            const key = self.allocator.dupe(u8, &stat.info_hash_hex) catch continue;
-            hashes.put(key, statsHash(stat)) catch {
-                self.allocator.free(key);
-                continue;
-            };
+            hashes.put(stat.info_hash_hex, statsHash(stat)) catch continue;
         }
 
         self.snapshots[slot] = .{
