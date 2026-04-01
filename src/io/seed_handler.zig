@@ -64,43 +64,16 @@ fn createPlaintextBatchSendState(
     self: *EventLoop,
     batch: []const EventLoop.QueuedBlockResponse,
 ) !*EventLoop.VectoredSendState {
-    const state_align = @alignOf(EventLoop.VectoredSendState);
-    const headers_align = @alignOf([13]u8);
-    const iovecs_align = @alignOf(posix.iovec_const);
-    const refs_align = @alignOf(*EventLoop.PieceBuffer);
-    const backing_align = @max(state_align, @max(headers_align, @max(iovecs_align, refs_align)));
-    const state_bytes = @sizeOf(EventLoop.VectoredSendState);
-    const headers_bytes = @sizeOf([13]u8) * batch.len;
-    const iovecs_bytes = @sizeOf(posix.iovec_const) * batch.len * 2;
-    const refs_bytes = @sizeOf(*EventLoop.PieceBuffer) * batch.len;
-
-    var total_bytes: usize = 0;
-    total_bytes = std.mem.alignForward(usize, total_bytes, state_align);
-    const state_offset = total_bytes;
-    total_bytes += state_bytes;
-    total_bytes = std.mem.alignForward(usize, total_bytes, headers_align);
-    const headers_offset = total_bytes;
-    total_bytes += headers_bytes;
-    total_bytes = std.mem.alignForward(usize, total_bytes, iovecs_align);
-    const iovecs_offset = total_bytes;
-    total_bytes += iovecs_bytes;
-    total_bytes = std.mem.alignForward(usize, total_bytes, refs_align);
-    const refs_offset = total_bytes;
-    total_bytes += refs_bytes;
-
-    const backing = try self.allocator.alignedAlloc(u8, std.mem.Alignment.fromByteUnits(backing_align), total_bytes);
-    errdefer self.allocator.free(backing);
-
-    const state: *EventLoop.VectoredSendState = @ptrCast(@alignCast(backing.ptr + state_offset));
-    const headers = std.mem.bytesAsSlice([13]u8, backing[headers_offset .. headers_offset + headers_bytes]);
-    const iovecs = @as([*]posix.iovec_const, @ptrCast(@alignCast(backing.ptr + iovecs_offset)))[0 .. batch.len * 2];
-    const piece_buffers = @as([*]*EventLoop.PieceBuffer, @ptrCast(@alignCast(backing.ptr + refs_offset)))[0..batch.len];
+    const state = try self.acquireVectoredSendState(batch.len);
+    const headers = state.headers;
+    const iovecs = state.iovecs;
+    const piece_buffers = state.piece_buffers;
     var retained: usize = 0;
     errdefer {
         for (piece_buffers[0..retained]) |piece_buffer| {
             self.releasePieceBuffer(piece_buffer);
         }
-        self.allocator.free(backing);
+        self.vectored_send_pool.release(self.allocator, state);
     }
 
     for (batch, 0..) |resp, idx| {
@@ -130,7 +103,9 @@ fn createPlaintextBatchSendState(
     }
 
     state.* = .{
-        .backing = backing,
+        .backing = state.backing,
+        .backing_capacity = state.backing_capacity,
+        .pool_class = state.pool_class,
         .headers = headers,
         .iovecs = iovecs,
         .msg = .{

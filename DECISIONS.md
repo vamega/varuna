@@ -14,6 +14,29 @@ Use [STATUS.md](STATUS.md) for the running list of completed work, next work, an
 
 ## Decision Entries
 
+### 2026-04-01: Pool Plaintext `sendmsg` State Blocks By Batch Capacity
+
+Context:
+After piece-buffer pooling, the remaining steady allocator cost on the plaintext upload path was one packed vectored-send-state allocation per batch. The production `seed_plaintext_burst` workload still showed `501` allocs for `500` iterations even though payload copies were already gone.
+
+Decision:
+- Add a bounded `VectoredSendPool` to `EventLoop`.
+- Pool packed vectored-send backing blocks by batch-capacity class (`1` through `64` blocks, rounded up by power-of-two style classes).
+- Reuse the `VectoredSendState` object in-place because it already lives at the front of the packed backing block.
+- Keep exact heap allocation for rare batches larger than the pooled classes.
+
+Reasoning:
+- The packed state blocks are small and regular, so pooling them is cheap and predictable.
+- This is a better fit than a resettable arena because send completion is asynchronous; blocks must stay alive until the send CQE arrives.
+- Reusing the entire packed block keeps all header, iovec, and retained-piece-ref storage in one object and avoids fragmenting the allocator with tiny per-batch lifetimes.
+
+Measured effect:
+- `seed_plaintext_burst --iterations=500 --scale=8` moved from `12176541 ns`, `501` allocs, `500` frees, `276096` bytes allocated to `6933360 ns`, repeat `6796282 ns`, `2` allocs, `0` frees, `672` retained bytes.
+
+Follow-up triggers:
+- If real swarm traces show many batch sizes above the current pooled classes, extend the class table from measurement.
+- If the encrypted upload path becomes a bottleneck, it still needs separate work because it uses the copied contiguous-buffer path, not the plaintext vectored-send path.
+
 ### 2026-04-01: Pool Common Piece Buffer Sizes Instead Of Reallocating Them
 
 Context:

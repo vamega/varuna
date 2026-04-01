@@ -106,6 +106,7 @@ Update it whenever a milestone lands, the near-term backlog changes, or a new op
 - **Huge page piece cache**: optional reusable `mmap(MAP_HUGETLB)` buffer pool for seed piece reads. Falls back to `madvise(MADV_HUGEPAGE)` (transparent huge pages), then regular pages. Freed pooled slices are now returned to the cache and merged for reuse. Config: `performance.use_huge_pages`, `performance.piece_cache_size`.
 - **Synthetic memory baseline harness**: `varuna-perf` with allocator-counting scenarios for peer scans, request batching, seed batching, extension parsing, session loading, and `/sync/maindata`. Supports stable before/after comparisons without a live swarm.
 - **Piece buffer pool**: `EventLoop` now reuses `PieceBuffer` wrappers and retains common heap-backed piece sizes behind a bounded pool instead of reallocating them on every seed-read cycle.
+- **Vectored send-state pool**: plaintext seed uploads now reuse packed `sendmsg` state blocks by batch capacity instead of allocating one aligned block per batch.
 - **Synthetic API burst harness**: `varuna-perf` now includes `api_get_burst` and `api_upload_burst`, which drive the real RPC server over loopback sockets with configurable client concurrency and upload body size.
 - **API steady-state allocation removal**: standard RPC responses now write headers into inline per-client storage, `api_get_burst` is allocation-free, and upload-sized request buffers are retained per slot up to `256 KiB` instead of reallocating on every disconnect.
 - **Synthetic peer accept harness**: `varuna-perf` now includes `peer_accept_burst`, which drives the real shared `EventLoop` listener with inbound loopback TCP connects and measures accept-slot-recv-EOF teardown cost.
@@ -230,7 +231,7 @@ Update it whenever a milestone lands, the near-term backlog changes, or a new op
 - `zig build -Doptimize=ReleaseFast perf-workload -- peer_churn --iterations=5000 --peers=4096 --scale=128`: `1.13e9 ns` -> `3.81e6 ns`, `0` allocs before and after
 - `zig build -Doptimize=ReleaseFast perf-workload -- sync_delta --iterations=200 --torrents=10000`: `3.26e10 ns` -> `3.21e10 ns`, alloc calls `4,229,117` -> `4,228,317`
 - `zig build -Doptimize=ReleaseFast perf-workload -- sync_stats_live --iterations=1 --torrents=10000 --peers=1000 --scale=20`: `1.95e7 ns` -> `4.89e6 ns`, repeat `4.05e6 ns`
-- `zig build -Doptimize=ReleaseFast perf-workload -- seed_plaintext_burst --iterations=500 --scale=8`: `~2.73e7 ns` to `~3.04e7 ns` -> `1.07e7 ns` to `1.28e7 ns`, alloc calls `501` -> `501`, transient bytes `65.6 MB` -> `276 KB`
+- `zig build -Doptimize=ReleaseFast perf-workload -- seed_plaintext_burst --iterations=500 --scale=8`: `~2.73e7 ns` to `~3.04e7 ns` -> `6.79e6 ns` to `6.93e6 ns`, alloc calls `501` -> `2`, transient bytes `65.6 MB` -> `672 B`
 - `zig build -Doptimize=ReleaseFast perf-workload -- seed_send_copy_burst --iterations=200 --scale=8`: `5.40e7 ns` to `5.93e7 ns`, `200` allocs, `26.2 MB` transient bytes
 - `zig build -Doptimize=ReleaseFast perf-workload -- seed_sendmsg_burst --iterations=200 --scale=8`: `3.92e7 ns` to `4.55e7 ns`, `400` allocs, `72 KB` transient bytes
 - `zig build -Doptimize=ReleaseFast perf-workload -- seed_splice_burst --iterations=200 --scale=8`: `1.80e8 ns`, `0` allocs

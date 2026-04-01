@@ -359,7 +359,7 @@ New benchmark-only workloads added in this pass:
 | Scenario | Result |
 |----------|--------|
 | `piece_buffer_cycle --iterations=5000` | before: `356068992 ns`, `50000` allocs, `27.9 GB` allocated; after: `239873 ns`, repeat `206658 ns`, `11` allocs, `5.59 MB` retained bytes |
-| `seed_plaintext_burst --iterations=500 --scale=8` | before: `30384358 ns`, `27940324 ns`, `28669060 ns`; after: `10659949 ns`, `12832968 ns`; alloc calls `501`, `276 KB` transient bytes |
+| `seed_plaintext_burst --iterations=500 --scale=8` | before: `30384358 ns`, `27940324 ns`, `28669060 ns`; after piece-buffer ownership: `10659949 ns`, `12832968 ns`, `501` allocs, `276 KB`; after pooled send state: `6933360 ns`, repeat `6796282 ns`, `2` allocs, `672 B` retained |
 | `seed_send_copy_burst --iterations=200 --scale=8` | `59303132 ns`, `54058775 ns`; `200` allocs, `26.2 MB` transient bytes |
 | `seed_sendmsg_burst --iterations=200 --scale=8` | `45529205 ns`, `39205524 ns`; `400` allocs, `72 KB` transient bytes |
 | `seed_splice_burst --iterations=200 --scale=8` | `180185989 ns`; `0` allocs |
@@ -368,11 +368,11 @@ New benchmark-only workloads added in this pass:
 Interpretation:
 
 - `piece_buffer_cycle` measures the production `createPieceBuffer()` / `releasePieceBuffer()` path directly. Pooling common size classes plus wrapper reuse removes almost all piece-buffer allocation churn after warmup.
-- `seed_plaintext_burst` is now the production plaintext upload path. Refcounted piece buffers plus tracked vectored `sendmsg` improved wall-clock time by about `2.2x` to `2.8x` on this host and cut transient bytes from `65.6 MB` down to `276 KB`.
+- `seed_plaintext_burst` is now the production plaintext upload path. Refcounted piece buffers plus tracked vectored `sendmsg` already removed the large payload copy, and pooling the packed send state removed the remaining per-batch allocator churn. On this host the current path is about `4x` faster than the original copy baseline and about `1.8x` faster than the first `sendmsg` landing.
 - `seed_sendmsg_burst` is the clearest syscall win so far for plaintext seeding. On the same loopback TCP shape as the contiguous-copy benchmark, vectored header + payload send improved wall-clock time by about `23%` to `33%` and cut transient bytes from `26.2 MB` to `72 KB`.
 - `seed_splice_burst` shows why `sendfile` / `splice` are a poor fit for the current BitTorrent upload path. The protocol still needs a per-block header send, `splice(2)` still requires a pipe on one side, and the measured prototype was much slower than either copy or vectored `sendmsg`.
 - `READ_FIXED` / `WRITE_FIXED` are not the first lever for this path. They can help if piece-read buffers are pre-registered, but they do not solve message framing or the need to keep piece pages alive until the socket-send CQE arrives.
-- Packing the tracked vectored send state into its backing allocation removed the extra allocator traffic from the first `sendmsg` landing. The next optional lever here is pooling those packed blocks or trying `sendmsg_zc` if real swarm traces still show plaintext seeding as a hotspot.
+- Pooling the tracked vectored send blocks removed the last steady-state allocator churn from the plaintext batch path after warmup. `sendmsg_zc` is still optional future work only if real swarm traces show the current plaintext path remains hot.
 - The huge-page piece cache is now reusable rather than bump-only. Freed pooled piece buffers return to the mapped cache and adjacent free ranges merge back together instead of exhausting the cache after one pass.
 - `utp_outbound_burst` is a real loopback UDP path benchmark. A first queue-cleanup prototype removed allocator churn but did not produce a stable wall-clock win, so it was not kept in production.
 

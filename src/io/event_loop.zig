@@ -419,6 +419,9 @@ pub const EventLoop = struct {
 
     pub const VectoredSendState = struct {
         backing: []align(@alignOf(posix.iovec_const)) u8,
+        backing_capacity: usize = 0,
+        pool_class: u8 = std.math.maxInt(u8),
+        next_free: ?*VectoredSendState = null,
         headers: [][13]u8,
         iovecs: []posix.iovec_const,
         msg: posix.msghdr_const,
@@ -442,6 +445,98 @@ pub const EventLoop = struct {
             self.msg.iov = self.iovecs.ptr + self.iov_index;
             self.msg.iovlen = self.iovecs.len - self.iov_index;
             return self.iov_index < self.iovecs.len;
+        }
+    };
+
+    const vectored_send_backing_align = @max(
+        @alignOf(VectoredSendState),
+        @max(@alignOf([13]u8), @max(@alignOf(posix.iovec_const), @alignOf(*PieceBuffer))),
+    );
+
+    const VectoredSendLayout = struct {
+        total_bytes: usize,
+        headers_offset: usize,
+        iovecs_offset: usize,
+        refs_offset: usize,
+    };
+
+    const VectoredSendPool = struct {
+        const retained_limit: usize = 256 * 1024;
+        const max_blocks_per_class: u16 = 16;
+        const invalid_class: u8 = std.math.maxInt(u8);
+        const class_capacities = [_]usize{ 1, 2, 4, 8, 16, 32, 64 };
+
+        const RetainedClass = struct {
+            head: ?*VectoredSendState = null,
+            count: u16 = 0,
+        };
+
+        retained_bytes: usize = 0,
+        classes: [class_capacities.len]RetainedClass = [_]RetainedClass{.{}} ** class_capacities.len,
+
+        fn acquire(self: *VectoredSendPool, allocator: std.mem.Allocator, batch_len: usize) !*VectoredSendState {
+            const selection = selectClass(batch_len);
+            const layout = vectoredSendLayout(selection.capacity);
+
+            if (selection.class_index) |class_index| {
+                const retained = &self.classes[class_index];
+                if (retained.head) |state| {
+                    retained.head = state.next_free;
+                    retained.count -= 1;
+                    self.retained_bytes -= state.backing.len;
+                    state.backing_capacity = selection.capacity;
+                    state.pool_class = @intCast(class_index);
+                    state.next_free = null;
+                    return state;
+                }
+            }
+
+            const backing = try allocator.alignedAlloc(u8, std.mem.Alignment.fromByteUnits(vectored_send_backing_align), layout.total_bytes);
+            const state: *VectoredSendState = @ptrCast(@alignCast(backing.ptr));
+            state.backing = backing;
+            state.backing_capacity = selection.capacity;
+            state.pool_class = if (selection.class_index) |class_index| @intCast(class_index) else invalid_class;
+            state.next_free = null;
+            return state;
+        }
+
+        fn release(self: *VectoredSendPool, allocator: std.mem.Allocator, state: *VectoredSendState) void {
+            if (state.pool_class == invalid_class) {
+                allocator.free(state.backing);
+                return;
+            }
+
+            const class_index: usize = state.pool_class;
+            const retained = &self.classes[class_index];
+            if (retained.count >= max_blocks_per_class or self.retained_bytes + state.backing.len > retained_limit) {
+                allocator.free(state.backing);
+                return;
+            }
+
+            state.next_free = retained.head;
+            retained.head = state;
+            retained.count += 1;
+            self.retained_bytes += state.backing.len;
+        }
+
+        fn deinit(self: *VectoredSendPool, allocator: std.mem.Allocator) void {
+            for (&self.classes) |*retained| {
+                var head = retained.head;
+                while (head) |state| {
+                    const next = state.next_free;
+                    allocator.free(state.backing);
+                    head = next;
+                }
+                retained.* = .{};
+            }
+            self.* = .{};
+        }
+
+        fn selectClass(batch_len: usize) struct { capacity: usize, class_index: ?usize } {
+            for (class_capacities, 0..) |capacity, idx| {
+                if (batch_len <= capacity) return .{ .capacity = capacity, .class_index = idx };
+            }
+            return .{ .capacity = batch_len, .class_index = null };
         }
     };
 
@@ -625,6 +720,7 @@ pub const EventLoop = struct {
     // of the general-purpose allocator. Reduces TLB pressure for large torrents.
     huge_page_cache: ?HugePageCache = null,
     piece_buffer_pool: PieceBufferPool = .{},
+    vectored_send_pool: VectoredSendPool = .{},
 
     // Queued piece block responses (batched per tick, flushed after CQE dispatch)
     queued_responses: std.ArrayList(QueuedBlockResponse),
@@ -802,8 +898,6 @@ pub const EventLoop = struct {
             self.releasePieceBuffer(piece_buffer);
         }
         // Free huge page cache pool
-        self.piece_buffer_pool.deinit(self.allocator);
-        if (self.huge_page_cache) |*hpc| hpc.deinit();
         {
             var it = self.pending_writes.valueIterator();
             while (it.next()) |pending| {
@@ -816,6 +910,7 @@ pub const EventLoop = struct {
             self.releasePendingSend(ps);
         }
         self.pending_sends.deinit(self.allocator);
+        self.vectored_send_pool.deinit(self.allocator);
         self.small_send_pool.deinit(self.allocator);
         for (self.pending_reads.items) |pr| {
             self.releasePieceBuffer(pr.piece_buffer);
@@ -825,6 +920,8 @@ pub const EventLoop = struct {
             self.releasePieceBuffer(piece_buf.piece_buffer);
         }
         self.deferred_piece_buffers.deinit(self.allocator);
+        self.piece_buffer_pool.deinit(self.allocator);
+        if (self.huge_page_cache) |*hpc| hpc.deinit();
         self.queued_responses.deinit(self.allocator);
         self.idle_peers.deinit(self.allocator);
         self.active_peer_slots.deinit(self.allocator);
@@ -1711,6 +1808,30 @@ pub const EventLoop = struct {
         return self.piece_buffer_pool.acquire(self.allocator, if (self.huge_page_cache) |*hpc| hpc else null, size);
     }
 
+    pub fn acquireVectoredSendState(self: *EventLoop, batch_len: usize) !*VectoredSendState {
+        const state = try self.vectored_send_pool.acquire(self.allocator, batch_len);
+        const layout = vectoredSendLayout(state.backing_capacity);
+        const headers_bytes = @sizeOf([13]u8) * batch_len;
+        const iovecs_len = batch_len * 2;
+        const refs_len = batch_len;
+
+        state.headers = std.mem.bytesAsSlice([13]u8, state.backing[layout.headers_offset .. layout.headers_offset + headers_bytes]);
+        state.iovecs = @as([*]posix.iovec_const, @ptrCast(@alignCast(state.backing.ptr + layout.iovecs_offset)))[0..iovecs_len];
+        state.piece_buffers = @as([*]*PieceBuffer, @ptrCast(@alignCast(state.backing.ptr + layout.refs_offset)))[0..refs_len];
+        state.msg = .{
+            .name = null,
+            .namelen = 0,
+            .iov = state.iovecs.ptr,
+            .iovlen = state.iovecs.len,
+            .control = null,
+            .controllen = 0,
+            .flags = 0,
+        };
+        state.iov_index = 0;
+        state.next_free = null;
+        return state;
+    }
+
     pub fn retainPieceBuffer(self: *EventLoop, piece_buffer: *PieceBuffer) void {
         _ = self;
         piece_buffer.ref_count += 1;
@@ -1823,7 +1944,7 @@ pub const EventLoop = struct {
         for (state.piece_buffers) |piece_buffer| {
             self.releasePieceBuffer(piece_buffer);
         }
-        self.allocator.free(state.backing);
+        self.vectored_send_pool.release(self.allocator, state);
     }
 
     fn releasePendingSend(self: *EventLoop, pending_send: PendingSend) void {
@@ -1908,6 +2029,30 @@ pub const EventLoop = struct {
                 .vectored = state,
             },
         });
+    }
+
+    fn vectoredSendLayout(block_capacity: usize) VectoredSendLayout {
+        const state_bytes = @sizeOf(VectoredSendState);
+        const headers_bytes = @sizeOf([13]u8) * block_capacity;
+        const iovecs_bytes = @sizeOf(posix.iovec_const) * block_capacity * 2;
+        const refs_bytes = @sizeOf(*PieceBuffer) * block_capacity;
+
+        var total_bytes: usize = 0;
+        const state_offset = std.mem.alignForward(usize, total_bytes, @alignOf(VectoredSendState));
+        total_bytes = state_offset + state_bytes;
+        const headers_offset = std.mem.alignForward(usize, total_bytes, @alignOf([13]u8));
+        total_bytes = headers_offset + headers_bytes;
+        const iovecs_offset = std.mem.alignForward(usize, total_bytes, @alignOf(posix.iovec_const));
+        total_bytes = iovecs_offset + iovecs_bytes;
+        const refs_offset = std.mem.alignForward(usize, total_bytes, @alignOf(*PieceBuffer));
+        total_bytes = refs_offset + refs_bytes;
+
+        return .{
+            .total_bytes = total_bytes,
+            .headers_offset = headers_offset,
+            .iovecs_offset = iovecs_offset,
+            .refs_offset = refs_offset,
+        };
     }
 
     pub fn nextPendingWriteId(self: *EventLoop) u32 {
