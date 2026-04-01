@@ -533,3 +533,21 @@ Reasoning:
 Follow-up triggers:
 - If plaintext seeding remains hot in real swarms, pool or inline the vectored send state so allocation count also drops below the old copy path.
 - Consider `sendmsg_zc` only after validating the new ownership model under real workloads; it does not remove the lifetime requirement.
+
+### 2026-04-01: Pack Plaintext Seed Send State into One Allocation
+
+Context:
+The first production plaintext `sendmsg` path removed the large payload copy and cut transient bytes sharply, but it still allocated a `VectoredSendState` object plus a separate backing block for every batch. That doubled alloc-call count on `seed_plaintext_burst` from `501` to `1001`.
+
+Decision:
+- Pack the `VectoredSendState` struct into the same backing allocation as the batch headers, iovecs, and retained piece-buffer references.
+- Keep the rest of the ownership model unchanged: refcounted `PieceBuffer` pages still outlive the socket CQE, and partial sends still resubmit through the tracked send path.
+
+Reasoning:
+- The production-path workload `seed_plaintext_burst --iterations=500 --scale=8` improved from the first `sendmsg` landing at roughly `12.5` to `13.0 ms` down to roughly `10.7` to `12.8 ms`.
+- Alloc-call count dropped from `1001` back to `501`, matching the old copy path while keeping the new low transient memory footprint of `276 KB`.
+- This change is low risk because it does not alter CQE routing, rate accounting, or the plaintext/encrypted path split. It only changes how the tracked vectored send state is allocated.
+
+Follow-up triggers:
+- If plaintext seeding is still hot under real swarm traffic, consider pooling the packed vectored send blocks or trying `sendmsg_zc`.
+- Keep the encrypted copy path unless MSE gains a separate framing/encryption strategy.

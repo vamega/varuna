@@ -1679,7 +1679,6 @@ pub const EventLoop = struct {
             self.releasePieceBuffer(piece_buffer);
         }
         self.allocator.free(state.backing);
-        self.allocator.destroy(state);
     }
 
     fn releasePendingSend(self: *EventLoop, pending_send: PendingSend) void {

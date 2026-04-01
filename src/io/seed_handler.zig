@@ -64,18 +64,20 @@ fn createPlaintextBatchSendState(
     self: *EventLoop,
     batch: []const EventLoop.QueuedBlockResponse,
 ) !*EventLoop.VectoredSendState {
-    const state = try self.allocator.create(EventLoop.VectoredSendState);
-    errdefer self.allocator.destroy(state);
-
+    const state_align = @alignOf(EventLoop.VectoredSendState);
     const headers_align = @alignOf([13]u8);
     const iovecs_align = @alignOf(posix.iovec_const);
     const refs_align = @alignOf(*EventLoop.PieceBuffer);
-    const backing_align = @max(headers_align, @max(iovecs_align, refs_align));
+    const backing_align = @max(state_align, @max(headers_align, @max(iovecs_align, refs_align)));
+    const state_bytes = @sizeOf(EventLoop.VectoredSendState);
     const headers_bytes = @sizeOf([13]u8) * batch.len;
     const iovecs_bytes = @sizeOf(posix.iovec_const) * batch.len * 2;
     const refs_bytes = @sizeOf(*EventLoop.PieceBuffer) * batch.len;
 
     var total_bytes: usize = 0;
+    total_bytes = std.mem.alignForward(usize, total_bytes, state_align);
+    const state_offset = total_bytes;
+    total_bytes += state_bytes;
     total_bytes = std.mem.alignForward(usize, total_bytes, headers_align);
     const headers_offset = total_bytes;
     total_bytes += headers_bytes;
@@ -86,21 +88,23 @@ fn createPlaintextBatchSendState(
     const refs_offset = total_bytes;
     total_bytes += refs_bytes;
 
-    state.backing = try self.allocator.alignedAlloc(u8, std.mem.Alignment.fromByteUnits(backing_align), total_bytes);
+    const backing = try self.allocator.alignedAlloc(u8, std.mem.Alignment.fromByteUnits(backing_align), total_bytes);
+    errdefer self.allocator.free(backing);
+
+    const state: *EventLoop.VectoredSendState = @ptrCast(@alignCast(backing.ptr + state_offset));
+    const headers = std.mem.bytesAsSlice([13]u8, backing[headers_offset .. headers_offset + headers_bytes]);
+    const iovecs = @as([*]posix.iovec_const, @ptrCast(@alignCast(backing.ptr + iovecs_offset)))[0 .. batch.len * 2];
+    const piece_buffers = @as([*]*EventLoop.PieceBuffer, @ptrCast(@alignCast(backing.ptr + refs_offset)))[0..batch.len];
     var retained: usize = 0;
     errdefer {
-        for (state.piece_buffers[0..retained]) |piece_buffer| {
+        for (piece_buffers[0..retained]) |piece_buffer| {
             self.releasePieceBuffer(piece_buffer);
         }
-        self.allocator.free(state.backing);
+        self.allocator.free(backing);
     }
 
-    state.headers = std.mem.bytesAsSlice([13]u8, state.backing[headers_offset .. headers_offset + headers_bytes]);
-    state.iovecs = @as([*]posix.iovec_const, @ptrCast(@alignCast(state.backing.ptr + iovecs_offset)))[0 .. batch.len * 2];
-    state.piece_buffers = @as([*]*EventLoop.PieceBuffer, @ptrCast(@alignCast(state.backing.ptr + refs_offset)))[0..batch.len];
-
     for (batch, 0..) |resp, idx| {
-        const header = &state.headers[idx];
+        const header = &headers[idx];
         const block_len: usize = @intCast(resp.block_length);
         const start: usize = @intCast(resp.block_offset);
         const block_data = resp.piece_buffer.buf[start .. start + block_len];
@@ -111,29 +115,35 @@ fn createPlaintextBatchSendState(
         std.mem.writeInt(u32, header[5..9], resp.piece_index, .big);
         std.mem.writeInt(u32, header[9..13], resp.block_offset, .big);
 
-        state.iovecs[idx * 2] = .{
+        iovecs[idx * 2] = .{
             .base = @ptrCast(header),
             .len = header.len,
         };
-        state.iovecs[idx * 2 + 1] = .{
+        iovecs[idx * 2 + 1] = .{
             .base = block_data.ptr,
             .len = block_data.len,
         };
 
         self.retainPieceBuffer(resp.piece_buffer);
-        state.piece_buffers[idx] = resp.piece_buffer;
+        piece_buffers[idx] = resp.piece_buffer;
         retained += 1;
     }
 
-    state.iov_index = 0;
-    state.msg = .{
-        .name = null,
-        .namelen = 0,
-        .iov = state.iovecs.ptr,
-        .iovlen = state.iovecs.len,
-        .control = null,
-        .controllen = 0,
-        .flags = 0,
+    state.* = .{
+        .backing = backing,
+        .headers = headers,
+        .iovecs = iovecs,
+        .msg = .{
+            .name = null,
+            .namelen = 0,
+            .iov = iovecs.ptr,
+            .iovlen = iovecs.len,
+            .control = null,
+            .controllen = 0,
+            .flags = 0,
+        },
+        .piece_buffers = piece_buffers,
+        .iov_index = 0,
     };
     return state;
 }

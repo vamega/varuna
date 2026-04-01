@@ -200,7 +200,6 @@ Update it whenever a milestone lands, the near-term backlog changes, or a new op
 - The `peer_scan` harness is now parameterized by active density (`--scale`), but the production peer table is still a wide AoS. Sparse synthetic scans are measurable; a full hot/cold split is still pending.
 - The shared EventLoop no longer has a 64-torrent cap, and the sparse peer/torrent registry pass removed the main cross-product scans. Cached live byte totals further reduced `/sync` stats cost, but a broader hot-summary registry may still be needed for `10k+` torrents.
 - The first outbound uTP queue cleanup experiment removed allocator churn but did not show a convincing wall-clock improvement on the loopback workload, so it was not kept in production.
-- Plaintext seed uploads now retain piece buffers across CQE completion and use vectored `sendmsg`. The remaining tradeoff is allocation count: transient bytes are much lower, but the current tracked send state still allocates once per batch.
 - `splice` / sendfile-style upload is currently a poor fit for BitTorrent framing and multi-file spans. The benchmark prototype was slower than both contiguous copy and `sendmsg`.
 
 ## Last Verified Milestone
@@ -228,7 +227,7 @@ Update it whenever a milestone lands, the near-term backlog changes, or a new op
 - `zig build -Doptimize=ReleaseFast perf-workload -- peer_churn --iterations=5000 --peers=4096 --scale=128`: `1.13e9 ns` -> `3.81e6 ns`, `0` allocs before and after
 - `zig build -Doptimize=ReleaseFast perf-workload -- sync_delta --iterations=200 --torrents=10000`: `3.26e10 ns` -> `3.21e10 ns`, alloc calls `4,229,117` -> `4,228,317`
 - `zig build -Doptimize=ReleaseFast perf-workload -- sync_stats_live --iterations=1 --torrents=10000 --peers=1000 --scale=20`: `1.95e7 ns` -> `4.89e6 ns`, repeat `4.05e6 ns`
-- `zig build -Doptimize=ReleaseFast perf-workload -- seed_plaintext_burst --iterations=500 --scale=8`: `~2.73e7 ns` to `~3.04e7 ns` -> `1.25e7 ns` to `1.30e7 ns`, alloc calls `501` -> `1001`, transient bytes `65.6 MB` -> `276 KB`
+- `zig build -Doptimize=ReleaseFast perf-workload -- seed_plaintext_burst --iterations=500 --scale=8`: `~2.73e7 ns` to `~3.04e7 ns` -> `1.07e7 ns` to `1.28e7 ns`, alloc calls `501` -> `501`, transient bytes `65.6 MB` -> `276 KB`
 - `zig build -Doptimize=ReleaseFast perf-workload -- seed_send_copy_burst --iterations=200 --scale=8`: `5.40e7 ns` to `5.93e7 ns`, `200` allocs, `26.2 MB` transient bytes
 - `zig build -Doptimize=ReleaseFast perf-workload -- seed_sendmsg_burst --iterations=200 --scale=8`: `3.92e7 ns` to `4.55e7 ns`, `400` allocs, `72 KB` transient bytes
 - `zig build -Doptimize=ReleaseFast perf-workload -- seed_splice_burst --iterations=200 --scale=8`: `1.80e8 ns`, `0` allocs
