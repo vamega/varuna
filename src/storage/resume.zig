@@ -163,6 +163,25 @@ pub const ResumeDb = struct {
             return error.SqliteSchemaFailed;
         }
 
+        // Create tracker_overrides table for user-modified tracker URLs
+        if (sqlite.sqlite3_exec(
+            d,
+            "CREATE TABLE IF NOT EXISTS tracker_overrides (" ++
+                "info_hash BLOB NOT NULL, " ++
+                "url TEXT NOT NULL, " ++
+                "tier INTEGER NOT NULL DEFAULT 0, " ++
+                "action TEXT NOT NULL DEFAULT 'add', " ++
+                "orig_url TEXT, " ++
+                "PRIMARY KEY (info_hash, url)" ++
+                ")",
+            null,
+            null,
+            null,
+        ) != sqlite.SQLITE_OK) {
+            _ = sqlite.sqlite3_close(d);
+            return error.SqliteSchemaFailed;
+        }
+
         // Create banned_ips table for individual IP bans
         if (sqlite.sqlite3_exec(
             d,
@@ -798,6 +817,114 @@ pub const ResumeDb = struct {
         return result.toOwnedSlice(allocator);
     }
 
+    // ── Tracker override persistence ──────────────────────────
+
+    /// A tracker override record: 'add' means a user-added tracker URL,
+    /// 'remove' means a metainfo tracker URL the user wants hidden,
+    /// 'edit' means the user replaced orig_url with url.
+    pub const TrackerOverride = struct {
+        url: []const u8,
+        tier: u32,
+        action: []const u8, // "add", "remove", or "edit"
+        orig_url: ?[]const u8, // non-null only for "edit" action
+    };
+
+    /// Save a tracker override (upsert). For 'add' and 'remove', orig_url should be null.
+    /// For 'edit', orig_url is the original URL that was replaced.
+    pub fn saveTrackerOverride(self: *ResumeDb, info_hash: [20]u8, url: []const u8, tier: u32, action: []const u8, orig_url: ?[]const u8) !void {
+        const stmt = try self.execOneShot(
+            "INSERT INTO tracker_overrides (info_hash, url, tier, action, orig_url) VALUES (?1, ?2, ?3, ?4, ?5) " ++
+                "ON CONFLICT(info_hash, url) DO UPDATE SET tier = ?3, action = ?4, orig_url = ?5",
+        );
+        _ = sqlite.sqlite3_bind_blob(stmt, 1, &info_hash, 20, sqlite.SQLITE_TRANSIENT);
+        _ = sqlite.sqlite3_bind_text(stmt, 2, url.ptr, @intCast(url.len), sqlite.SQLITE_TRANSIENT);
+        _ = sqlite.sqlite3_bind_int(stmt, 3, @intCast(tier));
+        _ = sqlite.sqlite3_bind_text(stmt, 4, action.ptr, @intCast(action.len), sqlite.SQLITE_TRANSIENT);
+        if (orig_url) |ou| {
+            _ = sqlite.sqlite3_bind_text(stmt, 5, ou.ptr, @intCast(ou.len), sqlite.SQLITE_TRANSIENT);
+        } else {
+            _ = sqlite.sqlite3_bind_null(stmt, 5);
+        }
+        try stepAndFinalize(stmt);
+    }
+
+    /// Remove a tracker override by URL.
+    pub fn removeTrackerOverride(self: *ResumeDb, info_hash: [20]u8, url: []const u8) !void {
+        const stmt = try self.execOneShot("DELETE FROM tracker_overrides WHERE info_hash = ?1 AND url = ?2");
+        _ = sqlite.sqlite3_bind_blob(stmt, 1, &info_hash, 20, sqlite.SQLITE_TRANSIENT);
+        _ = sqlite.sqlite3_bind_text(stmt, 2, url.ptr, @intCast(url.len), sqlite.SQLITE_TRANSIENT);
+        try stepAndFinalize(stmt);
+    }
+
+    /// Remove a tracker override by orig_url (used when editing: remove the edit record for a given original URL).
+    pub fn removeTrackerOverrideByOrig(self: *ResumeDb, info_hash: [20]u8, orig_url: []const u8) !void {
+        const stmt = try self.execOneShot("DELETE FROM tracker_overrides WHERE info_hash = ?1 AND orig_url = ?2");
+        _ = sqlite.sqlite3_bind_blob(stmt, 1, &info_hash, 20, sqlite.SQLITE_TRANSIENT);
+        _ = sqlite.sqlite3_bind_text(stmt, 2, orig_url.ptr, @intCast(orig_url.len), sqlite.SQLITE_TRANSIENT);
+        try stepAndFinalize(stmt);
+    }
+
+    /// Clear all tracker overrides for a torrent.
+    pub fn clearTrackerOverrides(self: *ResumeDb, info_hash: [20]u8) !void {
+        const stmt = try self.execOneShot("DELETE FROM tracker_overrides WHERE info_hash = ?1");
+        _ = sqlite.sqlite3_bind_blob(stmt, 1, &info_hash, 20, sqlite.SQLITE_TRANSIENT);
+        try stepAndFinalize(stmt);
+    }
+
+    /// Load all tracker overrides for a torrent. Caller owns the returned slices.
+    pub fn loadTrackerOverrides(self: *ResumeDb, allocator: std.mem.Allocator, info_hash: [20]u8) ![]TrackerOverride {
+        const stmt = try self.execOneShot("SELECT url, tier, action, orig_url FROM tracker_overrides WHERE info_hash = ?1 ORDER BY tier");
+        defer _ = sqlite.sqlite3_finalize(stmt);
+        _ = sqlite.sqlite3_bind_blob(stmt, 1, &info_hash, 20, sqlite.SQLITE_TRANSIENT);
+
+        var result = std.ArrayList(TrackerOverride).empty;
+        errdefer {
+            for (result.items) |item| {
+                allocator.free(item.url);
+                allocator.free(item.action);
+                if (item.orig_url) |ou| allocator.free(ou);
+            }
+            result.deinit(allocator);
+        }
+
+        while (sqlite.sqlite3_step(stmt) == sqlite.SQLITE_ROW) {
+            const url_ptr = sqlite.sqlite3_column_text(stmt, 0) orelse continue;
+            const url_len: usize = @intCast(sqlite.sqlite3_column_bytes(stmt, 0));
+            const tier: u32 = @intCast(sqlite.sqlite3_column_int(stmt, 1));
+            const action_ptr = sqlite.sqlite3_column_text(stmt, 2) orelse continue;
+            const action_len: usize = @intCast(sqlite.sqlite3_column_bytes(stmt, 2));
+            const orig_ptr = sqlite.sqlite3_column_text(stmt, 3);
+            const orig_len: usize = @intCast(sqlite.sqlite3_column_bytes(stmt, 3));
+
+            const url = try allocator.dupe(u8, url_ptr[0..url_len]);
+            errdefer allocator.free(url);
+            const action = try allocator.dupe(u8, action_ptr[0..action_len]);
+            errdefer allocator.free(action);
+            const orig_url: ?[]const u8 = if (orig_ptr != null and orig_len > 0)
+                try allocator.dupe(u8, orig_ptr.?[0..orig_len])
+            else
+                null;
+
+            try result.append(allocator, .{
+                .url = url,
+                .tier = tier,
+                .action = action,
+                .orig_url = orig_url,
+            });
+        }
+        return result.toOwnedSlice(allocator);
+    }
+
+    /// Free a TrackerOverride slice returned by loadTrackerOverrides().
+    pub fn freeTrackerOverrides(allocator: std.mem.Allocator, overrides: []const TrackerOverride) void {
+        for (overrides) |item| {
+            allocator.free(item.url);
+            allocator.free(item.action);
+            if (item.orig_url) |ou| allocator.free(ou);
+        }
+        allocator.free(overrides);
+    }
+
     /// IP filter config loaded from the DB.
     pub const IpFilterConfig = struct {
         path: ?[]const u8 = null,
@@ -1392,4 +1519,94 @@ test "resume db ipfilter config persistence" {
     try std.testing.expect(loaded.enabled);
     try std.testing.expectEqual(@as(u32, 1500), loaded.rule_count);
     try std.testing.expectEqualStrings("/etc/ipfilter.dat", loaded.path.?);
+}
+
+test "resume db tracker overrides add and load" {
+    const allocator = std.testing.allocator;
+    var db = ResumeDb.open(":memory:") catch return error.SkipZigTest;
+    defer db.close();
+
+    const info_hash = [_]u8{0xAA} ** 20;
+
+    // Initially empty
+    const empty = try db.loadTrackerOverrides(allocator, info_hash);
+    defer ResumeDb.freeTrackerOverrides(allocator, empty);
+    try std.testing.expectEqual(@as(usize, 0), empty.len);
+
+    // Add tracker overrides
+    try db.saveTrackerOverride(info_hash, "http://tracker1.example.com/announce", 10, "add", null);
+    try db.saveTrackerOverride(info_hash, "http://tracker2.example.com/announce", 11, "add", null);
+    try db.saveTrackerOverride(info_hash, "http://old.example.com/announce", 0, "remove", null);
+
+    const overrides = try db.loadTrackerOverrides(allocator, info_hash);
+    defer ResumeDb.freeTrackerOverrides(allocator, overrides);
+    try std.testing.expectEqual(@as(usize, 3), overrides.len);
+
+    // Should be sorted by tier: remove (tier 0), add (tier 10), add (tier 11)
+    try std.testing.expectEqualStrings("remove", overrides[0].action);
+    try std.testing.expectEqualStrings("add", overrides[1].action);
+    try std.testing.expectEqual(@as(u32, 10), overrides[1].tier);
+}
+
+test "resume db tracker overrides edit with orig_url" {
+    const allocator = std.testing.allocator;
+    var db = ResumeDb.open(":memory:") catch return error.SkipZigTest;
+    defer db.close();
+
+    const info_hash = [_]u8{0xBB} ** 20;
+
+    // Save an edit override
+    try db.saveTrackerOverride(info_hash, "http://new.example.com/announce", 0, "edit", "http://old.example.com/announce");
+
+    const overrides = try db.loadTrackerOverrides(allocator, info_hash);
+    defer ResumeDb.freeTrackerOverrides(allocator, overrides);
+    try std.testing.expectEqual(@as(usize, 1), overrides.len);
+    try std.testing.expectEqualStrings("edit", overrides[0].action);
+    try std.testing.expectEqualStrings("http://new.example.com/announce", overrides[0].url);
+    try std.testing.expectEqualStrings("http://old.example.com/announce", overrides[0].orig_url.?);
+}
+
+test "resume db tracker overrides remove and clear" {
+    const allocator = std.testing.allocator;
+    var db = ResumeDb.open(":memory:") catch return error.SkipZigTest;
+    defer db.close();
+
+    const info_hash = [_]u8{0xCC} ** 20;
+
+    try db.saveTrackerOverride(info_hash, "http://a.example.com/announce", 0, "add", null);
+    try db.saveTrackerOverride(info_hash, "http://b.example.com/announce", 1, "add", null);
+
+    // Remove one
+    try db.removeTrackerOverride(info_hash, "http://a.example.com/announce");
+    const after_remove = try db.loadTrackerOverrides(allocator, info_hash);
+    defer ResumeDb.freeTrackerOverrides(allocator, after_remove);
+    try std.testing.expectEqual(@as(usize, 1), after_remove.len);
+
+    // Clear all
+    try db.clearTrackerOverrides(info_hash);
+    const after_clear = try db.loadTrackerOverrides(allocator, info_hash);
+    defer ResumeDb.freeTrackerOverrides(allocator, after_clear);
+    try std.testing.expectEqual(@as(usize, 0), after_clear.len);
+}
+
+test "resume db tracker overrides isolated per torrent" {
+    const allocator = std.testing.allocator;
+    var db = ResumeDb.open(":memory:") catch return error.SkipZigTest;
+    defer db.close();
+
+    const hash_a = [_]u8{0xDD} ** 20;
+    const hash_b = [_]u8{0xEE} ** 20;
+
+    try db.saveTrackerOverride(hash_a, "http://a.example.com/announce", 0, "add", null);
+    try db.saveTrackerOverride(hash_b, "http://b.example.com/announce", 0, "add", null);
+
+    const overrides_a = try db.loadTrackerOverrides(allocator, hash_a);
+    defer ResumeDb.freeTrackerOverrides(allocator, overrides_a);
+    try std.testing.expectEqual(@as(usize, 1), overrides_a.len);
+    try std.testing.expectEqualStrings("http://a.example.com/announce", overrides_a[0].url);
+
+    const overrides_b = try db.loadTrackerOverrides(allocator, hash_b);
+    defer ResumeDb.freeTrackerOverrides(allocator, overrides_b);
+    try std.testing.expectEqual(@as(usize, 1), overrides_b.len);
+    try std.testing.expectEqualStrings("http://b.example.com/announce", overrides_b[0].url);
 }

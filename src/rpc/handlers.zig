@@ -193,8 +193,20 @@ pub const ApiHandler = struct {
             return self.handleTorrentsInfo(allocator);
         }
 
+        if (std.mem.eql(u8, action_name, "addTrackers") and std.mem.eql(u8, method, "POST")) {
+            return self.handleTorrentsAddTrackers(allocator, body);
+        }
+
         if (std.mem.startsWith(u8, action_name, "add") and std.mem.eql(u8, method, "POST")) {
             return self.handleTorrentsAdd(allocator, body, query, content_type);
+        }
+
+        if (std.mem.eql(u8, action_name, "removeTrackers") and std.mem.eql(u8, method, "POST")) {
+            return self.handleTorrentsRemoveTrackers(allocator, body);
+        }
+
+        if (std.mem.eql(u8, action_name, "editTracker") and std.mem.eql(u8, method, "POST")) {
+            return self.handleTorrentsEditTracker(allocator, body);
         }
 
         if (std.mem.eql(u8, action_name, "delete") and std.mem.eql(u8, method, "POST")) {
@@ -839,6 +851,92 @@ pub const ApiHandler = struct {
         const enabled = std.mem.eql(u8, value_str, "true");
 
         self.session_manager.setSuperSeeding(hash, enabled) catch |err| {
+            const msg = std.fmt.allocPrint(allocator, "{{\"error\":\"{s}\"}}", .{@errorName(err)}) catch
+                return .{ .status = 500, .body = "{\"error\":\"internal\"}" };
+            return .{ .status = 404, .body = msg, .owned_body = msg };
+        };
+
+        return .{ .body = "{\"status\":\"ok\"}" };
+    }
+
+    // ── Tracker editing handlers ────────────────────────────
+
+    fn handleTorrentsAddTrackers(self: *const ApiHandler, allocator: std.mem.Allocator, body: []const u8) server.Response {
+        const hash = extractParam(body, "hash") orelse
+            return .{ .status = 400, .body = "{\"error\":\"missing hash\"}" };
+        const urls_str = extractParam(body, "urls") orelse
+            return .{ .status = 400, .body = "{\"error\":\"missing urls\"}" };
+
+        // URLs are newline-separated (qBittorrent compat: %0A is \n)
+        var url_list = std.ArrayList([]const u8).empty;
+        defer url_list.deinit(allocator);
+        var iter = std.mem.splitSequence(u8, urls_str, "%0A");
+        while (iter.next()) |part| {
+            // Also handle literal newlines
+            var sub_iter = std.mem.splitScalar(u8, part, '\n');
+            while (sub_iter.next()) |url| {
+                const trimmed = std.mem.trim(u8, url, " \r\t");
+                if (trimmed.len > 0) {
+                    url_list.append(allocator, trimmed) catch continue;
+                }
+            }
+        }
+
+        if (url_list.items.len == 0) {
+            return .{ .status = 400, .body = "{\"error\":\"no valid urls\"}" };
+        }
+
+        self.session_manager.addTrackers(hash, url_list.items) catch |err| {
+            const msg = std.fmt.allocPrint(allocator, "{{\"error\":\"{s}\"}}", .{@errorName(err)}) catch
+                return .{ .status = 500, .body = "{\"error\":\"internal\"}" };
+            return .{ .status = 404, .body = msg, .owned_body = msg };
+        };
+
+        return .{ .body = "{\"status\":\"ok\"}" };
+    }
+
+    fn handleTorrentsRemoveTrackers(self: *const ApiHandler, allocator: std.mem.Allocator, body: []const u8) server.Response {
+        const hash = extractParam(body, "hash") orelse
+            return .{ .status = 400, .body = "{\"error\":\"missing hash\"}" };
+        const urls_str = extractParam(body, "urls") orelse
+            return .{ .status = 400, .body = "{\"error\":\"missing urls\"}" };
+
+        // URLs are pipe-separated (qBittorrent compat: %7C is |)
+        var url_list = std.ArrayList([]const u8).empty;
+        defer url_list.deinit(allocator);
+        var iter = std.mem.splitSequence(u8, urls_str, "%7C");
+        while (iter.next()) |part| {
+            var sub_iter = std.mem.splitScalar(u8, part, '|');
+            while (sub_iter.next()) |url| {
+                const trimmed = std.mem.trim(u8, url, " \r\t\n");
+                if (trimmed.len > 0) {
+                    url_list.append(allocator, trimmed) catch continue;
+                }
+            }
+        }
+
+        if (url_list.items.len == 0) {
+            return .{ .status = 400, .body = "{\"error\":\"no valid urls\"}" };
+        }
+
+        self.session_manager.removeTrackers(hash, url_list.items) catch |err| {
+            const msg = std.fmt.allocPrint(allocator, "{{\"error\":\"{s}\"}}", .{@errorName(err)}) catch
+                return .{ .status = 500, .body = "{\"error\":\"internal\"}" };
+            return .{ .status = 404, .body = msg, .owned_body = msg };
+        };
+
+        return .{ .body = "{\"status\":\"ok\"}" };
+    }
+
+    fn handleTorrentsEditTracker(self: *const ApiHandler, allocator: std.mem.Allocator, body: []const u8) server.Response {
+        const hash = extractParam(body, "hash") orelse
+            return .{ .status = 400, .body = "{\"error\":\"missing hash\"}" };
+        const orig_url = extractParam(body, "origUrl") orelse
+            return .{ .status = 400, .body = "{\"error\":\"missing origUrl\"}" };
+        const new_url = extractParam(body, "newUrl") orelse
+            return .{ .status = 400, .body = "{\"error\":\"missing newUrl\"}" };
+
+        self.session_manager.editTracker(hash, orig_url, new_url) catch |err| {
             const msg = std.fmt.allocPrint(allocator, "{{\"error\":\"{s}\"}}", .{@errorName(err)}) catch
                 return .{ .status = 500, .body = "{\"error\":\"internal\"}" };
             return .{ .status = 404, .body = msg, .owned_body = msg };

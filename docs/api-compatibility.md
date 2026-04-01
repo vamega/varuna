@@ -52,6 +52,9 @@ This document tracks which endpoints are implemented, which return placeholder d
 | `POST /api/v2/torrents/recheck` | Full |
 | `POST /api/v2/torrents/setLocation` | Full |
 | `POST /api/v2/torrents/setSuperSeeding` | Full |
+| `POST /api/v2/torrents/addTrackers` | Full |
+| `POST /api/v2/torrents/removeTrackers` | Full |
+| `POST /api/v2/torrents/editTracker` | Full |
 | `GET /api/v2/torrents/connDiagnostics` | Full (Varuna extension) |
 
 ### Categories & Tags
@@ -91,9 +94,6 @@ These endpoints are explicitly out of scope for Varuna.
 
 | Endpoint | Reason |
 |---|---|
-| `POST /api/v2/torrents/addTrackers` | Modifying tracker lists post-add conflicts with private tracker semantics. Use the torrent file's announce list. |
-| `POST /api/v2/torrents/removeTrackers` | Same as above. |
-| `POST /api/v2/torrents/editTracker` | Same as above. |
 | Time-based alt-speed scheduling | Use `cron` + `varuna-ctl` instead. See `docs/future-features.md`. |
 
 ## Unsupported -- Could Be Added Later

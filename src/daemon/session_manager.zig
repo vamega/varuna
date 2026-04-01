@@ -494,6 +494,49 @@ pub const SessionManager = struct {
         session.setSuperSeeding(enabled);
     }
 
+    /// Add tracker URLs to a torrent (user override). Triggers re-announce.
+    pub fn addTrackers(self: *SessionManager, hash: []const u8, urls: []const []const u8) !void {
+        self.mutex.lock();
+        const session = self.sessions.get(hash) orelse {
+            self.mutex.unlock();
+            return error.TorrentNotFound;
+        };
+        session.addTrackerUrls(urls) catch |err| {
+            self.mutex.unlock();
+            return err;
+        };
+        self.mutex.unlock();
+
+        // Trigger a re-announce on the background thread
+        self.forceReannounce(hash) catch {};
+    }
+
+    /// Remove tracker URLs from a torrent (user override). Persists removal.
+    pub fn removeTrackers(self: *SessionManager, hash: []const u8, urls: []const []const u8) !void {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+
+        const session = self.sessions.get(hash) orelse return error.TorrentNotFound;
+        try session.removeTrackerUrls(urls);
+    }
+
+    /// Replace one tracker URL with another (user override). Triggers re-announce.
+    pub fn editTracker(self: *SessionManager, hash: []const u8, orig_url: []const u8, new_url: []const u8) !void {
+        self.mutex.lock();
+        const session = self.sessions.get(hash) orelse {
+            self.mutex.unlock();
+            return error.TorrentNotFound;
+        };
+        session.editTrackerUrl(orig_url, new_url) catch |err| {
+            self.mutex.unlock();
+            return err;
+        };
+        self.mutex.unlock();
+
+        // Trigger a re-announce on the background thread
+        self.forceReannounce(hash) catch {};
+    }
+
     /// Force re-announce to tracker for a torrent.
     pub fn forceReannounce(self: *SessionManager, hash: []const u8) !void {
         self.mutex.lock();
@@ -907,6 +950,7 @@ pub const SessionManager = struct {
     }
 
     /// Return tracker info for a torrent, copying all data under the mutex.
+    /// Applies tracker overrides (user-added, removed, edited URLs).
     pub fn getSessionTrackers(self: *SessionManager, allocator: std.mem.Allocator, hash: []const u8) ![]const TrackerInfo {
         self.mutex.lock();
         defer self.mutex.unlock();
@@ -915,59 +959,83 @@ pub const SessionManager = struct {
         const sess = session.session orelse return error.TorrentNotReady;
         const meta = sess.metainfo;
         const stats = session.getStats();
+        const overrides = &session.tracker_overrides;
 
-        // Count trackers: primary announce (if any) + announce_list (minus duplicates)
-        var tracker_count: usize = 0;
-        if (meta.announce != null) tracker_count += 1;
-        for (meta.announce_list) |url| {
-            if (meta.announce) |primary| {
-                if (std.mem.eql(u8, url, primary)) continue;
-            }
-            tracker_count += 1;
-        }
-
-        var result = try allocator.alloc(TrackerInfo, tracker_count);
-        var built: usize = 0;
+        // Build effective tracker list with overrides applied
+        var result_list = std.ArrayList(TrackerInfo).empty;
         errdefer {
-            for (result[0..built]) |ti| allocator.free(ti.url);
-            allocator.free(result);
+            for (result_list.items) |ti| allocator.free(ti.url);
+            result_list.deinit(allocator);
         }
 
         var tier: u32 = 0;
 
         if (meta.announce) |url| {
-            const status: u8 = if (session.state == .downloading or session.state == .seeding or session.state == .metadata_fetching) 2 else 1;
-            result[built] = .{
-                .url = try allocator.dupe(u8, url),
-                .status = status,
-                .tier = tier,
-                .num_peers = stats.peers_connected,
-                .num_seeds = stats.scrape_complete,
-                .num_leeches = stats.scrape_incomplete,
-                .num_downloaded = stats.scrape_downloaded,
-            };
-            built += 1;
-            tier += 1;
+            if (!overrides.isRemoved(url)) {
+                const effective = overrides.getEdit(url) orelse url;
+                const status: u8 = if (session.state == .downloading or session.state == .seeding or session.state == .metadata_fetching) 2 else 1;
+                try result_list.append(allocator, .{
+                    .url = try allocator.dupe(u8, effective),
+                    .status = status,
+                    .tier = tier,
+                    .num_peers = stats.peers_connected,
+                    .num_seeds = stats.scrape_complete,
+                    .num_leeches = stats.scrape_incomplete,
+                    .num_downloaded = stats.scrape_downloaded,
+                });
+                tier += 1;
+            }
         }
 
         for (meta.announce_list) |url| {
+            if (overrides.isRemoved(url)) continue;
             if (meta.announce) |primary| {
                 if (std.mem.eql(u8, url, primary)) continue;
             }
-            result[built] = .{
-                .url = try allocator.dupe(u8, url),
+            const effective = overrides.getEdit(url) orelse url;
+            // Check not already added (dedup)
+            var dup = false;
+            for (result_list.items) |existing| {
+                if (std.mem.eql(u8, existing.url, effective)) {
+                    dup = true;
+                    break;
+                }
+            }
+            if (dup) continue;
+            try result_list.append(allocator, .{
+                .url = try allocator.dupe(u8, effective),
                 .status = 1,
                 .tier = tier,
                 .num_peers = 0,
                 .num_seeds = 0,
                 .num_leeches = 0,
                 .num_downloaded = 0,
-            };
-            built += 1;
+            });
             tier += 1;
         }
 
-        return result;
+        // Add user-added trackers
+        for (overrides.added.items) |entry| {
+            var dup = false;
+            for (result_list.items) |existing| {
+                if (std.mem.eql(u8, existing.url, entry.url)) {
+                    dup = true;
+                    break;
+                }
+            }
+            if (dup) continue;
+            try result_list.append(allocator, .{
+                .url = try allocator.dupe(u8, entry.url),
+                .status = 1,
+                .tier = entry.tier,
+                .num_peers = 0,
+                .num_seeds = 0,
+                .num_leeches = 0,
+                .num_downloaded = 0,
+            });
+        }
+
+        return result_list.toOwnedSlice(allocator);
     }
 
     /// Properties information returned by getSessionProperties().

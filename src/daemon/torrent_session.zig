@@ -14,7 +14,67 @@ const magnet_mod = @import("../torrent/magnet.zig");
 const ut_metadata = @import("../net/ut_metadata.zig");
 const metadata_fetch = @import("../net/metadata_fetch.zig");
 const ResumeWriter = storage.resume_state.ResumeWriter;
+const ResumeDb = storage.resume_state.ResumeDb;
 const DnsResolver = @import("../io/dns.zig").DnsResolver;
+
+/// Mutable tracker URL storage. Tracks user-added, user-removed,
+/// and user-edited tracker URLs as overlays on top of the metainfo
+/// announce-list. Persisted to SQLite via the `tracker_overrides` table.
+pub const TrackerOverrides = struct {
+    /// URLs added by the user (not in metainfo). Each entry is (url, tier).
+    added: std.ArrayList(TrackerEntry) = std.ArrayList(TrackerEntry).empty,
+    /// URLs from metainfo that the user wants removed.
+    removed: std.ArrayList([]const u8) = std.ArrayList([]const u8).empty,
+    /// URL replacements: orig_url -> new_url.
+    edits: std.ArrayList(TrackerEdit) = std.ArrayList(TrackerEdit).empty,
+
+    pub const TrackerEntry = struct {
+        url: []const u8,
+        tier: u32,
+    };
+
+    pub const TrackerEdit = struct {
+        orig_url: []const u8,
+        new_url: []const u8,
+    };
+
+    pub fn deinit(self: *TrackerOverrides, allocator: std.mem.Allocator) void {
+        for (self.added.items) |entry| allocator.free(entry.url);
+        self.added.deinit(allocator);
+        for (self.removed.items) |url| allocator.free(url);
+        self.removed.deinit(allocator);
+        for (self.edits.items) |edit| {
+            allocator.free(edit.orig_url);
+            allocator.free(edit.new_url);
+        }
+        self.edits.deinit(allocator);
+    }
+
+    /// Check if a URL is in the removed list.
+    pub fn isRemoved(self: *const TrackerOverrides, url: []const u8) bool {
+        for (self.removed.items) |removed_url| {
+            if (std.mem.eql(u8, removed_url, url)) return true;
+        }
+        return false;
+    }
+
+    /// Get the replacement URL for an edited tracker, or null if not edited.
+    pub fn getEdit(self: *const TrackerOverrides, orig_url: []const u8) ?[]const u8 {
+        for (self.edits.items) |edit| {
+            if (std.mem.eql(u8, edit.orig_url, orig_url)) return edit.new_url;
+        }
+        return null;
+    }
+
+    /// Get the highest tier number across metainfo + added trackers.
+    pub fn maxAddedTier(self: *const TrackerOverrides) u32 {
+        var max: u32 = 0;
+        for (self.added.items) |entry| {
+            if (entry.tier > max) max = entry.tier;
+        }
+        return max;
+    }
+};
 
 pub const State = enum {
     checking,
@@ -173,6 +233,10 @@ pub const TorrentSession = struct {
     /// Pre-computed comma-separated tags string for Stats serialization.
     tags_string: ?[]const u8 = null,
 
+    // Tracker URL overrides (user-added/removed/edited trackers, persisted in SQLite)
+    // These are applied on top of the metainfo's announce-list.
+    tracker_overrides: TrackerOverrides = .{},
+
     // Connection diagnostics (updated from event loop callbacks)
     conn_attempts: u64 = 0,
     conn_failures: u64 = 0,
@@ -286,6 +350,7 @@ pub const TorrentSession = struct {
         for (self.tags.items) |tag| self.allocator.free(tag);
         self.tags.deinit(self.allocator);
         if (self.tags_string) |ts| self.allocator.free(ts);
+        self.tracker_overrides.deinit(self.allocator);
         // Magnet-specific cleanup
         if (self.magnet_trackers) |trackers| {
             for (trackers) |tr| self.allocator.free(tr);
@@ -584,19 +649,40 @@ pub const TorrentSession = struct {
 
         // Extract tracker and file metadata from parsed session (if available)
         const meta_opt = if (self.session) |*s| s.metainfo else null;
-        const tracker_url: []const u8 = if (meta_opt) |m| (m.announce orelse "") else "";
+        const overrides = &self.tracker_overrides;
+        // Primary tracker: use edited URL if applicable, or first added URL
+        const tracker_url: []const u8 = if (meta_opt) |m| blk: {
+            if (m.announce) |url| {
+                if (!overrides.isRemoved(url)) {
+                    break :blk overrides.getEdit(url) orelse url;
+                }
+            }
+            // If primary was removed, try first available metainfo URL
+            for (m.announce_list) |url| {
+                if (!overrides.isRemoved(url)) {
+                    break :blk overrides.getEdit(url) orelse url;
+                }
+            }
+            // Try first user-added tracker
+            if (overrides.added.items.len > 0) break :blk overrides.added.items[0].url;
+            break :blk "";
+        } else if (overrides.added.items.len > 0) overrides.added.items[0].url else "";
         const trackers_count: u32 = if (meta_opt) |m| blk: {
             var count: u32 = 0;
-            if (m.announce != null) count += 1;
+            if (m.announce) |url| {
+                if (!overrides.isRemoved(url)) count += 1;
+            }
             for (m.announce_list) |url| {
+                if (overrides.isRemoved(url)) continue;
                 if (m.announce) |primary| {
                     if (!std.mem.eql(u8, url, primary)) count += 1;
                 } else {
                     count += 1;
                 }
             }
+            count += @intCast(overrides.added.items.len);
             break :blk count;
-        } else 0;
+        } else @intCast(overrides.added.items.len);
 
         // content_path: single-file = save_path/name, multi-file = save_path/torrent_name
         const content_path: []const u8 = if (meta_opt) |m|
@@ -722,6 +808,14 @@ pub const TorrentSession = struct {
                         self.allocator.free(tags);
                         self.rebuildTagsString();
                     } else |_| {}
+                }
+
+                // Load persisted tracker overrides for this torrent
+                if (self.tracker_overrides.added.items.len == 0 and
+                    self.tracker_overrides.removed.items.len == 0 and
+                    self.tracker_overrides.edits.items.len == 0)
+                {
+                    self.loadTrackerOverrides();
                 }
 
                 // BEP 52: persist v2 info-hash if this is a hybrid/v2 torrent
@@ -1276,21 +1370,241 @@ pub const TorrentSession = struct {
         var urls = std.ArrayList([]const u8).empty;
         defer urls.deinit(self.allocator);
 
+        const overrides = &self.tracker_overrides;
+
+        // Add metainfo trackers, applying edits and removals
         if (session.metainfo.announce) |url| {
-            try urls.append(self.allocator, url);
+            if (!overrides.isRemoved(url)) {
+                const effective = overrides.getEdit(url) orelse url;
+                try urls.append(self.allocator, effective);
+            }
         }
         for (session.metainfo.announce_list) |url| {
+            if (overrides.isRemoved(url)) continue;
+            const effective = overrides.getEdit(url) orelse url;
             var already_added = false;
             for (urls.items) |existing| {
-                if (std.mem.eql(u8, existing, url)) {
+                if (std.mem.eql(u8, existing, effective)) {
                     already_added = true;
                     break;
                 }
             }
-            if (!already_added) try urls.append(self.allocator, url);
+            if (!already_added) try urls.append(self.allocator, effective);
+        }
+
+        // Add user-added trackers
+        for (overrides.added.items) |entry| {
+            var already_added = false;
+            for (urls.items) |existing| {
+                if (std.mem.eql(u8, existing, entry.url)) {
+                    already_added = true;
+                    break;
+                }
+            }
+            if (!already_added) try urls.append(self.allocator, entry.url);
         }
 
         return urls.toOwnedSlice(self.allocator);
+    }
+
+    // ── Tracker override operations ─────────────────────────
+
+    /// Add one or more tracker URLs (each goes into a new tier).
+    /// Persists to SQLite and triggers a re-announce.
+    pub fn addTrackerUrls(self: *TorrentSession, urls: []const []const u8) !void {
+        // Determine next tier number
+        var next_tier: u32 = 0;
+        if (self.session) |*s| {
+            if (s.metainfo.announce != null) next_tier += 1;
+            next_tier += @intCast(s.metainfo.announce_list.len);
+        }
+        if (self.tracker_overrides.added.items.len > 0) {
+            next_tier = self.tracker_overrides.maxAddedTier() + 1;
+        }
+
+        for (urls) |url| {
+            if (url.len == 0) continue;
+            // Skip duplicates
+            var duplicate = false;
+            for (self.tracker_overrides.added.items) |entry| {
+                if (std.mem.eql(u8, entry.url, url)) {
+                    duplicate = true;
+                    break;
+                }
+            }
+            if (duplicate) continue;
+
+            const owned_url = try self.allocator.dupe(u8, url);
+            errdefer self.allocator.free(owned_url);
+            try self.tracker_overrides.added.append(self.allocator, .{
+                .url = owned_url,
+                .tier = next_tier,
+            });
+            next_tier += 1;
+
+            // Persist to SQLite
+            self.persistTrackerOverride(owned_url, next_tier - 1, "add", null);
+        }
+    }
+
+    /// Remove tracker URLs from the effective tracker list.
+    /// If the URL is user-added, removes it from the added list.
+    /// If the URL is from metainfo, adds a 'remove' override.
+    pub fn removeTrackerUrls(self: *TorrentSession, urls: []const []const u8) !void {
+        for (urls) |url| {
+            if (url.len == 0) continue;
+
+            // Check if this is a user-added tracker
+            var removed_added = false;
+            var i: usize = 0;
+            while (i < self.tracker_overrides.added.items.len) {
+                if (std.mem.eql(u8, self.tracker_overrides.added.items[i].url, url)) {
+                    self.allocator.free(self.tracker_overrides.added.items[i].url);
+                    _ = self.tracker_overrides.added.orderedRemove(i);
+                    removed_added = true;
+                    // Remove from SQLite
+                    self.unpersistTrackerOverride(url);
+                    break;
+                }
+                i += 1;
+            }
+            if (removed_added) continue;
+
+            // Check if it's an edit replacement URL
+            var removed_edit = false;
+            i = 0;
+            while (i < self.tracker_overrides.edits.items.len) {
+                if (std.mem.eql(u8, self.tracker_overrides.edits.items[i].new_url, url)) {
+                    const edit = self.tracker_overrides.edits.items[i];
+                    self.allocator.free(edit.orig_url);
+                    self.allocator.free(edit.new_url);
+                    _ = self.tracker_overrides.edits.orderedRemove(i);
+                    removed_edit = true;
+                    self.unpersistTrackerOverride(url);
+                    break;
+                }
+                i += 1;
+            }
+            if (removed_edit) continue;
+
+            // It's a metainfo tracker -- add a 'remove' override
+            // Check not already in removed list
+            var already_removed = false;
+            for (self.tracker_overrides.removed.items) |r| {
+                if (std.mem.eql(u8, r, url)) {
+                    already_removed = true;
+                    break;
+                }
+            }
+            if (!already_removed) {
+                const owned_url = try self.allocator.dupe(u8, url);
+                errdefer self.allocator.free(owned_url);
+                try self.tracker_overrides.removed.append(self.allocator, owned_url);
+                self.persistTrackerOverride(owned_url, 0, "remove", null);
+            }
+        }
+    }
+
+    /// Replace one tracker URL with another.
+    /// Works for metainfo URLs, user-added URLs, and previously-edited URLs.
+    pub fn editTrackerUrl(self: *TorrentSession, orig_url: []const u8, new_url: []const u8) !void {
+        if (orig_url.len == 0 or new_url.len == 0) return error.InvalidUrl;
+        if (std.mem.eql(u8, orig_url, new_url)) return; // no-op
+
+        // Check if orig_url is a user-added tracker
+        for (self.tracker_overrides.added.items) |*entry| {
+            if (std.mem.eql(u8, entry.url, orig_url)) {
+                // Replace in-place
+                const owned_new = try self.allocator.dupe(u8, new_url);
+                self.unpersistTrackerOverride(orig_url);
+                self.allocator.free(entry.url);
+                entry.url = owned_new;
+                self.persistTrackerOverride(owned_new, entry.tier, "add", null);
+                return;
+            }
+        }
+
+        // Check if orig_url is already an edited URL (new_url of an existing edit)
+        for (self.tracker_overrides.edits.items) |*edit| {
+            if (std.mem.eql(u8, edit.new_url, orig_url)) {
+                // Update the replacement
+                const owned_new = try self.allocator.dupe(u8, new_url);
+                self.unpersistTrackerOverride(orig_url);
+                self.allocator.free(edit.new_url);
+                edit.new_url = owned_new;
+                self.persistTrackerOverride(owned_new, 0, "edit", edit.orig_url);
+                return;
+            }
+        }
+
+        // It's a metainfo URL -- create a new edit override
+        const owned_orig = try self.allocator.dupe(u8, orig_url);
+        errdefer self.allocator.free(owned_orig);
+        const owned_new = try self.allocator.dupe(u8, new_url);
+        errdefer self.allocator.free(owned_new);
+        try self.tracker_overrides.edits.append(self.allocator, .{
+            .orig_url = owned_orig,
+            .new_url = owned_new,
+        });
+        self.persistTrackerOverride(owned_new, 0, "edit", owned_orig);
+    }
+
+    /// Load tracker overrides from SQLite into the in-memory state.
+    pub fn loadTrackerOverrides(self: *TorrentSession) void {
+        const db_path = self.resume_db_path orelse return;
+        var db = ResumeDb.open(db_path) catch return;
+        defer db.close();
+
+        const overrides = db.loadTrackerOverrides(self.allocator, self.info_hash) catch return;
+        defer ResumeDb.freeTrackerOverrides(self.allocator, overrides);
+
+        for (overrides) |ov| {
+            if (std.mem.eql(u8, ov.action, "add")) {
+                const owned = self.allocator.dupe(u8, ov.url) catch continue;
+                self.tracker_overrides.added.append(self.allocator, .{
+                    .url = owned,
+                    .tier = ov.tier,
+                }) catch {
+                    self.allocator.free(owned);
+                };
+            } else if (std.mem.eql(u8, ov.action, "remove")) {
+                const owned = self.allocator.dupe(u8, ov.url) catch continue;
+                self.tracker_overrides.removed.append(self.allocator, owned) catch {
+                    self.allocator.free(owned);
+                };
+            } else if (std.mem.eql(u8, ov.action, "edit")) {
+                if (ov.orig_url) |orig| {
+                    const owned_new = self.allocator.dupe(u8, ov.url) catch continue;
+                    const owned_orig = self.allocator.dupe(u8, orig) catch {
+                        self.allocator.free(owned_new);
+                        continue;
+                    };
+                    self.tracker_overrides.edits.append(self.allocator, .{
+                        .orig_url = owned_orig,
+                        .new_url = owned_new,
+                    }) catch {
+                        self.allocator.free(owned_new);
+                        self.allocator.free(owned_orig);
+                    };
+                }
+            }
+        }
+    }
+
+    /// Persist a single tracker override to SQLite (best-effort, ignores errors).
+    fn persistTrackerOverride(self: *TorrentSession, url: []const u8, tier: u32, action: []const u8, orig_url: ?[]const u8) void {
+        const db_path = self.resume_db_path orelse return;
+        var db = ResumeDb.open(db_path) catch return;
+        defer db.close();
+        db.saveTrackerOverride(self.info_hash, url, tier, action, orig_url) catch {};
+    }
+
+    /// Remove a tracker override from SQLite (best-effort, ignores errors).
+    fn unpersistTrackerOverride(self: *TorrentSession, url: []const u8) void {
+        const db_path = self.resume_db_path orelse return;
+        var db = ResumeDb.open(db_path) catch return;
+        defer db.close();
+        db.removeTrackerOverride(self.info_hash, url) catch {};
     }
 
     // ── Resume persistence helpers ────────────────────────

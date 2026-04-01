@@ -63,7 +63,8 @@ Update it whenever a milestone lands, the near-term backlog changes, or a new op
 - **Sync**: /api/v2/sync/maindata delta protocol (rid-based, Wyhash change detection, 100-snapshot circular buffer, real DHT node count in server_state, infohash_v2 in torrent objects), sync/torrentPeers with real peer data (IP, flags, progress, transfer stats, per-peer dl/ul speed, client name from peer ID).
 - **Compatibility**: qBittorrent state strings (downloading/uploading/pausedDL/pausedUP/etc), CORS headers on all responses, OPTIONS preflight handler, magnet URI generation, percent-encoding, content_path building, HTTP 404 for unknown API paths. Validated against qui (autobrr/qui) TypeScript interfaces. See [docs/api-compatibility.md](docs/api-compatibility.md) for full endpoint coverage and known placeholder fields.
 - **Multipart form-data**: zero-copy parser for Flood/WebUI torrent uploads.
-- **varuna-ctl**: list, add (--save-path), pause, resume, delete (--delete-files), move, conn-diag, version, stats, speed limits (set/get), --username/--password auth.
+- **Tracker editing**: add, remove, and edit tracker URLs per-torrent via API and CLI. User overrides persisted to SQLite `tracker_overrides` table, loaded on startup. Overrides applied on top of metainfo announce-list. Re-announce triggered on add/edit. qBittorrent-compatible endpoints: `addTrackers`, `removeTrackers`, `editTracker`.
+- **varuna-ctl**: list, add (--save-path), pause, resume, delete (--delete-files), move, conn-diag, add-tracker, remove-tracker, edit-tracker, version, stats, speed limits (set/get), --username/--password auth.
 
 ### Daemon Features
 - Graceful SIGINT/SIGTERM shutdown: flush resume DB, send tracker stopped, close connections.
@@ -146,6 +147,7 @@ Update it whenever a milestone lands, the near-term backlog changes, or a new op
 - 5 super-seed (BEP 16) tests, 4 partial seed (BEP 21) tests, 2 multi-announce tests, 5 huge page cache tests.
 - BEP 52 tests: 11 Merkle tree tests, 8 file tree parser tests, 7 v2 metainfo tests, 4 v2 layout tests, 1 v2 info-hash test, 8 hash exchange tests, 2 v2 announce URL tests, 2 v2 resume DB tests, 11 Merkle cache tests, 2 async Merkle hasher tests.
 - DHT tests: 7 node_id tests, 8 routing_table tests, 8 krpc tests, 8 token tests, 7 lookup tests, 5 dht_engine tests, 1 persistence test (44 total).
+- 4 tracker override persistence tests (add/load, edit with orig_url, remove/clear, per-torrent isolation).
 - 10 peer ID client identification tests (Azureus-style, Shadow-style, Mainline, unknown).
 - 17 peer ID masquerading tests: all 5 client formats, case insensitivity, malformed input, unsupported client error, random suffix validation.
 - 4 TLS tests: TlsStream init/deinit, ClientHello generation, garbage ciphertext handling, stub error returns. 3 HTTPS URL parsing tests.

@@ -241,6 +241,51 @@ pub fn main() !void {
             try path_buf.print(allocator, "/api/v2/torrents/connDiagnostics?hash={s}", .{args[cmd_start + 1]});
             try doGet(allocator, stdout, api_host, api_port, path_buf.items, sid);
         }
+    } else if (std.mem.eql(u8, command, "add-tracker")) {
+        if (cmd_start + 2 >= args.len) {
+            try stdout.print("usage: varuna-ctl add-tracker <hash> <url> [<url2> ...]\n", .{});
+        } else {
+            const hash = args[cmd_start + 1];
+            // Collect all URLs after hash, join with %0A (newline-encoded)
+            var urls_buf = std.ArrayList(u8).empty;
+            defer urls_buf.deinit(allocator);
+            var i: usize = cmd_start + 2;
+            while (i < args.len) : (i += 1) {
+                if (i > cmd_start + 2) try urls_buf.appendSlice(allocator, "%0A");
+                try urls_buf.appendSlice(allocator, args[i]);
+            }
+            var body_buf = std.ArrayList(u8).empty;
+            defer body_buf.deinit(allocator);
+            try body_buf.print(allocator, "hash={s}&urls={s}", .{ hash, urls_buf.items });
+            try doPost(allocator, stdout, api_host, api_port, "/api/v2/torrents/addTrackers", body_buf.items, sid);
+        }
+    } else if (std.mem.eql(u8, command, "remove-tracker")) {
+        if (cmd_start + 2 >= args.len) {
+            try stdout.print("usage: varuna-ctl remove-tracker <hash> <url> [<url2> ...]\n", .{});
+        } else {
+            const hash = args[cmd_start + 1];
+            // Collect all URLs after hash, join with | (pipe-separated)
+            var urls_buf = std.ArrayList(u8).empty;
+            defer urls_buf.deinit(allocator);
+            var i: usize = cmd_start + 2;
+            while (i < args.len) : (i += 1) {
+                if (i > cmd_start + 2) try urls_buf.appendSlice(allocator, "%7C");
+                try urls_buf.appendSlice(allocator, args[i]);
+            }
+            var body_buf = std.ArrayList(u8).empty;
+            defer body_buf.deinit(allocator);
+            try body_buf.print(allocator, "hash={s}&urls={s}", .{ hash, urls_buf.items });
+            try doPost(allocator, stdout, api_host, api_port, "/api/v2/torrents/removeTrackers", body_buf.items, sid);
+        }
+    } else if (std.mem.eql(u8, command, "edit-tracker")) {
+        if (cmd_start + 3 >= args.len) {
+            try stdout.print("usage: varuna-ctl edit-tracker <hash> <old-url> <new-url>\n", .{});
+        } else {
+            var body_buf = std.ArrayList(u8).empty;
+            defer body_buf.deinit(allocator);
+            try body_buf.print(allocator, "hash={s}&origUrl={s}&newUrl={s}", .{ args[cmd_start + 1], args[cmd_start + 2], args[cmd_start + 3] });
+            try doPost(allocator, stdout, api_host, api_port, "/api/v2/torrents/editTracker", body_buf.items, sid);
+        }
     } else if (std.mem.eql(u8, command, "ban")) {
         if (cmd_start + 1 >= args.len) {
             try stdout.print("usage: varuna-ctl ban <ip> [--reason <text>]\n", .{});
@@ -522,6 +567,9 @@ fn printUsage(stdout: *std.Io.Writer, host: []const u8, port: u16) !void {
     try stdout.print("  get-ul-limit <hash|global>     get upload limit\n", .{});
     try stdout.print("  move <hash> <path>             move torrent data to new path\n", .{});
     try stdout.print("  conn-diag <hash>               connection diagnostics\n", .{});
+    try stdout.print("  add-tracker <hash> <url> ...    add tracker URL(s)\n", .{});
+    try stdout.print("  remove-tracker <hash> <url> ... remove tracker URL(s)\n", .{});
+    try stdout.print("  edit-tracker <hash> <old> <new> replace a tracker URL\n", .{});
     try stdout.print("  ban <ip> [--reason <text>]      ban a peer IP\n", .{});
     try stdout.print("  unban <ip>                     unban a peer IP\n", .{});
     try stdout.print("  banlist [--json]               list banned peers\n", .{});
