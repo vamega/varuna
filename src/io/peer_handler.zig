@@ -211,14 +211,18 @@ pub fn handleSend(self: *EventLoop, slot: u16, cqe: linux.io_uring_cqe) void {
     // Check if this was a tracked send buffer (context != 0, send_id encoded)
     if (op.context != 0) {
         const bytes_sent: usize = @intCast(cqe.res);
-        // Check for partial send and re-submit remainder
-        if (!self.handlePartialSend(slot, send_id, bytes_sent)) {
-            // Full send complete, free the buffer
-            self.freeOnePendingSend(slot, send_id);
+        switch (self.handlePartialSend(slot, send_id, bytes_sent)) {
+            .resubmitted => {},
+            .complete => self.freeOnePendingSend(slot, send_id),
+            .failed => {
+                self.freeOnePendingSend(slot, send_id);
+                self.removePeer(slot);
+                return;
+            },
         }
     }
 
-    peer.send_pending = false;
+    peer.send_pending = self.hasPendingSendForSlot(slot);
 
     switch (peer.state) {
         .mse_handshake_send => {

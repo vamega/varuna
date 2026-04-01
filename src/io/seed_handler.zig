@@ -29,25 +29,24 @@ fn queuePieceBlockResponse(
     piece_index: u32,
     block_offset: u32,
     block_length: u32,
-    piece_data: []const u8,
+    piece_buffer: *EventLoop.PieceBuffer,
 ) !void {
     const start: usize = @intCast(block_offset);
     const len: usize = @intCast(block_length);
-    if (start + len > piece_data.len) return error.InvalidBlockRange;
+    if (start + len > piece_buffer.buf.len) return error.InvalidBlockRange;
 
     try self.queued_responses.append(self.allocator, .{
         .slot = slot,
         .piece_index = piece_index,
         .block_offset = block_offset,
         .block_length = block_length,
-        .piece_data = piece_data,
+        .piece_buffer = piece_buffer,
     });
 }
 
-fn deferCachedPieceBuffer(self: *EventLoop, buf: []u8, from_pool: bool) void {
+fn deferCachedPieceBuffer(self: *EventLoop, piece_buffer: *EventLoop.PieceBuffer) void {
     self.deferred_piece_buffers.append(self.allocator, .{
-        .buf = buf,
-        .from_pool = from_pool,
+        .piece_buffer = piece_buffer,
     }) catch {
         // Keep the old buffer alive if we can't queue it for deferred release.
         // This avoids invalidating queued response slices before the next flush.
@@ -56,9 +55,141 @@ fn deferCachedPieceBuffer(self: *EventLoop, buf: []u8, from_pool: bool) void {
 
 fn releaseDeferredPieceBuffers(self: *EventLoop) void {
     for (self.deferred_piece_buffers.items) |piece_buf| {
-        if (!piece_buf.from_pool) self.allocator.free(piece_buf.buf);
+        self.releasePieceBuffer(piece_buf.piece_buffer);
     }
     self.deferred_piece_buffers.clearRetainingCapacity();
+}
+
+fn createPlaintextBatchSendState(
+    self: *EventLoop,
+    batch: []const EventLoop.QueuedBlockResponse,
+) !*EventLoop.VectoredSendState {
+    const state = try self.allocator.create(EventLoop.VectoredSendState);
+    errdefer self.allocator.destroy(state);
+
+    const headers_align = @alignOf([13]u8);
+    const iovecs_align = @alignOf(posix.iovec_const);
+    const refs_align = @alignOf(*EventLoop.PieceBuffer);
+    const backing_align = @max(headers_align, @max(iovecs_align, refs_align));
+    const headers_bytes = @sizeOf([13]u8) * batch.len;
+    const iovecs_bytes = @sizeOf(posix.iovec_const) * batch.len * 2;
+    const refs_bytes = @sizeOf(*EventLoop.PieceBuffer) * batch.len;
+
+    var total_bytes: usize = 0;
+    total_bytes = std.mem.alignForward(usize, total_bytes, headers_align);
+    const headers_offset = total_bytes;
+    total_bytes += headers_bytes;
+    total_bytes = std.mem.alignForward(usize, total_bytes, iovecs_align);
+    const iovecs_offset = total_bytes;
+    total_bytes += iovecs_bytes;
+    total_bytes = std.mem.alignForward(usize, total_bytes, refs_align);
+    const refs_offset = total_bytes;
+    total_bytes += refs_bytes;
+
+    state.backing = try self.allocator.alignedAlloc(u8, std.mem.Alignment.fromByteUnits(backing_align), total_bytes);
+    var retained: usize = 0;
+    errdefer {
+        for (state.piece_buffers[0..retained]) |piece_buffer| {
+            self.releasePieceBuffer(piece_buffer);
+        }
+        self.allocator.free(state.backing);
+    }
+
+    state.headers = std.mem.bytesAsSlice([13]u8, state.backing[headers_offset .. headers_offset + headers_bytes]);
+    state.iovecs = @as([*]posix.iovec_const, @ptrCast(@alignCast(state.backing.ptr + iovecs_offset)))[0 .. batch.len * 2];
+    state.piece_buffers = @as([*]*EventLoop.PieceBuffer, @ptrCast(@alignCast(state.backing.ptr + refs_offset)))[0..batch.len];
+
+    for (batch, 0..) |resp, idx| {
+        const header = &state.headers[idx];
+        const block_len: usize = @intCast(resp.block_length);
+        const start: usize = @intCast(resp.block_offset);
+        const block_data = resp.piece_buffer.buf[start .. start + block_len];
+        const msg_len: u32 = 1 + 8 + resp.block_length;
+
+        std.mem.writeInt(u32, header[0..4], msg_len, .big);
+        header[4] = 7;
+        std.mem.writeInt(u32, header[5..9], resp.piece_index, .big);
+        std.mem.writeInt(u32, header[9..13], resp.block_offset, .big);
+
+        state.iovecs[idx * 2] = .{
+            .base = @ptrCast(header),
+            .len = header.len,
+        };
+        state.iovecs[idx * 2 + 1] = .{
+            .base = block_data.ptr,
+            .len = block_data.len,
+        };
+
+        self.retainPieceBuffer(resp.piece_buffer);
+        state.piece_buffers[idx] = resp.piece_buffer;
+        retained += 1;
+    }
+
+    state.iov_index = 0;
+    state.msg = .{
+        .name = null,
+        .namelen = 0,
+        .iov = state.iovecs.ptr,
+        .iovlen = state.iovecs.len,
+        .control = null,
+        .controllen = 0,
+        .flags = 0,
+    };
+    return state;
+}
+
+fn submitPlaintextPieceBatch(self: *EventLoop, slot: u16, batch: []const EventLoop.QueuedBlockResponse) bool {
+    const peer = &self.peers[slot];
+    const state = createPlaintextBatchSendState(self, batch) catch return false;
+
+    const ts = self.nextTrackedSendUserData(slot);
+    self.trackPendingSendVectored(slot, ts.send_id, state) catch return false;
+
+    _ = self.ring.sendmsg(ts.ud, peer.fd, &state.msg, 0) catch {
+        self.freeOnePendingSend(slot, ts.send_id);
+        return false;
+    };
+    peer.send_pending = true;
+    return true;
+}
+
+fn submitCopiedPieceBatch(self: *EventLoop, slot: u16, batch: []const EventLoop.QueuedBlockResponse) bool {
+    const peer = &self.peers[slot];
+
+    var total_len: usize = 0;
+    for (batch) |resp| {
+        total_len += 4 + 1 + 8 + @as(usize, resp.block_length);
+    }
+
+    const send_buf = self.allocator.alloc(u8, total_len) catch return false;
+
+    var offset: usize = 0;
+    for (batch) |resp| {
+        const msg_len: u32 = 1 + 8 + resp.block_length;
+        std.mem.writeInt(u32, send_buf[offset..][0..4], msg_len, .big);
+        send_buf[offset + 4] = 7;
+        std.mem.writeInt(u32, send_buf[offset + 5 ..][0..4], resp.piece_index, .big);
+        std.mem.writeInt(u32, send_buf[offset + 9 ..][0..4], resp.block_offset, .big);
+        const start: usize = @intCast(resp.block_offset);
+        const len: usize = @intCast(resp.block_length);
+        @memcpy(send_buf[offset + 13 ..][0..len], resp.piece_buffer.buf[start .. start + len]);
+        offset += 13 + len;
+    }
+
+    peer.crypto.encryptBuf(send_buf);
+
+    const ts = self.nextTrackedSendUserData(slot);
+    const tracked = self.trackPendingSendOwned(slot, ts.send_id, send_buf) catch {
+        self.allocator.free(send_buf);
+        return false;
+    };
+
+    _ = self.ring.send(ts.ud, peer.fd, tracked, 0) catch {
+        self.freeOnePendingSend(slot, ts.send_id);
+        return false;
+    };
+    peer.send_pending = true;
+    return true;
 }
 
 pub fn servePieceRequest(self: *EventLoop, slot: u16, payload: []const u8) void {
@@ -83,8 +214,8 @@ pub fn servePieceRequest(self: *EventLoop, slot: u16, payload: []const u8) void 
 
     // If piece is cached, queue for batched send (flushed after CQE dispatch)
     if (self.cached_piece_index != null and self.cached_piece_index.? == piece_index) {
-        if (self.cached_piece_data) |cached_data| {
-            queuePieceBlockResponse(self, slot, piece_index, block_offset, block_length, cached_data) catch |err| {
+        if (self.cached_piece_buffer) |cached_piece| {
+            queuePieceBlockResponse(self, slot, piece_index, block_offset, block_length, cached_piece) catch |err| {
                 log.warn("queue cached piece response: {s}", .{@errorName(err)});
             };
             return;
@@ -98,10 +229,7 @@ pub fn servePieceRequest(self: *EventLoop, slot: u16, payload: []const u8) void 
 
     if (plan.spans.len == 0) return;
 
-    // Try huge page cache pool first, fall back to general allocator.
-    const pool_buf = if (self.huge_page_cache) |*hpc| hpc.alloc(piece_size) else null;
-    const from_pool = pool_buf != null;
-    const read_buf = pool_buf orelse (self.allocator.alloc(u8, piece_size) catch return);
+    const piece_buffer = self.createPieceBuffer(piece_size) catch return;
     const read_id = nextSeedReadId(self);
 
     self.pending_reads.append(self.allocator, .{
@@ -110,12 +238,10 @@ pub fn servePieceRequest(self: *EventLoop, slot: u16, payload: []const u8) void 
         .piece_index = piece_index,
         .block_offset = block_offset,
         .block_length = block_length,
-        .read_buf = read_buf,
-        .piece_size = piece_size,
+        .piece_buffer = piece_buffer,
         .reads_remaining = 0,
-        .from_pool = from_pool,
     }) catch {
-        if (!from_pool) self.allocator.free(read_buf);
+        self.releasePieceBuffer(piece_buffer);
         return;
     };
 
@@ -124,7 +250,7 @@ pub fn servePieceRequest(self: *EventLoop, slot: u16, payload: []const u8) void 
 
     // Submit one io_uring read per span (all non-blocking)
     for (plan.spans) |span| {
-        const target = read_buf[span.piece_offset .. span.piece_offset + span.length];
+        const target = piece_buffer.buf[span.piece_offset .. span.piece_offset + span.length];
         const ud = encodeUserData(.{ .slot = slot, .op_type = .disk_read, .context = @intCast(read_id) });
         _ = self.ring.read(ud, tc.shared_fds[span.file_index], .{ .buffer = target }, span.file_offset) catch |err| {
             log.warn("disk read submit for piece {d}: {s}", .{ piece_index, @errorName(err) });
@@ -135,7 +261,7 @@ pub fn servePieceRequest(self: *EventLoop, slot: u16, payload: []const u8) void 
 
     if (submitted_reads == 0) {
         _ = self.pending_reads.pop();
-        self.allocator.free(read_buf);
+        self.releasePieceBuffer(piece_buffer);
         return;
     }
 
@@ -150,7 +276,7 @@ pub fn handleSeedDiskRead(self: *EventLoop, cqe: @import("std").os.linux.io_urin
     var pending = self.pending_reads.items[idx];
 
     if (cqe.res <= 0) {
-        if (!pending.from_pool) self.allocator.free(pending.read_buf);
+        self.releasePieceBuffer(pending.piece_buffer);
         _ = self.pending_reads.swapRemove(idx);
         return;
     }
@@ -165,13 +291,11 @@ pub fn handleSeedDiskRead(self: *EventLoop, cqe: @import("std").os.linux.io_urin
     _ = self.pending_reads.swapRemove(idx);
 
     // Update cache
-    if (self.cached_piece_data) |old| {
-        deferCachedPieceBuffer(self, old, self.cached_piece_from_pool);
+    if (self.cached_piece_buffer) |old| {
+        deferCachedPieceBuffer(self, old);
     }
-    self.cached_piece_data = pending.read_buf;
+    self.cached_piece_buffer = pending.piece_buffer;
     self.cached_piece_index = pending.piece_index;
-    self.cached_piece_len = pending.piece_size;
-    self.cached_piece_from_pool = pending.from_pool;
 
     // Queue for batched send (flushed after CQE dispatch)
     queuePieceBlockResponse(
@@ -180,10 +304,10 @@ pub fn handleSeedDiskRead(self: *EventLoop, cqe: @import("std").os.linux.io_urin
         pending.piece_index,
         pending.block_offset,
         pending.block_length,
-        pending.read_buf,
+        pending.piece_buffer,
     ) catch {
         // Fallback: send individually
-        sendPieceBlock(self, pending.slot, pending.piece_index, pending.block_offset, pending.block_length, pending.read_buf);
+        sendPieceBlock(self, pending.slot, pending.piece_index, pending.block_offset, pending.block_length, pending.piece_buffer);
     };
 }
 
@@ -225,64 +349,32 @@ pub fn flushQueuedResponses(self: *EventLoop) void {
             continue;
         }
 
-        // Calculate total send buffer size
         var total_len: usize = 0;
-        for (batch) |resp| {
-            total_len += 4 + 1 + 8 + @as(usize, resp.block_length); // len_prefix + msg_id + piece_index + offset + data
-        }
-
-        // Allocate single buffer for all blocks
-        const send_buf = self.allocator.alloc(u8, total_len) catch {
-            // Fallback: send individually
-            for (batch) |resp| {
-                const start: usize = @intCast(resp.block_offset);
-                const len: usize = @intCast(resp.block_length);
-                sendPieceBlockData(self, resp.slot, resp.piece_index, resp.block_offset, resp.piece_data[start .. start + len]);
-            }
-            i = j;
-            continue;
-        };
-
-        // Pack all block responses into the buffer
-        var offset: usize = 0;
         var total_uploaded: u64 = 0;
         for (batch) |resp| {
-            const msg_len: u32 = 1 + 8 + resp.block_length;
-            std.mem.writeInt(u32, send_buf[offset..][0..4], msg_len, .big);
-            send_buf[offset + 4] = 7; // piece message id
-            std.mem.writeInt(u32, send_buf[offset + 5 ..][0..4], resp.piece_index, .big);
-            std.mem.writeInt(u32, send_buf[offset + 9 ..][0..4], resp.block_offset, .big);
-            const start: usize = @intCast(resp.block_offset);
-            const len: usize = @intCast(resp.block_length);
-            @memcpy(send_buf[offset + 13 ..][0..resp.block_length], resp.piece_data[start .. start + len]);
-            offset += 4 + 1 + 8 + @as(usize, resp.block_length);
+            total_len += 4 + 1 + 8 + @as(usize, resp.block_length);
             total_uploaded += resp.block_length;
         }
 
-        // Consume upload tokens for rate limiting
-        _ = self.consumeUploadTokens(peer.torrent_id, total_uploaded);
+        var submitted = false;
+        if (!peer.crypto.isEncrypted()) {
+            submitted = submitPlaintextPieceBatch(self, current_slot, batch);
+        }
+        if (!submitted) {
+            submitted = submitCopiedPieceBatch(self, current_slot, batch);
+        }
 
-        peer.bytes_uploaded_to += total_uploaded;
-        self.accountTorrentBytes(peer.torrent_id, 0, total_uploaded);
-
-        // MSE/PE: encrypt the entire batch buffer before sending
-        peer.crypto.encryptBuf(send_buf);
-
-        const ts = self.nextTrackedSendUserData(current_slot);
-        const tracked = self.trackPendingSendOwned(current_slot, ts.send_id, send_buf) catch {
-            self.allocator.free(send_buf);
+        if (submitted) {
+            _ = self.consumeUploadTokens(peer.torrent_id, total_uploaded);
+            peer.bytes_uploaded_to += total_uploaded;
+            self.accountTorrentBytes(peer.torrent_id, 0, total_uploaded);
             i = j;
             continue;
-        };
+        }
 
-        _ = self.ring.send(ts.ud, peer.fd, tracked, 0) catch {
-            // SQE submission failed -- free via the pending_sends entry
-            // to avoid leaving a dangling pointer in the list.
-            self.freeOnePendingSend(current_slot, ts.send_id);
-            i = j;
-            continue;
-        };
-        peer.send_pending = true;
+        for (batch) |resp| {
+            sendPieceBlock(self, resp.slot, resp.piece_index, resp.block_offset, resp.block_length, resp.piece_buffer);
+        }
 
         i = j;
     }
@@ -291,51 +383,36 @@ pub fn flushQueuedResponses(self: *EventLoop) void {
     releaseDeferredPieceBuffers(self);
 }
 
-pub fn sendPieceBlock(self: *EventLoop, slot: u16, piece_index: u32, block_offset: u32, block_length: u32, read_buf: []u8) void {
+pub fn sendPieceBlock(self: *EventLoop, slot: u16, piece_index: u32, block_offset: u32, block_length: u32, piece_buffer: *EventLoop.PieceBuffer) void {
     const start: usize = @intCast(block_offset);
     const len: usize = @intCast(block_length);
-    if (start + len > read_buf.len) return;
-    sendPieceBlockData(self, slot, piece_index, block_offset, read_buf[start..][0..len]);
-}
+    if (start + len > piece_buffer.buf.len) return;
 
-fn sendPieceBlockData(self: *EventLoop, slot: u16, piece_index: u32, block_offset: u32, block_data: []const u8) void {
     const peer = &self.peers[slot];
 
     // Check upload rate limit
     if (self.isUploadThrottled(peer.torrent_id)) return;
 
-    const block_length: u32 = @intCast(block_data.len);
-    const msg_len: u32 = 1 + 8 + block_length;
-    const total_len: usize = 4 + @as(usize, msg_len);
-    const send_buf = self.allocator.alloc(u8, total_len) catch return;
+    const batch = [_]EventLoop.QueuedBlockResponse{.{
+        .slot = slot,
+        .piece_index = piece_index,
+        .block_offset = block_offset,
+        .block_length = block_length,
+        .piece_buffer = piece_buffer,
+    }};
 
-    std.mem.writeInt(u32, send_buf[0..4], msg_len, .big);
-    send_buf[4] = 7;
-    std.mem.writeInt(u32, send_buf[5..9], piece_index, .big);
-    std.mem.writeInt(u32, send_buf[9..13], block_offset, .big);
-    @memcpy(send_buf[13..total_len], block_data);
+    var submitted = false;
+    if (!peer.crypto.isEncrypted()) {
+        submitted = submitPlaintextPieceBatch(self, slot, batch[0..]);
+    }
+    if (!submitted) {
+        submitted = submitCopiedPieceBatch(self, slot, batch[0..]);
+    }
+    if (!submitted) return;
 
-    // Consume upload tokens
     _ = self.consumeUploadTokens(peer.torrent_id, block_length);
     peer.bytes_uploaded_to += block_length;
     self.accountTorrentBytes(peer.torrent_id, 0, block_length);
-
-    // MSE/PE: encrypt the send buffer before sending
-    peer.crypto.encryptBuf(send_buf);
-
-    const ts = self.nextTrackedSendUserData(slot);
-    const tracked = self.trackPendingSendOwned(slot, ts.send_id, send_buf) catch {
-        self.allocator.free(send_buf);
-        return;
-    };
-
-    _ = self.ring.send(ts.ud, peer.fd, tracked, 0) catch {
-        // SQE submission failed -- free via the pending_sends entry
-        // (not directly) to avoid leaving a dangling pointer.
-        self.freeOnePendingSend(slot, ts.send_id);
-        return;
-    };
-    peer.send_pending = true;
 }
 
 test "queuePieceBlockResponse stores block metadata without copying" {
@@ -344,18 +421,22 @@ test "queuePieceBlockResponse stores block metadata without copying" {
     el.queued_responses = std.ArrayList(EventLoop.QueuedBlockResponse).empty;
     defer el.queued_responses.deinit(std.testing.allocator);
 
-    const source = "abcdef";
-    try queuePieceBlockResponse(&el, 3, 7, 2, 3, source);
+    var source = EventLoop.PieceBuffer{
+        .buf = @constCast("abcdef"),
+    };
+    try queuePieceBlockResponse(&el, 3, 7, 2, 3, &source);
 
     try std.testing.expectEqual(@as(usize, 1), el.queued_responses.items.len);
     const queued = el.queued_responses.items[0];
     try std.testing.expectEqual(@as(u16, 3), queued.slot);
     try std.testing.expectEqual(@as(u32, 7), queued.piece_index);
-    try std.testing.expectEqualStrings(source, queued.piece_data);
+    try std.testing.expectEqualStrings(source.buf, queued.piece_buffer.buf);
 }
 
 test "findPendingSeedReadIndex matches by unique read id" {
     var dummy: [1]u8 = .{0};
+    var piece_a = EventLoop.PieceBuffer{ .buf = dummy[0..0] };
+    var piece_b = EventLoop.PieceBuffer{ .buf = dummy[0..0] };
     const reads = [_]EventLoop.PendingPieceRead{
         .{
             .read_id = 11,
@@ -363,8 +444,7 @@ test "findPendingSeedReadIndex matches by unique read id" {
             .piece_index = 7,
             .block_offset = 0,
             .block_length = 16,
-            .read_buf = dummy[0..0],
-            .piece_size = 16,
+            .piece_buffer = &piece_a,
             .reads_remaining = 1,
         },
         .{
@@ -373,8 +453,7 @@ test "findPendingSeedReadIndex matches by unique read id" {
             .piece_index = 7,
             .block_offset = 16,
             .block_length = 16,
-            .read_buf = dummy[0..0],
-            .piece_size = 16,
+            .piece_buffer = &piece_b,
             .reads_remaining = 1,
         },
     };

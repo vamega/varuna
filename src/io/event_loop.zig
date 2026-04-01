@@ -257,14 +257,53 @@ pub const EventLoop = struct {
         write_failed: bool = false,
     };
 
-    pub const PendingSend = struct {
+    pub const PieceBuffer = struct {
         buf: []u8,
+        from_pool: bool = false,
+        ref_count: u32 = 1,
+    };
+
+    pub const VectoredSendState = struct {
+        backing: []align(@alignOf(posix.iovec_const)) u8,
+        headers: [][13]u8,
+        iovecs: []posix.iovec_const,
+        msg: posix.msghdr_const,
+        piece_buffers: []*PieceBuffer,
+        iov_index: usize = 0,
+
+        fn advance(self: *VectoredSendState, bytes_sent: usize) bool {
+            var remaining = bytes_sent;
+            while (remaining > 0 and self.iov_index < self.iovecs.len) {
+                const iov = &self.iovecs[self.iov_index];
+                if (remaining < iov.len) {
+                    iov.base += remaining;
+                    iov.len -= remaining;
+                    remaining = 0;
+                    break;
+                }
+                remaining -= iov.len;
+                self.iov_index += 1;
+            }
+
+            self.msg.iov = self.iovecs.ptr + self.iov_index;
+            self.msg.iovlen = self.iovecs.len - self.iov_index;
+            return self.iov_index < self.iovecs.len;
+        }
+    };
+
+    pub const PendingSend = struct {
         sent: usize = 0,
         slot: u16,
         /// Unique ID for matching CQEs to the correct PendingSend when
         /// multiple sends are in-flight for the same slot.
         send_id: u32,
-        small_slot: ?u16 = null,
+        storage: union(enum) {
+            owned: struct {
+                buf: []u8,
+                small_slot: ?u16 = null,
+            },
+            vectored: *VectoredSendState,
+        },
     };
 
     const SmallSendPool = struct {
@@ -330,12 +369,11 @@ pub const EventLoop = struct {
         piece_index: u32,
         block_offset: u32,
         block_length: u32,
-        piece_data: []const u8,
+        piece_buffer: *PieceBuffer,
     };
 
     const DeferredPieceBuffer = struct {
-        buf: []u8,
-        from_pool: bool,
+        piece_buffer: *PieceBuffer,
     };
 
     /// Tracks an async piece read for seed mode.
@@ -347,10 +385,8 @@ pub const EventLoop = struct {
         piece_index: u32,
         block_offset: u32,
         block_length: u32,
-        read_buf: []u8,
-        piece_size: u32,
+        piece_buffer: *PieceBuffer,
         reads_remaining: u32, // number of successfully submitted read CQEs still pending
-        from_pool: bool = false, // true if read_buf is from huge page pool (don't free)
     };
 
     ring: linux.IoUring,
@@ -428,9 +464,7 @@ pub const EventLoop = struct {
 
     // Piece read cache for seed mode (avoid re-reading from disk per block)
     cached_piece_index: ?u32 = null,
-    cached_piece_data: ?[]u8 = null,
-    cached_piece_len: usize = 0,
-    cached_piece_from_pool: bool = false, // true if from huge page pool (don't free)
+    cached_piece_buffer: ?*PieceBuffer = null,
 
     // Huge page piece cache buffer pool (optional, configured at init time).
     // When allocated, piece read buffers are served from this pool instead
@@ -609,8 +643,8 @@ pub const EventLoop = struct {
         // Now that the kernel has completed all pending operations,
         // it is safe to free the buffers they referenced.
         // Free piece cache (only if not from huge page pool)
-        if (self.cached_piece_data) |d| {
-            if (!self.cached_piece_from_pool) self.allocator.free(d);
+        if (self.cached_piece_buffer) |piece_buffer| {
+            self.releasePieceBuffer(piece_buffer);
         }
         // Free huge page cache pool
         if (self.huge_page_cache) |*hpc| hpc.deinit();
@@ -628,11 +662,11 @@ pub const EventLoop = struct {
         self.pending_sends.deinit(self.allocator);
         self.small_send_pool.deinit(self.allocator);
         for (self.pending_reads.items) |pr| {
-            if (!pr.from_pool) self.allocator.free(pr.read_buf);
+            self.releasePieceBuffer(pr.piece_buffer);
         }
         self.pending_reads.deinit(self.allocator);
         for (self.deferred_piece_buffers.items) |piece_buf| {
-            if (!piece_buf.from_pool) self.allocator.free(piece_buf.buf);
+            self.releasePieceBuffer(piece_buf.piece_buffer);
         }
         self.deferred_piece_buffers.deinit(self.allocator);
         self.queued_responses.deinit(self.allocator);
@@ -1517,6 +1551,34 @@ pub const EventLoop = struct {
         _ = try self.ring.accept_multishot(ud, self.listen_fd, null, null, posix.SOCK.CLOEXEC | posix.SOCK.NONBLOCK);
     }
 
+    pub fn createPieceBuffer(self: *EventLoop, size: usize) !*PieceBuffer {
+        const pool_buf = if (self.huge_page_cache) |*hpc| hpc.alloc(size) else null;
+        const from_pool = pool_buf != null;
+        const buf = pool_buf orelse try self.allocator.alloc(u8, size);
+        errdefer if (!from_pool) self.allocator.free(buf);
+
+        const piece_buffer = try self.allocator.create(PieceBuffer);
+        piece_buffer.* = .{
+            .buf = buf,
+            .from_pool = from_pool,
+        };
+        return piece_buffer;
+    }
+
+    pub fn retainPieceBuffer(self: *EventLoop, piece_buffer: *PieceBuffer) void {
+        _ = self;
+        piece_buffer.ref_count += 1;
+    }
+
+    pub fn releasePieceBuffer(self: *EventLoop, piece_buffer: *PieceBuffer) void {
+        std.debug.assert(piece_buffer.ref_count > 0);
+        piece_buffer.ref_count -= 1;
+        if (piece_buffer.ref_count != 0) return;
+
+        if (!piece_buffer.from_pool) self.allocator.free(piece_buffer.buf);
+        self.allocator.destroy(piece_buffer);
+    }
+
     /// Allocate a unique send_id for a new PendingSend and return the
     /// encoded user data with the send_id in the context field.
     /// Allocate a unique send_id for a new PendingSend and return the
@@ -1535,24 +1597,43 @@ pub const EventLoop = struct {
     /// Handle partial send: re-submit remaining bytes. Returns true if partial (more to send).
     /// Matches by send_id (extracted from the CQE context field) so that multiple
     /// in-flight sends for the same slot are correctly distinguished.
-    pub fn handlePartialSend(self: *EventLoop, slot: u16, send_id: u32, bytes_sent: usize) bool {
+    pub const PartialSendResult = enum {
+        resubmitted,
+        complete,
+        failed,
+    };
+
+    pub fn handlePartialSend(self: *EventLoop, slot: u16, send_id: u32, bytes_sent: usize) PartialSendResult {
         for (self.pending_sends.items) |*ps| {
             if (ps.slot == slot and ps.send_id == send_id) {
                 ps.sent += bytes_sent;
-                if (ps.sent < ps.buf.len) {
-                    // Partial send -- re-submit remainder with same send_id
-                    const remaining = ps.buf[ps.sent..];
-                    const ud = encodeUserData(.{ .slot = slot, .op_type = .peer_send, .context = @as(u40, send_id) });
-                    _ = self.ring.send(ud, self.peers[slot].fd, remaining, 0) catch {
-                        return false; // treat as complete on error
-                    };
-                    self.peers[slot].send_pending = true;
-                    return true;
+                switch (ps.storage) {
+                    .owned => |owned| {
+                        if (ps.sent < owned.buf.len) {
+                            const remaining = owned.buf[ps.sent..];
+                            const ud = encodeUserData(.{ .slot = slot, .op_type = .peer_send, .context = @as(u40, send_id) });
+                            _ = self.ring.send(ud, self.peers[slot].fd, remaining, 0) catch {
+                                return .failed;
+                            };
+                            self.peers[slot].send_pending = true;
+                            return .resubmitted;
+                        }
+                    },
+                    .vectored => |state| {
+                        if (state.advance(bytes_sent)) {
+                            const ud = encodeUserData(.{ .slot = slot, .op_type = .peer_send, .context = @as(u40, send_id) });
+                            _ = self.ring.sendmsg(ud, self.peers[slot].fd, &state.msg, 0) catch {
+                                return .failed;
+                            };
+                            self.peers[slot].send_pending = true;
+                            return .resubmitted;
+                        }
+                    },
                 }
-                return false; // fully sent
+                return .complete;
             }
         }
-        return false;
+        return .complete;
     }
 
     /// Free ONE pending send buffer matching the send_id.
@@ -1586,11 +1667,31 @@ pub const EventLoop = struct {
         }
     }
 
+    pub fn hasPendingSendForSlot(self: *const EventLoop, slot: u16) bool {
+        for (self.pending_sends.items) |ps| {
+            if (ps.slot == slot) return true;
+        }
+        return false;
+    }
+
+    fn releaseVectoredSendState(self: *EventLoop, state: *VectoredSendState) void {
+        for (state.piece_buffers) |piece_buffer| {
+            self.releasePieceBuffer(piece_buffer);
+        }
+        self.allocator.free(state.backing);
+        self.allocator.destroy(state);
+    }
+
     fn releasePendingSend(self: *EventLoop, pending_send: PendingSend) void {
-        if (pending_send.small_slot) |small_slot| {
-            self.small_send_pool.release(small_slot);
-        } else {
-            self.allocator.free(pending_send.buf);
+        switch (pending_send.storage) {
+            .owned => |owned| {
+                if (owned.small_slot) |small_slot| {
+                    self.small_send_pool.release(small_slot);
+                } else {
+                    self.allocator.free(owned.buf);
+                }
+            },
+            .vectored => |state| self.releaseVectoredSendState(state),
         }
     }
 
@@ -1598,22 +1699,30 @@ pub const EventLoop = struct {
         if (self.small_send_pool.alloc(data)) |entry| {
             errdefer self.small_send_pool.release(entry.slot);
             try self.pending_sends.append(self.allocator, .{
-                .buf = entry.buf,
                 .slot = slot,
                 .send_id = send_id,
-                .small_slot = entry.slot,
+                .storage = .{
+                    .owned = .{
+                        .buf = entry.buf,
+                        .small_slot = entry.slot,
+                    },
+                },
             });
-            return self.pending_sends.items[self.pending_sends.items.len - 1].buf;
+            return self.pending_sends.items[self.pending_sends.items.len - 1].storage.owned.buf;
         }
 
         const heap_buf = try self.allocator.dupe(u8, data);
         errdefer self.allocator.free(heap_buf);
         try self.pending_sends.append(self.allocator, .{
-            .buf = heap_buf,
             .slot = slot,
             .send_id = send_id,
+            .storage = .{
+                .owned = .{
+                    .buf = heap_buf,
+                },
+            },
         });
-        return self.pending_sends.items[self.pending_sends.items.len - 1].buf;
+        return self.pending_sends.items[self.pending_sends.items.len - 1].storage.owned.buf;
     }
 
     pub fn trackPendingSendOwned(self: *EventLoop, slot: u16, send_id: u32, buf: []u8) ![]const u8 {
@@ -1621,21 +1730,40 @@ pub const EventLoop = struct {
             errdefer self.small_send_pool.release(entry.slot);
 
             try self.pending_sends.append(self.allocator, .{
-                .buf = entry.buf,
                 .slot = slot,
                 .send_id = send_id,
-                .small_slot = entry.slot,
+                .storage = .{
+                    .owned = .{
+                        .buf = entry.buf,
+                        .small_slot = entry.slot,
+                    },
+                },
             });
             self.allocator.free(buf);
-            return self.pending_sends.items[self.pending_sends.items.len - 1].buf;
+            return self.pending_sends.items[self.pending_sends.items.len - 1].storage.owned.buf;
         }
 
         try self.pending_sends.append(self.allocator, .{
-            .buf = buf,
             .slot = slot,
             .send_id = send_id,
+            .storage = .{
+                .owned = .{
+                    .buf = buf,
+                },
+            },
         });
-        return self.pending_sends.items[self.pending_sends.items.len - 1].buf;
+        return self.pending_sends.items[self.pending_sends.items.len - 1].storage.owned.buf;
+    }
+
+    pub fn trackPendingSendVectored(self: *EventLoop, slot: u16, send_id: u32, state: *VectoredSendState) !void {
+        errdefer self.releaseVectoredSendState(state);
+        try self.pending_sends.append(self.allocator, .{
+            .slot = slot,
+            .send_id = send_id,
+            .storage = .{
+                .vectored = state,
+            },
+        });
     }
 
     pub fn nextPendingWriteId(self: *EventLoop) u32 {

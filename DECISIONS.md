@@ -512,3 +512,24 @@ Reasoning:
 Follow-up triggers:
 - If the plaintext upload path matters in real swarms, implement tracked vectored sends with explicit piece-buffer ownership and partial-send fallback.
 - Consider `sendmsg_zc` only after that ownership model exists, because zero-copy notifications add CQE complexity but do not remove the lifetime requirement.
+
+### 2026-04-01: Land Plaintext Seed `sendmsg` with Owned Piece Buffers
+
+Context:
+The benchmark-only feasibility pass showed that plaintext scatter/gather was promising, but the production seed path still copied every block into a contiguous buffer because queued piece slices did not survive safely across async send completion.
+
+Decision:
+- Add refcounted seed `PieceBuffer` objects and use them for pending reads, the cached piece, deferred cache release, and queued seed responses.
+- Extend tracked peer sends so `PendingSend` can own either a contiguous buffer or a stable vectored-send state with header storage, iovecs, and retained piece-buffer references.
+- Use vectored `sendmsg` for plaintext seed uploads only.
+- Keep the contiguous copy path for encrypted peers, because MSE still needs in-place encryption over one contiguous buffer.
+
+Reasoning:
+- The production-path workload `seed_plaintext_burst --iterations=500 --scale=8` improved from roughly `27.9` to `30.4 ms` down to roughly `12.5` to `13.0 ms`, about a `2.2x` to `2.4x` win.
+- Transient bytes on that same workload dropped from `65.6 MB` down to `276 KB`, which is the main memory win for the upload path.
+- The first production implementation allocated four small objects per send batch. Folding the vectored send state into one backing allocation reduced that to one small allocation per batch, bringing allocation count to `1001` on the benchmark instead of the initial `2001`.
+- Partial-send handling now resubmits either contiguous or vectored sends through the same tracked-send path, so the new seed path does not need a second completion mechanism.
+
+Follow-up triggers:
+- If plaintext seeding remains hot in real swarms, pool or inline the vectored send state so allocation count also drops below the old copy path.
+- Consider `sendmsg_zc` only after validating the new ownership model under real workloads; it does not remove the lifetime requirement.

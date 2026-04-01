@@ -442,9 +442,9 @@ fn runSeedPlaintextBurst(
     const piece_len = block_count * block_len;
     const total_len = block_count * (13 + block_len);
 
-    const piece_data = try allocator.alloc(u8, piece_len);
-    defer allocator.free(piece_data);
-    for (piece_data, 0..) |*byte, idx| byte.* = @truncate(idx *% 29 +% 7);
+    const piece_buffer = try event_loop.createPieceBuffer(piece_len);
+    defer event_loop.releasePieceBuffer(piece_buffer);
+    for (piece_buffer.buf, 0..) |*byte, idx| byte.* = @truncate(idx *% 29 +% 7);
 
     const recv_buf = try allocator.alloc(u8, total_len);
     defer allocator.free(recv_buf);
@@ -470,7 +470,7 @@ fn runSeedPlaintextBurst(
                 .piece_index = @intCast(iter & 0xffff),
                 .block_offset = @intCast(idx * block_len),
                 .block_length = block_len,
-                .piece_data = piece_data,
+                .piece_buffer = piece_buffer,
             });
         }
 
