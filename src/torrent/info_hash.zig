@@ -1,6 +1,7 @@
 const std = @import("std");
-const Sha1 = @import("../crypto/sha1.zig");
-const Sha256 = std.crypto.hash.sha2.Sha256;
+const crypto = @import("../crypto/root.zig");
+const Sha1 = crypto.Sha1;
+const Sha256 = crypto.Sha256;
 
 /// Compute the v1 info-hash (SHA-1 of the bencoded info dict).
 pub fn compute(torrent_bytes: []const u8) ![20]u8 {

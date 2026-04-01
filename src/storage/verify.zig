@@ -1,6 +1,7 @@
 const std = @import("std");
-const Sha1 = @import("../crypto/sha1.zig");
-const Sha256 = std.crypto.hash.sha2.Sha256;
+const crypto = @import("../crypto/root.zig");
+const Sha1 = crypto.Sha1;
+const Sha256 = crypto.Sha256;
 const torrent = @import("../torrent/root.zig");
 const writer = @import("writer.zig");
 

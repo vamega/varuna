@@ -1,5 +1,5 @@
 const std = @import("std");
-const Sha1 = @import("../crypto/sha1.zig");
+const Sha1 = @import("../crypto/root.zig").Sha1;
 const peer_wire = @import("../net/peer_wire.zig");
 const storage = @import("../storage/root.zig");
 const tracker = @import("../tracker/root.zig");

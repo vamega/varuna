@@ -99,7 +99,7 @@ fn benchSha1DirectShaNi(
     buffer: []const u8,
     iterations: usize,
 ) !void {
-    const Sha1 = varuna.crypto.Sha1;
+    const Sha1 = varuna.crypto.VarunaSha1;
     var timer = try std.time.Timer.start();
     var checksum: u64 = 0;
     for (0..iterations) |_| {
@@ -139,7 +139,8 @@ fn benchSha1Noop(
 }
 
 fn benchSha1(stdout: *std.Io.Writer) !void {
-    const Sha1 = varuna.crypto.Sha1;
+    const VarunaSha1 = varuna.crypto.VarunaSha1;
+    const ActiveSha1 = varuna.crypto.Sha1;
     const StdSha1 = std.crypto.hash.Sha1;
 
     const piece_256k: usize = 256 * 1024;
@@ -152,20 +153,26 @@ fn benchSha1(stdout: *std.Io.Writer) !void {
     const iterations_256k: usize = 2000;
     const iterations_1m: usize = 500;
 
-    // Report runtime-detected acceleration backend
-    try stdout.print("sha1_accel={s}, hw_enabled={}\n", .{ @tagName(Sha1.accel()), Sha1.hasShaNi() });
+    // Report active crypto backend and runtime-detected acceleration
+    try stdout.print("crypto_backend={s}, sha1_accel={s}, hw_enabled={}\n", .{
+        @tagName(varuna.crypto.crypto_backend),
+        @tagName(VarunaSha1.accel()),
+        VarunaSha1.hasShaNi(),
+    });
     try stdout.flush();
 
     // --- 256KB ---
     try benchSha1Noop(stdout, "sha1_noop_256kb", &buffer_256k, iterations_256k);
     try benchSha1Generic(stdout, StdSha1, "sha1_std_256kb", &buffer_256k, iterations_256k);
-    try benchSha1Generic(stdout, Sha1, "sha1_varuna_256kb", &buffer_256k, iterations_256k);
+    try benchSha1Generic(stdout, VarunaSha1, "sha1_varuna_256kb", &buffer_256k, iterations_256k);
+    try benchSha1Generic(stdout, ActiveSha1, "sha1_active_256kb", &buffer_256k, iterations_256k);
     try benchSha1DirectShaNi(stdout, "sha1_direct_shani_256kb", &buffer_256k, iterations_256k);
 
     // --- 1MB ---
     try benchSha1Noop(stdout, "sha1_noop_1mb", &buffer_1m, iterations_1m);
     try benchSha1Generic(stdout, StdSha1, "sha1_std_1mb", &buffer_1m, iterations_1m);
-    try benchSha1Generic(stdout, Sha1, "sha1_varuna_1mb", &buffer_1m, iterations_1m);
+    try benchSha1Generic(stdout, VarunaSha1, "sha1_varuna_1mb", &buffer_1m, iterations_1m);
+    try benchSha1Generic(stdout, ActiveSha1, "sha1_active_1mb", &buffer_1m, iterations_1m);
     try benchSha1DirectShaNi(stdout, "sha1_direct_shani_1mb", &buffer_1m, iterations_1m);
 }
 

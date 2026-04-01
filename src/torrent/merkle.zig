@@ -1,5 +1,5 @@
 const std = @import("std");
-const Sha256 = std.crypto.hash.sha2.Sha256;
+const Sha256 = @import("../crypto/root.zig").Sha256;
 
 /// SHA-256 Merkle tree for BEP 52 per-file piece verification.
 ///

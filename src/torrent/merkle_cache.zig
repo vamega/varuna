@@ -4,7 +4,7 @@ const metainfo = @import("metainfo.zig");
 const layout_mod = @import("layout.zig");
 const hash_exchange = @import("../net/hash_exchange.zig");
 const Bitfield = @import("../bitfield.zig").Bitfield;
-const Sha256 = std.crypto.hash.sha2.Sha256;
+const Sha256 = @import("../crypto/root.zig").Sha256;
 
 const log = std.log.scoped(.merkle_cache);
 

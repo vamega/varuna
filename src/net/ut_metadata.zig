@@ -1,7 +1,7 @@
 const std = @import("std");
 const bencode = @import("../torrent/bencode.zig");
 const bencode_encode = @import("../torrent/bencode_encode.zig");
-const Sha1 = @import("../crypto/sha1.zig");
+const Sha1 = @import("../crypto/root.zig").Sha1;
 
 /// BEP 9: Extension for Peers to Send Metadata Files (ut_metadata).
 ///

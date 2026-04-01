@@ -48,7 +48,8 @@ Update it whenever a milestone lands, the near-term backlog changes, or a new op
 - Bind interface (SO_BINDTODEVICE), bind address, port ranges (port_min/port_max).
 - Download/upload speed limits (per-torrent + global), connection limits, hasher threads, pipeline depth.
 - API credentials (api_username, api_password).
-- Build options: `-Dsqlite=system|bundled`, `-Ddns=threadpool|c-ares`, `-Dtls=boringssl|none`.
+- Build options: `-Dsqlite=system|bundled`, `-Ddns=threadpool|c-ares`, `-Dtls=boringssl|none`, `-Dcrypto=varuna|stdlib|boringssl`.
+- Configurable crypto backend (`-Dcrypto`): `varuna` (default, SHA-1 with runtime SHA-NI/AArch64 hardware detection), `stdlib` (Zig std.crypto), `boringssl` (vendored BoringSSL SHA/RC4). Unified dispatch via `src/crypto/backend.zig`. Build-time validation prevents `-Dcrypto=boringssl` when `-Dtls=none`.
 - Peer ID masquerading: `network.masquerade_as` config option to identify as qBittorrent, rTorrent, uTorrent, Deluge, or Transmission. Useful for private trackers with client whitelists.
 
 ### API (qBittorrent v2 compatible)

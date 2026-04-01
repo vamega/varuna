@@ -1,8 +1,9 @@
 const std = @import("std");
 const posix = std.posix;
 const linux = std.os.linux;
-const Sha1 = @import("../crypto/sha1.zig");
-const Sha256 = std.crypto.hash.sha2.Sha256;
+const crypto = @import("../crypto/root.zig");
+const Sha1 = crypto.Sha1;
+const Sha256 = crypto.Sha256;
 const HashType = @import("../storage/verify.zig").HashType;
 const Layout = @import("../torrent/layout.zig").Layout;
 

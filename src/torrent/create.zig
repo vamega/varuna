@@ -1,5 +1,5 @@
 const std = @import("std");
-const Sha1 = @import("../crypto/sha1.zig");
+const Sha1 = @import("../crypto/root.zig").Sha1;
 const Ring = @import("../io/ring.zig").Ring;
 
 pub const CreateOptions = struct {

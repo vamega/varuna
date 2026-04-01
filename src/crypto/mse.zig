@@ -18,8 +18,9 @@
 //! the (optionally) encrypted stream.
 
 const std = @import("std");
-const Sha1 = @import("sha1.zig");
-const Rc4 = @import("rc4.zig").Rc4;
+const backend = @import("backend.zig");
+const Sha1 = backend.Sha1;
+const Rc4 = backend.Rc4;
 
 const log = std.log.scoped(.mse);
 

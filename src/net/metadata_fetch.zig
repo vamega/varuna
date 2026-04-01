@@ -4,7 +4,7 @@ const linux = std.os.linux;
 const ut_metadata = @import("ut_metadata.zig");
 const ext = @import("extensions.zig");
 const Ring = @import("../io/ring.zig").Ring;
-const Sha1 = @import("../crypto/sha1.zig");
+const Sha1 = @import("../crypto/root.zig").Sha1;
 
 /// BEP 9 resilient metadata fetcher.
 ///

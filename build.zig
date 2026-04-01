@@ -23,10 +23,22 @@ pub fn build(b: *std.Build) void {
         "TLS backend: 'boringssl' links vendored BoringSSL for HTTPS tracker support (default), 'none' disables TLS",
     ) orelse .boringssl;
 
-    // ── Build options module (dns backend + tls backend selection) ────────
+    const crypto_backend = b.option(
+        CryptoBackend,
+        "crypto",
+        "Cryptographic algorithm backend: 'varuna' uses our SHA-1 with hardware acceleration (default), 'stdlib' uses Zig std.crypto, 'boringssl' uses vendored BoringSSL",
+    ) orelse .varuna;
+
+    // Validate: -Dcrypto=boringssl requires -Dtls=boringssl (BoringSSL must be linked)
+    if (crypto_backend == .boringssl and tls_backend != .boringssl) {
+        @panic("-Dcrypto=boringssl requires -Dtls=boringssl (BoringSSL is not linked when -Dtls=none)");
+    }
+
+    // ── Build options module (dns backend + tls backend + crypto backend) ─
     const build_options = b.addOptions();
     build_options.addOption(DnsBackend, "dns_backend", dns_backend);
     build_options.addOption(TlsBackend, "tls_backend", tls_backend);
+    build_options.addOption(CryptoBackend, "crypto_backend", crypto_backend);
 
     const toml_dep = b.dependency("toml", .{
         .target = target,
@@ -370,4 +382,17 @@ pub const TlsBackend = enum {
     boringssl,
     /// No TLS — HTTPS tracker URLs will return error.HttpsNotSupported.
     none,
+};
+
+/// Cryptographic algorithm backend selection.
+pub const CryptoBackend = enum {
+    /// Default: our SHA-1 with runtime SHA-NI/AArch64 hardware detection,
+    /// our RC4, and std SHA-256.
+    varuna,
+    /// Zig standard library: std.crypto.hash.Sha1, std.crypto.hash.sha2.Sha256.
+    /// RC4 falls back to our implementation (no stdlib RC4).
+    stdlib,
+    /// BoringSSL: SHA1_Init/SHA256_Init/RC4_set_key via @cImport.
+    /// Requires -Dtls=boringssl so BoringSSL is linked.
+    boringssl,
 };
