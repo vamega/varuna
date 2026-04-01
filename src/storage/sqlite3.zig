@@ -52,10 +52,12 @@ pub extern "sqlite3" fn sqlite3_bind_blob(
 
 pub extern "sqlite3" fn sqlite3_bind_int(stmt: *Stmt, col: c_int, value: c_int) c_int;
 pub extern "sqlite3" fn sqlite3_bind_int64(stmt: *Stmt, col: c_int, value: i64) c_int;
+pub extern "sqlite3" fn sqlite3_bind_double(stmt: *Stmt, col: c_int, value: f64) c_int;
 pub extern "sqlite3" fn sqlite3_bind_null(stmt: *Stmt, col: c_int) c_int;
 
 pub extern "sqlite3" fn sqlite3_column_int(stmt: *Stmt, col: c_int) c_int;
 pub extern "sqlite3" fn sqlite3_column_int64(stmt: *Stmt, col: c_int) i64;
+pub extern "sqlite3" fn sqlite3_column_double(stmt: *Stmt, col: c_int) f64;
 pub extern "sqlite3" fn sqlite3_bind_text(
     stmt: *Stmt,
     col: c_int,
