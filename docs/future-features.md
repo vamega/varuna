@@ -119,3 +119,11 @@ See [api-compatibility.md](api-compatibility.md) for the full qBittorrent WebAPI
 ### Time-based alternative speed scheduling
 
 qBittorrent offers an "alt speed" scheduler that automatically switches between normal and reduced speed limits based on time of day. Varuna will not implement this. Users who need scheduled rate changes should use external tooling (e.g., `cron` + `varuna-ctl setDownloadLimit`/`setUploadLimit`) to adjust limits at desired times. This keeps the daemon simpler and avoids embedding a scheduler for a feature that cron handles better.
+
+### Watch folder auto-add
+
+Monitoring a directory for new `.torrent` files and auto-adding them is out of scope for the varuna daemon. This functionality should be implemented as a separate lightweight daemon that watches the folder and uses the varuna API (`/api/v2/torrents/add`) to add torrents. Tools like `inotifywait` + a shell script, or a purpose-built sidecar, are better suited for this than embedding filesystem watching into the torrent daemon.
+
+### RSS feed auto-download
+
+Monitoring RSS feeds for new torrents (e.g., for TV show automation) is out of scope for the varuna daemon. This should be a separate daemon/service that polls RSS feeds, filters entries, and uses the varuna API to add matching torrents. Keeping RSS parsing, feed scheduling, and filter rule management out of the torrent daemon avoids unnecessary complexity and allows users to choose their preferred RSS tooling.
