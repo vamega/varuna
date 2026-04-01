@@ -65,6 +65,13 @@ Scenario-specific notes:
 - `http_response`: models the API response assembly path, including header formatting and body ownership.
 - `session_load`: measures immutable torrent-session metadata setup and teardown.
 
+High-count active-torrent validation currently lives in unit tests rather than `varuna-perf`:
+
+- `zig test src/io/event_loop.zig --test-filter "high torrent counts"`
+- `zig build test`
+
+That regression adds `20,000` torrent contexts to the shared EventLoop, validates info-hash lookup, removes one slot, and confirms that the freed slot is reused.
+
 ## Direct Tool Usage
 
 Fast syscall summary:

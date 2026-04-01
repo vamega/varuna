@@ -14,6 +14,32 @@ Use [STATUS.md](STATUS.md) for the running list of completed work, next work, an
 
 ## Decision Entries
 
+### 2026-03-31: Shared Event Loop Torrent Registry Uses Dynamic `u32` IDs
+
+Context:
+The shared daemon `EventLoop` capped active torrents at 64 because it stored torrent state in a fixed `[64]?TorrentContext` table and used `u8` torrent IDs throughout the peer, uTP, hasher, and session-integration code. Inbound TCP/uTP handshakes and DHT results also linearly scanned that table by info-hash, and disk-write CQEs encoded `torrent_id` inside the 40-bit `user_data.context`, which prevented widening IDs cleanly.
+
+Decision:
+- Replace the fixed torrent table with a dynamically sized slot array, a free-list, and stable `u32` torrent IDs.
+- Add a hash map from inbound info-hash to torrent ID for O(1) routing of inbound TCP handshakes, inbound uTP handshakes, DHT peer results, and MSE responder completion.
+- Replace disk-write CQE correlation with a dedicated per-write ID, so `torrent_id` no longer needs to fit inside `user_data.context`.
+- Change inbound MSE responder setup from a fixed `[64][20]u8` hash list to a dynamically allocated slice built from the current active torrent IDs.
+- Avoid eager per-torrent PEX-state allocation and skip speed-counter work when there are no connected peers.
+
+Reasoning:
+- The fixed array was the actual architectural cap for active torrents in daemon mode, not just a type-size problem.
+- Tens of thousands of mostly idle seeding torrents require lookup by info-hash, not repeated scans over all registered torrents on each inbound connection.
+- Write IDs decouple CQE matching from torrent-ID width and are safer than overpacking multiple identities into 40 context bits.
+- Idle-seeding scale needs not only more slots, but also lower background work when there are zero peers attached.
+
+Validation:
+- `zig build test` passes with the new dynamic registry.
+- A new regression test adds `20,000` torrent contexts, validates hashed lookup, removes one slot, and confirms slot reuse with a new info-hash.
+
+Follow-up triggers:
+- If `/sync` polling or periodic torrent housekeeping shows up with very large torrent counts, add a hot torrent-summary registry instead of pulling state from full `TorrentSession` objects on demand.
+- If idle seeding still spends measurable time in housekeeping, rate-limit or event-drive partial-seed state checks instead of scanning all active torrents every tick.
+
 ### 2026-03-31: Second Memory Pass Uses Session Arenas And API Vectored Sends
 
 Context:

@@ -190,7 +190,7 @@ pub const TorrentSession = struct {
     shared_fds: ?[]posix.fd_t = null,
     event_loop: ?EventLoop = null,
     shared_event_loop: ?*EventLoop = null,
-    torrent_id_in_shared: ?u8 = null,
+    torrent_id_in_shared: ?EventLoop.TorrentId = null,
     pending_peers: ?[]std.net.Address = null, // peers waiting for main thread to add
     pending_seed_setup: bool = false, // signals main thread to set up seed mode
     thread: ?std.Thread = null,
@@ -1713,27 +1713,11 @@ pub const TorrentSession = struct {
 };
 
 fn initTestEventLoop(allocator: std.mem.Allocator) !EventLoop {
-    const peers = try allocator.alloc(EventLoop.Peer, 1);
-    @memset(peers, EventLoop.Peer{});
-    return .{
-        .ring = undefined,
-        .allocator = allocator,
-        .peers = peers,
-        .pending_writes = .empty,
-        .pending_sends = std.ArrayList(EventLoop.PendingSend).empty,
-        .pending_reads = std.ArrayList(EventLoop.PendingPieceRead).empty,
-        .queued_responses = std.ArrayList(EventLoop.QueuedBlockResponse).empty,
-        .idle_peers = std.ArrayList(u16).empty,
-    };
+    return EventLoop.initBare(allocator, 0);
 }
 
-fn deinitTestEventLoop(allocator: std.mem.Allocator, el: *EventLoop) void {
-    el.pending_writes.deinit(allocator);
-    el.pending_sends.deinit(allocator);
-    el.pending_reads.deinit(allocator);
-    el.queued_responses.deinit(allocator);
-    el.idle_peers.deinit(allocator);
-    allocator.free(el.peers);
+fn deinitTestEventLoop(_: std.mem.Allocator, el: *EventLoop) void {
+    el.deinit();
 }
 
 test "stop detaches torrent from shared event loop" {
@@ -1741,12 +1725,11 @@ test "stop detaches torrent from shared event loop" {
     defer deinitTestEventLoop(std.testing.allocator, &el);
 
     const empty_fds = [_]posix.fd_t{};
-    el.torrents[0] = .{
+    _ = try el.addTorrentContext(.{
         .shared_fds = empty_fds[0..],
         .info_hash = [_]u8{0} ** 20,
         .peer_id = [_]u8{0} ** 20,
-    };
-    el.torrent_count = 1;
+    });
 
     var session = TorrentSession{
         .allocator = std.testing.allocator,
@@ -1770,8 +1753,8 @@ test "stop detaches torrent from shared event loop" {
     try std.testing.expectEqual(State.stopped, session.state);
     try std.testing.expect(session.torrent_id_in_shared == null);
     try std.testing.expect(session.pending_seed_setup == false);
-    try std.testing.expect(el.torrents[0] == null);
-    try std.testing.expectEqual(@as(u8, 0), el.torrent_count);
+    try std.testing.expect(el.getTorrentContextConst(0) == null);
+    try std.testing.expectEqual(@as(u32, 0), el.torrent_count);
 }
 
 test "resume_session preserves shared event loop mode" {

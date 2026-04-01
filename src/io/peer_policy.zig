@@ -210,10 +210,12 @@ pub fn completePieceDownload(self: *EventLoop, slot: u16) void {
             }
 
             // Track pending writes for completion
-            self.pending_writes.put(self.allocator, .{
+            const pending_key = EventLoop.PendingWriteKey{
                 .piece_index = piece_index,
                 .torrent_id = peer.torrent_id,
-            }, .{
+            };
+            const write_id = self.createPendingWrite(pending_key, .{
+                .write_id = 0,
                 .piece_index = piece_index,
                 .torrent_id = peer.torrent_id,
                 .slot = slot,
@@ -230,22 +232,22 @@ pub fn completePieceDownload(self: *EventLoop, slot: u16) void {
 
             for (plan.spans) |span| {
                 const block = piece_buf[span.piece_offset .. span.piece_offset + span.length];
-                const ud = encodeUserData(.{ .slot = slot, .op_type = .disk_write, .context = @as(u40, @intCast(peer.torrent_id)) << 32 | @as(u40, piece_index) });
+                const ud = encodeUserData(.{ .slot = slot, .op_type = .disk_write, .context = write_id });
                 _ = self.ring.write(ud, tc.shared_fds[span.file_index], block, span.file_offset) catch |err| {
                     log.warn("inline disk write for piece {d}: {s}", .{ piece_index, @errorName(err) });
-                    if (self.pending_writes.getPtr(.{ .piece_index = piece_index, .torrent_id = peer.torrent_id })) |pending_w| {
+                    if (self.getPendingWrite(pending_key)) |pending_w| {
                         pending_w.write_failed = true;
                     }
                     continue;
                 };
-                if (self.pending_writes.getPtr(.{ .piece_index = piece_index, .torrent_id = peer.torrent_id })) |pending_w| {
+                if (self.getPendingWrite(pending_key)) |pending_w| {
                     pending_w.spans_remaining += 1;
                 }
             }
 
-            if (self.pending_writes.getPtr(.{ .piece_index = piece_index, .torrent_id = peer.torrent_id })) |pending_w| {
+            if (self.getPendingWrite(pending_key)) |pending_w| {
                 if (pending_w.spans_remaining == 0) {
-                    _ = self.pending_writes.remove(.{ .piece_index = piece_index, .torrent_id = peer.torrent_id });
+                    _ = self.removePendingWrite(pending_key);
                     pt.releasePiece(piece_index);
                     self.allocator.free(piece_buf);
                     peer.piece_buf = null;
@@ -295,7 +297,7 @@ pub fn processHashResults(self: *EventLoop) void {
                 .piece_index = result.piece_index,
                 .torrent_id = torrent_id,
             };
-            if (self.pending_writes.contains(pending_key)) {
+            if (self.hasPendingWrite(pending_key)) {
                 log.debug("skipping duplicate write for piece {d} torrent {d} (endgame)", .{
                     result.piece_index, torrent_id,
                 });
@@ -318,10 +320,8 @@ pub fn processHashResults(self: *EventLoop) void {
             }
 
             // Track the buffer so we can free it after all writes complete
-            self.pending_writes.put(self.allocator, .{
-                .piece_index = result.piece_index,
-                .torrent_id = torrent_id,
-            }, .{
+            const write_id = self.createPendingWrite(pending_key, .{
+                .write_id = 0,
                 .piece_index = result.piece_index,
                 .torrent_id = torrent_id,
                 .slot = result.slot,
@@ -334,22 +334,22 @@ pub fn processHashResults(self: *EventLoop) void {
 
             for (plan.spans) |span| {
                 const block = result.piece_buf[span.piece_offset .. span.piece_offset + span.length];
-                const ud = encodeUserData(.{ .slot = result.slot, .op_type = .disk_write, .context = @as(u40, @intCast(torrent_id)) << 32 | @as(u40, result.piece_index) });
+                const ud = encodeUserData(.{ .slot = result.slot, .op_type = .disk_write, .context = write_id });
                 _ = self.ring.write(ud, tc.shared_fds[span.file_index], block, span.file_offset) catch |err| {
                     log.warn("disk write submit for piece {d}: {s}", .{ result.piece_index, @errorName(err) });
-                    if (self.pending_writes.getPtr(.{ .piece_index = result.piece_index, .torrent_id = torrent_id })) |pending_w| {
+                    if (self.getPendingWrite(pending_key)) |pending_w| {
                         pending_w.write_failed = true;
                     }
                     continue;
                 };
-                if (self.pending_writes.getPtr(.{ .piece_index = result.piece_index, .torrent_id = torrent_id })) |pending_w| {
+                if (self.getPendingWrite(pending_key)) |pending_w| {
                     pending_w.spans_remaining += 1;
                 }
             }
 
-            if (self.pending_writes.getPtr(.{ .piece_index = result.piece_index, .torrent_id = torrent_id })) |pending_w| {
+            if (self.getPendingWrite(pending_key)) |pending_w| {
                 if (pending_w.spans_remaining == 0) {
-                    _ = self.pending_writes.remove(.{ .piece_index = result.piece_index, .torrent_id = torrent_id });
+                    _ = self.removePendingWrite(pending_key);
                     if (tc.piece_tracker) |pt| pt.releasePiece(result.piece_index);
                     self.allocator.free(result.piece_buf);
                     continue;
@@ -635,22 +635,17 @@ fn generateAnnounceJitter(self: *const EventLoop) i32 {
 /// Send PEX messages to all eligible peers at the BEP 11 interval.
 /// Also ensures torrent PEX state is initialized for non-private torrents.
 pub fn checkPex(self: *EventLoop) void {
+    if (self.active_peer_slots.items.len == 0) return;
+
     const now = std.time.timestamp();
 
-    for (&self.torrents, 0..) |*slot, idx| {
-        const tc = &(slot.* orelse continue);
-        const tid: u8 = @intCast(idx);
+    for (self.active_torrent_ids.items) |tid| {
+        const tc = self.getTorrentContext(tid) orelse continue;
 
         // PEX is disabled for private torrents (BEP 27)
         if (tc.is_private) continue;
 
-        // Lazily allocate torrent PEX state
-        if (tc.pex_state == null) {
-            const tps = self.allocator.create(pex_mod.TorrentPexState) catch continue;
-            tps.* = pex_mod.TorrentPexState{};
-            tc.pex_state = tps;
-        }
-        const torrent_pex = tc.pex_state.?;
+        var has_connected_peers = false;
 
         // Update the torrent's connected peers set
         for (self.active_peer_slots.items) |peer_slot| {
@@ -660,12 +655,22 @@ pub fn checkPex(self: *EventLoop) void {
             // Only include peers that have completed the handshake
             if (peer.state != .active_recv_header and peer.state != .active_recv_body) continue;
 
+            has_connected_peers = true;
+            if (tc.pex_state == null) {
+                const tps = self.allocator.create(pex_mod.TorrentPexState) catch break;
+                tps.* = pex_mod.TorrentPexState{};
+                tc.pex_state = tps;
+            }
+            const torrent_pex = tc.pex_state orelse break;
+
             const flags = pex_mod.PeerFlags{
                 .seed = peer.mode == .seed or peer.upload_only,
                 .utp = peer.transport == .utp,
             };
             torrent_pex.addPeer(self.allocator, peer.address, flags);
         }
+
+        if (!has_connected_peers or tc.pex_state == null) continue;
 
         // Send PEX messages to each eligible peer for this torrent
         for (self.active_peer_slots.items) |pi| {
@@ -693,6 +698,8 @@ pub fn checkPex(self: *EventLoop) void {
 
 /// Update speed counters for all active torrents and individual peers (called from tick).
 pub fn updateSpeedCounters(self: *EventLoop) void {
+    if (self.active_peer_slots.items.len == 0) return;
+
     const now = std.time.timestamp();
 
     // Update per-peer speed counters
@@ -723,9 +730,8 @@ pub fn updateSpeedCounters(self: *EventLoop) void {
     }
 
     // Update per-torrent speed counters
-    for (&self.torrents, 0..) |*slot, idx| {
-        const tc = &(slot.* orelse continue);
-        const tid: u8 = @intCast(idx);
+    for (self.active_torrent_ids.items) |tid| {
+        const tc = self.getTorrentContext(tid) orelse continue;
 
         // Sum bytes across peers for this torrent
         var dl_total: u64 = 0;
@@ -768,9 +774,8 @@ pub fn updateSpeedCounters(self: *EventLoop) void {
 /// the torrent's `upload_only` flag and re-send extension handshakes to
 /// all connected peers so they know we are upload_only.
 pub fn checkPartialSeed(self: *EventLoop) void {
-    for (&self.torrents, 0..) |*slot, idx| {
-        const tc = &(slot.* orelse continue);
-        const tid: u8 = @intCast(idx);
+    for (self.active_torrent_ids.items) |tid| {
+        const tc = self.getTorrentContext(tid) orelse continue;
         const pt = tc.piece_tracker orelse continue;
 
         const should_be_upload_only = pt.isPartialSeed();

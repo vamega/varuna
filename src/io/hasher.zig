@@ -50,7 +50,7 @@ pub const Hasher = struct {
         expected_hash: [20]u8,
         expected_hash_v2: [32]u8 = [_]u8{0} ** 32,
         hash_type: HashType = .sha1,
-        torrent_id: u8,
+        torrent_id: u32,
     };
 
     pub const Result = struct {
@@ -58,14 +58,14 @@ pub const Hasher = struct {
         piece_index: u32,
         piece_buf: []u8,
         valid: bool,
-        torrent_id: u8,
+        torrent_id: u32,
     };
 
     /// A job to build SHA-256 piece hashes for an entire file (BEP 52 Merkle tree).
     /// The worker thread reads piece data from disk via pread and computes hashes.
     /// The layout and shared_fds pointers are valid for the lifetime of the torrent.
     pub const MerkleJob = struct {
-        torrent_id: u8,
+        torrent_id: u32,
         file_index: u32,
         first_piece: u32,
         piece_count: u32,
@@ -77,7 +77,7 @@ pub const Hasher = struct {
     /// allocated slice of SHA-256 hashes (one per piece) that the event loop
     /// must free after building and caching the Merkle tree.
     pub const MerkleResult = struct {
-        torrent_id: u8,
+        torrent_id: u32,
         file_index: u32,
         piece_hashes: ?[][32]u8,
     };
@@ -161,7 +161,7 @@ pub const Hasher = struct {
         piece_index: u32,
         piece_buf: []u8,
         expected_hash: [20]u8,
-        torrent_id: u8,
+        torrent_id: u32,
     ) !void {
         self.queue_mutex.lock();
         defer self.queue_mutex.unlock();
@@ -182,7 +182,7 @@ pub const Hasher = struct {
     /// Called from the event loop thread. Does not block.
     pub fn submitMerkleJob(
         self: *Hasher,
-        torrent_id: u8,
+        torrent_id: u32,
         file_index: u32,
         first_piece: u32,
         piece_count: u32,
@@ -567,7 +567,7 @@ test "merkle job hashes file pieces from disk" {
         if (results.len > 0) {
             try std.testing.expectEqual(@as(usize, 1), results.len);
             const result = results[0];
-            try std.testing.expectEqual(@as(u8, 0), result.torrent_id);
+            try std.testing.expectEqual(@as(u32, 0), result.torrent_id);
             try std.testing.expectEqual(@as(u32, 0), result.file_index);
             try std.testing.expect(result.piece_hashes != null);
 

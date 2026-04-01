@@ -48,17 +48,7 @@ fn drainDhtPeerResults(self: *EventLoop) void {
         const result = engine.peer_results.orderedRemove(0);
         defer self.allocator.free(result.peers);
 
-        // Find the torrent context matching this info-hash
-        var matched_tid: ?u8 = null;
-        for (&self.torrents, 0..) |*tslot, ti| {
-            if (tslot.*) |tc| {
-                if (std.mem.eql(u8, &tc.info_hash, &result.info_hash)) {
-                    matched_tid = @intCast(ti);
-                    break;
-                }
-            }
-        }
-        const tid = matched_tid orelse continue;
+        const tid = self.findTorrentIdByInfoHash(&result.info_hash) orelse continue;
 
         // Feed peers into the event loop's connection pipeline.
         // Reuse the same path as tracker-discovered peers.

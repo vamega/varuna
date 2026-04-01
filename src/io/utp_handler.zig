@@ -421,31 +421,10 @@ fn processUtpInboundHandshake(self: *EventLoop, peer_slot: u16) void {
 
     // Match info_hash against all registered torrents.
     // BEP 52: also match on the truncated v2 info-hash for hybrid torrents.
-    var matched = false;
-    var resp_tid: u8 = 0;
-    for (&self.torrents, 0..) |*tslot, ti| {
-        if (tslot.*) |*tc_match| {
-            if (tc_match.active) {
-                if (std.mem.eql(u8, &tc_match.info_hash, inbound_hash)) {
-                    resp_tid = @intCast(ti);
-                    matched = true;
-                    break;
-                }
-                // BEP 52: check v2 info-hash for hybrid torrents
-                if (tc_match.info_hash_v2) |v2_hash| {
-                    if (std.mem.eql(u8, &v2_hash, inbound_hash)) {
-                        resp_tid = @intCast(ti);
-                        matched = true;
-                        break;
-                    }
-                }
-            }
-        }
-    }
-    if (!matched) {
+    const resp_tid = self.findTorrentIdByInfoHash(inbound_hash) orelse {
         self.removePeer(peer_slot);
         return;
-    }
+    };
     peer.torrent_id = resp_tid;
     // Store remote peer ID for client identification
     @memcpy(&peer.remote_peer_id, peer.handshake_buf[48..68]);

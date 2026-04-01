@@ -28,6 +28,7 @@ Update it whenever a milestone lands, the near-term backlog changes, or a new op
 - **Single-threaded io_uring event loop**: all peer I/O, disk I/O, HTTP API, tracker HTTP through io_uring. Split into focused sub-modules: event_loop.zig (core), peer_handler.zig, protocol.zig, seed_handler.zig, peer_policy.zig, utp_handler.zig.
 - **3-binary architecture**: `varuna` (daemon), `varuna-ctl` (CLI client), `varuna-tools` (standalone utilities).
 - **Shared multi-torrent event loop**: all torrents on one EventLoop thread with TorrentContext per torrent.
+- **Dynamic shared-torrent registry**: the shared EventLoop now uses dynamic slot storage, free-list reuse, `u32` torrent IDs, and hashed info-hash lookup instead of the old fixed 64-slot table.
 - **Shared announce ring**: tracker announces reuse a single ring instead of spawning per-announce threads.
 - **Connection limits**: global (500), per-torrent (100), half-open (50). Announce jitter ±10% with initial stagger.
 - **API vectored-send path**: the HTTP API server now sends headers and body as separate iovecs through `io_uring` `sendmsg` instead of concatenating them into one response buffer first.
@@ -85,6 +86,7 @@ Update it whenever a milestone lands, the near-term backlog changes, or a new op
 - **SHA-1 hardware acceleration**: runtime CPU detection for x86_64 SHA-NI (~2x to ~2.2 GB/s) and AArch64 SHA1 crypto extensions. Atomic-cached dispatch, automatic fallback to software.
 - popcount bitfield counting, inline message buffers (16-byte for small messages).
 - Idle peers list (O(k) not O(4096)), HashMap pending_writes (O(1) not O(n)).
+- Shared torrent routing no longer scans the full torrent table on inbound TCP/uTP/DHT paths; info-hash lookup is O(1), and disk-write CQEs use dedicated write IDs instead of packing torrent IDs into `user_data.context`.
 - claimPiece scan hint + min_availability for faster rarest-first selection.
 - Hasher TOCTOU fix (atomic drainResultsInto), proper drain loop, endgame duplicate write skip.
 - timeout_pending tracking, write error checking in handleDiskWrite, error logging for silent catches.
@@ -137,6 +139,7 @@ Update it whenever a milestone lands, the near-term backlog changes, or a new op
 - Bencode fuzz + edge case tests, HTTP parser fuzz tests.
 - Fuzz tests for: multipart parser, tracker response, uTP packets, BEP 10 extensions, scrape response (18 fuzz tests total).
 - Regression tests for API partial-send progress, unique seed read IDs, seed block-copy batching, shared-event-loop detach on stop, shared-loop preservation on resume, and failed disk-write release.
+- Shared EventLoop high-count regression: `20,000` active torrent contexts with hashed lookup and freed-slot reuse.
 - 10 io_uring Ring tests: pread/pwrite roundtrip, short reads, probe, shutdown, statx, renameat, unlinkat, cancel, timeout, link_timeout, send_zc, fixed buffer roundtrip.
 - Transfer test matrix: 24 tests (1KB-100MB, 16KB/64KB/256KB pieces, multi-file torrents). All pass.
 - Daemon swarm integration test, daemon-to-peer seeding test, selective download integration test.
@@ -173,6 +176,7 @@ Update it whenever a milestone lands, the near-term backlog changes, or a new op
 - ~~**Flood/qui WebUI validation**~~: (DONE) populated remaining stub fields (tracker URL, trackers_count, piece_range, content_path, magnet_uri, super_seeding, properties hash/name/created_by), added real peer data to torrentPeers endpoint.
 - ~~**API placeholder cleanup**~~: (DONE) wired real DHT node count into transfer/info and sync/maindata, wired real infohash_v2 (BEP 52) into torrent info/properties/sync, wired scrape data into properties peers_total/seeds_total, parsed creation_date from .torrent files. Documented unsupported endpoints in `docs/api-compatibility.md`.
 - **Peer hot/cold split / partial SoA**: the active-slot pass removes a lot of wasted scans, but the `Peer` struct is still wide. The next performance step is separating hot scheduling/state fields from cold crypto/buffering state.
+- **Torrent hot-summary registry**: now that the shared EventLoop can hold far more than 64 torrents, `/sync` and periodic torrent housekeeping should move toward a denser hot-state registry instead of pulling data from full `TorrentSession` objects on demand.
 - **Broader RPC arena coverage**: `/sync/maindata` now uses an arena for transient work; the other list-heavy endpoints still allocate temporary object graphs and strings.
 - **API request-body growth / reuse**: the response path is vectored now, but request buffers still grow with `realloc` and are freed on disconnect. A per-client arena or growth policy is still available if API polling or uploads show allocator churn.
 
@@ -183,6 +187,7 @@ Update it whenever a milestone lands, the near-term backlog changes, or a new op
 - uTP send queue previously truncated data packets to header-only size (fixed).
 - On this WSL2 host, `perf stat` and `perf record` still require the kernel-matched `linux-tools-6.6.87.2-microsoft-standard-WSL2` package. `cachegrind` is the current cache-miss fallback.
 - The `peer_scan` harness is now parameterized by active density (`--scale`), but the production peer table is still a wide AoS. Sparse synthetic scans are measurable; a full hot/cold split is still pending.
+- The shared EventLoop no longer has a 64-torrent cap, but partial-seed bookkeeping still scans active torrents periodically. If real deployments keep tens of thousands of torrents loaded continuously, that path may still need a slower cadence or a dedicated hot summary.
 
 ## Last Verified Milestone
 
@@ -192,6 +197,7 @@ Update it whenever a milestone lands, the near-term backlog changes, or a new op
 - MSE/PE (BEP 6) async handshake + auto-fallback
 - All protocol features merged, API placeholder values replaced with real data where available
 - `zig build test`: all tests pass
+- Shared EventLoop registry validated with `20,000` active torrent contexts and hashed inbound lookup
 - `zig build`: clean build (with `-Dtls=boringssl` default and `-Dtls=none`)
 - `zig build -Doptimize=ReleaseFast perf-workload -- http_response --iterations=5000`: `5,001` allocs, `648 KB` transient bytes, `4.63e7 ns`
 - `zig build -Doptimize=ReleaseFast perf-workload -- session_load --iterations=1000`: `2,004` allocs, `1.33e7 ns`

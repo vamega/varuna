@@ -1515,7 +1515,7 @@ pub const SessionManager = struct {
         // Get the event loop and torrent ID
         const el: *EventLoop = session.shared_event_loop orelse
             (if (session.event_loop) |*solo| solo else return try allocator.alloc(PeerInfo, 0));
-        const tid: u8 = session.torrent_id_in_shared orelse 0;
+        const tid: EventLoop.TorrentId = session.torrent_id_in_shared orelse 0;
 
         var result = std.ArrayList(PeerInfo).empty;
         errdefer {

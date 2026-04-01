@@ -363,13 +363,12 @@ pub fn handleRecv(self: *EventLoop, slot: u16, cqe: linux.io_uring_cqe) void {
         }
     }
 
-    const tc_recv = self.getTorrentContext(peer.torrent_id) orelse {
-        self.removePeer(slot);
-        return;
-    };
-
     switch (peer.state) {
         .handshake_recv => {
+            const tc_recv = self.getTorrentContext(peer.torrent_id) orelse {
+                self.removePeer(slot);
+                return;
+            };
             peer.handshake_offset += n;
             if (peer.handshake_offset < 68) {
                 protocol.submitHandshakeRecv(self, slot) catch {
@@ -433,34 +432,14 @@ pub fn handleRecv(self: *EventLoop, slot: u16, cqe: linux.io_uring_cqe) void {
             // BEP 52: for hybrid torrents, also match on the truncated v2 info-hash
             // since v2-capable peers may use the SHA-256 info-hash in the handshake.
             const inbound_hash = peer.handshake_buf[28..48];
-            var resp_tc: *const @import("event_loop.zig").TorrentContext = tc_recv;
-            var resp_tid: u8 = peer.torrent_id;
-            var matched = false;
-            for (&self.torrents, 0..) |*tslot, ti| {
-                if (tslot.*) |*tc_match| {
-                    if (tc_match.active) {
-                        if (std.mem.eql(u8, &tc_match.info_hash, inbound_hash)) {
-                            resp_tc = tc_match;
-                            resp_tid = @intCast(ti);
-                            matched = true;
-                            break;
-                        }
-                        // BEP 52: check v2 info-hash for hybrid torrents
-                        if (tc_match.info_hash_v2) |v2_hash| {
-                            if (std.mem.eql(u8, &v2_hash, inbound_hash)) {
-                                resp_tc = tc_match;
-                                resp_tid = @intCast(ti);
-                                matched = true;
-                                break;
-                            }
-                        }
-                    }
-                }
-            }
-            if (!matched) {
+            const resp_tid = self.findTorrentIdByInfoHash(inbound_hash) orelse {
                 self.removePeer(slot);
                 return;
-            }
+            };
+            const resp_tc = self.getTorrentContext(resp_tid) orelse {
+                self.removePeer(slot);
+                return;
+            };
             peer.torrent_id = resp_tid;
             // Store remote peer ID for client identification
             @memcpy(&peer.remote_peer_id, peer.handshake_buf[48..68]);
@@ -558,25 +537,21 @@ pub fn handleRecv(self: *EventLoop, slot: u16, cqe: linux.io_uring_cqe) void {
 pub fn handleDiskWrite(self: *EventLoop, slot: u16, cqe: linux.io_uring_cqe) void {
     _ = slot;
     const op = decodeUserData(cqe.user_data);
-    const piece_index: u32 = @intCast(op.context & 0xFFFFFFFF);
-    const write_torrent_id: u8 = @intCast((op.context >> 32) & 0xFF);
+    const write_id: u32 = @truncate(op.context);
 
-    const PendingWriteKey = EventLoop.PendingWriteKey;
-
-    // Find the pending write for this piece and decrement spans_remaining
-    const key = PendingWriteKey{ .piece_index = piece_index, .torrent_id = write_torrent_id };
-    if (self.pending_writes.getPtr(key)) |pending_w| {
+    if (self.getPendingWriteById(write_id)) |pending_w| {
+        const piece_index = pending_w.piece_index;
         // Check for write errors (disk full, I/O error, etc.)
         if (cqe.res < 0) {
             log.err("disk write failed for piece {d} torrent {d}: errno={d}", .{
-                piece_index, write_torrent_id, -cqe.res,
+                piece_index, pending_w.torrent_id, -cqe.res,
             });
             // Release the piece back so it can be re-downloaded
             if (self.getTorrentContext(pending_w.torrent_id)) |tc| {
                 if (tc.piece_tracker) |pt| pt.releasePiece(piece_index);
             }
             self.allocator.free(pending_w.buf);
-            _ = self.pending_writes.remove(key);
+            _ = self.removePendingWriteById(write_id);
             return;
         }
 
@@ -595,7 +570,7 @@ pub fn handleDiskWrite(self: *EventLoop, slot: u16, cqe: linux.io_uring_cqe) voi
                 }
             }
             self.allocator.free(pending_w.buf);
-            _ = self.pending_writes.remove(key);
+            _ = self.removePendingWriteById(write_id);
         }
     }
 }
@@ -647,18 +622,13 @@ fn executeMseAction(self: *EventLoop, slot: u16, action: mse.MseAction, is_initi
                     peer.crypto = mr.result();
                     // Set the torrent_id based on matched info-hash
                     if (mr.matchedInfoHash()) |hash| {
-                        var matched_tid: ?u8 = null;
-                        for (&self.torrents, 0..) |*tslot, ti| {
-                            if (tslot.*) |*tc| {
-                                if (tc.active and std.mem.eql(u8, &tc.info_hash, &hash)) {
-                                    matched_tid = @intCast(ti);
-                                    break;
-                                }
-                            }
-                        }
-                        if (matched_tid) |tid| {
+                        if (self.findTorrentIdByInfoHash(&hash)) |tid| {
                             peer.torrent_id = tid;
                         }
+                    }
+                    if (peer.mse_known_hashes) |hashes| {
+                        self.allocator.free(hashes);
+                        peer.mse_known_hashes = null;
                     }
                     self.allocator.destroy(mr);
                     peer.mse_responder = null;
@@ -700,6 +670,10 @@ fn handleMseFailure(self: *EventLoop, slot: u16, is_initiator: bool) void {
         if (peer.mse_responder) |mr| {
             self.allocator.destroy(mr);
             peer.mse_responder = null;
+        }
+        if (peer.mse_known_hashes) |hashes| {
+            self.allocator.free(hashes);
+            peer.mse_known_hashes = null;
         }
     }
 
@@ -790,18 +764,28 @@ fn startMseResponder(self: *EventLoop, slot: u16) void {
     const peer = &self.peers[slot];
 
     // Collect known info-hashes from all active torrents
-    var known_hashes: [64][20]u8 = undefined;
-    var hash_count: usize = 0;
-    for (&self.torrents) |*tslot| {
-        if (tslot.*) |*tc| {
-            if (tc.active and hash_count < known_hashes.len) {
-                known_hashes[hash_count] = tc.info_hash;
-                hash_count += 1;
-            }
-        }
-    }
+    const hash_count = self.active_torrent_ids.items.len;
 
     if (hash_count == 0) {
+        self.removePeer(slot);
+        return;
+    }
+
+    const known_hashes = self.allocator.alloc([20]u8, hash_count) catch {
+        self.removePeer(slot);
+        return;
+    };
+    errdefer self.allocator.free(known_hashes);
+
+    var hash_index: usize = 0;
+    for (self.active_torrent_ids.items) |torrent_id| {
+        const tc = self.getTorrentContextConst(torrent_id) orelse continue;
+        known_hashes[hash_index] = tc.info_hash;
+        hash_index += 1;
+    }
+
+    if (hash_index == 0) {
+        self.allocator.free(known_hashes);
         self.removePeer(slot);
         return;
     }
@@ -811,8 +795,9 @@ fn startMseResponder(self: *EventLoop, slot: u16) void {
         self.removePeer(slot);
         return;
     };
-    mr.* = mse.MseResponderHandshake.init(known_hashes[0..hash_count], self.encryption_mode);
+    mr.* = mse.MseResponderHandshake.init(known_hashes[0..hash_index], self.encryption_mode);
     peer.mse_responder = mr;
+    peer.mse_known_hashes = known_hashes;
 
     // The first byte we already received is part of the DH key.
     // We need to feed it to the state machine. The responder starts
@@ -856,28 +841,8 @@ pub fn detectAndHandleInboundMse(self: *EventLoop, slot: u16, first_byte: u8) bo
 test "handleDiskWrite releases piece when any submit failed" {
     const PieceTracker = @import("../torrent/piece_tracker.zig").PieceTracker;
     const Bitfield = @import("../bitfield.zig").Bitfield;
-
-    const peers = try std.testing.allocator.alloc(Peer, 1);
-    defer std.testing.allocator.free(peers);
-    @memset(peers, Peer{});
-
-    var el: EventLoop = .{
-        .ring = undefined,
-        .allocator = std.testing.allocator,
-        .peers = peers,
-        .pending_writes = .empty,
-        .pending_sends = std.ArrayList(EventLoop.PendingSend).empty,
-        .pending_reads = std.ArrayList(EventLoop.PendingPieceRead).empty,
-        .queued_responses = std.ArrayList(EventLoop.QueuedBlockResponse).empty,
-        .idle_peers = std.ArrayList(u16).empty,
-    };
-    defer {
-        el.pending_writes.deinit(std.testing.allocator);
-        el.pending_sends.deinit(std.testing.allocator);
-        el.pending_reads.deinit(std.testing.allocator);
-        el.queued_responses.deinit(std.testing.allocator);
-        el.idle_peers.deinit(std.testing.allocator);
-    }
+    var el = try EventLoop.initBare(std.testing.allocator, 0);
+    defer el.deinit();
 
     var initial_complete = try Bitfield.init(std.testing.allocator, 1);
     defer initial_complete.deinit(std.testing.allocator);
@@ -888,19 +853,19 @@ test "handleDiskWrite releases piece when any submit failed" {
     try std.testing.expectEqual(@as(?u32, 0), tracker.claimPiece(null));
 
     const empty_fds = [_]posix.fd_t{};
-    el.torrents[0] = .{
+    _ = try el.addTorrentContext(.{
         .piece_tracker = &tracker,
         .shared_fds = empty_fds[0..],
         .info_hash = [_]u8{0} ** 20,
         .peer_id = [_]u8{0} ** 20,
-    };
-    el.torrent_count = 1;
+    });
 
     const buf = try std.testing.allocator.alloc(u8, 16);
-    try el.pending_writes.put(std.testing.allocator, .{
+    const write_id = try el.createPendingWrite(.{
         .piece_index = 0,
         .torrent_id = 0,
     }, .{
+        .write_id = 0,
         .piece_index = 0,
         .torrent_id = 0,
         .slot = 0,
@@ -913,7 +878,7 @@ test "handleDiskWrite releases piece when any submit failed" {
     cqe.user_data = encodeUserData(.{
         .slot = 0,
         .op_type = .disk_write,
-        .context = 0,
+        .context = write_id,
     });
     cqe.res = 16;
 
