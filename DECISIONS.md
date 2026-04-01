@@ -14,6 +14,30 @@ Use [STATUS.md](STATUS.md) for the running list of completed work, next work, an
 
 ## Decision Entries
 
+### 2026-04-01: Pool Common Piece Buffer Sizes Instead Of Reallocating Them
+
+Context:
+Even after the huge-page cache became reusable, `createPieceBuffer()` still allocated and destroyed `PieceBuffer` wrappers constantly, and heap-backed piece buffers still churned when the huge-page cache was disabled or temporarily exhausted. Seed reads and upload-side piece caching naturally cycle through a small set of common piece sizes, so repeated allocate/free of those buffers was unnecessary.
+
+Decision:
+- Add a `PieceBufferPool` to `EventLoop`.
+- Reuse `PieceBuffer` wrappers through an intrusive free list.
+- Retain heap-backed piece buffers in common size classes (`16 KiB` through `8 MiB`) with a bounded global retained-byte cap (`64 MiB`) and a per-class count cap (`8`).
+- Keep preferring the huge-page cache first when it is configured; fall back to the retained heap pool only when no huge-page slice is available.
+
+Reasoning:
+- Common torrent piece sizes repeat constantly. Keeping a bounded set of buffers for those sizes is much cheaper than re-allocating them on every seed read.
+- Wrapper pooling matters too; otherwise the code would still allocate and destroy a `PieceBuffer` object for every create/release cycle.
+- The pool is deliberately bounded so it improves steady-state churn without letting rare large sizes accumulate unbounded retained memory.
+
+Measured effect:
+- `piece_buffer_cycle --iterations=5000` moved from `50000` allocs / `50000` frees / `27935320000` bytes allocated / `356068992 ns` to `11` allocs / `0` frees / `5587408` retained bytes / `239873 ns`.
+- Repeat after: `206658 ns`.
+
+Follow-up triggers:
+- If real swarm traces show many sizes outside the current class table, extend or tune the size classes from measurement instead of guessing.
+- If plaintext seeding still shows wrapper-side allocation in production traces, pool the packed vectored-send state separately; this pass only eliminates piece-buffer churn.
+
 ### 2026-04-01: Huge-Page Piece Cache Must Reuse Freed Slices
 
 Context:

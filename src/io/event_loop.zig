@@ -259,8 +259,162 @@ pub const EventLoop = struct {
 
     pub const PieceBuffer = struct {
         buf: []u8,
+        storage: []u8 = &.{},
         from_pool: bool = false,
         ref_count: u32 = 1,
+        next_free: ?*PieceBuffer = null,
+    };
+
+    const PieceBufferPool = struct {
+        const retained_heap_limit: usize = 64 * 1024 * 1024;
+        const max_buffers_per_class: u16 = 8;
+        const class_sizes = [_]usize{
+            16 * 1024,
+            64 * 1024,
+            256 * 1024,
+            512 * 1024,
+            1024 * 1024,
+            2 * 1024 * 1024,
+            4 * 1024 * 1024,
+            8 * 1024 * 1024,
+        };
+
+        const RetainedClass = struct {
+            head: ?*PieceBuffer = null,
+            count: u16 = 0,
+        };
+
+        retained_heap_bytes: usize = 0,
+        retained_heap: std.AutoHashMapUnmanaged(usize, RetainedClass) = .empty,
+        free_wrappers: ?*PieceBuffer = null,
+
+        fn acquire(
+            self: *PieceBufferPool,
+            allocator: std.mem.Allocator,
+            huge_page_cache: ?*HugePageCache,
+            size: usize,
+        ) !*PieceBuffer {
+            const storage_size = preferredStorageSize(size);
+            if (huge_page_cache) |hpc| {
+                if (hpc.alloc(storage_size)) |storage| {
+                    const piece_buffer = try self.acquireWrapper(allocator);
+                    piece_buffer.* = .{
+                        .buf = storage[0..size],
+                        .storage = storage,
+                        .from_pool = true,
+                    };
+                    return piece_buffer;
+                }
+            }
+
+            if (self.acquireRetained(storage_size)) |piece_buffer| {
+                piece_buffer.* = .{
+                    .buf = piece_buffer.storage[0..size],
+                    .storage = piece_buffer.storage,
+                    .from_pool = false,
+                };
+                return piece_buffer;
+            }
+
+            const storage = try allocator.alloc(u8, storage_size);
+            errdefer allocator.free(storage);
+
+            const piece_buffer = try self.acquireWrapper(allocator);
+            piece_buffer.* = .{
+                .buf = storage[0..size],
+                .storage = storage,
+                .from_pool = false,
+            };
+            return piece_buffer;
+        }
+
+        fn release(
+            self: *PieceBufferPool,
+            allocator: std.mem.Allocator,
+            huge_page_cache: ?*HugePageCache,
+            piece_buffer: *PieceBuffer,
+        ) void {
+            if (piece_buffer.from_pool) {
+                if (huge_page_cache) |hpc| hpc.free(piece_buffer.storage);
+                self.recycleWrapper(piece_buffer);
+                return;
+            }
+
+            if (self.retainHeapBuffer(allocator, piece_buffer)) return;
+
+            allocator.free(piece_buffer.storage);
+            self.recycleWrapper(piece_buffer);
+        }
+
+        fn deinit(self: *PieceBufferPool, allocator: std.mem.Allocator) void {
+            var retained_it = self.retained_heap.iterator();
+            while (retained_it.next()) |entry| {
+                var head = entry.value_ptr.head;
+                while (head) |piece_buffer| {
+                    const next = piece_buffer.next_free;
+                    allocator.free(piece_buffer.storage);
+                    allocator.destroy(piece_buffer);
+                    head = next;
+                }
+            }
+            self.retained_heap.deinit(allocator);
+
+            var wrappers = self.free_wrappers;
+            while (wrappers) |piece_buffer| {
+                wrappers = piece_buffer.next_free;
+                allocator.destroy(piece_buffer);
+            }
+            self.* = .{};
+        }
+
+        fn acquireWrapper(self: *PieceBufferPool, allocator: std.mem.Allocator) !*PieceBuffer {
+            if (self.free_wrappers) |piece_buffer| {
+                self.free_wrappers = piece_buffer.next_free;
+                piece_buffer.next_free = null;
+                return piece_buffer;
+            }
+            return allocator.create(PieceBuffer);
+        }
+
+        fn recycleWrapper(self: *PieceBufferPool, piece_buffer: *PieceBuffer) void {
+            piece_buffer.next_free = self.free_wrappers;
+            self.free_wrappers = piece_buffer;
+        }
+
+        fn acquireRetained(self: *PieceBufferPool, storage_size: usize) ?*PieceBuffer {
+            const retained = self.retained_heap.getPtr(storage_size) orelse return null;
+            const piece_buffer = retained.head orelse return null;
+            retained.head = piece_buffer.next_free;
+            piece_buffer.next_free = null;
+            retained.count -= 1;
+            self.retained_heap_bytes -= piece_buffer.storage.len;
+            return piece_buffer;
+        }
+
+        fn retainHeapBuffer(self: *PieceBufferPool, allocator: std.mem.Allocator, piece_buffer: *PieceBuffer) bool {
+            const storage = piece_buffer.storage;
+            if (self.retained_heap_bytes + storage.len > retained_heap_limit) return false;
+
+            const gop = self.retained_heap.getOrPut(allocator, storage.len) catch return false;
+            if (!gop.found_existing) {
+                gop.value_ptr.* = .{};
+            }
+            if (gop.value_ptr.count >= max_buffers_per_class) return false;
+
+            piece_buffer.buf = storage;
+            piece_buffer.next_free = gop.value_ptr.head;
+            gop.value_ptr.head = piece_buffer;
+            gop.value_ptr.count += 1;
+            self.retained_heap_bytes += storage.len;
+            return true;
+        }
+
+        fn preferredStorageSize(size: usize) usize {
+            for (class_sizes) |class_size| {
+                if (size <= class_size) return class_size;
+            }
+            return size;
+        }
     };
 
     pub const VectoredSendState = struct {
@@ -470,6 +624,7 @@ pub const EventLoop = struct {
     // When allocated, piece read buffers are served from this pool instead
     // of the general-purpose allocator. Reduces TLB pressure for large torrents.
     huge_page_cache: ?HugePageCache = null,
+    piece_buffer_pool: PieceBufferPool = .{},
 
     // Queued piece block responses (batched per tick, flushed after CQE dispatch)
     queued_responses: std.ArrayList(QueuedBlockResponse),
@@ -647,6 +802,7 @@ pub const EventLoop = struct {
             self.releasePieceBuffer(piece_buffer);
         }
         // Free huge page cache pool
+        self.piece_buffer_pool.deinit(self.allocator);
         if (self.huge_page_cache) |*hpc| hpc.deinit();
         {
             var it = self.pending_writes.valueIterator();
@@ -1552,17 +1708,7 @@ pub const EventLoop = struct {
     }
 
     pub fn createPieceBuffer(self: *EventLoop, size: usize) !*PieceBuffer {
-        const pool_buf = if (self.huge_page_cache) |*hpc| hpc.alloc(size) else null;
-        const from_pool = pool_buf != null;
-        const buf = pool_buf orelse try self.allocator.alloc(u8, size);
-        errdefer if (!from_pool) self.allocator.free(buf);
-
-        const piece_buffer = try self.allocator.create(PieceBuffer);
-        piece_buffer.* = .{
-            .buf = buf,
-            .from_pool = from_pool,
-        };
-        return piece_buffer;
+        return self.piece_buffer_pool.acquire(self.allocator, if (self.huge_page_cache) |*hpc| hpc else null, size);
     }
 
     pub fn retainPieceBuffer(self: *EventLoop, piece_buffer: *PieceBuffer) void {
@@ -1575,14 +1721,7 @@ pub const EventLoop = struct {
         piece_buffer.ref_count -= 1;
         if (piece_buffer.ref_count != 0) return;
 
-        if (piece_buffer.from_pool) {
-            if (self.huge_page_cache) |*hpc| {
-                hpc.free(piece_buffer.buf);
-            }
-        } else {
-            self.allocator.free(piece_buffer.buf);
-        }
-        self.allocator.destroy(piece_buffer);
+        self.piece_buffer_pool.release(self.allocator, if (self.huge_page_cache) |*hpc| hpc else null, piece_buffer);
     }
 
     /// Allocate a unique send_id for a new PendingSend and return the

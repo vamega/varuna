@@ -47,6 +47,7 @@ pub const Scenario = enum {
     peer_scan,
     peer_accept_burst,
     request_batch,
+    piece_buffer_cycle,
     seed_batch,
     seed_plaintext_burst,
     seed_send_copy_burst,
@@ -92,6 +93,7 @@ pub fn run(
         .peer_scan => runPeerScan(allocator, alloc_counter, iterations, config),
         .peer_accept_burst => runPeerAcceptBurst(allocator, alloc_counter, iterations, config),
         .request_batch => runRequestBatch(allocator, alloc_counter, iterations, config),
+        .piece_buffer_cycle => runPieceBufferCycle(allocator, alloc_counter, iterations, config),
         .seed_batch => runSeedBatch(allocator, alloc_counter, iterations, config),
         .seed_plaintext_burst => runSeedPlaintextBurst(allocator, alloc_counter, iterations, config),
         .seed_send_copy_burst => runSeedSendCopyBurst(allocator, alloc_counter, iterations, config),
@@ -422,6 +424,43 @@ fn runSeedBatch(
     }
 
     return makeResult("seed_batch", iterations, &timer, checksum, alloc_counter);
+}
+
+fn runPieceBufferCycle(
+    allocator: std.mem.Allocator,
+    alloc_counter: *CountingAllocator,
+    iterations: usize,
+    config: Config,
+) !Result {
+    _ = config;
+    var event_loop = try EventLoop.initBare(allocator, 0);
+    defer event_loop.deinit();
+
+    const sizes = [_]usize{
+        16 * 1024,
+        64 * 1024,
+        256 * 1024,
+        1024 * 1024,
+        4 * 1024 * 1024,
+    };
+
+    alloc_counter.stats = .{};
+    var timer = try std.time.Timer.start();
+    var checksum: u64 = 0;
+
+    for (0..iterations) |iter| {
+        for (sizes, 0..) |size, idx| {
+            const piece_buffer = try event_loop.createPieceBuffer(size);
+            piece_buffer.buf[0] = @truncate(iter +% idx);
+            piece_buffer.buf[piece_buffer.buf.len - 1] = @truncate((iter *% 17) +% idx);
+            checksum +%= piece_buffer.buf[0];
+            checksum +%= piece_buffer.buf[piece_buffer.buf.len - 1];
+            checksum +%= piece_buffer.buf.len;
+            event_loop.releasePieceBuffer(piece_buffer);
+        }
+    }
+
+    return makeResult("piece_buffer_cycle", iterations, &timer, checksum, alloc_counter);
 }
 
 fn runSeedPlaintextBurst(

@@ -105,6 +105,7 @@ Update it whenever a milestone lands, the near-term backlog changes, or a new op
 - Seed/read-path correctness: queued seed responses own exact block copies, async seed reads use unique IDs, and only successfully submitted reads/writes contribute to pending completion counts.
 - **Huge page piece cache**: optional reusable `mmap(MAP_HUGETLB)` buffer pool for seed piece reads. Falls back to `madvise(MADV_HUGEPAGE)` (transparent huge pages), then regular pages. Freed pooled slices are now returned to the cache and merged for reuse. Config: `performance.use_huge_pages`, `performance.piece_cache_size`.
 - **Synthetic memory baseline harness**: `varuna-perf` with allocator-counting scenarios for peer scans, request batching, seed batching, extension parsing, session loading, and `/sync/maindata`. Supports stable before/after comparisons without a live swarm.
+- **Piece buffer pool**: `EventLoop` now reuses `PieceBuffer` wrappers and retains common heap-backed piece sizes behind a bounded pool instead of reallocating them on every seed-read cycle.
 - **Synthetic API burst harness**: `varuna-perf` now includes `api_get_burst` and `api_upload_burst`, which drive the real RPC server over loopback sockets with configurable client concurrency and upload body size.
 - **API steady-state allocation removal**: standard RPC responses now write headers into inline per-client storage, `api_get_burst` is allocation-free, and upload-sized request buffers are retained per slot up to `256 KiB` instead of reallocating on every disconnect.
 - **Synthetic peer accept harness**: `varuna-perf` now includes `peer_accept_burst`, which drives the real shared `EventLoop` listener with inbound loopback TCP connects and measures accept-slot-recv-EOF teardown cost.
@@ -214,6 +215,7 @@ Update it whenever a milestone lands, the near-term backlog changes, or a new op
 - Shared EventLoop registry validated with `20,000` active torrent contexts and hashed inbound lookup
 - `zig build`: clean build (with `-Dtls=boringssl` default and `-Dtls=none`)
 - `zig build -Doptimize=ReleaseFast perf-workload -- session_load --iterations=1000`: `2,004` allocs, `1.33e7 ns`
+- `zig build -Doptimize=ReleaseFast perf-workload -- piece_buffer_cycle --iterations=5000`: `11` allocs, `5.59 MB` retained bytes, `2.40e5 ns`, repeat `2.07e5 ns`
 - `zig build -Doptimize=ReleaseFast perf-workload -- http_response --iterations=5000`: `1` alloc, `8 KB` transient bytes, `1.77e6 ns`
 - `zig build -Doptimize=ReleaseFast perf-workload -- api_get_burst --iterations=4000 --clients=8`: `0` allocs, `0` transient bytes, `2.13e8 ns` to `2.31e8 ns`
 - `zig build -Doptimize=ReleaseFast perf-workload -- api_upload_burst --iterations=1000 --clients=8 --body-bytes=65536`: `8` allocs, `525 KB` retained bytes, `1.24e8 ns`

@@ -46,6 +46,7 @@ Use `varuna-perf` when you need deterministic allocator and cache comparisons wi
 - `zig build -Doptimize=ReleaseFast perf-workload -- peer_scan --iterations=20000 --peers=4096 --scale=8`
 - `zig build -Doptimize=ReleaseFast perf-workload -- peer_accept_burst --iterations=4000 --clients=1`
 - `zig build -Doptimize=ReleaseFast perf-workload -- request_batch --iterations=100000`
+- `zig build -Doptimize=ReleaseFast perf-workload -- piece_buffer_cycle --iterations=5000`
 - `zig build -Doptimize=ReleaseFast perf-workload -- seed_batch --iterations=5000`
 - `zig build -Doptimize=ReleaseFast perf-workload -- api_get_burst --iterations=4000 --clients=8`
 - `zig build -Doptimize=ReleaseFast perf-workload -- api_upload_burst --iterations=1000 --clients=8 --body-bytes=65536`
@@ -56,6 +57,7 @@ Current scenarios:
 - `peer_scan`
 - `peer_accept_burst`
 - `request_batch`
+- `piece_buffer_cycle`
 - `seed_batch`
 - `http_response`
 - `api_get_burst`
@@ -69,6 +71,7 @@ Scenario-specific notes:
 
 - `peer_scan`: `--scale` controls active-slot density. `--scale=1` keeps the table dense; larger values keep fewer slots active and are more representative when you want to measure scan cost instead of connection-state churn.
 - `peer_accept_burst`: drives the real shared `EventLoop` listener with inbound loopback TCP connects that immediately disconnect. `--clients` controls concurrent connector threads. Very high iteration counts may hit loopback ephemeral-port limits on some hosts.
+- `piece_buffer_cycle`: repeatedly creates, touches, and releases common piece-buffer sizes through the production `EventLoop` allocator path.
 - `http_response`: models the API response assembly path, including header formatting and body ownership.
 - `api_get_burst`: drives the real RPC server over loopback with one short request per connection. `--clients` controls concurrent client threads.
 - `api_upload_burst`: drives the real RPC server with upload-sized POST bodies. `--clients` controls concurrent client threads and `--body-bytes` controls request size.
@@ -355,6 +358,7 @@ New benchmark-only workloads added in this pass:
 
 | Scenario | Result |
 |----------|--------|
+| `piece_buffer_cycle --iterations=5000` | before: `356068992 ns`, `50000` allocs, `27.9 GB` allocated; after: `239873 ns`, repeat `206658 ns`, `11` allocs, `5.59 MB` retained bytes |
 | `seed_plaintext_burst --iterations=500 --scale=8` | before: `30384358 ns`, `27940324 ns`, `28669060 ns`; after: `10659949 ns`, `12832968 ns`; alloc calls `501`, `276 KB` transient bytes |
 | `seed_send_copy_burst --iterations=200 --scale=8` | `59303132 ns`, `54058775 ns`; `200` allocs, `26.2 MB` transient bytes |
 | `seed_sendmsg_burst --iterations=200 --scale=8` | `45529205 ns`, `39205524 ns`; `400` allocs, `72 KB` transient bytes |
@@ -363,6 +367,7 @@ New benchmark-only workloads added in this pass:
 
 Interpretation:
 
+- `piece_buffer_cycle` measures the production `createPieceBuffer()` / `releasePieceBuffer()` path directly. Pooling common size classes plus wrapper reuse removes almost all piece-buffer allocation churn after warmup.
 - `seed_plaintext_burst` is now the production plaintext upload path. Refcounted piece buffers plus tracked vectored `sendmsg` improved wall-clock time by about `2.2x` to `2.8x` on this host and cut transient bytes from `65.6 MB` down to `276 KB`.
 - `seed_sendmsg_burst` is the clearest syscall win so far for plaintext seeding. On the same loopback TCP shape as the contiguous-copy benchmark, vectored header + payload send improved wall-clock time by about `23%` to `33%` and cut transient bytes from `26.2 MB` to `72 KB`.
 - `seed_splice_burst` shows why `sendfile` / `splice` are a poor fit for the current BitTorrent upload path. The protocol still needs a per-block header send, `splice(2)` still requires a pipe on one side, and the measured prototype was much slower than either copy or vectored `sendmsg`.
