@@ -103,7 +103,7 @@ Update it whenever a milestone lands, the near-term backlog changes, or a new op
 - Partial send buffer matching: monotonic send_id in CQE context to match correct in-flight buffer.
 - RPC server partial-send handling: API responses now track send progress until the full body is written.
 - Seed/read-path correctness: queued seed responses own exact block copies, async seed reads use unique IDs, and only successfully submitted reads/writes contribute to pending completion counts.
-- **Huge page piece cache**: optional `mmap(MAP_HUGETLB)` buffer pool for seed piece reads. Falls back to `madvise(MADV_HUGEPAGE)` (transparent huge pages), then regular pages. Config: `performance.use_huge_pages`, `performance.piece_cache_size`. Reduces TLB pressure for large torrents.
+- **Huge page piece cache**: optional reusable `mmap(MAP_HUGETLB)` buffer pool for seed piece reads. Falls back to `madvise(MADV_HUGEPAGE)` (transparent huge pages), then regular pages. Freed pooled slices are now returned to the cache and merged for reuse. Config: `performance.use_huge_pages`, `performance.piece_cache_size`.
 - **Synthetic memory baseline harness**: `varuna-perf` with allocator-counting scenarios for peer scans, request batching, seed batching, extension parsing, session loading, and `/sync/maindata`. Supports stable before/after comparisons without a live swarm.
 - **Synthetic API burst harness**: `varuna-perf` now includes `api_get_burst` and `api_upload_burst`, which drive the real RPC server over loopback sockets with configurable client concurrency and upload body size.
 - **API steady-state allocation removal**: standard RPC responses now write headers into inline per-client storage, `api_get_burst` is allocation-free, and upload-sized request buffers are retained per slot up to `256 KiB` instead of reallocating on every disconnect.
@@ -154,7 +154,7 @@ Update it whenever a milestone lands, the near-term backlog changes, or a new op
 - Adversarial peer tests (35 tests): oversized messages, invalid IDs, wrong lengths, malformed handshake, unrequested pieces, OOB piece indices, garbage extension bencode, bitfield bounds, connection limit sanity.
 - Private tracker simulation tests (25 tests): required announce fields (compact, numwant, key, event), per-session key generation, private flag enforcement (no ut_pex), tracker error responses (failure reason, missing fields, invalid formats, negative interval), compact peer parsing.
 - Soak test framework (`zig build soak-test`): multi-torrent piece tracker stress, allocator leak detection (GPA), FD leak monitoring, tick latency tracking, bitfield stress cycles.
-- 5 super-seed (BEP 16) tests, 4 partial seed (BEP 21) tests, 2 multi-announce tests, 5 huge page cache tests.
+- 5 super-seed (BEP 16) tests, 4 partial seed (BEP 21) tests, 2 multi-announce tests, 7 huge page cache tests.
 - BEP 52 tests: 11 Merkle tree tests, 8 file tree parser tests, 7 v2 metainfo tests, 4 v2 layout tests, 1 v2 info-hash test, 8 hash exchange tests, 2 v2 announce URL tests, 2 v2 resume DB tests, 11 Merkle cache tests, 2 async Merkle hasher tests.
 - DHT tests: 7 node_id tests, 8 routing_table tests, 8 krpc tests, 8 token tests, 7 lookup tests, 5 dht_engine tests, 1 persistence test (44 total).
 - 4 tracker override persistence tests (add/load, edit with orig_url, remove/clear, per-torrent isolation).

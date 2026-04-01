@@ -1392,7 +1392,7 @@ pub const EventLoop = struct {
     pub fn initHugePageCache(self: *EventLoop, capacity: u64, use_huge_pages: bool) void {
         const default_cache_size: usize = 64 * 1024 * 1024; // 64 MB
         const size: usize = if (capacity > 0) @intCast(@min(capacity, 1 << 32)) else default_cache_size;
-        self.huge_page_cache = HugePageCache.init(size, use_huge_pages);
+        self.huge_page_cache = HugePageCache.init(self.allocator, size, use_huge_pages);
         if (self.huge_page_cache.?.isAllocated()) {
             log.info("piece cache: {d} MB ({s})", .{
                 self.huge_page_cache.?.capacity / (1024 * 1024),
@@ -1575,7 +1575,13 @@ pub const EventLoop = struct {
         piece_buffer.ref_count -= 1;
         if (piece_buffer.ref_count != 0) return;
 
-        if (!piece_buffer.from_pool) self.allocator.free(piece_buffer.buf);
+        if (piece_buffer.from_pool) {
+            if (self.huge_page_cache) |*hpc| {
+                hpc.free(piece_buffer.buf);
+            }
+        } else {
+            self.allocator.free(piece_buffer.buf);
+        }
         self.allocator.destroy(piece_buffer);
     }
 

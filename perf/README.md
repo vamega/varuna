@@ -368,6 +368,7 @@ Interpretation:
 - `seed_splice_burst` shows why `sendfile` / `splice` are a poor fit for the current BitTorrent upload path. The protocol still needs a per-block header send, `splice(2)` still requires a pipe on one side, and the measured prototype was much slower than either copy or vectored `sendmsg`.
 - `READ_FIXED` / `WRITE_FIXED` are not the first lever for this path. They can help if piece-read buffers are pre-registered, but they do not solve message framing or the need to keep piece pages alive until the socket-send CQE arrives.
 - Packing the tracked vectored send state into its backing allocation removed the extra allocator traffic from the first `sendmsg` landing. The next optional lever here is pooling those packed blocks or trying `sendmsg_zc` if real swarm traces still show plaintext seeding as a hotspot.
+- The huge-page piece cache is now reusable rather than bump-only. Freed pooled piece buffers return to the mapped cache and adjacent free ranges merge back together instead of exhausting the cache after one pass.
 - `utp_outbound_burst` is a real loopback UDP path benchmark. A first queue-cleanup prototype removed allocator churn but did not produce a stable wall-clock win, so it was not kept in production.
 
 ## Interpretation Notes

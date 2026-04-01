@@ -14,6 +14,30 @@ Use [STATUS.md](STATUS.md) for the running list of completed work, next work, an
 
 ## Decision Entries
 
+### 2026-04-01: Huge-Page Piece Cache Must Reuse Freed Slices
+
+Context:
+The shared event loop already had an optional huge-page-backed piece cache for seed reads, but the original implementation was only a bump allocator. Once it carved through the mapped region once, later piece-buffer releases did not return space to the cache, so the daemon eventually fell back to the general allocator even under a stable steady-state workload.
+
+Decision:
+- Keep the same `mmap` / `MAP_HUGETLB` / `MADV_HUGEPAGE` initialization strategy.
+- Replace the one-way bump-only behavior with a reusable free-range allocator inside `HugePageCache`.
+- Return pooled piece buffers to the cache from `releasePieceBuffer()` instead of just skipping `free()` for them.
+- Merge adjacent freed ranges and collapse free space back into the bump tail when possible.
+
+Reasoning:
+- “Huge-page cache” that exhausts permanently after one pass is not acceptable for a long-running seeding daemon.
+- Piece sizes are usually stable for a given torrent set, so a simple reusable range allocator is enough to recover the mapped region without adding a second separate pool layer first.
+- This keeps the existing configuration surface and fallback behavior intact while fixing the actual lifetime bug.
+
+Validation:
+- `zig build test` passes.
+- New unit tests cover range reuse and adjacent-range merging in `src/storage/huge_page_cache.zig`.
+
+Follow-up triggers:
+- If piece-buffer allocation still shows up in profiles after this fix, the next step is a real `PieceBuffer` wrapper pool on top of the reusable cache so wrapper objects and common-sized backing buffers both get reused.
+- If the free-range metadata itself becomes hot, replace the generic range list with size-class free lists tuned for common piece sizes.
+
 ### 2026-04-01: Eliminate Steady-State API Header Allocs And Reuse Upload Buffers Per Slot
 
 Context:
