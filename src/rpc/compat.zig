@@ -19,6 +19,7 @@ pub fn torrentStateString(state: TorrentState, progress: f64) []const u8 {
         .seeding => "uploading",
         .paused => if (progress >= 1.0) "pausedUP" else "pausedDL",
         .stopped => if (progress >= 1.0) "stoppedUP" else "stoppedDL",
+        .queued => if (progress >= 1.0) "queuedUP" else "queuedDL",
         .checking => if (progress >= 1.0) "checkingUP" else "checkingDL",
         .metadata_fetching => "metaDL",
         .@"error" => "error",
@@ -103,6 +104,11 @@ test "stopped maps based on progress" {
 test "checking maps based on progress" {
     try std.testing.expectEqualStrings("checkingDL", torrentStateString(.checking, 0.3));
     try std.testing.expectEqualStrings("checkingUP", torrentStateString(.checking, 1.0));
+}
+
+test "queued maps based on progress" {
+    try std.testing.expectEqualStrings("queuedDL", torrentStateString(.queued, 0.3));
+    try std.testing.expectEqualStrings("queuedUP", torrentStateString(.queued, 1.0));
 }
 
 test "error state maps to error" {

@@ -299,6 +299,42 @@ pub fn main() !void {
             try body_buf.appendSlice(allocator, file_data);
             try doPost(allocator, stdout, api_host, api_port, "/api/v2/transfer/importBanList", body_buf.items, sid);
         }
+    } else if (std.mem.eql(u8, command, "queue-top")) {
+        if (cmd_start + 1 >= args.len) {
+            try stdout.print("usage: varuna-ctl queue-top <hash>\n", .{});
+        } else {
+            var body_buf = std.ArrayList(u8).empty;
+            defer body_buf.deinit(allocator);
+            try body_buf.print(allocator, "hashes={s}", .{args[cmd_start + 1]});
+            try doPost(allocator, stdout, api_host, api_port, "/api/v2/torrents/topPrio", body_buf.items, sid);
+        }
+    } else if (std.mem.eql(u8, command, "queue-bottom")) {
+        if (cmd_start + 1 >= args.len) {
+            try stdout.print("usage: varuna-ctl queue-bottom <hash>\n", .{});
+        } else {
+            var body_buf = std.ArrayList(u8).empty;
+            defer body_buf.deinit(allocator);
+            try body_buf.print(allocator, "hashes={s}", .{args[cmd_start + 1]});
+            try doPost(allocator, stdout, api_host, api_port, "/api/v2/torrents/bottomPrio", body_buf.items, sid);
+        }
+    } else if (std.mem.eql(u8, command, "queue-up")) {
+        if (cmd_start + 1 >= args.len) {
+            try stdout.print("usage: varuna-ctl queue-up <hash>\n", .{});
+        } else {
+            var body_buf = std.ArrayList(u8).empty;
+            defer body_buf.deinit(allocator);
+            try body_buf.print(allocator, "hashes={s}", .{args[cmd_start + 1]});
+            try doPost(allocator, stdout, api_host, api_port, "/api/v2/torrents/increasePrio", body_buf.items, sid);
+        }
+    } else if (std.mem.eql(u8, command, "queue-down")) {
+        if (cmd_start + 1 >= args.len) {
+            try stdout.print("usage: varuna-ctl queue-down <hash>\n", .{});
+        } else {
+            var body_buf = std.ArrayList(u8).empty;
+            defer body_buf.deinit(allocator);
+            try body_buf.print(allocator, "hashes={s}", .{args[cmd_start + 1]});
+            try doPost(allocator, stdout, api_host, api_port, "/api/v2/torrents/decreasePrio", body_buf.items, sid);
+        }
     } else {
         try stdout.print("unknown command: {s}\n\n", .{command});
         try printUsage(stdout, api_host, api_port);
@@ -526,6 +562,10 @@ fn printUsage(stdout: *std.Io.Writer, host: []const u8, port: u16) !void {
     try stdout.print("  unban <ip>                     unban a peer IP\n", .{});
     try stdout.print("  banlist [--json]               list banned peers\n", .{});
     try stdout.print("  import-banlist <file>           import ipfilter file\n", .{});
+    try stdout.print("  queue-top <hash>               move torrent to top of queue\n", .{});
+    try stdout.print("  queue-bottom <hash>            move torrent to bottom of queue\n", .{});
+    try stdout.print("  queue-up <hash>                increase torrent queue priority\n", .{});
+    try stdout.print("  queue-down <hash>              decrease torrent queue priority\n", .{});
     try stdout.print("  version                        daemon API version\n", .{});
     try stdout.print("  stats                          global transfer stats\n", .{});
     try stdout.print("\ndaemon: http://{s}:{}\n", .{ host, port });

@@ -23,6 +23,7 @@ pub const State = enum {
     seeding,
     paused,
     stopped,
+    queued,
     @"error",
 };
 
@@ -81,6 +82,8 @@ pub const Stats = struct {
     metadata_peers_with_metadata: u32 = 0,
     /// BEP 52: full v2 info-hash (32 bytes, SHA-256). null for pure v1.
     info_hash_v2: ?[32]u8 = null,
+    /// Queue position (1-based). 0 means not queued or queueing disabled.
+    queue_position: u32 = 0,
     /// Primary tracker URL (first announce URL). Empty string if none.
     tracker: []const u8 = "",
     /// Total number of tracker URLs configured for this torrent.

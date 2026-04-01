@@ -95,6 +95,13 @@ pub fn main() !void {
     session_manager.resume_db_path = resume_db_path;
     session_manager.masquerade_as = cfg.network.masquerade_as;
     if (cfg.storage.data_dir) |dir| session_manager.default_save_path = dir;
+    // Apply queue config from TOML
+    session_manager.queue_manager.config = .{
+        .enabled = cfg.daemon.queueing_enabled,
+        .max_active_downloads = cfg.daemon.max_active_downloads,
+        .max_active_uploads = cfg.daemon.max_active_uploads,
+        .max_active_torrents = cfg.daemon.max_active_torrents,
+    };
     // Load persisted categories and tags from the resume DB
     session_manager.loadCategoriesAndTags();
     defer session_manager.deinit();
@@ -224,9 +231,15 @@ pub fn main() !void {
             session_manager.mutex.unlock();
         }
 
+        // Periodically run queue enforcement (~every 5s at 100ms tick).
+        // This catches state transitions (download->seed) that free up slots.
+        resume_tick_counter +%= 1;
+        if (resume_tick_counter % 50 == 0) {
+            session_manager.runQueueEnforcement();
+        }
+
         // Periodically persist completed pieces to resume DB (~every 5s at 100ms tick)
         // and trigger tracker scrapes for swarm health stats.
-        resume_tick_counter +%= 1;
         if (resume_tick_counter % 50 == 0) {
             session_manager.mutex.lock();
             var iter = session_manager.sessions.iterator();

@@ -311,6 +311,23 @@ pub const ApiHandler = struct {
             return self.handleRemoveTags(allocator, params);
         }
 
+        // Queue management endpoints (qBittorrent-compatible)
+        if (std.mem.eql(u8, action_name, "increasePrio") and std.mem.eql(u8, method, "POST")) {
+            return self.handleQueueIncreasePrio(allocator, body);
+        }
+
+        if (std.mem.eql(u8, action_name, "decreasePrio") and std.mem.eql(u8, method, "POST")) {
+            return self.handleQueueDecreasePrio(allocator, body);
+        }
+
+        if (std.mem.eql(u8, action_name, "topPrio") and std.mem.eql(u8, method, "POST")) {
+            return self.handleQueueTopPrio(allocator, body);
+        }
+
+        if (std.mem.eql(u8, action_name, "bottomPrio") and std.mem.eql(u8, method, "POST")) {
+            return self.handleQueueBottomPrio(allocator, body);
+        }
+
         return .{ .status = 404, .body = "{\"error\":\"unknown action\"}" };
     }
 
@@ -486,11 +503,13 @@ pub const ApiHandler = struct {
             "";
         defer if (banned_ips_str.len > 0 and self.session_manager.ban_list != null) allocator.free(banned_ips_str);
 
+        const qcfg = self.session_manager.queue_manager.config;
+
         const body = std.fmt.allocPrint(allocator,
             \\{{"dl_limit":{},"up_limit":{},"alt_dl_limit":0,"alt_up_limit":0,
             \\"save_path":"{f}","temp_path":"","temp_path_enabled":false,
-            \\"queueing_enabled":false,"max_active_downloads":-1,"max_active_torrents":-1,
-            \\"max_active_uploads":-1,"max_active_checking_torrents":1,
+            \\"queueing_enabled":{s},"max_active_downloads":{},"max_active_torrents":{},
+            \\"max_active_uploads":{},"max_active_checking_torrents":1,
             \\"listen_port":6881,"random_port":false,"upnp":false,"upnp_lease_duration":0,
             \\"bittorrent_protocol":0,"utp_tcp_mixed_mode":0,
             \\"current_network_interface":"","current_interface_address":"",
@@ -514,8 +533,18 @@ pub const ApiHandler = struct {
             \\"ip_filter_enabled":false,"ip_filter_path":"","ip_filter_trackers":false,
             \\"banned_IPs":"{f}"}}
         , .{
-            dl_limit,                       ul_limit,                             esc(save_path),                        enc_mode,
-            @as(u8, if (has_hpc) 1 else 0), @as(u8, if (hpc_allocated) 1 else 0), @as(u8, if (hpc_using_huge) 1 else 0), esc(banned_ips_str),
+            dl_limit,
+            ul_limit,
+            esc(save_path),
+            @as([]const u8, if (qcfg.enabled) "true" else "false"),
+            qcfg.max_active_downloads,
+            qcfg.max_active_torrents,
+            qcfg.max_active_uploads,
+            enc_mode,
+            @as(u8, if (has_hpc) 1 else 0),
+            @as(u8, if (hpc_allocated) 1 else 0),
+            @as(u8, if (hpc_using_huge) 1 else 0),
+            esc(banned_ips_str),
         }) catch
             return .{ .status = 500, .body = "{\"error\":\"internal\"}" };
         return .{ .body = body, .owned_body = body };
@@ -564,6 +593,48 @@ pub const ApiHandler = struct {
                 el.ban_list_dirty.store(true, .release);
                 self.session_manager.persistBanList();
             }
+        }
+
+        // Handle queue settings
+        var queue_changed = false;
+        if (extractParam(body, "queueing_enabled")) |val| {
+            self.session_manager.queue_manager.config.enabled = std.mem.eql(u8, val, "true");
+            queue_changed = true;
+        } else if (extractJsonBool(body, "queueing_enabled")) |val| {
+            self.session_manager.queue_manager.config.enabled = val;
+            queue_changed = true;
+        }
+        if (extractParam(body, "max_active_downloads")) |val| {
+            if (std.fmt.parseInt(i32, val, 10)) |v| {
+                self.session_manager.queue_manager.config.max_active_downloads = v;
+                queue_changed = true;
+            } else |_| {}
+        } else if (extractJsonInt(body, "max_active_downloads")) |v| {
+            self.session_manager.queue_manager.config.max_active_downloads = @intCast(v);
+            queue_changed = true;
+        }
+        if (extractParam(body, "max_active_uploads")) |val| {
+            if (std.fmt.parseInt(i32, val, 10)) |v| {
+                self.session_manager.queue_manager.config.max_active_uploads = v;
+                queue_changed = true;
+            } else |_| {}
+        } else if (extractJsonInt(body, "max_active_uploads")) |v| {
+            self.session_manager.queue_manager.config.max_active_uploads = @intCast(v);
+            queue_changed = true;
+        }
+        if (extractParam(body, "max_active_torrents")) |val| {
+            if (std.fmt.parseInt(i32, val, 10)) |v| {
+                self.session_manager.queue_manager.config.max_active_torrents = v;
+                queue_changed = true;
+            } else |_| {}
+        } else if (extractJsonInt(body, "max_active_torrents")) |v| {
+            self.session_manager.queue_manager.config.max_active_torrents = @intCast(v);
+            queue_changed = true;
+        }
+
+        // If queue settings changed, re-evaluate the queue
+        if (queue_changed) {
+            self.session_manager.runQueueEnforcement();
         }
 
         return .{ .body = "{\"status\":\"ok\"}" };
@@ -1369,6 +1440,50 @@ pub const ApiHandler = struct {
             return .{ .status = 500, .body = "{\"error\":\"internal\"}" };
         return .{ .body = resp, .owned_body = resp };
     }
+
+    // ── Queue management endpoints (qBittorrent-compatible) ──
+
+    fn handleQueueIncreasePrio(self: *const ApiHandler, allocator: std.mem.Allocator, body: []const u8) server.Response {
+        return self.handleQueuePrioAction(allocator, body, .increase);
+    }
+
+    fn handleQueueDecreasePrio(self: *const ApiHandler, allocator: std.mem.Allocator, body: []const u8) server.Response {
+        return self.handleQueuePrioAction(allocator, body, .decrease);
+    }
+
+    fn handleQueueTopPrio(self: *const ApiHandler, allocator: std.mem.Allocator, body: []const u8) server.Response {
+        return self.handleQueuePrioAction(allocator, body, .top);
+    }
+
+    fn handleQueueBottomPrio(self: *const ApiHandler, allocator: std.mem.Allocator, body: []const u8) server.Response {
+        return self.handleQueuePrioAction(allocator, body, .bottom);
+    }
+
+    const QueueAction = enum { increase, decrease, top, bottom };
+
+    fn handleQueuePrioAction(self: *const ApiHandler, allocator: std.mem.Allocator, body: []const u8, action: QueueAction) server.Response {
+        const hashes_str = extractParam(body, "hashes") orelse
+            return .{ .status = 400, .body = "{\"error\":\"missing hashes\"}" };
+
+        // Support multiple hashes separated by |
+        var iter = std.mem.splitScalar(u8, hashes_str, '|');
+        while (iter.next()) |hash| {
+            if (hash.len == 0) continue;
+            const result = switch (action) {
+                .increase => self.session_manager.queueIncreasePrio(hash),
+                .decrease => self.session_manager.queueDecreasePrio(hash),
+                .top => self.session_manager.queueTopPrio(hash),
+                .bottom => self.session_manager.queueBottomPrio(hash),
+            };
+            result catch |err| {
+                const msg = std.fmt.allocPrint(allocator, "{{\"error\":\"{s}\"}}", .{@errorName(err)}) catch
+                    return .{ .status = 500, .body = "{\"error\":\"internal\"}" };
+                return .{ .status = 404, .body = msg, .owned_body = msg };
+            };
+        }
+
+        return .{ .body = "{\"status\":\"ok\"}" };
+    }
 };
 
 fn serializeTorrentInfo(allocator: std.mem.Allocator, json: *std.ArrayList(u8), stat: TorrentSession.Stats) !void {
@@ -1425,7 +1540,7 @@ fn serializeTorrentInfo(allocator: std.mem.Allocator, json: *std.ArrayList(u8), 
 
     try json.print(
         allocator,
-        ",\"f_l_piece_prio\":false,\"force_start\":false,\"super_seeding\":{s},\"partial_seed\":{s},\"auto_tmm\":false,\"category\":\"{f}\",\"tags\":\"{f}\",\"tracker\":\"{f}\",\"trackers_count\":{},\"amount_left\":{},\"completed\":{},\"downloaded\":{},\"downloaded_session\":{},\"uploaded\":{},\"uploaded_session\":{},\"time_active\":{},\"seeding_time\":{},\"last_activity\":{},\"seen_complete\":-1,\"priority\":0,\"availability\":-1,\"max_ratio\":-1,\"max_seeding_time\":-1,\"ratio_limit\":-1,\"seeding_time_limit\":-1,\"popularity\":0,\"magnet_uri\":\"{f}\",\"reannounce\":0}}",
+        ",\"f_l_piece_prio\":false,\"force_start\":false,\"super_seeding\":{s},\"partial_seed\":{s},\"auto_tmm\":false,\"category\":\"{f}\",\"tags\":\"{f}\",\"tracker\":\"{f}\",\"trackers_count\":{},\"amount_left\":{},\"completed\":{},\"downloaded\":{},\"downloaded_session\":{},\"uploaded\":{},\"uploaded_session\":{},\"time_active\":{},\"seeding_time\":{},\"last_activity\":{},\"seen_complete\":-1,\"priority\":{},\"availability\":-1,\"max_ratio\":-1,\"max_seeding_time\":-1,\"ratio_limit\":-1,\"seeding_time_limit\":-1,\"popularity\":0,\"magnet_uri\":\"{f}\",\"reannounce\":0}}",
         .{
             @as([]const u8, if (stat.super_seeding) "true" else "false"),
             @as([]const u8, if (stat.partial_seed) "true" else "false"),
@@ -1442,6 +1557,7 @@ fn serializeTorrentInfo(allocator: std.mem.Allocator, json: *std.ArrayList(u8), 
             time_active,
             @as(i64, if (stat.state == .seeding) time_active else 0),
             now,
+            stat.queue_position,
             esc(magnet_uri),
         },
     );
@@ -1489,6 +1605,29 @@ fn extractJsonInt(body: []const u8, key: []const u8) ?u64 {
     if (val_end == val_start) return null;
 
     return std.fmt.parseInt(u64, body[val_start..val_end], 10) catch null;
+}
+
+/// Extract a boolean value from a simple JSON object by key.
+/// Handles: {"key":true} or {"key": false} patterns without a full JSON parser.
+fn extractJsonBool(body: []const u8, key: []const u8) ?bool {
+    var needle_buf: [128]u8 = undefined;
+    if (key.len + 3 > needle_buf.len) return null;
+    needle_buf[0] = '"';
+    @memcpy(needle_buf[1..][0..key.len], key);
+    needle_buf[key.len + 1] = '"';
+    needle_buf[key.len + 2] = ':';
+    const needle = needle_buf[0 .. key.len + 3];
+
+    const key_pos = std.mem.indexOf(u8, body, needle) orelse return null;
+    var val_start = key_pos + needle.len;
+
+    // Skip whitespace
+    while (val_start < body.len and body[val_start] == ' ') val_start += 1;
+    if (val_start >= body.len) return null;
+
+    if (val_start + 4 <= body.len and std.mem.eql(u8, body[val_start..][0..4], "true")) return true;
+    if (val_start + 5 <= body.len and std.mem.eql(u8, body[val_start..][0..5], "false")) return false;
+    return null;
 }
 
 test "extract form param" {

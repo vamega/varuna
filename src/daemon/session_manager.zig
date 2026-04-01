@@ -5,6 +5,8 @@ const TorrentState = @import("torrent_session.zig").State;
 const categories_mod = @import("categories.zig");
 pub const CategoryStore = categories_mod.CategoryStore;
 pub const TagStore = categories_mod.TagStore;
+pub const QueueManager = @import("queue_manager.zig").QueueManager;
+pub const QueueConfig = @import("queue_manager.zig").QueueConfig;
 const ResumeDb = @import("../storage/resume.zig").ResumeDb;
 const BanList = @import("../net/ban_list.zig").BanList;
 
@@ -29,6 +31,9 @@ pub const SessionManager = struct {
     category_store: CategoryStore,
     tag_store: TagStore,
 
+    /// Queue manager for controlling how many torrents are active.
+    queue_manager: QueueManager,
+
     /// Shared resume DB for category/tag persistence. Opened once, shared
     /// with all sessions. null if no resume_db_path is configured.
     resume_db: ?ResumeDb = null,
@@ -43,6 +48,7 @@ pub const SessionManager = struct {
             .sessions = std.StringHashMap(*TorrentSession).init(allocator),
             .category_store = CategoryStore.init(allocator),
             .tag_store = TagStore.init(allocator),
+            .queue_manager = QueueManager.init(allocator),
         };
     }
 
@@ -75,6 +81,9 @@ pub const SessionManager = struct {
 
         self.resume_db = db;
 
+        // Load queue positions from SQLite
+        self.queue_manager.loadFromDb(&db);
+
         // Load ban list from SQLite
         self.loadBanList();
     }
@@ -88,6 +97,7 @@ pub const SessionManager = struct {
         self.sessions.deinit();
         self.category_store.deinit();
         self.tag_store.deinit();
+        self.queue_manager.deinit();
         if (self.ban_list) |bl| {
             bl.deinit();
             self.allocator.destroy(bl);
@@ -124,8 +134,19 @@ pub const SessionManager = struct {
 
         try self.sessions.put(&session.info_hash_hex, session);
 
-        // Auto-start (with shared event loop if available)
-        session.startWithEventLoop(self.shared_event_loop);
+        // Add to queue (bottom)
+        _ = self.queue_manager.addTorrent(session.info_hash_hex) catch 0;
+
+        // Auto-start or queue based on limits
+        if (self.queue_manager.config.enabled and
+            !self.queue_manager.shouldBeActive(session.info_hash_hex, &self.sessions))
+        {
+            session.state = .queued;
+        } else {
+            session.startWithEventLoop(self.shared_event_loop);
+        }
+
+        self.persistQueuePositions();
 
         return session;
     }
@@ -160,8 +181,19 @@ pub const SessionManager = struct {
 
         try self.sessions.put(&session.info_hash_hex, session);
 
-        // Auto-start (with shared event loop if available)
-        session.startWithEventLoop(self.shared_event_loop);
+        // Add to queue (bottom)
+        _ = self.queue_manager.addTorrent(session.info_hash_hex) catch 0;
+
+        // Auto-start or queue based on limits
+        if (self.queue_manager.config.enabled and
+            !self.queue_manager.shouldBeActive(session.info_hash_hex, &self.sessions))
+        {
+            session.state = .queued;
+        } else {
+            session.startWithEventLoop(self.shared_event_loop);
+        }
+
+        self.persistQueuePositions();
 
         return session;
     }
@@ -182,6 +214,9 @@ pub const SessionManager = struct {
             return error.TorrentNotFound;
         };
         var session = kv.value;
+
+        // Remove from queue
+        self.queue_manager.removeTorrent(session.info_hash_hex);
 
         // Grab info we need before deinit
         const save_path = self.allocator.dupe(u8, session.save_path) catch {
@@ -269,6 +304,10 @@ pub const SessionManager = struct {
             // Clean up empty directories (bottom-up)
             cleanupEmptyDirs(save_path, torrent_name);
         }
+
+        // A slot may have opened up -- start queued torrents if applicable
+        self.runQueueEnforcement();
+        self.persistQueuePositions();
     }
 
     // ── Ban list management ──────────────────────────────
@@ -412,15 +451,39 @@ pub const SessionManager = struct {
 
         const session = self.sessions.get(hash) orelse return error.TorrentNotFound;
         session.pause();
+
+        // A slot opened up -- start queued torrents if applicable
+        self.runQueueEnforcementLocked();
     }
 
-    /// Resume a torrent.
+    /// Resume a torrent. If queueing is enabled, the torrent may go to
+    /// queued state instead of immediately starting.
     pub fn resumeTorrent(self: *SessionManager, hash: []const u8) !void {
         self.mutex.lock();
         defer self.mutex.unlock();
 
         const session = self.sessions.get(hash) orelse return error.TorrentNotFound;
-        session.resume_session();
+
+        if (session.state == .queued) {
+            // The torrent was queued -- attempt to make it active
+            if (self.queue_manager.config.enabled) {
+                // Temporarily set to paused so shouldBeActive can evaluate it as "wants to start"
+                // Actually, just run enforcement which will pick this one up
+                // if there is a slot available
+                session.state = .paused; // mark as "wants to run"
+                session.resume_session();
+                // If enforcement says it can't be active, queue it again
+                if (!self.queue_manager.shouldBeActive(session.info_hash_hex, &self.sessions)) {
+                    session.pause();
+                    session.state = .queued;
+                }
+            } else {
+                session.state = .paused; // so resume_session sees .paused
+                session.resume_session();
+            }
+        } else {
+            session.resume_session();
+        }
     }
 
     /// Get stats for all torrents.
@@ -431,7 +494,9 @@ pub const SessionManager = struct {
         var stats = std.ArrayList(Stats).empty;
         var iter = self.sessions.iterator();
         while (iter.next()) |entry| {
-            try stats.append(allocator, entry.value_ptr.*.getStats());
+            var s = entry.value_ptr.*.getStats();
+            s.queue_position = self.queue_manager.getPosition(entry.value_ptr.*.info_hash_hex) orelse 0;
+            try stats.append(allocator, s);
         }
         return stats.toOwnedSlice(allocator);
     }
@@ -442,7 +507,9 @@ pub const SessionManager = struct {
         defer self.mutex.unlock();
 
         const session = self.sessions.get(hash) orelse return error.TorrentNotFound;
-        return session.getStats();
+        var s = session.getStats();
+        s.queue_position = self.queue_manager.getPosition(session.info_hash_hex) orelse 0;
+        return s;
     }
 
     /// Toggle sequential download mode for a torrent.
@@ -520,6 +587,98 @@ pub const SessionManager = struct {
         session.stop();
         // Restart it (will recheck from disk)
         session.startWithEventLoop(self.shared_event_loop);
+    }
+
+    // ── Queue management ─────────────────────────────────
+
+    /// Move torrent to top of queue (highest priority).
+    pub fn queueTopPrio(self: *SessionManager, hash: []const u8) !void {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+
+        const session = self.sessions.get(hash) orelse return error.TorrentNotFound;
+        self.queue_manager.moveToTop(session.info_hash_hex);
+        self.runQueueEnforcementLocked();
+        self.persistQueuePositionsLocked();
+    }
+
+    /// Move torrent to bottom of queue (lowest priority).
+    pub fn queueBottomPrio(self: *SessionManager, hash: []const u8) !void {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+
+        const session = self.sessions.get(hash) orelse return error.TorrentNotFound;
+        self.queue_manager.moveToBottom(session.info_hash_hex);
+        self.runQueueEnforcementLocked();
+        self.persistQueuePositionsLocked();
+    }
+
+    /// Increase torrent priority (move up in queue).
+    pub fn queueIncreasePrio(self: *SessionManager, hash: []const u8) !void {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+
+        const session = self.sessions.get(hash) orelse return error.TorrentNotFound;
+        self.queue_manager.increasePriority(session.info_hash_hex);
+        self.runQueueEnforcementLocked();
+        self.persistQueuePositionsLocked();
+    }
+
+    /// Decrease torrent priority (move down in queue).
+    pub fn queueDecreasePrio(self: *SessionManager, hash: []const u8) !void {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+
+        const session = self.sessions.get(hash) orelse return error.TorrentNotFound;
+        self.queue_manager.decreasePriority(session.info_hash_hex);
+        self.runQueueEnforcementLocked();
+        self.persistQueuePositionsLocked();
+    }
+
+    /// Run queue enforcement: start queued torrents if slots are available.
+    /// Called from contexts where the mutex is NOT held.
+    pub fn runQueueEnforcement(self: *SessionManager) void {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        self.runQueueEnforcementLocked();
+    }
+
+    /// Run queue enforcement while the mutex is already held.
+    fn runQueueEnforcementLocked(self: *SessionManager) void {
+        if (!self.queue_manager.config.enabled) return;
+
+        const result = self.queue_manager.enforceQueue(&self.sessions);
+        for (0..result.start_count) |i| {
+            const hash = result.to_start[i];
+            if (self.sessions.get(&hash)) |session| {
+                if (session.state == .queued) {
+                    session.state = .paused; // so resume_session sees .paused
+                    session.resume_session();
+                }
+            }
+        }
+    }
+
+    /// Persist queue positions to SQLite. Acquires mutex.
+    fn persistQueuePositions(self: *SessionManager) void {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        self.persistQueuePositionsLocked();
+    }
+
+    /// Persist queue positions to SQLite. Caller must hold mutex.
+    fn persistQueuePositionsLocked(self: *SessionManager) void {
+        if (self.resume_db) |*db| {
+            self.queue_manager.saveToDb(db);
+        }
+    }
+
+    /// Load queue positions from the resume DB and apply config.
+    /// Call after setting resume_db_path and before accepting API requests.
+    pub fn loadQueueState(self: *SessionManager) void {
+        if (self.resume_db) |*db| {
+            self.queue_manager.loadFromDb(db);
+        }
     }
 
     // ── Category / Tag operations ─────────────────────────
