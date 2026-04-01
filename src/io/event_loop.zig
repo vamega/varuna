@@ -1861,3 +1861,71 @@ test "event loop supports high torrent counts with hashed lookup and slot reuse"
     try std.testing.expectEqual(@as(TorrentIdType, 4_096), replacement_id);
     try std.testing.expectEqual(@as(?TorrentIdType, replacement_id), el.findTorrentIdByInfoHash(&replacement_hash));
 }
+
+test "peer and torrent membership indices stay consistent across swap-remove" {
+    var el = try EventLoop.initBare(std.testing.allocator, 0);
+    defer el.deinit();
+
+    const empty_fds = [_]posix.fd_t{};
+    const tid0 = try el.addTorrentContext(.{
+        .shared_fds = empty_fds[0..],
+        .info_hash = [_]u8{0x11} ** 20,
+        .peer_id = [_]u8{0x22} ** 20,
+    });
+    const tid1 = try el.addTorrentContext(.{
+        .shared_fds = empty_fds[0..],
+        .info_hash = [_]u8{0x33} ** 20,
+        .peer_id = [_]u8{0x44} ** 20,
+    });
+
+    const torrent0_slots = [_]u16{ 0, 1, 2 };
+    for (torrent0_slots) |slot| {
+        el.peers[slot].state = .active_recv_header;
+        el.peers[slot].torrent_id = tid0;
+        el.peers[slot].availability_known = true;
+        el.peers[slot].peer_choking = false;
+        el.attachPeerToTorrent(tid0, slot);
+        el.markActivePeer(slot);
+        el.markIdle(slot);
+    }
+
+    el.peers[3].state = .active_recv_header;
+    el.peers[3].torrent_id = tid1;
+    el.peers[3].availability_known = true;
+    el.peers[3].peer_choking = false;
+    el.attachPeerToTorrent(tid1, 3);
+    el.markActivePeer(3);
+    el.markIdle(3);
+
+    try std.testing.expectEqual(@as(usize, 4), el.active_peer_slots.items.len);
+    try std.testing.expectEqual(@as(usize, 4), el.idle_peers.items.len);
+    try std.testing.expectEqual(@as(usize, 2), el.torrents_with_peers.items.len);
+
+    el.unmarkIdle(1);
+    try std.testing.expectEqual(@as(?u16, null), el.peers[1].idle_peer_index);
+    try std.testing.expectEqual(@as(?u16, 1), el.peers[3].idle_peer_index);
+    try std.testing.expectEqual(@as(u16, 3), el.idle_peers.items[1]);
+
+    el.unmarkActivePeer(1);
+    try std.testing.expectEqual(@as(?u16, null), el.peers[1].active_peer_index);
+    try std.testing.expectEqual(@as(?u16, 1), el.peers[3].active_peer_index);
+    try std.testing.expectEqual(@as(u16, 3), el.active_peer_slots.items[1]);
+
+    el.detachPeerFromTorrent(tid0, 1);
+    try std.testing.expectEqual(@as(?u16, null), el.peers[1].torrent_peer_index);
+    try std.testing.expectEqual(@as(?u16, 1), el.peers[2].torrent_peer_index);
+    try std.testing.expectEqual(@as(u16, 2), el.getTorrentContext(tid0).?.peer_slots.items[1]);
+
+    el.detachPeerFromTorrent(tid0, 0);
+    try std.testing.expectEqual(@as(?u16, 0), el.peers[2].torrent_peer_index);
+    try std.testing.expectEqual(@as(u16, 2), el.getTorrentContext(tid0).?.peer_slots.items[0]);
+
+    el.detachPeerFromTorrent(tid0, 2);
+    const tc0 = el.getTorrentContext(tid0).?;
+    const tc1 = el.getTorrentContext(tid1).?;
+    try std.testing.expectEqual(@as(usize, 0), tc0.peer_slots.items.len);
+    try std.testing.expectEqual(@as(?u32, null), tc0.torrent_peer_list_index);
+    try std.testing.expectEqual(@as(?u32, 0), tc1.torrent_peer_list_index);
+    try std.testing.expectEqual(@as(usize, 1), el.torrents_with_peers.items.len);
+    try std.testing.expectEqual(tid1, el.torrents_with_peers.items[0]);
+}
