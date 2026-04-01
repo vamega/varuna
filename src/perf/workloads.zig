@@ -10,6 +10,9 @@ const rpc_server = varuna.rpc.server;
 const sync_mod = varuna.rpc.sync;
 const event_loop_mod = varuna.io.event_loop;
 const peer_handler = varuna.io.peer_handler;
+const http_mod = varuna.io.http;
+const Ring = varuna.io.ring.Ring;
+const mse_mod = varuna.crypto.mse;
 const SessionManager = varuna.daemon.session_manager.SessionManager;
 const TorrentSession = varuna.daemon.torrent_session.TorrentSession;
 
@@ -37,9 +40,13 @@ pub const Scenario = enum {
     seed_batch,
     http_response,
     api_get_burst,
+    api_get_seq,
     api_upload_burst,
+    tracker_http_fresh,
+    tracker_http_reuse_potential,
     extension_decode,
     ut_metadata_decode,
+    mse_responder_prep,
     session_load,
     sync_delta,
 
@@ -68,9 +75,13 @@ pub fn run(
         .seed_batch => runSeedBatch(allocator, alloc_counter, iterations, config),
         .http_response => runHttpResponse(allocator, alloc_counter, iterations, config),
         .api_get_burst => runApiBurst(allocator, alloc_counter, iterations, config, .get),
+        .api_get_seq => runApiSequentialGet(allocator, alloc_counter, iterations, config),
         .api_upload_burst => runApiBurst(allocator, alloc_counter, iterations, config, .upload),
+        .tracker_http_fresh => runTrackerHttpSeries(allocator, alloc_counter, iterations, .fresh),
+        .tracker_http_reuse_potential => runTrackerHttpSeries(allocator, alloc_counter, iterations, .reuse_potential),
         .extension_decode => runExtensionDecode(allocator, alloc_counter, iterations),
         .ut_metadata_decode => runUtMetadataDecode(allocator, alloc_counter, iterations),
+        .mse_responder_prep => runMseResponderPrep(allocator, alloc_counter, iterations, config),
         .session_load => runSessionLoad(allocator, alloc_counter, iterations),
         .sync_delta => runSyncDelta(allocator, alloc_counter, iterations, config),
     };
@@ -581,6 +592,79 @@ fn runApiBurst(
     );
 }
 
+const ApiSequentialWork = struct {
+    address: std.net.Address,
+    requests: usize,
+    checksum: u64 = 0,
+};
+
+fn runApiSequentialGet(
+    allocator: std.mem.Allocator,
+    alloc_counter: *CountingAllocator,
+    iterations: usize,
+    config: Config,
+) !Result {
+    var server = try rpc_server.ApiServer.init(allocator, "127.0.0.1", 0);
+    defer server.deinit();
+
+    server.setHandler(struct {
+        fn handle(_: std.mem.Allocator, request: rpc_server.Request) rpc_server.Response {
+            _ = request;
+            return .{
+                .status = 200,
+                .content_type = "application/json",
+                .body = "{\"ok\":true}",
+            };
+        }
+    }.handle);
+
+    const port = try getListenPort(server.listen_fd);
+    const address = try std.net.Address.parseIp4("127.0.0.1", port);
+    const client_threads = @max(@min(config.clients, 32), 1);
+
+    const workers = try allocator.alloc(ApiSequentialWork, client_threads);
+    defer allocator.free(workers);
+    const threads = try allocator.alloc(std.Thread, client_threads);
+    defer allocator.free(threads);
+
+    const base_requests = iterations / client_threads;
+    var remainder = iterations % client_threads;
+    for (workers) |*worker| {
+        worker.* = .{
+            .address = address,
+            .requests = base_requests + @intFromBool(remainder > 0),
+        };
+        if (remainder > 0) remainder -= 1;
+    }
+
+    const server_thread = try std.Thread.spawn(.{}, struct {
+        fn run(api_server: *rpc_server.ApiServer) void {
+            api_server.run() catch |err| std.debug.panic("api sequential benchmark server failed: {}", .{err});
+        }
+    }.run, .{&server});
+    defer {
+        server.stop();
+        wakeApiServer(address) catch {};
+        server_thread.join();
+    }
+
+    std.Thread.sleep(10 * std.time.ns_per_ms);
+    alloc_counter.stats = .{};
+
+    var timer = try std.time.Timer.start();
+    for (threads, workers) |*thread, *worker| {
+        thread.* = try std.Thread.spawn(.{}, apiSequentialClientWorker, .{worker});
+    }
+
+    var checksum: u64 = 0;
+    for (threads, workers) |*thread, *worker| {
+        thread.join();
+        checksum +%= worker.checksum;
+    }
+
+    return makeResult("api_get_seq", iterations, &timer, checksum, alloc_counter);
+}
+
 fn apiClientWorker(work: *ApiClientWork) void {
     var response_buf: [4096]u8 = undefined;
     var header_buf: [256]u8 = undefined;
@@ -626,11 +710,167 @@ fn apiClientWorker(work: *ApiClientWork) void {
     work.checksum = checksum;
 }
 
+fn apiSequentialClientWorker(work: *ApiSequentialWork) void {
+    var response_buf: [4096]u8 = undefined;
+    var checksum: u64 = 0;
+    var fd: posix.fd_t = -1;
+    defer if (fd >= 0) posix.close(fd);
+
+    const request_bytes = "GET /api/v2/app/webapiVersion HTTP/1.1\r\nHost: localhost\r\n\r\n";
+
+    for (0..work.requests) |_| {
+        var attempts: u8 = 0;
+        while (true) : (attempts += 1) {
+            if (fd < 0) {
+                fd = connectLoopback(work.address) catch |err| {
+                    std.debug.panic("api sequential benchmark connect failed: {}", .{err});
+                };
+            }
+
+            writeAll(fd, request_bytes) catch |err| {
+                if (fd >= 0) {
+                    posix.close(fd);
+                    fd = -1;
+                }
+                if (isRetryableSocketError(err) and attempts < 2) continue;
+                std.debug.panic("api sequential benchmark write failed: {}", .{err});
+            };
+
+            const n = readOneHttpResponse(fd, &response_buf) catch |err| {
+                if (fd >= 0) {
+                    posix.close(fd);
+                    fd = -1;
+                }
+                if ((isRetryableSocketError(err) or err == error.UnexpectedEndOfStream) and attempts < 2) continue;
+                std.debug.panic("api sequential benchmark read failed: {}", .{err});
+            };
+            checksum +%= std.hash.Wyhash.hash(0, response_buf[0..n]);
+            break;
+        }
+    }
+
+    work.checksum = checksum;
+}
+
 fn writeAll(fd: posix.fd_t, data: []const u8) !void {
     var written: usize = 0;
     while (written < data.len) {
         written += try posix.write(fd, data[written..]);
     }
+}
+
+fn connectLoopback(address: std.net.Address) !posix.fd_t {
+    const fd = try posix.socket(posix.AF.INET, posix.SOCK.STREAM | posix.SOCK.CLOEXEC, posix.IPPROTO.TCP);
+    errdefer posix.close(fd);
+    try posix.connect(fd, &address.any, address.getOsSockLen());
+    return fd;
+}
+
+fn readOneHttpResponse(fd: posix.fd_t, buffer: []u8) !usize {
+    var total: usize = 0;
+    var body_start: ?usize = null;
+    var content_length: ?usize = null;
+
+    while (total < buffer.len) {
+        const n = try posix.read(fd, buffer[total..]);
+        if (n == 0) return error.UnexpectedEndOfStream;
+        total += n;
+
+        if (body_start == null) {
+            if (http_mod.findBodyStart(buffer[0..total])) |start| {
+                body_start = start;
+                content_length = http_mod.parseContentLength(buffer[0..start]);
+                if (content_length == null) return error.MissingContentLength;
+            }
+        }
+
+        if (body_start) |start| {
+            const expected = start + (content_length orelse return error.MissingContentLength);
+            if (total >= expected) return expected;
+        }
+    }
+
+    return error.ResponseTooLarge;
+}
+
+fn isRetryableSocketError(err: anyerror) bool {
+    return err == error.BrokenPipe or
+        err == error.ConnectionResetByPeer or
+        err == error.ConnectionAborted or
+        err == error.NotOpenForWriting;
+}
+
+const TrackerHttpMode = enum {
+    fresh,
+    reuse_potential,
+};
+
+const TrackerServerState = struct {
+    listen_fd: posix.fd_t,
+    running: std.atomic.Value(bool) = std.atomic.Value(bool).init(true),
+};
+
+fn runTrackerHttpSeries(
+    allocator: std.mem.Allocator,
+    alloc_counter: *CountingAllocator,
+    iterations: usize,
+    mode: TrackerHttpMode,
+) !Result {
+    const listen_fd = try createLoopbackListener();
+    defer posix.close(listen_fd);
+
+    const port = try getListenPort(listen_fd);
+    var server_state = TrackerServerState{ .listen_fd = listen_fd };
+    const server_thread = try std.Thread.spawn(.{}, trackerServerWorker, .{&server_state});
+    defer {
+        server_state.running.store(false, .release);
+        wakeTrackerServer(port) catch {};
+        server_thread.join();
+    }
+
+    var ring = try Ring.init(32);
+    defer ring.deinit();
+
+    const url = try std.fmt.allocPrint(allocator, "http://127.0.0.1:{}/announce?info_hash=abc", .{port});
+    defer allocator.free(url);
+
+    std.Thread.sleep(10 * std.time.ns_per_ms);
+    alloc_counter.stats = .{};
+    var timer = try std.time.Timer.start();
+    var checksum: u64 = 0;
+
+    switch (mode) {
+        .fresh => {
+            var client = http_mod.HttpClient.init(allocator, &ring);
+            for (0..iterations) |_| {
+                var response = try client.get(url);
+                checksum +%= response.status;
+                checksum +%= std.hash.Wyhash.hash(0, response.body);
+                response.deinit();
+            }
+        },
+        .reuse_potential => {
+            const address = try std.net.Address.parseIp4("127.0.0.1", port);
+            const fd = try connectLoopback(address);
+            defer posix.close(fd);
+
+            const request = "GET /announce?info_hash=abc HTTP/1.1\r\nHost: localhost\r\nConnection: keep-alive\r\n\r\n";
+            var response_buf: [4096]u8 = undefined;
+            for (0..iterations) |_| {
+                try writeAll(fd, request);
+                const n = try readOneHttpResponse(fd, &response_buf);
+                checksum +%= std.hash.Wyhash.hash(0, response_buf[0..n]);
+            }
+        },
+    }
+
+    return makeResult(
+        if (mode == .fresh) "tracker_http_fresh" else "tracker_http_reuse_potential",
+        iterations,
+        &timer,
+        checksum,
+        alloc_counter,
+    );
 }
 
 fn createLoopbackListener() !posix.fd_t {
@@ -670,6 +910,89 @@ fn wakeApiServer(address: std.net.Address) !void {
     const fd = try posix.socket(posix.AF.INET, posix.SOCK.STREAM | posix.SOCK.CLOEXEC, posix.IPPROTO.TCP);
     defer posix.close(fd);
     posix.connect(fd, &address.any, address.getOsSockLen()) catch {};
+}
+
+fn trackerServerWorker(state: *TrackerServerState) void {
+    var request_buf: [4096]u8 = undefined;
+    var response_buf: [256]u8 = undefined;
+    const body = "d8:intervali1800e5:peers0:e";
+
+    while (state.running.load(.acquire)) {
+        var addr: posix.sockaddr = undefined;
+        var addr_len: posix.socklen_t = @sizeOf(posix.sockaddr);
+        const fd = posix.accept(state.listen_fd, &addr, &addr_len, posix.SOCK.CLOEXEC) catch {
+            continue;
+        };
+
+        while (state.running.load(.acquire)) {
+            const req_len = readOneHttpRequest(fd, &request_buf) catch break;
+            const request = request_buf[0..req_len];
+            const keep_alive = std.mem.indexOf(u8, request, "Connection: keep-alive") != null;
+            const response = std.fmt.bufPrint(
+                &response_buf,
+                "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: {s}\r\n\r\n{s}",
+                .{ body.len, if (keep_alive) "keep-alive" else "close", body },
+            ) catch break;
+            writeAll(fd, response) catch break;
+            if (!keep_alive) break;
+        }
+
+        posix.close(fd);
+    }
+}
+
+fn readOneHttpRequest(fd: posix.fd_t, buffer: []u8) !usize {
+    var total: usize = 0;
+    while (total < buffer.len) {
+        const n = try posix.read(fd, buffer[total..]);
+        if (n == 0) return error.UnexpectedEndOfStream;
+        total += n;
+        if (std.mem.indexOf(u8, buffer[0..total], "\r\n\r\n")) |end| {
+            return end + 4;
+        }
+    }
+    return error.RequestTooLarge;
+}
+
+fn wakeTrackerServer(port: u16) !void {
+    const address = try std.net.Address.parseIp4("127.0.0.1", port);
+    const fd = try posix.socket(posix.AF.INET, posix.SOCK.STREAM | posix.SOCK.CLOEXEC, posix.IPPROTO.TCP);
+    defer posix.close(fd);
+    posix.connect(fd, &address.any, address.getOsSockLen()) catch {};
+}
+
+fn runMseResponderPrep(
+    allocator: std.mem.Allocator,
+    alloc_counter: *CountingAllocator,
+    iterations: usize,
+    config: Config,
+) !Result {
+    const hash_count = @max(config.torrents, 1);
+    const source_hashes = try allocator.alloc([20]u8, hash_count);
+    defer allocator.free(source_hashes);
+    var lookup = std.AutoHashMap([20]u8, [20]u8).init(allocator);
+    defer lookup.deinit();
+
+    for (source_hashes, 0..) |*hash, idx| {
+        for (hash, 0..) |*byte, byte_idx| {
+            byte.* = @truncate((idx *% 17) +% (byte_idx *% 13) +% 11);
+        }
+        std.mem.writeInt(u64, hash[0..8], idx, .little);
+        try lookup.put(mse_mod.hashReq2ForInfoHash(hash.*), hash.*);
+    }
+
+    const target_hash = source_hashes[hash_count / 2];
+    const target_req2 = mse_mod.hashReq2ForInfoHash(target_hash);
+
+    var timer = try std.time.Timer.start();
+    var checksum: u64 = 0;
+
+    for (0..iterations) |_| {
+        const matched = mse_mod.matchKnownHashLookup(&lookup, target_req2) orelse return error.MatchFailed;
+        checksum +%= std.hash.Wyhash.hash(0, &matched);
+    }
+
+    return makeResult("mse_responder_prep", iterations, &timer, checksum, alloc_counter);
 }
 
 fn runSessionLoad(

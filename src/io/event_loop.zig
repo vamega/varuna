@@ -355,6 +355,7 @@ pub const EventLoop = struct {
     free_torrent_ids: std.ArrayList(TorrentId),
     active_torrent_ids: std.ArrayList(TorrentId),
     info_hash_to_torrent: std.AutoHashMap([20]u8, TorrentId),
+    mse_req2_to_hash: std.AutoHashMap([20]u8, [20]u8),
     torrent_count: TorrentId = 0,
 
     // Listening port for tracker announces
@@ -492,6 +493,7 @@ pub const EventLoop = struct {
             .free_torrent_ids = std.ArrayList(TorrentId).empty,
             .active_torrent_ids = try std.ArrayList(TorrentId).initCapacity(allocator, default_torrent_capacity),
             .info_hash_to_torrent = std.AutoHashMap([20]u8, TorrentId).init(allocator),
+            .mse_req2_to_hash = std.AutoHashMap([20]u8, [20]u8).init(allocator),
             .pending_writes = .empty,
             .pending_write_lookup = .empty,
             .pending_sends = std.ArrayList(PendingSend).empty,
@@ -530,6 +532,7 @@ pub const EventLoop = struct {
             .free_torrent_ids = std.ArrayList(TorrentId).empty,
             .active_torrent_ids = try std.ArrayList(TorrentId).initCapacity(allocator, default_torrent_capacity),
             .info_hash_to_torrent = std.AutoHashMap([20]u8, TorrentId).init(allocator),
+            .mse_req2_to_hash = std.AutoHashMap([20]u8, [20]u8).init(allocator),
             .pending_writes = .empty,
             .pending_write_lookup = .empty,
             .pending_sends = std.ArrayList(PendingSend).empty,
@@ -655,6 +658,7 @@ pub const EventLoop = struct {
         self.free_torrent_ids.deinit(self.allocator);
         self.active_torrent_ids.deinit(self.allocator);
         self.info_hash_to_torrent.deinit();
+        self.mse_req2_to_hash.deinit();
         // Clean up shared announce ring (created once, reused across announces)
         if (self.announce_ring) |*r| r.deinit();
         if (self.announce_result_peers) |peers| self.allocator.free(peers);
@@ -1670,24 +1674,29 @@ pub const EventLoop = struct {
         const hash_slot = try self.info_hash_to_torrent.getOrPut(info_hash);
         if (hash_slot.found_existing and hash_slot.value_ptr.* != torrent_id) return error.DuplicateInfoHash;
         hash_slot.value_ptr.* = torrent_id;
+        try self.mse_req2_to_hash.put(mse.hashReq2ForInfoHash(info_hash), info_hash);
 
         if (info_hash_v2) |v2_hash| {
             if (!std.mem.eql(u8, &v2_hash, &info_hash)) {
                 const v2_slot = try self.info_hash_to_torrent.getOrPut(v2_hash);
                 if (v2_slot.found_existing and v2_slot.value_ptr.* != torrent_id) {
                     if (!hash_slot.found_existing) _ = self.info_hash_to_torrent.remove(info_hash);
+                    _ = self.mse_req2_to_hash.remove(mse.hashReq2ForInfoHash(info_hash));
                     return error.DuplicateInfoHash;
                 }
                 v2_slot.value_ptr.* = torrent_id;
+                try self.mse_req2_to_hash.put(mse.hashReq2ForInfoHash(v2_hash), v2_hash);
             }
         }
     }
 
     fn unregisterTorrentHashes(self: *EventLoop, info_hash: [20]u8, info_hash_v2: ?[20]u8) void {
         _ = self.info_hash_to_torrent.remove(info_hash);
+        _ = self.mse_req2_to_hash.remove(mse.hashReq2ForInfoHash(info_hash));
         if (info_hash_v2) |v2_hash| {
             if (!std.mem.eql(u8, &v2_hash, &info_hash)) {
                 _ = self.info_hash_to_torrent.remove(v2_hash);
+                _ = self.mse_req2_to_hash.remove(mse.hashReq2ForInfoHash(v2_hash));
             }
         }
     }

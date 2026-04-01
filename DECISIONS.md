@@ -404,3 +404,23 @@ Follow-up triggers:
 - Add parallel metadata piece requests when multiple peers are available.
 - Add retry logic across peers if metadata hash verification fails.
 - Support trackerless magnets once DHT is implemented.
+
+### 2026-04-01: Keep API Connections Alive And Precompute MSE Responder Matches
+
+Context:
+The existing `api_get_seq` workload was dominated by repeated accept/connect/close churn for WebUI-style polling, and the inbound MSE responder path still allocated and copied all active torrent hashes per connection before recomputing `hashReq2` linearly across them.
+
+Decision:
+- Keep HTTP/1.1 connections alive by default in the RPC server, reusing the client slot and buffered receive storage across sequential requests unless the client explicitly sends `Connection: close`.
+- Parse request framing into a consumed-length result so the server can retain pipelined leftovers in the receive buffer instead of forcing one-request-per-connection behavior.
+- Maintain a shared `req2 -> info_hash` lookup table in the shared event loop and initialize inbound MSE responder handshakes from that lookup instead of heap-copying the torrent hash list into every peer.
+- Add explicit perf workloads for sequential API polling, MSE responder preparation, and tracker HTTP reuse potential.
+
+Reasoning:
+- The sequential RPC workload improved from `2.41e8 ns` to `9.56e7 ns` and `8.71e7 ns` on repeat runs with the same `4000` requests / `8` clients shape, which is a large enough win to justify the extra request-framing logic.
+- The MSE responder-prep workload improved from `1.019e9 ns`, `2001` allocs, and `800 MB` of churn to `5.21e4 ns` / `3.57e4 ns` and only setup-time map allocations at `20,000` torrents, which is exactly the kind of scale-path improvement the shared daemon needs.
+- A tracker-like loopback benchmark showed strong microbenchmark upside for connection reuse (`~7.31e8 ns` / `7.04e8 ns` fresh versus `~2.83e8 ns` / `2.72e8 ns` reused for `2000` requests), but that result is still benchmark-only. The current daemon still needs a broader shared tracker-client ownership model before reusing connections across real torrent sessions.
+
+Follow-up triggers:
+- If WebUI polling remains prominent, consider header-buffer reuse in the API server so the keep-alive path also cuts the remaining per-response header allocation.
+- If tracker reuse is pursued in production, do it as a shared executor/pool across torrent sessions instead of a per-session connection cache.

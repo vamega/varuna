@@ -1148,6 +1148,7 @@ pub const MseResponderHandshake = struct {
 
     // Known info-hashes we accept (borrowed slice, must outlive handshake)
     known_hashes: []const [20]u8,
+    known_hash_lookup: ?*const std.AutoHashMap([20]u8, [20]u8) = null,
     matched_hash: ?[20]u8 = null,
 
     // Ciphers
@@ -1201,6 +1202,19 @@ pub const MseResponderHandshake = struct {
         };
 
         // Generate DH keypair
+        self.private_key = generatePrivateKey();
+        self.public_key = computePublicKey(self.private_key);
+
+        return self;
+    }
+
+    pub fn initWithLookup(known_hash_lookup: *const std.AutoHashMap([20]u8, [20]u8), mode: EncryptionMode) MseResponderHandshake {
+        var self = MseResponderHandshake{
+            .mode = mode,
+            .known_hashes = &.{},
+            .known_hash_lookup = known_hash_lookup,
+        };
+
         self.private_key = generatePrivateKey();
         self.public_key = computePublicKey(self.private_key);
 
@@ -1388,15 +1402,10 @@ pub const MseResponderHandshake = struct {
             target_req2[i] = self.req2_xor_req3[i] ^ self.expected_req3[i];
         }
 
-        // Match against known hashes
-        self.matched_hash = null;
-        for (self.known_hashes) |hash| {
-            const candidate = hashReq2(hash);
-            if (std.mem.eql(u8, &candidate, &target_req2)) {
-                self.matched_hash = hash;
-                break;
-            }
-        }
+        self.matched_hash = if (self.known_hash_lookup) |lookup|
+            matchKnownHashLookup(lookup, target_req2)
+        else
+            matchKnownHashLinear(self.known_hashes, target_req2);
 
         const skey = self.matched_hash orelse return .{ .failed = .unknown_info_hash };
 
@@ -1510,6 +1519,22 @@ pub const MseResponderHandshake = struct {
         return self.matched_hash;
     }
 };
+
+pub fn hashReq2ForInfoHash(info_hash: [20]u8) [20]u8 {
+    return hashReq2(info_hash);
+}
+
+pub fn matchKnownHashLinear(known_hashes: []const [20]u8, target_req2: [20]u8) ?[20]u8 {
+    for (known_hashes) |hash| {
+        const candidate = hashReq2(hash);
+        if (std.mem.eql(u8, &candidate, &target_req2)) return hash;
+    }
+    return null;
+}
+
+pub fn matchKnownHashLookup(lookup: *const std.AutoHashMap([20]u8, [20]u8), target_req2: [20]u8) ?[20]u8 {
+    return lookup.get(target_req2);
+}
 
 /// Detect whether incoming bytes look like an MSE handshake.
 /// MSE starts with a 96-byte DH public key which looks like random data.

@@ -627,10 +627,6 @@ fn executeMseAction(self: *EventLoop, slot: u16, action: mse.MseAction, is_initi
                             peer.torrent_id = tid;
                         }
                     }
-                    if (peer.mse_known_hashes) |hashes| {
-                        self.allocator.free(hashes);
-                        peer.mse_known_hashes = null;
-                    }
                     self.allocator.destroy(mr);
                     peer.mse_responder = null;
                     log.info("slot {d}: MSE handshake complete (responder, method={s})", .{
@@ -671,10 +667,6 @@ fn handleMseFailure(self: *EventLoop, slot: u16, is_initiator: bool) void {
         if (peer.mse_responder) |mr| {
             self.allocator.destroy(mr);
             peer.mse_responder = null;
-        }
-        if (peer.mse_known_hashes) |hashes| {
-            self.allocator.free(hashes);
-            peer.mse_known_hashes = null;
         }
     }
 
@@ -764,29 +756,7 @@ fn attemptMseFallback(self: *EventLoop, slot: u16) void {
 fn startMseResponder(self: *EventLoop, slot: u16) void {
     const peer = &self.peers[slot];
 
-    // Collect known info-hashes from all active torrents
-    const hash_count = self.active_torrent_ids.items.len;
-
-    if (hash_count == 0) {
-        self.removePeer(slot);
-        return;
-    }
-
-    const known_hashes = self.allocator.alloc([20]u8, hash_count) catch {
-        self.removePeer(slot);
-        return;
-    };
-    errdefer self.allocator.free(known_hashes);
-
-    var hash_index: usize = 0;
-    for (self.active_torrent_ids.items) |torrent_id| {
-        const tc = self.getTorrentContextConst(torrent_id) orelse continue;
-        known_hashes[hash_index] = tc.info_hash;
-        hash_index += 1;
-    }
-
-    if (hash_index == 0) {
-        self.allocator.free(known_hashes);
+    if (self.mse_req2_to_hash.count() == 0) {
         self.removePeer(slot);
         return;
     }
@@ -796,9 +766,8 @@ fn startMseResponder(self: *EventLoop, slot: u16) void {
         self.removePeer(slot);
         return;
     };
-    mr.* = mse.MseResponderHandshake.init(known_hashes[0..hash_index], self.encryption_mode);
+    mr.* = mse.MseResponderHandshake.initWithLookup(&self.mse_req2_to_hash, self.encryption_mode);
     peer.mse_responder = mr;
-    peer.mse_known_hashes = known_hashes;
 
     // The first byte we already received is part of the DH key.
     // We need to feed it to the state machine. The responder starts

@@ -242,6 +242,50 @@ Interpretation:
 - `accept_multishot` produced a modest but repeatable improvement for the low-concurrency inbound case on this host, roughly `5.8%` against the direct one-shot A/B baseline.
 - The more concurrent 8-thread burst was effectively flat/noisy, so do not treat this change as a broad listener throughput breakthrough by itself.
 
+## API Keep-Alive Snapshot (ReleaseFast, 2026-04-01)
+
+Measured with the sequential polling workload against the real loopback RPC server:
+
+| Scenario | Before | After |
+|----------|--------|-------|
+| `api_get_seq --iterations=4000 --clients=8` | `241075138 ns` | `95649970 ns`, `87088833 ns` |
+
+Interpretation:
+
+- Server-side HTTP/1.1 keep-alive is a real win for WebUI-style polling on this host, roughly `2.5x` to `2.8x` faster on the measured sequential request shape.
+- The remaining allocator count is still dominated by one response-header allocation per request, so keep-alive addressed socket churn first, not all transient RPC allocation.
+
+## MSE Responder Snapshot (ReleaseFast, 2026-04-01)
+
+Measured with the synthetic inbound MSE setup workload at `20,000` active torrents:
+
+| Scenario | Before | After |
+|----------|--------|-------|
+| `mse_responder_prep --iterations=2000 --torrents=20000` | `1.019e9 ns`, `2001` allocs, `800.4 MB` allocated | `52077 ns`, `14` allocs, `3.09 MB` allocated |
+
+Repeat after:
+
+- `35677 ns`
+
+Interpretation:
+
+- Replacing the per-connection copied hash list plus linear `hashReq2` recomputation with a shared lookup table is a very large scale-path win.
+- This specifically targets the “many active but mostly idle torrents” case, where inbound peer arrivals should not pay O(torrents) setup cost.
+
+## Tracker HTTP Reuse Potential (ReleaseFast, 2026-04-01)
+
+Measured against a tracker-like loopback HTTP server:
+
+| Scenario | Result |
+|----------|--------|
+| `tracker_http_fresh --iterations=2000` | `730731535 ns`, `704347260 ns` |
+| `tracker_http_reuse_potential --iterations=2000` | `282904495 ns`, `272008017 ns` |
+
+Interpretation:
+
+- Reusing a single HTTP connection for repeated tracker-style GETs is about `2.5x` faster in this microbenchmark and eliminates the per-request allocator churn entirely.
+- This result is benchmark-only for now. The daemon does not yet have a production shared tracker-connection owner, so do not read this as “tracker pooling is already landed”.
+
 ## Interpretation Notes
 
 - A minimal-client build that still shows `read`, `write`, `connect`, `recvfrom`, or `sendto` is expected until the networking and storage paths are moved to `io_uring`.

@@ -182,72 +182,7 @@ pub const ApiServer = struct {
             return;
         }
         client.recv_offset += @intCast(cqe.res);
-
-        const data = recvData(client);
-
-        // First, we need the headers (terminated by \r\n\r\n)
-        const header_end = std.mem.indexOf(u8, data, "\r\n\r\n") orelse {
-            // Haven't received complete headers yet
-            if (client.recv_offset >= max_request_size) {
-                self.sendErrorResponse(slot, 413, "Request Too Large");
-            } else {
-                if (client.recv_offset == recvStorage(client).len) {
-                    const next_capacity = @min(max_request_size, recvStorage(client).len * 2);
-                    ensureRecvCapacity(self, client, next_capacity) catch {
-                        self.sendErrorResponse(slot, 500, "Internal Server Error");
-                        return;
-                    };
-                }
-                self.submitRecv(slot) catch {
-                    self.closeClient(slot);
-                };
-            }
-            return;
-        };
-
-        // Headers are complete. Check if we need to wait for the body.
-        const body_start = header_end + 4;
-        const first_line_end = std.mem.indexOf(u8, data, "\r\n") orelse {
-            self.sendErrorResponse(slot, 400, "Bad Request");
-            return;
-        };
-        const headers = data[first_line_end + 2 .. header_end];
-        const content_length = parseContentLength(headers);
-
-        if (content_length) |expected_body_len| {
-            const body_received = client.recv_offset - body_start;
-
-            if (body_received < expected_body_len) {
-                // Need more body data. Grow buffer if needed.
-                const total_needed = body_start + expected_body_len;
-                if (total_needed > max_request_size) {
-                    self.sendErrorResponse(slot, 413, "Request Too Large");
-                    return;
-                }
-
-                ensureRecvCapacity(self, client, total_needed) catch |err| {
-                    switch (err) {
-                        error.RequestTooLarge => self.sendErrorResponse(slot, 413, "Request Too Large"),
-                        else => self.sendErrorResponse(slot, 500, "Internal Server Error"),
-                    }
-                    return;
-                };
-
-                self.submitRecv(slot) catch {
-                    self.closeClient(slot);
-                };
-                return;
-            }
-        }
-
-        // We have enough data. Parse and handle.
-        const request = parseRequest(data) orelse {
-            self.sendErrorResponse(slot, 400, "Bad Request");
-            return;
-        };
-
-        const response = self.handler(self.allocator, request);
-        self.sendResponse(slot, response);
+        self.processBufferedRequest(slot);
     }
 
     fn handleSend(self: *ApiServer, slot: u8, generation: u32, cqe: linux.io_uring_cqe) void {
@@ -264,7 +199,19 @@ pub const ApiServer = struct {
             return;
         };
         if (complete) {
-            self.closeClient(slot);
+            if (!client.keep_alive) {
+                self.closeClient(slot);
+                return;
+            }
+
+            releaseClientResponse(self, client);
+            if (client.recv_offset > 0) {
+                self.processBufferedRequest(slot);
+            } else {
+                self.submitRecv(slot) catch {
+                    self.closeClient(slot);
+                };
+            }
             return;
         }
 
@@ -333,11 +280,12 @@ pub const ApiServer = struct {
         var buf = std.ArrayList(u8).empty;
         defer buf.deinit(self.allocator);
 
-        buf.print(self.allocator, "HTTP/1.1 {} {s}\r\nContent-Type: {s}\r\nContent-Length: {}\r\nConnection: close\r\n", .{
+        buf.print(self.allocator, "HTTP/1.1 {} {s}\r\nContent-Type: {s}\r\nContent-Length: {}\r\nConnection: {s}\r\n", .{
             response.status,
             statusText(response.status),
             response.content_type,
             response.body.len,
+            if (client.keep_alive) "keep-alive" else "close",
         }) catch return;
         if (response.extra_headers) |hdrs| {
             buf.appendSlice(self.allocator, hdrs) catch return;
@@ -358,6 +306,73 @@ pub const ApiServer = struct {
             self.closeClient(slot);
             return;
         };
+    }
+
+    fn processBufferedRequest(self: *ApiServer, slot: u8) void {
+        const client = &self.clients[slot];
+        const data = recvData(client);
+
+        const header_end = std.mem.indexOf(u8, data, "\r\n\r\n") orelse {
+            if (client.recv_offset >= max_request_size) {
+                self.sendErrorResponse(slot, 413, "Request Too Large");
+            } else {
+                if (client.recv_offset == recvStorage(client).len) {
+                    const next_capacity = @min(max_request_size, recvStorage(client).len * 2);
+                    ensureRecvCapacity(self, client, next_capacity) catch {
+                        self.sendErrorResponse(slot, 500, "Internal Server Error");
+                        return;
+                    };
+                }
+                self.submitRecv(slot) catch {
+                    self.closeClient(slot);
+                };
+            }
+            return;
+        };
+
+        const body_start = header_end + 4;
+        const first_line_end = std.mem.indexOf(u8, data, "\r\n") orelse {
+            self.sendErrorResponse(slot, 400, "Bad Request");
+            return;
+        };
+        const headers = data[first_line_end + 2 .. header_end];
+        const content_length = parseContentLength(headers) orelse 0;
+        const total_needed = body_start + content_length;
+        if (total_needed > max_request_size) {
+            self.sendErrorResponse(slot, 413, "Request Too Large");
+            return;
+        }
+        if (data.len < total_needed) {
+            ensureRecvCapacity(self, client, total_needed) catch |err| {
+                switch (err) {
+                    error.RequestTooLarge => self.sendErrorResponse(slot, 413, "Request Too Large"),
+                    else => self.sendErrorResponse(slot, 500, "Internal Server Error"),
+                }
+                return;
+            };
+
+            self.submitRecv(slot) catch {
+                self.closeClient(slot);
+            };
+            return;
+        }
+
+        const parsed = parseRequest(data[0..total_needed]) orelse {
+            self.sendErrorResponse(slot, 400, "Bad Request");
+            return;
+        };
+
+        client.keep_alive = parsed.request.keep_alive;
+
+        const remaining = client.recv_offset - parsed.consumed_len;
+        if (remaining > 0) {
+            const storage = recvStorage(client);
+            std.mem.copyForwards(u8, storage[0..remaining], storage[parsed.consumed_len .. parsed.consumed_len + remaining]);
+        }
+        client.recv_offset = remaining;
+
+        const response = self.handler(self.allocator, parsed.request);
+        self.sendResponse(slot, response);
     }
 
     fn sendErrorResponse(self: *ApiServer, slot: u8, status: u16, message: []const u8) void {
@@ -403,6 +418,7 @@ pub const Request = struct {
     body: []const u8 = "",
     cookie_sid: ?[]const u8 = null,
     content_type: ?[]const u8 = null,
+    keep_alive: bool = false,
 };
 
 pub const Response = struct {
@@ -424,8 +440,14 @@ pub const ApiClient = struct {
     body: []const u8 = "",
     owned_body: ?[]u8 = null,
     body_offset: usize = 0,
+    keep_alive: bool = false,
     send_iov: [2]posix.iovec_const = undefined,
     send_msg: posix.msghdr_const = std.mem.zeroes(posix.msghdr_const),
+};
+
+const ParsedRequest = struct {
+    request: Request,
+    consumed_len: usize,
 };
 
 fn recvStorage(client: *ApiClient) []u8 {
@@ -451,7 +473,7 @@ fn ensureRecvCapacity(self: *ApiServer, client: *ApiClient, min_capacity: usize)
     client.recv_buf = new_buf;
 }
 
-fn parseRequest(data: []const u8) ?Request {
+fn parseRequest(data: []const u8) ?ParsedRequest {
     const header_end = std.mem.indexOf(u8, data, "\r\n\r\n") orelse return null;
     const first_line_end = std.mem.indexOf(u8, data, "\r\n") orelse return null;
     const first_line = data[0..first_line_end];
@@ -463,21 +485,38 @@ fn parseRequest(data: []const u8) ?Request {
     const path_start = method_end + 1;
     const path_end = std.mem.indexOfScalarPos(u8, first_line, path_start, ' ') orelse return null;
     const path = first_line[path_start..path_end];
-
-    const body = data[header_end + 4 ..];
+    const version = first_line[path_end + 1 ..];
 
     // Extract headers
     const headers = data[first_line_end + 2 .. header_end];
+    const content_length = parseContentLength(headers) orelse 0;
+    const consumed_len = header_end + 4 + content_length;
+    if (consumed_len > data.len) return null;
+    const body = data[header_end + 4 .. consumed_len];
     const cookie_sid = auth.extractSidFromHeaders(headers);
     const content_type = extractHeader(headers, "content-type");
+    const keep_alive = requestKeepAlive(version, extractHeader(headers, "connection"));
 
     return .{
-        .method = method,
-        .path = path,
-        .body = body,
-        .cookie_sid = cookie_sid,
-        .content_type = content_type,
+        .request = .{
+            .method = method,
+            .path = path,
+            .body = body,
+            .cookie_sid = cookie_sid,
+            .content_type = content_type,
+            .keep_alive = keep_alive,
+        },
+        .consumed_len = consumed_len,
     };
+}
+
+fn requestKeepAlive(version: []const u8, connection: ?[]const u8) bool {
+    if (connection) |value| {
+        const trimmed = std.mem.trim(u8, value, " ");
+        if (std.ascii.eqlIgnoreCase(trimmed, "close")) return false;
+        if (std.ascii.eqlIgnoreCase(trimmed, "keep-alive")) return true;
+    }
+    return std.mem.eql(u8, version, "HTTP/1.1");
 }
 
 /// Extract Content-Length from raw header block. Returns null if not present or invalid.
@@ -572,28 +611,35 @@ fn statusText(status: u16) []const u8 {
 test "parse HTTP request" {
     const data = "GET /api/v2/app/webapiVersion HTTP/1.1\r\nHost: localhost\r\n\r\n";
     const req = parseRequest(data).?;
-    try std.testing.expectEqualStrings("GET", req.method);
-    try std.testing.expectEqualStrings("/api/v2/app/webapiVersion", req.path);
+    try std.testing.expectEqualStrings("GET", req.request.method);
+    try std.testing.expectEqualStrings("/api/v2/app/webapiVersion", req.request.path);
+    try std.testing.expect(req.request.keep_alive);
 }
 
 test "parse POST request with body" {
     const data = "POST /api/v2/torrents/add HTTP/1.1\r\nContent-Length: 5\r\n\r\nhello";
     const req = parseRequest(data).?;
-    try std.testing.expectEqualStrings("POST", req.method);
-    try std.testing.expectEqualStrings("/api/v2/torrents/add", req.path);
-    try std.testing.expectEqualStrings("hello", req.body);
+    try std.testing.expectEqualStrings("POST", req.request.method);
+    try std.testing.expectEqualStrings("/api/v2/torrents/add", req.request.path);
+    try std.testing.expectEqualStrings("hello", req.request.body);
 }
 
 test "parse request extracts content-type" {
     const data = "POST /api/v2/torrents/add HTTP/1.1\r\nContent-Type: multipart/form-data; boundary=abc\r\nContent-Length: 0\r\n\r\n";
     const req = parseRequest(data).?;
-    try std.testing.expectEqualStrings("multipart/form-data; boundary=abc", req.content_type.?);
+    try std.testing.expectEqualStrings("multipart/form-data; boundary=abc", req.request.content_type.?);
 }
 
 test "parse request without content-type" {
     const data = "GET /api/v2/app/webapiVersion HTTP/1.1\r\nHost: localhost\r\n\r\n";
     const req = parseRequest(data).?;
-    try std.testing.expect(req.content_type == null);
+    try std.testing.expect(req.request.content_type == null);
+}
+
+test "parse request honors connection close" {
+    const data = "GET /api/v2/app/webapiVersion HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n";
+    const req = parseRequest(data).?;
+    try std.testing.expect(!req.request.keep_alive);
 }
 
 test "extractHeader case insensitive" {
@@ -667,6 +713,58 @@ test "api server handles request via io_uring" {
 
     try std.testing.expect(std.mem.startsWith(u8, response, "HTTP/1.1 200 OK"));
     try std.testing.expect(std.mem.indexOf(u8, response, "\"2.9.3\"") != null);
+}
+
+test "api server keeps HTTP/1.1 connection alive for sequential requests" {
+    var server = ApiServer.init(std.testing.allocator, "127.0.0.1", 0) catch return error.SkipZigTest;
+    defer server.deinit();
+
+    var addr: posix.sockaddr = undefined;
+    var addr_len: posix.socklen_t = @sizeOf(posix.sockaddr);
+    try posix.getsockname(server.listen_fd, &addr, &addr_len);
+    const listen_addr = std.net.Address{ .any = addr };
+    const port = listen_addr.getPort();
+
+    server.setHandler(struct {
+        fn handle(_: std.mem.Allocator, request: Request) Response {
+            _ = request;
+            return .{ .body = "\"2.9.3\"" };
+        }
+    }.handle);
+
+    server.submitAccept() catch return;
+
+    const client_fd = try posix.socket(posix.AF.INET, posix.SOCK.STREAM | posix.SOCK.CLOEXEC, posix.IPPROTO.TCP);
+    defer posix.close(client_fd);
+
+    const connect_addr = try std.net.Address.parseIp4("127.0.0.1", port);
+    try posix.connect(client_fd, &connect_addr.any, connect_addr.getOsSockLen());
+
+    const request_bytes = "GET /api/v2/app/webapiVersion HTTP/1.1\r\nHost: localhost\r\n\r\n";
+    _ = try posix.write(client_fd, request_bytes);
+
+    var iterations: u32 = 0;
+    while (iterations < 100) : (iterations += 1) {
+        _ = server.poll() catch break;
+        std.Thread.sleep(5 * std.time.ns_per_ms);
+    }
+
+    var response_buf: [4096]u8 = undefined;
+    const n1 = try posix.read(client_fd, &response_buf);
+    const response1 = response_buf[0..n1];
+    try std.testing.expect(std.mem.indexOf(u8, response1, "Connection: keep-alive") != null);
+
+    _ = try posix.write(client_fd, request_bytes);
+    iterations = 0;
+    while (iterations < 100) : (iterations += 1) {
+        _ = server.poll() catch break;
+        std.Thread.sleep(5 * std.time.ns_per_ms);
+    }
+
+    const n2 = try posix.read(client_fd, &response_buf);
+    const response2 = response_buf[0..n2];
+    try std.testing.expect(std.mem.startsWith(u8, response2, "HTTP/1.1 200 OK"));
+    try std.testing.expect(std.mem.indexOf(u8, response2, "\"2.9.3\"") != null);
 }
 
 test "advanceSendProgress tracks partial sends" {
