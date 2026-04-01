@@ -78,6 +78,7 @@ Update it whenever a milestone lands, the near-term backlog changes, or a new op
 - Torrent data relocation: move completed torrent data to a new path via API (setLocation endpoint).
 - Per-torrent connection diagnostics: connection attempts/failures/timeouts exposed via connDiagnostics API.
 - Partial download cleanup: delete torrent with --delete-files removes data files and empty directories.
+- Torrent queueing: configurable limits for active downloads/uploads/total (`queueing_enabled`, `max_active_downloads`, `max_active_uploads`, `max_active_torrents` in `[daemon]` config). `queued` state added to `TorrentSession.State`. Auto-management: when an active torrent completes/pauses/is removed, next queued torrent starts. Queue positions (1-based) persisted to SQLite. API endpoints: `increasePrio`, `decreasePrio`, `topPrio`, `bottomPrio` (qBittorrent-compatible). Preferences API wired to real queue config. CLI: `queue-top`, `queue-bottom`, `queue-up`, `queue-down`.
 
 ### Performance & Hardening
 - **SHA-1 hardware acceleration**: runtime CPU detection for x86_64 SHA-NI (~2x to ~2.2 GB/s) and AArch64 SHA1 crypto extensions. Atomic-cached dispatch, automatic fallback to software.
@@ -151,6 +152,7 @@ Update it whenever a milestone lands, the near-term backlog changes, or a new op
 - 10 peer ID client identification tests (Azureus-style, Shadow-style, Mainline, unknown).
 - 17 peer ID masquerading tests: all 5 client formats, case insensitivity, malformed input, unsupported client error, random suffix validation.
 - 4 TLS tests: TlsStream init/deinit, ClientHello generation, garbage ciphertext handling, stub error returns. 3 HTTPS URL parsing tests.
+- 10 queue manager tests: position management, remove/compact, move to top/bottom, increase/decrease priority, boundary no-ops, disabled queue, enforcement with limits. 1 compat test for queued state mapping.
 
 ## Next
 

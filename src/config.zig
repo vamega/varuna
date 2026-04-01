@@ -13,6 +13,14 @@ pub const Config = struct {
         api_bind: []const u8 = "127.0.0.1",
         api_username: []const u8 = "admin",
         api_password: []const u8 = "adminadmin",
+        /// Enable torrent queueing. When false, all torrents are active.
+        queueing_enabled: bool = false,
+        /// Max torrents actively downloading. -1 = unlimited.
+        max_active_downloads: i32 = 5,
+        /// Max torrents actively seeding. -1 = unlimited.
+        max_active_uploads: i32 = 5,
+        /// Overall max active torrents (downloading + seeding). -1 = unlimited.
+        max_active_torrents: i32 = -1,
     };
 
     pub const Storage = struct {

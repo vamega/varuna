@@ -234,6 +234,21 @@ pub const ResumeDb = struct {
             return error.SqliteSchemaFailed;
         }
 
+        // Create queue_positions table for torrent queue ordering
+        if (sqlite.sqlite3_exec(
+            d,
+            "CREATE TABLE IF NOT EXISTS queue_positions (" ++
+                "info_hash_hex TEXT NOT NULL PRIMARY KEY, " ++
+                "position INTEGER NOT NULL" ++
+                ")",
+            null,
+            null,
+            null,
+        ) != sqlite.SQLITE_OK) {
+            _ = sqlite.sqlite3_close(d);
+            return error.SqliteSchemaFailed;
+        }
+
         // Prepare statements
         var insert_stmt: ?*sqlite.Stmt = null;
         if (sqlite.sqlite3_prepare_v2(
@@ -967,6 +982,59 @@ pub const ResumeDb = struct {
         _ = sqlite.sqlite3_bind_int(stmt, 2, if (config.enabled) 1 else 0);
         _ = sqlite.sqlite3_bind_int(stmt, 3, @intCast(config.rule_count));
         try stepAndFinalize(stmt);
+    }
+
+    // ── Queue position persistence ───────────────────────
+
+    /// Save a torrent's queue position (upsert).
+    pub fn saveQueuePosition(self: *ResumeDb, info_hash_hex: [40]u8, position: u32) !void {
+        const stmt = try self.execOneShot(
+            "INSERT INTO queue_positions (info_hash_hex, position) VALUES (?1, ?2) " ++
+                "ON CONFLICT(info_hash_hex) DO UPDATE SET position = ?2",
+        );
+        _ = sqlite.sqlite3_bind_text(stmt, 1, &info_hash_hex, 40, sqlite.SQLITE_TRANSIENT);
+        _ = sqlite.sqlite3_bind_int(stmt, 2, @intCast(position));
+        try stepAndFinalize(stmt);
+    }
+
+    /// Remove a torrent's queue position.
+    pub fn removeQueuePosition(self: *ResumeDb, info_hash_hex: [40]u8) !void {
+        const stmt = try self.execOneShot(
+            "DELETE FROM queue_positions WHERE info_hash_hex = ?1",
+        );
+        _ = sqlite.sqlite3_bind_text(stmt, 1, &info_hash_hex, 40, sqlite.SQLITE_TRANSIENT);
+        try stepAndFinalize(stmt);
+    }
+
+    /// Clear all queue positions (used before re-saving the full queue).
+    pub fn clearQueuePositions(self: *ResumeDb) !void {
+        const stmt = try self.execOneShot("DELETE FROM queue_positions");
+        try stepAndFinalize(stmt);
+    }
+
+    /// Load all queue positions from SQLite.
+    pub fn loadQueuePositions(self: *ResumeDb, allocator: std.mem.Allocator) ![]@import("../daemon/queue_manager.zig").QueueEntry {
+        const QueueEntry = @import("../daemon/queue_manager.zig").QueueEntry;
+        const stmt = try self.execOneShot(
+            "SELECT info_hash_hex, position FROM queue_positions ORDER BY position ASC",
+        );
+        var entries = std.ArrayList(QueueEntry).empty;
+        while (sqlite.sqlite3_step(stmt) == sqlite.SQLITE_ROW) {
+            const hex_ptr: ?[*]const u8 = @ptrCast(sqlite.sqlite3_column_text(stmt, 0));
+            const hex_len: usize = @intCast(sqlite.sqlite3_column_bytes(stmt, 0));
+            const position: u32 = @intCast(sqlite.sqlite3_column_int(stmt, 1));
+
+            if (hex_ptr != null and hex_len == 40) {
+                var entry: QueueEntry = .{
+                    .info_hash_hex = undefined,
+                    .position = position,
+                };
+                @memcpy(&entry.info_hash_hex, hex_ptr.?[0..40]);
+                entries.append(allocator, entry) catch continue;
+            }
+        }
+        _ = sqlite.sqlite3_finalize(stmt);
+        return entries.toOwnedSlice(allocator);
     }
 };
 
