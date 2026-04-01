@@ -13,7 +13,7 @@ These tools are external Linux packages, not Zig dependencies. The helper steps 
 - `bpftrace`
 
 On many distributions this means packages similar to `strace`, `linux-perf` or `perf`, and `bpftrace`.
-On WSL kernels, `perf` may additionally require a kernel-matched `linux-tools-<kernel>` package before `perf stat` or `perf record` will run successfully.
+On Ubuntu and WSL, `/usr/bin/perf` may be a wrapper script that refuses to run unless an exact kernel-matched backend exists. The build helpers in `build.zig` detect and prefer a real backend binary from `/usr/lib/linux-tools.../perf` when one is installed.
 
 ## Goals
 
@@ -52,11 +52,24 @@ CPU counters:
 perf stat -d --output perf/output/perf-stat.txt ./zig-out/bin/varuna banner
 ```
 
+If `/usr/bin/perf` prints `perf not found for kernel ...`, run the real backend directly instead:
+
+```bash
+/usr/lib/linux-tools-*/perf stat -d --output perf/output/perf-stat.txt ./zig-out/bin/varuna banner
+```
+
 Sampled profile:
 
 ```bash
 perf record -o perf/output/perf.data --call-graph dwarf ./zig-out/bin/varuna banner
 perf report -i perf/output/perf.data
+```
+
+And likewise for direct backend invocation:
+
+```bash
+/usr/lib/linux-tools-*/perf record -o perf/output/perf.data --call-graph dwarf ./zig-out/bin/varuna banner
+/usr/lib/linux-tools-*/perf report -i perf/output/perf.data
 ```
 
 ## eBPF / bpftrace Strategy

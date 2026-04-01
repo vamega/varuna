@@ -196,6 +196,7 @@ pub fn build(b: *std.Build) void {
 
     // ── Profiling helpers ─────────────────────────────────
     const installed_exe_path = b.getInstallPath(.bin, "varuna");
+    const perf_exe_path = resolvePerfExecutable(b);
 
     const trace_step = b.step("trace-syscalls", "Run varuna under strace and write perf/output/strace.log");
     const trace_cmd = b.addSystemCommand(&.{
@@ -207,7 +208,7 @@ pub fn build(b: *std.Build) void {
 
     const perf_stat_step = b.step("perf-stat", "Run varuna under perf stat and write perf/output/perf-stat.txt");
     const perf_stat_cmd = b.addSystemCommand(&.{
-        "perf", "stat", "-d", "--output", "perf/output/perf-stat.txt", installed_exe_path,
+        perf_exe_path, "stat", "-d", "--output", "perf/output/perf-stat.txt", installed_exe_path,
     });
     perf_stat_cmd.step.dependOn(b.getInstallStep());
     if (b.args) |args| perf_stat_cmd.addArgs(args);
@@ -215,11 +216,143 @@ pub fn build(b: *std.Build) void {
 
     const perf_record_step = b.step("perf-record", "Run varuna under perf record and write perf/output/perf.data");
     const perf_record_cmd = b.addSystemCommand(&.{
-        "perf", "record", "-o", "perf/output/perf.data", "--call-graph", "dwarf", installed_exe_path,
+        perf_exe_path, "record", "-o", "perf/output/perf.data", "--call-graph", "dwarf", installed_exe_path,
     });
     perf_record_cmd.step.dependOn(b.getInstallStep());
     if (b.args) |args| perf_record_cmd.addArgs(args);
     perf_record_step.dependOn(&perf_record_cmd.step);
+}
+
+fn resolvePerfExecutable(b: *std.Build) []const u8 {
+    const uts = std.posix.uname();
+    const release = std.mem.sliceTo(&uts.release, 0);
+
+    const exact_candidates = [_][]const u8{
+        b.pathJoin(&.{ "/usr/lib/linux-tools", release, "perf" }),
+        b.fmt("/usr/lib/linux-tools-{s}/perf", .{release}),
+    };
+    for (exact_candidates) |candidate| {
+        if (pathExists(candidate)) return candidate;
+    }
+
+    if (findNewestPerfInDir(b, "/usr/lib/linux-tools")) |candidate| return candidate;
+    if (findNewestPrefixedPerfInDir(b, "/usr/lib", "linux-tools-")) |candidate| return candidate;
+
+    return "perf";
+}
+
+fn findNewestPerfInDir(b: *std.Build, base_dir_path: []const u8) ?[]const u8 {
+    var dir = std.fs.openDirAbsolute(base_dir_path, .{ .iterate = true }) catch return null;
+    defer dir.close();
+
+    var best_key: ?[]const u8 = null;
+    var best_path: ?[]const u8 = null;
+    var iter = dir.iterate();
+    while (iter.next() catch return best_path) |entry| {
+        switch (entry.kind) {
+            .directory, .sym_link => {},
+            else => continue,
+        }
+
+        const candidate = b.pathJoin(&.{ base_dir_path, entry.name, "perf" });
+        if (!pathExists(candidate)) continue;
+
+        if (best_key == null or compareVersionStrings(entry.name, best_key.?) == .gt) {
+            best_key = b.dupe(entry.name);
+            best_path = candidate;
+        }
+    }
+
+    return best_path;
+}
+
+fn findNewestPrefixedPerfInDir(b: *std.Build, base_dir_path: []const u8, prefix: []const u8) ?[]const u8 {
+    var dir = std.fs.openDirAbsolute(base_dir_path, .{ .iterate = true }) catch return null;
+    defer dir.close();
+
+    var best_key: ?[]const u8 = null;
+    var best_path: ?[]const u8 = null;
+    var iter = dir.iterate();
+    while (iter.next() catch return best_path) |entry| {
+        switch (entry.kind) {
+            .directory, .sym_link => {},
+            else => continue,
+        }
+        if (!std.mem.startsWith(u8, entry.name, prefix)) continue;
+
+        const version_key = entry.name[prefix.len..];
+        const candidate = b.pathJoin(&.{ base_dir_path, entry.name, "perf" });
+        if (!pathExists(candidate)) continue;
+
+        if (best_key == null or compareVersionStrings(version_key, best_key.?) == .gt) {
+            best_key = b.dupe(version_key);
+            best_path = candidate;
+        }
+    }
+
+    return best_path;
+}
+
+fn pathExists(path: []const u8) bool {
+    std.fs.accessAbsolute(path, .{}) catch return false;
+    return true;
+}
+
+fn compareVersionStrings(a: []const u8, b: []const u8) std.math.Order {
+    var a_index: usize = 0;
+    var b_index: usize = 0;
+
+    while (true) {
+        while (a_index < a.len and isVersionSeparator(a[a_index])) : (a_index += 1) {}
+        while (b_index < b.len and isVersionSeparator(b[b_index])) : (b_index += 1) {}
+
+        if (a_index >= a.len and b_index >= b.len) return .eq;
+        if (a_index >= a.len) return .lt;
+        if (b_index >= b.len) return .gt;
+
+        const a_is_digit = std.ascii.isDigit(a[a_index]);
+        const b_is_digit = std.ascii.isDigit(b[b_index]);
+
+        if (a_is_digit and b_is_digit) {
+            const a_start = a_index;
+            while (a_index < a.len and std.ascii.isDigit(a[a_index])) : (a_index += 1) {}
+            const b_start = b_index;
+            while (b_index < b.len and std.ascii.isDigit(b[b_index])) : (b_index += 1) {}
+
+            const order = compareNumericChunks(a[a_start..a_index], b[b_start..b_index]);
+            if (order != .eq) return order;
+            continue;
+        }
+
+        if (a_is_digit != b_is_digit) return if (a_is_digit) .gt else .lt;
+
+        const a_start = a_index;
+        while (a_index < a.len and !isVersionSeparator(a[a_index]) and !std.ascii.isDigit(a[a_index])) : (a_index += 1) {}
+        const b_start = b_index;
+        while (b_index < b.len and !isVersionSeparator(b[b_index]) and !std.ascii.isDigit(b[b_index])) : (b_index += 1) {}
+
+        const order = std.ascii.orderIgnoreCase(a[a_start..a_index], b[b_start..b_index]);
+        if (order != .eq) return order;
+    }
+}
+
+fn compareNumericChunks(a: []const u8, b: []const u8) std.math.Order {
+    var a_index: usize = 0;
+    var b_index: usize = 0;
+    while (a_index < a.len and a[a_index] == '0') : (a_index += 1) {}
+    while (b_index < b.len and b[b_index] == '0') : (b_index += 1) {}
+
+    const a_trimmed = a[a_index..];
+    const b_trimmed = b[b_index..];
+    if (a_trimmed.len < b_trimmed.len) return .lt;
+    if (a_trimmed.len > b_trimmed.len) return .gt;
+
+    if (a_trimmed.len == 0) return .eq;
+    return std.mem.order(u8, a_trimmed, b_trimmed);
+}
+
+fn isVersionSeparator(byte: u8) bool {
+    return !std.ascii.isAlphanumeric(byte);
 }
 
 /// DNS resolver backend selection.

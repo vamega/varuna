@@ -131,12 +131,31 @@ The profiling helpers were exercised on WSL2 after installing tracing tools.
 Findings:
 - `zig build trace-syscalls -- banner` works and writes `perf/output/strace.log`.
 - `strace -f -yy -c` shows the current binary is still using conventional syscalls; there is no `io_uring` activity yet.
-- `perf stat` on this host still needs a kernel-matched `linux-tools-<kernel>` package for `6.6.87.2-microsoft-standard-WSL2`.
+- The Ubuntu `/usr/bin/perf` wrapper on this host refuses to run without an exact kernel-matched `linux-tools-<kernel>` backend for `6.6.87.2-microsoft-standard-WSL2`.
 - `bpftrace` requires root privileges, which is expected and should be treated as part of the workflow requirements.
 
 Implication:
 - Keep `strace` as the default unprivileged syscall audit path.
 - Treat `perf` and `bpftrace` as environment-dependent tools whose availability must be verified per machine.
+
+### 2026-03-31: WSL Perf Backend Detection
+
+Context:
+On this Ubuntu 24.04 WSL host, `perf` is installed, but `/usr/bin/perf` is only a wrapper script. That wrapper fails because it wants an exact `linux-tools-6.6.87.2-microsoft-standard-WSL2` backend path, even though a usable backend exists at `/usr/lib/linux-tools-6.8.0-106/perf`.
+
+Decision:
+- Teach the profiling build steps to resolve a real `perf` backend from `/usr/lib/linux-tools/.../perf` or `/usr/lib/linux-tools-.../perf` before falling back to plain `perf`.
+- Keep `perf stat` and `perf record` wired through those build steps so the profiling workflow remains one command.
+
+Reasoning:
+- The failure mode on WSL is a wrapper-script packaging problem, not a hard requirement for root or a proof that `perf` is unusable on the host.
+- Calling the real backend directly keeps the workflow working without local symlink hacks or shell aliases.
+- This preserves normal Linux behavior because the fallback is still plain `perf` when no backend binary is found.
+
+Current behavior:
+- `zig build perf-stat -- ...` and `zig build perf-record -- ...` now bypass the broken wrapper automatically when a backend binary is installed.
+- On this WSL host, software counters and sampled profiles work through `/usr/lib/linux-tools-6.8.0-106/perf`.
+- Several hardware counters (`cycles`, `instructions`, `branches`) still report `<not supported>`, which appears to be a WSL/kernel capability limit rather than a build-step issue.
 
 ### 2026-03-25: Safety, Quality, And Throughput Improvements
 
