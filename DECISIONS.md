@@ -487,3 +487,28 @@ Follow-up triggers:
 - If `/sync/maindata` still dominates at very high torrent counts, move more fields into a dedicated hot registry rather than repeatedly walking `TorrentSession` objects.
 - Revisit seed plaintext scatter/gather only if the new `seed_plaintext_burst` workload justifies the buffer-lifetime refactor needed for a correct `sendmsg` path.
 - Revisit uTP queueing only with a design that can show a clear wall-clock win, not just fewer allocations.
+
+### 2026-04-01: Seed Upload Syscall Feasibility Favors `sendmsg`, Not `splice`
+
+Context:
+The remaining obvious seeding opportunity is the plaintext upload path, which still copies piece payloads into one contiguous heap buffer before each send. The question was whether to pursue vectored `sendmsg`, `sendmsg_zc`, `splice`/`sendfile`, or fixed buffers for the upload path.
+
+Decision:
+- Add benchmark-only workload surfaces for:
+  - contiguous copy over TCP: `seed_send_copy_burst`
+  - vectored header + piece slices over TCP: `seed_sendmsg_burst`
+  - file-to-pipe-to-socket transfer via `io_uring` `splice`: `seed_splice_burst`
+- Do not land a production seed `sendmsg` path yet.
+- Do not pursue `splice` / `sendfile` for the current seed path.
+- Do not prioritize `READ_FIXED` / `WRITE_FIXED` for seeding yet.
+
+Reasoning:
+- On the same TCP benchmark shape (`200` iterations, `8` blocks per burst), vectored `sendmsg` improved from roughly `54` to `59 ms` down to roughly `39` to `46 ms`, about a `23%` to `33%` win, and reduced transient bytes from `26.2 MB` to `72 KB`.
+- `splice` was much slower on the same shape, around `149` to `180 ms`. That lines up with the extra syscall/CQE count and the fact that BitTorrent piece framing still needs a separate header send per block.
+- `sendfile` is not the right abstraction for the current daemon design. `io_uring` exposes `splice`, and `sendfile` semantics still do not solve the header problem, multi-file block spans, or MSE encryption.
+- `READ_FIXED` / `WRITE_FIXED` help the disk-buffer layer, not the socket-framing layer. They could reduce piece-read buffer churn, but they do not remove the need to keep message headers and payload pages alive across the socket send. The current huge-page piece cache already addresses part of that memory/TLB problem.
+- The real blocker for a production vectored seed send is buffer lifetime: queued responses currently reference cached piece buffers that can be replaced before the send CQE arrives. A correct `sendmsg` implementation needs explicit ownership, likely refcounted piece-buffer objects or equivalent tracked lifetimes.
+
+Follow-up triggers:
+- If the plaintext upload path matters in real swarms, implement tracked vectored sends with explicit piece-buffer ownership and partial-send fallback.
+- Consider `sendmsg_zc` only after that ownership model exists, because zero-copy notifications add CQE complexity but do not remove the lifetime requirement.

@@ -49,6 +49,9 @@ pub const Scenario = enum {
     request_batch,
     seed_batch,
     seed_plaintext_burst,
+    seed_send_copy_burst,
+    seed_sendmsg_burst,
+    seed_splice_burst,
     http_response,
     api_get_burst,
     api_get_seq,
@@ -91,6 +94,9 @@ pub fn run(
         .request_batch => runRequestBatch(allocator, alloc_counter, iterations, config),
         .seed_batch => runSeedBatch(allocator, alloc_counter, iterations, config),
         .seed_plaintext_burst => runSeedPlaintextBurst(allocator, alloc_counter, iterations, config),
+        .seed_send_copy_burst => runSeedSendCopyBurst(allocator, alloc_counter, iterations, config),
+        .seed_sendmsg_burst => runSeedSendmsgBurst(allocator, alloc_counter, iterations, config),
+        .seed_splice_burst => runSeedSpliceBurst(allocator, alloc_counter, iterations, config),
         .http_response => runHttpResponse(allocator, alloc_counter, iterations, config),
         .api_get_burst => runApiBurst(allocator, alloc_counter, iterations, config, .get),
         .api_get_seq => runApiSequentialGet(allocator, alloc_counter, iterations, config),
@@ -475,6 +481,218 @@ fn runSeedPlaintextBurst(
     }
 
     return makeResult("seed_plaintext_burst", iterations, &timer, checksum, alloc_counter);
+}
+
+fn runSeedSendCopyBurst(
+    allocator: std.mem.Allocator,
+    alloc_counter: *CountingAllocator,
+    iterations: usize,
+    config: Config,
+) !Result {
+    var ring = try Ring.init(64);
+    defer ring.deinit();
+
+    const pair = try createLoopbackTcpPair();
+    defer posix.close(pair.listen_fd);
+    defer posix.close(pair.sender_fd);
+    defer posix.close(pair.receiver_fd);
+
+    const block_count = @max(config.scale, 8);
+    const block_len = 16 * 1024;
+    const piece_len = block_count * block_len;
+    const total_len = block_count * (13 + block_len);
+
+    const piece_data = try allocator.alloc(u8, piece_len);
+    defer allocator.free(piece_data);
+    for (piece_data, 0..) |*byte, idx| byte.* = @truncate(idx *% 17 +% 11);
+
+    const recv_buf = try allocator.alloc(u8, total_len);
+    defer allocator.free(recv_buf);
+
+    alloc_counter.stats = .{};
+    var timer = try std.time.Timer.start();
+    var checksum: u64 = 0;
+
+    for (0..iterations) |iter| {
+        const send_buf = try allocator.alloc(u8, total_len);
+        defer allocator.free(send_buf);
+
+        var offset: usize = 0;
+        for (0..block_count) |idx| {
+            const msg_len: u32 = 1 + 8 + block_len;
+            std.mem.writeInt(u32, send_buf[offset..][0..4], msg_len, .big);
+            send_buf[offset + 4] = 7;
+            std.mem.writeInt(u32, send_buf[offset + 5 ..][0..4], @intCast(iter & 0xffff), .big);
+            std.mem.writeInt(u32, send_buf[offset + 9 ..][0..4], @intCast(idx * block_len), .big);
+            @memcpy(send_buf[offset + 13 ..][0..block_len], piece_data[idx * block_len ..][0..block_len]);
+            offset += 13 + block_len;
+        }
+
+        _ = try ring.inner.send(1, pair.sender_fd, send_buf, 0);
+        _ = try ring.inner.submit_and_wait(1);
+        const cqe = try ring.inner.copy_cqe();
+        if (cqe.res < 0) return error.SeedCopySendFailed;
+        if (@as(usize, @intCast(cqe.res)) != total_len) return error.PartialSeedCopySend;
+
+        try readExact(pair.receiver_fd, recv_buf);
+        checksum +%= std.hash.Wyhash.hash(0, recv_buf);
+    }
+
+    return makeResult("seed_send_copy_burst", iterations, &timer, checksum, alloc_counter);
+}
+
+fn runSeedSendmsgBurst(
+    allocator: std.mem.Allocator,
+    alloc_counter: *CountingAllocator,
+    iterations: usize,
+    config: Config,
+) !Result {
+    var ring = try Ring.init(64);
+    defer ring.deinit();
+
+    const pair = try createLoopbackTcpPair();
+    defer posix.close(pair.listen_fd);
+    defer posix.close(pair.sender_fd);
+    defer posix.close(pair.receiver_fd);
+
+    const block_count = @max(config.scale, 8);
+    const block_len = 16 * 1024;
+    const piece_len = block_count * block_len;
+    const total_len = block_count * (13 + block_len);
+
+    const piece_data = try allocator.alloc(u8, piece_len);
+    defer allocator.free(piece_data);
+    for (piece_data, 0..) |*byte, idx| byte.* = @truncate(idx *% 19 +% 5);
+
+    const recv_buf = try allocator.alloc(u8, total_len);
+    defer allocator.free(recv_buf);
+
+    alloc_counter.stats = .{};
+    var timer = try std.time.Timer.start();
+    var checksum: u64 = 0;
+
+    for (0..iterations) |iter| {
+        const headers = try allocator.alloc([13]u8, block_count);
+        defer allocator.free(headers);
+        const iovecs = try allocator.alloc(posix.iovec_const, block_count * 2);
+        defer allocator.free(iovecs);
+
+        for (0..block_count) |idx| {
+            const msg_len: u32 = 1 + 8 + block_len;
+            std.mem.writeInt(u32, headers[idx][0..4], msg_len, .big);
+            headers[idx][4] = 7;
+            std.mem.writeInt(u32, headers[idx][5..9], @intCast(iter & 0xffff), .big);
+            std.mem.writeInt(u32, headers[idx][9..13], @intCast(idx * block_len), .big);
+
+            iovecs[idx * 2] = .{
+                .base = @ptrCast(&headers[idx]),
+                .len = headers[idx].len,
+            };
+            iovecs[idx * 2 + 1] = .{
+                .base = @ptrCast(piece_data.ptr + idx * block_len),
+                .len = block_len,
+            };
+        }
+
+        var msg = posix.msghdr_const{
+            .name = null,
+            .namelen = 0,
+            .iov = iovecs.ptr,
+            .iovlen = iovecs.len,
+            .control = null,
+            .controllen = 0,
+            .flags = 0,
+        };
+
+        _ = try ring.inner.sendmsg(1, pair.sender_fd, &msg, 0);
+        _ = try ring.inner.submit_and_wait(1);
+        const cqe = try ring.inner.copy_cqe();
+        if (cqe.res < 0) return error.SendmsgFailed;
+        if (@as(usize, @intCast(cqe.res)) != total_len) return error.PartialSeedSendmsg;
+
+        try readExact(pair.receiver_fd, recv_buf);
+        checksum +%= std.hash.Wyhash.hash(0, recv_buf);
+    }
+
+    return makeResult("seed_sendmsg_burst", iterations, &timer, checksum, alloc_counter);
+}
+
+fn runSeedSpliceBurst(
+    allocator: std.mem.Allocator,
+    alloc_counter: *CountingAllocator,
+    iterations: usize,
+    config: Config,
+) !Result {
+    var ring = try Ring.init(64);
+    defer ring.deinit();
+
+    const pair = try createLoopbackTcpPair();
+    defer posix.close(pair.listen_fd);
+    defer posix.close(pair.sender_fd);
+    defer posix.close(pair.receiver_fd);
+
+    const pipe_fds = try posix.pipe();
+    defer posix.close(pipe_fds[0]);
+    defer posix.close(pipe_fds[1]);
+
+    const block_count = @max(config.scale, 8);
+    const block_len = 16 * 1024;
+    const piece_len = block_count * block_len;
+    const total_len = block_count * (13 + block_len);
+
+    const piece_data = try allocator.alloc(u8, piece_len);
+    defer allocator.free(piece_data);
+    for (piece_data, 0..) |*byte, idx| byte.* = @truncate(idx *% 23 +% 9);
+
+    var temp = try createTempSeedFile(piece_data);
+    defer {
+        temp.dir.close();
+        temp.dir.deleteFile(temp.name) catch {};
+        std.heap.page_allocator.free(temp.name);
+    }
+    defer temp.file.close();
+
+    const recv_buf = try allocator.alloc(u8, total_len);
+    defer allocator.free(recv_buf);
+
+    alloc_counter.stats = .{};
+    var timer = try std.time.Timer.start();
+    var checksum: u64 = 0;
+
+    for (0..iterations) |iter| {
+        for (0..block_count) |idx| {
+            var header: [13]u8 = undefined;
+            const msg_len: u32 = 1 + 8 + block_len;
+            std.mem.writeInt(u32, header[0..4], msg_len, .big);
+            header[4] = 7;
+            std.mem.writeInt(u32, header[5..9], @intCast(iter & 0xffff), .big);
+            std.mem.writeInt(u32, header[9..13], @intCast(idx * block_len), .big);
+
+            _ = try ring.inner.send(10, pair.sender_fd, header[0..], 0);
+            _ = try ring.inner.submit_and_wait(1);
+            const header_cqe = try ring.inner.copy_cqe();
+            if (header_cqe.res < 0) return error.SpliceHeaderSendFailed;
+            if (header_cqe.res != header.len) return error.PartialSpliceHeader;
+
+            const file_offset = idx * block_len;
+            _ = try ring.inner.splice(11, temp.file.handle, file_offset, pipe_fds[1], std.math.maxInt(u64), block_len);
+            _ = try ring.inner.submit_and_wait(1);
+            const in_cqe = try ring.inner.copy_cqe();
+            if (in_cqe.res < 0) return error.SpliceFileToPipeFailed;
+            if (in_cqe.res != block_len) return error.PartialSpliceFileToPipe;
+
+            _ = try ring.inner.splice(12, pipe_fds[0], std.math.maxInt(u64), pair.sender_fd, std.math.maxInt(u64), block_len);
+            _ = try ring.inner.submit_and_wait(1);
+            const out_cqe = try ring.inner.copy_cqe();
+            if (out_cqe.res < 0) return error.SplicePipeToSocketFailed;
+            if (out_cqe.res != block_len) return error.PartialSplicePipeToSocket;
+        }
+
+        try readExact(pair.receiver_fd, recv_buf);
+        checksum +%= std.hash.Wyhash.hash(0, recv_buf);
+    }
+
+    return makeResult("seed_splice_burst", iterations, &timer, checksum, alloc_counter);
 }
 
 fn runHttpResponse(
@@ -1120,6 +1338,67 @@ fn createStreamSocketPair() ![2]posix.fd_t {
     const rc = linux.socketpair(posix.AF.UNIX, posix.SOCK.STREAM, 0, &fds);
     if (linux.E.init(rc) != .SUCCESS) return error.SocketPairFailed;
     return fds;
+}
+
+fn createLoopbackTcpPair() !struct { sender_fd: posix.fd_t, receiver_fd: posix.fd_t, listen_fd: posix.fd_t } {
+    const address = try std.net.Address.parseIp4("127.0.0.1", 0);
+    const listen_fd = try posix.socket(posix.AF.INET, posix.SOCK.STREAM | posix.SOCK.CLOEXEC, posix.IPPROTO.TCP);
+    errdefer posix.close(listen_fd);
+
+    const enable: u32 = 1;
+    try posix.setsockopt(listen_fd, posix.SOL.SOCKET, posix.SO.REUSEADDR, std.mem.asBytes(&enable));
+    try posix.bind(listen_fd, &address.any, address.getOsSockLen());
+    try posix.listen(listen_fd, 16);
+
+    const port = try getListenPort(listen_fd);
+    const remote = try std.net.Address.parseIp4("127.0.0.1", port);
+
+    const receiver_fd = try posix.socket(posix.AF.INET, posix.SOCK.STREAM | posix.SOCK.CLOEXEC, posix.IPPROTO.TCP);
+    errdefer posix.close(receiver_fd);
+    try posix.connect(receiver_fd, &remote.any, remote.getOsSockLen());
+
+    var raw_addr: posix.sockaddr = undefined;
+    var raw_len: posix.socklen_t = @sizeOf(posix.sockaddr);
+    const sender_fd = try posix.accept(listen_fd, &raw_addr, &raw_len, posix.SOCK.CLOEXEC);
+    errdefer posix.close(sender_fd);
+
+    var sock_buf: c_int = 1 << 20;
+    posix.setsockopt(sender_fd, posix.SOL.SOCKET, posix.SO.SNDBUF, std.mem.asBytes(&sock_buf)) catch {};
+    posix.setsockopt(receiver_fd, posix.SOL.SOCKET, posix.SO.RCVBUF, std.mem.asBytes(&sock_buf)) catch {};
+
+    return .{
+        .sender_fd = sender_fd,
+        .receiver_fd = receiver_fd,
+        .listen_fd = listen_fd,
+    };
+}
+
+fn createTempSeedFile(bytes: []const u8) !struct {
+    dir: std.fs.Dir,
+    file: std.fs.File,
+    name: []u8,
+} {
+    var tmp_dir = try std.fs.openDirAbsolute("/tmp", .{});
+    errdefer tmp_dir.close();
+
+    const name = try std.fmt.allocPrint(std.heap.page_allocator, "varuna-seed-perf-{}-{}.bin", .{
+        std.time.nanoTimestamp(),
+        bytes.len,
+    });
+    errdefer std.heap.page_allocator.free(name);
+
+    const file = try tmp_dir.createFile(name, .{ .read = true, .truncate = true });
+    errdefer {
+        tmp_dir.deleteFile(name) catch {};
+        file.close();
+    }
+    try file.writeAll(bytes);
+
+    return .{
+        .dir = tmp_dir,
+        .file = file,
+        .name = name,
+    };
 }
 
 fn getListenPort(fd: posix.fd_t) !u16 {

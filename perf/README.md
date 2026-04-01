@@ -339,11 +339,18 @@ New benchmark-only workloads added in this pass:
 | Scenario | Result |
 |----------|--------|
 | `seed_plaintext_burst --iterations=500 --scale=8` | `30384358 ns`, `27940324 ns`, `28669060 ns`; `501` allocs, `65.6 MB` transient bytes |
+| `seed_send_copy_burst --iterations=200 --scale=8` | `59303132 ns`, `54058775 ns`; `200` allocs, `26.2 MB` transient bytes |
+| `seed_sendmsg_burst --iterations=200 --scale=8` | `45529205 ns`, `39205524 ns`; `400` allocs, `72 KB` transient bytes |
+| `seed_splice_burst --iterations=200 --scale=8` | `180185989 ns`; `0` allocs |
 | `utp_outbound_burst --iterations=200 --scale=64` | `81276385 ns`, `110159182 ns`, `90773293 ns` |
 
 Interpretation:
 
 - `seed_plaintext_burst` gives a concrete measurement surface for the remaining plaintext seed-copy path. It confirms that allocator churn is still present, but this pass did not yet land a safe `sendmsg` / scatter-gather implementation.
+- `seed_sendmsg_burst` is the clearest syscall win so far for plaintext seeding. On the same loopback TCP shape as the contiguous-copy benchmark, vectored header + payload send improved wall-clock time by about `23%` to `33%` and cut transient bytes from `26.2 MB` to `72 KB`.
+- `seed_splice_burst` shows why `sendfile` / `splice` are a poor fit for the current BitTorrent upload path. The protocol still needs a per-block header send, `splice(2)` still requires a pipe on one side, and the measured prototype was much slower than either copy or vectored `sendmsg`.
+- `READ_FIXED` / `WRITE_FIXED` are not the first lever for this path. They can help if piece-read buffers are pre-registered, but they do not solve message framing or the need to keep piece pages alive until the socket-send CQE arrives.
+- The production blocker for a direct `sendmsg` path is buffer lifetime. `queued_responses` currently stores raw slices into `cached_piece_data`, and `flushQueuedResponses()` keeps that safe by copying into a temporary send buffer before deferred piece buffers are released. A real scatter/gather send would need explicit ownership across async completion.
 - `utp_outbound_burst` is a real loopback UDP path benchmark. A first queue-cleanup prototype removed allocator churn but did not produce a stable wall-clock win, so it was not kept in production.
 
 ## Interpretation Notes
