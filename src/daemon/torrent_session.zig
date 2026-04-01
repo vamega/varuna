@@ -4,6 +4,7 @@ const session_mod = @import("../torrent/session.zig");
 const storage = @import("../storage/root.zig");
 const tracker = @import("../tracker/root.zig");
 const Ring = @import("../io/ring.zig").Ring;
+const HttpClient = @import("../io/http.zig").HttpClient;
 const EventLoop = @import("../io/event_loop.zig").EventLoop;
 const PieceTracker = @import("../torrent/piece_tracker.zig").PieceTracker;
 const file_priority = @import("../torrent/file_priority.zig");
@@ -16,6 +17,7 @@ const metadata_fetch = @import("../net/metadata_fetch.zig");
 const ResumeWriter = storage.resume_state.ResumeWriter;
 const ResumeDb = storage.resume_state.ResumeDb;
 const DnsResolver = @import("../io/dns.zig").DnsResolver;
+const TrackerExecutor = @import("tracker_executor.zig").TrackerExecutor;
 
 /// Mutable tracker URL storage. Tracks user-added, user-removed,
 /// and user-edited tracker URLs as overlays on top of the metainfo
@@ -190,6 +192,7 @@ pub const TorrentSession = struct {
     shared_fds: ?[]posix.fd_t = null,
     event_loop: ?EventLoop = null,
     shared_event_loop: ?*EventLoop = null,
+    tracker_executor: ?*TrackerExecutor = null,
     torrent_id_in_shared: ?u32 = null,
     pending_peers: ?[]std.net.Address = null, // peers waiting for main thread to add
     pending_seed_setup: bool = false, // signals main thread to set up seed mode
@@ -1181,15 +1184,7 @@ pub const TorrentSession = struct {
         // Signal seed setup needed
         self.pending_seed_setup = true;
 
-        // Announce completion on a background thread (blocking HTTP).
-        // Uses the shared announce_ring to avoid creating a new ring per announce.
-        if (!self.announcing.swap(true, .acq_rel)) {
-            const thread = std.Thread.spawn(.{}, announceCompletedWorker, .{self}) catch {
-                self.announcing.store(false, .release);
-                return true;
-            };
-            thread.detach();
-        }
+        self.scheduleCompletedAnnounce() catch {};
 
         return true;
     }
@@ -1213,6 +1208,51 @@ pub const TorrentSession = struct {
         } else |_| {}
     }
 
+    pub fn scheduleCompletedAnnounce(self: *TorrentSession) !void {
+        if (self.announcing.swap(true, .acq_rel)) return;
+        errdefer self.announcing.store(false, .release);
+
+        if (self.tracker_executor) |executor| {
+            try executor.submit(self, trackerCompletedAnnounceJob);
+            return;
+        }
+
+        const thread = try std.Thread.spawn(.{}, announceCompletedWorker, .{self});
+        thread.detach();
+    }
+
+    fn performCompletedAnnounce(self: *TorrentSession, ring: *Ring, http_client: ?*HttpClient) void {
+        const session = &(self.session orelse return);
+        const announce_url = session.metainfo.announce orelse return;
+        const request: tracker.announce.Request = .{
+            .announce_url = announce_url,
+            .info_hash = session.metainfo.info_hash,
+            .peer_id = self.peer_id,
+            .port = self.port,
+            .left = 0,
+            .event = .completed,
+            .key = self.tracker_key,
+            .info_hash_v2 = self.info_hash_v2,
+        };
+
+        if (http_client) |client| {
+            if (tracker.announce.fetchAutoWithHttpClient(self.allocator, ring, client, request)) |resp| {
+                tracker.announce.freeResponse(self.allocator, resp);
+            } else |_| {}
+            return;
+        }
+
+        if (tracker.announce.fetchAutoWithDns(self.allocator, ring, self.getDnsResolver(), request)) |resp| {
+            tracker.announce.freeResponse(self.allocator, resp);
+        } else |_| {}
+    }
+
+    fn trackerCompletedAnnounceJob(context: *anyopaque, ring: *Ring, http_client: *HttpClient) void {
+        const self: *TorrentSession = @ptrCast(@alignCast(context));
+        defer self.announcing.store(false, .release);
+        self.performCompletedAnnounce(ring, http_client);
+    }
+
     pub fn announceCompletedWorker(self: *TorrentSession) void {
         defer self.announcing.store(false, .release);
 
@@ -1224,21 +1264,7 @@ pub const TorrentSession = struct {
             self.announce_ring = Ring.init(16) catch return;
         }
 
-        const session = &(self.session orelse return);
-        const announce_url = session.metainfo.announce orelse return;
-
-        if (tracker.announce.fetchAutoWithDns(self.allocator, &self.announce_ring.?, self.getDnsResolver(), .{
-            .announce_url = announce_url,
-            .info_hash = session.metainfo.info_hash,
-            .peer_id = self.peer_id,
-            .port = self.port,
-            .left = 0,
-            .event = .completed,
-            .key = self.tracker_key,
-            .info_hash_v2 = self.info_hash_v2,
-        })) |resp| {
-            tracker.announce.freeResponse(self.allocator, resp);
-        } else |_| {}
+        self.performCompletedAnnounce(&self.announce_ring.?, null);
     }
 
     /// Trigger a background scrape if enough time has passed (30 minutes).
@@ -1254,11 +1280,47 @@ pub const TorrentSession = struct {
         if (self.scraping.swap(true, .acq_rel)) return;
 
         self.last_scrape_time = now;
-        const thread = std.Thread.spawn(.{}, scrapeWorker, .{self}) catch {
+        self.scheduleScrape() catch {
             self.scraping.store(false, .release);
-            return;
         };
+    }
+
+    fn scheduleScrape(self: *TorrentSession) !void {
+        if (self.tracker_executor) |executor| {
+            try executor.submit(self, trackerScrapeJob);
+            return;
+        }
+
+        const thread = try std.Thread.spawn(.{}, scrapeWorker, .{self});
         thread.detach();
+    }
+
+    fn performScrape(self: *TorrentSession, ring: *Ring, http_client: ?*HttpClient) void {
+        const session = &(self.session orelse return);
+        const announce_url = session.metainfo.announce orelse return;
+
+        if (http_client) |client| {
+            if (tracker.scrape.scrapeAutoWithHttpClient(self.allocator, ring, client, announce_url, session.metainfo.info_hash)) |result| {
+                self.scrape_result = result;
+            } else |_| {}
+            return;
+        }
+
+        if (tracker.scrape.scrapeAutoWithDns(
+            self.allocator,
+            ring,
+            self.getDnsResolver(),
+            announce_url,
+            session.metainfo.info_hash,
+        )) |result| {
+            self.scrape_result = result;
+        } else |_| {}
+    }
+
+    fn trackerScrapeJob(context: *anyopaque, ring: *Ring, http_client: *HttpClient) void {
+        const self: *TorrentSession = @ptrCast(@alignCast(context));
+        defer self.scraping.store(false, .release);
+        self.performScrape(ring, http_client);
     }
 
     fn scrapeWorker(self: *TorrentSession) void {
@@ -1272,18 +1334,7 @@ pub const TorrentSession = struct {
             self.announce_ring = Ring.init(16) catch return;
         }
 
-        const session = &(self.session orelse return);
-        const announce_url = session.metainfo.announce orelse return;
-
-        if (tracker.scrape.scrapeAutoWithDns(
-            self.allocator,
-            &self.announce_ring.?,
-            self.getDnsResolver(),
-            announce_url,
-            session.metainfo.info_hash,
-        )) |result| {
-            self.scrape_result = result;
-        } else |_| {}
+        self.performScrape(&self.announce_ring.?, null);
     }
 
     // ── Magnet metadata fetching (BEP 9) ────────────────────

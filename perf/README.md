@@ -284,7 +284,22 @@ Measured against a tracker-like loopback HTTP server:
 Interpretation:
 
 - Reusing a single HTTP connection for repeated tracker-style GETs is about `2.5x` faster in this microbenchmark and eliminates the per-request allocator churn entirely.
-- This result is benchmark-only for now. The daemon does not yet have a production shared tracker-connection owner, so do not read this as “tracker pooling is already landed”.
+- This is still a transport-level lower bound rather than the full production path. The daemon now uses a shared tracker executor with a persistent client, but the executor benchmark below is the honest end-to-end number to use for production comparisons.
+
+## Tracker Announce Executor Snapshot (ReleaseFast, 2026-04-01)
+
+Measured against the real tracker announce path, including request URL building and bencode response parsing:
+
+| Scenario | Result |
+|----------|--------|
+| `tracker_announce_fresh --iterations=2000` | `849301098 ns`, `879521023 ns` |
+| `tracker_announce_executor --iterations=2000` | `427559358 ns`, `449506041 ns` |
+
+Interpretation:
+
+- The production daemon path now has a measured win, not just a transport microbenchmark. Sharing tracker I/O and reusing the executor-owned HTTP connection cuts loopback announce time by roughly `1.9x` to `2.0x` on this host.
+- The executor-backed path keeps a small amount of live memory at the end of the workload because the persistent client still owns its reusable tracker connection and host metadata.
+- This pass still does not run tracker jobs on the shared peer `EventLoop` ring. The current HTTP helper is synchronous, so moving tracker jobs onto that ring would require a dedicated async state machine rather than this executor model.
 
 ## Interpretation Notes
 

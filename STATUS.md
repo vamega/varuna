@@ -181,12 +181,13 @@ Update it whenever a milestone lands, the near-term backlog changes, or a new op
 - ~~**API placeholder cleanup**~~: (DONE) wired real DHT node count into transfer/info and sync/maindata, wired real infohash_v2 (BEP 52) into torrent info/properties/sync, wired scrape data into properties peers_total/seeds_total, parsed creation_date from .torrent files. Documented unsupported endpoints in `docs/api-compatibility.md`.
 - ~~**API keep-alive for polling**~~: (DONE) HTTP/1.1 clients now stay connected across sequential requests, and the server keeps buffered leftovers instead of forcing one request per socket.
 - ~~**Shared MSE responder lookup**~~: (DONE) inbound encrypted handshakes now consult a shared `req2 -> info_hash` table instead of copying and scanning all torrent hashes per peer.
+- ~~**Shared tracker executor / connection reuse**~~: (DONE) daemon-side reannounce, completion announce, and scrape jobs now run through one shared tracker executor with a persistent HTTP client instead of detached per-session tracker threads.
 - **Peer hot/cold split / partial SoA**: the active-slot pass removes a lot of wasted scans, but the `Peer` struct is still wide. The next performance step is separating hot scheduling/state fields from cold crypto/buffering state.
 - **Torrent hot-summary registry**: now that the shared EventLoop can hold far more than 64 torrents, `/sync` and periodic torrent housekeeping should move toward a denser hot-state registry instead of pulling data from full `TorrentSession` objects on demand.
 - **Broader RPC arena coverage**: `/sync/maindata` now uses an arena for transient work; the other list-heavy endpoints still allocate temporary object graphs and strings.
 - **API request-body growth / reuse**: the short-request path now uses inline storage, but large request bodies still allocate on demand and are freed on disconnect. A per-client arena or reuse pool is still available if API uploads remain allocator-heavy.
 - **uTP multishot receive**: `recvmsg_multishot` plus a provided-buffer strategy still needs a workload and a measured implementation before it should land.
-- **Shared tracker executor / connection reuse**: the benchmark-only tracker reuse workload shows large potential, but production reuse still needs a cross-session ownership model rather than an ad hoc per-session cache.
+- **Tracker work on the shared peer ring**: the daemon now shares tracker I/O through one executor, but the executor still owns its own ring. Moving tracker work onto the shared peer `EventLoop` ring requires an async tracker state machine rather than the current synchronous HTTP helper.
 
 ## Known Issues
 
@@ -216,3 +217,5 @@ Update it whenever a milestone lands, the near-term backlog changes, or a new op
 - `zig build -Doptimize=ReleaseFast perf-workload -- mse_responder_prep --iterations=2000 --torrents=20000`: shared lookup `5.21e4 ns` / `3.57e4 ns` vs pre-change `1.02e9 ns`
 - `zig build -Doptimize=ReleaseFast perf-workload -- tracker_http_fresh --iterations=2000`: `7.31e8 ns` / `7.04e8 ns`
 - `zig build -Doptimize=ReleaseFast perf-workload -- tracker_http_reuse_potential --iterations=2000`: `2.83e8 ns` / `2.72e8 ns` (benchmark-only potential, not yet wired into production tracker flow)
+- `zig build -Doptimize=ReleaseFast perf-workload -- tracker_announce_fresh --iterations=2000`: `8.49e8 ns` / `8.80e8 ns`
+- `zig build -Doptimize=ReleaseFast perf-workload -- tracker_announce_executor --iterations=2000`: `4.28e8 ns` / `4.50e8 ns`

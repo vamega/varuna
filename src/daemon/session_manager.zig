@@ -9,6 +9,7 @@ pub const QueueManager = @import("queue_manager.zig").QueueManager;
 pub const QueueConfig = @import("queue_manager.zig").QueueConfig;
 const ResumeDb = @import("../storage/resume.zig").ResumeDb;
 const BanList = @import("../net/ban_list.zig").BanList;
+const TrackerExecutor = @import("tracker_executor.zig").TrackerExecutor;
 
 /// Manages multiple torrent sessions for the daemon.
 /// Thread-safe: the API server and event loop can access concurrently.
@@ -53,6 +54,9 @@ pub const SessionManager = struct {
     /// Shared ban list for peer IP filtering. Owned by SessionManager,
     /// shared with EventLoop (read-only ban checks) and API handlers (mutations).
     ban_list: ?*BanList = null,
+
+    /// Shared tracker executor for daemon-side announces and scrapes.
+    tracker_executor: ?*TrackerExecutor = null,
 
     pub fn init(allocator: std.mem.Allocator) SessionManager {
         return .{
@@ -114,6 +118,10 @@ pub const SessionManager = struct {
             bl.deinit();
             self.allocator.destroy(bl);
         }
+        if (self.tracker_executor) |executor| {
+            executor.destroy();
+            self.tracker_executor = null;
+        }
         if (self.resume_db) |*db| db.close();
     }
 
@@ -133,6 +141,7 @@ pub const SessionManager = struct {
         session.max_peers = self.max_peers;
         session.hasher_threads = self.hasher_threads;
         session.resume_db_path = self.resume_db_path;
+        session.tracker_executor = try self.ensureTrackerExecutor();
 
         self.mutex.lock();
         defer self.mutex.unlock();
@@ -180,6 +189,7 @@ pub const SessionManager = struct {
         session.max_peers = self.max_peers;
         session.hasher_threads = self.hasher_threads;
         session.resume_db_path = self.resume_db_path;
+        session.tracker_executor = try self.ensureTrackerExecutor();
 
         self.mutex.lock();
         defer self.mutex.unlock();
@@ -623,14 +633,14 @@ pub const SessionManager = struct {
         defer self.mutex.unlock();
 
         const session = self.sessions.get(hash) orelse return error.TorrentNotFound;
-        // Spawn a background thread to do the announce (blocking HTTP is fine there).
-        // Uses the session's shared announce_ring to avoid creating a new ring per announce.
-        if (session.announcing.swap(true, .acq_rel)) return; // already announcing
-        const thread = std.Thread.spawn(.{}, TorrentSession.announceCompletedWorker, .{session}) catch {
-            session.announcing.store(false, .release);
-            return;
-        };
-        thread.detach();
+        try session.scheduleCompletedAnnounce();
+    }
+
+    fn ensureTrackerExecutor(self: *SessionManager) !*TrackerExecutor {
+        if (self.tracker_executor == null) {
+            self.tracker_executor = try TrackerExecutor.create(self.allocator);
+        }
+        return self.tracker_executor.?;
     }
 
     /// Force piece recheck for a torrent: stop, recheck, resume.

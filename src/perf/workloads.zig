@@ -13,7 +13,9 @@ const peer_handler = varuna.io.peer_handler;
 const http_mod = varuna.io.http;
 const Ring = varuna.io.ring.Ring;
 const mse_mod = varuna.crypto.mse;
+const tracker_announce = varuna.tracker.announce;
 const SessionManager = varuna.daemon.session_manager.SessionManager;
+const TrackerExecutor = varuna.daemon.tracker_executor.TrackerExecutor;
 const TorrentSession = varuna.daemon.torrent_session.TorrentSession;
 
 pub const Config = struct {
@@ -44,6 +46,8 @@ pub const Scenario = enum {
     api_upload_burst,
     tracker_http_fresh,
     tracker_http_reuse_potential,
+    tracker_announce_fresh,
+    tracker_announce_executor,
     extension_decode,
     ut_metadata_decode,
     mse_responder_prep,
@@ -79,6 +83,8 @@ pub fn run(
         .api_upload_burst => runApiBurst(allocator, alloc_counter, iterations, config, .upload),
         .tracker_http_fresh => runTrackerHttpSeries(allocator, alloc_counter, iterations, .fresh),
         .tracker_http_reuse_potential => runTrackerHttpSeries(allocator, alloc_counter, iterations, .reuse_potential),
+        .tracker_announce_fresh => runTrackerAnnounceFresh(allocator, alloc_counter, iterations),
+        .tracker_announce_executor => runTrackerAnnounceExecutor(allocator, alloc_counter, iterations),
         .extension_decode => runExtensionDecode(allocator, alloc_counter, iterations),
         .ut_metadata_decode => runUtMetadataDecode(allocator, alloc_counter, iterations),
         .mse_responder_prep => runMseResponderPrep(allocator, alloc_counter, iterations, config),
@@ -871,6 +877,131 @@ fn runTrackerHttpSeries(
         checksum,
         alloc_counter,
     );
+}
+
+fn makeTrackerAnnounceRequest(allocator: std.mem.Allocator, port: u16) !tracker_announce.Request {
+    return .{
+        .announce_url = try std.fmt.allocPrint(allocator, "http://127.0.0.1:{}/announce?info_hash=abc", .{port}),
+        .info_hash = [_]u8{1} ** 20,
+        .peer_id = [_]u8{2} ** 20,
+        .port = 6881,
+        .left = 0,
+        .event = null,
+    };
+}
+
+fn runTrackerAnnounceFresh(
+    allocator: std.mem.Allocator,
+    alloc_counter: *CountingAllocator,
+    iterations: usize,
+) !Result {
+    const listen_fd = try createLoopbackListener();
+    defer posix.close(listen_fd);
+
+    const port = try getListenPort(listen_fd);
+    var server_state = TrackerServerState{ .listen_fd = listen_fd };
+    const server_thread = try std.Thread.spawn(.{}, trackerServerWorker, .{&server_state});
+    defer {
+        server_state.running.store(false, .release);
+        wakeTrackerServer(port) catch {};
+        server_thread.join();
+    }
+
+    var ring = try Ring.init(32);
+    defer ring.deinit();
+
+    const request = try makeTrackerAnnounceRequest(allocator, port);
+    defer allocator.free(request.announce_url);
+
+    std.Thread.sleep(10 * std.time.ns_per_ms);
+    alloc_counter.stats = .{};
+    var timer = try std.time.Timer.start();
+    var checksum: u64 = 0;
+
+    for (0..iterations) |_| {
+        const response = try tracker_announce.fetchAutoWithDns(allocator, &ring, null, request);
+        defer tracker_announce.freeResponse(allocator, response);
+        checksum +%= response.interval;
+        checksum +%= response.peers.len;
+    }
+
+    return makeResult("tracker_announce_fresh", iterations, &timer, checksum, alloc_counter);
+}
+
+const TrackerExecutorBenchState = struct {
+    allocator: std.mem.Allocator,
+    request: tracker_announce.Request,
+    mutex: std.Thread.Mutex = .{},
+    cond: std.Thread.Condition = .{},
+    completed: usize = 0,
+    failures: usize = 0,
+    checksum: u64 = 0,
+};
+
+fn runTrackerAnnounceExecutor(
+    allocator: std.mem.Allocator,
+    alloc_counter: *CountingAllocator,
+    iterations: usize,
+) !Result {
+    const listen_fd = try createLoopbackListener();
+    defer posix.close(listen_fd);
+
+    const port = try getListenPort(listen_fd);
+    var server_state = TrackerServerState{ .listen_fd = listen_fd };
+    const server_thread = try std.Thread.spawn(.{}, trackerServerWorker, .{&server_state});
+    defer {
+        server_state.running.store(false, .release);
+        wakeTrackerServer(port) catch {};
+        server_thread.join();
+    }
+
+    const executor = try TrackerExecutor.create(allocator);
+    defer executor.destroy();
+
+    std.Thread.sleep(10 * std.time.ns_per_ms);
+
+    var state = TrackerExecutorBenchState{
+        .allocator = allocator,
+        .request = try makeTrackerAnnounceRequest(allocator, port),
+    };
+    defer allocator.free(state.request.announce_url);
+
+    alloc_counter.stats = .{};
+    var timer = try std.time.Timer.start();
+
+    for (0..iterations) |_| {
+        try executor.submit(&state, trackerExecutorBenchJob);
+    }
+
+    state.mutex.lock();
+    while (state.completed < iterations) {
+        state.cond.wait(&state.mutex);
+    }
+    const checksum = state.checksum +% state.failures;
+    state.mutex.unlock();
+
+    return makeResult("tracker_announce_executor", iterations, &timer, checksum, alloc_counter);
+}
+
+fn trackerExecutorBenchJob(context: *anyopaque, ring: *Ring, http_client: *http_mod.HttpClient) void {
+    const state: *TrackerExecutorBenchState = @ptrCast(@alignCast(context));
+
+    if (tracker_announce.fetchAutoWithHttpClient(state.allocator, ring, http_client, state.request)) |response| {
+        defer tracker_announce.freeResponse(state.allocator, response);
+
+        state.mutex.lock();
+        state.completed += 1;
+        state.checksum +%= response.interval;
+        state.checksum +%= response.peers.len;
+        state.cond.signal();
+        state.mutex.unlock();
+    } else |_| {
+        state.mutex.lock();
+        state.completed += 1;
+        state.failures += 1;
+        state.cond.signal();
+        state.mutex.unlock();
+    }
 }
 
 fn createLoopbackListener() !posix.fd_t {

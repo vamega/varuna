@@ -89,6 +89,25 @@ pub fn scrapeHttpWithDns(
     return parseScrapeResponse(allocator, http_response.body, info_hash);
 }
 
+pub fn scrapeHttpWithClient(
+    allocator: std.mem.Allocator,
+    http_client: *@import("../io/http.zig").HttpClient,
+    announce_url: []const u8,
+    info_hash: [20]u8,
+) !ScrapeResult {
+    const url = try buildScrapeUrl(allocator, announce_url, info_hash);
+    defer allocator.free(url);
+
+    var http_response = try http_client.get(url);
+    defer http_response.deinit();
+
+    if (http_response.status != 200) {
+        return error.UnexpectedTrackerStatus;
+    }
+
+    return parseScrapeResponse(allocator, http_response.body, info_hash);
+}
+
 /// Perform a UDP scrape request (BEP 15, action=2) via io_uring.
 pub fn scrapeUdp(
     allocator: std.mem.Allocator,
@@ -188,6 +207,19 @@ pub fn scrapeAutoWithDns(
         return scrapeUdp(allocator, ring, announce_url, info_hash);
     }
     return scrapeHttpWithDns(allocator, ring, dns_resolver, announce_url, info_hash);
+}
+
+pub fn scrapeAutoWithHttpClient(
+    allocator: std.mem.Allocator,
+    ring: *Ring,
+    http_client: *@import("../io/http.zig").HttpClient,
+    announce_url: []const u8,
+    info_hash: [20]u8,
+) !ScrapeResult {
+    if (std.mem.startsWith(u8, announce_url, "udp://")) {
+        return scrapeUdp(allocator, ring, announce_url, info_hash);
+    }
+    return scrapeHttpWithClient(allocator, http_client, announce_url, info_hash);
 }
 
 // ── Response parsing ─────────────────────────────────────

@@ -12,6 +12,19 @@ pub const HttpClient = struct {
     ring: *Ring,
     allocator: std.mem.Allocator,
     dns_resolver: ?*DnsResolver = null,
+    persistent_plain_http: bool = false,
+    pooled_plain_connections: std.ArrayList(PooledPlainConnection) = .empty,
+
+    const PooledPlainConnection = struct {
+        host: []u8,
+        port: u16,
+        fd: posix.fd_t,
+    };
+
+    const ResponseResult = struct {
+        response: HttpResponse,
+        reusable: bool,
+    };
 
     pub fn init(allocator: std.mem.Allocator, ring: *Ring) HttpClient {
         return .{
@@ -27,6 +40,34 @@ pub const HttpClient = struct {
             .allocator = allocator,
             .dns_resolver = dns_resolver,
         };
+    }
+
+    /// Create an HttpClient that keeps plain HTTP tracker connections open and
+    /// reuses them across requests. HTTPS still falls back to one-shot sockets.
+    pub fn initPersistent(allocator: std.mem.Allocator, ring: *Ring) HttpClient {
+        return .{
+            .ring = ring,
+            .allocator = allocator,
+            .persistent_plain_http = true,
+        };
+    }
+
+    /// Create a persistent HttpClient with a shared DNS cache.
+    pub fn initPersistentWithDns(allocator: std.mem.Allocator, ring: *Ring, dns_resolver: *DnsResolver) HttpClient {
+        return .{
+            .ring = ring,
+            .allocator = allocator,
+            .dns_resolver = dns_resolver,
+            .persistent_plain_http = true,
+        };
+    }
+
+    pub fn deinit(self: *HttpClient) void {
+        for (self.pooled_plain_connections.items) |connection| {
+            posix.close(connection.fd);
+            self.allocator.free(connection.host);
+        }
+        self.pooled_plain_connections.deinit(self.allocator);
     }
 
     /// Perform an HTTP GET request and return the response body.
@@ -65,13 +106,61 @@ pub const HttpClient = struct {
 
     /// Plain HTTP GET over io_uring with additional headers.
     fn getHttpWithHeaders(self: *HttpClient, parsed: ParsedUrl, extra_headers: []const []const u8) !HttpResponse {
+        if (self.persistent_plain_http) {
+            return self.getHttpWithReuse(parsed, extra_headers);
+        }
+
+        const fd = try self.openHttpConnection(parsed);
+        defer posix.close(fd);
+
+        const result = try self.performHttpRequest(fd, parsed, extra_headers, false);
+        return result.response;
+    }
+
+    fn getHttpWithReuse(self: *HttpClient, parsed: ParsedUrl, extra_headers: []const []const u8) !HttpResponse {
+        if (parsed.is_https) {
+            return self.getHttpFresh(parsed, extra_headers);
+        }
+
+        var attempts: usize = 0;
+        while (attempts < 2) : (attempts += 1) {
+            var pooled_index = self.findPooledPlainConnection(parsed);
+            if (pooled_index == null) {
+                pooled_index = try self.addPooledPlainConnection(parsed);
+            }
+
+            const index = pooled_index.?;
+            const fd = self.pooled_plain_connections.items[index].fd;
+            const result = self.performHttpRequest(fd, parsed, extra_headers, true) catch |err| {
+                self.dropPooledPlainConnection(index);
+                if (attempts == 0 and isRetryableKeepAliveError(err)) continue;
+                return err;
+            };
+
+            if (!result.reusable) {
+                self.dropPooledPlainConnection(index);
+            }
+            return result.response;
+        }
+
+        return error.ConnectionClosed;
+    }
+
+    fn getHttpFresh(self: *HttpClient, parsed: ParsedUrl, extra_headers: []const []const u8) !HttpResponse {
         // Resolve DNS -- use shared cache if available, otherwise one-shot
+        const fd = try self.openHttpConnection(parsed);
+        errdefer posix.close(fd);
+
+        const result = try self.performHttpRequest(fd, parsed, extra_headers, false);
+        return result.response;
+    }
+
+    fn openHttpConnection(self: *HttpClient, parsed: ParsedUrl) !posix.fd_t {
         const address = if (self.dns_resolver) |r|
             try r.resolve(self.allocator, parsed.host, parsed.port)
         else
             try @import("dns.zig").resolveOnce(self.allocator, parsed.host, parsed.port);
 
-        // Connect via io_uring
         const fd = try self.ring.socket(
             address.any.family,
             posix.SOCK.STREAM | posix.SOCK.CLOEXEC,
@@ -83,8 +172,16 @@ pub const HttpClient = struct {
             if (err == error.ConnectionTimedOut) return error.ConnectionTimedOut;
             return err;
         };
+        return fd;
+    }
 
-        // Build and send HTTP request
+    fn performHttpRequest(
+        self: *HttpClient,
+        fd: posix.fd_t,
+        parsed: ParsedUrl,
+        extra_headers: []const []const u8,
+        keep_alive: bool,
+    ) !ResponseResult {
         var request_buf = std.ArrayList(u8).empty;
         defer request_buf.deinit(self.allocator);
 
@@ -96,46 +193,95 @@ pub const HttpClient = struct {
             try request_buf.appendSlice(self.allocator, hdr);
             try request_buf.appendSlice(self.allocator, "\r\n");
         }
-        try request_buf.appendSlice(self.allocator, "Connection: close\r\n\r\n");
+        try request_buf.print(self.allocator, "Connection: {s}\r\n\r\n", .{
+            if (keep_alive) "keep-alive" else "close",
+        });
 
         try self.ring.send_all(fd, request_buf.items);
 
-        // Receive response
         var response_buf = std.ArrayList(u8).empty;
         errdefer response_buf.deinit(self.allocator);
 
         var recv_buf: [8192]u8 = undefined;
+        var saw_close = false;
         while (true) {
             const n = self.ring.recv(fd, &recv_buf) catch |err| {
-                if (response_buf.items.len > 0) break; // treat as end of response
+                if (response_buf.items.len > 0 and isRetryableKeepAliveError(err)) {
+                    saw_close = true;
+                    break;
+                }
                 return err;
             };
-            if (n == 0) break;
+            if (n == 0) {
+                saw_close = true;
+                break;
+            }
             try response_buf.appendSlice(self.allocator, recv_buf[0..n]);
 
-            // Check if we have the full response
             if (findBodyStart(response_buf.items)) |body_start| {
-                const content_length = parseContentLength(response_buf.items[0..body_start]);
-                if (content_length) |cl| {
+                const headers = response_buf.items[0..body_start];
+                if (parseContentLength(headers)) |cl| {
                     const total_expected = body_start + cl;
                     if (response_buf.items.len >= total_expected) break;
                 }
-                // If no Content-Length, keep reading until connection closes
             }
         }
 
-        posix.close(fd);
-
-        // Parse response
         const body_start = findBodyStart(response_buf.items) orelse return error.InvalidHttpResponse;
+        const headers = response_buf.items[0..body_start];
         const status = parseStatusCode(response_buf.items) orelse return error.InvalidHttpResponse;
+        if (parseContentLength(headers)) |cl| {
+            if (response_buf.items.len < body_start + cl) {
+                return error.UnexpectedEndOfStream;
+            }
+        }
 
         return .{
-            .status = status,
-            .body = response_buf.items[body_start..],
-            .raw = response_buf,
-            .allocator = self.allocator,
+            .response = .{
+                .status = status,
+                .body = response_buf.items[body_start..],
+                .raw = response_buf,
+                .allocator = self.allocator,
+            },
+            .reusable = keep_alive and
+                parseContentLength(headers) != null and
+                !parseConnectionClose(headers) and
+                !saw_close,
         };
+    }
+
+    fn findPooledPlainConnection(self: *HttpClient, parsed: ParsedUrl) ?usize {
+        for (self.pooled_plain_connections.items, 0..) |connection, idx| {
+            if (connection.port != parsed.port) continue;
+            if (!std.mem.eql(u8, connection.host, parsed.host)) continue;
+            return idx;
+        }
+        return null;
+    }
+
+    fn addPooledPlainConnection(self: *HttpClient, parsed: ParsedUrl) !usize {
+        const max_plain_pool = 8;
+        if (self.pooled_plain_connections.items.len >= max_plain_pool) {
+            self.dropPooledPlainConnection(0);
+        }
+
+        const host = try self.allocator.dupe(u8, parsed.host);
+        errdefer self.allocator.free(host);
+        const fd = try self.openHttpConnection(parsed);
+        errdefer posix.close(fd);
+
+        try self.pooled_plain_connections.append(self.allocator, .{
+            .host = host,
+            .port = parsed.port,
+            .fd = fd,
+        });
+        return self.pooled_plain_connections.items.len - 1;
+    }
+
+    fn dropPooledPlainConnection(self: *HttpClient, index: usize) void {
+        const connection = self.pooled_plain_connections.orderedRemove(index);
+        posix.close(connection.fd);
+        self.allocator.free(connection.host);
     }
 
     /// HTTPS GET: TLS handshake + HTTP tunneled through BoringSSL BIO pair,
@@ -399,6 +545,25 @@ pub fn parseContentLength(headers: []const u8) ?usize {
     return null;
 }
 
+pub fn parseConnectionClose(headers: []const u8) bool {
+    var iter = std.mem.splitSequence(u8, headers, "\r\n");
+    while (iter.next()) |line| {
+        if (std.ascii.startsWithIgnoreCase(line, "connection:")) {
+            const value = std.mem.trim(u8, line["connection:".len..], " ");
+            return std.ascii.eqlIgnoreCase(value, "close");
+        }
+    }
+    return false;
+}
+
+fn isRetryableKeepAliveError(err: anyerror) bool {
+    return err == error.BrokenPipe or
+        err == error.ConnectionResetByPeer or
+        err == error.ConnectionAborted or
+        err == error.NotOpenForWriting or
+        err == error.UnexpectedEndOfStream;
+}
+
 pub fn parseStatusCode(data: []const u8) ?u16 {
     // "HTTP/1.1 200 OK\r\n"
     if (data.len < 12) return null;
@@ -464,6 +629,11 @@ test "find body start" {
 test "parse content length" {
     const headers = "HTTP/1.1 200 OK\r\nContent-Length: 42\r\nConnection: close\r\n";
     try std.testing.expectEqual(@as(?usize, 42), parseContentLength(headers));
+}
+
+test "parse connection close" {
+    try std.testing.expect(parseConnectionClose("HTTP/1.1 200 OK\r\nConnection: close\r\n"));
+    try std.testing.expect(!parseConnectionClose("HTTP/1.1 200 OK\r\nConnection: keep-alive\r\n"));
 }
 
 // ── Fuzz and edge case tests for HTTP response parsing ────

@@ -96,6 +96,20 @@ pub fn fetchAutoWithDns(
     return fetchViaRing(allocator, ring, dns_resolver, request);
 }
 
+/// Fetch tracker announce using a caller-owned HTTP client. This allows a
+/// shared executor to reuse DNS state and keep-alive connections across jobs.
+pub fn fetchAutoWithHttpClient(
+    allocator: std.mem.Allocator,
+    ring: *@import("../io/ring.zig").Ring,
+    http_client: *@import("../io/http.zig").HttpClient,
+    request: Request,
+) !Response {
+    if (std.mem.startsWith(u8, request.announce_url, "udp://")) {
+        return @import("udp.zig").fetchViaUdp(allocator, ring, request);
+    }
+    return fetchViaHttpClient(allocator, http_client, request);
+}
+
 /// Fetch tracker announce using our io_uring-based HTTP client.
 /// This replaces the std.http.Client path -- all I/O goes through io_uring.
 pub fn fetchViaRing(
@@ -112,6 +126,24 @@ pub fn fetchViaRing(
         http_mod.HttpClient.initWithDns(allocator, ring, r)
     else
         http_mod.HttpClient.init(allocator, ring);
+    var http_response = try http_client.get(url);
+    defer http_response.deinit();
+
+    if (http_response.status != 200) {
+        return error.UnexpectedTrackerStatus;
+    }
+
+    return parseResponse(allocator, http_response.body);
+}
+
+pub fn fetchViaHttpClient(
+    allocator: std.mem.Allocator,
+    http_client: *@import("../io/http.zig").HttpClient,
+    request: Request,
+) !Response {
+    const url = try buildUrl(allocator, request);
+    defer allocator.free(url);
+
     var http_response = try http_client.get(url);
     defer http_response.deinit();
 
