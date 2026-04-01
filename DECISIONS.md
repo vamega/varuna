@@ -465,3 +465,25 @@ Reasoning:
 Follow-up triggers:
 - If HTTP tracker reuse still matters after this pass, teach the executor-owned client to pool more than the current small set of plain HTTP endpoints and measure mixed-tracker workloads.
 - If the daemon needs tracker work on the main peer ring, first redesign tracker I/O as incrementally-driven state machines with explicit CQE routing instead of calling the current synchronous HTTP helper on the peer loop thread.
+
+### 2026-04-01: Cache Live Torrent Byte Totals For `/sync` Stats
+
+Context:
+The sparse peer/torrent registry pass removed the worst cross-product scans, but the live stats path still rebuilt per-torrent byte totals by summing every attached peer inside `getSpeedStats()` and `updateSpeedCounters()`. A dedicated workload was needed to measure the live `SessionManager.getAllStats()` path, not just `/sync` JSON formatting.
+
+Decision:
+- Add `downloaded_bytes` and `uploaded_bytes` to `TorrentContext` and update them incrementally when piece payload bytes are received or sent.
+- Make `EventLoop.getSpeedStats()` and `peer_policy.updateSpeedCounters()` read those cached totals instead of rescanning each torrent's peer list.
+- Add a live synthetic workload, `sync_stats_live`, that builds a shared-loop `SessionManager` with `10k` torrents and sparse active peers, then measures the hot stats path directly.
+- Keep `seed_plaintext_burst` and `utp_outbound_burst` in the perf harness as measurement surfaces, but do not land new production changes for those paths in this pass.
+
+Reasoning:
+- The new live-stats workload improved from `19,509,532 ns` to `4,886,050 ns` and `4,046,868 ns` on repeat runs at `10,000` torrents / `1,000` peers / `scale=20`, which is a large enough win to justify the narrow cache.
+- This is a smaller and safer change than a full torrent hot-summary registry. The expensive part of the current path was repeated byte aggregation, not queue position lookup or JSON emission.
+- The cached totals also fix semantics: torrent byte totals are now cumulative across peer disconnects instead of being derived only from currently attached peers.
+- A first outbound uTP queue cleanup pass removed allocator churn, but benchmark time stayed noisy and roughly flat, so it was explicitly rejected for now instead of being carried as speculative complexity.
+
+Follow-up triggers:
+- If `/sync/maindata` still dominates at very high torrent counts, move more fields into a dedicated hot registry rather than repeatedly walking `TorrentSession` objects.
+- Revisit seed plaintext scatter/gather only if the new `seed_plaintext_burst` workload justifies the buffer-lifetime refactor needed for a correct `sendmsg` path.
+- Revisit uTP queueing only with a design that can show a clear wall-clock win, not just fewer allocations.

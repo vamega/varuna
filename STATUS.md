@@ -183,7 +183,7 @@ Update it whenever a milestone lands, the near-term backlog changes, or a new op
 - ~~**Shared MSE responder lookup**~~: (DONE) inbound encrypted handshakes now consult a shared `req2 -> info_hash` table instead of copying and scanning all torrent hashes per peer.
 - ~~**Shared tracker executor / connection reuse**~~: (DONE) daemon-side reannounce, completion announce, and scrape jobs now run through one shared tracker executor with a persistent HTTP client instead of detached per-session tracker threads.
 - **Peer hot/cold split / partial SoA**: the active-slot pass removes a lot of wasted scans, but the `Peer` struct is still wide. The next performance step is separating hot scheduling/state fields from cold crypto/buffering state.
-- **Torrent hot-summary registry**: now that the shared EventLoop can hold far more than 64 torrents, `/sync` and periodic torrent housekeeping should move toward a denser hot-state registry instead of pulling data from full `TorrentSession` objects on demand.
+- **Torrent hot-summary registry**: cached cumulative byte totals now remove the hottest `/sync` stats scan, but a denser registry is still the next step if queue position, state derivation, or other per-torrent fields dominate at `10k+` torrents.
 - **Broader RPC arena coverage**: `/sync/maindata` now uses an arena for transient work; the other list-heavy endpoints still allocate temporary object graphs and strings.
 - **API request-body growth / reuse**: the short-request path now uses inline storage, but large request bodies still allocate on demand and are freed on disconnect. A per-client arena or reuse pool is still available if API uploads remain allocator-heavy.
 - **Seed plaintext scatter/gather**: piece sends still use copy-based buffering for plaintext peers. `sendmsg` / `sendmsg_zc` are still available if seed profiles justify another pass.
@@ -198,7 +198,8 @@ Update it whenever a milestone lands, the near-term backlog changes, or a new op
 - uTP send queue previously truncated data packets to header-only size (fixed).
 - On this WSL2 host, `perf stat` and `perf record` still require the kernel-matched `linux-tools-6.6.87.2-microsoft-standard-WSL2` package. `cachegrind` is the current cache-miss fallback.
 - The `peer_scan` harness is now parameterized by active density (`--scale`), but the production peer table is still a wide AoS. Sparse synthetic scans are measurable; a full hot/cold split is still pending.
-- The shared EventLoop no longer has a 64-torrent cap, and the sparse peer/torrent registry pass removed the main cross-product scans. If `/sync` or other admin paths still dominate at 10k+ torrents, the next step is a denser hot-summary registry.
+- The shared EventLoop no longer has a 64-torrent cap, and the sparse peer/torrent registry pass removed the main cross-product scans. Cached live byte totals further reduced `/sync` stats cost, but a broader hot-summary registry may still be needed for `10k+` torrents.
+- The first outbound uTP queue cleanup experiment removed allocator churn but did not show a convincing wall-clock improvement on the loopback workload, so it was not kept in production.
 
 ## Last Verified Milestone
 
@@ -224,3 +225,6 @@ Update it whenever a milestone lands, the near-term backlog changes, or a new op
 - `zig build -Doptimize=ReleaseFast perf-workload -- tick_sparse_torrents --iterations=500 --torrents=10000 --peers=512 --scale=20`: `2.80e9 ns` -> `1.09e7 ns`, `0` allocs before and after
 - `zig build -Doptimize=ReleaseFast perf-workload -- peer_churn --iterations=5000 --peers=4096 --scale=128`: `1.13e9 ns` -> `3.81e6 ns`, `0` allocs before and after
 - `zig build -Doptimize=ReleaseFast perf-workload -- sync_delta --iterations=200 --torrents=10000`: `3.26e10 ns` -> `3.21e10 ns`, alloc calls `4,229,117` -> `4,228,317`
+- `zig build -Doptimize=ReleaseFast perf-workload -- sync_stats_live --iterations=1 --torrents=10000 --peers=1000 --scale=20`: `1.95e7 ns` -> `4.89e6 ns`, repeat `4.05e6 ns`
+- `zig build -Doptimize=ReleaseFast perf-workload -- seed_plaintext_burst --iterations=500 --scale=8`: `~2.73e7 ns` to `~3.04e7 ns`, `501` allocs, `65.6 MB` transient bytes
+- `zig build -Doptimize=ReleaseFast perf-workload -- utp_outbound_burst --iterations=200 --scale=64`: baseline surface only, `~8.13e7 ns` to `~1.10e8 ns` across runs; first queue cleanup pass removed allocs but did not show a stable latency win

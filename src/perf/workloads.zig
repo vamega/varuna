@@ -23,6 +23,8 @@ const TrackerExecutor = varuna.daemon.tracker_executor.TrackerExecutor;
 const TorrentSession = varuna.daemon.torrent_session.TorrentSession;
 const peer_policy = varuna.io.peer_policy;
 const pex_mod = varuna.net.pex;
+const seed_handler = varuna.io.seed_handler;
+const utp_handler = varuna.io.utp_handler;
 
 pub const Config = struct {
     iterations: usize = 1_000,
@@ -46,6 +48,7 @@ pub const Scenario = enum {
     peer_accept_burst,
     request_batch,
     seed_batch,
+    seed_plaintext_burst,
     http_response,
     api_get_burst,
     api_get_seq,
@@ -59,8 +62,10 @@ pub const Scenario = enum {
     mse_responder_prep,
     session_load,
     sync_delta,
+    sync_stats_live,
     tick_sparse_torrents,
     peer_churn,
+    utp_outbound_burst,
 
     pub fn parse(name: []const u8) ?Scenario {
         inline for (std.meta.fields(Scenario)) |field| {
@@ -85,6 +90,7 @@ pub fn run(
         .peer_accept_burst => runPeerAcceptBurst(allocator, alloc_counter, iterations, config),
         .request_batch => runRequestBatch(allocator, alloc_counter, iterations, config),
         .seed_batch => runSeedBatch(allocator, alloc_counter, iterations, config),
+        .seed_plaintext_burst => runSeedPlaintextBurst(allocator, alloc_counter, iterations, config),
         .http_response => runHttpResponse(allocator, alloc_counter, iterations, config),
         .api_get_burst => runApiBurst(allocator, alloc_counter, iterations, config, .get),
         .api_get_seq => runApiSequentialGet(allocator, alloc_counter, iterations, config),
@@ -98,8 +104,10 @@ pub fn run(
         .mse_responder_prep => runMseResponderPrep(allocator, alloc_counter, iterations, config),
         .session_load => runSessionLoad(allocator, alloc_counter, iterations),
         .sync_delta => runSyncDelta(allocator, alloc_counter, iterations, config),
+        .sync_stats_live => runSyncStatsLive(allocator, alloc_counter, iterations, config),
         .tick_sparse_torrents => runTickSparseTorrents(allocator, alloc_counter, iterations, config),
         .peer_churn => runPeerChurn(allocator, alloc_counter, iterations, config),
+        .utp_outbound_burst => runUtpOutboundBurst(allocator, alloc_counter, iterations, config),
     };
 }
 
@@ -408,6 +416,65 @@ fn runSeedBatch(
     }
 
     return makeResult("seed_batch", iterations, &timer, checksum, alloc_counter);
+}
+
+fn runSeedPlaintextBurst(
+    allocator: std.mem.Allocator,
+    alloc_counter: *CountingAllocator,
+    iterations: usize,
+    config: Config,
+) !Result {
+    var event_loop = try EventLoop.initBare(allocator, 0);
+    defer event_loop.deinit();
+
+    const fds = try createStreamSocketPair();
+    defer posix.close(fds[0]);
+    defer posix.close(fds[1]);
+
+    const block_count = @max(config.scale, 8);
+    const block_len = 16 * 1024;
+    const piece_len = block_count * block_len;
+    const total_len = block_count * (13 + block_len);
+
+    const piece_data = try allocator.alloc(u8, piece_len);
+    defer allocator.free(piece_data);
+    for (piece_data, 0..) |*byte, idx| byte.* = @truncate(idx *% 29 +% 7);
+
+    const recv_buf = try allocator.alloc(u8, total_len);
+    defer allocator.free(recv_buf);
+
+    event_loop.peers[0] = .{
+        .fd = fds[0],
+        .state = .active_recv_header,
+        .mode = .seed,
+        .torrent_id = 0,
+        .crypto = mse_mod.PeerCrypto.plaintext,
+    };
+    event_loop.peer_count = 1;
+    event_loop.markActivePeer(0);
+
+    alloc_counter.stats = .{};
+    var timer = try std.time.Timer.start();
+    var checksum: u64 = 0;
+
+    for (0..iterations) |iter| {
+        for (0..block_count) |idx| {
+            try event_loop.queued_responses.append(allocator, .{
+                .slot = 0,
+                .piece_index = @intCast(iter & 0xffff),
+                .block_offset = @intCast(idx * block_len),
+                .block_length = block_len,
+                .piece_data = piece_data,
+            });
+        }
+
+        seed_handler.flushQueuedResponses(&event_loop);
+        try drainPeerSendCompletions(&event_loop, 0);
+        try readExact(fds[1], recv_buf);
+        checksum +%= std.hash.Wyhash.hash(0, recv_buf);
+    }
+
+    return makeResult("seed_plaintext_burst", iterations, &timer, checksum, alloc_counter);
 }
 
 fn runHttpResponse(
@@ -1039,6 +1106,22 @@ fn readUntilClose(fd: posix.fd_t, buffer: []u8) !usize {
     return error.ResponseTooLarge;
 }
 
+fn readExact(fd: posix.fd_t, buffer: []u8) !void {
+    var total: usize = 0;
+    while (total < buffer.len) {
+        const n = try posix.read(fd, buffer[total..]);
+        if (n == 0) return error.UnexpectedEof;
+        total += n;
+    }
+}
+
+fn createStreamSocketPair() ![2]posix.fd_t {
+    var fds: [2]i32 = undefined;
+    const rc = linux.socketpair(posix.AF.UNIX, posix.SOCK.STREAM, 0, &fds);
+    if (linux.E.init(rc) != .SUCCESS) return error.SocketPairFailed;
+    return fds;
+}
+
 fn getListenPort(fd: posix.fd_t) !u16 {
     var addr: posix.sockaddr = undefined;
     var addr_len: posix.socklen_t = @sizeOf(posix.sockaddr);
@@ -1050,6 +1133,66 @@ fn wakeApiServer(address: std.net.Address) !void {
     const fd = try posix.socket(posix.AF.INET, posix.SOCK.STREAM | posix.SOCK.CLOEXEC, posix.IPPROTO.TCP);
     defer posix.close(fd);
     posix.connect(fd, &address.any, address.getOsSockLen()) catch {};
+}
+
+fn drainPeerSendCompletions(event_loop: *EventLoop, slot: u16) !void {
+    var cqes: [8]linux.io_uring_cqe = undefined;
+    while (event_loop.peers[slot].send_pending or event_loop.pending_sends.items.len != 0) {
+        _ = try event_loop.ring.submit_and_wait(1);
+        const count = try event_loop.ring.copy_cqes(&cqes, 0);
+        for (cqes[0..count]) |cqe| {
+            const op = event_loop_mod.decodeUserData(cqe.user_data);
+            if (op.op_type == .peer_send) {
+                peer_handler.handleSend(event_loop, op.slot, cqe);
+            }
+        }
+    }
+}
+
+fn createLoopbackUdpReceiver() !struct { fd: posix.fd_t, address: std.net.Address } {
+    const fd = try posix.socket(
+        posix.AF.INET,
+        posix.SOCK.DGRAM | posix.SOCK.CLOEXEC | posix.SOCK.NONBLOCK,
+        posix.IPPROTO.UDP,
+    );
+    errdefer posix.close(fd);
+
+    const address = std.net.Address.initIp4(.{ 127, 0, 0, 1 }, 0);
+    try posix.bind(fd, &address.any, address.getOsSockLen());
+
+    var raw_addr: posix.sockaddr = undefined;
+    var raw_len: posix.socklen_t = @sizeOf(posix.sockaddr);
+    try posix.getsockname(fd, &raw_addr, &raw_len);
+
+    return .{
+        .fd = fd,
+        .address = .{ .any = raw_addr },
+    };
+}
+
+fn drainUtpSendCompletions(event_loop: *EventLoop) !void {
+    var cqes: [16]linux.io_uring_cqe = undefined;
+    _ = try event_loop.ring.submit_and_wait(1);
+    const count = try event_loop.ring.copy_cqes(&cqes, 0);
+    for (cqes[0..count]) |cqe| {
+        const op = event_loop_mod.decodeUserData(cqe.user_data);
+        if (op.op_type == .utp_send) {
+            utp_handler.handleUtpSend(event_loop, cqe);
+        }
+    }
+}
+
+fn drainUdpReceiver(fd: posix.fd_t, buffer: []u8) !u64 {
+    var checksum: u64 = 0;
+    while (true) {
+        const n = posix.recv(fd, buffer, posix.MSG.DONTWAIT) catch |err| switch (err) {
+            error.WouldBlock => break,
+            else => return err,
+        };
+        if (n == 0) break;
+        checksum +%= std.hash.Wyhash.hash(0, buffer[0..n]);
+    }
+    return checksum;
 }
 
 fn trackerServerWorker(state: *TrackerServerState) void {
@@ -1208,11 +1351,11 @@ fn runSyncDelta(
     for (0..iterations) |idx| {
         if (idx % 8 == 0) {
             manager.mutex.lock();
-            defer manager.mutex.unlock();
             var iter = manager.sessions.iterator();
             if (iter.next()) |entry| {
                 entry.value_ptr.*.state = if (entry.value_ptr.*.state == .downloading) .paused else .downloading;
             }
+            manager.mutex.unlock();
         }
 
         const body = try sync_state.computeDelta(&manager, allocator, request_rid);
@@ -1221,6 +1364,119 @@ fn runSyncDelta(
     }
 
     return makeResult("sync_delta", iterations, &timer, checksum, alloc_counter);
+}
+
+fn runSyncStatsLive(
+    allocator: std.mem.Allocator,
+    alloc_counter: *CountingAllocator,
+    iterations: usize,
+    config: Config,
+) !Result {
+    var event_loop = try EventLoop.initBare(allocator, 0);
+    defer event_loop.deinit();
+
+    var manager = SessionManager.init(allocator);
+    defer manager.deinit();
+    manager.shared_event_loop = &event_loop;
+
+    const torrent_count = @max(config.torrents, 1);
+    const active_stride = @max(config.scale, 1);
+    const peer_count = @max(config.peers, 1);
+    const empty_fds = [_]std.posix.fd_t{};
+    const active_torrent_budget = @max(torrent_count / active_stride, 1);
+
+    try manager.category_store.create("bench", "/tmp/bench");
+    try manager.tag_store.create("fast");
+
+    var active_peer_count: usize = 0;
+
+    for (0..torrent_count) |idx| {
+        const torrent_bytes = try makeTorrentBytes(allocator, idx);
+        defer allocator.free(torrent_bytes);
+
+        const session = try allocator.create(TorrentSession);
+        errdefer allocator.destroy(session);
+        session.* = try TorrentSession.create(allocator, torrent_bytes, "/tmp/varuna-bench", null);
+        errdefer session.deinit();
+        session.shared_event_loop = &event_loop;
+
+        if ((idx & 1) == 0) {
+            session.category = try allocator.dupe(u8, "bench");
+        }
+        if ((idx & 3) == 0) {
+            try session.tags.append(allocator, try allocator.dupe(u8, "fast"));
+            session.rebuildTagsString();
+        }
+        session.state = if ((idx & 1) == 0) .seeding else .paused;
+
+        manager.mutex.lock();
+        manager.sessions.put(&session.info_hash_hex, session) catch |err| {
+            manager.mutex.unlock();
+            return err;
+        };
+        manager.mutex.unlock();
+
+        const torrent_id = try event_loop.addTorrentContext(.{
+            .shared_fds = empty_fds[0..],
+            .info_hash = session.info_hash,
+            .peer_id = session.peer_id,
+            .session = null,
+        });
+        session.torrent_id_in_shared = torrent_id;
+
+        if (idx % active_stride != 0) continue;
+
+        const peers_this_torrent = @max(@divTrunc(peer_count, active_torrent_budget), 1);
+        for (0..peers_this_torrent) |_| {
+            if (active_peer_count >= event_loop.peers.len) break;
+            const slot: u16 = @intCast(active_peer_count);
+            const peer = &event_loop.peers[slot];
+            peer.* = .{
+                .state = .active_recv_header,
+                .mode = .seed,
+                .torrent_id = torrent_id,
+                .availability_known = true,
+                .peer_choking = false,
+                .extensions_supported = false,
+                .bytes_downloaded_from = @as(u64, active_peer_count) * 1024,
+                .bytes_uploaded_to = @as(u64, active_peer_count) * 512,
+            };
+            event_loop.active_peer_slots.append(allocator, slot) catch unreachable;
+            event_loop.attachPeerToTorrent(torrent_id, slot);
+            event_loop.accountTorrentBytes(torrent_id, peer.bytes_downloaded_from, peer.bytes_uploaded_to);
+            active_peer_count += 1;
+        }
+    }
+
+    const warm_stats = try manager.getAllStats(allocator);
+    defer allocator.free(warm_stats);
+
+    alloc_counter.stats = .{};
+    var timer = try std.time.Timer.start();
+    var checksum: u64 = 0;
+
+    for (0..iterations) |idx| {
+        if (idx % 8 == 0) {
+            manager.mutex.lock();
+            var iter = manager.sessions.iterator();
+            if (iter.next()) |entry| {
+                entry.value_ptr.*.state = if (entry.value_ptr.*.state == .seeding) .paused else .seeding;
+            }
+            manager.mutex.unlock();
+        }
+
+        const stats = try manager.getAllStats(allocator);
+        for (stats) |stat| {
+            checksum +%= stat.bytes_downloaded;
+            checksum +%= stat.bytes_uploaded;
+            checksum +%= stat.peers_connected;
+            checksum +%= stat.download_speed;
+            checksum +%= stat.upload_speed;
+        }
+        allocator.free(stats);
+    }
+
+    return makeResult("sync_stats_live", iterations, &timer, checksum, alloc_counter);
 }
 
 fn runTickSparseTorrents(
@@ -1362,6 +1618,55 @@ fn runPeerChurn(
     }
 
     return makeResult("peer_churn", iterations, &timer, checksum, alloc_counter);
+}
+
+fn runUtpOutboundBurst(
+    allocator: std.mem.Allocator,
+    alloc_counter: *CountingAllocator,
+    iterations: usize,
+    config: Config,
+) !Result {
+    var event_loop = try EventLoop.initBare(allocator, 0);
+    defer event_loop.deinit();
+
+    const sender_fd = try posix.socket(
+        posix.AF.INET,
+        posix.SOCK.DGRAM | posix.SOCK.CLOEXEC | posix.SOCK.NONBLOCK,
+        posix.IPPROTO.UDP,
+    );
+    defer posix.close(sender_fd);
+
+    const receiver = try createLoopbackUdpReceiver();
+    defer posix.close(receiver.fd);
+
+    event_loop.udp_fd = sender_fd;
+
+    const packets_per_iter = @max(config.scale, 64);
+    const payload_len = 1200;
+    var payload: [payload_len]u8 = undefined;
+    const recv_buf = try allocator.alloc(u8, payload_len);
+    defer allocator.free(recv_buf);
+
+    alloc_counter.stats = .{};
+    var timer = try std.time.Timer.start();
+    var checksum: u64 = 0;
+
+    for (0..iterations) |iter| {
+        for (0..packets_per_iter) |packet_idx| {
+            for (&payload, 0..) |*byte, byte_idx| {
+                byte.* = @truncate(iter +% packet_idx +% byte_idx);
+            }
+            utp_handler.utpSendPacket(&event_loop, &payload, receiver.address);
+        }
+
+        while (event_loop.utp_send_pending or event_loop.utp_send_queue.items.len != 0) {
+            try drainUtpSendCompletions(&event_loop);
+            checksum +%= try drainUdpReceiver(receiver.fd, recv_buf);
+        }
+        checksum +%= try drainUdpReceiver(receiver.fd, recv_buf);
+    }
+
+    return makeResult("utp_outbound_burst", iterations, &timer, checksum, alloc_counter);
 }
 
 fn makeTorrentBytes(allocator: std.mem.Allocator, seed: usize) ![]u8 {

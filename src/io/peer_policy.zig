@@ -730,17 +730,8 @@ pub fn updateSpeedCounters(self: *EventLoop) void {
     // Update per-torrent speed counters
     for (self.torrents_with_peers.items) |tid| {
         const tc = self.getTorrentContext(tid) orelse continue;
-
-        // Sum bytes across peers for this torrent
-        var dl_total: u64 = 0;
-        var ul_total: u64 = 0;
-        for (tc.peer_slots.items) |peer_slot| {
-            const peer = &self.peers[peer_slot];
-            if (peer.state != .free) {
-                dl_total += peer.bytes_downloaded_from;
-                ul_total += peer.bytes_uploaded_to;
-            }
-        }
+        const dl_total = tc.downloaded_bytes;
+        const ul_total = tc.uploaded_bytes;
 
         if (tc.last_speed_check == 0) {
             // First check: initialize baselines, no speed yet

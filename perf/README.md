@@ -317,6 +317,35 @@ Interpretation:
 - `peer_churn` improved because peer-list membership checks now use per-peer indices instead of linear duplicate scans.
 - `sync_delta` only moved modestly; the cached categories/tags JSON removes some churn, but the poll path is still dominated by torrent snapshot materialization.
 
+## Live `/sync` Stats Snapshot (ReleaseFast, 2026-04-01)
+
+Measured with a shared-loop `SessionManager` workload that stresses `getAllStats()` directly:
+
+| Scenario | Before | After |
+|----------|--------|-------|
+| `sync_stats_live --iterations=1 --torrents=10000 --peers=1000 --scale=20` | `19509532 ns` | `4886050 ns`, repeat `4046868 ns` |
+| `sync_delta --iterations=200 --torrents=10000` | `3.26e10 ns` | `3.19e10 ns` |
+
+Interpretation:
+
+- The live stats path was still paying to rescan torrent peer byte counters even after the sparse registry pass. Caching cumulative upload/download byte totals in `TorrentContext` removes that hot traversal directly.
+- The isolated stats workload shows the real win clearly, roughly `3.5x` to `4x` on this host. The full `/sync` delta path improves more modestly because it still spends most of its time allocating snapshots and serializing JSON.
+- This pass is intentionally narrower than a full torrent hot-summary registry. It addresses the measured hot spot first and leaves a denser registry for a follow-up if `/sync` still dominates.
+
+## Seed / uTP Experiment Surfaces (ReleaseFast, 2026-04-01)
+
+New benchmark-only workloads added in this pass:
+
+| Scenario | Result |
+|----------|--------|
+| `seed_plaintext_burst --iterations=500 --scale=8` | `30384358 ns`, `27940324 ns`, `28669060 ns`; `501` allocs, `65.6 MB` transient bytes |
+| `utp_outbound_burst --iterations=200 --scale=64` | `81276385 ns`, `110159182 ns`, `90773293 ns` |
+
+Interpretation:
+
+- `seed_plaintext_burst` gives a concrete measurement surface for the remaining plaintext seed-copy path. It confirms that allocator churn is still present, but this pass did not yet land a safe `sendmsg` / scatter-gather implementation.
+- `utp_outbound_burst` is a real loopback UDP path benchmark. A first queue-cleanup prototype removed allocator churn but did not produce a stable wall-clock win, so it was not kept in production.
+
 ## Interpretation Notes
 
 - A minimal-client build that still shows `read`, `write`, `connect`, `recvfrom`, or `sendto` is expected until the networking and storage paths are moved to `io_uring`.

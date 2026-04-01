@@ -112,6 +112,7 @@ pub fn processMessage(self: *EventLoop, slot: u16) void {
                             @memcpy(pbuf[start..end], block_data);
                             peer.blocks_received += 1;
                             peer.bytes_downloaded_from += block_data.len;
+                            self.accountTorrentBytes(peer.torrent_id, block_data.len, 0);
                             if (peer.inflight_requests > 0) peer.inflight_requests -= 1;
 
                             if (peer.blocks_received >= peer.blocks_expected) {
