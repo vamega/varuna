@@ -186,6 +186,8 @@ Update it whenever a milestone lands, the near-term backlog changes, or a new op
 - **Torrent hot-summary registry**: now that the shared EventLoop can hold far more than 64 torrents, `/sync` and periodic torrent housekeeping should move toward a denser hot-state registry instead of pulling data from full `TorrentSession` objects on demand.
 - **Broader RPC arena coverage**: `/sync/maindata` now uses an arena for transient work; the other list-heavy endpoints still allocate temporary object graphs and strings.
 - **API request-body growth / reuse**: the short-request path now uses inline storage, but large request bodies still allocate on demand and are freed on disconnect. A per-client arena or reuse pool is still available if API uploads remain allocator-heavy.
+- **Seed plaintext scatter/gather**: piece sends still use copy-based buffering for plaintext peers. `sendmsg` / `sendmsg_zc` are still available if seed profiles justify another pass.
+- **uTP outbound queueing**: the UDP path still has room for a ring queue and multiple in-flight sends if uTP becomes hot in real swarms.
 - **uTP multishot receive**: `recvmsg_multishot` plus a provided-buffer strategy still needs a workload and a measured implementation before it should land.
 - **Tracker work on the shared peer ring**: the daemon now shares tracker I/O through one executor, but the executor still owns its own ring. Moving tracker work onto the shared peer `EventLoop` ring requires an async tracker state machine rather than the current synchronous HTTP helper.
 
@@ -196,7 +198,7 @@ Update it whenever a milestone lands, the near-term backlog changes, or a new op
 - uTP send queue previously truncated data packets to header-only size (fixed).
 - On this WSL2 host, `perf stat` and `perf record` still require the kernel-matched `linux-tools-6.6.87.2-microsoft-standard-WSL2` package. `cachegrind` is the current cache-miss fallback.
 - The `peer_scan` harness is now parameterized by active density (`--scale`), but the production peer table is still a wide AoS. Sparse synthetic scans are measurable; a full hot/cold split is still pending.
-- The shared EventLoop no longer has a 64-torrent cap, but partial-seed bookkeeping still scans active torrents periodically. If real deployments keep tens of thousands of torrents loaded continuously, that path may still need a slower cadence or a dedicated hot summary.
+- The shared EventLoop no longer has a 64-torrent cap, and the sparse peer/torrent registry pass removed the main cross-product scans. If `/sync` or other admin paths still dominate at 10k+ torrents, the next step is a denser hot-summary registry.
 
 ## Last Verified Milestone
 
@@ -219,3 +221,6 @@ Update it whenever a milestone lands, the near-term backlog changes, or a new op
 - `zig build -Doptimize=ReleaseFast perf-workload -- tracker_http_reuse_potential --iterations=2000`: `2.83e8 ns` / `2.72e8 ns` (benchmark-only potential, not yet wired into production tracker flow)
 - `zig build -Doptimize=ReleaseFast perf-workload -- tracker_announce_fresh --iterations=2000`: `8.49e8 ns` / `8.80e8 ns`
 - `zig build -Doptimize=ReleaseFast perf-workload -- tracker_announce_executor --iterations=2000`: `4.28e8 ns` / `4.50e8 ns`
+- `zig build -Doptimize=ReleaseFast perf-workload -- tick_sparse_torrents --iterations=500 --torrents=10000 --peers=512 --scale=20`: `2.80e9 ns` -> `1.09e7 ns`, `0` allocs before and after
+- `zig build -Doptimize=ReleaseFast perf-workload -- peer_churn --iterations=5000 --peers=4096 --scale=128`: `1.13e9 ns` -> `3.81e6 ns`, `0` allocs before and after
+- `zig build -Doptimize=ReleaseFast perf-workload -- sync_delta --iterations=200 --torrents=10000`: `3.26e10 ns` -> `3.21e10 ns`, alloc calls `4,229,117` -> `4,228,317`

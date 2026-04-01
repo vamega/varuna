@@ -301,6 +301,22 @@ Interpretation:
 - The executor-backed path keeps a small amount of live memory at the end of the workload because the persistent client still owns its reusable tracker connection and host metadata.
 - This pass still does not run tracker jobs on the shared peer `EventLoop` ring. The current HTTP helper is synchronous, so moving tracker jobs onto that ring would require a dedicated async state machine rather than this executor model.
 
+## Sparse Registry Snapshot (ReleaseFast, 2026-04-01)
+
+Synthetic workload deltas from the active-registry and peer-bookkeeping pass:
+
+| Scenario | Before | After |
+|----------|--------|-------|
+| `tick_sparse_torrents` | 2.80e9 ns | 1.09e7 ns |
+| `peer_churn` | 1.13e9 ns | 3.81e6 ns |
+| `sync_delta` | 4,229,117 allocs, 3.26e10 ns | 4,228,317 allocs, 3.21e10 ns |
+
+Interpretation:
+
+- `tick_sparse_torrents` improved because the shared loop now walks dense torrent/peer membership lists instead of cross-product scans over all torrents and peers.
+- `peer_churn` improved because peer-list membership checks now use per-peer indices instead of linear duplicate scans.
+- `sync_delta` only moved modestly; the cached categories/tags JSON removes some churn, but the poll path is still dominated by torrent snapshot materialization.
+
 ## Interpretation Notes
 
 - A minimal-client build that still shows `read`, `write`, `connect`, `recvfrom`, or `sendto` is expected until the networking and storage paths are moved to `io_uring`.

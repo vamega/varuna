@@ -371,6 +371,26 @@ Follow-up triggers:
 - Connect to PEX-discovered peers through the existing addPeerForTorrent machinery, respecting all connection limits.
 - Cap added/dropped lists at 50 peers per message and enforce 60-second intervals per peer, as recommended by BEP 11.
 
+### 2026-04-01: Sparse Torrent Tick And Peer-Churn Registry Pass
+
+Context:
+The shared event loop had already been widened to support many more torrents, but the hot periodic paths still paid for repeated scans over peer and torrent collections. The remaining `/sync` path also rebuilt categories/tags JSON on every poll, and peer-list bookkeeping still used linear duplicate checks.
+
+Decision:
+- Keep a dense per-torrent peer slot list and a `torrents_with_peers` list so periodic torrent work only touches active torrents.
+- Add per-peer indices for the idle and active peer lists so `markIdle` / `unmarkIdle` / `markActivePeer` / `unmarkActivePeer` are O(1).
+- Cache category and tag JSON in the daemon stores and reuse that cache from `/sync/maindata`.
+- Add benchmark surfaces in `src/perf/workloads.zig` for `tick_sparse_torrents`, `peer_churn`, and `sync_delta` so the hot paths can be measured before and after layout changes.
+
+Reasoning:
+- The sparse-torrent benchmark showed that cross-product scans are the real cost, not allocation churn, when most torrents are idle seeds.
+- Peer-churn work validated that the linear membership scans were pure overhead; the O(1) index change removes them entirely.
+- `/sync` still benefits from cache reuse, but the biggest wins came from reducing traversal work first.
+
+Follow-up triggers:
+- If `/sync` continues to dominate, move more torrent state into a dedicated hot-summary registry instead of deriving it from live torrent/session objects on every poll.
+- If seed or uTP profiles still show allocator or syscall overhead after these registry changes, revisit plaintext scatter/gather and outbound UDP queueing with the same benchmark discipline.
+
 Reasoning:
 - Delta encoding is required by BEP 11 and minimizes bandwidth (only changes are sent).
 - Lazy allocation avoids wasting memory for private torrents where PEX is forbidden.
