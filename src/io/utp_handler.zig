@@ -254,6 +254,7 @@ fn acceptUtpConnection(self: *EventLoop, mgr: *utp_mgr.UtpManager) void {
             .address = remote_addr,
         };
         self.peer_count += 1;
+        self.markActivePeer(peer_slot);
 
         log.info("accepted inbound uTP connection from {any}", .{remote_addr});
 

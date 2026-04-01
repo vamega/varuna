@@ -5,6 +5,7 @@ const storage = @import("../storage/root.zig");
 const EventLoop = @import("event_loop.zig").EventLoop;
 const encodeUserData = @import("event_loop.zig").encodeUserData;
 const decodeUserData = @import("event_loop.zig").decodeUserData;
+const LayoutSpan = @import("../torrent/layout.zig").Layout.Span;
 
 // ── Piece upload (seed mode) ─────────────────────────
 
@@ -22,21 +23,6 @@ fn findPendingSeedReadIndex(items: []const EventLoop.PendingPieceRead, read_id: 
     return null;
 }
 
-fn copyQueuedBlockData(
-    allocator: std.mem.Allocator,
-    piece_data: []const u8,
-    block_offset: u32,
-    block_length: u32,
-) ![]u8 {
-    const start: usize = @intCast(block_offset);
-    const len: usize = @intCast(block_length);
-    if (start + len > piece_data.len) return error.InvalidBlockRange;
-
-    const block = try allocator.alloc(u8, len);
-    @memcpy(block, piece_data[start..][0..len]);
-    return block;
-}
-
 fn queuePieceBlockResponse(
     self: *EventLoop,
     slot: u16,
@@ -45,22 +31,34 @@ fn queuePieceBlockResponse(
     block_length: u32,
     piece_data: []const u8,
 ) !void {
-    const block_data = try copyQueuedBlockData(self.allocator, piece_data, block_offset, block_length);
-    errdefer self.allocator.free(block_data);
+    const start: usize = @intCast(block_offset);
+    const len: usize = @intCast(block_length);
+    if (start + len > piece_data.len) return error.InvalidBlockRange;
 
     try self.queued_responses.append(self.allocator, .{
         .slot = slot,
         .piece_index = piece_index,
         .block_offset = block_offset,
         .block_length = block_length,
-        .block_data = block_data,
+        .piece_data = piece_data,
     });
 }
 
-fn freeQueuedBatchBlocks(self: *EventLoop, batch: []const EventLoop.QueuedBlockResponse) void {
-    for (batch) |resp| {
-        self.allocator.free(resp.block_data);
+fn deferCachedPieceBuffer(self: *EventLoop, buf: []u8, from_pool: bool) void {
+    self.deferred_piece_buffers.append(self.allocator, .{
+        .buf = buf,
+        .from_pool = from_pool,
+    }) catch {
+        // Keep the old buffer alive if we can't queue it for deferred release.
+        // This avoids invalidating queued response slices before the next flush.
+    };
+}
+
+fn releaseDeferredPieceBuffers(self: *EventLoop) void {
+    for (self.deferred_piece_buffers.items) |piece_buf| {
+        if (!piece_buf.from_pool) self.allocator.free(piece_buf.buf);
     }
+    self.deferred_piece_buffers.clearRetainingCapacity();
 }
 
 pub fn servePieceRequest(self: *EventLoop, slot: u16, payload: []const u8) void {
@@ -94,7 +92,8 @@ pub fn servePieceRequest(self: *EventLoop, slot: u16, payload: []const u8) void 
     }
 
     // Submit async io_uring reads for all spans (no blocking)
-    const plan = storage.verify.planPieceVerification(self.allocator, sess, piece_index) catch return;
+    var span_scratch: [8]LayoutSpan = undefined;
+    const plan = storage.verify.planPieceVerificationWithScratch(self.allocator, sess, piece_index, span_scratch[0..]) catch return;
     defer storage.verify.freePiecePlan(self.allocator, plan);
 
     if (plan.spans.len == 0) return;
@@ -167,7 +166,7 @@ pub fn handleSeedDiskRead(self: *EventLoop, cqe: @import("std").os.linux.io_urin
 
     // Update cache
     if (self.cached_piece_data) |old| {
-        if (!self.cached_piece_from_pool) self.allocator.free(old);
+        deferCachedPieceBuffer(self, old, self.cached_piece_from_pool);
     }
     self.cached_piece_data = pending.read_buf;
     self.cached_piece_index = pending.piece_index;
@@ -193,7 +192,10 @@ pub fn handleSeedDiskRead(self: *EventLoop, cqe: @import("std").os.linux.io_urin
 pub fn flushQueuedResponses(self: *EventLoop) void {
     const QueuedBlockResponse = EventLoop.QueuedBlockResponse;
 
-    if (self.queued_responses.items.len == 0) return;
+    if (self.queued_responses.items.len == 0) {
+        releaseDeferredPieceBuffers(self);
+        return;
+    }
 
     // Process all queued responses, grouping by slot.
     // Since most responses in a tick are for the same peer, we use a simple
@@ -219,7 +221,6 @@ pub fn flushQueuedResponses(self: *EventLoop) void {
 
         // Skip if peer disconnected between queueing and flushing
         if (peer.state == .free or peer.state == .disconnecting) {
-            freeQueuedBatchBlocks(self, batch);
             i = j;
             continue;
         }
@@ -234,8 +235,9 @@ pub fn flushQueuedResponses(self: *EventLoop) void {
         const send_buf = self.allocator.alloc(u8, total_len) catch {
             // Fallback: send individually
             for (batch) |resp| {
-                sendPieceBlockData(self, resp.slot, resp.piece_index, resp.block_offset, resp.block_data);
-                self.allocator.free(resp.block_data);
+                const start: usize = @intCast(resp.block_offset);
+                const len: usize = @intCast(resp.block_length);
+                sendPieceBlockData(self, resp.slot, resp.piece_index, resp.block_offset, resp.piece_data[start .. start + len]);
             }
             i = j;
             continue;
@@ -250,8 +252,9 @@ pub fn flushQueuedResponses(self: *EventLoop) void {
             send_buf[offset + 4] = 7; // piece message id
             std.mem.writeInt(u32, send_buf[offset + 5 ..][0..4], resp.piece_index, .big);
             std.mem.writeInt(u32, send_buf[offset + 9 ..][0..4], resp.block_offset, .big);
-            @memcpy(send_buf[offset + 13 ..][0..resp.block_length], resp.block_data);
-            self.allocator.free(resp.block_data);
+            const start: usize = @intCast(resp.block_offset);
+            const len: usize = @intCast(resp.block_length);
+            @memcpy(send_buf[offset + 13 ..][0..resp.block_length], resp.piece_data[start .. start + len]);
             offset += 4 + 1 + 8 + @as(usize, resp.block_length);
             total_uploaded += resp.block_length;
         }
@@ -265,17 +268,13 @@ pub fn flushQueuedResponses(self: *EventLoop) void {
         peer.crypto.encryptBuf(send_buf);
 
         const ts = self.nextTrackedSendUserData(current_slot);
-        self.pending_sends.append(self.allocator, .{
-            .buf = send_buf,
-            .slot = current_slot,
-            .send_id = ts.send_id,
-        }) catch {
+        const tracked = self.trackPendingSendOwned(current_slot, ts.send_id, send_buf) catch {
             self.allocator.free(send_buf);
             i = j;
             continue;
         };
 
-        _ = self.ring.send(ts.ud, peer.fd, send_buf, 0) catch {
+        _ = self.ring.send(ts.ud, peer.fd, tracked, 0) catch {
             // SQE submission failed -- free via the pending_sends entry
             // to avoid leaving a dangling pointer in the list.
             self.freeOnePendingSend(current_slot, ts.send_id);
@@ -288,6 +287,7 @@ pub fn flushQueuedResponses(self: *EventLoop) void {
     }
 
     self.queued_responses.items.len = 0;
+    releaseDeferredPieceBuffers(self);
 }
 
 pub fn sendPieceBlock(self: *EventLoop, slot: u16, piece_index: u32, block_offset: u32, block_length: u32, read_buf: []u8) void {
@@ -322,16 +322,12 @@ fn sendPieceBlockData(self: *EventLoop, slot: u16, piece_index: u32, block_offse
     peer.crypto.encryptBuf(send_buf);
 
     const ts = self.nextTrackedSendUserData(slot);
-    self.pending_sends.append(self.allocator, .{
-        .buf = send_buf,
-        .slot = slot,
-        .send_id = ts.send_id,
-    }) catch {
+    const tracked = self.trackPendingSendOwned(slot, ts.send_id, send_buf) catch {
         self.allocator.free(send_buf);
         return;
     };
 
-    _ = self.ring.send(ts.ud, peer.fd, send_buf, 0) catch {
+    _ = self.ring.send(ts.ud, peer.fd, tracked, 0) catch {
         // SQE submission failed -- free via the pending_sends entry
         // (not directly) to avoid leaving a dangling pointer.
         self.freeOnePendingSend(slot, ts.send_id);
@@ -340,13 +336,20 @@ fn sendPieceBlockData(self: *EventLoop, slot: u16, piece_index: u32, block_offse
     peer.send_pending = true;
 }
 
-test "copyQueuedBlockData makes an independent block copy" {
-    var source = [_]u8{ 'a', 'b', 'c', 'd', 'e', 'f' };
-    const block = try copyQueuedBlockData(std.testing.allocator, source[0..], 2, 3);
-    defer std.testing.allocator.free(block);
+test "queuePieceBlockResponse stores block metadata without copying" {
+    var el: EventLoop = undefined;
+    el.allocator = std.testing.allocator;
+    el.queued_responses = std.ArrayList(EventLoop.QueuedBlockResponse).empty;
+    defer el.queued_responses.deinit(std.testing.allocator);
 
-    source[2] = 'X';
-    try std.testing.expectEqualStrings("cde", block);
+    const source = "abcdef";
+    try queuePieceBlockResponse(&el, 3, 7, 2, 3, source);
+
+    try std.testing.expectEqual(@as(usize, 1), el.queued_responses.items.len);
+    const queued = el.queued_responses.items[0];
+    try std.testing.expectEqual(@as(u16, 3), queued.slot);
+    try std.testing.expectEqual(@as(u32, 7), queued.piece_index);
+    try std.testing.expectEqualStrings(source, queued.piece_data);
 }
 
 test "findPendingSeedReadIndex matches by unique read id" {

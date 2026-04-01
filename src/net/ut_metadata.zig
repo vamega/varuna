@@ -100,54 +100,53 @@ pub const DecodeError = error{
 /// by raw piece data. We find the dictionary boundary by parsing and
 /// measuring the encoded size, then return the data_offset.
 pub fn decode(allocator: std.mem.Allocator, payload: []const u8) DecodeError!MetadataMessage {
+    _ = allocator;
     // BEP 9 data messages have a bencoded dict followed by raw bytes.
     // We need to find where the dict ends. Parse it, and the dict
     // boundary is determined by the bencoded structure.
     const dict_end = findDictEnd(payload) orelse return error.InvalidMessage;
-    const dict_bytes = payload[0..dict_end];
+    var parser = Parser{ .input = payload[0..dict_end] };
+    try parser.expectByte('d');
 
-    const root = try bencode.parse(allocator, dict_bytes);
-    defer bencode.freeValue(allocator, root);
+    var msg_type: ?MsgType = null;
+    var piece: ?u32 = null;
+    var total_size: u32 = 0;
 
-    const dict = switch (root) {
-        .dict => |d| d,
-        else => return error.InvalidMessage,
-    };
+    while (true) {
+        const next = parser.peek() orelse return error.InvalidMessage;
+        if (next == 'e') {
+            parser.index += 1;
+            break;
+        }
 
-    // msg_type (required)
-    const msg_type_val = bencode.dictGet(dict, "msg_type") orelse return error.InvalidMessage;
-    const msg_type_int = switch (msg_type_val) {
-        .integer => |i| i,
-        else => return error.InvalidMessage,
-    };
-    if (msg_type_int < 0 or msg_type_int > 2) return error.InvalidMsgType;
-    const msg_type: MsgType = @enumFromInt(@as(u8, @intCast(msg_type_int)));
+        const key = try parser.parseBytes();
+        if (std.mem.eql(u8, key, "msg_type")) {
+            const value = try parser.parseInteger();
+            if (value < 0 or value > 2) return error.InvalidMsgType;
+            msg_type = @enumFromInt(@as(u8, @intCast(value)));
+        } else if (std.mem.eql(u8, key, "piece")) {
+            const value = try parser.parseInteger();
+            if (value < 0 or value > std.math.maxInt(u32)) return error.InvalidMessage;
+            piece = @intCast(value);
+        } else if (std.mem.eql(u8, key, "total_size")) {
+            const value = try parser.parseInteger();
+            if (value > 0 and value <= std.math.maxInt(u32)) {
+                total_size = @intCast(value);
+            }
+        } else {
+            try parser.skipValue();
+        }
+    }
 
-    // piece (required)
-    const piece_val = bencode.dictGet(dict, "piece") orelse return error.MissingPieceField;
-    const piece_int = switch (piece_val) {
-        .integer => |i| i,
-        else => return error.InvalidMessage,
-    };
-    if (piece_int < 0 or piece_int > std.math.maxInt(u32)) return error.InvalidMessage;
-    const piece: u32 = @intCast(piece_int);
+    if (!parser.isAtEnd()) return error.InvalidMessage;
 
     var result = MetadataMessage{
-        .msg_type = msg_type,
-        .piece = piece,
+        .msg_type = msg_type orelse return error.InvalidMessage,
+        .piece = piece orelse return error.MissingPieceField,
     };
 
-    if (msg_type == .data) {
-        // total_size (required in data messages)
-        if (bencode.dictGet(dict, "total_size")) |ts_val| {
-            const ts_int = switch (ts_val) {
-                .integer => |i| i,
-                else => return error.InvalidMessage,
-            };
-            if (ts_int > 0 and ts_int <= std.math.maxInt(u32)) {
-                result.total_size = @intCast(ts_int);
-            }
-        }
+    if (result.msg_type == .data) {
+        result.total_size = total_size;
         result.data_offset = dict_end;
     }
 
@@ -217,6 +216,94 @@ fn skipByteString(data: []const u8, start: usize) ?usize {
     if (end > data.len) return null;
     return end;
 }
+
+const Parser = struct {
+    input: []const u8,
+    index: usize = 0,
+
+    fn peek(self: *const Parser) ?u8 {
+        if (self.index >= self.input.len) return null;
+        return self.input[self.index];
+    }
+
+    fn isAtEnd(self: *const Parser) bool {
+        return self.index == self.input.len;
+    }
+
+    fn expectByte(self: *Parser, byte: u8) DecodeError!void {
+        if (self.peek() != byte) return error.InvalidMessage;
+        self.index += 1;
+    }
+
+    fn parseBytes(self: *Parser) DecodeError![]const u8 {
+        const start = self.index;
+        while (self.peek()) |byte| {
+            if (byte == ':') break;
+            if (!std.ascii.isDigit(byte)) return error.InvalidMessage;
+            self.index += 1;
+        }
+        if (self.peek() != ':') return error.InvalidMessage;
+
+        const len_slice = self.input[start..self.index];
+        if (len_slice.len == 0) return error.InvalidMessage;
+
+        self.index += 1;
+        const len = std.fmt.parseUnsigned(usize, len_slice, 10) catch return error.InvalidMessage;
+        const end = self.index + len;
+        if (end > self.input.len) return error.InvalidMessage;
+
+        defer self.index = end;
+        return self.input[self.index..end];
+    }
+
+    fn parseInteger(self: *Parser) DecodeError!i64 {
+        try self.expectByte('i');
+        const start = self.index;
+        while (self.peek()) |byte| {
+            if (byte == 'e') break;
+            self.index += 1;
+        }
+        if (self.peek() != 'e') return error.InvalidMessage;
+
+        const digits = self.input[start..self.index];
+        if (digits.len == 0) return error.InvalidMessage;
+
+        self.index += 1;
+        return std.fmt.parseInt(i64, digits, 10) catch error.InvalidMessage;
+    }
+
+    fn skipValue(self: *Parser) DecodeError!void {
+        const next = self.peek() orelse return error.InvalidMessage;
+        switch (next) {
+            'i' => _ = try self.parseInteger(),
+            'l' => {
+                self.index += 1;
+                while (true) {
+                    const item = self.peek() orelse return error.InvalidMessage;
+                    if (item == 'e') {
+                        self.index += 1;
+                        return;
+                    }
+                    try self.skipValue();
+                }
+            },
+            'd' => {
+                self.index += 1;
+                while (true) {
+                    const item = self.peek() orelse return error.InvalidMessage;
+                    if (item == 'e') {
+                        self.index += 1;
+                        return;
+                    }
+                    _ = try self.parseBytes();
+                    try self.skipValue();
+                }
+            },
+            '0'...'9' => _ = try self.parseBytes(),
+            else => return error.InvalidMessage,
+        }
+    }
+};
 
 // ── Metadata assembler ──────────────────────────────────────
 

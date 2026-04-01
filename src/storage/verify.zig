@@ -28,6 +28,7 @@ pub const PiecePlan = struct {
     expected_hash_v2: [32]u8 = [_]u8{0} ** 32,
     hash_type: HashType = .sha1,
     spans: []torrent.layout.Layout.Span,
+    spans_owned: bool = true,
 };
 
 pub fn planPieceVerification(
@@ -35,9 +36,22 @@ pub fn planPieceVerification(
     session: *const torrent.session.Session,
     piece_index: u32,
 ) !PiecePlan {
+    return planPieceVerificationWithScratch(allocator, session, piece_index, &.{});
+}
+
+pub fn planPieceVerificationWithScratch(
+    allocator: std.mem.Allocator,
+    session: *const torrent.session.Session,
+    piece_index: u32,
+    scratch: []torrent.layout.Layout.Span,
+) !PiecePlan {
     const span_count = try session.layout.pieceSpanCount(piece_index);
-    const spans = try allocator.alloc(torrent.layout.Layout.Span, span_count);
-    errdefer allocator.free(spans);
+    const use_scratch = span_count <= scratch.len;
+    const spans = if (use_scratch)
+        scratch[0..span_count]
+    else
+        try allocator.alloc(torrent.layout.Layout.Span, span_count);
+    errdefer if (!use_scratch) allocator.free(spans);
 
     const mapped = try session.layout.mapPiece(piece_index, spans);
     const piece_size = try session.layout.pieceSize(piece_index);
@@ -53,6 +67,7 @@ pub fn planPieceVerification(
             .expected_hash_v2 = expected_v2,
             .hash_type = .sha256,
             .spans = mapped,
+            .spans_owned = !use_scratch,
         };
     }
 
@@ -66,6 +81,7 @@ pub fn planPieceVerification(
         .piece_length = piece_size,
         .expected_hash = expected_hash,
         .spans = mapped,
+        .spans_owned = !use_scratch,
     };
 }
 
@@ -91,7 +107,7 @@ fn findV2PieceHash(
 }
 
 pub fn freePiecePlan(allocator: std.mem.Allocator, plan: PiecePlan) void {
-    allocator.free(plan.spans);
+    if (plan.spans_owned) allocator.free(plan.spans);
 }
 
 pub fn verifyPieceBuffer(plan: PiecePlan, piece_data: []const u8) !bool {

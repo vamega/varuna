@@ -1193,11 +1193,18 @@ pub const ApiHandler = struct {
             }
         }
 
-        const body = self.sync_state.computeDelta(
+        var arena_state = std.heap.ArenaAllocator.init(allocator);
+        defer arena_state.deinit();
+        const arena = arena_state.allocator();
+
+        const arena_body = self.sync_state.computeDelta(
             self.session_manager,
-            allocator,
+            arena,
             request_rid,
         ) catch
+            return .{ .status = 500, .body = "{\"error\":\"internal\"}" };
+
+        const body = allocator.dupe(u8, arena_body) catch
             return .{ .status = 500, .body = "{\"error\":\"internal\"}" };
         return .{ .body = body, .owned_body = body };
     }

@@ -30,6 +30,7 @@ Update it whenever a milestone lands, the near-term backlog changes, or a new op
 - **Shared multi-torrent event loop**: all torrents on one EventLoop thread with TorrentContext per torrent.
 - **Shared announce ring**: tracker announces reuse a single ring instead of spawning per-announce threads.
 - **Connection limits**: global (500), per-torrent (100), half-open (50). Announce jitter ±10% with initial stagger.
+- **API vectored-send path**: the HTTP API server now sends headers and body as separate iovecs through `io_uring` `sendmsg` instead of concatenating them into one response buffer first.
 - **Reference codebases as git submodules**: libtorrent (arvidn), libtorrent-rakshasa, qBittorrent, rtorrent, vortex, qui (autobrr).
 - **BoringSSL TLS**: vendored BoringSSL built as static libraries via pure Zig build (`build/boringssl.zig`). BIO pair transport decouples TLS record processing from socket I/O, keeping all network I/O on io_uring. TlsStream provides feedRecv/pendingSend interface for ciphertext shuttle.
 
@@ -37,6 +38,7 @@ Update it whenever a milestone lands, the near-term backlog changes, or a new op
 - SQLite resume state: WAL mode, prepared statements, background thread. Daemon persists completions every ~5s.
 - Bundled SQLite option: `-Dsqlite=bundled` or `-Dsqlite=system`.
 - Resume fast path: loads known-complete pieces from SQLite, skips SHA-1 rehashing.
+- Session-owned metadata arena: `Session.load` now allocates torrent bytes, metainfo, layout, and manifest from one arena and frees them as a unit on session teardown.
 - Lifetime transfer stats: total_uploaded/total_downloaded persisted to SQLite, loaded as baseline on startup so share ratio survives daemon restarts.
 - Categories and tags persisted to SQLite (write-through on change, load at startup).
 - Per-torrent rate limits persisted to SQLite (saved on change, loaded at startup).
@@ -94,6 +96,8 @@ Update it whenever a milestone lands, the near-term backlog changes, or a new op
 - RPC server partial-send handling: API responses now track send progress until the full body is written.
 - Seed/read-path correctness: queued seed responses own exact block copies, async seed reads use unique IDs, and only successfully submitted reads/writes contribute to pending completion counts.
 - **Huge page piece cache**: optional `mmap(MAP_HUGETLB)` buffer pool for seed piece reads. Falls back to `madvise(MADV_HUGEPAGE)` (transparent huge pages), then regular pages. Config: `performance.use_huge_pages`, `performance.piece_cache_size`. Reduces TLB pressure for large torrents.
+- **Synthetic memory baseline harness**: `varuna-perf` with allocator-counting scenarios for peer scans, request batching, seed batching, extension parsing, session loading, and `/sync/maindata`. Supports stable before/after comparisons without a live swarm.
+- **First allocation-reduction pass**: request batches now avoid heap allocation, seed batching no longer heap-copies each queued block, `/sync/maindata` uses fixed-size snapshot keys plus a request arena, BEP 9/BEP 10 decode paths are allocation-free, and scan-heavy peer-policy paths use dense active-slot lists.
 
 ### BEP 52 (BitTorrent v2 / Hybrid Torrents)
 - Torrent version detection: v1/v2/hybrid based on `pieces` vs `file tree` field presence.
@@ -161,11 +165,16 @@ Update it whenever a milestone lands, the near-term backlog changes, or a new op
 ### Operational
 - ~~**Flood/qui WebUI validation**~~: (DONE) populated remaining stub fields (tracker URL, trackers_count, piece_range, content_path, magnet_uri, super_seeding, properties hash/name/created_by), added real peer data to torrentPeers endpoint.
 - ~~**API placeholder cleanup**~~: (DONE) wired real DHT node count into transfer/info and sync/maindata, wired real infohash_v2 (BEP 52) into torrent info/properties/sync, wired scrape data into properties peers_total/seeds_total, parsed creation_date from .torrent files. Documented unsupported endpoints in `docs/api-compatibility.md`.
+- **Peer hot/cold split / partial SoA**: the active-slot pass removes a lot of wasted scans, but the `Peer` struct is still wide. The next performance step is separating hot scheduling/state fields from cold crypto/buffering state.
+- **Broader RPC arena coverage**: `/sync/maindata` now uses an arena for transient work; the other list-heavy endpoints still allocate temporary object graphs and strings.
+- **API request-body growth / reuse**: the response path is vectored now, but request buffers still grow with `realloc` and are freed on disconnect. A per-client arena or growth policy is still available if API polling or uploads show allocator churn.
 
 ## Known Issues
 
 - The packaged Ubuntu `opentracker` build requires explicit info-hash whitelisting (`--whitelist-hash`).
 - uTP send queue previously truncated data packets to header-only size (fixed).
+- On this WSL2 host, `perf stat` and `perf record` still require the kernel-matched `linux-tools-6.6.87.2-microsoft-standard-WSL2` package. `cachegrind` is the current cache-miss fallback.
+- The `peer_scan` harness is now parameterized by active density (`--scale`), but the production peer table is still a wide AoS. Sparse synthetic scans are measurable; a full hot/cold split is still pending.
 
 ## Last Verified Milestone
 
@@ -176,3 +185,5 @@ Update it whenever a milestone lands, the near-term backlog changes, or a new op
 - All protocol features merged, API placeholder values replaced with real data where available
 - `zig build test`: all tests pass
 - `zig build`: clean build (with `-Dtls=boringssl` default and `-Dtls=none`)
+- `zig build -Doptimize=ReleaseFast perf-workload -- http_response --iterations=5000`: `5,001` allocs, `648 KB` transient bytes, `4.63e7 ns`
+- `zig build -Doptimize=ReleaseFast perf-workload -- session_load --iterations=1000`: `2,004` allocs, `1.33e7 ns`

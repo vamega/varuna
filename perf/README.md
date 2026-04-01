@@ -11,6 +11,9 @@ These tools are external Linux packages, not Zig dependencies. The helper steps 
 - `strace`
 - `perf`
 - `bpftrace`
+- `heaptrack`
+- `valgrind` / `cachegrind`
+- `pahole`
 
 On many distributions this means packages similar to `strace`, `linux-perf` or `perf`, and `bpftrace`.
 On WSL kernels, `perf` may additionally require a kernel-matched `linux-tools-<kernel>` package before `perf stat` or `perf record` will run successfully.
@@ -31,6 +34,36 @@ These commands build `varuna` first and then run it under the selected tool. Pas
   Writes `perf stat` counters to `perf/output/perf-stat.txt`.
 - `zig build perf-record -- banner`
   Writes sampled profiling data to `perf/output/perf.data`.
+- `zig build perf-workload -- request_batch --iterations=100000`
+  Runs the synthetic workload harness (`zig-out/bin/varuna-perf`) for targeted allocation and cache baselines.
+
+## Synthetic Workloads
+
+Use `varuna-perf` when you need deterministic allocator and cache comparisons without a real swarm or API client.
+
+- `zig build perf-workload -- list`
+- `zig build -Doptimize=ReleaseFast perf-workload -- peer_scan --iterations=20000`
+- `zig build -Doptimize=ReleaseFast perf-workload -- peer_scan --iterations=20000 --peers=4096 --scale=8`
+- `zig build -Doptimize=ReleaseFast perf-workload -- request_batch --iterations=100000`
+- `zig build -Doptimize=ReleaseFast perf-workload -- seed_batch --iterations=5000`
+- `zig build -Doptimize=ReleaseFast perf-workload -- sync_delta --iterations=200 --torrents=64`
+
+Current scenarios:
+
+- `peer_scan`
+- `request_batch`
+- `seed_batch`
+- `http_response`
+- `extension_decode`
+- `ut_metadata_decode`
+- `session_load`
+- `sync_delta`
+
+Scenario-specific notes:
+
+- `peer_scan`: `--scale` controls active-slot density. `--scale=1` keeps the table dense; larger values keep fewer slots active and are more representative when you want to measure scan cost instead of connection-state churn.
+- `http_response`: models the API response assembly path, including header formatting and body ownership.
+- `session_load`: measures immutable torrent-session metadata setup and teardown.
 
 ## Direct Tool Usage
 
@@ -50,6 +83,26 @@ CPU counters:
 
 ```bash
 perf stat -d --output perf/output/perf-stat.txt ./zig-out/bin/varuna banner
+```
+
+When `perf` is unavailable on WSL because the matching kernel tools package is missing, use `cachegrind` as the cache-miss fallback:
+
+```bash
+zig build -Doptimize=ReleaseFast -Dcpu=baseline install
+valgrind --tool=cachegrind --cache-sim=yes --branch-sim=yes ./zig-out/bin/varuna-perf request_batch --iterations=5000
+```
+
+Use `heaptrack` for stack-attributed allocation traces:
+
+```bash
+heaptrack ./zig-out/bin/varuna-perf sync_delta --iterations=50 --torrents=64
+heaptrack_print heaptrack.varuna-perf.<pid>.zst
+```
+
+Use `pahole` to confirm struct size and field placement:
+
+```bash
+pahole ./zig-out/bin/varuna
 ```
 
 Sampled profile:
@@ -99,6 +152,38 @@ Host: WSL2, kernel 6.6.87.2, x86_64
 | metainfo_parse | 36us | 37 MB/s | Full parse including info_hash |
 
 SHA-1 at 1.1 GB/s means piece verification is not a bottleneck for typical network speeds (<100 MB/s). Hardware SHA-NI would add ~2x but is not urgent.
+
+## Memory Optimization Snapshot (ReleaseFast, 2026-03-31)
+
+Synthetic workload deltas from the first allocation-reduction pass:
+
+| Scenario | Before | After |
+|----------|--------|-------|
+| `request_batch` | 100,000 allocs, 8.63e8 ns | 0 allocs, 1.20e6 ns |
+| `seed_batch` | 45,001 allocs, 1.31 GB transient bytes, 5.10e8 ns | 5,001 allocs, 656 MB transient bytes, 2.27e8 ns |
+| `extension_decode` | 200,003 allocs, 1.16e9 ns | 3 allocs (setup only), 1.99e6 ns |
+| `ut_metadata_decode` | 50,004 allocs, 4.18e8 ns | 4 allocs (setup only), 1.51e6 ns |
+| `sync_delta` | 46,946 allocs, 3.63e7 transient bytes, 1.38e8 ns | 32,491 allocs, 3.61e7 transient bytes, 1.77e8 ns |
+
+Cachegrind deltas on the baseline-CPU build:
+
+- `request_batch`: D1 misses fell from `22,472` to `4,076`, LLd misses from `21,586` to `3,406`.
+- `seed_batch`: D1 misses fell from `2,066,789` to `1,240,358`, LLd misses from `825,732` to `415,460`.
+- `sync_delta`: D1 misses fell from `127,624` to `80,271`, LLd misses from `73,839` to `41,528`.
+
+## Second Memory Pass Snapshot (ReleaseFast, 2026-03-31)
+
+Synthetic workload deltas from the second allocation pass:
+
+| Scenario | Before | After |
+|----------|--------|-------|
+| `http_response` | 10,001 allocs, 48.6 MB transient bytes, 9.93e7 ns | 5,001 allocs, 648 KB transient bytes, 4.63e7 ns |
+| `session_load` | 14,004 allocs, 5.05e7 ns | 2,004 allocs, 1.33e7 ns |
+
+Interpretation:
+
+- `http_response` improved because the server now keeps handler-owned bodies in place and only allocates a header buffer before issuing `sendmsg`.
+- `session_load` improved because immutable session metadata now shares one arena-backed lifetime instead of many independent frees.
 
 ## Interpretation Notes
 

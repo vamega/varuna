@@ -253,13 +253,14 @@ pub fn handleUtMetadata(self: *EventLoop, slot: u16, ext_payload: []const u8) vo
             const frame = ext.serializeExtensionMessage(self.allocator, peer_ut_id, combined) catch return;
 
             const ts = self.nextTrackedSendUserData(slot);
-            self.pending_sends.append(self.allocator, .{ .buf = frame, .slot = slot, .send_id = ts.send_id }) catch {
+            const tracked = self.trackPendingSendOwned(slot, ts.send_id, frame) catch {
                 self.allocator.free(frame);
                 return;
             };
 
-            _ = self.ring.send(ts.ud, peer.fd, frame, 0) catch {
+            _ = self.ring.send(ts.ud, peer.fd, tracked, 0) catch {
                 // Send failed; the buffer will be freed when pending_sends is cleaned up
+                self.freeOnePendingSend(slot, ts.send_id);
                 return;
             };
             peer.send_pending = true;
@@ -286,12 +287,15 @@ fn sendUtMetadataReject(self: *EventLoop, slot: u16, peer: *Peer, piece: u32) vo
     const frame = ext.serializeExtensionMessage(self.allocator, peer_ut_id, reject_payload) catch return;
 
     const ts = self.nextTrackedSendUserData(slot);
-    self.pending_sends.append(self.allocator, .{ .buf = frame, .slot = slot, .send_id = ts.send_id }) catch {
+    const tracked = self.trackPendingSendOwned(slot, ts.send_id, frame) catch {
         self.allocator.free(frame);
         return;
     };
 
-    _ = self.ring.send(ts.ud, peer.fd, frame, 0) catch return;
+    _ = self.ring.send(ts.ud, peer.fd, tracked, 0) catch {
+        self.freeOnePendingSend(slot, ts.send_id);
+        return;
+    };
     peer.send_pending = true;
 }
 
@@ -341,17 +345,25 @@ pub fn submitMessage(self: *EventLoop, slot: u16, id: u8, payload: []const u8) !
     } else {
         // For larger messages, allocate a buffer for the complete message
         const total_len = 5 + payload.len;
-        const send_buf = try self.allocator.alloc(u8, total_len);
-        @memcpy(send_buf[0..5], &header);
-        @memcpy(send_buf[5..total_len], payload);
-        // MSE/PE: encrypt in-place before sending
-        peer.crypto.encryptBuf(send_buf);
-
-        // Track for cleanup with unique send_id
         const ts = self.nextTrackedSendUserData(slot);
-        try self.pending_sends.append(self.allocator, .{ .buf = send_buf, .slot = slot, .send_id = ts.send_id });
+        if (total_len <= EventLoop.small_send_capacity) {
+            var stack_buf: [EventLoop.small_send_capacity]u8 = undefined;
+            @memcpy(stack_buf[0..5], &header);
+            @memcpy(stack_buf[5..total_len], payload);
+            peer.crypto.encryptBuf(stack_buf[0..total_len]);
 
-        _ = try self.ring.send(ts.ud, peer.fd, send_buf, 0);
+            const tracked = try self.trackPendingSendCopy(slot, ts.send_id, stack_buf[0..total_len]);
+            _ = try self.ring.send(ts.ud, peer.fd, tracked, 0);
+        } else {
+            const send_buf = try self.allocator.alloc(u8, total_len);
+            errdefer self.allocator.free(send_buf);
+            @memcpy(send_buf[0..5], &header);
+            @memcpy(send_buf[5..total_len], payload);
+            peer.crypto.encryptBuf(send_buf);
+
+            const tracked = try self.trackPendingSendOwned(slot, ts.send_id, send_buf);
+            _ = try self.ring.send(ts.ud, peer.fd, tracked, 0);
+        }
         peer.send_pending = true;
     }
 }
@@ -381,14 +393,15 @@ pub fn submitExtensionHandshake(self: *EventLoop, slot: u16) !void {
 
     // Build the full framed message: 4-byte len | msg_id=20 | sub_id=0 | payload
     const frame = try ext.serializeExtensionMessage(self.allocator, ext.handshake_sub_id, ext_payload);
+    errdefer self.allocator.free(frame);
     // MSE/PE: encrypt in-place before sending
     peer.crypto.encryptBuf(frame);
 
     // Track for cleanup with unique send_id
     const ts = self.nextTrackedSendUserData(slot);
-    try self.pending_sends.append(self.allocator, .{ .buf = frame, .slot = slot, .send_id = ts.send_id });
+    const tracked = try self.trackPendingSendOwned(slot, ts.send_id, frame);
 
-    _ = try self.ring.send(ts.ud, peer.fd, frame, 0);
+    _ = try self.ring.send(ts.ud, peer.fd, tracked, 0);
     peer.send_pending = true;
 }
 
@@ -429,7 +442,8 @@ fn handlePexMessage(self: *EventLoop, slot: u16, payload: []const u8) void {
 
 /// Check if we already have a connection to the given address for this torrent.
 fn isPeerAlreadyConnected(self: *EventLoop, torrent_id: u8, addr: std.net.Address) bool {
-    for (self.peers) |*p| {
+    for (self.active_peer_slots.items) |slot| {
+        const p = &self.peers[slot];
         if (p.state == .free) continue;
         if (p.torrent_id != torrent_id) continue;
         // Compare address family, IP, and port
@@ -486,11 +500,12 @@ pub fn submitPexMessage(self: *EventLoop, slot: u16) !void {
 
     // Frame as BEP 10 extension message and send
     const frame = try ext.serializeExtensionMessage(self.allocator, peer_pex_id, payload);
+    errdefer self.allocator.free(frame);
 
     const ts = self.nextTrackedSendUserData(slot);
-    try self.pending_sends.append(self.allocator, .{ .buf = frame, .slot = slot, .send_id = ts.send_id });
+    const tracked = try self.trackPendingSendOwned(slot, ts.send_id, frame);
 
-    _ = try self.ring.send(ts.ud, peer.fd, frame, 0);
+    _ = try self.ring.send(ts.ud, peer.fd, tracked, 0);
     peer.send_pending = true;
     peer_pex.last_pex_time = std.time.timestamp();
 

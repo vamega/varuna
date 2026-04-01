@@ -13,6 +13,7 @@ const max_peers = @import("event_loop.zig").max_peers;
 const protocol = @import("protocol.zig");
 const MerkleCache = @import("../torrent/merkle_cache.zig").MerkleCache;
 const Hasher = @import("hasher.zig").Hasher;
+const LayoutSpan = @import("../torrent/layout.zig").Layout.Span;
 
 const pipeline_depth: u32 = 5;
 const peer_timeout_secs: i64 = 60;
@@ -115,13 +116,12 @@ pub fn tryFillPipeline(self: *EventLoop, slot: u16) !void {
 
     // Build all requests into one buffer (17 bytes each: 4 len + 1 id + 12 payload)
     const request_size: usize = 17;
+    var send_buf: [request_size * pipeline_depth]u8 = undefined;
     const total_len = request_size * to_send;
-    const send_buf = self.allocator.alloc(u8, total_len) catch return;
 
     var i: u32 = 0;
     while (i < to_send) : (i += 1) {
         const req = geometry.requestForBlock(piece_index, peer.pipeline_sent + i) catch {
-            self.allocator.free(send_buf);
             return;
         };
         const offset = i * request_size;
@@ -135,13 +135,12 @@ pub fn tryFillPipeline(self: *EventLoop, slot: u16) !void {
 
     // Track for cleanup with unique send_id
     const ts = self.nextTrackedSendUserData(slot);
-    self.pending_sends.append(self.allocator, .{ .buf = send_buf, .slot = slot, .send_id = ts.send_id }) catch {
-        self.allocator.free(send_buf);
+    const tracked = self.trackPendingSendCopy(slot, ts.send_id, send_buf[0..total_len]) catch {
         return;
     };
 
-    _ = self.ring.send(ts.ud, peer.fd, send_buf, 0) catch {
-        self.allocator.free(send_buf);
+    _ = self.ring.send(ts.ud, peer.fd, tracked, 0) catch {
+        self.freeOnePendingSend(slot, ts.send_id);
         return;
     };
     peer.send_pending = true;
@@ -189,7 +188,8 @@ pub fn completePieceDownload(self: *EventLoop, slot: u16) void {
         const valid = std.mem.eql(u8, &actual, &hash);
         if (valid) {
             // Write piece to disk via io_uring
-            const plan = storage.verify.planPieceVerification(self.allocator, sess, piece_index) catch {
+            var span_scratch: [8]LayoutSpan = undefined;
+            const plan = storage.verify.planPieceVerificationWithScratch(self.allocator, sess, piece_index, span_scratch[0..]) catch {
                 pt.releasePiece(piece_index);
                 self.allocator.free(piece_buf);
                 peer.piece_buf = null;
@@ -304,7 +304,8 @@ pub fn processHashResults(self: *EventLoop) void {
             }
 
             // Write verified piece to disk via io_uring
-            const plan = storage.verify.planPieceVerification(self.allocator, sess, result.piece_index) catch {
+            var span_scratch: [8]LayoutSpan = undefined;
+            const plan = storage.verify.planPieceVerificationWithScratch(self.allocator, sess, result.piece_index, span_scratch[0..]) catch {
                 self.allocator.free(result.piece_buf);
                 continue;
             };
@@ -435,15 +436,21 @@ pub fn processMerkleResults(self: *EventLoop) void {
 
 pub fn checkPeerTimeouts(self: *EventLoop) void {
     const now = std.time.timestamp();
-    for (self.peers, 0..) |*peer, i| {
+    var to_remove = std.ArrayList(u16).empty;
+    defer to_remove.deinit(self.allocator);
+
+    for (self.active_peer_slots.items) |slot| {
+        const peer = &self.peers[slot];
         if (peer.state == .free or peer.state == .disconnecting) continue;
         if (peer.last_activity == 0) continue;
         if (peer.mode == .seed) continue; // don't timeout seed peers
 
         if (now - peer.last_activity > peer_timeout_secs) {
-            self.removePeer(@intCast(i));
+            to_remove.append(self.allocator, slot) catch break;
         }
     }
+
+    for (to_remove.items) |slot| self.removePeer(slot);
 }
 
 // ── Choking algorithm (tit-for-tat) ─────────────────
@@ -457,12 +464,13 @@ pub fn recalculateUnchokes(self: *EventLoop) void {
     var interested_peers: [max_peers]u16 = undefined;
     var interested_count: u32 = 0;
 
-    for (self.peers, 0..) |*peer, i| {
+    for (self.active_peer_slots.items) |slot| {
+        const peer = &self.peers[slot];
         if (peer.state == .free or peer.state == .disconnecting) continue;
         if (peer.mode != .seed) continue;
         if (!peer.peer_interested) continue;
         if (interested_count < max_peers) {
-            interested_peers[interested_count] = @intCast(i);
+            interested_peers[interested_count] = slot;
             interested_count += 1;
         }
     }
@@ -645,7 +653,8 @@ pub fn checkPex(self: *EventLoop) void {
         const torrent_pex = tc.pex_state.?;
 
         // Update the torrent's connected peers set
-        for (self.peers) |*peer| {
+        for (self.active_peer_slots.items) |peer_slot| {
+            const peer = &self.peers[peer_slot];
             if (peer.state == .free or peer.state == .connecting or peer.state == .disconnecting) continue;
             if (peer.torrent_id != tid) continue;
             // Only include peers that have completed the handshake
@@ -659,7 +668,8 @@ pub fn checkPex(self: *EventLoop) void {
         }
 
         // Send PEX messages to each eligible peer for this torrent
-        for (self.peers, 0..) |*peer, pi| {
+        for (self.active_peer_slots.items) |pi| {
+            const peer = &self.peers[pi];
             if (peer.state == .free or peer.state == .disconnecting) continue;
             if (peer.torrent_id != tid) continue;
             if (peer.state != .active_recv_header and peer.state != .active_recv_body) continue;
@@ -674,7 +684,7 @@ pub fn checkPex(self: *EventLoop) void {
                 if (now - ps.last_pex_time < pex_mod.pex_interval_secs) continue;
             }
 
-            protocol.submitPexMessage(self, @intCast(pi)) catch |err| {
+            protocol.submitPexMessage(self, pi) catch |err| {
                 log.debug("PEX send to slot {d}: {s}", .{ pi, @errorName(err) });
             };
         }
@@ -686,7 +696,8 @@ pub fn updateSpeedCounters(self: *EventLoop) void {
     const now = std.time.timestamp();
 
     // Update per-peer speed counters
-    for (self.peers) |*peer| {
+    for (self.active_peer_slots.items) |slot| {
+        const peer = &self.peers[slot];
         if (peer.state == .free) continue;
 
         if (peer.last_speed_check == 0) {
@@ -719,7 +730,8 @@ pub fn updateSpeedCounters(self: *EventLoop) void {
         // Sum bytes across peers for this torrent
         var dl_total: u64 = 0;
         var ul_total: u64 = 0;
-        for (self.peers) |*peer| {
+        for (self.active_peer_slots.items) |peer_slot| {
+            const peer = &self.peers[peer_slot];
             if (peer.state != .free and peer.torrent_id == tid) {
                 dl_total += peer.bytes_downloaded_from;
                 ul_total += peer.bytes_uploaded_to;
@@ -776,14 +788,15 @@ pub fn checkPartialSeed(self: *EventLoop) void {
 
         // Re-send extension handshake to all connected peers for this torrent
         // so they learn about our upload_only state change.
-        for (self.peers, 0..) |*peer, pi| {
+        for (self.active_peer_slots.items) |pi| {
+            const peer = &self.peers[pi];
             if (peer.state == .free or peer.state == .disconnecting) continue;
             if (peer.torrent_id != tid) continue;
             if (peer.state != .active_recv_header and peer.state != .active_recv_body) continue;
             if (!peer.extensions_supported) continue;
             if (peer.send_pending) continue;
 
-            protocol.submitExtensionHandshake(self, @intCast(pi)) catch |err| {
+            protocol.submitExtensionHandshake(self, pi) catch |err| {
                 log.debug("BEP 21 ext handshake resend to slot {d}: {s}", .{ pi, @errorName(err) });
             };
         }
