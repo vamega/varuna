@@ -220,12 +220,13 @@ Measured with the real loopback RPC server workloads:
 
 | Scenario | Before | After |
 |----------|--------|-------|
-| `api_get_burst --iterations=4000 --clients=8` | 8,000 allocs, 33.28 MB transient bytes, ~2.20e8 ns | 4,000 allocs, 512 KB transient bytes, ~2.20e8 ns |
-| `api_upload_burst --iterations=1000 --clients=8 --body-bytes=65536` | 3,000 allocs, 73.97 MB transient bytes, ~1.30e8 ns | 2,000 allocs, 65.78 MB transient bytes, ~1.26e8 ns |
+| `api_get_burst --iterations=4000 --clients=8` | 8,000 allocs, 33.28 MB transient bytes, ~2.20e8 ns | 0 allocs, 0 transient bytes, `2.13e8 ns` to `2.31e8 ns` |
+| `api_upload_burst --iterations=1000 --clients=8 --body-bytes=65536` | 3,000 allocs, 73.97 MB transient bytes, ~1.30e8 ns | 8 allocs, 525 KB retained bytes, `1.24e8 ns` |
 
 Interpretation:
 
-- The measured win that held up was `accept_multishot` plus inline per-client request storage.
+- The measured wins that held up were `accept_multishot`, inline per-client request storage, inline response headers, and bounded per-slot retention of grown upload buffers.
+- The burst workloads now send `Connection: close` explicitly so they still measure one request per connection after the server began honoring HTTP/1.1 keep-alive by default.
 - A prototype API `recv_multishot` + provided-buffer path was tested and rejected in this pass because teardown overhead erased the latency gain on these workloads.
 
 ## Peer Listener Snapshot (ReleaseFast, 2026-04-01)
@@ -253,7 +254,23 @@ Measured with the sequential polling workload against the real loopback RPC serv
 Interpretation:
 
 - Server-side HTTP/1.1 keep-alive is a real win for WebUI-style polling on this host, roughly `2.5x` to `2.8x` faster on the measured sequential request shape.
-- The remaining allocator count is still dominated by one response-header allocation per request, so keep-alive addressed socket churn first, not all transient RPC allocation.
+- Response-header allocation is now eliminated on the steady-state path, so repeat runs are allocation-free and measured `73276685 ns` and `79175258 ns` on this host.
+
+## API Header / Upload Buffer Reuse Snapshot (ReleaseFast, 2026-04-01)
+
+Measured after switching the server to inline response headers with heap fallback and retaining grown upload receive buffers per slot up to `256 KiB`:
+
+| Scenario | Before | After |
+|----------|--------|-------|
+| `http_response --iterations=5000` | `5,001` allocs, `648 KB` transient bytes, `4.63e7 ns` | `1` alloc, `8 KB` transient bytes, `1.80e6 ns`, repeat `1.77e6 ns` |
+| `api_get_seq --iterations=4000 --clients=8` | `95649970 ns`, `87088833 ns` | `73276685 ns`, `79175258 ns` |
+| `api_upload_burst --iterations=1000 --clients=8 --body-bytes=65536` | `2,000` allocs, `65.78 MB` transient bytes, `~1.26e8 ns` | `8` allocs, `525 KB` retained bytes, `123901066 ns` |
+
+Interpretation:
+
+- Inline response headers remove the last steady-state allocation from ordinary API GET responses and make the isolated response assembly benchmark dramatically cheaper.
+- Bounded per-slot receive-buffer retention is a good fit for repeated upload-sized requests: it turns per-request heap growth into one retained buffer per active API slot instead of one allocate/free pair per connection.
+- This deliberately keeps the retention policy simple and bounded. Uploads larger than the retained cap still allocate on demand, which is the next thing to revisit only if real API traces justify it.
 
 ## MSE Responder Snapshot (ReleaseFast, 2026-04-01)
 

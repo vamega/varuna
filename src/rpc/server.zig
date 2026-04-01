@@ -7,7 +7,10 @@ const auth = @import("auth.zig");
 
 const max_api_clients = 64;
 const recv_buf_size = 8192;
+const header_buf_size = 512;
+const retained_recv_buf_limit = 256 * 1024;
 const max_request_size = 4 * 1024 * 1024; // 4 MiB max for torrent uploads
+pub const response_header_inline_size = header_buf_size;
 
 /// HTTP API server running entirely on io_uring.
 /// Accept, recv, parse, route, send -- all via SQEs, no blocking I/O.
@@ -275,27 +278,20 @@ pub const ApiServer = struct {
         errdefer if (owned_body) |owned| self.allocator.free(owned);
         defer if (response.owned_extra_headers) |owned| self.allocator.free(owned);
 
-        // Build the headers only; the body stays in its original storage and is
-        // sent as the second iovec.
-        var buf = std.ArrayList(u8).empty;
-        defer buf.deinit(self.allocator);
-
-        buf.print(self.allocator, "HTTP/1.1 {} {s}\r\nContent-Type: {s}\r\nContent-Length: {}\r\nConnection: {s}\r\n", .{
-            response.status,
-            statusText(response.status),
-            response.content_type,
-            response.body.len,
-            if (client.keep_alive) "keep-alive" else "close",
-        }) catch return;
-        if (response.extra_headers) |hdrs| {
-            buf.appendSlice(self.allocator, hdrs) catch return;
-        }
-        buf.appendSlice(self.allocator, "\r\n") catch return;
-
-        const header_buf = buf.toOwnedSlice(self.allocator) catch return;
-
         releaseClientResponse(self, client);
-        client.header_buf = header_buf;
+
+        const header_len = responseHeaderLength(response, client.keep_alive);
+        if (header_len <= client.header_inline.len) {
+            client.header_buf = writeResponseHeader(client.header_inline[0..header_len], response, client.keep_alive) catch return;
+            client.header_is_heap = false;
+        } else {
+            const header_buf = self.allocator.alloc(u8, header_len) catch return;
+            errdefer self.allocator.free(header_buf);
+            const written = writeResponseHeader(header_buf, response, client.keep_alive) catch return;
+            client.header_buf = written;
+            client.header_is_heap = true;
+        }
+
         client.header_offset = 0;
         client.body = response.body;
         client.body_offset = 0;
@@ -385,13 +381,21 @@ pub const ApiServer = struct {
 
     fn closeClient(self: *ApiServer, slot: u8) void {
         const client = &self.clients[slot];
+        var retained_recv_buf: ?[]u8 = null;
         if (client.fd >= 0) {
             _ = self.ring.inner.close(0, client.fd) catch {};
             client.fd = -1;
         }
-        if (client.recv_buf) |buf| self.allocator.free(buf);
+        if (client.recv_buf) |buf| {
+            if (buf.len <= retained_recv_buf_limit) {
+                retained_recv_buf = buf;
+            } else {
+                self.allocator.free(buf);
+            }
+        }
         releaseClientResponse(self, client);
         client.* = .{};
+        client.recv_buf = retained_recv_buf;
     }
 
     fn allocClientSlot(self: *ApiServer) ?u8 {
@@ -436,6 +440,8 @@ pub const ApiClient = struct {
     recv_inline: [recv_buf_size]u8 = undefined,
     recv_offset: usize = 0,
     header_buf: ?[]u8 = null,
+    header_inline: [header_buf_size]u8 = undefined,
+    header_is_heap: bool = false,
     header_offset: usize = 0,
     body: []const u8 = "",
     owned_body: ?[]u8 = null,
@@ -558,6 +564,33 @@ fn defaultHandler(_: std.mem.Allocator, request: Request) Response {
     return .{ .status = 404, .body = "{\"error\":\"not found\"}" };
 }
 
+pub fn responseHeaderLength(response: Response, keep_alive: bool) usize {
+    return std.fmt.count("HTTP/1.1 {} {s}\r\nContent-Type: {s}\r\nContent-Length: {}\r\nConnection: {s}\r\n", .{
+        response.status,
+        statusText(response.status),
+        response.content_type,
+        response.body.len,
+        if (keep_alive) "keep-alive" else "close",
+    }) + (response.extra_headers orelse "").len + 2;
+}
+
+pub fn writeResponseHeader(dest: []u8, response: Response, keep_alive: bool) ![]u8 {
+    var stream = std.io.fixedBufferStream(dest);
+    const writer = stream.writer();
+    try writer.print("HTTP/1.1 {} {s}\r\nContent-Type: {s}\r\nContent-Length: {}\r\nConnection: {s}\r\n", .{
+        response.status,
+        statusText(response.status),
+        response.content_type,
+        response.body.len,
+        if (keep_alive) "keep-alive" else "close",
+    });
+    if (response.extra_headers) |hdrs| {
+        try writer.writeAll(hdrs);
+    }
+    try writer.writeAll("\r\n");
+    return dest[0..stream.pos];
+}
+
 fn releaseOwnedResponseBody(allocator: std.mem.Allocator, client: *ApiClient) void {
     if (client.owned_body) |owned| allocator.free(owned);
     client.owned_body = null;
@@ -585,8 +618,11 @@ fn advanceSendProgress(client: *ApiClient, sent: usize) !bool {
 }
 
 fn releaseClientResponse(self: *ApiServer, client: *ApiClient) void {
-    if (client.header_buf) |buf| self.allocator.free(buf);
+    if (client.header_is_heap) {
+        if (client.header_buf) |buf| self.allocator.free(buf);
+    }
     client.header_buf = null;
+    client.header_is_heap = false;
     client.header_offset = 0;
     client.body = "";
     client.body_offset = 0;

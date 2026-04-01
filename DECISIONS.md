@@ -14,6 +14,35 @@ Use [STATUS.md](STATUS.md) for the running list of completed work, next work, an
 
 ## Decision Entries
 
+### 2026-04-01: Eliminate Steady-State API Header Allocs And Reuse Upload Buffers Per Slot
+
+Context:
+The API server had already removed full response-body copies and gained HTTP/1.1 keep-alive, but two steady-state costs remained:
+- every response still allocated one header buffer before `sendmsg`
+- one-request-per-connection uploads still allocated and freed a large receive buffer on every connection close
+
+Decision:
+- Add an inline response-header buffer to each API client and write headers directly into that fixed storage when they fit, with heap fallback only for unusually large header sets.
+- Add `responseHeaderLength()` and `writeResponseHeader()` helpers so the server and perf harness share the same header assembly path.
+- Retain grown per-slot receive buffers across client teardown up to `256 KiB` instead of freeing them immediately on disconnect.
+- Keep the burst harness explicitly sending `Connection: close` so the “one request per connection” workload stays comparable after HTTP/1.1 keep-alive became the correct server default.
+
+Reasoning:
+- Normal qBittorrent-compatible API responses have small, predictable headers, so fixed per-client storage is cheaper and simpler than allocating a transient header slice every time.
+- Bounded per-slot receive-buffer retention amortizes upload request-body growth without allowing one pathological upload to pin multi-megabyte buffers indefinitely.
+- The retention cap keeps worst-case idle memory for this optimization bounded to about `16 MiB` (`64 * 256 KiB`) even if every API slot previously handled an upload-sized request.
+- The benchmark harness needed to be explicit about connection semantics; once the server correctly honored HTTP/1.1 keep-alive by default, the old “read until close” burst client no longer represented a short-lived-connection workload.
+
+Measured effect:
+- `http_response --iterations=5000` moved from `5,001` allocs / `648 KB` transient bytes / `4.63e7 ns` to `1` alloc / `8 KB` transient bytes / `1.77e6 ns`.
+- `api_get_burst --iterations=4000 --clients=8` moved from `4,000` allocs / `512 KB` transient bytes / `~2.20e8 ns` to `0` allocs / `0` transient bytes / `2.13e8 ns` to `2.31e8 ns` on this host.
+- `api_get_seq --iterations=4000 --clients=8` remained allocation-free and measured `7.33e7 ns` and `7.92e7 ns` in repeat runs.
+- `api_upload_burst --iterations=1000 --clients=8 --body-bytes=65536` moved from `2,000` allocs / `65.78 MB` transient bytes / `~1.26e8 ns` to `8` allocs / `525 KB` retained bytes / `1.24e8 ns`.
+
+Follow-up triggers:
+- If large API uploads above `256 KiB` become common, either tune the retention cap with real traces or move to a small shared receive-buffer pool.
+- If response metadata grows enough that heap fallback becomes common, increase the inline header size based on measurement rather than guessing.
+
 ### 2026-04-01: Keep Peer Listener `accept_multishot`, But Only On Measured Low-Concurrency Evidence
 
 Context:

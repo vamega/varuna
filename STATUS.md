@@ -106,6 +106,7 @@ Update it whenever a milestone lands, the near-term backlog changes, or a new op
 - **Huge page piece cache**: optional `mmap(MAP_HUGETLB)` buffer pool for seed piece reads. Falls back to `madvise(MADV_HUGEPAGE)` (transparent huge pages), then regular pages. Config: `performance.use_huge_pages`, `performance.piece_cache_size`. Reduces TLB pressure for large torrents.
 - **Synthetic memory baseline harness**: `varuna-perf` with allocator-counting scenarios for peer scans, request batching, seed batching, extension parsing, session loading, and `/sync/maindata`. Supports stable before/after comparisons without a live swarm.
 - **Synthetic API burst harness**: `varuna-perf` now includes `api_get_burst` and `api_upload_burst`, which drive the real RPC server over loopback sockets with configurable client concurrency and upload body size.
+- **API steady-state allocation removal**: standard RPC responses now write headers into inline per-client storage, `api_get_burst` is allocation-free, and upload-sized request buffers are retained per slot up to `256 KiB` instead of reallocating on every disconnect.
 - **Synthetic peer accept harness**: `varuna-perf` now includes `peer_accept_burst`, which drives the real shared `EventLoop` listener with inbound loopback TCP connects and measures accept-slot-recv-EOF teardown cost.
 - **First allocation-reduction pass**: request batches now avoid heap allocation, seed batching no longer heap-copies each queued block, `/sync/maindata` uses fixed-size snapshot keys plus a request arena, BEP 9/BEP 10 decode paths are allocation-free, and scan-heavy peer-policy paths use dense active-slot lists.
 
@@ -185,7 +186,7 @@ Update it whenever a milestone lands, the near-term backlog changes, or a new op
 - **Peer hot/cold split / partial SoA**: the active-slot pass removes a lot of wasted scans, but the `Peer` struct is still wide. The next performance step is separating hot scheduling/state fields from cold crypto/buffering state.
 - **Torrent hot-summary registry**: cached cumulative byte totals now remove the hottest `/sync` stats scan, but a denser registry is still the next step if queue position, state derivation, or other per-torrent fields dominate at `10k+` torrents.
 - **Broader RPC arena coverage**: `/sync/maindata` now uses an arena for transient work; the other list-heavy endpoints still allocate temporary object graphs and strings.
-- **API request-body growth / reuse**: the short-request path now uses inline storage, but large request bodies still allocate on demand and are freed on disconnect. A per-client arena or reuse pool is still available if API uploads remain allocator-heavy.
+- **API request-body reuse above the retained cap**: upload-sized request buffers are now retained per slot up to `256 KiB`, but larger bodies still allocate on demand. Revisit this only if real API traces show sustained uploads above that threshold.
 - ~~**Seed plaintext scatter/gather**~~: (DONE) plaintext seed sends now use tracked vectored `sendmsg` with explicit piece-buffer ownership; encrypted peers still use the contiguous copy path.
 - **uTP outbound queueing**: the UDP path still has room for a ring queue and multiple in-flight sends if uTP becomes hot in real swarms.
 - **uTP multishot receive**: `recvmsg_multishot` plus a provided-buffer strategy still needs a workload and a measured implementation before it should land.
@@ -212,12 +213,12 @@ Update it whenever a milestone lands, the near-term backlog changes, or a new op
 - `zig build test`: all tests pass
 - Shared EventLoop registry validated with `20,000` active torrent contexts and hashed inbound lookup
 - `zig build`: clean build (with `-Dtls=boringssl` default and `-Dtls=none`)
-- `zig build -Doptimize=ReleaseFast perf-workload -- http_response --iterations=5000`: `5,001` allocs, `648 KB` transient bytes, `4.63e7 ns`
 - `zig build -Doptimize=ReleaseFast perf-workload -- session_load --iterations=1000`: `2,004` allocs, `1.33e7 ns`
-- `zig build -Doptimize=ReleaseFast perf-workload -- api_get_burst --iterations=4000 --clients=8`: `4,000` allocs, `512 KB` transient bytes, `~2.20e8 ns`
-- `zig build -Doptimize=ReleaseFast perf-workload -- api_upload_burst --iterations=1000 --clients=8 --body-bytes=65536`: `2,000` allocs, `65.8 MB` transient bytes, `~1.26e8 ns`
+- `zig build -Doptimize=ReleaseFast perf-workload -- http_response --iterations=5000`: `1` alloc, `8 KB` transient bytes, `1.77e6 ns`
+- `zig build -Doptimize=ReleaseFast perf-workload -- api_get_burst --iterations=4000 --clients=8`: `0` allocs, `0` transient bytes, `2.13e8 ns` to `2.31e8 ns`
+- `zig build -Doptimize=ReleaseFast perf-workload -- api_upload_burst --iterations=1000 --clients=8 --body-bytes=65536`: `8` allocs, `525 KB` retained bytes, `1.24e8 ns`
 - `zig build -Doptimize=ReleaseFast perf-workload -- peer_accept_burst --iterations=4000 --clients=1`: multishot listener `~6.91e8 ns` vs one-shot A/B baseline `~7.34e8 ns`
-- `zig build -Doptimize=ReleaseFast perf-workload -- api_get_seq --iterations=4000 --clients=8`: keep-alive server `9.56e7 ns` / `8.71e7 ns` vs pre-change `2.41e8 ns`
+- `zig build -Doptimize=ReleaseFast perf-workload -- api_get_seq --iterations=4000 --clients=8`: keep-alive server `7.33e7 ns` / `7.92e7 ns` vs pre-change `2.41e8 ns`
 - `zig build -Doptimize=ReleaseFast perf-workload -- mse_responder_prep --iterations=2000 --torrents=20000`: shared lookup `5.21e4 ns` / `3.57e4 ns` vs pre-change `1.02e9 ns`
 - `zig build -Doptimize=ReleaseFast perf-workload -- tracker_http_fresh --iterations=2000`: `7.31e8 ns` / `7.04e8 ns`
 - `zig build -Doptimize=ReleaseFast perf-workload -- tracker_http_reuse_potential --iterations=2000`: `2.83e8 ns` / `2.72e8 ns` (benchmark-only potential, not yet wired into production tracker flow)

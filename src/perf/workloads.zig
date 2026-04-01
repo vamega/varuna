@@ -717,23 +717,16 @@ fn runHttpResponse(
     var checksum: u64 = 0;
 
     for (0..iterations) |_| {
-        var header = std.ArrayList(u8).empty;
-        defer header.deinit(allocator);
-
-        try header.print(allocator, "HTTP/1.1 {} {s}\r\nContent-Type: {s}\r\nContent-Length: {}\r\nConnection: close\r\n", .{
-            response.status,
-            "OK",
-            response.content_type,
-            response.body.len,
-        });
-        if (response.extra_headers) |headers| {
-            try header.appendSlice(allocator, headers);
-        }
-        try header.appendSlice(allocator, "\r\n");
-
-        const owned = try header.toOwnedSlice(allocator);
-        defer allocator.free(owned);
-        checksum +%= std.hash.Wyhash.hash(0, owned);
+        const header_len = rpc_server.responseHeaderLength(response, false);
+        var header_inline: [rpc_server.response_header_inline_size]u8 = undefined;
+        const header = if (header_len <= header_inline.len)
+            try rpc_server.writeResponseHeader(header_inline[0..header_len], response, false)
+        else blk: {
+            const owned = try allocator.alloc(u8, header_len);
+            defer allocator.free(owned);
+            break :blk try rpc_server.writeResponseHeader(owned, response, false);
+        };
+        checksum +%= std.hash.Wyhash.hash(0, header);
         checksum +%= std.hash.Wyhash.hash(0, response.body);
     }
 
@@ -981,13 +974,13 @@ fn apiClientWorker(work: *ApiClientWork) void {
         };
 
         switch (work.mode) {
-            .get => writeAll(fd, "GET /api/v2/app/webapiVersion HTTP/1.1\r\nHost: localhost\r\n\r\n") catch |err| {
+            .get => writeAll(fd, "GET /api/v2/app/webapiVersion HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n") catch |err| {
                 std.debug.panic("api benchmark GET write failed: {}", .{err});
             },
             .upload => {
                 const header = std.fmt.bufPrint(
                     &header_buf,
-                    "POST /api/v2/torrents/add HTTP/1.1\r\nHost: localhost\r\nContent-Type: application/octet-stream\r\nContent-Length: {}\r\n\r\n",
+                    "POST /api/v2/torrents/add HTTP/1.1\r\nHost: localhost\r\nContent-Type: application/octet-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
                     .{work.body.len},
                 ) catch |err| {
                     std.debug.panic("api benchmark header build failed: {}", .{err});
