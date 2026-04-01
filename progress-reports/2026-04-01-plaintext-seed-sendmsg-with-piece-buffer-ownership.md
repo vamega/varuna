@@ -12,13 +12,13 @@ The key changes were:
 
 Relevant code references:
 
-- `src/io/event_loop.zig:260` — tracked send storage now supports owned and vectored sends
-- `src/io/event_loop.zig:328` — queued seed responses now point at `PieceBuffer`
-- `src/io/event_loop.zig:1536` — partial-send handling now resubmits vectored sends too
-- `src/io/seed_handler.zig:64` — vectored plaintext batch state builder
-- `src/io/seed_handler.zig:143` — plaintext `sendmsg` submit path
-- `src/io/seed_handler.zig:191` — batched plaintext seed flush now prefers `sendmsg`
-- `src/io/peer_handler.zig:206` — send completion now recomputes `send_pending` from tracked sends
+- `src/io/event_loop.zig:294` — tracked send storage now supports owned and vectored sends
+- `src/io/event_loop.zig:367` — queued seed responses now point at `PieceBuffer`
+- `src/io/event_loop.zig:1606` — partial-send handling now resubmits vectored sends too
+- `src/io/seed_handler.zig:63` — vectored plaintext batch state builder
+- `src/io/seed_handler.zig:141` — plaintext `sendmsg` submit path
+- `src/io/seed_handler.zig:316` — batched plaintext seed flush now prefers `sendmsg`
+- `src/io/peer_handler.zig:225` — send completion now recomputes `send_pending` from tracked sends
 
 ## What was learned
 
