@@ -31,7 +31,7 @@ pub fn tryAssignPieces(self: *EventLoop) void {
 
         // Re-check eligibility (state may have changed since enqueue).
         if (!EventLoop.isIdleCandidate(peer)) {
-            _ = self.idle_peers.swapRemove(i);
+            self.unmarkIdle(slot);
             continue;
         }
 
@@ -42,7 +42,7 @@ pub fn tryAssignPieces(self: *EventLoop) void {
         }
 
         const tc = self.getTorrentContext(peer.torrent_id) orelse {
-            _ = self.idle_peers.swapRemove(i);
+            self.unmarkIdle(slot);
             continue;
         };
 
@@ -53,7 +53,7 @@ pub fn tryAssignPieces(self: *EventLoop) void {
         }
 
         const pt = tc.piece_tracker orelse {
-            _ = self.idle_peers.swapRemove(i);
+            self.unmarkIdle(slot);
             continue;
         };
 
@@ -72,7 +72,7 @@ pub fn tryAssignPieces(self: *EventLoop) void {
         };
 
         // Successfully assigned -- remove from idle list.
-        _ = self.idle_peers.swapRemove(i);
+        self.unmarkIdle(slot);
     }
 }
 
@@ -639,7 +639,7 @@ pub fn checkPex(self: *EventLoop) void {
 
     const now = std.time.timestamp();
 
-    for (self.active_torrent_ids.items) |tid| {
+    for (self.torrents_with_peers.items) |tid| {
         const tc = self.getTorrentContext(tid) orelse continue;
 
         // PEX is disabled for private torrents (BEP 27)
@@ -648,10 +648,9 @@ pub fn checkPex(self: *EventLoop) void {
         var has_connected_peers = false;
 
         // Update the torrent's connected peers set
-        for (self.active_peer_slots.items) |peer_slot| {
+        for (tc.peer_slots.items) |peer_slot| {
             const peer = &self.peers[peer_slot];
             if (peer.state == .free or peer.state == .connecting or peer.state == .disconnecting) continue;
-            if (peer.torrent_id != tid) continue;
             // Only include peers that have completed the handshake
             if (peer.state != .active_recv_header and peer.state != .active_recv_body) continue;
 
@@ -673,10 +672,9 @@ pub fn checkPex(self: *EventLoop) void {
         if (!has_connected_peers or tc.pex_state == null) continue;
 
         // Send PEX messages to each eligible peer for this torrent
-        for (self.active_peer_slots.items) |pi| {
+        for (tc.peer_slots.items) |pi| {
             const peer = &self.peers[pi];
             if (peer.state == .free or peer.state == .disconnecting) continue;
-            if (peer.torrent_id != tid) continue;
             if (peer.state != .active_recv_header and peer.state != .active_recv_body) continue;
             if (peer.send_pending) continue;
 
@@ -730,15 +728,15 @@ pub fn updateSpeedCounters(self: *EventLoop) void {
     }
 
     // Update per-torrent speed counters
-    for (self.active_torrent_ids.items) |tid| {
+    for (self.torrents_with_peers.items) |tid| {
         const tc = self.getTorrentContext(tid) orelse continue;
 
         // Sum bytes across peers for this torrent
         var dl_total: u64 = 0;
         var ul_total: u64 = 0;
-        for (self.active_peer_slots.items) |peer_slot| {
+        for (tc.peer_slots.items) |peer_slot| {
             const peer = &self.peers[peer_slot];
-            if (peer.state != .free and peer.torrent_id == tid) {
+            if (peer.state != .free) {
                 dl_total += peer.bytes_downloaded_from;
                 ul_total += peer.bytes_uploaded_to;
             }
@@ -774,7 +772,7 @@ pub fn updateSpeedCounters(self: *EventLoop) void {
 /// the torrent's `upload_only` flag and re-send extension handshakes to
 /// all connected peers so they know we are upload_only.
 pub fn checkPartialSeed(self: *EventLoop) void {
-    for (self.active_torrent_ids.items) |tid| {
+    for (self.torrents_with_peers.items) |tid| {
         const tc = self.getTorrentContext(tid) orelse continue;
         const pt = tc.piece_tracker orelse continue;
 
@@ -793,10 +791,9 @@ pub fn checkPartialSeed(self: *EventLoop) void {
 
         // Re-send extension handshake to all connected peers for this torrent
         // so they learn about our upload_only state change.
-        for (self.active_peer_slots.items) |pi| {
+        for (tc.peer_slots.items) |pi| {
             const peer = &self.peers[pi];
             if (peer.state == .free or peer.state == .disconnecting) continue;
-            if (peer.torrent_id != tid) continue;
             if (peer.state != .active_recv_header and peer.state != .active_recv_body) continue;
             if (!peer.extensions_supported) continue;
             if (peer.send_pending) continue;

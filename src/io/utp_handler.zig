@@ -426,6 +426,7 @@ fn processUtpInboundHandshake(self: *EventLoop, peer_slot: u16) void {
         return;
     };
     peer.torrent_id = resp_tid;
+    self.attachPeerToTorrent(resp_tid, peer_slot);
     // Store remote peer ID for client identification
     @memcpy(&peer.remote_peer_id, peer.handshake_buf[48..68]);
     peer.has_peer_id = true;

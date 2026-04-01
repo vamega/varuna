@@ -6,6 +6,10 @@ const CountingAllocator = @import("counting_allocator.zig").CountingAllocator;
 const Stats = @import("counting_allocator.zig").Stats;
 
 const blocks = varuna.torrent.blocks;
+const Bitfield = varuna.bitfield.Bitfield;
+const EventLoop = varuna.io.event_loop.EventLoop;
+const Peer = varuna.io.event_loop.Peer;
+const PieceTracker = varuna.torrent.piece_tracker.PieceTracker;
 const rpc_server = varuna.rpc.server;
 const sync_mod = varuna.rpc.sync;
 const event_loop_mod = varuna.io.event_loop;
@@ -17,6 +21,8 @@ const tracker_announce = varuna.tracker.announce;
 const SessionManager = varuna.daemon.session_manager.SessionManager;
 const TrackerExecutor = varuna.daemon.tracker_executor.TrackerExecutor;
 const TorrentSession = varuna.daemon.torrent_session.TorrentSession;
+const peer_policy = varuna.io.peer_policy;
+const pex_mod = varuna.net.pex;
 
 pub const Config = struct {
     iterations: usize = 1_000,
@@ -53,6 +59,8 @@ pub const Scenario = enum {
     mse_responder_prep,
     session_load,
     sync_delta,
+    tick_sparse_torrents,
+    peer_churn,
 
     pub fn parse(name: []const u8) ?Scenario {
         inline for (std.meta.fields(Scenario)) |field| {
@@ -90,6 +98,8 @@ pub fn run(
         .mse_responder_prep => runMseResponderPrep(allocator, alloc_counter, iterations, config),
         .session_load => runSessionLoad(allocator, alloc_counter, iterations),
         .sync_delta => runSyncDelta(allocator, alloc_counter, iterations, config),
+        .tick_sparse_torrents => runTickSparseTorrents(allocator, alloc_counter, iterations, config),
+        .peer_churn => runPeerChurn(allocator, alloc_counter, iterations, config),
     };
 }
 
@@ -115,7 +125,6 @@ fn runPeerScan(
     iterations: usize,
     config: Config,
 ) !Result {
-    const Peer = varuna.io.event_loop.Peer;
     const max_peers = @min(config.peers, varuna.io.event_loop.max_peers);
     const active_stride = @max(config.scale, 1);
     const peers = try allocator.alloc(Peer, max_peers);
@@ -1212,6 +1221,147 @@ fn runSyncDelta(
     }
 
     return makeResult("sync_delta", iterations, &timer, checksum, alloc_counter);
+}
+
+fn runTickSparseTorrents(
+    allocator: std.mem.Allocator,
+    alloc_counter: *CountingAllocator,
+    iterations: usize,
+    config: Config,
+) !Result {
+    var el = try EventLoop.initBare(allocator, 0);
+    defer el.deinit();
+
+    const empty_fds = [_]std.posix.fd_t{};
+    const torrent_count = @max(config.torrents, 1);
+    const active_stride = @max(config.scale, 1);
+    const peer_count = @max(config.peers, 1);
+
+    var complete = try Bitfield.init(allocator, 64);
+    defer complete.deinit(allocator);
+    for (0..32) |idx| complete.set(@intCast(idx)) catch {};
+
+    var wanted = try Bitfield.init(allocator, 64);
+    for (0..32) |idx| wanted.set(@intCast(idx)) catch {};
+
+    var tracker = try PieceTracker.init(allocator, 64, 16 * 1024, 64 * 16 * 1024, &complete, 32 * 16 * 1024);
+    defer tracker.deinit(allocator);
+    tracker.setWanted(wanted);
+
+    var seed: u32 = 1;
+    var active_torrents: usize = 0;
+
+    for (0..torrent_count) |idx| {
+        var info_hash = [_]u8{0} ** 20;
+        var peer_id = [_]u8{0} ** 20;
+        std.mem.writeInt(u32, info_hash[0..4], @intCast(idx), .big);
+        std.mem.writeInt(u32, peer_id[0..4], seed, .big);
+        seed +%= 1;
+
+        const torrent_id = try el.addTorrentContext(.{
+            .shared_fds = empty_fds[0..],
+            .info_hash = info_hash,
+            .peer_id = peer_id,
+            .piece_tracker = &tracker,
+        });
+
+        const tc = el.getTorrentContext(torrent_id).?;
+        tc.upload_only = true;
+        if (idx % active_stride == 0) {
+            active_torrents += 1;
+            tc.is_private = false;
+            tc.pex_state = try allocator.create(pex_mod.TorrentPexState);
+            tc.pex_state.?.* = .{};
+        }
+    }
+
+    var active_peer_count: usize = 0;
+    const active_torrent_limit = @min(active_torrents, torrent_count);
+
+    for (0..active_torrent_limit) |tidx| {
+        const torrent_id: varuna.io.event_loop.TorrentId = @intCast(tidx * active_stride);
+        const peers_this_torrent = @max(@divTrunc(peer_count, active_torrent_limit), 1);
+
+        for (0..peers_this_torrent) |_| {
+            if (active_peer_count >= el.peers.len) break;
+            const slot: u16 = @intCast(active_peer_count);
+            const peer = &el.peers[slot];
+            peer.* = .{
+                .state = .active_recv_header,
+                .mode = .seed,
+                .torrent_id = torrent_id,
+                .availability_known = true,
+                .peer_choking = false,
+                .extensions_supported = false,
+                .bytes_downloaded_from = @as(u64, active_peer_count) * 1024,
+                .bytes_uploaded_to = @as(u64, active_peer_count) * 512,
+            };
+            el.active_peer_slots.append(allocator, slot) catch unreachable;
+            el.attachPeerToTorrent(torrent_id, slot);
+            active_peer_count += 1;
+        }
+    }
+
+    alloc_counter.stats = .{};
+    var timer = try std.time.Timer.start();
+    var checksum: u64 = 0;
+
+    for (0..iterations) |_| {
+        peer_policy.checkPex(&el);
+        peer_policy.checkPartialSeed(&el);
+        checksum +%= el.active_torrent_ids.items.len;
+        checksum +%= el.active_peer_slots.items.len;
+    }
+
+    return makeResult("tick_sparse_torrents", iterations, &timer, checksum, alloc_counter);
+}
+
+fn runPeerChurn(
+    allocator: std.mem.Allocator,
+    alloc_counter: *CountingAllocator,
+    iterations: usize,
+    config: Config,
+) !Result {
+    var el = try EventLoop.initBare(allocator, 0);
+    defer el.deinit();
+
+    const peer_count = @min(@max(config.peers, 1), el.peers.len);
+    const churn_count = @max(config.scale, 1);
+
+    var idle_slots = try std.ArrayList(u16).initCapacity(allocator, peer_count);
+    defer idle_slots.deinit(allocator);
+
+    for (0..peer_count) |idx| {
+        const slot: u16 = @intCast(idx);
+        const peer = &el.peers[slot];
+        peer.* = .{
+            .state = .active_recv_header,
+            .availability_known = true,
+            .peer_choking = false,
+            .torrent_id = 0,
+        };
+        idle_slots.appendAssumeCapacity(slot);
+        el.markActivePeer(slot);
+        el.markIdle(slot);
+    }
+
+    alloc_counter.stats = .{};
+    var timer = try std.time.Timer.start();
+    var checksum: u64 = 0;
+
+    for (0..iterations) |iter| {
+        const base = (iter * churn_count) % peer_count;
+        for (0..churn_count) |step| {
+            const slot = idle_slots.items[(base + step) % peer_count];
+            el.unmarkIdle(slot);
+            el.markIdle(slot);
+            el.unmarkActivePeer(slot);
+            el.markActivePeer(slot);
+            checksum +%= slot;
+        }
+    }
+
+    return makeResult("peer_churn", iterations, &timer, checksum, alloc_counter);
 }
 
 fn makeTorrentBytes(allocator: std.mem.Allocator, seed: usize) ![]u8 {

@@ -141,8 +141,7 @@ pub const SyncState = struct {
         {
             session_manager.mutex.lock();
             defer session_manager.mutex.unlock();
-            const cat_json = try session_manager.category_store.serializeJson(allocator);
-            defer allocator.free(cat_json);
+            const cat_json = try session_manager.category_store.cachedJson();
             try json.appendSlice(allocator, cat_json);
         }
 
@@ -151,8 +150,7 @@ pub const SyncState = struct {
         {
             session_manager.mutex.lock();
             defer session_manager.mutex.unlock();
-            const tag_json = try session_manager.tag_store.serializeJson(allocator);
-            defer allocator.free(tag_json);
+            const tag_json = try session_manager.tag_store.cachedJson();
             try json.appendSlice(allocator, tag_json);
         }
 

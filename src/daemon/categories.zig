@@ -11,6 +11,7 @@ pub const Category = struct {
 pub const CategoryStore = struct {
     allocator: std.mem.Allocator,
     categories: std.StringHashMap(Category),
+    cached_json: ?[]u8 = null,
 
     pub fn init(allocator: std.mem.Allocator) CategoryStore {
         return .{
@@ -20,6 +21,7 @@ pub const CategoryStore = struct {
     }
 
     pub fn deinit(self: *CategoryStore) void {
+        if (self.cached_json) |json| self.allocator.free(json);
         var iter = self.categories.iterator();
         while (iter.next()) |entry| {
             self.allocator.free(entry.value_ptr.name);
@@ -42,6 +44,7 @@ pub const CategoryStore = struct {
             .name = owned_name,
             .save_path = owned_path,
         });
+        self.invalidateCache();
     }
 
     /// Edit an existing category's save path. Returns error if not found.
@@ -50,6 +53,7 @@ pub const CategoryStore = struct {
         const owned_path = try self.allocator.dupe(u8, save_path);
         self.allocator.free(entry.save_path);
         entry.save_path = owned_path;
+        self.invalidateCache();
     }
 
     /// Remove a category by name. No-op if it doesn't exist (matching qBittorrent behavior).
@@ -57,6 +61,7 @@ pub const CategoryStore = struct {
         if (self.categories.fetchRemove(name)) |kv| {
             self.allocator.free(kv.value.name);
             self.allocator.free(kv.value.save_path);
+            self.invalidateCache();
         }
     }
 
@@ -65,26 +70,39 @@ pub const CategoryStore = struct {
         return self.categories.get(name);
     }
 
-    /// Serialize all categories as JSON: {"name":{"name":"...","savePath":"..."},...}
-    pub fn serializeJson(self: *const CategoryStore, allocator: std.mem.Allocator) ![]u8 {
-        var json = std.ArrayList(u8).empty;
-        errdefer json.deinit(allocator);
+    pub fn cachedJson(self: *CategoryStore) ![]const u8 {
+        if (self.cached_json) |json| return json;
 
-        try json.append(allocator, '{');
+        var json = std.ArrayList(u8).empty;
+        errdefer json.deinit(self.allocator);
+
+        try json.append(self.allocator, '{');
         var first = true;
         var iter = self.categories.iterator();
         while (iter.next()) |entry| {
-            if (!first) try json.append(allocator, ',');
+            if (!first) try json.append(self.allocator, ',');
             first = false;
-            try json.print(allocator, "\"{s}\":{{\"name\":\"{s}\",\"savePath\":\"{s}\"}}", .{
+            try json.print(self.allocator, "\"{s}\":{{\"name\":\"{s}\",\"savePath\":\"{s}\"}}", .{
                 entry.value_ptr.name,
                 entry.value_ptr.name,
                 entry.value_ptr.save_path,
             });
         }
-        try json.append(allocator, '}');
+        try json.append(self.allocator, '}');
 
-        return json.toOwnedSlice(allocator);
+        self.cached_json = try json.toOwnedSlice(self.allocator);
+        return self.cached_json.?;
+    }
+
+    /// Serialize all categories as JSON: {"name":{"name":"...","savePath":"..."},...}
+    pub fn serializeJson(self: *const CategoryStore, allocator: std.mem.Allocator) ![]u8 {
+        const cached = try @constCast(self).cachedJson();
+        return allocator.dupe(u8, cached);
+    }
+
+    fn invalidateCache(self: *CategoryStore) void {
+        if (self.cached_json) |json| self.allocator.free(json);
+        self.cached_json = null;
     }
 };
 
@@ -93,6 +111,7 @@ pub const CategoryStore = struct {
 pub const TagStore = struct {
     allocator: std.mem.Allocator,
     tags: std.StringHashMap(void),
+    cached_json: ?[]u8 = null,
 
     pub fn init(allocator: std.mem.Allocator) TagStore {
         return .{
@@ -102,6 +121,7 @@ pub const TagStore = struct {
     }
 
     pub fn deinit(self: *TagStore) void {
+        if (self.cached_json) |json| self.allocator.free(json);
         var iter = self.tags.iterator();
         while (iter.next()) |entry| {
             self.allocator.free(entry.key_ptr.*);
@@ -116,12 +136,14 @@ pub const TagStore = struct {
         const owned = try self.allocator.dupe(u8, name);
         errdefer self.allocator.free(owned);
         try self.tags.put(owned, {});
+        self.invalidateCache();
     }
 
     /// Delete a tag. No-op if it doesn't exist.
     pub fn delete(self: *TagStore, name: []const u8) void {
         if (self.tags.fetchRemove(name)) |kv| {
             self.allocator.free(kv.key);
+            self.invalidateCache();
         }
     }
 
@@ -130,22 +152,35 @@ pub const TagStore = struct {
         return self.tags.contains(name);
     }
 
-    /// Serialize all tags as JSON array: ["tag1","tag2",...]
-    pub fn serializeJson(self: *const TagStore, allocator: std.mem.Allocator) ![]u8 {
-        var json = std.ArrayList(u8).empty;
-        errdefer json.deinit(allocator);
+    pub fn cachedJson(self: *TagStore) ![]const u8 {
+        if (self.cached_json) |json| return json;
 
-        try json.append(allocator, '[');
+        var json = std.ArrayList(u8).empty;
+        errdefer json.deinit(self.allocator);
+
+        try json.append(self.allocator, '[');
         var first = true;
         var iter = self.tags.iterator();
         while (iter.next()) |entry| {
-            if (!first) try json.append(allocator, ',');
+            if (!first) try json.append(self.allocator, ',');
             first = false;
-            try json.print(allocator, "\"{s}\"", .{entry.key_ptr.*});
+            try json.print(self.allocator, "\"{s}\"", .{entry.key_ptr.*});
         }
-        try json.append(allocator, ']');
+        try json.append(self.allocator, ']');
 
-        return json.toOwnedSlice(allocator);
+        self.cached_json = try json.toOwnedSlice(self.allocator);
+        return self.cached_json.?;
+    }
+
+    /// Serialize all tags as JSON array: ["tag1","tag2",...]
+    pub fn serializeJson(self: *const TagStore, allocator: std.mem.Allocator) ![]u8 {
+        const cached = try @constCast(self).cachedJson();
+        return allocator.dupe(u8, cached);
+    }
+
+    fn invalidateCache(self: *TagStore) void {
+        if (self.cached_json) |json| self.allocator.free(json);
+        self.cached_json = null;
     }
 };
 

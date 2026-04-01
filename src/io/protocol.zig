@@ -441,11 +441,11 @@ fn handlePexMessage(self: *EventLoop, slot: u16, payload: []const u8) void {
 }
 
 /// Check if we already have a connection to the given address for this torrent.
-fn isPeerAlreadyConnected(self: *EventLoop, torrent_id: u32, addr: std.net.Address) bool {
-    for (self.active_peer_slots.items) |slot| {
+fn isPeerAlreadyConnected(self: *EventLoop, torrent_id: @import("event_loop.zig").TorrentId, addr: std.net.Address) bool {
+    const tc = self.getTorrentContext(torrent_id) orelse return false;
+    for (tc.peer_slots.items) |slot| {
         const p = &self.peers[slot];
         if (p.state == .free) continue;
-        if (p.torrent_id != torrent_id) continue;
         // Compare address family, IP, and port
         if (addressesEqual(p.address, addr)) return true;
     }

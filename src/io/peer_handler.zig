@@ -442,6 +442,7 @@ pub fn handleRecv(self: *EventLoop, slot: u16, cqe: linux.io_uring_cqe) void {
                 return;
             };
             peer.torrent_id = resp_tid;
+            self.attachPeerToTorrent(resp_tid, slot);
             // Store remote peer ID for client identification
             @memcpy(&peer.remote_peer_id, peer.handshake_buf[48..68]);
             peer.has_peer_id = true;
@@ -625,6 +626,7 @@ fn executeMseAction(self: *EventLoop, slot: u16, action: mse.MseAction, is_initi
                     if (mr.matchedInfoHash()) |hash| {
                         if (self.findTorrentIdByInfoHash(&hash)) |tid| {
                             peer.torrent_id = tid;
+                            self.attachPeerToTorrent(tid, slot);
                         }
                     }
                     self.allocator.destroy(mr);
