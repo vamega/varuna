@@ -9,3 +9,4 @@
 /vendor/sqlite/sqlite3.h
 *.deb
 .claude/worktrees/
+.codex/worktrees/
