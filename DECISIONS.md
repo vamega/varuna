@@ -83,6 +83,28 @@ Validation:
 
 Follow-up triggers:
 - If piece-buffer allocation still shows up in profiles after this fix, the next step is a real `PieceBuffer` wrapper pool on top of the reusable cache so wrapper objects and common-sized backing buffers both get reused.
+
+### 2026-04-02: Remove Explicit MAP_HUGETLB From The Piece Cache
+
+Context:
+The piece cache is useful, but explicit `MAP_HUGETLB` support made the feature look like it required system-wide huge-page provisioning. That is unnecessary operational complexity for this daemon, especially when the main benefit we want is simply giving the kernel a good transparent-huge-page candidate for large, reusable piece buffers.
+
+Decision:
+- Remove the explicit `MAP_HUGETLB` mapping path from `HugePageCache`.
+- Keep the mmap-backed piece cache and optionally apply `madvise(MADV_HUGEPAGE)` to that mapping.
+- Preserve the existing config shape for compatibility, but redefine `performance.use_huge_pages` as a transparent-huge-page hint toggle rather than explicit huge-page allocation.
+- Keep the existing API preference field wired to whether the huge-page hint is enabled, not to explicit huge-page provisioning.
+
+Reasoning:
+- Users should not have to pre-allocate huge pages or tune `vm.nr_hugepages` just to benefit from the piece cache.
+- The piece cache still benefits from stable mmap-backed storage, and `MADV_HUGEPAGE` is the right low-friction hint for that region.
+- This keeps the cache reusable and simple while removing a misleading feature distinction between explicit huge pages and transparent huge pages.
+
+Validation:
+- `mise exec -- zig build test` passes.
+
+Follow-up triggers:
+- If we later decide the piece cache should always be enabled when `piece_cache_size` is set, remove the remaining `use_huge_pages` naming ambiguity entirely instead of carrying the compatibility flag forever.
 - If the free-range metadata itself becomes hot, replace the generic range list with size-class free lists tuned for common piece sizes.
 
 ### 2026-04-01: Eliminate Steady-State API Header Allocs And Reuse Upload Buffers Per Slot

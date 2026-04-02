@@ -1641,7 +1641,7 @@ pub const EventLoop = struct {
 
     /// Configure the huge page piece cache. Call after init, before tick.
     /// `capacity` is the desired cache size in bytes (0 = default 64 MB).
-    /// `use_huge_pages` controls whether MAP_HUGETLB is attempted.
+    /// `use_huge_pages` controls whether MADV_HUGEPAGE is requested.
     pub fn initHugePageCache(self: *EventLoop, capacity: u64, use_huge_pages: bool) void {
         const default_cache_size: usize = 64 * 1024 * 1024; // 64 MB
         const size: usize = if (capacity > 0) @intCast(@min(capacity, 1 << 32)) else default_cache_size;
@@ -1649,7 +1649,7 @@ pub const EventLoop = struct {
         if (self.huge_page_cache.?.isAllocated()) {
             log.info("piece cache: {d} MB ({s})", .{
                 self.huge_page_cache.?.capacity / (1024 * 1024),
-                if (self.huge_page_cache.?.using_huge_pages) "huge pages" else "regular pages",
+                if (self.huge_page_cache.?.huge_page_hint_enabled) "MADV_HUGEPAGE hint" else "regular pages",
             });
         }
     }

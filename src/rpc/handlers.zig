@@ -511,7 +511,7 @@ pub const ApiHandler = struct {
 
         const has_hpc = if (el) |e| e.huge_page_cache != null else false;
         const hpc_allocated = if (el) |e| (if (e.huge_page_cache) |*hpc| hpc.isAllocated() else false) else false;
-        const hpc_using_huge = if (el) |e| (if (e.huge_page_cache) |hpc| hpc.using_huge_pages else false) else false;
+        const hpc_huge_page_hint = if (el) |e| (if (e.huge_page_cache) |hpc| hpc.huge_page_hint_enabled else false) else false;
 
         // Build banned_IPs string for preferences
         const banned_ips_str: []const u8 = if (sm.ban_list) |bl|
@@ -565,7 +565,7 @@ pub const ApiHandler = struct {
             enc_mode,
             @as(u8, if (has_hpc) 1 else 0),
             @as(u8, if (hpc_allocated) 1 else 0),
-            @as(u8, if (hpc_using_huge) 1 else 0),
+            @as(u8, if (hpc_huge_page_hint) 1 else 0),
             esc(banned_ips_str),
         }) catch
             return .{ .status = 500, .body = "{\"error\":\"internal\"}" };

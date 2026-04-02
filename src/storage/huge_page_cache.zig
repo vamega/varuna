@@ -2,90 +2,70 @@ const std = @import("std");
 const posix = std.posix;
 const linux = std.os.linux;
 
-/// A piece cache buffer pool backed by huge pages (2MB TLB entries) when
-/// available. Falls back gracefully to regular mmap if huge pages are not
-/// configured on the system.
-///
-/// Huge pages reduce TLB pressure for large torrents where the piece cache
-/// may be tens or hundreds of megabytes. This is especially beneficial on
-/// systems with many simultaneous torrents.
+/// A piece cache buffer pool backed by anonymous mmap. When requested, the
+/// mapping is hinted with MADV_HUGEPAGE so the kernel can promote it to
+/// transparent huge pages without requiring explicit MAP_HUGETLB setup.
 pub const HugePageCache = struct {
     const Range = struct {
         offset: usize,
         len: usize,
     };
 
+    const MmapAllocation = struct {
+        buffer: []align(std.heap.page_size_min) u8,
+        huge_page_hint_enabled: bool,
+    };
+
     allocator: std.mem.Allocator,
     buffer: []align(std.heap.page_size_min) u8,
     capacity: usize,
     used: usize = 0,
-    using_huge_pages: bool,
+    huge_page_hint_enabled: bool,
     free_ranges: std.ArrayListUnmanaged(Range) = .empty,
-
-    /// Minimum allocation size when huge pages are requested (2MB).
-    const huge_page_size: usize = 2 * 1024 * 1024;
 
     /// Initialize a piece cache buffer pool.
     ///
-    /// `capacity` is the desired size in bytes. When `use_huge_pages` is true,
-    /// the allocator tries MAP_HUGETLB first, then falls back to regular mmap
-    /// with MADV_HUGEPAGE hints (transparent huge pages).
+    /// `capacity` is the desired size in bytes. When `use_huge_page_hint` is
+    /// true, the allocator applies MADV_HUGEPAGE to the mmap-backed region.
     ///
     /// If capacity is 0, no allocation is performed and the cache is a no-op.
-    pub fn init(allocator: std.mem.Allocator, capacity: usize, use_huge_pages: bool) HugePageCache {
+    pub fn init(allocator: std.mem.Allocator, capacity: usize, use_huge_page_hint: bool) HugePageCache {
         if (capacity == 0) {
             return .{
                 .allocator = allocator,
                 .buffer = &.{},
                 .capacity = 0,
-                .using_huge_pages = false,
+                .huge_page_hint_enabled = false,
             };
         }
 
-        // Round up to huge page boundary when using huge pages
-        const alloc_size = if (use_huge_pages)
-            alignToHugePage(capacity)
-        else
-            std.mem.alignForward(usize, capacity, std.heap.page_size_min);
+        const alloc_size = std.mem.alignForward(usize, capacity, std.heap.page_size_min);
 
-        if (use_huge_pages) {
-            // Try explicit huge pages first (MAP_HUGETLB)
-            if (mmapHugePages(alloc_size)) |buf| {
+        if (use_huge_page_hint) {
+            if (mmapWithHugePageHint(alloc_size)) |mapping| {
                 return .{
                     .allocator = allocator,
-                    .buffer = buf,
+                    .buffer = mapping.buffer,
                     .capacity = alloc_size,
-                    .using_huge_pages = true,
-                };
-            }
-
-            // Fall back to regular mmap + MADV_HUGEPAGE (transparent huge pages)
-            if (mmapWithHugePageHint(alloc_size)) |buf| {
-                return .{
-                    .allocator = allocator,
-                    .buffer = buf,
-                    .capacity = alloc_size,
-                    .using_huge_pages = false, // THP, not explicit
+                    .huge_page_hint_enabled = mapping.huge_page_hint_enabled,
                 };
             }
         }
 
-        // Final fallback: regular mmap
         if (mmapRegular(alloc_size)) |buf| {
             return .{
                 .allocator = allocator,
                 .buffer = buf,
                 .capacity = alloc_size,
-                .using_huge_pages = false,
+                .huge_page_hint_enabled = false,
             };
         }
 
-        // All mmap attempts failed
         return .{
             .allocator = allocator,
             .buffer = &.{},
             .capacity = 0,
-            .using_huge_pages = false,
+            .huge_page_hint_enabled = false,
         };
     }
 
@@ -202,24 +182,13 @@ pub const HugePageCache = struct {
         }
     }
 
-    fn alignToHugePage(size: usize) usize {
-        return std.mem.alignForward(usize, size, huge_page_size);
-    }
-
-    fn mmapHugePages(size: usize) ?[]align(std.heap.page_size_min) u8 {
-        const flags: linux.MAP = .{
-            .TYPE = .PRIVATE,
-            .ANONYMOUS = true,
-            .HUGETLB = true,
-        };
-        return doMmap(size, flags);
-    }
-
-    fn mmapWithHugePageHint(size: usize) ?[]align(std.heap.page_size_min) u8 {
+    fn mmapWithHugePageHint(size: usize) ?MmapAllocation {
         const buf = mmapRegular(size) orelse return null;
-        // Hint the kernel to use transparent huge pages
-        posix.madvise(buf.ptr, buf.len, linux.MADV.HUGEPAGE) catch {};
-        return buf;
+        const hint_enabled = if (posix.madvise(buf.ptr, buf.len, linux.MADV.HUGEPAGE)) |_| true else |_| false;
+        return .{
+            .buffer = buf,
+            .huge_page_hint_enabled = hint_enabled,
+        };
     }
 
     fn mmapRegular(size: usize) ?[]align(std.heap.page_size_min) u8 {
@@ -258,14 +227,12 @@ test "huge page cache init with zero capacity is no-op" {
 }
 
 test "huge page cache fallback to regular mmap" {
-    // Huge pages are unlikely to be configured in a test environment,
-    // so this should fall back to regular mmap.
     var cache = HugePageCache.init(std.testing.allocator, 64 * 1024, false);
     if (!cache.isAllocated()) return; // mmap failed (shouldn't happen)
     defer cache.deinit();
 
     try std.testing.expect(cache.capacity >= 64 * 1024);
-    try std.testing.expect(!cache.using_huge_pages);
+    try std.testing.expect(!cache.huge_page_hint_enabled);
 }
 
 test "huge page cache alloc and reset" {
@@ -297,9 +264,7 @@ test "huge page cache exhaustion returns null" {
     try std.testing.expect(buf == null);
 }
 
-test "huge page cache with huge pages flag" {
-    // This may or may not succeed depending on system configuration.
-    // The key test is that it doesn't crash and falls back gracefully.
+test "huge page cache with huge page hint flag" {
     var cache = HugePageCache.init(std.testing.allocator, 4 * 1024 * 1024, true);
     if (!cache.isAllocated()) return;
     defer cache.deinit();
