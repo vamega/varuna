@@ -97,13 +97,14 @@ Update it whenever a milestone lands, the near-term backlog changes, or a new op
 - IORING_OP_CLOSE for hot-path fd cleanup in RPC server.
 - Session use-after-free fix: RPC handlers copy data under mutex instead of holding raw session pointers.
 - Shared event loop lifetime hardening: pause/stop/resume now detach torrents from the shared EventLoop before freeing runtime state, and resume preserves daemon/shared-loop integration.
-- Tracker background-worker hardening: session teardown now waits for both announce and scrape workers, and announce/scrape serialize access to the shared announce ring.
+- Tracker executor consolidation: daemon torrent sessions now use only the shared tracker executor for announces and scrapes; the old per-session tracker ring/DNS fallback path is gone.
 - Hasher OOM resilience: free piece buffer and log on result append failure.
 - JSON injection prevention: escape helper for all user-provided strings in API responses.
 - Partial send buffer matching: monotonic send_id in CQE context to match correct in-flight buffer.
 - RPC server partial-send handling: API responses now track send progress until the full body is written.
 - Seed/read-path correctness: queued seed responses own exact block copies, async seed reads use unique IDs, and only successfully submitted reads/writes contribute to pending completion counts.
-- **Piece cache with transparent huge-page hinting**: optional reusable mmap-backed buffer pool for seed piece reads. When enabled, it can apply `madvise(MADV_HUGEPAGE)` without requiring explicit huge-page provisioning. Freed pooled slices are returned to the cache and merged for reuse. Config: `performance.use_huge_pages`, `performance.piece_cache_size`.
+- **Piece cache with transparent huge-page hinting**: reusable mmap-backed buffer pool for seed piece reads. It applies `madvise(MADV_HUGEPAGE)` without requiring explicit huge-page provisioning. Freed pooled slices are returned to the cache and merged for reuse. Config: `performance.piece_cache_size` (`0` = default `64 MiB`).
+- **TorrentSession cleanup**: removed the old standalone/per-session network path, `getStats()` is now side-effect free, and `SessionManager` deduplicates torrent/magnet session registration.
 - **Synthetic memory baseline harness**: `varuna-perf` with allocator-counting scenarios for peer scans, request batching, seed batching, extension parsing, session loading, and `/sync/maindata`. Supports stable before/after comparisons without a live swarm.
 - **Piece buffer pool**: `EventLoop` now reuses `PieceBuffer` wrappers and retains common heap-backed piece sizes behind a bounded pool instead of reallocating them on every seed-read cycle.
 - **Vectored send-state pool**: plaintext seed uploads now reuse packed `sendmsg` state blocks by batch capacity instead of allocating one aligned block per batch.

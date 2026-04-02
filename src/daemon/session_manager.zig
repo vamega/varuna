@@ -137,39 +137,8 @@ pub const SessionManager = struct {
         session.* = try TorrentSession.create(self.allocator, torrent_bytes, save_path, self.masquerade_as);
         errdefer session.deinit();
 
-        session.port = self.port;
-        session.max_peers = self.max_peers;
-        session.hasher_threads = self.hasher_threads;
-        session.resume_db_path = self.resume_db_path;
-        session.tracker_executor = try self.ensureTrackerExecutor();
-
-        self.mutex.lock();
-        defer self.mutex.unlock();
-
-        // Check for duplicate -- use pointer to session's stable memory
-        if (self.sessions.get(&session.info_hash_hex)) |_| {
-            session.deinit();
-            self.allocator.destroy(session);
-            return error.TorrentAlreadyExists;
-        }
-
-        try self.sessions.put(&session.info_hash_hex, session);
-
-        // Add to queue (bottom)
-        _ = self.queue_manager.addTorrent(session.info_hash_hex) catch 0;
-
-        // Auto-start or queue based on limits
-        if (self.queue_manager.config.enabled and
-            !self.queue_manager.shouldBeActive(session.info_hash_hex, &self.sessions))
-        {
-            session.state = .queued;
-        } else {
-            session.startWithEventLoop(self.shared_event_loop);
-        }
-
-        self.persistQueuePositions();
-
-        return session;
+        try self.configureManagedSession(session);
+        return try self.registerSession(session);
     }
 
     /// Add a torrent from a magnet URI (BEP 9).
@@ -185,38 +154,39 @@ pub const SessionManager = struct {
         session.* = try TorrentSession.createFromMagnet(self.allocator, magnet_uri, save_path, self.masquerade_as);
         errdefer session.deinit();
 
+        try self.configureManagedSession(session);
+        return try self.registerSession(session);
+    }
+
+    fn configureManagedSession(self: *SessionManager, session: *TorrentSession) !void {
         session.port = self.port;
         session.max_peers = self.max_peers;
         session.hasher_threads = self.hasher_threads;
         session.resume_db_path = self.resume_db_path;
+        session.shared_event_loop = self.shared_event_loop orelse return error.SharedEventLoopNotConfigured;
         session.tracker_executor = try self.ensureTrackerExecutor();
+    }
 
+    fn registerSession(self: *SessionManager, session: *TorrentSession) !*TorrentSession {
         self.mutex.lock();
         defer self.mutex.unlock();
 
-        // Check for duplicate
         if (self.sessions.get(&session.info_hash_hex)) |_| {
-            session.deinit();
-            self.allocator.destroy(session);
             return error.TorrentAlreadyExists;
         }
 
         try self.sessions.put(&session.info_hash_hex, session);
-
-        // Add to queue (bottom)
         _ = self.queue_manager.addTorrent(session.info_hash_hex) catch 0;
 
-        // Auto-start or queue based on limits
         if (self.queue_manager.config.enabled and
             !self.queue_manager.shouldBeActive(session.info_hash_hex, &self.sessions))
         {
             session.state = .queued;
         } else {
-            session.startWithEventLoop(self.shared_event_loop);
+            session.start();
         }
 
-        self.persistQueuePositions();
-
+        self.persistQueuePositionsLocked();
         return session;
     }
 
@@ -633,7 +603,7 @@ pub const SessionManager = struct {
         defer self.mutex.unlock();
 
         const session = self.sessions.get(hash) orelse return error.TorrentNotFound;
-        try session.scheduleCompletedAnnounce();
+        try session.scheduleReannounce();
     }
 
     fn ensureTrackerExecutor(self: *SessionManager) !*TrackerExecutor {
@@ -652,7 +622,7 @@ pub const SessionManager = struct {
         // Stop the session (joins threads, frees runtime state)
         session.stop();
         // Restart it (will recheck from disk)
-        session.startWithEventLoop(self.shared_event_loop);
+        session.start();
     }
 
     // ── Queue management ─────────────────────────────────
@@ -1129,8 +1099,6 @@ pub const SessionManager = struct {
                 diag.peers_connected = el.peerCountForTorrent(tid);
                 diag.peers_half_open = el.halfOpenCount();
             }
-        } else if (session.event_loop) |*el| {
-            diag.peers_connected = el.peer_count;
         }
 
         // Get per-torrent connection stats from the session
@@ -1523,9 +1491,8 @@ pub const SessionManager = struct {
 
         const session = self.sessions.get(hash) orelse return error.TorrentNotFound;
         // Get the event loop and torrent ID
-        const el: *EventLoop = session.shared_event_loop orelse
-            (if (session.event_loop) |*solo| solo else return try allocator.alloc(PeerInfo, 0));
-        const tid: @import("../io/event_loop.zig").TorrentId = session.torrent_id_in_shared orelse 0;
+        const el = session.shared_event_loop orelse return try allocator.alloc(PeerInfo, 0);
+        const tid = session.torrent_id_in_shared orelse return try allocator.alloc(PeerInfo, 0);
 
         var result = std.ArrayList(PeerInfo).empty;
         errdefer {

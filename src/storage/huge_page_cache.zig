@@ -25,11 +25,11 @@ pub const HugePageCache = struct {
 
     /// Initialize a piece cache buffer pool.
     ///
-    /// `capacity` is the desired size in bytes. When `use_huge_page_hint` is
-    /// true, the allocator applies MADV_HUGEPAGE to the mmap-backed region.
+    /// `capacity` is the desired size in bytes.
+    /// The allocator always tries MADV_HUGEPAGE on the mmap-backed region.
     ///
     /// If capacity is 0, no allocation is performed and the cache is a no-op.
-    pub fn init(allocator: std.mem.Allocator, capacity: usize, use_huge_page_hint: bool) HugePageCache {
+    pub fn init(allocator: std.mem.Allocator, capacity: usize) HugePageCache {
         if (capacity == 0) {
             return .{
                 .allocator = allocator,
@@ -41,15 +41,13 @@ pub const HugePageCache = struct {
 
         const alloc_size = std.mem.alignForward(usize, capacity, std.heap.page_size_min);
 
-        if (use_huge_page_hint) {
-            if (mmapWithHugePageHint(alloc_size)) |mapping| {
-                return .{
-                    .allocator = allocator,
-                    .buffer = mapping.buffer,
-                    .capacity = alloc_size,
-                    .huge_page_hint_enabled = mapping.huge_page_hint_enabled,
-                };
-            }
+        if (mmapWithHugePageHint(alloc_size)) |mapping| {
+            return .{
+                .allocator = allocator,
+                .buffer = mapping.buffer,
+                .capacity = alloc_size,
+                .huge_page_hint_enabled = mapping.huge_page_hint_enabled,
+            };
         }
 
         if (mmapRegular(alloc_size)) |buf| {
@@ -219,7 +217,7 @@ pub const HugePageCache = struct {
 // ── Tests ────────────────────────────────────────────────
 
 test "huge page cache init with zero capacity is no-op" {
-    var cache = HugePageCache.init(std.testing.allocator, 0, true);
+    var cache = HugePageCache.init(std.testing.allocator, 0);
     try std.testing.expect(!cache.isAllocated());
     try std.testing.expectEqual(@as(usize, 0), cache.capacity);
     // deinit on zero-capacity is safe
@@ -227,16 +225,15 @@ test "huge page cache init with zero capacity is no-op" {
 }
 
 test "huge page cache fallback to regular mmap" {
-    var cache = HugePageCache.init(std.testing.allocator, 64 * 1024, false);
+    var cache = HugePageCache.init(std.testing.allocator, 64 * 1024);
     if (!cache.isAllocated()) return; // mmap failed (shouldn't happen)
     defer cache.deinit();
 
     try std.testing.expect(cache.capacity >= 64 * 1024);
-    try std.testing.expect(!cache.huge_page_hint_enabled);
 }
 
 test "huge page cache alloc and reset" {
-    var cache = HugePageCache.init(std.testing.allocator, 4096, false);
+    var cache = HugePageCache.init(std.testing.allocator, 4096);
     if (!cache.isAllocated()) return;
     defer cache.deinit();
 
@@ -255,7 +252,7 @@ test "huge page cache alloc and reset" {
 }
 
 test "huge page cache exhaustion returns null" {
-    var cache = HugePageCache.init(std.testing.allocator, 4096, false);
+    var cache = HugePageCache.init(std.testing.allocator, 4096);
     if (!cache.isAllocated()) return;
     defer cache.deinit();
 
@@ -265,7 +262,7 @@ test "huge page cache exhaustion returns null" {
 }
 
 test "huge page cache with huge page hint flag" {
-    var cache = HugePageCache.init(std.testing.allocator, 4 * 1024 * 1024, true);
+    var cache = HugePageCache.init(std.testing.allocator, 4 * 1024 * 1024);
     if (!cache.isAllocated()) return;
     defer cache.deinit();
 
@@ -276,7 +273,7 @@ test "huge page cache with huge page hint flag" {
 }
 
 test "huge page cache reuses freed ranges" {
-    var cache = HugePageCache.init(std.testing.allocator, 4096, false);
+    var cache = HugePageCache.init(std.testing.allocator, 4096);
     if (!cache.isAllocated()) return;
     defer cache.deinit();
 
@@ -294,7 +291,7 @@ test "huge page cache reuses freed ranges" {
 }
 
 test "huge page cache merges adjacent freed ranges" {
-    var cache = HugePageCache.init(std.testing.allocator, 4096, false);
+    var cache = HugePageCache.init(std.testing.allocator, 4096);
     if (!cache.isAllocated()) return;
     defer cache.deinit();
 

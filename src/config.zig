@@ -74,13 +74,8 @@ pub const Config = struct {
         hasher_threads: u32 = 4,
         pipeline_depth: u32 = 5,
         ring_entries: u16 = 256,
-        /// Piece cache size in bytes. 0 = use default (64 MB) when enabled.
+        /// Piece cache size in bytes. 0 = use default (64 MB).
         piece_cache_size: u64 = 0,
-        /// Request transparent huge pages via MADV_HUGEPAGE for the piece
-        /// cache. This does not require explicit MAP_HUGETLB provisioning.
-        /// When true and `piece_cache_size` is 0, enables the default 64 MB
-        /// piece cache.
-        use_huge_pages: bool = false,
     };
 };
 

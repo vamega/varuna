@@ -6,13 +6,77 @@ Use [STATUS.md](STATUS.md) for the running list of completed work, next work, an
 
 ## Active Constraints
 
-- Client ingestion supports `.torrent` files and magnet links (BEP 9). DHT, PEX, LSD are not in scope yet.
-- The currently verified tracker path is HTTP announce with compact peer lists.
-- The current peer strategy is one active peer at a time, sequential piece download, and a single inbound seed connection.
-- Seeder behavior is minimal: announce as complete, accept one inbound peer, serve requests sequentially, and exit after that peer disconnects.
-- Pieces are SHA-1 verified before being committed to disk.
+- Client ingestion supports `.torrent` files and magnet links (BEP 9).
+- DHT, PEX, LSD, uTP, and MSE are in scope for the daemon.
+- The primary runtime is a Linux daemon with a shared `io_uring` event loop and a qBittorrent-compatible WebAPI.
+- Hot-path daemon I/O stays on `io_uring`; blocking SQLite work remains off the event-loop thread.
+- Private-tracker correctness and compatibility still take priority over feature breadth.
 
 ## Decision Entries
+
+### 2026-04-02: Simplify TorrentSession To The Daemon Runtime Path
+
+Context:
+`TorrentSession` had accumulated both the current daemon runtime path and an older standalone/per-session network path. That left the type carrying nullable fields for a local event loop, per-session tracker ring/DNS fallback, and duplicated startup branches even though in-repo daemon construction always wires sessions to the shared event loop and shared tracker executor.
+
+Decision:
+- Remove the standalone `TorrentSession` startup path and keep only the daemon/shared-event-loop path.
+- Remove the per-session tracker fallback machinery (`announce_ring`, per-session DNS resolver, detached announce/scrape worker threads).
+- Keep tracker work on the shared `TrackerExecutor` only.
+- Deduplicate `SessionManager.addTorrent()` and `addMagnet()` through shared session-configuration and registration helpers.
+- Make `forceReannounce()` use a regular re-announce job instead of routing through the completed-announce path.
+
+Reasoning:
+- Carrying two runtime architectures inside `TorrentSession` obscured ownership, duplicated startup logic, and kept old fallback branches alive in the main daemon type.
+- The shared tracker executor is now the production path, so keeping per-session tracker I/O code around was maintenance baggage, not resilience.
+- The `addTorrent()`/`addMagnet()` duplication was straightforward setup duplication and not an intentional behavioral split.
+
+Validation:
+- `mise exec -- zig build test` passes.
+
+Follow-up triggers:
+- If an out-of-repo embedding mode genuinely still needs standalone session startup, it should live in a separate type instead of reintroducing daemon-only branches into `TorrentSession`.
+
+### 2026-04-02: Keep Torrent Stats Reads Side-Effect Free
+
+Context:
+`TorrentSession.getStats()` was mutating `state` and `completion_on` when piece completion was observed. That let API polling change torrent state without running the rest of the real completion-transition work such as seed setup and tracker announce scheduling.
+
+Decision:
+- Make `getStats()` compute an effective reported state without mutating session state.
+- Keep completion-state mutation in `checkSeedTransition()`, which remains the main-thread transition point.
+- Add regression coverage for “stats reads do not mutate” and “checkSeedTransition is the mutation point.”
+
+Reasoning:
+- Read paths should not carry hidden state transitions.
+- The download-to-seed transition has real side effects, so it needs one canonical mutating path.
+
+Validation:
+- `mise exec -- zig build test` passes.
+
+Follow-up triggers:
+- If more session state starts being derived on read, split the stats snapshot logic into a dedicated immutable snapshot helper instead of reintroducing mutation into accessors.
+
+### 2026-04-02: Remove The Piece-Cache Huge-Page Toggle And Extra Preference Fields
+
+Context:
+After removing `MAP_HUGETLB`, the `performance.use_huge_pages` config option and the extra `piece_cache_allocated` / `piece_cache_huge_pages` preference fields no longer reflected a meaningful user-facing choice. They were just leftover compatibility baggage around an mmap-backed cache that now always tries `MADV_HUGEPAGE`.
+
+Decision:
+- Remove `performance.use_huge_pages` and always initialize the piece cache from `performance.piece_cache_size` (`0` = default `64 MiB`).
+- Keep `MADV_HUGEPAGE` as the internal hinting behavior for the cache mapping.
+- Remove `piece_cache_allocated` and `piece_cache_huge_pages` from `GET /api/v2/app/preferences`.
+- Keep only `piece_cache_enabled` in the preferences response, keyed to whether the cache mapping is actually allocated.
+
+Reasoning:
+- There is no longer a meaningful explicit-huge-page mode to configure.
+- The two extra preference fields are Varuna-specific metrics, not qBittorrent-compatible preference data.
+
+Validation:
+- `mise exec -- zig build test` passes.
+
+Follow-up triggers:
+- If the remaining piece-cache status should be exposed, move it to a dedicated metrics or diagnostics endpoint instead of expanding `app/preferences` with more runtime fields.
 
 ### 2026-04-01: Pool Plaintext `sendmsg` State Blocks By Batch Capacity
 

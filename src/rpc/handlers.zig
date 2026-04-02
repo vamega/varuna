@@ -509,9 +509,10 @@ pub const ApiHandler = struct {
             .disabled => 2,
         } else 0;
 
-        const has_hpc = if (el) |e| e.huge_page_cache != null else false;
-        const hpc_allocated = if (el) |e| (if (e.huge_page_cache) |*hpc| hpc.isAllocated() else false) else false;
-        const hpc_huge_page_hint = if (el) |e| (if (e.huge_page_cache) |hpc| hpc.huge_page_hint_enabled else false) else false;
+        const piece_cache_enabled = if (el) |e|
+            (if (e.huge_page_cache) |*hpc| hpc.isAllocated() else false)
+        else
+            false;
 
         // Build banned_IPs string for preferences
         const banned_ips_str: []const u8 = if (sm.ban_list) |bl|
@@ -546,7 +547,7 @@ pub const ApiHandler = struct {
             \\"auto_tmm_enabled":false,"save_resume_data_interval":60,
             \\"start_paused_enabled":false,
             \\"dht":false,"pex":false,"lsd":false,"encryption":{},"anonymous_mode":false,
-            \\"piece_cache_enabled":{},"piece_cache_allocated":{},"piece_cache_huge_pages":{},
+            \\"piece_cache_enabled":{},
             \\"ip_filter_enabled":false,"ip_filter_path":"","ip_filter_trackers":false,
             \\"banned_IPs":"{f}"}}
         , .{
@@ -563,9 +564,7 @@ pub const ApiHandler = struct {
             @as([]const u8, if (sm.max_seeding_time_enabled) "true" else "false"),
             sm.max_seeding_time,
             enc_mode,
-            @as(u8, if (has_hpc) 1 else 0),
-            @as(u8, if (hpc_allocated) 1 else 0),
-            @as(u8, if (hpc_huge_page_hint) 1 else 0),
+            @as(u8, if (piece_cache_enabled) 1 else 0),
             esc(banned_ips_str),
         }) catch
             return .{ .status = 500, .body = "{\"error\":\"internal\"}" };

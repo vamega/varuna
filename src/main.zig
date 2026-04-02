@@ -81,11 +81,8 @@ pub fn main() !void {
     if (cfg.network.dl_limit > 0) shared_el.setGlobalDlLimit(cfg.network.dl_limit);
     if (cfg.network.ul_limit > 0) shared_el.setGlobalUlLimit(cfg.network.ul_limit);
 
-    // Initialize the piece cache if configured. The `use_huge_pages` toggle
-    // now only requests MADV_HUGEPAGE on the mmap-backed cache.
-    if (cfg.performance.use_huge_pages or cfg.performance.piece_cache_size > 0) {
-        shared_el.initHugePageCache(cfg.performance.piece_cache_size, cfg.performance.use_huge_pages);
-    }
+    // Initialize the reusable piece cache. A zero size means the default 64 MB.
+    shared_el.initHugePageCache(cfg.performance.piece_cache_size);
 
     // Session manager
     var session_manager = varuna.daemon.session_manager.SessionManager.init(allocator);
