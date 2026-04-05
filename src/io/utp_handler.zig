@@ -23,13 +23,14 @@ pub fn submitUtpRecv(self: *EventLoop) !void {
         .len = self.utp_recv_buf.len,
     };
 
-    // Initialize the source address storage
-    self.utp_recv_addr = std.mem.zeroes(posix.sockaddr);
+    // Initialize the source address storage (large enough for IPv4 and IPv6).
+    self.utp_recv_addr = std.mem.zeroes(std.net.Address);
 
-    // Set up msghdr
+    // Set up msghdr. namelen is set to the full storage size so the kernel
+    // can write an IPv6 sockaddr_in6 if needed; it updates namelen on return.
     self.utp_recv_msg = .{
-        .name = &self.utp_recv_addr,
-        .namelen = @sizeOf(posix.sockaddr),
+        .name = @ptrCast(&self.utp_recv_addr),
+        .namelen = @sizeOf(std.net.Address),
         .iov = &self.utp_recv_iov,
         .iovlen = 1,
         .control = null,
@@ -56,13 +57,15 @@ pub fn submitUtpSend(self: *EventLoop, data: []const u8, remote: std.net.Address
         .len = len,
     };
 
-    // Set up destination address
-    self.utp_send_addr = remote.any;
+    // Set up destination address. If the UDP socket is AF.INET6 (dual-stack)
+    // and the remote is an IPv4 address, convert to IPv4-mapped IPv6 so the
+    // kernel can route it correctly.
+    self.utp_send_addr = toSendAddr(remote);
 
     // Set up msghdr_const
     self.utp_send_msg = .{
         .name = @ptrCast(&self.utp_send_addr),
-        .namelen = remote.getOsSockLen(),
+        .namelen = self.utp_send_addr.getOsSockLen(),
         .iov = @ptrCast(&self.utp_send_iov),
         .iovlen = 1,
         .control = null,
@@ -124,8 +127,11 @@ pub fn handleUtpRecv(self: *EventLoop, cqe: linux.io_uring_cqe) void {
 
     const data = self.utp_recv_buf[0..datagram_len];
 
-    // Reconstruct the remote address from the msghdr
-    const remote = std.net.Address{ .any = self.utp_recv_addr };
+    // The remote address was written into utp_recv_addr by the kernel.
+    // On a dual-stack IPv6 socket, IPv4 peers arrive as IPv4-mapped IPv6
+    // addresses (::ffff:x.x.x.x, AF.INET6). Normalize these back to AF.INET
+    // so DHT and uTP code can treat them uniformly.
+    const remote = normalizeMappedAddr(self.utp_recv_addr);
 
     // Demux DHT vs uTP: bencode dicts start with 'd' (0x64), uTP starts with version nibble 0x01
     if (data[0] == 'd') {
@@ -653,4 +659,37 @@ pub fn utpTick(self: *EventLoop) void {
 pub fn utpNowUs() u32 {
     const ts = std.time.microTimestamp();
     return @truncate(@as(u64, @intCast(ts)));
+}
+
+/// Normalize an IPv4-mapped IPv6 address (::ffff:x.x.x.x) to a plain IPv4
+/// address. On a dual-stack IPv6 socket, incoming IPv4 datagrams have family
+/// AF.INET6 with the first 10 bytes zero and bytes 10-11 = 0xffff. Return the
+/// address unchanged for native IPv6 or native IPv4 addresses.
+fn normalizeMappedAddr(addr: std.net.Address) std.net.Address {
+    if (addr.any.family != std.posix.AF.INET6) return addr;
+    const bytes = &addr.in6.sa.addr;
+    // IPv4-mapped prefix: 10 zero bytes + 0xff 0xff
+    const mapped_prefix = [_]u8{ 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0xff, 0xff };
+    if (!std.mem.eql(u8, bytes[0..12], &mapped_prefix)) return addr;
+    // Bytes 12-15 are the IPv4 address (network byte order)
+    const ipv4: [4]u8 = bytes[12..16].*;
+    const port = addr.in6.getPort();
+    return std.net.Address.initIp4(ipv4, port);
+}
+
+/// Convert an address for sending on a dual-stack IPv6 socket.
+/// If the destination is an IPv4 address, convert it to an IPv4-mapped
+/// IPv6 address (::ffff:x.x.x.x) so sendmsg works on the AF.INET6 socket.
+fn toSendAddr(addr: std.net.Address) std.net.Address {
+    if (addr.any.family != std.posix.AF.INET) return addr;
+    // Build ::ffff:x.x.x.x from the IPv4 address bytes.
+    const ip4: [4]u8 = @bitCast(addr.in.sa.addr);
+    var ip6: [16]u8 = std.mem.zeroes([16]u8);
+    ip6[10] = 0xff;
+    ip6[11] = 0xff;
+    ip6[12] = ip4[0];
+    ip6[13] = ip4[1];
+    ip6[14] = ip4[2];
+    ip6[15] = ip4[3];
+    return std.net.Address.initIp6(ip6, addr.getPort(), 0, 0);
 }

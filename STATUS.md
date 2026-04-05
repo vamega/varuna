@@ -140,6 +140,10 @@ Update it whenever a milestone lands, the near-term backlog changes, or a new op
 - DHT engine (`src/dht/dht.zig`): main coordinator tying routing table, KRPC, lookups, tokens, and bootstrap together. Responds to incoming queries (ping, find_node, get_peers, announce_peer). Drives iterative lookups. Sends announce_peer after get_peers completes. Outbound packet queue for event loop integration.
 - SQLite persistence (`src/dht/persistence.zig`): dht_config and dht_nodes tables. Saves/loads node ID and up to 300 routing table nodes. Runs on background thread.
 - Event loop integration (`src/io/dht_handler.zig`): DHT/uTP demux by first byte ('d' for KRPC, else uTP). DHT tick in event loop. Outbound packets sent via shared UDP socket. Discovered peers fed into existing peer connection pipeline via addPeerForTorrent.
+- **DHT activation wiring** (`src/main.zig`): DhtEngine instantiated at startup, bootstrap nodes resolved, UDP socket started before event loop, `requestPeers()` called when torrents integrate, `announcePeer()` called on seed setup, event loop ticks when UDP socket is open.
+- **IPv4/IPv6 dual-stack UDP socket** (`src/io/event_loop.zig`): `startUtpListener()` now creates an AF.INET6 socket with `IPV6_V6ONLY=0`, applies `SO_BINDTODEVICE` from config, binds to `::`. Recv address buffer upgraded to `std.net.Address` (large enough for IPv6). IPv4-mapped addresses (`::ffff:x.x.x.x`) normalized on recv, converted back on send.
+- **BEP 32 KRPC**: `nodes6` and `values6` fields parsed in responses. `encodeCompactNode6`/`decodeCompactNode6` for 38-byte IPv6 compact node info. IPv6 peers parsed from `values6` (18-byte format).
+- **Disable-trackers mode**: `[network] disable_trackers = true` skips tracker announces for non-private torrents; relies on DHT/PEX. Tracker failure is now a warning (not fatal); DHT fills peers asynchronously.
 
 ### Testing
 - 19 peer wire protocol tests, 16 BEP 10 extension tests (including 6 BEP 21 upload_only tests), 15 PEX tests, 31 uTP/LEDBAT tests, 5 categories tests, 10 resume DB tests, 25 MSE/RC4 tests, 13 magnet URI tests, 13 ut_metadata tests, 12 metadata fetch resilience tests.
@@ -172,7 +176,7 @@ Update it whenever a milestone lands, the near-term backlog changes, or a new op
 - ~~**uTP outbound connections**~~: (DONE) outbound uTP connections, retransmission buffer, RTO retransmission.
 - ~~**PEX (BEP 11)**~~: (DONE) peer exchange via BEP 10 extensions, delta encoding, private torrent enforcement.
 - ~~**DHT (BEP 5)**~~: (DONE) trackerless peer discovery — Phases 1-3 (core protocol, active lookups, announce and persistence).
-- **DHT Phase 4**: rate limiting outbound queries, IPv6 support (BEP 32), fuzz tests for incoming KRPC messages.
+- ~~**DHT Phase 4 (partial)**~~: (DONE) IPv6 support (BEP 32 dual-stack socket, `nodes6`/`values6` parsing, IPv4-mapped address normalization). Remaining: rate limiting outbound queries, fuzz tests for incoming KRPC messages.
 - ~~**Magnet links (BEP 9)**~~: (DONE) metadata download via ut_metadata extension.
 - ~~**Magnet link resilience**~~: (DONE) multi-peer retry with per-peer/overall timeouts, DHT peer provider interface stub, metadata fetch progress reporting via Stats/API.
 - ~~**MSE encryption (BEP 6)**~~: (DONE) message stream encryption/obfuscation.

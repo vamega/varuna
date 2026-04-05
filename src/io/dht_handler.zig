@@ -88,5 +88,10 @@ fn drainDhtPeerResults(self: *EventLoop) void {
 }
 
 fn addressEql(a: std.net.Address, b: std.net.Address) bool {
-    return a.in.sa.addr == b.in.sa.addr and a.in.sa.port == b.in.sa.port;
+    if (a.any.family != b.any.family) return false;
+    return switch (a.any.family) {
+        std.posix.AF.INET => a.in.sa.addr == b.in.sa.addr and a.in.sa.port == b.in.sa.port,
+        std.posix.AF.INET6 => std.mem.eql(u8, &a.in6.sa.addr, &b.in6.sa.addr) and a.in6.sa.port == b.in6.sa.port,
+        else => false,
+    };
 }

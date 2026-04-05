@@ -267,11 +267,15 @@ pub const DhtEngine = struct {
         var closest_buf: [routing_table.K]NodeInfo = undefined;
         const count = self.table.findClosest(target, routing_table.K, &closest_buf);
 
-        // Encode compact nodes
+        // Encode compact IPv4 nodes (26 bytes each). Skip IPv6 nodes -- they would
+        // need the "nodes6" field (BEP 32) which requires a different encoder path.
         var nodes_buf: [routing_table.K * 26]u8 = undefined;
+        var nodes_len: usize = 0;
         for (0..count) |i| {
+            if (closest_buf[i].address.any.family != std.posix.AF.INET) continue;
             const compact = node_id.encodeCompactNode(closest_buf[i]);
-            @memcpy(nodes_buf[i * 26 ..][0..26], &compact);
+            @memcpy(nodes_buf[nodes_len..][0..26], &compact);
+            nodes_len += 26;
         }
 
         var buf: [1024]u8 = undefined;
@@ -279,7 +283,7 @@ pub const DhtEngine = struct {
             &buf,
             q.transaction_id,
             self.own_id,
-            nodes_buf[0 .. count * 26],
+            nodes_buf[0..nodes_len],
         ) catch return;
         self.queueSend(buf[0..len], sender);
     }
@@ -292,14 +296,18 @@ pub const DhtEngine = struct {
         const token = self.tokens.generateToken(&ip_bytes);
 
         // We don't store peer lists ourselves (we're not a tracker).
-        // Return closest nodes instead.
+        // Return closest IPv4 nodes instead (BEP 32 "nodes6" field would be
+        // needed for IPv6 nodes but requires a different encoder path).
         var closest_buf: [routing_table.K]NodeInfo = undefined;
         const count = self.table.findClosest(info_hash, routing_table.K, &closest_buf);
 
         var nodes_buf: [routing_table.K * 26]u8 = undefined;
+        var nodes_len: usize = 0;
         for (0..count) |i| {
+            if (closest_buf[i].address.any.family != std.posix.AF.INET) continue;
             const compact = node_id.encodeCompactNode(closest_buf[i]);
-            @memcpy(nodes_buf[i * 26 ..][0..26], &compact);
+            @memcpy(nodes_buf[nodes_len..][0..26], &compact);
+            nodes_len += 26;
         }
 
         var buf: [1024]u8 = undefined;
@@ -308,7 +316,7 @@ pub const DhtEngine = struct {
             q.transaction_id,
             self.own_id,
             &token,
-            nodes_buf[0 .. count * 26],
+            nodes_buf[0..nodes_len],
         ) catch return;
         self.queueSend(buf[0..len], sender);
     }
@@ -372,15 +380,29 @@ pub const DhtEngine = struct {
         // If this was part of a lookup, feed the response
         if (pending.lookup_idx) |idx| {
             if (self.active_lookups[idx]) |*lk| {
-                // Decode compact nodes
-                var new_nodes_buf: [routing_table.K]NodeInfo = undefined;
+                // Decode compact IPv4 nodes (26 bytes each: 20 ID + 4 IP + 2 port)
+                var new_nodes_buf: [routing_table.K * 2]NodeInfo = undefined;
                 var new_node_count: usize = 0;
                 if (r.nodes) |nodes_data| {
                     if (nodes_data.len % 26 == 0) {
                         const count = nodes_data.len / 26;
                         for (0..@min(count, routing_table.K)) |i| {
+                            if (new_node_count >= new_nodes_buf.len) break;
                             new_nodes_buf[new_node_count] = node_id.decodeCompactNode(
                                 nodes_data[i * 26 ..][0..26],
+                            );
+                            new_node_count += 1;
+                        }
+                    }
+                }
+                // Decode compact IPv6 nodes (BEP 32, 38 bytes each: 20 ID + 16 IP + 2 port)
+                if (r.nodes6) |nodes_data| {
+                    if (nodes_data.len % 38 == 0) {
+                        const count = nodes_data.len / 38;
+                        for (0..@min(count, routing_table.K)) |i| {
+                            if (new_node_count >= new_nodes_buf.len) break;
+                            new_nodes_buf[new_node_count] = node_id.decodeCompactNode6(
+                                nodes_data[i * 38 ..][0..38],
                             );
                             new_node_count += 1;
                         }
@@ -392,16 +414,17 @@ pub const DhtEngine = struct {
                     _ = self.table.addNode(info, now);
                 }
 
-                // Parse compact IPv4 peers from the "values" list.
-                // Each entry is a 6-byte bencode string: 4B IPv4 + 2B port big-endian.
+                // Parse compact peers from "values" (IPv4, 6 bytes each) and
+                // "values6" (IPv6, 18 bytes each, BEP 32).
                 var peer_addrs: [50]std.net.Address = undefined;
                 var peer_count: usize = 0;
+
+                // IPv4 peers: 4-byte IP + 2-byte port
                 if (r.values_raw) |raw| {
                     // raw is `l<6:...><6:...>...e`
                     var vpos: usize = 1; // skip 'l'
                     while (vpos < raw.len and raw[vpos] != 'e') {
                         if (peer_count >= peer_addrs.len) break;
-                        // parse bencode string length
                         var dlen: usize = 0;
                         while (vpos < raw.len and raw[vpos] >= '0' and raw[vpos] <= '9') : (vpos += 1) {
                             dlen = dlen * 10 + (raw[vpos] - '0');
@@ -415,6 +438,27 @@ pub const DhtEngine = struct {
                                 @bitCast(std.mem.nativeToBig(u32, ip)),
                                 port,
                             );
+                            peer_count += 1;
+                        }
+                        vpos += dlen;
+                    }
+                }
+
+                // IPv6 peers (BEP 32): 16-byte IP + 2-byte port
+                if (r.values6_raw) |raw| {
+                    var vpos: usize = 1; // skip 'l'
+                    while (vpos < raw.len and raw[vpos] != 'e') {
+                        if (peer_count >= peer_addrs.len) break;
+                        var dlen: usize = 0;
+                        while (vpos < raw.len and raw[vpos] >= '0' and raw[vpos] <= '9') : (vpos += 1) {
+                            dlen = dlen * 10 + (raw[vpos] - '0');
+                        }
+                        if (vpos >= raw.len or raw[vpos] != ':') break;
+                        vpos += 1;
+                        if (dlen == 18 and vpos + 18 <= raw.len) {
+                            const ip6: [16]u8 = raw[vpos..][0..16].*;
+                            const port = std.mem.readInt(u16, raw[vpos + 16 ..][0..2], .big);
+                            peer_addrs[peer_count] = std.net.Address.initIp6(ip6, port, 0, 0);
                             peer_count += 1;
                         }
                         vpos += dlen;
@@ -663,8 +707,15 @@ pub const DhtEngine = struct {
     }
 };
 
+/// Return a stable byte representation of an address for token generation.
+/// For IPv4, returns the 4-byte address. For IPv6, returns the first 4 bytes
+/// of the 16-byte address (sufficient for anti-spoofing token use).
 fn addressToBytes(addr: std.net.Address) [4]u8 {
-    return @bitCast(addr.in.sa.addr);
+    return switch (addr.any.family) {
+        std.posix.AF.INET => @bitCast(addr.in.sa.addr),
+        std.posix.AF.INET6 => addr.in6.sa.addr[0..4].*,
+        else => [4]u8{ 0, 0, 0, 0 },
+    };
 }
 
 // ── Tests ──────────────────────────────────────────────

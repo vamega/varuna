@@ -210,6 +210,9 @@ pub const TorrentSession = struct {
 
     // Config
     port: u16 = 6881,
+    /// Skip tracker announces and rely on DHT/PEX for peer discovery.
+    /// Set from config.network.disable_trackers. Private torrents ignore this.
+    disable_trackers: bool = false,
     max_peers: u32 = 50,
     hasher_threads: u32 = 4,
     resume_db_path: ?[*:0]const u8 = null,
@@ -461,6 +464,15 @@ pub const TorrentSession = struct {
             };
             added += 1;
         }
+
+        // DHT peer discovery: register the info-hash with the DHT engine
+        // for automatic get_peers lookups. Disabled for private torrents (BEP 27).
+        if (!self.is_private) {
+            if (sel.dht_engine) |engine| {
+                engine.requestPeers(self.info_hash);
+            }
+        }
+
         return added > 0;
     }
 
@@ -902,60 +914,51 @@ pub const TorrentSession = struct {
             }
         }
 
-        const tracker_urls = self.buildTrackerUrls(&session) catch {
-            self.state = .@"error";
-            self.error_message = std.fmt.allocPrint(self.allocator, "no announce URL available", .{}) catch null;
-            return;
-        };
-        defer self.allocator.free(tracker_urls);
-
-        if (tracker_urls.len == 0) {
-            self.state = .@"error";
-            self.error_message = std.fmt.allocPrint(self.allocator, "no announce URL available", .{}) catch null;
-            return;
-        }
-
-        // BEP 12: announce to all tiers simultaneously. First successful
-        // response with peers wins; the rest are discarded.
-        const multi_result = tracker.multi_announce.announceParallel(
-            self.allocator,
-            tracker_urls,
-            .{
-                .announce_url = "", // overridden per-URL inside announceParallel
-                .info_hash = session.metainfo.info_hash,
-                .peer_id = self.peer_id,
-                .port = self.port,
-                .left = session.totalSize() - recheck.bytes_complete,
-                .key = self.tracker_key,
-                .info_hash_v2 = self.info_hash_v2,
-            },
-        ) catch {
-            self.state = .@"error";
-            self.error_message = std.fmt.allocPrint(self.allocator, "tracker announce failed for all URLs", .{}) catch null;
-            return;
-        };
-        const announce_resp = multi_result.response;
-        defer tracker.announce.freeResponse(self.allocator, announce_resp);
-
-        // Get shared file handles
+        // Get shared file handles (needed regardless of whether we use tracker)
         const shared_fds = try self.store.?.fileHandles(self.allocator);
         self.shared_fds = shared_fds;
 
-        // Store peer addresses for the main thread to add
-        // (the shared event loop is NOT thread-safe, so we can't add peers here)
+        // Peer collection from tracker (skipped when disable_trackers is set or
+        // when there are no tracker URLs -- DHT/PEX will provide peers instead).
         var peer_list = std.ArrayList(std.net.Address).empty;
         defer peer_list.deinit(self.allocator);
-        for (announce_resp.peers) |peer| {
-            if (peer_list.items.len >= self.max_peers) break;
-            peer_list.append(self.allocator, peer.address) catch continue;
+
+        const skip_tracker = self.disable_trackers and !self.is_private;
+        if (!skip_tracker) {
+            const tracker_urls = self.buildTrackerUrls(&session) catch &.{};
+            defer self.allocator.free(tracker_urls);
+
+            if (tracker_urls.len > 0) {
+                // BEP 12: announce to all tiers simultaneously. First successful
+                // response with peers wins; the rest are discarded.
+                if (tracker.multi_announce.announceParallel(
+                    self.allocator,
+                    tracker_urls,
+                    .{
+                        .announce_url = "", // overridden per-URL inside announceParallel
+                        .info_hash = session.metainfo.info_hash,
+                        .peer_id = self.peer_id,
+                        .port = self.port,
+                        .left = session.totalSize() - recheck.bytes_complete,
+                        .key = self.tracker_key,
+                        .info_hash_v2 = self.info_hash_v2,
+                    },
+                )) |multi_result| {
+                    const announce_resp = multi_result.response;
+                    defer tracker.announce.freeResponse(self.allocator, announce_resp);
+                    for (announce_resp.peers) |peer| {
+                        if (peer_list.items.len >= self.max_peers) break;
+                        peer_list.append(self.allocator, peer.address) catch continue;
+                    }
+                } else |_| {
+                    // Tracker failed -- log warning but continue; DHT will find peers.
+                    std.log.warn("tracker announce failed for {x}, relying on DHT", .{session.metainfo.info_hash[0..4].*});
+                }
+            }
         }
 
-        if (peer_list.items.len == 0) {
-            self.state = .@"error";
-            self.error_message = std.fmt.allocPrint(self.allocator, "no reachable peers", .{}) catch null;
-            return;
-        }
-
+        // DHT provides peers asynchronously after integrateIntoEventLoop is called.
+        // Even if the tracker returned zero peers, proceed -- DHT will fill in.
         self.pending_peers = peer_list.toOwnedSlice(self.allocator) catch null;
         self.state = .downloading;
     }
@@ -1027,6 +1030,15 @@ pub const TorrentSession = struct {
             self.torrent_id_in_shared.?,
             &self.piece_tracker.?.complete,
         );
+
+        // DHT announce: tell the network we are seeding this torrent.
+        // Disabled for private torrents (BEP 27).
+        if (!self.is_private) {
+            if (sel.dht_engine) |engine| {
+                engine.announcePeer(self.info_hash, self.port) catch {};
+            }
+        }
+
         self.pending_seed_setup = false;
         return true;
     }
