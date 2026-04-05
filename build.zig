@@ -113,6 +113,12 @@ pub fn build(b: *std.Build) void {
             .imports = &varuna_import,
         }),
     });
+    // DhtEngine + EventLoop on main()'s stack together exceed the default 8 MB stack.
+    // DHT routing table (160 buckets × 8 nodes × ~144 bytes = ~182 KB), 16 concurrent
+    // Lookup tables (each with 256-peer buffer = ~42 KB, total ~672 KB), and 256
+    // pending queries (~42 KB) = ~896 KB for DhtEngine alone.  Combined with other
+    // stack frames (getaddrinfo in glibc can use 1-4 MB), 8 MB is insufficient.
+    daemon_exe.stack_size = 32 * 1024 * 1024; // 32 MB
     b.installArtifact(daemon_exe);
 
     // ── varuna-ctl (CLI client) ───────────────────────────

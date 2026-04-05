@@ -85,16 +85,17 @@ pub fn main() !void {
     shared_el.initHugePageCache(cfg.performance.piece_cache_size);
 
     // Initialize DHT engine (BEP 5). Runs on the shared UDP socket alongside uTP.
-    // Bootstrap hostname resolution is blocking (acceptable at startup, one-time).
+    // DhtEngine.create() heap-allocates and initializes via explicit field assignment
+    // to avoid placing the ~900 KB struct on main()'s stack.
     shared_el.port = cfg.network.port_min;
-    var dht_engine_storage: varuna.dht.DhtEngine = blk: {
-        const own_id = varuna.dht.node_id.generate();
-        break :blk varuna.dht.DhtEngine.init(allocator, own_id);
-    };
-    defer dht_engine_storage.deinit();
+    const dht_engine = try varuna.dht.DhtEngine.create(allocator, varuna.dht.node_id.generate());
+    defer {
+        dht_engine.deinit();
+        allocator.destroy(dht_engine);
+    }
 
     // Wire the DHT engine into the shared event loop before starting the UDP socket.
-    shared_el.dht_engine = &dht_engine_storage;
+    shared_el.dht_engine = dht_engine;
 
     // Start the shared UDP socket (used by both DHT and uTP). This must happen
     // before the event loop so that DHT bootstrap pings can be submitted.
@@ -108,7 +109,7 @@ pub fn main() !void {
     const bootstrap_addrs = varuna.dht.bootstrap.resolveBootstrapNodes(allocator) catch &.{};
     defer if (bootstrap_addrs.len > 0) allocator.free(bootstrap_addrs);
     if (shared_el.dht_engine != null) {
-        dht_engine_storage.addBootstrapNodes(bootstrap_addrs);
+        dht_engine.addBootstrapNodes(bootstrap_addrs);
     }
 
     // Session manager

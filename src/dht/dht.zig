@@ -96,6 +96,46 @@ pub const DhtEngine = struct {
         };
     }
 
+    /// Heap-allocate and initialize a DhtEngine without placing a large
+    /// (~1 MB) struct value on the caller's stack. DhtEngine contains:
+    ///   - RoutingTable: 160 KBuckets × 8 NodeInfos = ~183 KB
+    ///   - pending[256]?PendingQuery = ~39 KB
+    ///   - active_lookups[16]?Lookup  = ~688 KB
+    /// Assigning these as struct literals would create large stack temporaries.
+    /// Instead we initialize each field individually via pointer dereference,
+    /// and use explicit loops for the large arrays so Zig writes directly
+    /// into the heap allocation.
+    pub fn create(allocator: std.mem.Allocator, own_id: NodeId) !*DhtEngine {
+        const self = try allocator.create(DhtEngine);
+        self.allocator = allocator;
+        self.own_id = own_id;
+        // Initialize the routing table in place (160 KBuckets).
+        self.table.own_id = own_id;
+        for (&self.table.buckets) |*b| {
+            b.count = 0;
+            b.last_changed = 0;
+            // nodes[] intentionally left undefined (count=0, so never read).
+        }
+        self.tokens = TokenManager.init();
+        self.next_txn_id = 1;
+        // Initialize nullable arrays via explicit loops to avoid ~38 KB / ~688 KB
+        // stack temporaries that would arise from array-literal assignment.
+        for (&self.pending) |*p| p.* = null;
+        for (&self.active_lookups) |*l| l.* = null;
+        self.send_queue = std.ArrayList(OutboundPacket).empty;
+        self.peer_results = std.ArrayList(PeerResult).empty;
+        self.listen_port = 6881;
+        self.bootstrapped = false;
+        self.bootstrap_pending = false;
+        self.pending_search_count = 0;
+        self.pending_search_started = false;
+        self.last_requery_time = 0;
+        self.last_refresh_check = 0;
+        self.last_save_time = 0;
+        self.enabled = true;
+        return self;
+    }
+
     pub fn deinit(self: *DhtEngine) void {
         for (self.peer_results.items) |result| {
             self.allocator.free(result.peers);
@@ -135,7 +175,15 @@ pub const DhtEngine = struct {
         // Drive active lookups forward
         self.driveLookups(now);
 
-        // Bootstrap if needed
+        // Bootstrap if needed.
+        // If bootstrap_pending but no active lookups remain (they all completed or
+        // timed out), reset bootstrap_pending so we retry on the next tick.
+        if (self.bootstrap_pending) {
+            const has_active = for (self.active_lookups) |lk| {
+                if (lk != null) break true;
+            } else false;
+            if (!has_active) self.bootstrap_pending = false;
+        }
         if (!self.bootstrapped and !self.bootstrap_pending) {
             if (self.table.nodeCount() < routing_table.K) {
                 self.startBootstrap(now);
