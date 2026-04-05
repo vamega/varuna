@@ -781,3 +781,68 @@ test "isPartialSeed transitions to false when all pieces complete" {
     // but all pieces are complete, so complete.count == piece_count
     try std.testing.expect(!tracker.isPartialSeed());
 }
+
+// ── completePiece clears in_progress ─────────────────────
+
+test "completePiece clears in_progress bit" {
+    var bf = try Bitfield.init(std.testing.allocator, 4);
+    defer bf.deinit(std.testing.allocator);
+
+    var tracker = try PieceTracker.init(std.testing.allocator, 4, 4, 16, &bf, 0);
+    defer tracker.deinit(std.testing.allocator);
+
+    // Step 1: claim a piece and verify it is marked in_progress
+    const p0 = tracker.claimPiece(null).?;
+    try std.testing.expectEqual(@as(u32, 0), p0);
+    try std.testing.expect(tracker.in_progress.has(p0));
+    try std.testing.expect(!tracker.complete.has(p0));
+
+    // Step 2: complete the piece and verify in_progress is cleared
+    const first_completion = tracker.completePiece(p0, 4);
+    try std.testing.expect(first_completion);
+    try std.testing.expect(tracker.complete.has(p0));
+    try std.testing.expect(!tracker.in_progress.has(p0));
+
+    // Step 3: verify cleared in_progress does not block scan_hint advancement.
+    // Claim the next two pieces so that scan_hint advances past them.
+    const p1 = tracker.claimPiece(null).?;
+    try std.testing.expectEqual(@as(u32, 1), p1);
+    _ = tracker.completePiece(p1, 4);
+
+    const p2 = tracker.claimPiece(null).?;
+    try std.testing.expectEqual(@as(u32, 2), p2);
+    _ = tracker.completePiece(p2, 4);
+
+    // Next claim must advance to piece 3, not revisit piece 0.
+    const p3 = tracker.claimPiece(null).?;
+    try std.testing.expectEqual(@as(u32, 3), p3);
+
+    // Step 4: duplicate completion returns false (endgame dedup)
+    try std.testing.expect(!tracker.completePiece(p0, 4));
+}
+
+test "completePiece in_progress count decrements correctly" {
+    var bf = try Bitfield.init(std.testing.allocator, 4);
+    defer bf.deinit(std.testing.allocator);
+
+    var tracker = try PieceTracker.init(std.testing.allocator, 4, 4, 16, &bf, 0);
+    defer tracker.deinit(std.testing.allocator);
+
+    // Initially no pieces in progress
+    try std.testing.expectEqual(@as(u32, 0), tracker.in_progress.count);
+
+    // Claim two pieces
+    _ = tracker.claimPiece(null); // piece 0
+    _ = tracker.claimPiece(null); // piece 1
+    try std.testing.expectEqual(@as(u32, 2), tracker.in_progress.count);
+
+    // Complete piece 0 -- count should drop to 1
+    _ = tracker.completePiece(0, 4);
+    try std.testing.expectEqual(@as(u32, 1), tracker.in_progress.count);
+    try std.testing.expect(!tracker.in_progress.has(0));
+    try std.testing.expect(tracker.in_progress.has(1));
+
+    // Complete piece 1 -- count should drop to 0
+    _ = tracker.completePiece(1, 4);
+    try std.testing.expectEqual(@as(u32, 0), tracker.in_progress.count);
+}

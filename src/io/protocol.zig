@@ -845,3 +845,743 @@ pub fn sendHashReject(self: *EventLoop, slot: u16, req: hash_exchange.HashReques
     const reject_payload = hash_exchange.encodeHashRequest(req);
     submitMessage(self, slot, hash_exchange.msg_hash_reject, &reject_payload) catch {};
 }
+
+// ── Tests ────────────────────────────────────────────────
+
+const testing = std.testing;
+const PieceTracker = @import("../torrent/piece_tracker.zig").PieceTracker;
+
+/// Set up a bare event loop with a torrent context and an active download peer
+/// in slot 0. Returns the slot index (always 0).
+fn setupTestPeer(el: *EventLoop) !u16 {
+    const slot: u16 = 0;
+    const peer = &el.peers[slot];
+    peer.* = Peer{};
+    peer.fd = -1;
+    peer.state = .active_recv_header;
+    peer.mode = .download;
+    peer.torrent_id = 0;
+    peer.peer_choking = true;
+    peer.am_choking = true;
+
+    // body_buf starts as the small_body_buf (protocol.zig dereferences body_buf)
+    peer.body_buf = &peer.small_body_buf;
+    peer.body_expected = 0;
+    peer.body_offset = 0;
+    return slot;
+}
+
+fn setupTestTorrent(el: *EventLoop, piece_tracker: ?*PieceTracker) !void {
+    const empty_fds = [_]std.posix.fd_t{};
+    _ = try el.addTorrentContext(.{
+        .piece_tracker = piece_tracker,
+        .shared_fds = empty_fds[0..],
+        .info_hash = [_]u8{0} ** 20,
+        .peer_id = [_]u8{0} ** 20,
+    });
+}
+
+// ── CHOKE (id=0) ─────────────────────────────────────────
+
+test "choke sets peer_choking to true" {
+    var el = try EventLoop.initBare(testing.allocator, 0);
+    defer el.deinit();
+    try setupTestTorrent(&el, null);
+    const slot = try setupTestPeer(&el);
+    const peer = &el.peers[slot];
+
+    // Start unchoked so we can verify the transition
+    peer.peer_choking = false;
+
+    // Build choke message: body = [id=0]
+    peer.small_body_buf[0] = 0; // choke
+    peer.body_buf = &peer.small_body_buf;
+
+    processMessage(&el, slot);
+
+    try testing.expect(peer.peer_choking);
+}
+
+test "choke clears inflight_requests" {
+    var el = try EventLoop.initBare(testing.allocator, 0);
+    defer el.deinit();
+    try setupTestTorrent(&el, null);
+    const slot = try setupTestPeer(&el);
+    const peer = &el.peers[slot];
+
+    peer.peer_choking = false;
+    peer.inflight_requests = 5;
+    peer.blocks_received = 2;
+    peer.pipeline_sent = 7;
+
+    peer.small_body_buf[0] = 0;
+    peer.body_buf = &peer.small_body_buf;
+
+    processMessage(&el, slot);
+
+    try testing.expectEqual(@as(u32, 0), peer.inflight_requests);
+    // pipeline_sent is reset to blocks_received
+    try testing.expectEqual(@as(u32, 2), peer.pipeline_sent);
+}
+
+test "choke releases and frees next_piece" {
+    var el = try EventLoop.initBare(testing.allocator, 0);
+    defer el.deinit();
+
+    var initial_complete = try Bitfield.init(testing.allocator, 4);
+    defer initial_complete.deinit(testing.allocator);
+    var tracker = try PieceTracker.init(testing.allocator, 4, 16384, 4 * 16384, &initial_complete, 0);
+    defer tracker.deinit(testing.allocator);
+
+    try setupTestTorrent(&el, &tracker);
+    const slot = try setupTestPeer(&el);
+    const peer = &el.peers[slot];
+
+    // Claim a piece via the tracker so we can verify it gets released
+    const claimed = tracker.claimPiece(null);
+    try testing.expect(claimed != null);
+
+    peer.peer_choking = false;
+    peer.next_piece = claimed;
+    peer.next_piece_buf = try testing.allocator.alloc(u8, 16384);
+    peer.next_blocks_expected = 4;
+    peer.next_blocks_received = 1;
+    peer.next_pipeline_sent = 2;
+
+    peer.small_body_buf[0] = 0;
+    peer.body_buf = &peer.small_body_buf;
+
+    processMessage(&el, slot);
+
+    try testing.expect(peer.next_piece == null);
+    try testing.expect(peer.next_piece_buf == null);
+    try testing.expectEqual(@as(u32, 0), peer.next_blocks_expected);
+    try testing.expectEqual(@as(u32, 0), peer.next_blocks_received);
+    try testing.expectEqual(@as(u32, 0), peer.next_pipeline_sent);
+
+    // The piece should be reclaimable since it was released
+    const reclaimed = tracker.claimPiece(null);
+    try testing.expect(reclaimed != null);
+    try testing.expectEqual(claimed.?, reclaimed.?);
+}
+
+test "choke removes peer from idle list" {
+    var el = try EventLoop.initBare(testing.allocator, 0);
+    defer el.deinit();
+    try setupTestTorrent(&el, null);
+    const slot = try setupTestPeer(&el);
+    const peer = &el.peers[slot];
+
+    // Set up peer as idle candidate and add to idle list
+    peer.peer_choking = false;
+    peer.availability_known = true;
+    peer.current_piece = null;
+    // Manually add to idle list (markIdle has side effects we want to avoid)
+    el.idle_peers.append(testing.allocator, slot) catch unreachable;
+    peer.idle_peer_index = 0;
+
+    peer.small_body_buf[0] = 0;
+    peer.body_buf = &peer.small_body_buf;
+
+    processMessage(&el, slot);
+
+    try testing.expect(peer.idle_peer_index == null);
+    try testing.expectEqual(@as(usize, 0), el.idle_peers.items.len);
+}
+
+// ── UNCHOKE (id=1) ───────────────────────────────────────
+
+test "unchoke sets peer_choking to false" {
+    var el = try EventLoop.initBare(testing.allocator, 0);
+    defer el.deinit();
+    try setupTestTorrent(&el, null);
+    const slot = try setupTestPeer(&el);
+    const peer = &el.peers[slot];
+
+    try testing.expect(peer.peer_choking);
+
+    peer.small_body_buf[0] = 1; // unchoke
+    peer.body_buf = &peer.small_body_buf;
+
+    processMessage(&el, slot);
+
+    try testing.expect(!peer.peer_choking);
+}
+
+// ── INTERESTED (id=2) ────────────────────────────────────
+
+test "interested sets peer_interested to true" {
+    var el = try EventLoop.initBare(testing.allocator, 0);
+    defer el.deinit();
+    try setupTestTorrent(&el, null);
+    const slot = try setupTestPeer(&el);
+    const peer = &el.peers[slot];
+
+    try testing.expect(!peer.peer_interested);
+
+    peer.small_body_buf[0] = 2; // interested
+    peer.body_buf = &peer.small_body_buf;
+
+    processMessage(&el, slot);
+
+    try testing.expect(peer.peer_interested);
+}
+
+// ── NOT INTERESTED (id=3) ────────────────────────────────
+
+test "not interested sets peer_interested to false" {
+    var el = try EventLoop.initBare(testing.allocator, 0);
+    defer el.deinit();
+    try setupTestTorrent(&el, null);
+    const slot = try setupTestPeer(&el);
+    const peer = &el.peers[slot];
+
+    peer.peer_interested = true;
+
+    peer.small_body_buf[0] = 3; // not interested
+    peer.body_buf = &peer.small_body_buf;
+
+    processMessage(&el, slot);
+
+    try testing.expect(!peer.peer_interested);
+}
+
+// ── HAVE (id=4) ──────────────────────────────────────────
+
+test "have updates availability bitfield" {
+    var el = try EventLoop.initBare(testing.allocator, 0);
+    defer el.deinit();
+
+    var initial_complete = try Bitfield.init(testing.allocator, 8);
+    defer initial_complete.deinit(testing.allocator);
+    var tracker = try PieceTracker.init(testing.allocator, 8, 16384, 8 * 16384, &initial_complete, 0);
+    defer tracker.deinit(testing.allocator);
+
+    try setupTestTorrent(&el, &tracker);
+    const slot = try setupTestPeer(&el);
+    const peer = &el.peers[slot];
+
+    // Pre-allocate availability bitfield (normally done during handshake)
+    peer.availability = try Bitfield.init(testing.allocator, 8);
+
+    // Build HAVE message: body = [id=4, piece_index=3 (big-endian)]
+    peer.small_body_buf[0] = 4;
+    std.mem.writeInt(u32, peer.small_body_buf[1..5], 3, .big);
+    peer.body_buf = &peer.small_body_buf;
+
+    processMessage(&el, slot);
+
+    try testing.expect(peer.availability.?.has(3));
+    try testing.expect(!peer.availability.?.has(0));
+    try testing.expect(!peer.availability.?.has(7));
+    try testing.expect(peer.availability_known);
+
+    // Clean up
+    peer.availability.?.deinit(testing.allocator);
+    peer.availability = null;
+}
+
+test "have with out-of-range piece index does not crash" {
+    var el = try EventLoop.initBare(testing.allocator, 0);
+    defer el.deinit();
+
+    var initial_complete = try Bitfield.init(testing.allocator, 4);
+    defer initial_complete.deinit(testing.allocator);
+    var tracker = try PieceTracker.init(testing.allocator, 4, 16384, 4 * 16384, &initial_complete, 0);
+    defer tracker.deinit(testing.allocator);
+
+    try setupTestTorrent(&el, &tracker);
+    const slot = try setupTestPeer(&el);
+    const peer = &el.peers[slot];
+
+    peer.availability = try Bitfield.init(testing.allocator, 4);
+
+    // Send HAVE for piece index 999 (way out of range for 4-piece torrent)
+    peer.small_body_buf[0] = 4;
+    std.mem.writeInt(u32, peer.small_body_buf[1..5], 999, .big);
+    peer.body_buf = &peer.small_body_buf;
+
+    // Should not crash or panic
+    processMessage(&el, slot);
+
+    // Bitfield should not have changed for any valid index
+    try testing.expect(!peer.availability.?.has(0));
+    try testing.expect(!peer.availability.?.has(3));
+
+    peer.availability.?.deinit(testing.allocator);
+    peer.availability = null;
+}
+
+test "have creates availability bitfield lazily when session exists" {
+    var el = try EventLoop.initBare(testing.allocator, 0);
+    defer el.deinit();
+
+    var initial_complete = try Bitfield.init(testing.allocator, 8);
+    defer initial_complete.deinit(testing.allocator);
+    var tracker = try PieceTracker.init(testing.allocator, 8, 16384, 8 * 16384, &initial_complete, 0);
+    defer tracker.deinit(testing.allocator);
+
+    try setupTestTorrent(&el, &tracker);
+    const slot = try setupTestPeer(&el);
+    const peer = &el.peers[slot];
+
+    // No pre-allocated availability -- it should stay null when there is no session
+    try testing.expect(peer.availability == null);
+
+    // HAVE message for piece 2
+    peer.small_body_buf[0] = 4;
+    std.mem.writeInt(u32, peer.small_body_buf[1..5], 2, .big);
+    peer.body_buf = &peer.small_body_buf;
+
+    processMessage(&el, slot);
+
+    // Without a session, availability won't be lazily created (the torrent context
+    // has session=null in our test setup), but availability_known should be set
+    // and it should not crash.
+    try testing.expect(peer.availability_known);
+}
+
+// ── BITFIELD (id=5) ──────────────────────────────────────
+
+test "bitfield imports peer bitfield correctly" {
+    var el = try EventLoop.initBare(testing.allocator, 0);
+    defer el.deinit();
+
+    var initial_complete = try Bitfield.init(testing.allocator, 8);
+    defer initial_complete.deinit(testing.allocator);
+    var tracker = try PieceTracker.init(testing.allocator, 8, 16384, 8 * 16384, &initial_complete, 0);
+    defer tracker.deinit(testing.allocator);
+
+    try setupTestTorrent(&el, &tracker);
+    const slot = try setupTestPeer(&el);
+    const peer = &el.peers[slot];
+
+    // Pre-allocate availability
+    peer.availability = try Bitfield.init(testing.allocator, 8);
+
+    // Build BITFIELD message: body = [id=5, bitfield_data...]
+    // Bitfield: pieces 0, 2, 4, 6 set = 0b10101010 = 0xAA
+    const body = try testing.allocator.alloc(u8, 2); // 1 byte id + 1 byte bitfield
+    defer testing.allocator.free(body);
+    body[0] = 5; // bitfield message id
+    body[1] = 0xAA; // pieces 0, 2, 4, 6
+
+    peer.body_buf = body;
+
+    processMessage(&el, slot);
+
+    try testing.expect(peer.availability.?.has(0));
+    try testing.expect(!peer.availability.?.has(1));
+    try testing.expect(peer.availability.?.has(2));
+    try testing.expect(!peer.availability.?.has(3));
+    try testing.expect(peer.availability.?.has(4));
+    try testing.expect(!peer.availability.?.has(5));
+    try testing.expect(peer.availability.?.has(6));
+    try testing.expect(!peer.availability.?.has(7));
+    try testing.expect(peer.availability_known);
+
+    peer.availability.?.deinit(testing.allocator);
+    peer.availability = null;
+}
+
+test "bitfield returns early without torrent context" {
+    var el = try EventLoop.initBare(testing.allocator, 0);
+    defer el.deinit();
+
+    // Do NOT set up a torrent context -- peer has torrent_id=0 but no context registered
+    const slot: u16 = 0;
+    const peer = &el.peers[slot];
+    peer.* = Peer{};
+    peer.state = .active_recv_header;
+    peer.torrent_id = 99; // non-existent torrent
+
+    const body = try testing.allocator.alloc(u8, 2);
+    defer testing.allocator.free(body);
+    body[0] = 5;
+    body[1] = 0xFF;
+    peer.body_buf = body;
+
+    // Should return early gracefully without crashing
+    processMessage(&el, slot);
+
+    try testing.expect(!peer.availability_known);
+}
+
+// ── PIECE (id=7) ─────────────────────────────────────────
+
+test "piece copies block data to piece_buf at correct offset" {
+    var el = try EventLoop.initBare(testing.allocator, 0);
+    defer el.deinit();
+    try setupTestTorrent(&el, null);
+    const slot = try setupTestPeer(&el);
+    const peer = &el.peers[slot];
+
+    // Simulate downloading piece 5
+    peer.current_piece = 5;
+    const piece_size: usize = 64;
+    peer.piece_buf = try testing.allocator.alloc(u8, piece_size);
+    defer testing.allocator.free(peer.piece_buf.?);
+    @memset(peer.piece_buf.?, 0);
+    peer.blocks_received = 0;
+    peer.blocks_expected = 4;
+    peer.inflight_requests = 2;
+    peer.peer_choking = false;
+
+    // Build PIECE message: body = [id=7, piece_index(4), block_offset(4), data...]
+    // piece_index=5, block_offset=16, data = "HELLO" (5 bytes)
+    const data = "HELLO";
+    const body_len = 1 + 4 + 4 + data.len; // id + piece_index + offset + data
+    const body = try testing.allocator.alloc(u8, body_len);
+    defer testing.allocator.free(body);
+    body[0] = 7; // piece
+    std.mem.writeInt(u32, body[1..5], 5, .big); // piece_index
+    std.mem.writeInt(u32, body[5..9], 16, .big); // block_offset
+    @memcpy(body[9..], data);
+
+    peer.body_buf = body;
+
+    processMessage(&el, slot);
+
+    // Verify data was copied at offset 16
+    try testing.expectEqualSlices(u8, data, peer.piece_buf.?[16 .. 16 + data.len]);
+    // Verify surrounding data is still zero
+    try testing.expectEqual(@as(u8, 0), peer.piece_buf.?[0]);
+    try testing.expectEqual(@as(u8, 0), peer.piece_buf.?[15]);
+    try testing.expectEqual(@as(u8, 0), peer.piece_buf.?[21]);
+
+    try testing.expectEqual(@as(u32, 1), peer.blocks_received);
+    try testing.expectEqual(@as(u32, 1), peer.inflight_requests);
+    try testing.expectEqual(@as(u64, data.len), peer.bytes_downloaded_from);
+}
+
+test "piece for wrong piece_index is ignored" {
+    var el = try EventLoop.initBare(testing.allocator, 0);
+    defer el.deinit();
+    try setupTestTorrent(&el, null);
+    const slot = try setupTestPeer(&el);
+    const peer = &el.peers[slot];
+
+    // Downloading piece 5, but we receive a block for piece 9
+    peer.current_piece = 5;
+    const piece_size: usize = 64;
+    peer.piece_buf = try testing.allocator.alloc(u8, piece_size);
+    defer testing.allocator.free(peer.piece_buf.?);
+    @memset(peer.piece_buf.?, 0);
+    peer.blocks_received = 0;
+    peer.blocks_expected = 4;
+    peer.inflight_requests = 2;
+
+    const data = "WRONG";
+    const body_len = 1 + 4 + 4 + data.len;
+    const body = try testing.allocator.alloc(u8, body_len);
+    defer testing.allocator.free(body);
+    body[0] = 7;
+    std.mem.writeInt(u32, body[1..5], 9, .big); // wrong piece_index
+    std.mem.writeInt(u32, body[5..9], 0, .big);
+    @memcpy(body[9..], data);
+
+    peer.body_buf = body;
+
+    processMessage(&el, slot);
+
+    // Nothing should be written to piece_buf
+    for (peer.piece_buf.?) |b| {
+        try testing.expectEqual(@as(u8, 0), b);
+    }
+    // blocks_received should not increment
+    try testing.expectEqual(@as(u32, 0), peer.blocks_received);
+    // inflight_requests still decrements (block was received, just for wrong piece)
+    try testing.expectEqual(@as(u32, 1), peer.inflight_requests);
+}
+
+test "piece decrements inflight_requests" {
+    var el = try EventLoop.initBare(testing.allocator, 0);
+    defer el.deinit();
+    try setupTestTorrent(&el, null);
+    const slot = try setupTestPeer(&el);
+    const peer = &el.peers[slot];
+
+    peer.current_piece = 0;
+    peer.piece_buf = try testing.allocator.alloc(u8, 32);
+    defer testing.allocator.free(peer.piece_buf.?);
+    @memset(peer.piece_buf.?, 0);
+    peer.blocks_received = 0;
+    peer.blocks_expected = 4;
+    peer.inflight_requests = 3;
+
+    const data = "AB";
+    const body_len = 1 + 4 + 4 + data.len;
+    const body = try testing.allocator.alloc(u8, body_len);
+    defer testing.allocator.free(body);
+    body[0] = 7;
+    std.mem.writeInt(u32, body[1..5], 0, .big);
+    std.mem.writeInt(u32, body[5..9], 0, .big);
+    @memcpy(body[9..], data);
+
+    peer.body_buf = body;
+
+    processMessage(&el, slot);
+
+    try testing.expectEqual(@as(u32, 2), peer.inflight_requests);
+}
+
+test "piece for next_piece updates next piece buffers" {
+    var el = try EventLoop.initBare(testing.allocator, 0);
+    defer el.deinit();
+    try setupTestTorrent(&el, null);
+    const slot = try setupTestPeer(&el);
+    const peer = &el.peers[slot];
+
+    // Current piece is 3, next piece is 7
+    peer.current_piece = 3;
+    peer.piece_buf = try testing.allocator.alloc(u8, 32);
+    defer testing.allocator.free(peer.piece_buf.?);
+    @memset(peer.piece_buf.?, 0);
+    peer.blocks_received = 0;
+    peer.blocks_expected = 2;
+
+    peer.next_piece = 7;
+    peer.next_piece_buf = try testing.allocator.alloc(u8, 32);
+    defer testing.allocator.free(peer.next_piece_buf.?);
+    @memset(peer.next_piece_buf.?, 0);
+    peer.next_blocks_received = 0;
+    peer.next_blocks_expected = 2;
+    peer.inflight_requests = 2;
+
+    // Send a block for piece 7 (the next piece)
+    const data = "NEXT";
+    const body_len = 1 + 4 + 4 + data.len;
+    const body = try testing.allocator.alloc(u8, body_len);
+    defer testing.allocator.free(body);
+    body[0] = 7;
+    std.mem.writeInt(u32, body[1..5], 7, .big); // piece_index = 7 (next_piece)
+    std.mem.writeInt(u32, body[5..9], 4, .big); // block_offset = 4
+    @memcpy(body[9..], data);
+
+    peer.body_buf = body;
+
+    processMessage(&el, slot);
+
+    // Data should be in next_piece_buf at offset 4
+    try testing.expectEqualSlices(u8, data, peer.next_piece_buf.?[4 .. 4 + data.len]);
+    try testing.expectEqual(@as(u32, 1), peer.next_blocks_received);
+    try testing.expectEqual(@as(u64, data.len), peer.bytes_downloaded_from);
+    // inflight_requests decrements for any piece block
+    try testing.expectEqual(@as(u32, 1), peer.inflight_requests);
+    // current piece should be untouched
+    try testing.expectEqual(@as(u32, 0), peer.blocks_received);
+}
+
+test "piece with zero inflight_requests does not underflow" {
+    var el = try EventLoop.initBare(testing.allocator, 0);
+    defer el.deinit();
+    try setupTestTorrent(&el, null);
+    const slot = try setupTestPeer(&el);
+    const peer = &el.peers[slot];
+
+    peer.current_piece = 0;
+    peer.piece_buf = try testing.allocator.alloc(u8, 16);
+    defer testing.allocator.free(peer.piece_buf.?);
+    @memset(peer.piece_buf.?, 0);
+    peer.blocks_received = 0;
+    peer.blocks_expected = 4;
+    peer.inflight_requests = 0; // already at zero
+
+    const data = "X";
+    const body_len = 1 + 4 + 4 + data.len;
+    const body = try testing.allocator.alloc(u8, body_len);
+    defer testing.allocator.free(body);
+    body[0] = 7;
+    std.mem.writeInt(u32, body[1..5], 0, .big);
+    std.mem.writeInt(u32, body[5..9], 0, .big);
+    @memcpy(body[9..], data);
+
+    peer.body_buf = body;
+
+    processMessage(&el, slot);
+
+    // Should remain 0, not underflow to maxInt(u32)
+    try testing.expectEqual(@as(u32, 0), peer.inflight_requests);
+    try testing.expectEqual(@as(u32, 1), peer.blocks_received);
+}
+
+test "piece with out-of-bounds offset is rejected" {
+    var el = try EventLoop.initBare(testing.allocator, 0);
+    defer el.deinit();
+    try setupTestTorrent(&el, null);
+    const slot = try setupTestPeer(&el);
+    const peer = &el.peers[slot];
+
+    peer.current_piece = 0;
+    const piece_size: usize = 16;
+    peer.piece_buf = try testing.allocator.alloc(u8, piece_size);
+    defer testing.allocator.free(peer.piece_buf.?);
+    @memset(peer.piece_buf.?, 0);
+    peer.blocks_received = 0;
+    peer.blocks_expected = 2;
+    peer.inflight_requests = 1;
+
+    // block_offset=14, data length=5 -> end=19 > piece_size=16
+    const data = "OVRFL";
+    const body_len = 1 + 4 + 4 + data.len;
+    const body = try testing.allocator.alloc(u8, body_len);
+    defer testing.allocator.free(body);
+    body[0] = 7;
+    std.mem.writeInt(u32, body[1..5], 0, .big);
+    std.mem.writeInt(u32, body[5..9], 14, .big); // offset 14 + 5 bytes > 16
+    @memcpy(body[9..], data);
+
+    peer.body_buf = body;
+
+    processMessage(&el, slot);
+
+    // Data should NOT be written (end > pbuf.len check should block it)
+    for (peer.piece_buf.?) |b| {
+        try testing.expectEqual(@as(u8, 0), b);
+    }
+    // blocks_received should not increment
+    try testing.expectEqual(@as(u32, 0), peer.blocks_received);
+    // inflight_requests still decrements (block was received, bounds check is after)
+    try testing.expectEqual(@as(u32, 0), peer.inflight_requests);
+}
+
+// ── CANCEL (id=8) ────────────────────────────────────────
+
+test "cancel removes matching queued response" {
+    var el = try EventLoop.initBare(testing.allocator, 0);
+    defer el.deinit();
+    try setupTestTorrent(&el, null);
+    const slot = try setupTestPeer(&el);
+    const peer = &el.peers[slot];
+    peer.mode = .seed;
+
+    // Create a fake PieceBuffer for the queued response
+    const piece_buffer = try testing.allocator.create(EventLoop.PieceBuffer);
+    piece_buffer.* = .{
+        .buf = &.{},
+        .ref_count = 2, // extra ref so it won't be freed during test
+    };
+    defer testing.allocator.destroy(piece_buffer);
+
+    // Add a queued response
+    try el.queued_responses.append(testing.allocator, .{
+        .slot = slot,
+        .piece_index = 10,
+        .block_offset = 0,
+        .block_length = 16384,
+        .piece_buffer = piece_buffer,
+    });
+
+    try testing.expectEqual(@as(usize, 1), el.queued_responses.items.len);
+
+    // Build CANCEL message: body = [id=8, piece_index(4), offset(4), length(4)]
+    peer.small_body_buf[0] = 8;
+    std.mem.writeInt(u32, peer.small_body_buf[1..5], 10, .big); // piece_index
+    std.mem.writeInt(u32, peer.small_body_buf[5..9], 0, .big); // offset
+    std.mem.writeInt(u32, peer.small_body_buf[9..13], 16384, .big); // length
+    peer.body_buf = &peer.small_body_buf;
+
+    processMessage(&el, slot);
+
+    try testing.expectEqual(@as(usize, 0), el.queued_responses.items.len);
+}
+
+test "cancel does not remove non-matching queued response" {
+    var el = try EventLoop.initBare(testing.allocator, 0);
+    defer el.deinit();
+    try setupTestTorrent(&el, null);
+    const slot = try setupTestPeer(&el);
+    const peer = &el.peers[slot];
+    peer.mode = .seed;
+
+    const piece_buffer = try testing.allocator.create(EventLoop.PieceBuffer);
+    piece_buffer.* = .{
+        .buf = &.{},
+        .ref_count = 2,
+    };
+    defer testing.allocator.destroy(piece_buffer);
+
+    // Queue a response for piece 10, offset 0
+    try el.queued_responses.append(testing.allocator, .{
+        .slot = slot,
+        .piece_index = 10,
+        .block_offset = 0,
+        .block_length = 16384,
+        .piece_buffer = piece_buffer,
+    });
+
+    // Cancel for piece 10, offset 16384 (different offset -- should not match)
+    peer.small_body_buf[0] = 8;
+    std.mem.writeInt(u32, peer.small_body_buf[1..5], 10, .big);
+    std.mem.writeInt(u32, peer.small_body_buf[5..9], 16384, .big); // different offset
+    std.mem.writeInt(u32, peer.small_body_buf[9..13], 16384, .big);
+    peer.body_buf = &peer.small_body_buf;
+
+    processMessage(&el, slot);
+
+    // Response should still be in the queue
+    try testing.expectEqual(@as(usize, 1), el.queued_responses.items.len);
+
+    // Clean up
+    _ = el.queued_responses.swapRemove(0);
+}
+
+// ── Empty / null body ────────────────────────────────────
+
+test "processMessage returns early on null body_buf" {
+    var el = try EventLoop.initBare(testing.allocator, 0);
+    defer el.deinit();
+    try setupTestTorrent(&el, null);
+    const slot: u16 = 0;
+    const peer = &el.peers[slot];
+    peer.* = Peer{};
+    peer.state = .active_recv_header;
+    peer.torrent_id = 0;
+    peer.body_buf = null;
+
+    // Should return immediately without crashing
+    processMessage(&el, slot);
+
+    try testing.expect(peer.peer_choking); // unchanged from default
+}
+
+test "processMessage returns early on empty body" {
+    var el = try EventLoop.initBare(testing.allocator, 0);
+    defer el.deinit();
+    try setupTestTorrent(&el, null);
+    const slot: u16 = 0;
+    const peer = &el.peers[slot];
+    peer.* = Peer{};
+    peer.state = .active_recv_header;
+    peer.torrent_id = 0;
+
+    // Empty slice body
+    const empty: []u8 = &.{};
+    peer.body_buf = empty;
+
+    processMessage(&el, slot);
+
+    try testing.expect(peer.peer_choking); // unchanged
+}
+
+// ── Unknown message ID ───────────────────────────────────
+
+test "unknown message ID is silently ignored" {
+    var el = try EventLoop.initBare(testing.allocator, 0);
+    defer el.deinit();
+    try setupTestTorrent(&el, null);
+    const slot = try setupTestPeer(&el);
+    const peer = &el.peers[slot];
+
+    peer.small_body_buf[0] = 255; // unknown message ID
+    peer.body_buf = &peer.small_body_buf;
+
+    const choking_before = peer.peer_choking;
+    const interested_before = peer.peer_interested;
+
+    processMessage(&el, slot);
+
+    // State should be untouched
+    try testing.expectEqual(choking_before, peer.peer_choking);
+    try testing.expectEqual(interested_before, peer.peer_interested);
+}

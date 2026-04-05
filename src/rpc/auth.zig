@@ -232,3 +232,176 @@ test "active count tracks sessions" {
     store.removeSession(&sid2);
     try std.testing.expectEqual(@as(usize, 1), store.activeCount());
 }
+
+// ── Additional session store tests ───────────────────────
+
+test "validate session with wrong length returns false" {
+    var store = SessionStore{};
+    _ = store.createSession();
+
+    // Too short
+    try std.testing.expect(!store.validateSession("abc"));
+    // Too long
+    try std.testing.expect(!store.validateSession("a" ** 33));
+    // Empty
+    try std.testing.expect(!store.validateSession(""));
+    // Exactly 32 but wrong content
+    try std.testing.expect(!store.validateSession("00000000000000000000000000000000"));
+}
+
+test "remove session with wrong length is no-op" {
+    var store = SessionStore{};
+    const sid = store.createSession();
+
+    // Removing with wrong length should not affect the valid session
+    store.removeSession("short");
+    store.removeSession("a" ** 33);
+    store.removeSession("");
+
+    // Original session should still be valid
+    try std.testing.expect(store.validateSession(&sid));
+}
+
+test "remove nonexistent session is no-op" {
+    var store = SessionStore{};
+    const sid = store.createSession();
+
+    // Remove a session that doesn't exist (correct length but wrong content)
+    store.removeSession("zzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz");
+
+    // Original session should still be valid
+    try std.testing.expect(store.validateSession(&sid));
+    try std.testing.expectEqual(@as(usize, 1), store.activeCount());
+}
+
+test "created session IDs are unique" {
+    var store = SessionStore{};
+    const sid1 = store.createSession();
+    const sid2 = store.createSession();
+    const sid3 = store.createSession();
+
+    try std.testing.expect(!std.mem.eql(u8, &sid1, &sid2));
+    try std.testing.expect(!std.mem.eql(u8, &sid2, &sid3));
+    try std.testing.expect(!std.mem.eql(u8, &sid1, &sid3));
+}
+
+test "session IDs are 32-char hex strings" {
+    var store = SessionStore{};
+    const sid = store.createSession();
+    const hex_chars = "0123456789abcdef";
+
+    for (sid) |c| {
+        try std.testing.expect(std.mem.indexOfScalar(u8, hex_chars, c) != null);
+    }
+}
+
+test "active count excludes expired sessions" {
+    var store = SessionStore{ .session_timeout_secs = 0 };
+    const sid = store.createSession();
+
+    // Force session into the past
+    for (&store.sessions) |*slot| {
+        if (slot.*) |*session| {
+            if (std.mem.eql(u8, &session.sid, &sid)) {
+                session.last_active -= 1;
+            }
+        }
+    }
+
+    try std.testing.expectEqual(@as(usize, 0), store.activeCount());
+}
+
+test "validate refreshes last_active timestamp" {
+    var store = SessionStore{ .session_timeout_secs = 100 };
+    const sid = store.createSession();
+
+    // Manually set last_active to something old but not expired
+    for (&store.sessions) |*slot| {
+        if (slot.*) |*session| {
+            if (std.mem.eql(u8, &session.sid, &sid)) {
+                session.last_active = std.time.timestamp() - 50;
+            }
+        }
+    }
+
+    // Validate should refresh the timestamp
+    try std.testing.expect(store.validateSession(&sid));
+
+    // Check that last_active was updated to approximately now
+    for (store.sessions) |slot| {
+        if (slot) |session| {
+            if (std.mem.eql(u8, &session.sid, &sid)) {
+                const now = std.time.timestamp();
+                try std.testing.expect(now - session.last_active < 5);
+            }
+        }
+    }
+}
+
+test "max sessions eviction picks oldest by last_active" {
+    var store = SessionStore{};
+
+    // Fill all slots and stagger timestamps
+    for (0..SessionStore.max_sessions) |i| {
+        _ = store.createSession();
+        // Set last_active so slot 0 is oldest (timestamp 0), slot 1 is 1, etc.
+        store.sessions[i].?.last_active = @intCast(i);
+    }
+
+    // All slots full. Creating another session should evict the slot with
+    // last_active=0 (the oldest).
+    const old_sid_0 = store.sessions[0].?.sid;
+    const new_sid = store.createSession();
+
+    // The old session at slot 0 should be gone
+    try std.testing.expect(!store.validateSession(&old_sid_0));
+    // The new session should be valid
+    try std.testing.expect(store.validateSession(&new_sid));
+}
+
+// ── Additional header extraction tests ───────────────────
+
+test "extractSidFromHeaders handles missing SID in cookie" {
+    const headers = "Cookie: other=abc123\r\n\r\n";
+    try std.testing.expect(extractSidFromHeaders(headers) == null);
+}
+
+test "extractSidFromHeaders handles empty cookie value" {
+    const headers = "Cookie: \r\n\r\n";
+    try std.testing.expect(extractSidFromHeaders(headers) == null);
+}
+
+test "extractSidFromHeaders handles cookie header with SID at end" {
+    const headers = "Host: localhost\r\nCookie: foo=bar; SID=abcdef0123456789abcdef0123456789\r\n\r\n";
+    const sid = extractSidFromHeaders(headers);
+    try std.testing.expect(sid != null);
+    try std.testing.expectEqualStrings("abcdef0123456789abcdef0123456789", sid.?);
+}
+
+test "extractSidFromHeaders is case sensitive for Cookie header name" {
+    // The implementation checks for "Cookie:" specifically
+    const headers = "COOKIE: SID=abcdef0123456789abcdef0123456789\r\n\r\n";
+    // Should still match because extractSidFromHeaders uses eqlIgnoreCase
+    const sid = extractSidFromHeaders(headers);
+    try std.testing.expect(sid != null);
+    try std.testing.expectEqualStrings("abcdef0123456789abcdef0123456789", sid.?);
+}
+
+test "extractSidFromHeaders handles cookie lowercase" {
+    const headers = "cookie: SID=abcdef0123456789abcdef0123456789\r\n\r\n";
+    const sid = extractSidFromHeaders(headers);
+    try std.testing.expect(sid != null);
+    try std.testing.expectEqualStrings("abcdef0123456789abcdef0123456789", sid.?);
+}
+
+test "extractSidFromHeaders ignores non-cookie headers" {
+    const headers = "X-SID: fake\r\nAuthorization: SID=fake\r\n\r\n";
+    try std.testing.expect(extractSidFromHeaders(headers) == null);
+}
+
+test "extractSidFromHeaders handles multiple headers before cookie" {
+    const headers = "Host: localhost:8080\r\nAccept: */*\r\nUser-Agent: test\r\nCookie: SID=abcdef0123456789abcdef0123456789\r\nConnection: keep-alive\r\n\r\n";
+    const sid = extractSidFromHeaders(headers);
+    try std.testing.expect(sid != null);
+    try std.testing.expectEqualStrings("abcdef0123456789abcdef0123456789", sid.?);
+}

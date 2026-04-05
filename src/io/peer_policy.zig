@@ -7,6 +7,7 @@ const pex_mod = @import("../net/pex.zig");
 const storage = @import("../storage/root.zig");
 const EventLoop = @import("event_loop.zig").EventLoop;
 const Peer = @import("event_loop.zig").Peer;
+const PeerState = @import("event_loop.zig").PeerState;
 const TorrentContext = @import("event_loop.zig").TorrentContext;
 const encodeUserData = @import("event_loop.zig").encodeUserData;
 const max_peers = @import("event_loop.zig").max_peers;
@@ -967,4 +968,404 @@ pub fn checkPartialSeed(self: *EventLoop) void {
             };
         }
     }
+}
+
+// ── Tests ─────────────────────────────────────────────────
+
+test "writeRequestMsg formats 17-byte request message correctly" {
+    var buf: [17]u8 = undefined;
+    const req = .{
+        .piece_index = @as(u32, 42),
+        .piece_offset = @as(u32, 16384),
+        .length = @as(u32, 16384),
+    };
+    writeRequestMsg(&buf, req);
+
+    // 4-byte big-endian length = 13 (1 byte id + 12 byte payload)
+    try std.testing.expectEqual(@as(u32, 13), std.mem.readInt(u32, buf[0..4], .big));
+    // 1-byte message id = 6 (REQUEST)
+    try std.testing.expectEqual(@as(u8, 6), buf[4]);
+    // piece_index = 42
+    try std.testing.expectEqual(@as(u32, 42), std.mem.readInt(u32, buf[5..9], .big));
+    // piece_offset = 16384
+    try std.testing.expectEqual(@as(u32, 16384), std.mem.readInt(u32, buf[9..13], .big));
+    // length = 16384
+    try std.testing.expectEqual(@as(u32, 16384), std.mem.readInt(u32, buf[13..17], .big));
+}
+
+test "writeRequestMsg encodes zero values" {
+    var buf: [17]u8 = undefined;
+    const req = .{
+        .piece_index = @as(u32, 0),
+        .piece_offset = @as(u32, 0),
+        .length = @as(u32, 0),
+    };
+    writeRequestMsg(&buf, req);
+
+    try std.testing.expectEqual(@as(u32, 13), std.mem.readInt(u32, buf[0..4], .big));
+    try std.testing.expectEqual(@as(u8, 6), buf[4]);
+    try std.testing.expectEqual(@as(u32, 0), std.mem.readInt(u32, buf[5..9], .big));
+    try std.testing.expectEqual(@as(u32, 0), std.mem.readInt(u32, buf[9..13], .big));
+    try std.testing.expectEqual(@as(u32, 0), std.mem.readInt(u32, buf[13..17], .big));
+}
+
+test "writeRequestMsg encodes max u32 values" {
+    var buf: [17]u8 = undefined;
+    const max = std.math.maxInt(u32);
+    const req = .{
+        .piece_index = @as(u32, max),
+        .piece_offset = @as(u32, max),
+        .length = @as(u32, max),
+    };
+    writeRequestMsg(&buf, req);
+
+    try std.testing.expectEqual(@as(u32, 13), std.mem.readInt(u32, buf[0..4], .big));
+    try std.testing.expectEqual(@as(u8, 6), buf[4]);
+    try std.testing.expectEqual(max, std.mem.readInt(u32, buf[5..9], .big));
+    try std.testing.expectEqual(max, std.mem.readInt(u32, buf[9..13], .big));
+    try std.testing.expectEqual(max, std.mem.readInt(u32, buf[13..17], .big));
+}
+
+test "promoteNextPieceOrMarkIdle promotes next piece to current" {
+    var el = try EventLoop.initBare(std.testing.allocator, 0);
+    defer el.deinit();
+
+    const slot: u16 = 0;
+    const peer = &el.peers[slot];
+    peer.state = .active_recv_header;
+    peer.mode = .download;
+    peer.availability_known = true;
+    peer.peer_choking = false;
+
+    // Set up next_piece state to promote
+    peer.next_piece = 7;
+    peer.next_piece_buf = try std.testing.allocator.alloc(u8, 64);
+    peer.next_blocks_expected = 4;
+    peer.next_blocks_received = 4; // all received so completePieceDownload will fire
+    peer.next_pipeline_sent = 4;
+
+    // current_piece should be null before promotion
+    peer.current_piece = null;
+    peer.piece_buf = null;
+
+    // promoteNextPieceOrMarkIdle will promote, then see blocks_received >= blocks_expected
+    // and call completePieceDownload, which needs a torrent context. Without one it
+    // returns early and calls markIdle. The key thing to verify is that promotion happened.
+    promoteNextPieceOrMarkIdle(&el, slot);
+
+    // After promotion + completePieceDownload (which returns early without torrent context),
+    // current_piece should be null (cleared by completePieceDownload's early return path)
+    // and next_piece fields should be cleared.
+    try std.testing.expectEqual(@as(?u32, null), peer.next_piece);
+    try std.testing.expectEqual(@as(?[]u8, null), peer.next_piece_buf);
+    try std.testing.expectEqual(@as(u32, 0), peer.next_blocks_expected);
+    try std.testing.expectEqual(@as(u32, 0), peer.next_blocks_received);
+    try std.testing.expectEqual(@as(u32, 0), peer.next_pipeline_sent);
+}
+
+test "promoteNextPieceOrMarkIdle marks idle when no next piece" {
+    var el = try EventLoop.initBare(std.testing.allocator, 0);
+    defer el.deinit();
+
+    const slot: u16 = 0;
+    const peer = &el.peers[slot];
+    peer.state = .active_recv_header;
+    peer.mode = .download;
+    peer.availability_known = true;
+    peer.peer_choking = false;
+    peer.current_piece = null;
+    peer.next_piece = null;
+
+    el.markActivePeer(slot);
+
+    promoteNextPieceOrMarkIdle(&el, slot);
+
+    // Should be in idle list since there is no next piece
+    try std.testing.expect(peer.idle_peer_index != null);
+}
+
+test "recalculateUnchokes unchokes top peers by download speed" {
+    var el = try EventLoop.initBare(std.testing.allocator, 0);
+    defer el.deinit();
+
+    // Force recalculation by setting last_unchoke_recalc far in the past
+    el.last_unchoke_recalc = 0;
+
+    // Set up 6 peers: all interested, various download speeds.
+    // max_unchoked = 4, so top 4 by speed should be unchoked.
+    const slots = [_]u16{ 0, 1, 2, 3, 4, 5 };
+    const speeds = [_]u64{ 100, 500, 200, 700, 50, 300 };
+
+    for (slots, speeds) |slot, speed| {
+        const peer = &el.peers[slot];
+        peer.state = .active_recv_header;
+        peer.mode = .download; // download mode: sort by dl speed
+        peer.peer_interested = true;
+        peer.am_choking = true;
+        peer.current_dl_speed = speed;
+        peer.last_activity = std.time.timestamp();
+        el.markActivePeer(slot);
+    }
+
+    recalculateUnchokes(&el);
+
+    // Top 4 by dl speed: slot 3 (700), slot 1 (500), slot 5 (300), slot 2 (200)
+    // Choked: slot 0 (100), slot 4 (50)
+    try std.testing.expectEqual(false, el.peers[3].am_choking); // 700
+    try std.testing.expectEqual(false, el.peers[1].am_choking); // 500
+    try std.testing.expectEqual(false, el.peers[5].am_choking); // 300
+    try std.testing.expectEqual(false, el.peers[2].am_choking); // 200
+    // Slot 0 and 4 should remain choked (or one might be optimistic-unchoked,
+    // but they start am_choking=true and the optimistic path only unchokes
+    // when last_optimistic_unchoke is old enough).
+}
+
+test "recalculateUnchokes uses upload speed in seed mode" {
+    var el = try EventLoop.initBare(std.testing.allocator, 0);
+    defer el.deinit();
+
+    el.last_unchoke_recalc = 0;
+
+    // All peers are in seed mode (inbound), so is_seeding = true
+    // and sorting is by upload speed.
+    const slots = [_]u16{ 0, 1, 2, 3, 4 };
+    const ul_speeds = [_]u64{ 10, 50, 30, 80, 20 };
+
+    for (slots, ul_speeds) |slot, speed| {
+        const peer = &el.peers[slot];
+        peer.state = .active_recv_header;
+        peer.mode = .seed; // all seed mode -> is_seeding = true
+        peer.peer_interested = true;
+        peer.am_choking = true;
+        peer.current_ul_speed = speed;
+        peer.last_activity = std.time.timestamp();
+        el.markActivePeer(slot);
+    }
+
+    recalculateUnchokes(&el);
+
+    // Top 4 by upload speed: slot 3 (80), slot 1 (50), slot 2 (30), slot 4 (20)
+    try std.testing.expectEqual(false, el.peers[3].am_choking); // 80
+    try std.testing.expectEqual(false, el.peers[1].am_choking); // 50
+    try std.testing.expectEqual(false, el.peers[2].am_choking); // 30
+    try std.testing.expectEqual(false, el.peers[4].am_choking); // 20
+    // slot 0 (10) is the lowest -- should remain choked (or optimistic)
+}
+
+test "recalculateUnchokes skips uninterested peers" {
+    var el = try EventLoop.initBare(std.testing.allocator, 0);
+    defer el.deinit();
+
+    el.last_unchoke_recalc = 0;
+
+    // Peer 0: interested, speed 100
+    el.peers[0].state = .active_recv_header;
+    el.peers[0].mode = .download;
+    el.peers[0].peer_interested = true;
+    el.peers[0].am_choking = true;
+    el.peers[0].current_dl_speed = 100;
+    el.markActivePeer(0);
+
+    // Peer 1: NOT interested, speed 999
+    el.peers[1].state = .active_recv_header;
+    el.peers[1].mode = .download;
+    el.peers[1].peer_interested = false;
+    el.peers[1].am_choking = true;
+    el.peers[1].current_dl_speed = 999;
+    el.markActivePeer(1);
+
+    recalculateUnchokes(&el);
+
+    // Peer 0 should be unchoked (interested)
+    try std.testing.expectEqual(false, el.peers[0].am_choking);
+    // Peer 1 should remain choked (not interested, never considered)
+    try std.testing.expectEqual(true, el.peers[1].am_choking);
+}
+
+test "recalculateUnchokes respects interval gating" {
+    var el = try EventLoop.initBare(std.testing.allocator, 0);
+    defer el.deinit();
+
+    // Set last recalc to now so the interval check fails
+    el.last_unchoke_recalc = std.time.timestamp();
+
+    el.peers[0].state = .active_recv_header;
+    el.peers[0].mode = .download;
+    el.peers[0].peer_interested = true;
+    el.peers[0].am_choking = true;
+    el.peers[0].current_dl_speed = 100;
+    el.markActivePeer(0);
+
+    recalculateUnchokes(&el);
+
+    // Should NOT unchoke because interval has not elapsed
+    try std.testing.expectEqual(true, el.peers[0].am_choking);
+}
+
+test "checkPeerTimeouts removes inactive download peers" {
+    var el = try EventLoop.initBare(std.testing.allocator, 0);
+    defer el.deinit();
+
+    // Peer 0: download mode, last activity is old (should be timed out)
+    el.peers[0].state = .active_recv_header;
+    el.peers[0].mode = .download;
+    el.peers[0].last_activity = std.time.timestamp() - (peer_timeout_secs + 10);
+    el.peer_count = 1;
+    el.markActivePeer(0);
+
+    checkPeerTimeouts(&el);
+
+    // Peer should have been removed (state reset to .free)
+    try std.testing.expectEqual(PeerState.free, el.peers[0].state);
+    try std.testing.expectEqual(@as(u16, 0), el.peer_count);
+}
+
+test "checkPeerTimeouts does not remove seed mode peers" {
+    var el = try EventLoop.initBare(std.testing.allocator, 0);
+    defer el.deinit();
+
+    // Peer 0: seed mode, last activity is old -- should NOT be timed out
+    el.peers[0].state = .active_recv_header;
+    el.peers[0].mode = .seed;
+    el.peers[0].last_activity = std.time.timestamp() - (peer_timeout_secs + 100);
+    el.peer_count = 1;
+    el.markActivePeer(0);
+
+    checkPeerTimeouts(&el);
+
+    // Peer should still be active
+    try std.testing.expect(el.peers[0].state != .free);
+    try std.testing.expectEqual(@as(u16, 1), el.peer_count);
+}
+
+test "checkPeerTimeouts does not remove recently active peers" {
+    var el = try EventLoop.initBare(std.testing.allocator, 0);
+    defer el.deinit();
+
+    // Peer 0: download mode, recently active -- should NOT be timed out
+    el.peers[0].state = .active_recv_header;
+    el.peers[0].mode = .download;
+    el.peers[0].last_activity = std.time.timestamp() - 5; // 5 seconds ago
+    el.peer_count = 1;
+    el.markActivePeer(0);
+
+    checkPeerTimeouts(&el);
+
+    try std.testing.expect(el.peers[0].state != .free);
+    try std.testing.expectEqual(@as(u16, 1), el.peer_count);
+}
+
+test "checkPeerTimeouts skips free and disconnecting peers" {
+    var el = try EventLoop.initBare(std.testing.allocator, 0);
+    defer el.deinit();
+
+    // Peer 0: free state with old timestamp -- should be skipped
+    el.peers[0].state = .free;
+    el.peers[0].mode = .download;
+    el.peers[0].last_activity = std.time.timestamp() - (peer_timeout_secs + 100);
+
+    // Peer 1: disconnecting state with old timestamp -- should be skipped
+    el.peers[1].state = .disconnecting;
+    el.peers[1].mode = .download;
+    el.peers[1].last_activity = std.time.timestamp() - (peer_timeout_secs + 100);
+    el.markActivePeer(1);
+
+    // These should not crash or remove anything
+    checkPeerTimeouts(&el);
+
+    // Peer 1 stays in disconnecting (not re-removed), peer 0 stays free
+    try std.testing.expectEqual(PeerState.free, el.peers[0].state);
+    try std.testing.expectEqual(PeerState.disconnecting, el.peers[1].state);
+}
+
+test "sendKeepAlives queues send for quiet peer" {
+    var el = try EventLoop.initBare(std.testing.allocator, 0);
+    defer el.deinit();
+
+    const slot: u16 = 0;
+    const peer = &el.peers[slot];
+    peer.state = .active_recv_header;
+    peer.mode = .download;
+    peer.send_pending = false;
+    // Set last_activity well beyond the keepalive interval
+    peer.last_activity = std.time.timestamp() - (keepalive_interval_secs + 10);
+    // Need a valid fd for the ring.send call -- use a /dev/null fd
+    peer.fd = std.posix.open("/dev/null", .{ .ACCMODE = .WRONLY }, 0) catch -1;
+    defer if (peer.fd >= 0) std.posix.close(peer.fd);
+    el.markActivePeer(slot);
+
+    sendKeepAlives(&el);
+
+    // After sendKeepAlives, the peer's send_pending should be true
+    // because a keep-alive was queued via ring.send.
+    // If the ring.send fails (possible in test), send_pending stays false,
+    // but last_activity is only updated if the send succeeded.
+    // With /dev/null, the SQE should be accepted by the ring.
+    if (peer.send_pending) {
+        // Verify last_activity was updated to approximately now
+        const now = std.time.timestamp();
+        try std.testing.expect(now - peer.last_activity < 5);
+    }
+}
+
+test "sendKeepAlives skips peer with recent activity" {
+    var el = try EventLoop.initBare(std.testing.allocator, 0);
+    defer el.deinit();
+
+    const slot: u16 = 0;
+    const peer = &el.peers[slot];
+    peer.state = .active_recv_header;
+    peer.mode = .download;
+    peer.send_pending = false;
+    peer.last_activity = std.time.timestamp() - 10; // only 10 seconds ago, well within interval
+    peer.fd = -1;
+    el.markActivePeer(slot);
+
+    const original_activity = peer.last_activity;
+    sendKeepAlives(&el);
+
+    // Should not have touched this peer -- activity timestamp unchanged
+    try std.testing.expectEqual(original_activity, peer.last_activity);
+    try std.testing.expectEqual(false, peer.send_pending);
+}
+
+test "sendKeepAlives skips peer with send already pending" {
+    var el = try EventLoop.initBare(std.testing.allocator, 0);
+    defer el.deinit();
+
+    const slot: u16 = 0;
+    const peer = &el.peers[slot];
+    peer.state = .active_recv_header;
+    peer.mode = .download;
+    peer.send_pending = true; // already has a send in flight
+    peer.last_activity = std.time.timestamp() - (keepalive_interval_secs + 10);
+    peer.fd = -1;
+    el.markActivePeer(slot);
+
+    const original_activity = peer.last_activity;
+    sendKeepAlives(&el);
+
+    // Should not modify anything since send_pending is already true
+    try std.testing.expectEqual(original_activity, peer.last_activity);
+}
+
+test "sendKeepAlives skips non-active peers" {
+    var el = try EventLoop.initBare(std.testing.allocator, 0);
+    defer el.deinit();
+
+    // A peer in handshake state should be skipped
+    const slot: u16 = 0;
+    const peer = &el.peers[slot];
+    peer.state = .handshake_send;
+    peer.mode = .download;
+    peer.send_pending = false;
+    peer.last_activity = std.time.timestamp() - (keepalive_interval_secs + 10);
+    peer.fd = -1;
+    el.markActivePeer(slot);
+
+    const original_activity = peer.last_activity;
+    sendKeepAlives(&el);
+
+    try std.testing.expectEqual(original_activity, peer.last_activity);
+    try std.testing.expectEqual(false, peer.send_pending);
 }

@@ -1868,3 +1868,352 @@ test "extract json float" {
     try std.testing.expect(@abs(v3 - 0.75) < eps);
     try std.testing.expect(extractJsonFloat("{}", "max_ratio") == null);
 }
+
+// ── Additional parameter extraction tests ────────────────
+
+test "extractParam returns empty string for key with no value" {
+    try std.testing.expectEqualStrings("", extractParam("hashes=&deleteFiles=true", "hashes").?);
+}
+
+test "extractParam returns first match for duplicate keys" {
+    try std.testing.expectEqualStrings("first", extractParam("key=first&key=second", "key").?);
+}
+
+test "extractParam handles single param without ampersand" {
+    try std.testing.expectEqualStrings("val", extractParam("key=val", "key").?);
+}
+
+test "extractParam returns null for empty body" {
+    try std.testing.expect(extractParam("", "key") == null);
+}
+
+test "extractParam does not match partial key names" {
+    // "hash" should not match "hashes=abc"
+    try std.testing.expect(extractParam("hashes=abc", "hash") == null);
+}
+
+test "extractParam handles value with equals sign" {
+    // "url=http://host?a=b" -- value contains '='
+    try std.testing.expectEqualStrings("http://host?a", extractParam("url=http://host?a=b", "url").?);
+}
+
+test "extractParam handles url-encoded special chars in value" {
+    try std.testing.expectEqualStrings("hello%20world", extractParam("name=hello%20world", "name").?);
+}
+
+test "extractJsonInt returns null for non-numeric value" {
+    try std.testing.expect(extractJsonInt("{\"dl_limit\":\"abc\"}", "dl_limit") == null);
+}
+
+test "extractJsonInt handles zero value" {
+    try std.testing.expectEqual(@as(?u64, 0), extractJsonInt("{\"dl_limit\":0}", "dl_limit"));
+}
+
+test "extractJsonInt handles large value" {
+    try std.testing.expectEqual(@as(?u64, 999999999), extractJsonInt("{\"dl_limit\":999999999}", "dl_limit"));
+}
+
+test "extractJsonInt returns null for empty body" {
+    try std.testing.expect(extractJsonInt("", "dl_limit") == null);
+}
+
+test "extractJsonInt handles multiple spaces after colon" {
+    try std.testing.expectEqual(@as(?u64, 42), extractJsonInt("{\"dl_limit\":  42}", "dl_limit"));
+}
+
+test "extractJsonBool returns null for empty body" {
+    try std.testing.expect(extractJsonBool("", "enabled") == null);
+}
+
+test "extractJsonBool handles key with multiple whitespace" {
+    try std.testing.expectEqual(@as(?bool, false), extractJsonBool("{\"enabled\":   false}", "enabled"));
+}
+
+test "extractJsonBool returns null for string true" {
+    // "true" in quotes should not match
+    try std.testing.expect(extractJsonBool("{\"enabled\":\"true\"}", "enabled") == null);
+}
+
+test "extractJsonFloat handles zero" {
+    const eps = 0.0001;
+    const v = extractJsonFloat("{\"ratio\":0.0}", "ratio").?;
+    try std.testing.expect(@abs(v) < eps);
+}
+
+test "extractJsonFloat handles negative decimal" {
+    const eps = 0.0001;
+    const v = extractJsonFloat("{\"ratio\":-2.5}", "ratio").?;
+    try std.testing.expect(@abs(v - (-2.5)) < eps);
+}
+
+test "extractJsonFloat returns null for boolean value" {
+    try std.testing.expect(extractJsonFloat("{\"ratio\":true}", "ratio") == null);
+}
+
+test "extractJsonFloat returns null for empty body" {
+    try std.testing.expect(extractJsonFloat("", "ratio") == null);
+}
+
+test "extractJsonInt key length near buffer limit" {
+    // Key that is exactly 125 chars (128 - 3 for quotes and colon)
+    const long_key = "a" ** 125;
+    const body = "\"" ++ long_key ++ "\":42";
+    try std.testing.expectEqual(@as(?u64, 42), extractJsonInt(body, long_key));
+}
+
+test "extractJsonInt key too long for needle buffer" {
+    // Key that exceeds 125 chars should return null gracefully
+    const long_key = "a" ** 126;
+    try std.testing.expect(extractJsonInt("{}", long_key) == null);
+}
+
+// ── serializeTorrentInfo tests ───────────────────────────
+
+test "serializeTorrentInfo produces valid JSON object" {
+    const allocator = std.testing.allocator;
+    var json = std.ArrayList(u8).empty;
+    defer json.deinit(allocator);
+
+    const stat = TorrentSession.Stats{
+        .state = .downloading,
+        .progress = 0.5,
+        .download_speed = 1024000,
+        .upload_speed = 512000,
+        .pieces_have = 50,
+        .pieces_total = 100,
+        .total_size = 1048576,
+        .bytes_downloaded = 524288,
+        .bytes_uploaded = 262144,
+        .peers_connected = 5,
+        .name = "test_torrent",
+        .info_hash_hex = "abcdef0123456789abcdef0123456789abcdef01".*,
+        .save_path = "/downloads",
+        .added_on = 1000000,
+    };
+
+    try serializeTorrentInfo(allocator, &json, stat);
+
+    const body = json.items;
+    // Must start with { and end with }
+    try std.testing.expect(body.len > 0);
+    try std.testing.expectEqual(@as(u8, '{'), body[0]);
+    try std.testing.expectEqual(@as(u8, '}'), body[body.len - 1]);
+
+    // Must contain required qBittorrent fields
+    try std.testing.expect(std.mem.indexOf(u8, body, "\"name\":\"test_torrent\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, body, "\"hash\":\"abcdef0123456789abcdef0123456789abcdef01\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, body, "\"state\":\"downloading\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, body, "\"progress\":0.5000") != null);
+    try std.testing.expect(std.mem.indexOf(u8, body, "\"dlspeed\":1024000") != null);
+    try std.testing.expect(std.mem.indexOf(u8, body, "\"upspeed\":512000") != null);
+    try std.testing.expect(std.mem.indexOf(u8, body, "\"total_size\":1048576") != null);
+    try std.testing.expect(std.mem.indexOf(u8, body, "\"save_path\":\"/downloads\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, body, "\"content_path\":\"/downloads/test_torrent\"") != null);
+}
+
+test "serializeTorrentInfo maps completed torrent state to uploading" {
+    const allocator = std.testing.allocator;
+    var json = std.ArrayList(u8).empty;
+    defer json.deinit(allocator);
+
+    const stat = TorrentSession.Stats{
+        .state = .downloading,
+        .progress = 1.0,
+        .name = "completed_torrent",
+        .info_hash_hex = "1111111111111111111111111111111111111111".*,
+        .save_path = "/data",
+    };
+
+    try serializeTorrentInfo(allocator, &json, stat);
+    const body = json.items;
+
+    // Progress 1.0 + downloading state -> "uploading" per qBittorrent compat
+    try std.testing.expect(std.mem.indexOf(u8, body, "\"state\":\"uploading\"") != null);
+    // completion_on should be set (not -1) when progress >= 1.0
+    try std.testing.expect(std.mem.indexOf(u8, body, "\"completion_on\":-1") == null);
+}
+
+test "serializeTorrentInfo includes seeding-related fields" {
+    const allocator = std.testing.allocator;
+    var json = std.ArrayList(u8).empty;
+    defer json.deinit(allocator);
+
+    const stat = TorrentSession.Stats{
+        .state = .seeding,
+        .progress = 1.0,
+        .sequential_download = true,
+        .is_private = true,
+        .super_seeding = true,
+        .name = "private_torrent",
+        .info_hash_hex = "2222222222222222222222222222222222222222".*,
+        .save_path = "/data",
+        .ratio = 2.5,
+        .category = "movies",
+        .tags = "hd,favorite",
+    };
+
+    try serializeTorrentInfo(allocator, &json, stat);
+    const body = json.items;
+
+    try std.testing.expect(std.mem.indexOf(u8, body, "\"seq_dl\":true") != null);
+    try std.testing.expect(std.mem.indexOf(u8, body, "\"private\":true") != null);
+    try std.testing.expect(std.mem.indexOf(u8, body, "\"super_seeding\":true") != null);
+    try std.testing.expect(std.mem.indexOf(u8, body, "\"category\":\"movies\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, body, "\"tags\":\"hd,favorite\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, body, "\"ratio\":2.5000") != null);
+}
+
+test "serializeTorrentInfo escapes special characters in name" {
+    const allocator = std.testing.allocator;
+    var json = std.ArrayList(u8).empty;
+    defer json.deinit(allocator);
+
+    const stat = TorrentSession.Stats{
+        .state = .downloading,
+        .progress = 0.0,
+        .name = "file \"with\" quotes",
+        .info_hash_hex = "3333333333333333333333333333333333333333".*,
+        .save_path = "/path/to/dir",
+    };
+
+    try serializeTorrentInfo(allocator, &json, stat);
+    const body = json.items;
+
+    // Quotes in name must be escaped for valid JSON
+    try std.testing.expect(std.mem.indexOf(u8, body, "\\\"with\\\"") != null);
+}
+
+test "serializeTorrentInfo computes amount_left correctly" {
+    const allocator = std.testing.allocator;
+    var json = std.ArrayList(u8).empty;
+    defer json.deinit(allocator);
+
+    const stat = TorrentSession.Stats{
+        .state = .downloading,
+        .progress = 0.75,
+        .total_size = 1000,
+        .bytes_downloaded = 750,
+        .name = "partial",
+        .info_hash_hex = "4444444444444444444444444444444444444444".*,
+        .save_path = "/dl",
+    };
+
+    try serializeTorrentInfo(allocator, &json, stat);
+    const body = json.items;
+
+    // amount_left = total_size - bytes_downloaded = 250
+    try std.testing.expect(std.mem.indexOf(u8, body, "\"amount_left\":250") != null);
+}
+
+test "serializeTorrentInfo includes v2 info hash when present" {
+    const allocator = std.testing.allocator;
+    var json = std.ArrayList(u8).empty;
+    defer json.deinit(allocator);
+
+    var v2_hash: [32]u8 = undefined;
+    for (&v2_hash, 0..) |*b, i| b.* = @intCast(i);
+
+    const stat = TorrentSession.Stats{
+        .state = .downloading,
+        .progress = 0.0,
+        .name = "v2_torrent",
+        .info_hash_hex = "5555555555555555555555555555555555555555".*,
+        .info_hash_v2 = v2_hash,
+        .save_path = "/dl",
+    };
+
+    try serializeTorrentInfo(allocator, &json, stat);
+    const body = json.items;
+
+    // v2 hash should be the 64-char hex representation
+    try std.testing.expect(std.mem.indexOf(u8, body, "\"infohash_v2\":\"000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f\"") != null);
+}
+
+test "serializeTorrentInfo omits v2 info hash for pure v1 torrent" {
+    const allocator = std.testing.allocator;
+    var json = std.ArrayList(u8).empty;
+    defer json.deinit(allocator);
+
+    const stat = TorrentSession.Stats{
+        .state = .downloading,
+        .progress = 0.0,
+        .name = "v1_torrent",
+        .info_hash_hex = "6666666666666666666666666666666666666666".*,
+        .info_hash_v2 = null,
+        .save_path = "/dl",
+    };
+
+    try serializeTorrentInfo(allocator, &json, stat);
+    const body = json.items;
+
+    // v2 hash should be empty string for pure v1
+    try std.testing.expect(std.mem.indexOf(u8, body, "\"infohash_v2\":\"\"") != null);
+}
+
+test "serializeTorrentInfo includes magnet_uri field" {
+    const allocator = std.testing.allocator;
+    var json = std.ArrayList(u8).empty;
+    defer json.deinit(allocator);
+
+    const stat = TorrentSession.Stats{
+        .state = .downloading,
+        .progress = 0.0,
+        .name = "magnet_test",
+        .info_hash_hex = "7777777777777777777777777777777777777777".*,
+        .save_path = "/dl",
+        .tracker = "http://tracker.example.com/announce",
+    };
+
+    try serializeTorrentInfo(allocator, &json, stat);
+    const body = json.items;
+
+    // Must contain a magnet URI with the info hash
+    try std.testing.expect(std.mem.indexOf(u8, body, "\"magnet_uri\":\"magnet:?xt=urn:btih:7777777777777777777777777777777777777777") != null);
+}
+
+test "serializeTorrentInfo includes queue position and share limits" {
+    const allocator = std.testing.allocator;
+    var json = std.ArrayList(u8).empty;
+    defer json.deinit(allocator);
+
+    const stat = TorrentSession.Stats{
+        .state = .queued,
+        .progress = 0.3,
+        .name = "queued_torrent",
+        .info_hash_hex = "8888888888888888888888888888888888888888".*,
+        .save_path = "/dl",
+        .queue_position = 3,
+        .ratio_limit = 1.5,
+        .seeding_time_limit = 7200,
+    };
+
+    try serializeTorrentInfo(allocator, &json, stat);
+    const body = json.items;
+
+    try std.testing.expect(std.mem.indexOf(u8, body, "\"priority\":3") != null);
+    try std.testing.expect(std.mem.indexOf(u8, body, "\"ratio_limit\":1.5000") != null);
+    try std.testing.expect(std.mem.indexOf(u8, body, "\"seeding_time_limit\":7200") != null);
+}
+
+test "serializeTorrentInfo handles zero-size torrent" {
+    const allocator = std.testing.allocator;
+    var json = std.ArrayList(u8).empty;
+    defer json.deinit(allocator);
+
+    const stat = TorrentSession.Stats{
+        .state = .downloading,
+        .progress = 0.0,
+        .total_size = 0,
+        .bytes_downloaded = 0,
+        .name = "empty",
+        .info_hash_hex = "9999999999999999999999999999999999999999".*,
+        .save_path = "/dl",
+    };
+
+    try serializeTorrentInfo(allocator, &json, stat);
+    const body = json.items;
+
+    // amount_left should be 0 when total_size is 0
+    try std.testing.expect(std.mem.indexOf(u8, body, "\"amount_left\":0") != null);
+    try std.testing.expect(std.mem.indexOf(u8, body, "\"total_size\":0") != null);
+}

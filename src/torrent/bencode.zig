@@ -443,3 +443,65 @@ test "parse i64 min and max" {
         try std.testing.expectEqual(Value{ .integer = std.math.minInt(i64) }, value);
     }
 }
+
+// ── Nesting depth limit tests ────────────────────────────
+
+test "list nested exactly at max depth succeeds" {
+    // Build "lll...li0ee...e" with exactly max_nesting_depth levels of 'l'.
+    const depth = max_nesting_depth;
+    var buf = std.testing.allocator.alloc(u8, depth + 3 + depth) catch return;
+    defer std.testing.allocator.free(buf);
+    @memset(buf[0..depth], 'l');
+    // Innermost value: "i0e"
+    buf[depth] = 'i';
+    buf[depth + 1] = '0';
+    buf[depth + 2] = 'e';
+    @memset(buf[depth + 3 ..], 'e');
+
+    const value = try parse(std.testing.allocator, buf);
+    freeValue(std.testing.allocator, value);
+}
+
+test "list nested one beyond max depth returns NestingTooDeep" {
+    // Build "lll...li0ee...e" with max_nesting_depth + 1 levels of 'l'.
+    const depth = max_nesting_depth + 1;
+    var buf = std.testing.allocator.alloc(u8, depth + 3 + depth) catch return;
+    defer std.testing.allocator.free(buf);
+    @memset(buf[0..depth], 'l');
+    buf[depth] = 'i';
+    buf[depth + 1] = '0';
+    buf[depth + 2] = 'e';
+    @memset(buf[depth + 3 ..], 'e');
+
+    try std.testing.expectError(error.NestingTooDeep, parse(std.testing.allocator, buf));
+}
+
+test "dict nested one beyond max depth returns NestingTooDeep" {
+    // Build "d1:ad1:a...d1:ade...e" with max_nesting_depth + 1 dict levels.
+    const depth = max_nesting_depth + 1;
+    // Each level: "d1:a" (4 bytes). Innermost value: "de" (2 bytes). Then depth closing 'e's.
+    const total = depth * 4 + 2 + depth;
+    var buf = std.testing.allocator.alloc(u8, total) catch return;
+    defer std.testing.allocator.free(buf);
+    for (0..depth) |i| {
+        buf[i * 4 + 0] = 'd';
+        buf[i * 4 + 1] = '1';
+        buf[i * 4 + 2] = ':';
+        buf[i * 4 + 3] = 'a';
+    }
+    const prefix_len = depth * 4;
+    buf[prefix_len] = 'd';
+    buf[prefix_len + 1] = 'e';
+    @memset(buf[prefix_len + 2 ..], 'e');
+
+    try std.testing.expectError(error.NestingTooDeep, parse(std.testing.allocator, buf));
+}
+
+test "max_container_elements constant is 500000" {
+    // Compile-time assertion that the safety limit exists at the expected value.
+    try std.testing.expectEqual(@as(u32, 500_000), max_container_elements);
+}
+
+test "max_nesting_depth constant is 64" {
+    try std.testing.expectEqual(@as(u32, 64), max_nesting_depth);
+}
