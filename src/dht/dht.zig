@@ -72,7 +72,8 @@ pub const DhtEngine = struct {
     /// get_peers will be called for each once the routing table has nodes.
     pending_searches: [16][20]u8 = undefined,
     pending_search_count: u8 = 0,
-    pending_search_started: bool = false,
+    /// Per-hash flag: true once get_peers has been called at least once.
+    pending_search_done: [16]bool = [_]bool{false} ** 16,
     last_requery_time: i64 = 0,
     /// Timing.
     last_refresh_check: i64 = 0,
@@ -128,7 +129,7 @@ pub const DhtEngine = struct {
         self.bootstrapped = false;
         self.bootstrap_pending = false;
         self.pending_search_count = 0;
-        self.pending_search_started = false;
+        self.pending_search_done = [_]bool{false} ** 16;
         self.last_requery_time = 0;
         self.last_refresh_check = 0;
         self.last_save_time = 0;
@@ -203,15 +204,18 @@ pub const DhtEngine = struct {
         // Start pending searches once bootstrapped, and re-query every 5 minutes
         const requery_interval: i64 = 5 * 60;
         if (self.bootstrapped and self.pending_search_count > 0) {
-            const should_start = !self.pending_search_started;
-            const should_requery = self.pending_search_started and (now - self.last_requery_time >= requery_interval);
-            if (should_start or should_requery) {
-                for (0..self.pending_search_count) |i| {
-                    self.getPeers(self.pending_searches[i]) catch {};
+            const should_requery = (now - self.last_requery_time >= requery_interval);
+            for (0..self.pending_search_count) |i| {
+                // Start new searches immediately; requery old ones on the interval
+                if (!self.pending_search_done[i] or should_requery) {
+                    self.getPeers(self.pending_searches[i]) catch |err| {
+                        log.debug("getPeers for {x} failed: {s}", .{ self.pending_searches[i][0..4].*, @errorName(err) });
+                        continue;
+                    };
+                    self.pending_search_done[i] = true;
                 }
-                self.pending_search_started = true;
-                self.last_requery_time = now;
             }
+            if (should_requery) self.last_requery_time = now;
         }
     }
 
@@ -219,16 +223,28 @@ pub const DhtEngine = struct {
     /// get_peers lookups automatically once bootstrapped, and re-query
     /// periodically. Call this before or after the engine is bootstrapped.
     pub fn requestPeers(self: *DhtEngine, info_hash: [20]u8) void {
+        // Check if already registered
+        for (0..self.pending_search_count) |i| {
+            if (std.mem.eql(u8, &self.pending_searches[i], &info_hash)) return;
+        }
         if (self.pending_search_count >= self.pending_searches.len) return;
-        @memcpy(&self.pending_searches[self.pending_search_count], &info_hash);
+        const idx = self.pending_search_count;
+        @memcpy(&self.pending_searches[idx], &info_hash);
+        self.pending_search_done[idx] = false; // new hash — search on next tick
         self.pending_search_count += 1;
-        self.pending_search_started = false; // trigger immediate start on next tick
     }
 
     /// Start a get_peers lookup for a torrent info-hash.
     /// Discovered peers will appear in peer_results.
     pub fn getPeers(self: *DhtEngine, info_hash: [20]u8) !void {
         if (!self.enabled) return error.DhtDisabled;
+
+        // Skip if a lookup for this hash is already active
+        for (0..max_lookups) |i| {
+            if (self.active_lookups[i]) |*lk| {
+                if (std.mem.eql(u8, &lk.target, &info_hash)) return;
+            }
+        }
 
         // Find a free lookup slot
         const idx = for (0..max_lookups) |i| {

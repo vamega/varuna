@@ -110,6 +110,16 @@ Remaining work for full production readiness:
 - Automatic MSE fallback: try encrypted first, fall back to plaintext on failure
 - Connection-level MSE initiation before BT handshake in the event loop connect flow
 
+## DHT Bootstrap Speed
+
+The DHT takes 3-5 minutes from cold start before it discovers peers for a given info hash. This matters most for torrents where the tracker is unhelpful (e.g., Ubuntu's tracker returns only 1 peer). Potential improvements:
+
+- **Persist routing table to SQLite** on shutdown, reload on startup. A warm table skips the bootstrap round-trips to hardcoded nodes. The `dht/persistence.zig` module already implements save/load — it just needs to be wired into daemon startup/shutdown.
+- **Seed from PEX-discovered nodes**: when PEX messages arrive with DHT port info, add those nodes to the routing table immediately.
+- **Bootstrap from connected peers**: after BT handshake, if the peer sent a PORT message (BEP 5), ping that node as a bootstrap entry.
+- **Parallel bootstrap**: query all 4 hardcoded bootstrap nodes simultaneously instead of sequentially.
+- **Larger initial find_node fan-out**: increase `alpha` from 3 to 8 during bootstrap for faster table population.
+
 ## API Compatibility
 
 See [api-compatibility.md](api-compatibility.md) for the full qBittorrent WebAPI compatibility matrix, including which endpoints are implemented, which return placeholder data, and which are explicitly unsupported or deferred.

@@ -193,6 +193,7 @@ pub const TorrentSession = struct {
     torrent_id_in_shared: ?@import("../io/event_loop.zig").TorrentId = null,
     pending_peers: ?[]std.net.Address = null, // peers waiting for main thread to add
     pending_seed_setup: bool = false, // signals main thread to set up seed mode
+    dht_registered: bool = false, // whether DHT requestPeers has been called
     thread: ?std.Thread = null,
     announcing: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
 

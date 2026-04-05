@@ -248,6 +248,16 @@ pub fn main() !void {
                         _ = sess.integrateIntoEventLoop();
                     }
                 }
+                // Start DHT search immediately — don't wait for tracker to finish.
+                // The tracker may take minutes (UDP timeouts), but DHT can find
+                // peers in parallel once bootstrapped.
+                if (!sess.is_private and !sess.dht_registered) {
+                    if (shared_el.dht_engine) |engine| {
+                        engine.requestPeers(sess.info_hash);
+                        sess.dht_registered = true;
+                        std.log.info("DHT: registered {x} for peer search", .{sess.info_hash[0..4].*});
+                    }
+                }
             }
             session_manager.mutex.unlock();
         }
