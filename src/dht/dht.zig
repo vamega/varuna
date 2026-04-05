@@ -68,6 +68,12 @@ pub const DhtEngine = struct {
     /// Bootstrapping state.
     bootstrapped: bool = false,
     bootstrap_pending: bool = false,
+    /// Auto-search: info hashes to search for once bootstrapped.
+    /// get_peers will be called for each once the routing table has nodes.
+    pending_searches: [16][20]u8 = undefined,
+    pending_search_count: u8 = 0,
+    pending_search_started: bool = false,
+    last_requery_time: i64 = 0,
     /// Timing.
     last_refresh_check: i64 = 0,
     last_save_time: i64 = 0,
@@ -85,8 +91,8 @@ pub const DhtEngine = struct {
             .own_id = own_id,
             .table = RoutingTable.init(own_id),
             .tokens = TokenManager.init(),
-            .send_queue = std.ArrayList(OutboundPacket).init(allocator),
-            .peer_results = std.ArrayList(PeerResult).init(allocator),
+            .send_queue = std.ArrayList(OutboundPacket).empty,
+            .peer_results = std.ArrayList(PeerResult).empty,
         };
     }
 
@@ -94,8 +100,8 @@ pub const DhtEngine = struct {
         for (self.peer_results.items) |result| {
             self.allocator.free(result.peers);
         }
-        self.peer_results.deinit();
-        self.send_queue.deinit();
+        self.peer_results.deinit(self.allocator);
+        self.send_queue.deinit(self.allocator);
     }
 
     /// Process an incoming UDP datagram that starts with 'd' (KRPC).
@@ -145,6 +151,30 @@ pub const DhtEngine = struct {
                 self.refreshBucket(bucket_idx, now);
             }
         }
+
+        // Start pending searches once bootstrapped, and re-query every 5 minutes
+        const requery_interval: i64 = 5 * 60;
+        if (self.bootstrapped and self.pending_search_count > 0) {
+            const should_start = !self.pending_search_started;
+            const should_requery = self.pending_search_started and (now - self.last_requery_time >= requery_interval);
+            if (should_start or should_requery) {
+                for (0..self.pending_search_count) |i| {
+                    self.getPeers(self.pending_searches[i]) catch {};
+                }
+                self.pending_search_started = true;
+                self.last_requery_time = now;
+            }
+        }
+    }
+
+    /// Register an info_hash for peer search. The DHT engine will start
+    /// get_peers lookups automatically once bootstrapped, and re-query
+    /// periodically. Call this before or after the engine is bootstrapped.
+    pub fn requestPeers(self: *DhtEngine, info_hash: [20]u8) void {
+        if (self.pending_search_count >= self.pending_searches.len) return;
+        @memcpy(&self.pending_searches[self.pending_search_count], &info_hash);
+        self.pending_search_count += 1;
+        self.pending_search_started = false; // trigger immediate start on next tick
     }
 
     /// Start a get_peers lookup for a torrent info-hash.
@@ -362,10 +392,39 @@ pub const DhtEngine = struct {
                     _ = self.table.addNode(info, now);
                 }
 
+                // Parse compact IPv4 peers from the "values" list.
+                // Each entry is a 6-byte bencode string: 4B IPv4 + 2B port big-endian.
+                var peer_addrs: [50]std.net.Address = undefined;
+                var peer_count: usize = 0;
+                if (r.values_raw) |raw| {
+                    // raw is `l<6:...><6:...>...e`
+                    var vpos: usize = 1; // skip 'l'
+                    while (vpos < raw.len and raw[vpos] != 'e') {
+                        if (peer_count >= peer_addrs.len) break;
+                        // parse bencode string length
+                        var dlen: usize = 0;
+                        while (vpos < raw.len and raw[vpos] >= '0' and raw[vpos] <= '9') : (vpos += 1) {
+                            dlen = dlen * 10 + (raw[vpos] - '0');
+                        }
+                        if (vpos >= raw.len or raw[vpos] != ':') break;
+                        vpos += 1;
+                        if (dlen == 6 and vpos + 6 <= raw.len) {
+                            const ip = std.mem.readInt(u32, raw[vpos..][0..4], .big);
+                            const port = std.mem.readInt(u16, raw[vpos + 4 ..][0..2], .big);
+                            peer_addrs[peer_count] = std.net.Address.initIp4(
+                                @bitCast(std.mem.nativeToBig(u32, ip)),
+                                port,
+                            );
+                            peer_count += 1;
+                        }
+                        vpos += dlen;
+                    }
+                }
+
                 lk.handleResponse(
                     r.sender_id,
                     if (new_node_count > 0) new_nodes_buf[0..new_node_count] else null,
-                    null, // TODO: parse values for get_peers
+                    if (peer_count > 0) peer_addrs[0..peer_count] else null,
                     r.token,
                 );
             }

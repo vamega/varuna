@@ -20,21 +20,23 @@ pub const BootstrapEntry = struct {
 /// DNS resolution is blocking, so this should be called before the
 /// event loop starts or on a background thread.
 pub fn resolveBootstrapNodes(allocator: std.mem.Allocator) ![]std.net.Address {
-    var addrs = std.ArrayList(std.net.Address).init(allocator);
-    errdefer addrs.deinit();
+    var addrs = std.ArrayList(std.net.Address).empty;
+    errdefer addrs.deinit(allocator);
 
     for (bootstrap_nodes) |entry| {
-        // Use getAddressList for DNS resolution
-        const list = std.net.Address.resolveIp(entry.host, entry.port) catch |err| {
-            // DNS resolution failed for this node -- skip it.
-            _ = err;
-            // Try numeric parse as fallback
-            continue;
-        };
-        try addrs.append(list);
+        // Resolve hostname via DNS (blocking)
+        const list = std.net.getAddressList(allocator, entry.host, entry.port) catch continue;
+        defer list.deinit();
+        // Prefer IPv4 addresses
+        for (list.addrs) |addr| {
+            if (addr.any.family == std.posix.AF.INET) {
+                try addrs.append(allocator, addr);
+                break;
+            }
+        }
     }
 
-    return addrs.toOwnedSlice();
+    return addrs.toOwnedSlice(allocator);
 }
 
 /// Convert resolved addresses into NodeInfo structs with random IDs.

@@ -191,8 +191,8 @@ pub const DhtPersistence = struct {
         const stmt = self.load_nodes_stmt orelse return error.SqlitePrepareFailed;
         _ = sqlite.sqlite3_reset(stmt);
 
-        var nodes = std.ArrayList(NodeInfo).init(allocator);
-        errdefer nodes.deinit();
+        var nodes = std.ArrayList(NodeInfo).empty;
+        errdefer nodes.deinit(allocator);
 
         while (sqlite.sqlite3_step(stmt) == sqlite.SQLITE_ROW) {
             const id_blob = sqlite.sqlite3_column_blob(stmt, 0);
@@ -211,7 +211,7 @@ pub const DhtPersistence = struct {
             // Parse IP address
             const addr = std.net.Address.resolveIp(std.mem.span(ip_text.?), port) catch continue;
 
-            try nodes.append(.{
+            try nodes.append(allocator, .{
                 .id = id,
                 .address = addr,
                 .last_seen = last_seen,
@@ -219,7 +219,7 @@ pub const DhtPersistence = struct {
             });
         }
 
-        return nodes.toOwnedSlice();
+        return nodes.toOwnedSlice(allocator);
     }
 };
 

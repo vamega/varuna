@@ -66,6 +66,9 @@ pub const Response = struct {
     token: ?[]const u8 = null,
     /// Compact peer values (from get_peers "values" list).
     values: ?[]const []const u8 = null,
+    /// Raw bytes of the bencoded "values" list (slice into original packet).
+    /// Use this to extract compact peers without allocation.
+    values_raw: ?[]const u8 = null,
 };
 
 /// Parsed KRPC error.
@@ -220,21 +223,15 @@ fn parseResponse(tid: []const u8, r_raw: []const u8) !Response {
         } else if (std.mem.eql(u8, key, "token")) {
             resp.token = parseByteString(r_raw, &pos) orelse return error.InvalidKrpc;
         } else if (std.mem.eql(u8, key, "values")) {
-            // "values" is a list of compact peer strings
+            // "values" is a list of compact peer strings (6 bytes each: 4B IP + 2B port)
             if (pos >= r_raw.len or r_raw[pos] != 'l') {
                 skipValue(r_raw, &pos) orelse return error.InvalidKrpc;
                 continue;
             }
-            // Store the raw values list for later extraction
-            // We need a different approach -- store a pointer to the list data
+            // Store the raw bencoded list so the caller can iterate without allocation.
             const list_start = pos;
             skipValue(r_raw, &pos) orelse return error.InvalidKrpc;
-            _ = list_start;
-            // For now, store as nodes (we'll parse values separately)
-            // Actually we need an allocator to return a slice of slices.
-            // Instead, store the raw values data and let the caller parse it.
-            // We'll use a different field: values_raw
-            resp.values = null; // parsed by caller with allocator
+            resp.values_raw = r_raw[list_start..pos];
         } else {
             skipValue(r_raw, &pos) orelse return error.InvalidKrpc;
         }
