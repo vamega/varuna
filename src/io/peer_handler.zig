@@ -515,7 +515,7 @@ pub fn handleRecv(self: *EventLoop, slot: u16, cqe: linux.io_uring_cqe) void {
                 };
                 return;
             }
-            if (msg_len > pw.max_message_length) {
+                if (msg_len > pw.max_message_length) {
                 self.removePeer(slot);
                 return;
             }

@@ -308,12 +308,27 @@ pub fn download(
 
     // Run event loop with periodic progress reporting
     var last_reported_count: u32 = piece_tracker.completedCount();
+    var zero_peer_ticks: u32 = 0;
+    const max_zero_peer_ticks: u32 = 300; // ~10 minutes of 2-second ticks with no peers
 
     // Submit a timeout so the loop doesn't block forever without CQEs
     event_loop.submitTimeout(2 * std.time.ns_per_s) catch {};
 
     const signal = @import("../io/signal.zig");
-    while (!piece_tracker.isComplete() and event_loop.peer_count > 0 and !signal.isShutdownRequested()) {
+    while (!piece_tracker.isComplete() and !signal.isShutdownRequested()) {
+        // Keep running while we have peers OR while an announce is in progress
+        // (which may bring new peers). When at zero peers, keep running so that
+        // checkReannounce can fire and fetch a fresh peer list.
+        if (event_loop.peer_count == 0 and !event_loop.announcing.load(.acquire) and !event_loop.announce_results_ready.load(.acquire)) {
+            zero_peer_ticks += 1;
+            if (zero_peer_ticks > max_zero_peer_ticks) break;
+            // Force an immediate re-announce when we first lose all peers
+            if (zero_peer_ticks == 1) {
+                event_loop.forceReannounce();
+            }
+        } else {
+            zero_peer_ticks = 0;
+        }
         event_loop.tick() catch |err| {
             try logStatus(options.status_writer, "tick error: {s}, peers={}\n", .{ @errorName(err), event_loop.peer_count });
             break;

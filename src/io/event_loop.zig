@@ -158,6 +158,13 @@ pub const Peer = struct {
     pipeline_sent: u32 = 0,
     inflight_requests: u32 = 0,
 
+    // Pre-claimed next piece (pipeline overlap: requests sent before current piece completes)
+    next_piece: ?u32 = null,
+    next_piece_buf: ?[]u8 = null,
+    next_blocks_expected: u32 = 0,
+    next_blocks_received: u32 = 0,
+    next_pipeline_sent: u32 = 0,
+
     // BEP 10 extension protocol state
     extensions_supported: bool = false, // peer advertised BEP 10 support
     extension_ids: ?ext.ExtensionIds = null, // peer's extension ID mapping
@@ -741,7 +748,7 @@ pub const EventLoop = struct {
     announce_interval: u32 = 1800,
     last_announce_time: i64 = 0,
     announce_jitter_secs: i32 = 0, // random jitter applied to this torrent's interval
-    min_peers_for_reannounce: u16 = 1, // re-announce when below this
+    min_peers_for_reannounce: u16 = 20, // re-announce when below this
     // Background announce thread state: announce runs on a background thread
     // with its own io_uring ring to avoid blocking the main event loop.
     // The ring is created once and reused across announces.
@@ -940,6 +947,7 @@ pub const EventLoop = struct {
                 if (peer.body_buf) |buf| self.allocator.free(buf);
             }
             if (peer.piece_buf) |buf| self.allocator.free(buf);
+            if (peer.next_piece_buf) |buf| self.allocator.free(buf);
             if (peer.availability) |*bf| bf.deinit(self.allocator);
             if (peer.pex_state) |ps| {
                 ps.deinit(self.allocator);
@@ -1421,6 +1429,13 @@ pub const EventLoop = struct {
                 if (tc.piece_tracker) |pt| pt.releasePiece(piece_index);
             }
         }
+        if (peer.next_piece) |next_index| {
+            if (self.getTorrentContext(peer.torrent_id)) |tc| {
+                if (tc.piece_tracker) |pt| pt.releasePiece(next_index);
+            }
+            if (peer.next_piece_buf) |buf| self.allocator.free(buf);
+            peer.next_piece_buf = null; // prevent double-free in cleanupPeer
+        }
         // BEP 11: notify torrent PEX state that this peer disconnected
         if (peer.state != .free and peer.state != .connecting) {
             if (self.getTorrentContext(peer.torrent_id)) |tc| {
@@ -1479,6 +1494,12 @@ pub const EventLoop = struct {
         self.announce_url = url;
         self.announce_interval = interval;
         self.last_announce_time = std.time.timestamp();
+    }
+
+    /// Force an immediate re-announce by resetting the last announce time.
+    /// Used when peer count drops to 0 to quickly recover new peers.
+    pub fn forceReannounce(self: *EventLoop) void {
+        self.last_announce_time = 0; // will expire immediately on next checkReannounce
     }
 
     pub fn tick(self: *EventLoop) !void {
@@ -1751,10 +1772,36 @@ pub const EventLoop = struct {
     }
 
     /// Add a slot to the idle_peers list if it is eligible and not already present.
+    /// Immediately tries to claim a piece and start downloading so that a peer
+    /// that sends UNCHOKE + HAVE + EOF in rapid succession still gets served
+    /// before the EOF CQE lands and removes the slot.
     pub fn markIdle(self: *EventLoop, slot: u16) void {
         const peer = &self.peers[slot];
         if (!isIdleCandidate(peer)) return;
         if (peer.idle_peer_index != null) return;
+
+        // Try to claim a piece and start the download immediately rather than
+        // waiting for the next tick's processIdlePeers pass.
+        const policy = @import("peer_policy.zig");
+        if (self.getTorrentContext(peer.torrent_id)) |tc| {
+            if (!tc.upload_only) {
+                if (tc.piece_tracker) |pt| {
+                    if (!self.isDownloadThrottled(peer.torrent_id)) {
+                        const peer_bf: ?*const Bitfield = if (peer.availability) |*bf| bf else null;
+                        if (pt.claimPiece(peer_bf)) |piece_index| {
+                            if (policy.startPieceDownload(self, slot, piece_index)) {
+                                return; // piece claimed and started; don't add to idle queue
+                            } else |_| {
+                                pt.releasePiece(piece_index);
+                                // startPieceDownload failed; fall through to add to idle queue
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        // No piece available right now -- add to idle queue for next tick.
         const idx: u16 = @intCast(self.idle_peers.items.len);
         self.idle_peers.append(self.allocator, slot) catch |err| {
             log.debug("idle_peers append for slot {d}: {s}", .{ slot, @errorName(err) });
@@ -2152,6 +2199,7 @@ pub const EventLoop = struct {
             if (peer.body_buf) |buf| self.allocator.free(buf);
         }
         if (peer.piece_buf) |buf| self.allocator.free(buf);
+        if (peer.next_piece_buf) |buf| self.allocator.free(buf);
         if (peer.availability) |*bf| bf.deinit(self.allocator);
         if (peer.pex_state) |ps| {
             ps.deinit(self.allocator);

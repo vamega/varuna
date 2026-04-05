@@ -15,7 +15,7 @@ const MerkleCache = @import("../torrent/merkle_cache.zig").MerkleCache;
 const Hasher = @import("hasher.zig").Hasher;
 const LayoutSpan = @import("../torrent/layout.zig").Layout.Span;
 
-const pipeline_depth: u32 = 5;
+const pipeline_depth: u32 = 64;
 const peer_timeout_secs: i64 = 60;
 const unchoke_interval_secs: i64 = 30;
 const max_unchoked: u32 = 4;
@@ -96,7 +96,7 @@ pub fn startPieceDownload(self: *EventLoop, slot: u16, piece_index: u32) !void {
 
 pub fn tryFillPipeline(self: *EventLoop, slot: u16) !void {
     const peer = &self.peers[slot];
-    const piece_index = peer.current_piece orelse return;
+    if (peer.current_piece == null) return;
     if (peer.peer_choking) return;
     if (peer.send_pending) return;
 
@@ -107,48 +107,135 @@ pub fn tryFillPipeline(self: *EventLoop, slot: u16) !void {
     const sess = tc.session orelse return;
     const geometry = sess.geometry();
 
-    // Count how many requests to send
-    var to_send: u32 = 0;
-    while (peer.inflight_requests + to_send < pipeline_depth and peer.pipeline_sent + to_send < peer.blocks_expected) {
-        to_send += 1;
-    }
-    if (to_send == 0) return;
-
-    // Build all requests into one buffer (17 bytes each: 4 len + 1 id + 12 payload)
+    // 17 bytes per REQUEST: 4-byte len + 1-byte id + 12-byte payload
     const request_size: usize = 17;
-    var send_buf: [request_size * pipeline_depth]u8 = undefined;
-    const total_len = request_size * to_send;
+    // Buffer covers current + next piece (at most pipeline_depth * 2 total requests)
+    var send_buf: [request_size * pipeline_depth * 2]u8 = undefined;
 
-    var i: u32 = 0;
-    while (i < to_send) : (i += 1) {
-        const req = geometry.requestForBlock(piece_index, peer.pipeline_sent + i) catch {
-            return;
-        };
-        const offset = i * request_size;
-        // 4-byte length prefix
-        std.mem.writeInt(u32, send_buf[offset..][0..4], 13, .big); // 1 + 12
-        send_buf[offset + 4] = 6; // request message id
-        std.mem.writeInt(u32, send_buf[offset + 5 ..][0..4], req.piece_index, .big);
-        std.mem.writeInt(u32, send_buf[offset + 9 ..][0..4], req.piece_offset, .big);
-        std.mem.writeInt(u32, send_buf[offset + 13 ..][0..4], req.length, .big);
+    // --- Phase 1: fill requests for current piece ---
+    var p1: u32 = 0; // requests to send for current piece this call
+    if (peer.current_piece) |piece_index| {
+        while (peer.inflight_requests + p1 < pipeline_depth and
+            peer.pipeline_sent + p1 < peer.blocks_expected)
+        {
+            const req = geometry.requestForBlock(piece_index, peer.pipeline_sent + p1) catch break;
+            writeRequestMsg(send_buf[p1 * request_size ..], req);
+            p1 += 1;
+        }
     }
+
+    // --- Phase 2: prefetch next piece if current is fully requested and pipeline has headroom ---
+    var p2: u32 = 0; // requests to send for next piece this call
+    const cur_fully_requested = if (peer.current_piece) |_|
+        (peer.pipeline_sent + p1 >= peer.blocks_expected)
+    else
+        false;
+
+    if (cur_fully_requested and peer.inflight_requests + p1 < pipeline_depth) {
+        // Claim next piece if not already done
+        if (peer.next_piece == null) {
+            if (tc.piece_tracker) |pt| {
+                const peer_bf: ?*const Bitfield = if (peer.availability) |*bf| bf else null;
+                if (pt.claimPiece(peer_bf)) |next_idx| {
+                    const next_size = sess.layout.pieceSize(next_idx) catch {
+                        pt.releasePiece(next_idx);
+                        return try submitPipelineRequests(self, slot, send_buf[0 .. p1 * request_size], p1, 0);
+                    };
+                    const next_block_count = geometry.blockCount(next_idx) catch {
+                        pt.releasePiece(next_idx);
+                        return try submitPipelineRequests(self, slot, send_buf[0 .. p1 * request_size], p1, 0);
+                    };
+                    const next_buf = self.allocator.alloc(u8, next_size) catch {
+                        pt.releasePiece(next_idx);
+                        return try submitPipelineRequests(self, slot, send_buf[0 .. p1 * request_size], p1, 0);
+                    };
+                    peer.next_piece = next_idx;
+                    peer.next_piece_buf = next_buf;
+                    peer.next_blocks_expected = next_block_count;
+                    peer.next_blocks_received = 0;
+                    peer.next_pipeline_sent = 0;
+                }
+            }
+        }
+
+        // Fill requests for next piece
+        if (peer.next_piece) |next_idx| {
+            while (peer.inflight_requests + p1 + p2 < pipeline_depth and
+                peer.next_pipeline_sent + p2 < peer.next_blocks_expected)
+            {
+                const req = geometry.requestForBlock(next_idx, peer.next_pipeline_sent + p2) catch break;
+                writeRequestMsg(send_buf[(p1 + p2) * request_size ..], req);
+                p2 += 1;
+            }
+        }
+    }
+
+    return try submitPipelineRequests(self, slot, send_buf[0 .. (p1 + p2) * request_size], p1, p2);
+}
+
+fn writeRequestMsg(buf: []u8, req: anytype) void {
+    std.mem.writeInt(u32, buf[0..4], 13, .big); // length prefix: 1 + 12
+    buf[4] = 6; // REQUEST message id
+    std.mem.writeInt(u32, buf[5..9], req.piece_index, .big);
+    std.mem.writeInt(u32, buf[9..13], req.piece_offset, .big);
+    std.mem.writeInt(u32, buf[13..17], req.length, .big);
+}
+
+/// Submit the request batch via io_uring and update peer pipeline state.
+fn submitPipelineRequests(
+    self: *EventLoop,
+    slot: u16,
+    buf: []u8,
+    p1: u32, // requests for current piece
+    p2: u32, // requests for next piece
+) !void {
+    const peer = &self.peers[slot];
+    const total = p1 + p2;
+    if (total == 0) return;
 
     // MSE/PE: encrypt in-place before copying into tracked buffer
-    peer.crypto.encryptBuf(send_buf[0..total_len]);
+    peer.crypto.encryptBuf(buf);
 
-    // Track for cleanup with unique send_id
     const ts = self.nextTrackedSendUserData(slot);
-    const tracked = self.trackPendingSendCopy(slot, ts.send_id, send_buf[0..total_len]) catch {
-        return;
-    };
+    const tracked = self.trackPendingSendCopy(slot, ts.send_id, buf) catch return;
 
     _ = self.ring.send(ts.ud, peer.fd, tracked, 0) catch {
         self.freeOnePendingSend(slot, ts.send_id);
         return;
     };
     peer.send_pending = true;
-    peer.pipeline_sent += to_send;
-    peer.inflight_requests += to_send;
+    peer.pipeline_sent += p1;
+    peer.next_pipeline_sent += p2;
+    peer.inflight_requests += total;
+}
+
+/// After current piece completes: promote pre-fetched next_piece to current,
+/// or fall back to markIdle if no next piece is queued.
+fn promoteNextPieceOrMarkIdle(self: *EventLoop, slot: u16) void {
+    const peer = &self.peers[slot];
+    if (peer.next_piece != null) {
+        peer.current_piece = peer.next_piece;
+        peer.piece_buf = peer.next_piece_buf;
+        peer.blocks_expected = peer.next_blocks_expected;
+        peer.blocks_received = peer.next_blocks_received;
+        peer.pipeline_sent = peer.next_pipeline_sent;
+        // inflight_requests covers pending requests for the promoted piece -- do not reset.
+        peer.next_piece = null;
+        peer.next_piece_buf = null;
+        peer.next_blocks_expected = 0;
+        peer.next_blocks_received = 0;
+        peer.next_pipeline_sent = 0;
+
+        // Check if the promoted piece is already complete (all blocks received)
+        if (peer.blocks_received >= peer.blocks_expected) {
+            completePieceDownload(self, slot);
+        } else {
+            // Refill pipeline: claim another next_piece and send remaining requests
+            tryFillPipeline(self, slot) catch {};
+        }
+    } else {
+        self.markIdle(slot);
+    }
 }
 
 pub fn completePieceDownload(self: *EventLoop, slot: u16) void {
@@ -182,7 +269,10 @@ pub fn completePieceDownload(self: *EventLoop, slot: u16) void {
         // The peer can start downloading another piece immediately.
         peer.piece_buf = null;
         peer.current_piece = null;
-        self.markIdle(slot);
+        peer.blocks_received = 0;
+        peer.blocks_expected = 0;
+        peer.pipeline_sent = 0;
+        promoteNextPieceOrMarkIdle(self, slot);
     } else {
         // Fallback: inline verification and write (blocks event loop).
         // This path is only reached if the hasher thread pool failed to create.
@@ -533,9 +623,14 @@ pub fn checkReannounce(self: *EventLoop) void {
     if (self.peer_count >= self.min_peers_for_reannounce) return;
 
     const now = std.time.timestamp();
-    // Apply jitter to the announce interval (+-10% of interval)
-    const jittered_interval = @as(i64, self.announce_interval) + @as(i64, self.announce_jitter_secs);
-    const effective_interval = @max(jittered_interval, 60); // floor at 60s
+    // When peer count is critically low, re-announce every 60 seconds.
+    // Otherwise respect the tracker's interval (with +-10% jitter).
+    const effective_interval: i64 = if (self.peer_count < 3) blk: {
+        break :blk 60;
+    } else blk: {
+        const jittered_interval = @as(i64, self.announce_interval) + @as(i64, self.announce_jitter_secs);
+        break :blk @max(jittered_interval, 60);
+    };
     if (now - self.last_announce_time < effective_interval) return;
 
     self.last_announce_time = now;

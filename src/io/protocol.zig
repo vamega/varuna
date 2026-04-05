@@ -34,6 +34,20 @@ pub fn processMessage(self: *EventLoop, slot: u16) void {
             // Clear pipeline state
             peer.inflight_requests = 0;
             peer.pipeline_sent = peer.blocks_received;
+            // Release pre-fetched next piece back to the tracker
+            if (peer.next_piece) |next_idx| {
+                if (self.getTorrentContext(peer.torrent_id)) |tc| {
+                    if (tc.piece_tracker) |pt| pt.releasePiece(next_idx);
+                }
+                if (peer.next_piece_buf) |nbuf| {
+                    self.allocator.free(nbuf);
+                    peer.next_piece_buf = null; // prevent double-free in cleanupPeer
+                }
+                peer.next_piece = null;
+                peer.next_blocks_expected = 0;
+                peer.next_blocks_received = 0;
+                peer.next_pipeline_sent = 0;
+            }
             self.unmarkIdle(slot);
         },
         1 => {
@@ -55,6 +69,13 @@ pub fn processMessage(self: *EventLoop, slot: u16) void {
         4 => { // have
             if (payload.len >= 4) {
                 const piece_index = std.mem.readInt(u32, payload[0..4], .big);
+                if (peer.availability == null) {
+                    if (self.getTorrentContext(peer.torrent_id)) |tc_have| {
+                        if (tc_have.session) |sess_have| {
+                            peer.availability = Bitfield.init(self.allocator, sess_have.pieceCount()) catch null;
+                        }
+                    }
+                }
                 if (peer.availability) |*bf| {
                     bf.set(piece_index) catch {};
                 }
@@ -104,6 +125,9 @@ pub fn processMessage(self: *EventLoop, slot: u16) void {
                 // Consume download tokens for rate limiting accounting
                 _ = self.consumeDownloadTokens(peer.torrent_id, block_data.len);
 
+                // Decrement shared inflight counter for any received block
+                if (peer.inflight_requests > 0) peer.inflight_requests -= 1;
+
                 if (peer.current_piece != null and peer.current_piece.? == piece_index) {
                     if (peer.piece_buf) |pbuf| {
                         const start: usize = @intCast(block_offset);
@@ -113,19 +137,32 @@ pub fn processMessage(self: *EventLoop, slot: u16) void {
                             peer.blocks_received += 1;
                             peer.bytes_downloaded_from += block_data.len;
                             self.accountTorrentBytes(peer.torrent_id, block_data.len, 0);
-                            if (peer.inflight_requests > 0) peer.inflight_requests -= 1;
 
                             if (peer.blocks_received >= peer.blocks_expected) {
                                 const policy = @import("peer_policy.zig");
                                 policy.completePieceDownload(self, slot);
                             } else {
                                 // Refill pipeline — request more blocks if slots available.
-                                // Without this, pieces with more blocks than pipeline_depth stall.
                                 const policy = @import("peer_policy.zig");
                                 policy.tryFillPipeline(self, slot) catch |err| {
                                     log.debug("pipeline refill failed for slot {d}: {s}", .{ slot, @errorName(err) });
                                 };
                             }
+                        }
+                    }
+                } else if (peer.next_piece != null and peer.next_piece.? == piece_index) {
+                    // Block arrived early for the pre-fetched next piece
+                    if (peer.next_piece_buf) |nbuf| {
+                        const start: usize = @intCast(block_offset);
+                        const end = start + block_data.len;
+                        if (end <= nbuf.len) {
+                            @memcpy(nbuf[start..end], block_data);
+                            peer.next_blocks_received += 1;
+                            peer.bytes_downloaded_from += block_data.len;
+                            self.accountTorrentBytes(peer.torrent_id, block_data.len, 0);
+                            // Refill pipeline with more blocks for next_piece or claim further piece
+                            const policy = @import("peer_policy.zig");
+                            policy.tryFillPipeline(self, slot) catch {};
                         }
                     }
                 }
