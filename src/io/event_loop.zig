@@ -179,6 +179,10 @@ pub const Peer = struct {
     mse_rejected: bool = false,
     // Track whether we're in MSE fallback (reconnecting without MSE)
     mse_fallback: bool = false,
+    // Remaining bytes to send for the current MSE send operation.
+    // Used to handle partial sends during MSE handshake without prematurely
+    // advancing the state machine.
+    mse_send_remaining: []const u8 = &.{},
 };
 
 // ── Torrent context (per-torrent state within shared event loop) ──
@@ -874,10 +878,8 @@ pub const EventLoop = struct {
                 peer.fd = -1;
             }
         }
-        if (self.listen_fd >= 0) {
-            posix.close(self.listen_fd);
-            self.listen_fd = -1;
-        }
+        // Note: listen_fd is NOT closed here -- it is owned by the caller
+        // (e.g. std.net.Server in client.zig) and will be closed by the caller's defer.
         if (self.udp_fd >= 0) {
             posix.close(self.udp_fd);
             self.udp_fd = -1;
@@ -939,6 +941,10 @@ pub const EventLoop = struct {
             }
             if (peer.piece_buf) |buf| self.allocator.free(buf);
             if (peer.availability) |*bf| bf.deinit(self.allocator);
+            if (peer.pex_state) |ps| {
+                ps.deinit(self.allocator);
+                self.allocator.destroy(ps);
+            }
             if (peer.mse_known_hashes) |hashes| self.allocator.free(hashes);
             // Free async MSE handshake state
             if (peer.mse_initiator) |mi| self.allocator.destroy(mi);

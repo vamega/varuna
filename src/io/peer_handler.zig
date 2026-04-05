@@ -129,6 +129,7 @@ fn startMseInitiator(self: *EventLoop, slot: u16) !void {
     switch (action) {
         .send => |data| {
             peer.state = .mse_handshake_send;
+            peer.mse_send_remaining = data;
             const ud = encodeUserData(.{ .slot = slot, .op_type = .peer_send, .context = 0 });
             _ = self.ring.send(ud, peer.fd, data, 0) catch {
                 return error.SubmitFailed;
@@ -201,6 +202,7 @@ pub fn handleSend(self: *EventLoop, slot: u16, cqe: linux.io_uring_cqe) void {
         // MSE fallback: if send failed during MSE handshake and mode is "preferred",
         // try reconnecting without MSE
         if (peer.state == .mse_handshake_send and self.encryption_mode == .preferred and !peer.mse_fallback) {
+            log.debug("slot {d}: MSE send failed (res={}), attempting plaintext fallback", .{ slot, cqe.res });
             attemptMseFallback(self, slot);
             return;
         }
@@ -226,7 +228,17 @@ pub fn handleSend(self: *EventLoop, slot: u16, cqe: linux.io_uring_cqe) void {
 
     switch (peer.state) {
         .mse_handshake_send => {
-            // MSE initiator: send completed, advance state machine
+            // MSE initiator: handle partial send before advancing state machine
+            const bytes_sent: usize = @intCast(cqe.res);
+            peer.mse_send_remaining = peer.mse_send_remaining[bytes_sent..];
+            if (peer.mse_send_remaining.len > 0) {
+                // Partial send -- resubmit remaining bytes without advancing state machine
+                const ud = encodeUserData(.{ .slot = slot, .op_type = .peer_send, .context = 0 });
+                _ = self.ring.send(ud, peer.fd, peer.mse_send_remaining, 0) catch {
+                    self.removePeer(slot);
+                };
+                return;
+            }
             if (peer.mse_initiator) |mi| {
                 const action = mi.feedSend();
                 executeMseAction(self, slot, action, true);
@@ -235,7 +247,17 @@ pub fn handleSend(self: *EventLoop, slot: u16, cqe: linux.io_uring_cqe) void {
             }
         },
         .mse_resp_send => {
-            // MSE responder: send completed, advance state machine
+            // MSE responder: handle partial send before advancing state machine
+            const bytes_sent: usize = @intCast(cqe.res);
+            peer.mse_send_remaining = peer.mse_send_remaining[bytes_sent..];
+            if (peer.mse_send_remaining.len > 0) {
+                // Partial send -- resubmit remaining bytes without advancing state machine
+                const ud = encodeUserData(.{ .slot = slot, .op_type = .peer_send, .context = 0 });
+                _ = self.ring.send(ud, peer.fd, peer.mse_send_remaining, 0) catch {
+                    self.removePeer(slot);
+                };
+                return;
+            }
             if (peer.mse_responder) |mr| {
                 const action = mr.feedSend();
                 executeMseAction(self, slot, action, false);
@@ -313,6 +335,7 @@ pub fn handleRecv(self: *EventLoop, slot: u16, cqe: linux.io_uring_cqe) void {
         // reconnect without MSE
         if (peer.state == .mse_handshake_recv or peer.state == .mse_resp_recv) {
             if (self.encryption_mode == .preferred and !peer.mse_fallback) {
+                log.debug("slot {d}: MSE recv failed (state={s} res={}), attempting plaintext fallback", .{ slot, @tagName(peer.state), cqe.res });
                 attemptMseFallback(self, slot);
                 return;
             }
@@ -414,8 +437,8 @@ pub fn handleRecv(self: *EventLoop, slot: u16, cqe: linux.io_uring_cqe) void {
             // MSE detection: on the very first bytes of an inbound connection,
             // check if this looks like an MSE handshake (not BT protocol).
             if (peer.handshake_offset == 0 and n > 0) {
-                if (detectAndHandleInboundMse(self, slot, peer.handshake_buf[0])) {
-                    // MSE responder started -- it took ownership of the first byte
+                if (detectAndHandleInboundMse(self, slot, peer.handshake_buf[0], n)) {
+                    // MSE responder started -- it took ownership of n bytes
                     return;
                 }
                 // If encryption is forced but first byte looks like BT, reject
@@ -591,6 +614,7 @@ fn executeMseAction(self: *EventLoop, slot: u16, action: mse.MseAction, is_initi
         .send => |data| {
             const state: PeerState = if (is_initiator) .mse_handshake_send else .mse_resp_send;
             peer.state = state;
+            peer.mse_send_remaining = data;
             const ud = encodeUserData(.{ .slot = slot, .op_type = .peer_send, .context = 0 });
             _ = self.ring.send(ud, peer.fd, data, 0) catch {
                 handleMseFailure(self, slot, is_initiator);
@@ -759,7 +783,9 @@ fn attemptMseFallback(self: *EventLoop, slot: u16) void {
 
 /// Start an inbound MSE responder handshake for a peer that sent
 /// non-BT-protocol bytes.
-fn startMseResponder(self: *EventLoop, slot: u16) void {
+/// `bytes_received` is the number of bytes already in `peer.handshake_buf`
+/// from the initial inbound recv (may be more than 1).
+fn startMseResponder(self: *EventLoop, slot: u16, bytes_received: usize) void {
     const peer = &self.peers[slot];
 
     if (self.mse_req2_to_hash.count() == 0) {
@@ -775,12 +801,12 @@ fn startMseResponder(self: *EventLoop, slot: u16) void {
     mr.* = mse.MseResponderHandshake.initWithLookup(&self.mse_req2_to_hash, self.encryption_mode);
     peer.mse_responder = mr;
 
-    // The first byte we already received is part of the DH key.
-    // We need to feed it to the state machine. The responder starts
-    // by receiving the DH key. We already have 1 byte in handshake_buf[0].
-    // Copy it into the responder's recv buffer and adjust offset.
-    mr.peer_public_key[0] = peer.handshake_buf[0];
-    mr.recv_offset = 1;
+    // Copy all bytes already received into the DH key buffer.
+    // The initial inbound recv is for 68 bytes (BT handshake size), so we may
+    // have received up to 68 bytes of the initiator's DH key (96 bytes total).
+    const copy_len = @min(bytes_received, mse.dh_key_size);
+    @memcpy(mr.peer_public_key[0..copy_len], peer.handshake_buf[0..copy_len]);
+    mr.recv_offset = copy_len;
 
     if (mr.recv_offset < mse.dh_key_size) {
         peer.state = .mse_resp_recv;
@@ -790,13 +816,18 @@ fn startMseResponder(self: *EventLoop, slot: u16) void {
             self.removePeer(slot);
             return;
         };
+    } else {
+        // Already have the full DH key -- feed it directly.
+        const action = mr.feedRecv(mse.dh_key_size);
+        executeMseAction(self, slot, action, false);
     }
 }
 
 /// Detect whether the first received byte on an inbound connection looks
 /// like an MSE DH key exchange (not a BT protocol handshake).
 /// Called from handleRecv when we get the first bytes on an inbound peer.
-pub fn detectAndHandleInboundMse(self: *EventLoop, slot: u16, first_byte: u8) bool {
+/// `n` is the total number of bytes already received into `peer.handshake_buf`.
+pub fn detectAndHandleInboundMse(self: *EventLoop, slot: u16, first_byte: u8, n: usize) bool {
     // If encryption is disabled, never try MSE detection
     if (self.encryption_mode == .disabled) return false;
 
@@ -807,7 +838,7 @@ pub fn detectAndHandleInboundMse(self: *EventLoop, slot: u16, first_byte: u8) bo
     // treat as plaintext. For non-0x13 first bytes, try MSE.
     // In "forced" mode, all inbound connections must be MSE.
     if (self.encryption_mode == .forced or mse.looksLikeMse(&[_]u8{first_byte})) {
-        startMseResponder(self, slot);
+        startMseResponder(self, slot, n);
         return true;
     }
 

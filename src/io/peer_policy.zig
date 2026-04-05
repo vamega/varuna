@@ -133,6 +133,9 @@ pub fn tryFillPipeline(self: *EventLoop, slot: u16) !void {
         std.mem.writeInt(u32, send_buf[offset + 13 ..][0..4], req.length, .big);
     }
 
+    // MSE/PE: encrypt in-place before copying into tracked buffer
+    peer.crypto.encryptBuf(send_buf[0..total_len]);
+
     // Track for cleanup with unique send_id
     const ts = self.nextTrackedSendUserData(slot);
     const tracked = self.trackPendingSendCopy(slot, ts.send_id, send_buf[0..total_len]) catch {

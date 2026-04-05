@@ -252,6 +252,8 @@ pub fn handleUtMetadata(self: *EventLoop, slot: u16, ext_payload: []const u8) vo
 
             // Allocate the frame for tracked send (io_uring is async, buffer must persist)
             const frame = ext.serializeExtensionMessage(self.allocator, peer_ut_id, combined) catch return;
+            // MSE/PE: encrypt in-place before sending
+            peer.crypto.encryptBuf(frame);
 
             const ts = self.nextTrackedSendUserData(slot);
             const tracked = self.trackPendingSendOwned(slot, ts.send_id, frame) catch {
@@ -286,6 +288,8 @@ fn sendUtMetadataReject(self: *EventLoop, slot: u16, peer: *Peer, piece: u32) vo
 
     // Allocate frame for tracked send
     const frame = ext.serializeExtensionMessage(self.allocator, peer_ut_id, reject_payload) catch return;
+    // MSE/PE: encrypt in-place before sending
+    peer.crypto.encryptBuf(frame);
 
     const ts = self.nextTrackedSendUserData(slot);
     const tracked = self.trackPendingSendOwned(slot, ts.send_id, frame) catch {
@@ -502,6 +506,8 @@ pub fn submitPexMessage(self: *EventLoop, slot: u16) !void {
     // Frame as BEP 10 extension message and send
     const frame = try ext.serializeExtensionMessage(self.allocator, peer_pex_id, payload);
     errdefer self.allocator.free(frame);
+    // MSE/PE: encrypt in-place before sending
+    peer.crypto.encryptBuf(frame);
 
     const ts = self.nextTrackedSendUserData(slot);
     const tracked = try self.trackPendingSendOwned(slot, ts.send_id, frame);

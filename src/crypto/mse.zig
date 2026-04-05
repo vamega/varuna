@@ -159,6 +159,9 @@ const U768 = struct {
     }
 
     /// Reduce a 24-limb product modulo P.
+    /// Uses the "top-limb elimination" approach: for each high limb position from top
+    /// down to 12, subtract work[top] * P << (shift*64) until work[top] == 0.
+    /// The quotient estimate q = work[top] may be off by 1, so we retry until done.
     fn reduceWide(product: *const [24]u64, p: U768) U768 {
         // Copy to mutable working space
         var work = [_]u64{0} ** 25; // extra limb for borrow detection
@@ -171,14 +174,14 @@ const U768 = struct {
             top -= 1;
         }
 
-        // For each limb position from top down to 12, reduce
+        // For each limb position from top down to 12, reduce until work[top] == 0.
+        // The estimate q = work[top] may underestimate by 1, so we loop per position.
         while (top >= 12) {
-            // Estimate quotient digit: work[top] / p.limbs[11]
-            // Since p.limbs[11] = 0xFFFFFFFFFFFFFFFF, quotient ~ work[top]
-            const shift = top - 12;
-            if (work[top] != 0) {
-                const q = work[top]; // Conservative estimate
-                // Subtract q * p << (shift * 64) from work
+            // Reduce work[top] to 0 by subtracting multiples of p << (shift*64).
+            // Since q = work[top] underestimates by at most 1, this loops at most twice.
+            while (work[top] != 0) {
+                const q = work[top];
+                const shift = top - 12;
                 var borrow: u64 = 0;
                 for (0..12) |i| {
                     const wide = @as(u128, q) * @as(u128, p.limbs[i]) + @as(u128, borrow);
@@ -188,7 +191,7 @@ const U768 = struct {
                     work[shift + i] = diff[0];
                     if (diff[1] != 0) borrow += 1;
                 }
-                // Propagate borrow
+                // Propagate borrow upward from position shift+12 = top
                 var k = shift + 12;
                 while (k < 25 and borrow != 0) : (k += 1) {
                     const diff = @subWithOverflow(work[k], borrow);
@@ -204,7 +207,7 @@ const U768 = struct {
         var result: U768 = undefined;
         @memcpy(&result.limbs, work[0..12]);
 
-        // May need a few final subtractions
+        // May need up to 2 final subtractions (in practice 0 or 1)
         while (cmp(result, p) >= 0) {
             result = sub(result, p);
         }
@@ -312,7 +315,8 @@ fn computeSharedSecret(private_key: [dh_key_size]u8, other_public: [dh_key_size]
     const other = U768.fromBytes(other_public);
     const priv = U768.fromBytes(private_key);
     const secret = U768.powMod(other, priv, p);
-    return secret.toBytes();
+    const result = secret.toBytes();
+    return result;
 }
 
 /// Compute HASH('req1', S) per BEP 6.
@@ -482,37 +486,29 @@ pub fn handshakeInitiator(
     enc_cipher.process(enc_payload, enc_payload);
     try ring.send_all(fd, enc_payload);
 
-    // Step 8: Receive responder's message
-    // We need to find the encrypted VC in the stream. The responder may send
-    // PadB (already past the DH key we read) and then encrypted data.
-    // Read up to 512+8 bytes looking for encrypted VC (8 zero bytes after decryption)
-    // Actually: we need to handle the case where the responder sent PadB after Yb.
-    // We need to scan incoming data for the VC after decryption.
-    //
-    // Strategy: read bytes one at a time (via small recv), decrypt, and look for VC.
-    // Once found, read crypto_select + len(PadD) + PadD.
-    var vc_found = false;
-    var vc_match_count: usize = 0;
+    // Step 8: Receive responder's message.
+    // After Yb (already consumed), the seeder sends: PadB (plaintext) || ENCRYPT(VC,...).
+    // ENCRYPT uses RC4(key_B) starting at keystream position 0.  PadB is NOT encrypted,
+    // so we must NOT advance dec_cipher through PadB.  Instead we buffer all arriving
+    // bytes and, for each candidate start position p (tried once p+8 bytes are buffered),
+    // try a fresh cipher at keystream position 0 to check whether those 8 bytes decrypt
+    // to the VC (8 zero bytes).
+    var scan_buf: [max_pad_len + 8]u8 = undefined;
     var scan_bytes: usize = 0;
-    const max_scan = max_pad_len + 8; // PadB can be up to 512, plus VC is 8
-
-    while (scan_bytes < max_scan) {
-        var byte_buf: [1]u8 = undefined;
-        try ring.recv_exact(fd, &byte_buf);
+    var vc_found = false;
+    while (scan_bytes < max_pad_len + 8) {
+        try ring.recv_exact(fd, scan_buf[scan_bytes .. scan_bytes + 1]);
         scan_bytes += 1;
-
-        dec_cipher.process(&byte_buf, &byte_buf);
-        if (byte_buf[0] == vc_bytes[vc_match_count]) {
-            vc_match_count += 1;
-            if (vc_match_count == 8) {
+        if (scan_bytes >= 8) {
+            const p = scan_bytes - 8;
+            var trial = Rc4.initDiscardBep6(&key_b);
+            var vc_check: [8]u8 = undefined;
+            trial.process(&vc_check, scan_buf[p .. p + 8]);
+            if (std.mem.eql(u8, &vc_check, &vc_bytes)) {
+                // VC found. trial is now at keystream position 8, ready for next data.
+                dec_cipher = trial;
                 vc_found = true;
                 break;
-            }
-        } else {
-            vc_match_count = 0;
-            // Check if this byte could start a new VC match
-            if (byte_buf[0] == vc_bytes[0]) {
-                vc_match_count = 1;
             }
         }
     }
@@ -915,6 +911,11 @@ pub const MseInitiatorHandshake = struct {
     // Ciphers (initialized after DH exchange)
     enc_cipher: ?Rc4 = null,
     dec_cipher: ?Rc4 = null,
+    // Key B is stored so we can recreate a fresh dec_cipher for each VC scan candidate.
+    // The seeder starts its enc_cipher at keystream position 0 when encrypting the VC.
+    // PadB is plaintext, so we must NOT advance dec_cipher through PadB bytes.
+    // Instead we buffer PadB + ENCRYPT(VC,...) and try each candidate offset with a fresh cipher.
+    dec_key: [20]u8 = undefined,
 
     // Send buffer (holds outgoing data across phases)
     send_buf: [mse_send_buf_size]u8 = undefined,
@@ -924,10 +925,9 @@ pub const MseInitiatorHandshake = struct {
     peer_public_key: [dh_key_size]u8 = undefined,
     recv_offset: usize = 0,
 
-    // VC scan state
-    vc_match_count: usize = 0,
+    // VC scan state: buffer incoming bytes and try each candidate start position.
     scan_bytes: usize = 0,
-    scan_byte_buf: [1]u8 = undefined,
+    scan_buf: [max_pad_len + 8]u8 = undefined,
 
     // crypto_select recv
     cs_buf: [6]u8 = undefined,
@@ -984,9 +984,8 @@ pub const MseInitiatorHandshake = struct {
             .send_crypto_req => {
                 // Crypto request sent, now scan for VC in response
                 self.phase = .recv_vc_scan;
-                self.vc_match_count = 0;
                 self.scan_bytes = 0;
-                return .{ .recv = self.scan_byte_buf[0..1] };
+                return .{ .recv = self.scan_buf[0..1] };
             },
             else => return .{ .failed = .internal },
         }
@@ -1013,6 +1012,7 @@ pub const MseInitiatorHandshake = struct {
                 const key_b = deriveKeyB(self.shared_secret, skey);
                 self.enc_cipher = Rc4.initDiscardBep6(&key_a);
                 self.dec_cipher = Rc4.initDiscardBep6(&key_b);
+                self.dec_key = key_b;
 
                 // Build send: HASH(req1,S) || HASH(req2,SKEY)^HASH(req3,S) || encrypted(VC + crypto_provide + PadC + len(IA))
                 const req1 = hashReq1(self.shared_secret);
@@ -1053,31 +1053,32 @@ pub const MseInitiatorHandshake = struct {
                 return .{ .send = self.send_buf[0..self.send_len] };
             },
             .recv_vc_scan => {
-                // Decrypt the received byte
-                if (self.dec_cipher) |*dec| {
-                    dec.process(&self.scan_byte_buf, &self.scan_byte_buf);
-                }
+                // The byte was received into scan_buf[scan_bytes]. Advance counter.
+                self.scan_bytes += 1;
 
-                if (self.scan_byte_buf[0] == vc_bytes[self.vc_match_count]) {
-                    self.vc_match_count += 1;
-                    if (self.vc_match_count == 8) {
-                        // VC found! Now recv crypto_select + len(PadD)
+                // PadB is plaintext; the seeder's enc_cipher starts at keystream position 0
+                // when encrypting ENCRYPT(VC,...). So we must NOT advance dec_cipher through
+                // PadB bytes. Instead, for each candidate start position p (tried once we
+                // have p+8 bytes buffered), try a fresh cipher at keystream position 0.
+                if (self.scan_bytes >= 8) {
+                    const p = self.scan_bytes - 8;
+                    var trial = Rc4.initDiscardBep6(&self.dec_key);
+                    var vc_check: [8]u8 = undefined;
+                    trial.process(&vc_check, self.scan_buf[p .. p + 8]);
+                    if (std.mem.eql(u8, &vc_check, &vc_bytes)) {
+                        // VC found at position p. trial has consumed 8 bytes of keystream,
+                        // so it is correctly positioned for the data that follows the VC.
+                        self.dec_cipher = trial;
                         self.phase = .recv_crypto_select;
                         self.cs_offset = 0;
                         return .{ .recv = self.cs_buf[0..6] };
                     }
-                } else {
-                    self.vc_match_count = 0;
-                    if (self.scan_byte_buf[0] == vc_bytes[0]) {
-                        self.vc_match_count = 1;
-                    }
                 }
 
-                self.scan_bytes += 1;
                 if (self.scan_bytes >= max_pad_len + 8) {
                     return .{ .failed = .vc_not_found };
                 }
-                return .{ .recv = self.scan_byte_buf[0..1] };
+                return .{ .recv = self.scan_buf[self.scan_bytes .. self.scan_bytes + 1] };
             },
             .recv_crypto_select => {
                 self.cs_offset += n;
@@ -1257,6 +1258,14 @@ pub const MseResponderHandshake = struct {
                     return .{ .recv = self.peer_public_key[self.recv_offset..] };
                 }
                 // DH key received -- compute shared secret
+                log.debug("responder peer_public_key[0..8]={x:0>2}{x:0>2}{x:0>2}{x:0>2}{x:0>2}{x:0>2}{x:0>2}{x:0>2}", .{
+                    self.peer_public_key[0], self.peer_public_key[1], self.peer_public_key[2], self.peer_public_key[3],
+                    self.peer_public_key[4], self.peer_public_key[5], self.peer_public_key[6], self.peer_public_key[7],
+                });
+                log.debug("responder peer_public_key[64..72]={x:0>2}{x:0>2}{x:0>2}{x:0>2}{x:0>2}{x:0>2}{x:0>2}{x:0>2}", .{
+                    self.peer_public_key[64], self.peer_public_key[65], self.peer_public_key[66], self.peer_public_key[67],
+                    self.peer_public_key[68], self.peer_public_key[69], self.peer_public_key[70], self.peer_public_key[71],
+                });
                 self.shared_secret = computeSharedSecret(self.private_key, self.peer_public_key);
                 const s_val = U768.fromBytes(self.shared_secret);
                 if (s_val.isZero()) return .{ .failed = .invalid_shared_secret };
@@ -1604,6 +1613,111 @@ test "U768 powMod: 2^10 mod P" {
     const exp = U768.fromU64(10);
     const result = U768.powMod(base, exp, p);
     try std.testing.expectEqual(@as(u64, 1024), result.limbs[0]);
+}
+
+test "DH powMod dense known-vector test (fully random 768-bit keys, Python-verified)" {
+    // Dense random 768-bit keys verified against Python's pow(base, exp, P)
+    const priv_a_dense = [96]u8{
+        0x11, 0xFE, 0x29, 0x32, 0x4D, 0xFF, 0x88, 0xA6, 0x8A, 0x81, 0xD9, 0xD5, 0xAB, 0x2C, 0x4D, 0xA0,
+        0x59, 0x25, 0x9B, 0xB1, 0xEB, 0x91, 0x97, 0x05, 0xB5, 0x67, 0x32, 0xE8, 0x70, 0x4C, 0xC6, 0xA4,
+        0x10, 0x97, 0xAA, 0xC0, 0x0D, 0x85, 0x08, 0xC5, 0xBD, 0x9C, 0x19, 0xC7, 0xBA, 0xB1, 0x48, 0x6F,
+        0xD7, 0x30, 0x63, 0x9E, 0x8C, 0xED, 0xD8, 0xF2, 0xDF, 0x64, 0xF5, 0xD0, 0xFE, 0x77, 0xD8, 0x37,
+        0x7C, 0x87, 0xB8, 0x32, 0xB1, 0x6E, 0x61, 0xAC, 0xAA, 0x95, 0x9D, 0x8B, 0x66, 0xF5, 0x1A, 0xF5,
+        0x6D, 0x6C, 0x11, 0x89, 0xA5, 0xA5, 0x21, 0x29, 0xDF, 0xD0, 0x90, 0xB4, 0x93, 0xF8, 0x15, 0x49,
+    };
+    const pub_a_dense = [96]u8{
+        0xDE, 0xC9, 0xC2, 0x16, 0x28, 0xBB, 0x82, 0xF8, 0x53, 0x86, 0xF4, 0x1F, 0xC0, 0x9A, 0x28, 0x29,
+        0xFF, 0x80, 0x5A, 0x5C, 0x25, 0xA1, 0xBB, 0x34, 0xA2, 0x69, 0x10, 0x2E, 0xCA, 0x9B, 0x53, 0xED,
+        0x22, 0x41, 0xF2, 0x53, 0xBC, 0xC7, 0xEF, 0xAD, 0x22, 0x75, 0xD2, 0x4D, 0x13, 0xAD, 0x8C, 0xC1,
+        0x2F, 0x93, 0x06, 0x1A, 0xB1, 0x47, 0x6D, 0x64, 0xC6, 0xFE, 0x5D, 0x22, 0x8F, 0x45, 0x7F, 0x64,
+        0x6A, 0x3B, 0x36, 0x9C, 0x74, 0xB1, 0x29, 0xD1, 0xE6, 0x91, 0x37, 0x41, 0x2B, 0x61, 0x62, 0x9F,
+        0x00, 0x13, 0xAF, 0x14, 0x48, 0xB4, 0xAC, 0x5B, 0xFB, 0xA0, 0x8D, 0x08, 0x21, 0xE9, 0x56, 0x56,
+    };
+    const priv_b_dense = [96]u8{
+        0xC2, 0xFF, 0xA3, 0xC2, 0xDF, 0xFE, 0x46, 0x7D, 0x1F, 0x48, 0x8C, 0x08, 0x2E, 0x35, 0x21, 0xDE,
+        0x2B, 0x09, 0x20, 0x84, 0x0C, 0xE4, 0xCF, 0x5F, 0x8F, 0x93, 0x70, 0xF8, 0x1B, 0xEA, 0x0C, 0x8D,
+        0x78, 0x14, 0x39, 0x35, 0xD3, 0x08, 0xC5, 0xFB, 0xF9, 0xA2, 0x4D, 0x03, 0xDB, 0x92, 0x60, 0x30,
+        0x18, 0xC4, 0x8E, 0x4A, 0x51, 0x43, 0x98, 0xF4, 0x7F, 0x79, 0xE3, 0x19, 0x4E, 0xDE, 0x48, 0xDC,
+        0xC2, 0x20, 0xDA, 0x50, 0xA9, 0xEE, 0x3A, 0xE2, 0x34, 0x8E, 0xD2, 0x31, 0x9D, 0xF1, 0xAC, 0x87,
+        0x8A, 0xD6, 0xA1, 0x1F, 0xAA, 0xC3, 0xDB, 0xE3, 0xF2, 0x60, 0xCB, 0xF6, 0x4E, 0x1D, 0xE9, 0xDF,
+    };
+    const pub_b_dense = [96]u8{
+        0x8F, 0xCF, 0xBB, 0x63, 0x02, 0x85, 0xAE, 0x0C, 0xB5, 0xD5, 0xEB, 0x31, 0x43, 0x2D, 0x20, 0x55,
+        0x4A, 0x7F, 0xC6, 0x56, 0xFB, 0x66, 0x03, 0x87, 0xFE, 0x0C, 0x83, 0xEF, 0xCF, 0x28, 0x9E, 0xEA,
+        0xD6, 0x76, 0xBA, 0x4E, 0x57, 0xD5, 0xBD, 0x2C, 0x81, 0x3C, 0x2D, 0x22, 0x0F, 0x09, 0xDB, 0x2A,
+        0x70, 0xB0, 0x47, 0x84, 0x68, 0x51, 0xE1, 0x56, 0x6C, 0x7D, 0x14, 0x9A, 0xC0, 0xEA, 0x77, 0x6D,
+        0x23, 0x27, 0x5E, 0x21, 0xCE, 0x6F, 0x07, 0x19, 0x22, 0x7E, 0x83, 0x72, 0x17, 0xE5, 0xF8, 0x2D,
+        0xA7, 0x50, 0x3E, 0x42, 0xC7, 0xF0, 0xCF, 0xB1, 0xB6, 0x84, 0x8B, 0xA4, 0x39, 0x52, 0x65, 0x56,
+    };
+    const expected_dense_secret = [96]u8{
+        0x8C, 0x95, 0x8F, 0xA1, 0x1E, 0x19, 0x7B, 0x6A, 0xAA, 0x8C, 0xB0, 0x62, 0x2D, 0x69, 0x91, 0x63,
+        0x53, 0x59, 0x42, 0xF0, 0xA3, 0x06, 0xD5, 0xA9, 0x5C, 0x58, 0xE1, 0xE1, 0xAF, 0xDC, 0x4C, 0x74,
+        0x1F, 0xF3, 0xE5, 0x6B, 0xEC, 0xAA, 0xD4, 0x34, 0x20, 0xC8, 0xCE, 0x27, 0x26, 0x53, 0xA5, 0x29,
+        0x0F, 0xB1, 0x7C, 0xD6, 0xAD, 0x5A, 0x6F, 0xBD, 0x83, 0x6B, 0x5E, 0x33, 0x73, 0x2B, 0xBF, 0xAE,
+        0x85, 0x5E, 0x9A, 0x84, 0xD7, 0xF3, 0xDC, 0x69, 0xA9, 0x0E, 0xA3, 0xE3, 0xD1, 0xBF, 0x64, 0xCB,
+        0xF7, 0x6D, 0x35, 0xB8, 0xF2, 0xB3, 0x3D, 0x09, 0x6D, 0x8A, 0xF4, 0x0A, 0x1D, 0xBA, 0x09, 0xC4,
+    };
+    const computed_pub_a = computePublicKey(priv_a_dense);
+    try std.testing.expectEqualSlices(u8, &pub_a_dense, &computed_pub_a);
+    const computed_pub_b = computePublicKey(priv_b_dense);
+    try std.testing.expectEqualSlices(u8, &pub_b_dense, &computed_pub_b);
+    const secret_ab = computeSharedSecret(priv_a_dense, pub_b_dense);
+    try std.testing.expectEqualSlices(u8, &expected_dense_secret, &secret_ab);
+    const secret_ba = computeSharedSecret(priv_b_dense, pub_a_dense);
+    try std.testing.expectEqualSlices(u8, &expected_dense_secret, &secret_ba);
+}
+
+test "DH powMod known-vector test (verified against Python)" {
+    // These values were generated by Python and verified with pow(base, exp, P)
+    const priv_a = [96]u8{
+        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+        0x00, 0x00, 0x00, 0x00, 0xDE, 0xAD, 0xBE, 0xEF, 0xCA, 0xFE, 0xBA, 0xBE, 0x01, 0x02, 0x03, 0x04,
+        0x05, 0x06, 0x07, 0x08, 0x09, 0x0A, 0x0B, 0x0C, 0x0D, 0x0E, 0x0F, 0x10, 0x11, 0x12, 0x13, 0x14,
+        0x15, 0x16, 0x17, 0x18, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01,
+    };
+    const pub_a = [96]u8{
+        0xDF, 0x2D, 0x28, 0x6E, 0xF1, 0x36, 0x1C, 0x9A, 0x55, 0x22, 0x7B, 0x3B, 0x59, 0x8B, 0xB7, 0x07,
+        0x72, 0xC5, 0x3D, 0xD0, 0x67, 0x48, 0xD7, 0xF9, 0x79, 0x48, 0x8F, 0x27, 0xC0, 0x44, 0xB8, 0xBF,
+        0x9E, 0xBE, 0x8A, 0xB7, 0xFF, 0x25, 0x0C, 0x34, 0xF1, 0xE5, 0x6A, 0xF7, 0x94, 0x67, 0xE4, 0x43,
+        0x81, 0x6B, 0x7B, 0xC2, 0xC1, 0x50, 0xB8, 0xA3, 0xED, 0xCB, 0x8A, 0xE0, 0xD1, 0x5E, 0x28, 0x73,
+        0x64, 0x3D, 0x73, 0x1C, 0xDD, 0x32, 0x3C, 0x03, 0x21, 0xA5, 0x5D, 0x94, 0x13, 0xDA, 0xC1, 0x41,
+        0xF0, 0x8B, 0xC3, 0xB2, 0x8A, 0x83, 0x8F, 0x58, 0x34, 0xDC, 0x46, 0x16, 0xB1, 0x62, 0x5B, 0xE3,
+    };
+    const priv_b = [96]u8{
+        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+        0x00, 0x00, 0x00, 0x00, 0x0B, 0xAD, 0xC0, 0xFF, 0xEE, 0x0D, 0xDF, 0x00, 0xD1, 0xF2, 0xF3, 0xF4,
+        0xF5, 0xF6, 0xF7, 0xF8, 0xF9, 0xFA, 0xFB, 0xFC, 0xFD, 0xFE, 0xFF, 0x00, 0x00, 0x00, 0x00, 0x00,
+        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x03,
+    };
+    const pub_b = [96]u8{
+        0x15, 0x18, 0xCC, 0x1A, 0xFA, 0x42, 0x33, 0xF9, 0x38, 0x95, 0x0C, 0x12, 0x24, 0x78, 0xEB, 0xCC,
+        0x55, 0x71, 0x64, 0x5B, 0x8C, 0xC1, 0x19, 0x34, 0x7D, 0x8F, 0x38, 0xF3, 0x4F, 0x81, 0x76, 0x40,
+        0x12, 0x91, 0x7B, 0xBF, 0x4A, 0xA8, 0x95, 0x34, 0xCC, 0x6B, 0xA2, 0xBB, 0x8A, 0x9A, 0x42, 0xF6,
+        0xF2, 0x5D, 0xD1, 0xD1, 0x0B, 0xC8, 0x48, 0x02, 0x49, 0x93, 0x70, 0xCA, 0x9A, 0xF1, 0x58, 0xCE,
+        0x4E, 0x46, 0xA9, 0xB6, 0x32, 0xE7, 0xF2, 0x2F, 0x72, 0x04, 0x47, 0x39, 0x17, 0x1B, 0xDE, 0x90,
+        0x06, 0x77, 0xB1, 0x70, 0x86, 0x26, 0xD4, 0x8B, 0x7D, 0x92, 0x05, 0x1E, 0x23, 0x68, 0x64, 0x94,
+    };
+    // Expected first 4 bytes of secret, verified by Python: pow(pub_b, priv_a, P) = pow(pub_a, priv_b, P)
+    const expected_first4 = [4]u8{ 0x39, 0xA3, 0x0B, 0x61 };
+
+    // Verify pub_a = 2^priv_a mod P
+    const computed_pub_a = computePublicKey(priv_a);
+    try std.testing.expectEqualSlices(u8, &pub_a, &computed_pub_a);
+
+    // Verify pub_b = 2^priv_b mod P
+    const computed_pub_b = computePublicKey(priv_b);
+    try std.testing.expectEqualSlices(u8, &pub_b, &computed_pub_b);
+
+    // Verify shared secrets match Python's expected value
+    const secret_ab = computeSharedSecret(priv_a, pub_b);
+    try std.testing.expectEqualSlices(u8, &expected_first4, secret_ab[0..4]);
+
+    const secret_ba = computeSharedSecret(priv_b, pub_a);
+    try std.testing.expectEqualSlices(u8, &expected_first4, secret_ba[0..4]);
 }
 
 test "DH key exchange produces same shared secret" {
@@ -2191,4 +2305,45 @@ test "MseInitiatorHandshake vc_scan exceeds limit returns vc_not_found" {
     }
     // If we get here, the limit wasn't reached (shouldn't happen)
     try std.testing.expect(false);
+}
+
+test "MseInitiator and MseResponder shared_secret agree after DH exchange" {
+    const info_hash = [_]u8{0x42} ** 20;
+    const known = [_][20]u8{info_hash};
+
+    // Create initiator and responder
+    var ini = MseInitiatorHandshake.init(info_hash, .preferred);
+    var resp = MseResponderHandshake.init(&known, .preferred);
+
+    // Initiator's first action: send Ya + PadA. Extract Ya (first dh_key_size bytes).
+    const ini_send_action = ini.start();
+    const ya_plus_pad = switch (ini_send_action) {
+        .send => |data| data,
+        else => return error.ExpectedSend,
+    };
+    const ya = ya_plus_pad[0..dh_key_size];
+
+    // Responder's initial state: recv DH key. Simulate receiving Ya.
+    _ = resp.start();
+    @memcpy(&resp.peer_public_key, ya);
+    const resp_after_dh = resp.feedRecv(dh_key_size);
+
+    // Responder computed shared_secret and now wants to send Yb + PadB.
+    const yb_plus_pad = switch (resp_after_dh) {
+        .send => |data| data,
+        else => return error.ExpectedSend,
+    };
+    const yb = yb_plus_pad[0..dh_key_size];
+
+    // Initiator receives Yb: simulate feedSend (send complete) then set peer key and feedRecv.
+    const ini_after_send = ini.feedSend();
+    _ = switch (ini_after_send) {
+        .recv => |buf| buf, // expecting recv for peer_public_key
+        else => return error.ExpectedRecv,
+    };
+    @memcpy(&ini.peer_public_key, yb);
+    _ = ini.feedRecv(dh_key_size);
+
+    // Now verify the shared secrets agree
+    try std.testing.expectEqualSlices(u8, &ini.shared_secret, &resp.shared_secret);
 }
