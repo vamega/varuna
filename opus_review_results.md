@@ -1,7 +1,6 @@
-# Varuna Codebase Review Results (Round 2)
+# Varuna Codebase Review Results (Round 2 — Updated)
 
-Comprehensive review after fixing 16 critical/high items from round 1,
-adding 134 tests, merging DHT, removing standalone download path.
+Items struck from this list have been fixed. Remaining issues only.
 
 ---
 
@@ -9,10 +8,6 @@ adding 134 tests, merging DHT, removing standalone download path.
 
 | # | Finding | Area | File(s) |
 |---|---------|------|---------|
-| 1 | **Config TOML use-after-free** -- `load()` calls `result.deinit()` which frees string memory, but returned Config retains dangling `[]const u8` slices. Crashes when any string field is set from a TOML file. | Memory Safety | `config.zig:90-98`, `main.zig:69-137` |
-| 2 | **`startPieceDownload` leaks piece_buf on `tryFillPipeline` failure** -- `current_piece` and `piece_buf` are set before `tryFillPipeline`, but callers only release the piece from tracker on error, never clearing `current_piece` or freeing `piece_buf`. Permanently stalls the peer. | Memory Safety | `peer_policy.zig:89-96` |
-| 3 | **Shell scripts broken** -- `demo_swarm.sh` and `test_transfer_matrix.sh` invoke `varuna-tools seed` / `download` which no longer exist. Zero working end-to-end transfer validation. | Testing | `scripts/demo_swarm.sh`, `scripts/test_transfer_matrix.sh` |
-| 4 | **BITFIELD not validated** -- no length check (`ceil(piece_count/8)`), no spare-bits-must-be-zero check, no ordering enforcement (must be first message after handshake) | Protocol | `protocol.zig:100-111` |
 | 5 | **UDP tracker: no retry/timeout per BEP 15** -- single send+recv, dropped packet = permanent hang. No exponential backoff. | Protocol | `tracker/udp.zig:40-78` |
 
 ---
@@ -21,14 +16,11 @@ adding 134 tests, merging DHT, removing standalone download path.
 
 | # | Finding | Area | File(s) |
 |---|---------|------|---------|
-| 6 | **UNCHOKE after CHOKE stalls download** -- when choked with `current_piece` set, unchoke calls `markIdle` which checks `current_piece==null` and returns. Download stalls for 60s until timeout. | Robustness | `protocol.zig:53-56` |
-| 7 | **Multi-file write passes fd=-1 for do_not_download files** -- boundary pieces spanning skipped files submit io_uring writes to fd -1, causing EBADF -> infinite re-download loop | Robustness | `peer_policy.zig:334,436` |
 | 8 | **DH public key not validated for 0 or 1** -- peer sending pubkey=1 makes shared secret=1 (trivially predictable). Zero check catches pubkey=0 but not pubkey=1 or P-1. | Security | `mse.zig:312-319` |
 | 9 | **KRPC `skipValue` has no recursion depth limit** -- separate from the fixed bencode parser; UDP packets with ~750 nesting levels can overflow the stack | Security | `dht/krpc.zig:300-335` |
 | 10 | **`setDhtEnabled` races with event loop** -- writes `el.dht_engine = null` from API thread without synchronization while event loop reads it every tick | Memory Safety | `session_manager.zig:111` |
 | 11 | **PORT message (id=9) silently discarded** -- DHT peers send PORT to indicate their DHT port; ignoring it means we miss routing table entries | Protocol | `protocol.zig:241` |
 | 12 | **No Fast Extension support** -- HAVE_ALL, HAVE_NONE, REJECT_REQUEST (ids 13-17) silently dropped. Seeders sending HAVE_ALL instead of BITFIELD appear to have zero pieces. | Protocol | `protocol.zig` switch |
-| 13 | **No SO_RCVBUF/SO_SNDBUF tuning** -- default 128KB receive buffer vs qBittorrent's 2MB. Limits TCP window for high-pipeline-depth transfers. Estimated 3-8% throughput gap. | Performance | `event_loop.zig`, `peer_handler.zig` |
 | 14 | **Dead code: `EventLoop.init()`, `run()`, re-announce infrastructure** -- ~200 lines + 7 struct fields from deleted client.zig path. `setAnnounce()` has zero callers. | Organization | `event_loop.zig`, `peer_policy.zig` |
 | 15 | **Config `pipeline_depth` disconnect** -- `Config.Performance.pipeline_depth` defaults to 5 but `peer_policy.zig` hardcodes 64. Config value has no effect. | Organization | `config.zig:83`, `peer_policy.zig:19` |
 
@@ -82,7 +74,6 @@ adding 134 tests, merging DHT, removing standalone download path.
 
 | Priority | Gap |
 |----------|-----|
-| **#1** | Shell scripts (`demo_swarm.sh`, `test_transfer_matrix.sh`) broken -- invoke removed `download`/`seed` commands |
 | **#2** | No end-to-end daemon integration test (add torrent -> download -> verify) |
 | **#3** | `dht_handler.zig` -- 0 tests. `addressEql`, peer dedup, drain logic untested |
 | **#4** | `dht/persistence.zig` -- 1 test. No save/load roundtrip for nodes or config |
@@ -92,3 +83,33 @@ adding 134 tests, merging DHT, removing standalone download path.
 | **#8** | Resume DB roundtrip (close -> reopen -> verify loaded pieces) not tested |
 | **#9** | `utp_handler.zig` -- 0 tests. `toSendAddr` IPv4-mapped-IPv6 untested |
 | **#10** | `tracker_executor.zig` -- 0 tests. Job lifecycle untested |
+
+---
+
+## Fixed in This Round
+
+- ~~#1 Config TOML use-after-free~~ -- `load()` returns `LoadedConfig` keeping parse tree alive
+- ~~#2 startPieceDownload leak~~ -- added errdefer for piece_buf/current_piece
+- ~~#3 Shell scripts broken~~ -- rewrote to use daemon + varuna-ctl API
+- ~~#4 BITFIELD not validated~~ -- length check, spare-bits check added; bad peers disconnected
+- ~~#6 UNCHOKE after CHOKE stalls~~ -- calls tryFillPipeline to resume interrupted piece
+- ~~#7 Multi-file write fd=-1~~ -- skip spans for do_not_download files
+- ~~#13 SO_RCVBUF/SO_SNDBUF~~ -- set 2MB recv / 512KB send on all peer sockets
+
+## Fixed in Round 1
+
+- u32 overflow in block_offset+block_length, max block_length 128KB cap
+- Disk write error use-after-free (defers free until spans complete)
+- Availability counters decremented on disconnect
+- Background announce thread joined in deinit
+- announce_result_peers protected by mutex
+- CANCEL message handler added
+- TCP_NODELAY on all peer sockets
+- Bencode: max nesting depth 64, max container elements 500K
+- completePiece clears in_progress bit
+- Choking: tit-for-tat both modes, 10s interval, optimistic unchoke
+- Keep-alive after 90s inactivity
+- io_uring COOP_TASKRUN + SINGLE_ISSUER flags
+- send_pending gate removed from tryFillPipeline
+- Pending disk writes flushed on shutdown
+- pipeline_depth 5 -> 64, multi-piece pipelining
