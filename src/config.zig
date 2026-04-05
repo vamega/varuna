@@ -68,6 +68,10 @@ pub const Config = struct {
         /// Supported: qBittorrent, rTorrent, uTorrent, Deluge, Transmission.
         /// When null (default), uses Varuna's own peer ID prefix (-VR0001-).
         masquerade_as: ?[]const u8 = null,
+        /// Disable tracker announces and rely on DHT/PEX for peer discovery.
+        /// Useful for testing DHT peer discovery or for privacy-conscious operation.
+        /// Private torrents (private=1 flag) always use the tracker regardless of this setting.
+        disable_trackers: bool = false,
     };
 
     pub const Performance = struct {

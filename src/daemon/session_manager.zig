@@ -27,6 +27,8 @@ pub const SessionManager = struct {
     resume_db_path: ?[*:0]const u8 = null,
     /// Masquerade as a different client for peer ID generation (e.g. "qBittorrent 5.1.4").
     masquerade_as: ?[]const u8 = null,
+    /// Disable tracker announces; rely on DHT/PEX for peer discovery.
+    disable_trackers: bool = false,
 
     // ── Global share ratio / seeding time limits ──────────
     /// Whether global ratio limit enforcement is enabled.
@@ -165,6 +167,7 @@ pub const SessionManager = struct {
         session.resume_db_path = self.resume_db_path;
         session.shared_event_loop = self.shared_event_loop orelse return error.SharedEventLoopNotConfigured;
         session.tracker_executor = try self.ensureTrackerExecutor();
+        session.disable_trackers = self.disable_trackers;
     }
 
     fn registerSession(self: *SessionManager, session: *TorrentSession) !*TorrentSession {

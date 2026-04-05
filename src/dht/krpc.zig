@@ -60,15 +60,19 @@ pub const Query = struct {
 pub const Response = struct {
     transaction_id: []const u8,
     sender_id: NodeId,
-    /// Compact nodes info (from "nodes" key).
+    /// Compact nodes info for IPv4 nodes (from "nodes" key, 26 bytes per entry).
     nodes: ?[]const u8 = null,
+    /// Compact nodes info for IPv6 nodes (from "nodes6" key, BEP 32, 38 bytes per entry).
+    nodes6: ?[]const u8 = null,
     /// Token (from get_peers response).
     token: ?[]const u8 = null,
     /// Compact peer values (from get_peers "values" list).
     values: ?[]const []const u8 = null,
-    /// Raw bytes of the bencoded "values" list (slice into original packet).
+    /// Raw bytes of the bencoded IPv4 "values" list (slice into original packet).
     /// Use this to extract compact peers without allocation.
     values_raw: ?[]const u8 = null,
+    /// Raw bytes of the bencoded IPv6 "values6" list (BEP 32, 18 bytes per entry).
+    values6_raw: ?[]const u8 = null,
 };
 
 /// Parsed KRPC error.
@@ -220,10 +224,13 @@ fn parseResponse(tid: []const u8, r_raw: []const u8) !Response {
             @memcpy(&resp.sender_id, id);
         } else if (std.mem.eql(u8, key, "nodes")) {
             resp.nodes = parseByteString(r_raw, &pos) orelse return error.InvalidKrpc;
+        } else if (std.mem.eql(u8, key, "nodes6")) {
+            // BEP 32: compact IPv6 node info (38 bytes each: 20 ID + 16 IP + 2 port)
+            resp.nodes6 = parseByteString(r_raw, &pos) orelse return error.InvalidKrpc;
         } else if (std.mem.eql(u8, key, "token")) {
             resp.token = parseByteString(r_raw, &pos) orelse return error.InvalidKrpc;
         } else if (std.mem.eql(u8, key, "values")) {
-            // "values" is a list of compact peer strings (6 bytes each: 4B IP + 2B port)
+            // "values" is a list of compact IPv4 peer strings (6 bytes each: 4B IP + 2B port)
             if (pos >= r_raw.len or r_raw[pos] != 'l') {
                 skipValue(r_raw, &pos) orelse return error.InvalidKrpc;
                 continue;
@@ -232,6 +239,15 @@ fn parseResponse(tid: []const u8, r_raw: []const u8) !Response {
             const list_start = pos;
             skipValue(r_raw, &pos) orelse return error.InvalidKrpc;
             resp.values_raw = r_raw[list_start..pos];
+        } else if (std.mem.eql(u8, key, "values6")) {
+            // BEP 32: list of compact IPv6 peer strings (18 bytes each: 16B IP + 2B port)
+            if (pos >= r_raw.len or r_raw[pos] != 'l') {
+                skipValue(r_raw, &pos) orelse return error.InvalidKrpc;
+                continue;
+            }
+            const list_start = pos;
+            skipValue(r_raw, &pos) orelse return error.InvalidKrpc;
+            resp.values6_raw = r_raw[list_start..pos];
         } else {
             skipValue(r_raw, &pos) orelse return error.InvalidKrpc;
         }

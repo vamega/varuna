@@ -96,7 +96,9 @@ pub fn randomIdInBucket(own_id: NodeId, bucket_index: u8) NodeId {
 
 /// Encode a NodeInfo as 26 bytes of compact node info (BEP 5).
 /// Format: 20-byte node ID + 4-byte IPv4 address + 2-byte port (big-endian).
+/// Only call this for IPv4 nodes; use encodeCompactNode6 for IPv6.
 pub fn encodeCompactNode(node: NodeInfo) [26]u8 {
+    std.debug.assert(node.address.any.family == std.posix.AF.INET);
     var buf: [26]u8 = undefined;
     @memcpy(buf[0..20], &node.id);
     const addr_bytes: [4]u8 = @bitCast(node.address.in.sa.addr);
@@ -105,7 +107,7 @@ pub fn encodeCompactNode(node: NodeInfo) [26]u8 {
     return buf;
 }
 
-/// Decode 26 bytes of compact node info into a NodeInfo.
+/// Decode 26 bytes of compact node info into a NodeInfo (IPv4).
 pub fn decodeCompactNode(data: *const [26]u8) NodeInfo {
     var id: NodeId = undefined;
     @memcpy(&id, data[0..20]);
@@ -114,6 +116,28 @@ pub fn decodeCompactNode(data: *const [26]u8) NodeInfo {
     return .{
         .id = id,
         .address = std.net.Address.initIp4(addr_bytes, port),
+    };
+}
+
+/// Encode a NodeInfo as 38 bytes of compact node info for IPv6 (BEP 32).
+/// Format: 20-byte node ID + 16-byte IPv6 address + 2-byte port (big-endian).
+pub fn encodeCompactNode6(node: NodeInfo) [38]u8 {
+    var buf: [38]u8 = undefined;
+    @memcpy(buf[0..20], &node.id);
+    @memcpy(buf[20..36], &node.address.in6.sa.addr);
+    std.mem.writeInt(u16, buf[36..38], node.address.getPort(), .big);
+    return buf;
+}
+
+/// Decode 38 bytes of compact IPv6 node info into a NodeInfo (BEP 32).
+pub fn decodeCompactNode6(data: *const [38]u8) NodeInfo {
+    var id: NodeId = undefined;
+    @memcpy(&id, data[0..20]);
+    const addr_bytes: [16]u8 = data[20..36].*;
+    const port = std.mem.readInt(u16, data[36..38], .big);
+    return .{
+        .id = id,
+        .address = std.net.Address.initIp6(addr_bytes, port, 0, 0),
     };
 }
 

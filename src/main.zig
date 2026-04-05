@@ -84,6 +84,34 @@ pub fn main() !void {
     // Initialize the reusable piece cache. A zero size means the default 64 MB.
     shared_el.initHugePageCache(cfg.performance.piece_cache_size);
 
+    // Initialize DHT engine (BEP 5). Runs on the shared UDP socket alongside uTP.
+    // DhtEngine.create() heap-allocates and initializes via explicit field assignment
+    // to avoid placing the ~900 KB struct on main()'s stack.
+    shared_el.port = cfg.network.port_min;
+    const dht_engine = try varuna.dht.DhtEngine.create(allocator, varuna.dht.node_id.generate());
+    defer {
+        dht_engine.deinit();
+        allocator.destroy(dht_engine);
+    }
+
+    // Wire the DHT engine into the shared event loop before starting the UDP socket.
+    shared_el.dht_engine = dht_engine;
+
+    // Start the shared UDP socket (used by both DHT and uTP). This must happen
+    // before the event loop so that DHT bootstrap pings can be submitted.
+    shared_el.startUtpListener() catch |err| {
+        try stdout.print("warning: failed to start UDP listener: {s}\n", .{@errorName(err)});
+        try stdout.flush();
+        shared_el.dht_engine = null; // Disable DHT if UDP socket failed
+    };
+
+    // Resolve bootstrap node hostnames (blocking DNS, after UDP socket is ready).
+    const bootstrap_addrs = varuna.dht.bootstrap.resolveBootstrapNodes(allocator) catch &.{};
+    defer if (bootstrap_addrs.len > 0) allocator.free(bootstrap_addrs);
+    if (shared_el.dht_engine != null) {
+        dht_engine.addBootstrapNodes(bootstrap_addrs);
+    }
+
     // Session manager
     var session_manager = varuna.daemon.session_manager.SessionManager.init(allocator);
     session_manager.shared_event_loop = &shared_el;
@@ -92,6 +120,7 @@ pub fn main() !void {
     session_manager.hasher_threads = cfg.performance.hasher_threads;
     session_manager.resume_db_path = resume_db_path;
     session_manager.masquerade_as = cfg.network.masquerade_as;
+    session_manager.disable_trackers = cfg.network.disable_trackers;
     if (cfg.storage.data_dir) |dir| session_manager.default_save_path = dir;
     // Apply queue config from TOML
     session_manager.queue_manager.config = .{
@@ -273,13 +302,15 @@ pub fn main() !void {
             _ = session_manager.checkShareLimits();
         }
 
-        // Tick shared event loop (non-blocking poll)
-        if (shared_el.peer_count > 0 or shared_el.listen_fd >= 0) {
-            // Has active peers or accepting connections -- use tick which calls submit_and_wait
+        // Tick shared event loop (non-blocking poll).
+        // Also tick when the DHT/uTP UDP socket is open so DHT bootstrap
+        // messages and incoming datagrams are processed even without TCP peers.
+        if (shared_el.peer_count > 0 or shared_el.listen_fd >= 0 or shared_el.udp_fd >= 0) {
+            // Has active I/O -- use tick which calls submit_and_wait
             shared_el.submitTimeout(100 * std.time.ns_per_ms) catch {};
             shared_el.tick() catch {};
         } else {
-            // No active peers -- just sleep to avoid busy-spinning
+            // No active I/O -- just sleep to avoid busy-spinning
             std.Thread.sleep(10 * std.time.ns_per_ms);
         }
     }

@@ -693,12 +693,14 @@ pub const EventLoop = struct {
     // Persistent recv buffer and msghdr for io_uring RECVMSG
     utp_recv_buf: [1500]u8 = undefined,
     utp_recv_iov: [1]posix.iovec = undefined,
-    utp_recv_addr: posix.sockaddr align(4) = undefined,
+    // sockaddr.storage is large enough for IPv4, IPv6, and any other family.
+    utp_recv_addr: std.net.Address = undefined,
     utp_recv_msg: posix.msghdr = undefined,
     // Persistent send buffer and msghdr for io_uring SENDMSG
     utp_send_buf: [1500]u8 = undefined,
     utp_send_iov: [1]posix.iovec_const = undefined,
-    utp_send_addr: posix.sockaddr align(4) = undefined,
+    // sockaddr.storage is large enough for IPv4, IPv6, and any other family.
+    utp_send_addr: std.net.Address = undefined,
     utp_send_msg: posix.msghdr_const = undefined,
     utp_send_pending: bool = false,
     // Outbound packet queue (when a send is already in flight)
@@ -1424,15 +1426,17 @@ pub const EventLoop = struct {
         try self.submitAccept();
     }
 
-    /// Start listening for inbound uTP connections on a UDP socket.
-    /// Creates the UDP socket, binds it to the daemon's listen port,
-    /// initializes the UtpManager, and submits the first RECVMSG.
+    /// Start listening for inbound uTP/DHT connections on a UDP socket.
+    /// Creates a dual-stack IPv6 UDP socket (handles IPv4-mapped addresses too),
+    /// binds to the daemon's listen port, initializes the UtpManager, and
+    /// submits the first RECVMSG.
     pub fn startUtpListener(self: *EventLoop) !void {
         if (self.udp_fd >= 0) return; // already listening
 
-        // Create UDP socket
+        // Create a dual-stack IPv6 UDP socket. When IPV6_V6ONLY is 0, the
+        // kernel also accepts IPv4 connections via IPv4-mapped addresses.
         const fd = try posix.socket(
-            posix.AF.INET,
+            posix.AF.INET6,
             posix.SOCK.DGRAM | posix.SOCK.CLOEXEC | posix.SOCK.NONBLOCK,
             posix.IPPROTO.UDP,
         );
@@ -1441,8 +1445,23 @@ pub const EventLoop = struct {
         // Allow address reuse
         posix.setsockopt(fd, posix.SOL.SOCKET, posix.SO.REUSEADDR, &std.mem.toBytes(@as(c_int, 1))) catch {};
 
-        // Bind to the same port as TCP
-        const bind_addr = std.net.Address.initIp4(.{ 0, 0, 0, 0 }, self.port);
+        // Disable IPV6_V6ONLY so IPv4 connections arrive as IPv4-mapped addresses.
+        posix.setsockopt(fd, linux.IPPROTO.IPV6, linux.IPV6.V6ONLY, &std.mem.toBytes(@as(c_int, 0))) catch {};
+
+        // Apply SO_BINDTODEVICE if configured (keeps traffic on a specific interface).
+        if (self.bind_device) |device| {
+            socket_util.applyBindDevice(fd, device) catch |err| {
+                log.warn("UDP socket SO_BINDTODEVICE({s}) failed: {s}", .{ device, @errorName(err) });
+            };
+        }
+
+        // Bind to :: (all interfaces) on the configured port.
+        const bind_addr = std.net.Address.initIp6(
+            std.mem.zeroes([16]u8), // ::
+            self.port,
+            0, // flowinfo
+            0, // scope_id
+        );
         try posix.bind(fd, &bind_addr.any, bind_addr.getOsSockLen());
 
         self.udp_fd = fd;

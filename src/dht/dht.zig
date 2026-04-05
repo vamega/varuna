@@ -96,6 +96,46 @@ pub const DhtEngine = struct {
         };
     }
 
+    /// Heap-allocate and initialize a DhtEngine without placing a large
+    /// (~1 MB) struct value on the caller's stack. DhtEngine contains:
+    ///   - RoutingTable: 160 KBuckets × 8 NodeInfos = ~183 KB
+    ///   - pending[256]?PendingQuery = ~39 KB
+    ///   - active_lookups[16]?Lookup  = ~688 KB
+    /// Assigning these as struct literals would create large stack temporaries.
+    /// Instead we initialize each field individually via pointer dereference,
+    /// and use explicit loops for the large arrays so Zig writes directly
+    /// into the heap allocation.
+    pub fn create(allocator: std.mem.Allocator, own_id: NodeId) !*DhtEngine {
+        const self = try allocator.create(DhtEngine);
+        self.allocator = allocator;
+        self.own_id = own_id;
+        // Initialize the routing table in place (160 KBuckets).
+        self.table.own_id = own_id;
+        for (&self.table.buckets) |*b| {
+            b.count = 0;
+            b.last_changed = 0;
+            // nodes[] intentionally left undefined (count=0, so never read).
+        }
+        self.tokens = TokenManager.init();
+        self.next_txn_id = 1;
+        // Initialize nullable arrays via explicit loops to avoid ~38 KB / ~688 KB
+        // stack temporaries that would arise from array-literal assignment.
+        for (&self.pending) |*p| p.* = null;
+        for (&self.active_lookups) |*l| l.* = null;
+        self.send_queue = std.ArrayList(OutboundPacket).empty;
+        self.peer_results = std.ArrayList(PeerResult).empty;
+        self.listen_port = 6881;
+        self.bootstrapped = false;
+        self.bootstrap_pending = false;
+        self.pending_search_count = 0;
+        self.pending_search_started = false;
+        self.last_requery_time = 0;
+        self.last_refresh_check = 0;
+        self.last_save_time = 0;
+        self.enabled = true;
+        return self;
+    }
+
     pub fn deinit(self: *DhtEngine) void {
         for (self.peer_results.items) |result| {
             self.allocator.free(result.peers);
@@ -135,7 +175,15 @@ pub const DhtEngine = struct {
         // Drive active lookups forward
         self.driveLookups(now);
 
-        // Bootstrap if needed
+        // Bootstrap if needed.
+        // If bootstrap_pending but no active lookups remain (they all completed or
+        // timed out), reset bootstrap_pending so we retry on the next tick.
+        if (self.bootstrap_pending) {
+            const has_active = for (self.active_lookups) |lk| {
+                if (lk != null) break true;
+            } else false;
+            if (!has_active) self.bootstrap_pending = false;
+        }
         if (!self.bootstrapped and !self.bootstrap_pending) {
             if (self.table.nodeCount() < routing_table.K) {
                 self.startBootstrap(now);
@@ -267,11 +315,15 @@ pub const DhtEngine = struct {
         var closest_buf: [routing_table.K]NodeInfo = undefined;
         const count = self.table.findClosest(target, routing_table.K, &closest_buf);
 
-        // Encode compact nodes
+        // Encode compact IPv4 nodes (26 bytes each). Skip IPv6 nodes -- they would
+        // need the "nodes6" field (BEP 32) which requires a different encoder path.
         var nodes_buf: [routing_table.K * 26]u8 = undefined;
+        var nodes_len: usize = 0;
         for (0..count) |i| {
+            if (closest_buf[i].address.any.family != std.posix.AF.INET) continue;
             const compact = node_id.encodeCompactNode(closest_buf[i]);
-            @memcpy(nodes_buf[i * 26 ..][0..26], &compact);
+            @memcpy(nodes_buf[nodes_len..][0..26], &compact);
+            nodes_len += 26;
         }
 
         var buf: [1024]u8 = undefined;
@@ -279,7 +331,7 @@ pub const DhtEngine = struct {
             &buf,
             q.transaction_id,
             self.own_id,
-            nodes_buf[0 .. count * 26],
+            nodes_buf[0..nodes_len],
         ) catch return;
         self.queueSend(buf[0..len], sender);
     }
@@ -292,14 +344,18 @@ pub const DhtEngine = struct {
         const token = self.tokens.generateToken(&ip_bytes);
 
         // We don't store peer lists ourselves (we're not a tracker).
-        // Return closest nodes instead.
+        // Return closest IPv4 nodes instead (BEP 32 "nodes6" field would be
+        // needed for IPv6 nodes but requires a different encoder path).
         var closest_buf: [routing_table.K]NodeInfo = undefined;
         const count = self.table.findClosest(info_hash, routing_table.K, &closest_buf);
 
         var nodes_buf: [routing_table.K * 26]u8 = undefined;
+        var nodes_len: usize = 0;
         for (0..count) |i| {
+            if (closest_buf[i].address.any.family != std.posix.AF.INET) continue;
             const compact = node_id.encodeCompactNode(closest_buf[i]);
-            @memcpy(nodes_buf[i * 26 ..][0..26], &compact);
+            @memcpy(nodes_buf[nodes_len..][0..26], &compact);
+            nodes_len += 26;
         }
 
         var buf: [1024]u8 = undefined;
@@ -308,7 +364,7 @@ pub const DhtEngine = struct {
             q.transaction_id,
             self.own_id,
             &token,
-            nodes_buf[0 .. count * 26],
+            nodes_buf[0..nodes_len],
         ) catch return;
         self.queueSend(buf[0..len], sender);
     }
@@ -372,15 +428,29 @@ pub const DhtEngine = struct {
         // If this was part of a lookup, feed the response
         if (pending.lookup_idx) |idx| {
             if (self.active_lookups[idx]) |*lk| {
-                // Decode compact nodes
-                var new_nodes_buf: [routing_table.K]NodeInfo = undefined;
+                // Decode compact IPv4 nodes (26 bytes each: 20 ID + 4 IP + 2 port)
+                var new_nodes_buf: [routing_table.K * 2]NodeInfo = undefined;
                 var new_node_count: usize = 0;
                 if (r.nodes) |nodes_data| {
                     if (nodes_data.len % 26 == 0) {
                         const count = nodes_data.len / 26;
                         for (0..@min(count, routing_table.K)) |i| {
+                            if (new_node_count >= new_nodes_buf.len) break;
                             new_nodes_buf[new_node_count] = node_id.decodeCompactNode(
                                 nodes_data[i * 26 ..][0..26],
+                            );
+                            new_node_count += 1;
+                        }
+                    }
+                }
+                // Decode compact IPv6 nodes (BEP 32, 38 bytes each: 20 ID + 16 IP + 2 port)
+                if (r.nodes6) |nodes_data| {
+                    if (nodes_data.len % 38 == 0) {
+                        const count = nodes_data.len / 38;
+                        for (0..@min(count, routing_table.K)) |i| {
+                            if (new_node_count >= new_nodes_buf.len) break;
+                            new_nodes_buf[new_node_count] = node_id.decodeCompactNode6(
+                                nodes_data[i * 38 ..][0..38],
                             );
                             new_node_count += 1;
                         }
@@ -392,16 +462,17 @@ pub const DhtEngine = struct {
                     _ = self.table.addNode(info, now);
                 }
 
-                // Parse compact IPv4 peers from the "values" list.
-                // Each entry is a 6-byte bencode string: 4B IPv4 + 2B port big-endian.
+                // Parse compact peers from "values" (IPv4, 6 bytes each) and
+                // "values6" (IPv6, 18 bytes each, BEP 32).
                 var peer_addrs: [50]std.net.Address = undefined;
                 var peer_count: usize = 0;
+
+                // IPv4 peers: 4-byte IP + 2-byte port
                 if (r.values_raw) |raw| {
                     // raw is `l<6:...><6:...>...e`
                     var vpos: usize = 1; // skip 'l'
                     while (vpos < raw.len and raw[vpos] != 'e') {
                         if (peer_count >= peer_addrs.len) break;
-                        // parse bencode string length
                         var dlen: usize = 0;
                         while (vpos < raw.len and raw[vpos] >= '0' and raw[vpos] <= '9') : (vpos += 1) {
                             dlen = dlen * 10 + (raw[vpos] - '0');
@@ -415,6 +486,27 @@ pub const DhtEngine = struct {
                                 @bitCast(std.mem.nativeToBig(u32, ip)),
                                 port,
                             );
+                            peer_count += 1;
+                        }
+                        vpos += dlen;
+                    }
+                }
+
+                // IPv6 peers (BEP 32): 16-byte IP + 2-byte port
+                if (r.values6_raw) |raw| {
+                    var vpos: usize = 1; // skip 'l'
+                    while (vpos < raw.len and raw[vpos] != 'e') {
+                        if (peer_count >= peer_addrs.len) break;
+                        var dlen: usize = 0;
+                        while (vpos < raw.len and raw[vpos] >= '0' and raw[vpos] <= '9') : (vpos += 1) {
+                            dlen = dlen * 10 + (raw[vpos] - '0');
+                        }
+                        if (vpos >= raw.len or raw[vpos] != ':') break;
+                        vpos += 1;
+                        if (dlen == 18 and vpos + 18 <= raw.len) {
+                            const ip6: [16]u8 = raw[vpos..][0..16].*;
+                            const port = std.mem.readInt(u16, raw[vpos + 16 ..][0..2], .big);
+                            peer_addrs[peer_count] = std.net.Address.initIp6(ip6, port, 0, 0);
                             peer_count += 1;
                         }
                         vpos += dlen;
@@ -663,8 +755,15 @@ pub const DhtEngine = struct {
     }
 };
 
+/// Return a stable byte representation of an address for token generation.
+/// For IPv4, returns the 4-byte address. For IPv6, returns the first 4 bytes
+/// of the 16-byte address (sufficient for anti-spoofing token use).
 fn addressToBytes(addr: std.net.Address) [4]u8 {
-    return @bitCast(addr.in.sa.addr);
+    return switch (addr.any.family) {
+        std.posix.AF.INET => @bitCast(addr.in.sa.addr),
+        std.posix.AF.INET6 => addr.in6.sa.addr[0..4].*,
+        else => [4]u8{ 0, 0, 0, 0 },
+    };
 }
 
 // ── Tests ──────────────────────────────────────────────

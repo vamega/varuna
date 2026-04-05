@@ -19,20 +19,28 @@ pub const BootstrapEntry = struct {
 /// Resolve bootstrap node hostnames to addresses.
 /// DNS resolution is blocking, so this should be called before the
 /// event loop starts or on a background thread.
+/// Collects both IPv4 and IPv6 addresses (BEP 32 dual-stack DHT).
 pub fn resolveBootstrapNodes(allocator: std.mem.Allocator) ![]std.net.Address {
     var addrs = std.ArrayList(std.net.Address).empty;
     errdefer addrs.deinit(allocator);
 
     for (bootstrap_nodes) |entry| {
-        // Resolve hostname via DNS (blocking)
+        // Resolve hostname via DNS (blocking).
         const list = std.net.getAddressList(allocator, entry.host, entry.port) catch continue;
         defer list.deinit();
-        // Prefer IPv4 addresses
+
+        // Collect the first IPv4 address and first IPv6 address found.
+        var got_ipv4 = false;
+        var got_ipv6 = false;
         for (list.addrs) |addr| {
-            if (addr.any.family == std.posix.AF.INET) {
-                try addrs.append(allocator, addr);
-                break;
+            if (addr.any.family == std.posix.AF.INET and !got_ipv4) {
+                addrs.append(allocator, addr) catch continue;
+                got_ipv4 = true;
+            } else if (addr.any.family == std.posix.AF.INET6 and !got_ipv6) {
+                addrs.append(allocator, addr) catch continue;
+                got_ipv6 = true;
             }
+            if (got_ipv4 and got_ipv6) break;
         }
     }
 
