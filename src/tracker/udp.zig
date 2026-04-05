@@ -27,6 +27,11 @@ pub fn fetchViaUdp(
     );
     defer posix.close(fd);
 
+    // Set a receive timeout so we don't block forever on lost packets (BEP 15).
+    // Initial timeout is 15 seconds per BEP 15 specification.
+    const timeout = posix.timeval{ .sec = 15, .usec = 0 };
+    posix.setsockopt(fd, posix.SOL.SOCKET, posix.SO.RCVTIMEO, std.mem.asBytes(&timeout)) catch {};
+
     // Connect the UDP socket (allows send/recv instead of sendto/recvfrom)
     try ring.connect(fd, &address.any, address.getOsSockLen());
 
@@ -37,19 +42,31 @@ pub fn fetchViaUdp(
     std.mem.writeInt(u32, connect_buf[8..12], action_connect, .big);
     std.mem.writeInt(u32, connect_buf[12..16], transaction_id, .big);
 
-    try ring.send_all(fd, &connect_buf);
+    // BEP 15: retry with exponential backoff (15 * 2^n seconds, n=0..3)
+    var connection_id: u64 = undefined;
+    var connect_ok = false;
+    for (0..4) |attempt| {
+        // Update timeout: 15 * 2^attempt seconds
+        const timeout_secs: i64 = 15 * (@as(i64, 1) << @intCast(attempt));
+        const to = posix.timeval{ .sec = timeout_secs, .usec = 0 };
+        posix.setsockopt(fd, posix.SOL.SOCKET, posix.SO.RCVTIMEO, std.mem.asBytes(&to)) catch {};
 
-    // Receive connect response
-    var connect_resp: [16]u8 = undefined;
-    const connect_n = try ring.recv(fd, &connect_resp);
-    if (connect_n < 16) return error.InvalidTrackerResponse;
+        ring.send_all(fd, &connect_buf) catch continue;
 
-    const resp_action = std.mem.readInt(u32, connect_resp[0..4], .big);
-    const resp_txid = std.mem.readInt(u32, connect_resp[4..8], .big);
-    if (resp_action != action_connect) return error.InvalidTrackerResponse;
-    if (resp_txid != transaction_id) return error.TransactionIdMismatch;
+        var connect_resp: [16]u8 = undefined;
+        const connect_n = ring.recv(fd, &connect_resp) catch continue;
+        if (connect_n < 16) continue;
 
-    const connection_id = std.mem.readInt(u64, connect_resp[8..16], .big);
+        const resp_action = std.mem.readInt(u32, connect_resp[0..4], .big);
+        const resp_txid = std.mem.readInt(u32, connect_resp[4..8], .big);
+        if (resp_action != action_connect) continue;
+        if (resp_txid != transaction_id) continue;
+
+        connection_id = std.mem.readInt(u64, connect_resp[8..16], .big);
+        connect_ok = true;
+        break;
+    }
+    if (!connect_ok) return error.TrackerTimeout;
 
     // Step 2: Announce
     const announce_txid = generateTransactionId();
@@ -71,11 +88,23 @@ pub fn fetchViaUdp(
     std.mem.writeInt(i32, announce_buf[92..96], numwant_i32, .big); // numwant
     std.mem.writeInt(u16, announce_buf[96..98], request.port, .big);
 
-    try ring.send_all(fd, &announce_buf);
-
-    // Receive announce response
+    // BEP 15: retry announce with exponential backoff
     var resp_buf: [4096]u8 = undefined;
-    const resp_n = try ring.recv(fd, &resp_buf);
+    var resp_n: usize = 0;
+    var announce_ok = false;
+    for (0..4) |attempt| {
+        const timeout_secs: i64 = 15 * (@as(i64, 1) << @intCast(attempt));
+        const to = posix.timeval{ .sec = timeout_secs, .usec = 0 };
+        posix.setsockopt(fd, posix.SOL.SOCKET, posix.SO.RCVTIMEO, std.mem.asBytes(&to)) catch {};
+
+        ring.send_all(fd, &announce_buf) catch continue;
+        resp_n = ring.recv(fd, &resp_buf) catch continue;
+        if (resp_n >= 20) {
+            announce_ok = true;
+            break;
+        }
+    }
+    if (!announce_ok) return error.TrackerTimeout;
     if (resp_n < 20) return error.InvalidTrackerResponse;
 
     const ann_action = std.mem.readInt(u32, resp_buf[0..4], .big);
