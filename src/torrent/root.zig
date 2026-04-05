@@ -2,7 +2,6 @@ pub const bencode = @import("bencode.zig");
 pub const bencode_encode = @import("bencode_encode.zig");
 pub const blocks = @import("blocks.zig");
 pub const create = @import("create.zig");
-pub const client = @import("client.zig");
 pub const file_priority = @import("file_priority.zig");
 pub const file_tree = @import("file_tree.zig");
 pub const info_hash = @import("info_hash.zig");

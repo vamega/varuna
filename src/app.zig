@@ -1,7 +1,6 @@
 const std = @import("std");
 const runtime = @import("runtime/root.zig");
 const torrent = @import("torrent/root.zig");
-const Config = @import("config.zig").Config;
 
 pub fn writeStartupBanner(writer: *std.Io.Writer) !void {
     try writer.print("varuna bootstrap\n", .{});
@@ -34,23 +33,10 @@ pub fn run(
     allocator: std.mem.Allocator,
     args: []const []const u8,
     writer: *std.Io.Writer,
-    cfg: Config,
 ) !void {
     if (args.len <= 1) {
         try writeStartupBanner(writer);
         try writeUsage(writer);
-        return;
-    }
-
-    if (std.mem.eql(u8, args[1], "download")) {
-        const options = try parseTransferOptions(args[2..], cfg);
-        try runDownload(allocator, options, writer, cfg);
-        return;
-    }
-
-    if (std.mem.eql(u8, args[1], "seed")) {
-        const options = try parseTransferOptions(args[2..], cfg);
-        try runSeed(allocator, options, writer, cfg);
         return;
     }
 
@@ -78,144 +64,7 @@ pub fn run(
         return;
     }
 
-    if (std.mem.eql(u8, args[1], "banner")) {
-        try writeStartupBanner(writer);
-        return;
-    }
-
     return error.UnknownCommand;
-}
-
-const TransferOptions = struct {
-    torrent_path: []const u8,
-    target_root: []const u8,
-    port: u16 = 6881,
-    max_peers: u32 = 50,
-};
-
-fn parseTransferOptions(args: []const []const u8, cfg: Config) !TransferOptions {
-    if (args.len < 2) {
-        return error.InvalidArguments;
-    }
-
-    var options = TransferOptions{
-        .torrent_path = args[0],
-        .target_root = args[1],
-        .port = cfg.network.port_min,
-        .max_peers = cfg.network.max_peers,
-    };
-
-    var index: usize = 2;
-    while (index < args.len) {
-        const arg = args[index];
-        if (std.mem.eql(u8, arg, "--port")) {
-            index += 1;
-            if (index >= args.len) {
-                return error.InvalidArguments;
-            }
-            options.port = try parsePort(args[index]);
-            index += 1;
-            continue;
-        }
-
-        if (std.mem.eql(u8, arg, "--max-peers")) {
-            index += 1;
-            if (index >= args.len) {
-                return error.InvalidArguments;
-            }
-            const parsed = try std.fmt.parseInt(u32, args[index], 10);
-            if (parsed == 0) return error.InvalidArguments;
-            options.max_peers = parsed;
-            index += 1;
-            continue;
-        }
-
-        return error.InvalidArguments;
-    }
-
-    return options;
-}
-
-fn parsePort(value: []const u8) !u16 {
-    const parsed = try std.fmt.parseInt(u32, value, 10);
-    if (parsed == 0) {
-        return error.InvalidArguments;
-    }
-
-    return std.math.cast(u16, parsed) orelse error.InvalidArguments;
-}
-
-fn runDownload(
-    allocator: std.mem.Allocator,
-    options: TransferOptions,
-    writer: *std.Io.Writer,
-    cfg: Config,
-) !void {
-    const torrent_bytes = try std.fs.cwd().readFileAlloc(allocator, options.torrent_path, 16 * 1024 * 1024);
-    defer allocator.free(torrent_bytes);
-
-    const peer_id = torrent.peer_id.generate(cfg.network.masquerade_as) catch {
-        std.log.err("unsupported masquerade_as client: \"{s}\"", .{cfg.network.masquerade_as.?});
-        return error.UnsupportedMasquerade;
-    };
-    const resume_db_z: ?[*:0]const u8 = if (cfg.storage.resume_db) |path| blk: {
-        break :blk (try allocator.dupeZ(u8, path)).ptr;
-    } else null;
-    defer if (resume_db_z) |z| allocator.free(std.mem.span(z));
-
-    const result = try torrent.client.download(allocator, torrent_bytes, options.target_root, .{
-        .peer_id = peer_id,
-        .port = options.port,
-        .max_peers = options.max_peers,
-        .resume_db_path = resume_db_z,
-        .hasher_threads = cfg.performance.hasher_threads,
-        .status_writer = writer,
-    });
-    const info_hash_hex = std.fmt.bytesToHex(result.info_hash, .lower);
-
-    try writer.print(
-        "downloaded {} bytes, reused {} bytes, complete {} bytes across {} pieces, info_hash={s}\n",
-        .{
-            result.bytes_downloaded,
-            result.bytes_reused,
-            result.bytes_complete,
-            result.piece_count,
-            info_hash_hex[0..],
-        },
-    );
-    try writer.flush();
-}
-
-fn runSeed(
-    allocator: std.mem.Allocator,
-    options: TransferOptions,
-    writer: *std.Io.Writer,
-    cfg: Config,
-) !void {
-    const torrent_bytes = try std.fs.cwd().readFileAlloc(allocator, options.torrent_path, 16 * 1024 * 1024);
-    defer allocator.free(torrent_bytes);
-
-    const peer_id = torrent.peer_id.generate(cfg.network.masquerade_as) catch {
-        std.log.err("unsupported masquerade_as client: \"{s}\"", .{cfg.network.masquerade_as.?});
-        return error.UnsupportedMasquerade;
-    };
-    const result = try torrent.client.seed(allocator, torrent_bytes, options.target_root, .{
-        .peer_id = peer_id,
-        .port = options.port,
-        .status_writer = writer,
-    });
-    const info_hash_hex = std.fmt.bytesToHex(result.info_hash, .lower);
-
-    try writer.print(
-        "seeded {} bytes from {} complete bytes across {} pieces, info_hash={s}\n",
-        .{
-            result.bytes_seeded,
-            result.bytes_complete,
-            result.piece_count,
-            info_hash_hex[0..],
-        },
-    );
-    try writer.flush();
 }
 
 fn runInspect(
@@ -333,14 +182,11 @@ fn runVerify(
 fn writeUsage(writer: *std.Io.Writer) !void {
     try writer.writeAll(
         "usage:\n" ++
-            "  varuna download <torrent-file> <target-root> [--port <port>] [--max-peers <n>]\n" ++
-            "  varuna seed <torrent-file> <target-root> [--port <port>] [--max-peers <n>]\n" ++
-            "  varuna create <file> <announce-url> [output.torrent]\n" ++
-            "  varuna inspect <torrent-file>\n" ++
-            "  varuna verify <torrent-file> <target-root>\n" ++
-            "  varuna banner\n" ++
+            "  varuna-tools create <file> <announce-url> [output.torrent]\n" ++
+            "  varuna-tools inspect <torrent-file>\n" ++
+            "  varuna-tools verify <torrent-file> <target-root>\n" ++
             "\n" ++
-            "config: varuna.toml, ~/.config/varuna/config.toml, or /etc/varuna/config.toml\n",
+            "For downloading and seeding, use the varuna daemon with varuna-ctl.\n",
     );
 }
 
@@ -355,22 +201,17 @@ test "startup banner mentions kernel floors" {
     try std.testing.expect(std.mem.indexOf(u8, output.items, "6.8") != null);
 }
 
-test "usage shows download command" {
+test "usage shows offline commands only" {
     var output = std.ArrayList(u8).empty;
     defer output.deinit(std.testing.allocator);
 
     var writer = output.writer(std.testing.allocator);
-    try run(std.testing.allocator, &.{"varuna"}, &writer.interface, Config{});
+    try run(std.testing.allocator, &.{"varuna-tools"}, &writer.interface);
 
-    try std.testing.expect(std.mem.indexOf(u8, output.items, "varuna download") != null);
-    try std.testing.expect(std.mem.indexOf(u8, output.items, "varuna seed") != null);
-    try std.testing.expect(std.mem.indexOf(u8, output.items, "varuna inspect") != null);
-}
-
-test "parse transfer options accepts explicit port" {
-    const options = try parseTransferOptions(&.{ "fixture.torrent", "/tmp/download", "--port", "6882" }, Config{});
-
-    try std.testing.expectEqualStrings("fixture.torrent", options.torrent_path);
-    try std.testing.expectEqualStrings("/tmp/download", options.target_root);
-    try std.testing.expectEqual(@as(u16, 6882), options.port);
+    try std.testing.expect(std.mem.indexOf(u8, output.items, "inspect") != null);
+    try std.testing.expect(std.mem.indexOf(u8, output.items, "verify") != null);
+    try std.testing.expect(std.mem.indexOf(u8, output.items, "create") != null);
+    // download and seed should NOT appear
+    try std.testing.expect(std.mem.indexOf(u8, output.items, "download <torrent") == null);
+    try std.testing.expect(std.mem.indexOf(u8, output.items, "seed <torrent") == null);
 }
