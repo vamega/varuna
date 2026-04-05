@@ -168,6 +168,15 @@ pub fn processMessage(self: *EventLoop, slot: u16) void {
                 }
             }
         },
+        8 => { // cancel
+            // BEP 3: peer cancels a previously requested block.
+            // Drop the request from the seed handler's queued responses so we
+            // don't waste bandwidth sending a block the peer no longer wants.
+            if (payload.len >= 12) {
+                const seed = @import("seed_handler.zig");
+                seed.cancelQueuedResponse(self, slot, payload);
+            }
+        },
         hash_exchange.msg_hash_request => {
             // BEP 52: hash request -- peer wants Merkle proof hashes
             handleHashRequest(self, slot, payload);

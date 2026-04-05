@@ -195,7 +195,10 @@ pub fn servePieceRequest(self: *EventLoop, slot: u16, payload: []const u8) void 
     const cp = tc.complete_pieces orelse self.complete_pieces orelse return;
     if (!cp.has(piece_index)) return;
     const piece_size = sess.layout.pieceSize(piece_index) catch return;
-    if (block_offset + block_length > piece_size) return;
+    // Reject unreasonably large blocks (standard is 16 KiB, cap at 128 KiB)
+    if (block_length > 128 * 1024) return;
+    // Use u64 arithmetic to prevent u32 overflow in offset+length check
+    if (@as(u64, block_offset) + @as(u64, block_length) > piece_size) return;
 
     // If piece is cached, queue for batched send (flushed after CQE dispatch)
     if (self.cached_piece_index != null and self.cached_piece_index.? == piece_index) {
@@ -294,6 +297,27 @@ pub fn handleSeedDiskRead(self: *EventLoop, cqe: @import("std").os.linux.io_urin
         // Fallback: send individually
         sendPieceBlock(self, pending.slot, pending.piece_index, pending.block_offset, pending.block_length, pending.piece_buffer);
     };
+}
+
+/// Handle a CANCEL message: remove matching queued response so we don't
+/// waste bandwidth sending a block the peer no longer wants.
+pub fn cancelQueuedResponse(self: *EventLoop, slot: u16, payload: []const u8) void {
+    const piece_index = std.mem.readInt(u32, payload[0..4], .big);
+    const block_offset = std.mem.readInt(u32, payload[4..8], .big);
+    const block_length = std.mem.readInt(u32, payload[8..12], .big);
+
+    var i: usize = 0;
+    while (i < self.queued_responses.items.len) {
+        const r = self.queued_responses.items[i];
+        if (r.slot == slot and r.piece_index == piece_index and
+            r.block_offset == block_offset and r.block_length == block_length)
+        {
+            _ = self.queued_responses.swapRemove(i);
+            // Don't increment i -- swapRemove moved the last element here
+        } else {
+            i += 1;
+        }
+    }
 }
 
 /// Flush all queued piece block responses, batching by peer slot.

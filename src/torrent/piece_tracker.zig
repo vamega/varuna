@@ -290,6 +290,8 @@ pub const PieceTracker = struct {
         if (self.complete.has(piece_index)) {
             return false; // Duplicate completion from endgame mode
         }
+        // Clear in_progress so scan_hint and endgame detection stay correct
+        self.clearInProgress(piece_index);
         self.complete.set(piece_index) catch return false;
         self.bytes_complete += piece_length;
         self.progress_cond.signal();

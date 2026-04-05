@@ -32,6 +32,16 @@ const TorrentIdType = u32;
 pub const TorrentId = TorrentIdType;
 const cqe_batch_size = 64;
 
+/// Create an io_uring with performance optimization flags when the kernel supports them.
+/// Falls back to plain init(entries, 0) on older kernels.
+fn initIoUring(entries: u16) !linux.IoUring {
+    // COOP_TASKRUN (5.18): cooperative task work, avoids IPI interrupts
+    // SINGLE_ISSUER (6.0): skip internal locking for single-threaded submitters
+    const optimized_flags: u32 = linux.IORING_SETUP_COOP_TASKRUN | linux.IORING_SETUP_SINGLE_ISSUER;
+    return linux.IoUring.init(entries, optimized_flags) catch
+        linux.IoUring.init(entries, 0);
+}
+
 // ── User data encoding ────────────────────────────────────
 
 pub const OpType = enum(u8) {
@@ -755,9 +765,11 @@ pub const EventLoop = struct {
     announce_ring: ?@import("ring.zig").Ring = null,
     announcing: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
     // Peers discovered by the background announce thread, picked up by the
-    // main thread on the next tick. Protected by atomic flag.
+    // main thread on the next tick. Protected by announce_mutex.
     announce_result_peers: ?[]std.net.Address = null,
     announce_results_ready: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
+    announce_mutex: std.Thread.Mutex = .{},
+    announce_thread: ?std.Thread = null,
 
     // Global rate limiter (applies across all torrents, 0 = unlimited)
     global_rate_limiter: RateLimiter = RateLimiter.initComptime(0, 0),
@@ -769,6 +781,7 @@ pub const EventLoop = struct {
 
     // Background hasher for SHA verification (off event loop thread)
     last_unchoke_recalc: i64 = 0,
+    last_optimistic_unchoke: i64 = 0,
     hasher: ?*Hasher = null,
     hash_result_swap: std.ArrayList(Hasher.Result) = std.ArrayList(Hasher.Result).empty,
     merkle_result_swap: std.ArrayList(Hasher.MerkleResult) = std.ArrayList(Hasher.MerkleResult).empty,
@@ -792,7 +805,7 @@ pub const EventLoop = struct {
             null;
 
         return .{
-            .ring = try linux.IoUring.init(256, 0),
+            .ring = try initIoUring(256),
             .allocator = allocator,
             .peers = peers,
             .torrents = try std.ArrayList(?TorrentContext).initCapacity(allocator, default_torrent_capacity),
@@ -832,7 +845,7 @@ pub const EventLoop = struct {
             null;
 
         var el = EventLoop{
-            .ring = try linux.IoUring.init(256, 0),
+            .ring = try initIoUring(256),
             .allocator = allocator,
             .peers = peers,
             .torrents = try std.ArrayList(?TorrentContext).initCapacity(allocator, default_torrent_capacity),
@@ -860,9 +873,31 @@ pub const EventLoop = struct {
     }
 
     pub fn deinit(self: *EventLoop) void {
+        // Wait for background announce thread to finish before freeing anything
+        if (self.announce_thread) |t| {
+            t.join();
+            self.announce_thread = null;
+        }
+
         if (self.hasher) |h| {
             h.deinit();
             self.allocator.destroy(h);
+        }
+
+        // ── Phase 0: Flush pending disk writes ────────────────────
+        // Before closing fds, drain any in-flight piece writes so that
+        // hash-verified data is not lost on shutdown.
+        {
+            _ = self.ring.submit() catch {};
+            var flush_rounds: u32 = 0;
+            while (self.pending_writes.count() > 0 and flush_rounds < 100) : (flush_rounds += 1) {
+                _ = self.ring.submit_and_wait(1) catch break;
+                var cqes: [cqe_batch_size]linux.io_uring_cqe = undefined;
+                const count = self.ring.copy_cqes(&cqes, 0) catch break;
+                for (cqes[0..count]) |cqe| {
+                    self.dispatch(cqe);
+                }
+            }
         }
 
         // ── Phase 1: Close all file descriptors ──────────────────
@@ -1304,6 +1339,10 @@ pub const EventLoop = struct {
         errdefer posix.close(fd);
         peer.fd = fd;
 
+        // Disable Nagle's algorithm: send small request batches immediately
+        // instead of waiting up to 40ms for more data. Every major BT client does this.
+        posix.setsockopt(fd, posix.IPPROTO.TCP, linux.TCP.NODELAY, &std.mem.toBytes(@as(c_int, 1))) catch {};
+
         // Apply bind configuration (SO_BINDTODEVICE and/or local address) to outbound socket
         try socket_util.applyBindConfig(fd, self.bind_device, self.bind_address, 0);
 
@@ -1436,6 +1475,14 @@ pub const EventLoop = struct {
             if (peer.next_piece_buf) |buf| self.allocator.free(buf);
             peer.next_piece_buf = null; // prevent double-free in cleanupPeer
         }
+        // Decrement per-piece availability counters so rarest-first stays accurate
+        if (peer.availability_known) {
+            if (peer.availability) |*bf| {
+                if (self.getTorrentContext(peer.torrent_id)) |tc| {
+                    if (tc.piece_tracker) |pt| pt.removeBitfieldAvailability(bf);
+                }
+            }
+        }
         // BEP 11: notify torrent PEX state that this peer disconnected
         if (peer.state != .free and peer.state != .connecting) {
             if (self.getTorrentContext(peer.torrent_id)) |tc| {
@@ -1515,6 +1562,7 @@ pub const EventLoop = struct {
         peer_policy.recalculateUnchokes(self);
         peer_policy.tryAssignPieces(self);
         peer_policy.updateSpeedCounters(self);
+        peer_policy.sendKeepAlives(self);
         peer_policy.checkPex(self);
         peer_policy.checkPartialSeed(self);
         utp_handler.utpTick(self);

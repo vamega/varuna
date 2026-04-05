@@ -74,6 +74,10 @@ pub fn handleAccept(self: *EventLoop, cqe: linux.io_uring_cqe) void {
     };
     peer.handshake_offset = 0;
     self.peer_count += 1;
+
+    // Disable Nagle: send responses immediately without coalescing delay
+    posix.setsockopt(new_fd, posix.IPPROTO.TCP, linux.TCP.NODELAY, &std.mem.toBytes(@as(c_int, 1))) catch {};
+
     self.markActivePeer(slot);
 
     // Start receiving the peer's handshake
@@ -575,13 +579,10 @@ pub fn handleDiskWrite(self: *EventLoop, slot: u16, cqe: linux.io_uring_cqe) voi
             log.err("disk write failed for piece {d} torrent {d}: errno={d}", .{
                 piece_index, pending_w.torrent_id, -cqe.res,
             });
-            // Release the piece back so it can be re-downloaded
-            if (self.getTorrentContext(pending_w.torrent_id)) |tc| {
-                if (tc.piece_tracker) |pt| pt.releasePiece(piece_index);
-            }
-            self.allocator.free(pending_w.buf);
-            _ = self.removePendingWriteById(write_id);
-            return;
+            // Mark as failed but do NOT free the buffer yet -- other spans
+            // may still be in-flight in io_uring and reference it.
+            // The buffer is freed when spans_remaining reaches 0.
+            pending_w.write_failed = true;
         }
 
         pending_w.spans_remaining -= 1;

@@ -19,6 +19,8 @@ pub const ParseError = std.mem.Allocator.Error || std.fmt.ParseIntError || error
     InvalidInteger,
     InvalidByteStringLength,
     UnexpectedByte,
+    NestingTooDeep,
+    TooManyElements,
 };
 
 pub fn parse(allocator: std.mem.Allocator, input: []const u8) ParseError!Value {
@@ -45,10 +47,14 @@ pub fn dictGet(dict: []const Value.Entry, key: []const u8) ?Value {
     return null;
 }
 
+const max_nesting_depth: u32 = 64;
+const max_container_elements: u32 = 500_000;
+
 const Parser = struct {
     allocator: std.mem.Allocator,
     input: []const u8,
     index: usize = 0,
+    depth: u32 = 0,
 
     fn parseValue(self: *Parser) ParseError!Value {
         const next = self.peek() orelse return error.UnexpectedEndOfStream;
@@ -113,6 +119,9 @@ const Parser = struct {
 
     fn parseList(self: *Parser) ParseError![]Value {
         try self.expectByte('l');
+        if (self.depth >= max_nesting_depth) return error.NestingTooDeep;
+        self.depth += 1;
+        defer self.depth -= 1;
 
         var values: std.ArrayListUnmanaged(Value) = .empty;
         errdefer values.deinit(self.allocator);
@@ -123,6 +132,7 @@ const Parser = struct {
                 self.index += 1;
                 return try values.toOwnedSlice(self.allocator);
             }
+            if (values.items.len >= max_container_elements) return error.TooManyElements;
 
             try values.append(self.allocator, try self.parseValue());
         }
@@ -130,6 +140,9 @@ const Parser = struct {
 
     fn parseDict(self: *Parser) ParseError![]Value.Entry {
         try self.expectByte('d');
+        if (self.depth >= max_nesting_depth) return error.NestingTooDeep;
+        self.depth += 1;
+        defer self.depth -= 1;
 
         var entries: std.ArrayListUnmanaged(Value.Entry) = .empty;
         errdefer {
@@ -145,6 +158,7 @@ const Parser = struct {
                 self.index += 1;
                 return try entries.toOwnedSlice(self.allocator);
             }
+            if (entries.items.len >= max_container_elements) return error.TooManyElements;
 
             const key = try self.parseBytes();
             const value = try self.parseValue();

@@ -17,7 +17,8 @@ const LayoutSpan = @import("../torrent/layout.zig").Layout.Span;
 
 const pipeline_depth: u32 = 64;
 const peer_timeout_secs: i64 = 60;
-const unchoke_interval_secs: i64 = 30;
+const unchoke_interval_secs: i64 = 10; // BEP 3: recalculate every 10 seconds
+const optimistic_unchoke_interval_secs: i64 = 30; // rotate optimistic unchoke every 30s
 const max_unchoked: u32 = 4;
 const optimistic_unchoke_slots: u32 = 1;
 
@@ -98,7 +99,10 @@ pub fn tryFillPipeline(self: *EventLoop, slot: u16) !void {
     const peer = &self.peers[slot];
     if (peer.current_piece == null) return;
     if (peer.peer_choking) return;
-    if (peer.send_pending) return;
+    // Note: we no longer gate on send_pending here. The tracked-send system
+    // (PendingSend with unique send_ids) supports multiple in-flight sends
+    // per slot. Gating on send_pending was serializing pipeline refills,
+    // adding up to 40ms latency per CQE batch when combined with Nagle.
 
     // Skip filling pipeline when download is throttled
     if (self.isDownloadThrottled(peer.torrent_id)) return;
@@ -546,6 +550,34 @@ pub fn checkPeerTimeouts(self: *EventLoop) void {
     for (to_remove.items) |slot| self.removePeer(slot);
 }
 
+const keepalive_interval_secs: i64 = 90; // send keep-alive if we've been quiet for this long
+
+/// Send keep-alive messages to peers we haven't sent anything to recently.
+/// Prevents remote peers from disconnecting us for inactivity.
+pub fn sendKeepAlives(self: *EventLoop) void {
+    const now = std.time.timestamp();
+    for (self.active_peer_slots.items) |slot| {
+        const peer = &self.peers[slot];
+        if (peer.state != .active_recv_header and peer.state != .active_recv_body) continue;
+        if (peer.send_pending) continue;
+        if (peer.last_activity == 0) continue;
+
+        if (now - peer.last_activity > keepalive_interval_secs) {
+            // BEP 3 keep-alive: 4 zero bytes (length-prefix only, no message ID)
+            var keepalive = [_]u8{ 0, 0, 0, 0 };
+            peer.crypto.encryptBuf(&keepalive);
+            const ts = self.nextTrackedSendUserData(slot);
+            const tracked = self.trackPendingSendCopy(slot, ts.send_id, &keepalive) catch continue;
+            _ = self.ring.send(ts.ud, peer.fd, tracked, 0) catch {
+                self.freeOnePendingSend(slot, ts.send_id);
+                continue;
+            };
+            peer.send_pending = true;
+            peer.last_activity = now;
+        }
+    }
+}
+
 // ── Choking algorithm (tit-for-tat) ─────────────────
 
 pub fn recalculateUnchokes(self: *EventLoop) void {
@@ -553,15 +585,16 @@ pub fn recalculateUnchokes(self: *EventLoop) void {
     if (now - self.last_unchoke_recalc < unchoke_interval_secs) return;
     self.last_unchoke_recalc = now;
 
-    // Collect active seed-mode peers that are interested
+    // Collect all active peers that are interested in our data
     var interested_peers: [max_peers]u16 = undefined;
     var interested_count: u32 = 0;
+    var is_seeding = true; // true if we are seed-only (no download-mode peers)
 
     for (self.active_peer_slots.items) |slot| {
         const peer = &self.peers[slot];
         if (peer.state == .free or peer.state == .disconnecting) continue;
-        if (peer.mode != .seed) continue;
         if (!peer.peer_interested) continue;
+        if (peer.mode == .download) is_seeding = false;
         if (interested_count < max_peers) {
             interested_peers[interested_count] = slot;
             interested_count += 1;
@@ -570,34 +603,64 @@ pub fn recalculateUnchokes(self: *EventLoop) void {
 
     if (interested_count == 0) return;
 
-    // Sort by bytes_downloaded_from (peers that give us most data get unchoked first)
-    // For seed-only mode, all peers upload equally, so use bytes_uploaded_to to spread
+    // Sort by download speed (tit-for-tat: unchoke peers that send us the most).
+    // When seeding, sort by upload speed instead (prefer fast downloaders).
     const peers_slice = interested_peers[0..interested_count];
     const context = self;
-    std.mem.sort(u16, peers_slice, context, struct {
-        fn lessThan(ctx: *EventLoop, a: u16, b: u16) bool {
-            return ctx.peers[a].bytes_downloaded_from > ctx.peers[b].bytes_downloaded_from;
-        }
-    }.lessThan);
+    if (is_seeding) {
+        std.mem.sort(u16, peers_slice, context, struct {
+            fn lessThan(ctx: *EventLoop, a: u16, b: u16) bool {
+                return ctx.peers[a].current_ul_speed > ctx.peers[b].current_ul_speed;
+            }
+        }.lessThan);
+    } else {
+        std.mem.sort(u16, peers_slice, context, struct {
+            fn lessThan(ctx: *EventLoop, a: u16, b: u16) bool {
+                return ctx.peers[a].current_dl_speed > ctx.peers[b].current_dl_speed;
+            }
+        }.lessThan);
+    }
 
-    // Unchoke top N, choke the rest
+    // Unchoke top max_unchoked by performance
     var unchoked: u32 = 0;
+    var optimistic_slot: ?u16 = null;
     for (peers_slice) |slot| {
-        const peer = &self.peers[slot];
-        if (unchoked < max_unchoked + optimistic_unchoke_slots) {
+        if (unchoked < max_unchoked) {
+            const peer = &self.peers[slot];
             if (peer.am_choking) {
                 peer.am_choking = false;
-                protocol.submitMessage(self, slot, 1, &.{}) catch |err| {
-                    log.debug("unchoke send for slot {d}: {s}", .{ slot, @errorName(err) });
-                }; // unchoke
+                protocol.submitMessage(self, slot, 1, &.{}) catch {};
             }
             unchoked += 1;
         } else {
+            // First peer past the performance cut-off is the optimistic candidate
+            if (optimistic_slot == null) optimistic_slot = slot;
+        }
+    }
+
+    // Optimistic unchoke: rotate one random interested peer every 30 seconds
+    if (interested_count > max_unchoked and now - self.last_optimistic_unchoke >= optimistic_unchoke_interval_secs) {
+        self.last_optimistic_unchoke = now;
+        // Pick a random peer from beyond the performance-unchoked set
+        const remaining = interested_count - @min(max_unchoked, interested_count);
+        if (remaining > 0) {
+            const rand_idx = @as(u32, @truncate(@as(u64, @bitCast(now)))) % remaining;
+            optimistic_slot = peers_slice[max_unchoked + rand_idx];
+        }
+    }
+
+    // Unchoke optimistic slot, choke everyone else beyond max_unchoked
+    for (peers_slice[unchoked..]) |slot| {
+        const peer = &self.peers[slot];
+        if (optimistic_slot != null and slot == optimistic_slot.?) {
+            if (peer.am_choking) {
+                peer.am_choking = false;
+                protocol.submitMessage(self, slot, 1, &.{}) catch {};
+            }
+        } else {
             if (!peer.am_choking) {
                 peer.am_choking = true;
-                protocol.submitMessage(self, slot, 0, &.{}) catch |err| {
-                    log.debug("choke send for slot {d}: {s}", .{ slot, @errorName(err) });
-                }; // choke
+                protocol.submitMessage(self, slot, 0, &.{}) catch {};
             }
         }
     }
@@ -608,15 +671,21 @@ pub fn recalculateUnchokes(self: *EventLoop) void {
 pub fn checkReannounce(self: *EventLoop) void {
     // Pick up results from a previous background announce
     if (self.announce_results_ready.load(.acquire)) {
-        if (self.announce_result_peers) |peers| {
-            for (peers) |addr| {
+        const peers = blk: {
+            self.announce_mutex.lock();
+            defer self.announce_mutex.unlock();
+            const p = self.announce_result_peers;
+            self.announce_result_peers = null;
+            self.announce_results_ready.store(false, .release);
+            break :blk p;
+        };
+        if (peers) |addrs| {
+            for (addrs) |addr| {
                 if (self.peer_count >= self.max_connections) break;
                 _ = self.addPeer(addr) catch continue;
             }
-            self.allocator.free(peers);
-            self.announce_result_peers = null;
+            self.allocator.free(addrs);
         }
-        self.announce_results_ready.store(false, .release);
     }
 
     const url = self.announce_url orelse return;
@@ -665,7 +734,9 @@ pub fn checkReannounce(self: *EventLoop) void {
         self.announcing.store(false, .release);
         return;
     };
-    thread.detach();
+    // Store handle so deinit can join. Previous handle (if any) must have
+    // already finished since we checked announcing.load above.
+    self.announce_thread = thread;
 }
 
 /// Background thread for tracker re-announce. Uses the shared announce_ring
@@ -710,9 +781,13 @@ fn announceWorkerThread(
         };
     }
 
-    // Store results for the main thread (atomic handoff)
-    self.announce_result_peers = addrs;
-    self.announce_results_ready.store(true, .release);
+    // Store results for the main thread (mutex-protected handoff)
+    {
+        self.announce_mutex.lock();
+        defer self.announce_mutex.unlock();
+        self.announce_result_peers = addrs;
+        self.announce_results_ready.store(true, .release);
+    }
 }
 
 /// Generate random jitter for announce interval: +-10% of the interval.
