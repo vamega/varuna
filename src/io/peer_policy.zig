@@ -809,6 +809,7 @@ fn generateAnnounceJitter(self: *const EventLoop) i32 {
 /// Send PEX messages to all eligible peers at the BEP 11 interval.
 /// Also ensures torrent PEX state is initialized for non-private torrents.
 pub fn checkPex(self: *EventLoop) void {
+    if (!self.pex_enabled) return;
     if (self.active_peer_slots.items.len == 0) return;
 
     const now = std.time.timestamp();

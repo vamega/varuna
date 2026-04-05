@@ -684,6 +684,9 @@ pub const EventLoop = struct {
     // MSE/PE (BEP 6) encryption mode
     encryption_mode: mse.EncryptionMode = .preferred,
 
+    // Runtime feature toggles (can be changed via API)
+    pex_enabled: bool = true,
+
     // Accept socket for seeding (-1 if not seeding)
     listen_fd: posix.fd_t = -1,
 

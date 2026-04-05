@@ -88,14 +88,25 @@ pub fn main() !void {
     // DhtEngine.create() heap-allocates and initializes via explicit field assignment
     // to avoid placing the ~900 KB struct on main()'s stack.
     shared_el.port = cfg.network.port_min;
-    const dht_engine = try varuna.dht.DhtEngine.create(allocator, varuna.dht.node_id.generate());
-    defer {
-        dht_engine.deinit();
-        allocator.destroy(dht_engine);
-    }
+    shared_el.pex_enabled = cfg.network.pex;
+
+    const dht_engine: ?*varuna.dht.DhtEngine = if (cfg.network.dht) blk: {
+        const engine = varuna.dht.DhtEngine.create(allocator, varuna.dht.node_id.generate()) catch |err| {
+            try stdout.print("warning: failed to create DHT engine: {s}\n", .{@errorName(err)});
+            try stdout.flush();
+            break :blk null;
+        };
+        break :blk engine;
+    } else null;
+    defer if (dht_engine) |engine| {
+        engine.deinit();
+        allocator.destroy(engine);
+    };
 
     // Wire the DHT engine into the shared event loop before starting the UDP socket.
-    shared_el.dht_engine = dht_engine;
+    if (dht_engine) |engine| {
+        shared_el.dht_engine = engine;
+    }
 
     // Start the shared UDP socket (used by both DHT and uTP). This must happen
     // before the event loop so that DHT bootstrap pings can be submitted.
@@ -108,8 +119,10 @@ pub fn main() !void {
     // Resolve bootstrap node hostnames (blocking DNS, after UDP socket is ready).
     const bootstrap_addrs = varuna.dht.bootstrap.resolveBootstrapNodes(allocator) catch &.{};
     defer if (bootstrap_addrs.len > 0) allocator.free(bootstrap_addrs);
-    if (shared_el.dht_engine != null) {
-        dht_engine.addBootstrapNodes(bootstrap_addrs);
+    if (dht_engine) |engine| {
+        if (shared_el.dht_engine != null) {
+            engine.addBootstrapNodes(bootstrap_addrs);
+        }
     }
 
     // Session manager

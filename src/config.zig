@@ -72,6 +72,10 @@ pub const Config = struct {
         /// Useful for testing DHT peer discovery or for privacy-conscious operation.
         /// Private torrents (private=1 flag) always use the tracker regardless of this setting.
         disable_trackers: bool = false,
+        /// Enable DHT (BEP 5) for distributed peer discovery.
+        dht: bool = true,
+        /// Enable PEX (BEP 11) for peer exchange between connected peers.
+        pex: bool = true,
     };
 
     pub const Performance = struct {

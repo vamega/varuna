@@ -217,8 +217,8 @@ pub fn processMessage(self: *EventLoop, slot: u16) void {
                 if (peer.extension_ids) |ids| {
                     if (ids.ut_pex != 0 and sub_id == ids.ut_pex) {
                         const is_private = if (self.getTorrentContext(peer.torrent_id)) |tc| tc.is_private else false;
-                        if (is_private) {
-                            log.debug("slot {d}: ignoring ut_pex message for private torrent", .{slot});
+                        if (is_private or !self.pex_enabled) {
+                            log.debug("slot {d}: ignoring ut_pex message (private={} pex_enabled={})", .{ slot, is_private, self.pex_enabled });
                             return;
                         }
                         // BEP 11: handle PEX message

@@ -155,6 +155,20 @@ pub fn main() !void {
             });
             try doPost(allocator, stdout, api_host, api_port, "/api/v2/torrents/delete", body.items, sid);
         }
+    } else if (std.mem.eql(u8, command, "set-pref")) {
+        if (cmd_start + 2 >= args.len) {
+            try stdout.print("usage: varuna-ctl set-pref <key> <value>\n", .{});
+            try stdout.print("  keys: dht, pex, dl_limit, up_limit, max_ratio, ...\n", .{});
+        } else {
+            const key = args[cmd_start + 1];
+            const val = args[cmd_start + 2];
+            var body_buf = std.ArrayList(u8).empty;
+            defer body_buf.deinit(allocator);
+            try body_buf.print(allocator, "{s}={s}", .{ key, val });
+            try doPost(allocator, stdout, api_host, api_port, "/api/v2/app/setPreferences", body_buf.items, sid);
+        }
+    } else if (std.mem.eql(u8, command, "get-pref")) {
+        try doGet(allocator, stdout, api_host, api_port, "/api/v2/app/preferences", sid);
     } else if (std.mem.eql(u8, command, "version")) {
         try doGet(allocator, stdout, api_host, api_port, "/api/v2/app/webapiVersion", sid);
     } else if (std.mem.eql(u8, command, "stats")) {
@@ -614,6 +628,8 @@ fn printUsage(stdout: *std.Io.Writer, host: []const u8, port: u16) !void {
     try stdout.print("  queue-bottom <hash>            move torrent to bottom of queue\n", .{});
     try stdout.print("  queue-up <hash>                increase torrent queue priority\n", .{});
     try stdout.print("  queue-down <hash>              decrease torrent queue priority\n", .{});
+    try stdout.print("  set-pref <key> <value>         set a daemon preference (dht, pex, ...)\n", .{});
+    try stdout.print("  get-pref                       show all daemon preferences\n", .{});
     try stdout.print("  version                        daemon API version\n", .{});
     try stdout.print("  stats                          global transfer stats\n", .{});
     try stdout.print("\ndaemon: http://{s}:{}\n", .{ host, port });

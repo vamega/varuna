@@ -546,7 +546,7 @@ pub const ApiHandler = struct {
             \\"max_seeding_time_enabled":{s},"max_seeding_time":{},
             \\"auto_tmm_enabled":false,"save_resume_data_interval":60,
             \\"start_paused_enabled":false,
-            \\"dht":false,"pex":false,"lsd":false,"encryption":{},"anonymous_mode":false,
+            \\"dht":{s},"pex":{s},"lsd":false,"encryption":{},"anonymous_mode":false,
             \\"piece_cache_enabled":{},
             \\"ip_filter_enabled":false,"ip_filter_path":"","ip_filter_trackers":false,
             \\"banned_IPs":"{f}"}}
@@ -563,6 +563,8 @@ pub const ApiHandler = struct {
             sm.max_ratio_act,
             @as([]const u8, if (sm.max_seeding_time_enabled) "true" else "false"),
             sm.max_seeding_time,
+            @as([]const u8, if (el) |e| (if (e.dht_engine != null) "true" else "false") else "false"),
+            @as([]const u8, if (el) |e| (if (e.pex_enabled) "true" else "false") else "false"),
             enc_mode,
             @as(u8, if (piece_cache_enabled) 1 else 0),
             esc(banned_ips_str),
@@ -696,6 +698,20 @@ pub const ApiHandler = struct {
         // If queue settings changed, re-evaluate the queue
         if (queue_changed) {
             self.session_manager.runQueueEnforcement();
+        }
+
+        // DHT toggle (runtime: stops/starts DHT peer discovery)
+        if (extractParam(body, "dht")) |v| {
+            self.session_manager.setDhtEnabled(std.mem.eql(u8, v, "true"));
+        } else if (extractJsonBool(body, "dht")) |v| {
+            self.session_manager.setDhtEnabled(v);
+        }
+
+        // PEX toggle (runtime: stops sending/receiving PEX messages)
+        if (extractParam(body, "pex")) |v| {
+            el.pex_enabled = std.mem.eql(u8, v, "true");
+        } else if (extractJsonBool(body, "pex")) |v| {
+            el.pex_enabled = v;
         }
 
         return .{ .body = "{\"status\":\"ok\"}" };

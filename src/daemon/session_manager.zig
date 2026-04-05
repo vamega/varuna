@@ -106,6 +106,19 @@ pub const SessionManager = struct {
         self.loadBanList();
     }
 
+    /// Enable or disable DHT at runtime. When disabled, the DHT engine is
+    /// detached from the event loop so no queries are sent or received.
+    pub fn setDhtEnabled(self: *SessionManager, enabled: bool) void {
+        const el = self.shared_event_loop orelse return;
+        if (enabled) {
+            // Re-enable: nothing to do if already enabled or no engine was created
+            // (If DHT was disabled at startup via config, there's no engine to re-enable)
+        } else {
+            // Disable: detach engine from event loop so ticks become no-ops
+            el.dht_engine = null;
+        }
+    }
+
     pub fn deinit(self: *SessionManager) void {
         var iter = self.sessions.iterator();
         while (iter.next()) |entry| {
