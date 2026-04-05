@@ -1347,6 +1347,10 @@ pub const EventLoop = struct {
         // Disable Nagle's algorithm: send small request batches immediately
         // instead of waiting up to 40ms for more data. Every major BT client does this.
         posix.setsockopt(fd, posix.IPPROTO.TCP, linux.TCP.NODELAY, &std.mem.toBytes(@as(c_int, 1))) catch {};
+        // Increase socket buffers for high-pipeline-depth transfers.
+        // libtorrent/qBittorrent use 2MB receive / 512KB send.
+        posix.setsockopt(fd, posix.SOL.SOCKET, posix.SO.RCVBUF, &std.mem.toBytes(@as(c_int, 2 * 1024 * 1024))) catch {};
+        posix.setsockopt(fd, posix.SOL.SOCKET, posix.SO.SNDBUF, &std.mem.toBytes(@as(c_int, 512 * 1024))) catch {};
 
         // Apply bind configuration (SO_BINDTODEVICE and/or local address) to outbound socket
         try socket_util.applyBindConfig(fd, self.bind_device, self.bind_address, 0);

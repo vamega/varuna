@@ -13,7 +13,9 @@ pub fn main() !void {
     var stdout_writer = std.fs.File.stdout().writer(&stdout_buffer);
     const stdout = &stdout_writer.interface;
 
-    const cfg = varuna.config.loadDefault(allocator);
+    var loaded_cfg = varuna.config.loadDefault(allocator);
+    defer loaded_cfg.deinit();
+    const cfg = loaded_cfg.value;
     const api_port = cfg.daemon.api_port;
     const api_host = cfg.daemon.api_bind;
 

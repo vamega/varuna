@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 # Comprehensive transfer test matrix for verifying data integrity.
 # Tests various file sizes, piece sizes, and multi-file torrents.
+# Uses the varuna daemon + varuna-ctl API instead of varuna-tools seed/download.
 set -o pipefail
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -9,8 +10,13 @@ FAIL_COUNT=0
 SKIP_COUNT=0
 RESULTS=()
 
+VARUNA="$ROOT_DIR/zig-out/bin/varuna"
+VARUNA_TOOLS="$ROOT_DIR/zig-out/bin/varuna-tools"
+
 # Each test gets a port range of 100 starting from 30000+
 # to avoid conflicts with standard services and other tests.
+# Within each range: +0 = tracker, +1 = seed peer, +2 = download peer,
+#                    +3 = seed API, +4 = download API.
 NEXT_PORT="${BASE_PORT:-30000}"
 
 cleanup_test() {
@@ -60,13 +66,63 @@ wait_for_tcp() {
   return 1
 }
 
-wait_for_log() {
-  local file="$1" pattern="$2" max_wait="${3:-600}"
-  for _ in $(seq 1 "$max_wait"); do
-    [[ -f "$file" ]] && grep -q "$pattern" "$file" && return 0
-    sleep 0.05
-  done
-  return 1
+# Login to a daemon API and return the SID cookie value.
+api_login() {
+  local port="$1"
+  local sid
+  sid=$(curl -s -c - "http://127.0.0.1:${port}/api/v2/auth/login" \
+    -d "username=admin&password=adminadmin" 2>/dev/null \
+    | grep SID | awk '{print $NF}')
+  echo "$sid"
+}
+
+# Add a torrent to a daemon via the API.
+# Args: api_port sid torrent_file save_path
+api_add_torrent() {
+  local port="$1" sid="$2" torrent_file="$3" save_path="$4"
+  curl -s -b "SID=${sid}" \
+    "http://127.0.0.1:${port}/api/v2/torrents/add?savepath=$(printf '%s' "$save_path" | sed 's/ /%20/g')" \
+    --data-binary @"$torrent_file" >/dev/null 2>&1
+}
+
+# Query the torrent list from a daemon and extract the progress of the first torrent.
+api_get_progress() {
+  local port="$1" sid="$2"
+  curl -s -b "SID=${sid}" "http://127.0.0.1:${port}/api/v2/torrents/info" 2>/dev/null \
+    | sed 's/.*"progress":\([0-9.]*\).*/\1/'
+}
+
+# Write a varuna daemon TOML config file.
+# Args: config_path api_port peer_port data_dir
+write_daemon_config() {
+  local config_path="$1" api_port="$2" peer_port="$3" data_dir="$4"
+  cat >"$config_path" <<EOF
+[daemon]
+api_port = ${api_port}
+api_bind = "127.0.0.1"
+api_username = "admin"
+api_password = "adminadmin"
+
+[storage]
+data_dir = "${data_dir}"
+
+[network]
+port_min = ${peer_port}
+port_max = ${peer_port}
+dht = false
+pex = false
+EOF
+}
+
+# Start a varuna daemon with a per-instance config in the given work directory.
+# Args: work_dir api_port peer_port data_dir log_file
+# Prints: the daemon PID
+start_daemon() {
+  local work_dir="$1" api_port="$2" peer_port="$3" data_dir="$4" log_file="$5"
+  mkdir -p "$work_dir"
+  write_daemon_config "$work_dir/varuna.toml" "$api_port" "$peer_port" "$data_dir"
+  (cd "$work_dir" && exec "$VARUNA") >"$log_file" 2>&1 &
+  echo "$!"
 }
 
 # Run a single-file transfer test
@@ -77,6 +133,7 @@ run_single_file_test() {
   NEXT_PORT=$((NEXT_PORT + 100))
 
   local tp=$port_base sp=$((port_base+1)) dp=$((port_base+2))
+  local sp_api=$((port_base+3)) dp_api=$((port_base+4))
   local W=$(mktemp -d -t "vt-${name}-XXXXXX")
   local pids=""
 
@@ -101,7 +158,7 @@ run_single_file_test() {
     --piece-length "$piece_len" >/dev/null 2>&1
 
   local H
-  H=$("$ROOT_DIR/zig-out/bin/varuna-tools" inspect "$W/test.torrent" 2>/dev/null | awk -F= '/^info_hash=/{print $2}')
+  H=$("$VARUNA_TOOLS" inspect "$W/test.torrent" 2>/dev/null | awk -F= '/^info_hash=/{print $2}')
   if [[ -z "$H" ]]; then
     echo "SKIP (inspect failed)"
     SKIP_COUNT=$((SKIP_COUNT + 1))
@@ -110,15 +167,65 @@ run_single_file_test() {
     return
   fi
 
+  # Start tracker
   "$ROOT_DIR/scripts/tracker.sh" --host 127.0.0.1 --port "$tp" --whitelist-hash "$H" >"$W/tracker.log" 2>&1 &
   pids="$!"
   wait_for_tcp "$tp" || { echo "SKIP (tracker)"; SKIP_COUNT=$((SKIP_COUNT+1)); RESULTS+=("SKIP $name"); cleanup_test "$pids"; rm -rf "$W"; return; }
 
-  "$ROOT_DIR/zig-out/bin/varuna-tools" seed "$W/test.torrent" "$W/seed" --port "$sp" >"$W/seed.log" 2>&1 &
-  pids="$pids $!"
-  wait_for_log "$W/seed.log" "seed announce accepted" || { echo "SKIP (seed)"; SKIP_COUNT=$((SKIP_COUNT+1)); RESULTS+=("SKIP $name"); cleanup_test "$pids"; rm -rf "$W"; return; }
+  # Start seeder daemon
+  local seed_pid
+  seed_pid=$(start_daemon "$W/seed-daemon" "$sp_api" "$sp" "$W/seed" "$W/seed.log")
+  pids="$pids $seed_pid"
+  if ! wait_for_tcp "$sp_api"; then
+    echo "SKIP (seed daemon)"
+    SKIP_COUNT=$((SKIP_COUNT+1)); RESULTS+=("SKIP $name"); cleanup_test "$pids"; rm -rf "$W"; return
+  fi
 
-  if timeout "$timeout_s" "$ROOT_DIR/zig-out/bin/varuna-tools" download "$W/test.torrent" "$W/dl" --port "$dp" --max-peers 1 >"$W/dl.log" 2>&1; then
+  # Add torrent to seeder
+  local seed_sid
+  seed_sid=$(api_login "$sp_api")
+  if [[ -z "$seed_sid" ]]; then
+    echo "SKIP (seed login)"
+    SKIP_COUNT=$((SKIP_COUNT+1)); RESULTS+=("SKIP $name"); cleanup_test "$pids"; rm -rf "$W"; return
+  fi
+  api_add_torrent "$sp_api" "$seed_sid" "$W/test.torrent" "$W/seed"
+
+  # Brief pause for the seeder to announce to tracker
+  sleep 1
+
+  # Start downloader daemon
+  local dl_pid
+  dl_pid=$(start_daemon "$W/dl-daemon" "$dp_api" "$dp" "$W/dl" "$W/dl.log")
+  pids="$pids $dl_pid"
+  if ! wait_for_tcp "$dp_api"; then
+    echo "SKIP (dl daemon)"
+    SKIP_COUNT=$((SKIP_COUNT+1)); RESULTS+=("SKIP $name"); cleanup_test "$pids"; rm -rf "$W"; return
+  fi
+
+  # Add torrent to downloader
+  local dl_sid
+  dl_sid=$(api_login "$dp_api")
+  if [[ -z "$dl_sid" ]]; then
+    echo "SKIP (dl login)"
+    SKIP_COUNT=$((SKIP_COUNT+1)); RESULTS+=("SKIP $name"); cleanup_test "$pids"; rm -rf "$W"; return
+  fi
+  api_add_torrent "$dp_api" "$dl_sid" "$W/test.torrent" "$W/dl"
+
+  # Poll until download completes or timeout
+  local elapsed=0
+  local progress=""
+  local completed=false
+  while [[ $elapsed -lt $timeout_s ]]; do
+    progress=$(api_get_progress "$dp_api" "$dl_sid")
+    if [[ -n "$progress" ]] && awk "BEGIN{exit(!($progress >= 1.0))}" 2>/dev/null; then
+      completed=true
+      break
+    fi
+    sleep 1
+    elapsed=$((elapsed + 1))
+  done
+
+  if $completed; then
     if cmp -s "$W/seed/payload.bin" "$W/dl/payload.bin"; then
       echo "PASS"
       PASS_COUNT=$((PASS_COUNT + 1))
@@ -129,16 +236,13 @@ run_single_file_test() {
       RESULTS+=("FAIL $name (data mismatch)")
     fi
   else
-    local rc=$?
-    if [[ $rc -eq 124 ]]; then
-      echo "FAIL (timeout ${timeout_s}s)"
-      FAIL_COUNT=$((FAIL_COUNT + 1))
-      RESULTS+=("FAIL $name (timeout)")
+    if [[ $elapsed -ge $timeout_s ]]; then
+      echo "FAIL (timeout ${timeout_s}s, progress=${progress:-unknown})"
     else
-      echo "FAIL (exit $rc)"
-      FAIL_COUNT=$((FAIL_COUNT + 1))
-      RESULTS+=("FAIL $name (exit $rc)")
+      echo "FAIL (download error, progress=${progress:-unknown})"
     fi
+    FAIL_COUNT=$((FAIL_COUNT + 1))
+    RESULTS+=("FAIL $name (timeout)")
   fi
 
   cleanup_test "$pids"
@@ -156,6 +260,7 @@ run_multi_file_test() {
   NEXT_PORT=$((NEXT_PORT + 100))
 
   local tp=$port_base sp=$((port_base+1)) dp=$((port_base+2))
+  local sp_api=$((port_base+3)) dp_api=$((port_base+4))
   local W=$(mktemp -d -t "vt-${name}-XXXXXX")
   local pids=""
 
@@ -192,7 +297,7 @@ run_multi_file_test() {
     --piece-length "$piece_len" >/dev/null 2>&1
 
   local H
-  H=$("$ROOT_DIR/zig-out/bin/varuna-tools" inspect "$W/test.torrent" 2>/dev/null | awk -F= '/^info_hash=/{print $2}')
+  H=$("$VARUNA_TOOLS" inspect "$W/test.torrent" 2>/dev/null | awk -F= '/^info_hash=/{print $2}')
   if [[ -z "$H" ]]; then
     echo "SKIP (inspect failed)"
     SKIP_COUNT=$((SKIP_COUNT + 1))
@@ -201,16 +306,65 @@ run_multi_file_test() {
     return
   fi
 
+  # Start tracker
   "$ROOT_DIR/scripts/tracker.sh" --host 127.0.0.1 --port "$tp" --whitelist-hash "$H" >"$W/tracker.log" 2>&1 &
   pids="$!"
   wait_for_tcp "$tp" || { echo "SKIP (tracker)"; SKIP_COUNT=$((SKIP_COUNT+1)); RESULTS+=("SKIP $name"); cleanup_test "$pids"; rm -rf "$W"; return; }
 
-  # Multi-file torrents: pass parent dir so PieceStore finds <torrent_name>/<file_path>
-  "$ROOT_DIR/zig-out/bin/varuna-tools" seed "$W/test.torrent" "$W/seed" --port "$sp" >"$W/seed.log" 2>&1 &
-  pids="$pids $!"
-  wait_for_log "$W/seed.log" "seed announce accepted" || { echo "SKIP (seed)"; SKIP_COUNT=$((SKIP_COUNT+1)); RESULTS+=("SKIP $name"); cleanup_test "$pids"; rm -rf "$W"; return; }
+  # Start seeder daemon (multi-file torrents: pass parent dir so PieceStore finds <torrent_name>/<file_path>)
+  local seed_pid
+  seed_pid=$(start_daemon "$W/seed-daemon" "$sp_api" "$sp" "$W/seed" "$W/seed.log")
+  pids="$pids $seed_pid"
+  if ! wait_for_tcp "$sp_api"; then
+    echo "SKIP (seed daemon)"
+    SKIP_COUNT=$((SKIP_COUNT+1)); RESULTS+=("SKIP $name"); cleanup_test "$pids"; rm -rf "$W"; return
+  fi
 
-  if timeout "$timeout_s" "$ROOT_DIR/zig-out/bin/varuna-tools" download "$W/test.torrent" "$W/dl" --port "$dp" --max-peers 1 >"$W/dl.log" 2>&1; then
+  # Add torrent to seeder
+  local seed_sid
+  seed_sid=$(api_login "$sp_api")
+  if [[ -z "$seed_sid" ]]; then
+    echo "SKIP (seed login)"
+    SKIP_COUNT=$((SKIP_COUNT+1)); RESULTS+=("SKIP $name"); cleanup_test "$pids"; rm -rf "$W"; return
+  fi
+  api_add_torrent "$sp_api" "$seed_sid" "$W/test.torrent" "$W/seed"
+
+  # Brief pause for the seeder to announce to tracker
+  sleep 1
+
+  # Start downloader daemon
+  local dl_pid
+  dl_pid=$(start_daemon "$W/dl-daemon" "$dp_api" "$dp" "$W/dl" "$W/dl.log")
+  pids="$pids $dl_pid"
+  if ! wait_for_tcp "$dp_api"; then
+    echo "SKIP (dl daemon)"
+    SKIP_COUNT=$((SKIP_COUNT+1)); RESULTS+=("SKIP $name"); cleanup_test "$pids"; rm -rf "$W"; return
+  fi
+
+  # Add torrent to downloader
+  local dl_sid
+  dl_sid=$(api_login "$dp_api")
+  if [[ -z "$dl_sid" ]]; then
+    echo "SKIP (dl login)"
+    SKIP_COUNT=$((SKIP_COUNT+1)); RESULTS+=("SKIP $name"); cleanup_test "$pids"; rm -rf "$W"; return
+  fi
+  api_add_torrent "$dp_api" "$dl_sid" "$W/test.torrent" "$W/dl"
+
+  # Poll until download completes or timeout
+  local elapsed=0
+  local progress=""
+  local completed=false
+  while [[ $elapsed -lt $timeout_s ]]; do
+    progress=$(api_get_progress "$dp_api" "$dl_sid")
+    if [[ -n "$progress" ]] && awk "BEGIN{exit(!($progress >= 1.0))}" 2>/dev/null; then
+      completed=true
+      break
+    fi
+    sleep 1
+    elapsed=$((elapsed + 1))
+  done
+
+  if $completed; then
     # Verify each file
     local all_match=true
     for spec in "${specs[@]}"; do
@@ -230,11 +384,10 @@ run_multi_file_test() {
       RESULTS+=("FAIL $name (data mismatch)")
     fi
   else
-    local rc=$?
-    if [[ $rc -eq 124 ]]; then
-      echo "FAIL (timeout ${timeout_s}s)"
+    if [[ $elapsed -ge $timeout_s ]]; then
+      echo "FAIL (timeout ${timeout_s}s, progress=${progress:-unknown})"
     else
-      echo "FAIL (exit $rc)"
+      echo "FAIL (download error, progress=${progress:-unknown})"
     fi
     FAIL_COUNT=$((FAIL_COUNT + 1))
     RESULTS+=("FAIL $name")
@@ -255,10 +408,10 @@ echo ""
 # Build
 zig build >/dev/null 2>&1
 
-# Kill any lingering processes from THIS worktree's previous runs.
+# Kill any lingering daemon processes from THIS worktree's previous runs.
 # Only kill processes whose command line references this ROOT_DIR to avoid
 # interfering with other concurrent test runs from different worktrees.
-for pid in $(pgrep -f "$ROOT_DIR/zig-out/bin/varuna-tools (seed|download)" 2>/dev/null || true); do
+for pid in $(pgrep -f "$ROOT_DIR/zig-out/bin/varuna" 2>/dev/null || true); do
   [[ "$pid" == "$$" ]] && continue
   kill -9 "$pid" 2>/dev/null || true
 done

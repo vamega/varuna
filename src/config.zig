@@ -87,17 +87,34 @@ pub const Config = struct {
     };
 };
 
-pub fn load(allocator: std.mem.Allocator, path: []const u8) !Config {
+/// Parsed config result. Holds ownership of the TOML parse tree so that
+/// string slices in the Config struct remain valid for the program lifetime.
+pub const LoadedConfig = struct {
+    value: Config,
+    /// Opaque handle to the TOML parse tree. Must NOT be deinit'd while
+    /// Config string slices (data_dir, bind_device, etc.) are still in use.
+    _parse_result: ?toml.Parsed(Config) = null,
+
+    pub fn deinit(self: *LoadedConfig) void {
+        if (self._parse_result) |r| {
+            var copy = r;
+            copy.deinit();
+        }
+    }
+};
+
+pub fn load(allocator: std.mem.Allocator, path: []const u8) !LoadedConfig {
     var parser = toml.Parser(Config).init(allocator);
     const result = parser.parseFile(path) catch |err| switch (err) {
-        error.FileNotFound => return Config{},
+        error.FileNotFound => return .{ .value = Config{} },
         else => return err,
     };
-    defer result.deinit();
-    return result.value;
+    // Do NOT deinit result — the Config's string slices point into its memory.
+    // Ownership transfers to the caller via LoadedConfig.
+    return .{ .value = result.value, ._parse_result = result };
 }
 
-pub fn loadDefault(allocator: std.mem.Allocator) Config {
+pub fn loadDefault(allocator: std.mem.Allocator) LoadedConfig {
     // Try well-known paths in order
     const paths = [_][]const u8{
         "varuna.toml",
@@ -113,7 +130,7 @@ pub fn loadDefault(allocator: std.mem.Allocator) Config {
     // Check $XDG_CONFIG_HOME/varuna/config.toml
     if (std.posix.getenv("XDG_CONFIG_HOME")) |xdg| {
         var buf: [1024]u8 = undefined;
-        const path = std.fmt.bufPrint(&buf, "{s}/varuna/config.toml", .{xdg}) catch return Config{};
+        const path = std.fmt.bufPrint(&buf, "{s}/varuna/config.toml", .{xdg}) catch return .{ .value = Config{} };
         if (load(allocator, path)) |config| {
             return config;
         } else |_| {}
@@ -122,13 +139,13 @@ pub fn loadDefault(allocator: std.mem.Allocator) Config {
     // Check ~/.config/varuna/config.toml
     if (std.posix.getenv("HOME")) |home| {
         var buf: [1024]u8 = undefined;
-        const path = std.fmt.bufPrint(&buf, "{s}/.config/varuna/config.toml", .{home}) catch return Config{};
+        const path = std.fmt.bufPrint(&buf, "{s}/.config/varuna/config.toml", .{home}) catch return .{ .value = Config{} };
         if (load(allocator, path)) |config| {
             return config;
         } else |_| {}
     }
 
-    return Config{};
+    return .{ .value = Config{} };
 }
 
 /// Parse the encryption config string into an EncryptionMode enum.

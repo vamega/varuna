@@ -52,7 +52,14 @@ pub fn processMessage(self: *EventLoop, slot: u16) void {
         },
         1 => {
             peer.peer_choking = false; // unchoke
-            self.markIdle(slot);
+            if (peer.current_piece != null) {
+                // Peer was choked mid-download — resume the interrupted piece
+                // instead of calling markIdle (which requires current_piece==null).
+                const policy = @import("peer_policy.zig");
+                policy.tryFillPipeline(self, slot) catch {};
+            } else {
+                self.markIdle(slot);
+            }
         },
         2 => { // interested
             peer.peer_interested = true;
@@ -99,9 +106,25 @@ pub fn processMessage(self: *EventLoop, slot: u16) void {
         },
         5 => { // bitfield
             const tc_bf = self.getTorrentContext(peer.torrent_id) orelse return;
+            const sess_bf = tc_bf.session orelse return;
+            const piece_count = sess_bf.pieceCount();
+            // BEP 3: bitfield length must be ceil(piece_count / 8)
+            const expected_len = (piece_count + 7) / 8;
+            if (payload.len != expected_len) {
+                self.removePeer(slot);
+                return;
+            }
+            // BEP 3: spare bits in the last byte must be zero
+            const spare: u32 = expected_len * 8 - piece_count;
+            if (spare > 0 and spare < 8) {
+                const mask = @as(u8, 0xFF) >> @as(u3, @intCast(8 - spare));
+                if (payload[payload.len - 1] & mask != 0) {
+                    self.removePeer(slot);
+                    return;
+                }
+            }
             if (peer.availability == null) {
-                const sess = tc_bf.session orelse return;
-                peer.availability = Bitfield.init(self.allocator, sess.pieceCount()) catch return;
+                peer.availability = Bitfield.init(self.allocator, piece_count) catch return;
             }
             if (peer.availability) |*bf| {
                 bf.importBitfield(payload);

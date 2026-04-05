@@ -88,6 +88,12 @@ pub fn startPieceDownload(self: *EventLoop, slot: u16, piece_index: u32) !void {
 
     peer.current_piece = piece_index;
     peer.piece_buf = try self.allocator.alloc(u8, piece_size);
+    errdefer {
+        // On failure, clean up so the peer doesn't stall with a dangling current_piece.
+        if (peer.piece_buf) |buf| self.allocator.free(buf);
+        peer.piece_buf = null;
+        peer.current_piece = null;
+    }
     peer.blocks_received = 0;
     peer.blocks_expected = block_count;
     peer.pipeline_sent = 0;
@@ -329,6 +335,8 @@ pub fn completePieceDownload(self: *EventLoop, slot: u16) void {
             };
 
             for (plan.spans) |span| {
+                // Skip spans for do_not_download files (fd == -1)
+                if (tc.shared_fds[span.file_index] < 0) continue;
                 const block = piece_buf[span.piece_offset .. span.piece_offset + span.length];
                 const ud = encodeUserData(.{ .slot = slot, .op_type = .disk_write, .context = write_id });
                 _ = self.ring.write(ud, tc.shared_fds[span.file_index], block, span.file_offset) catch |err| {
@@ -431,6 +439,8 @@ pub fn processHashResults(self: *EventLoop) void {
             };
 
             for (plan.spans) |span| {
+                // Skip spans for do_not_download files (fd == -1)
+                if (tc.shared_fds[span.file_index] < 0) continue;
                 const block = result.piece_buf[span.piece_offset .. span.piece_offset + span.length];
                 const ud = encodeUserData(.{ .slot = result.slot, .op_type = .disk_write, .context = write_id });
                 _ = self.ring.write(ud, tc.shared_fds[span.file_index], block, span.file_offset) catch |err| {

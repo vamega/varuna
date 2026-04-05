@@ -14,7 +14,9 @@ pub fn main() !void {
     const stdout = &stdout_writer.interface;
 
     varuna.io.signal.installHandlers();
-    const cfg = varuna.config.loadDefault(allocator);
+    var loaded_cfg = varuna.config.loadDefault(allocator);
+    defer loaded_cfg.deinit();
+    const cfg = loaded_cfg.value;
 
     // Check for --help
     for (args[1..]) |arg| {
