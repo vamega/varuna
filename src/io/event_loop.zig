@@ -711,6 +711,9 @@ pub const EventLoop = struct {
     // API server (shares the event loop's ring)
     api_server: ?*@import("../rpc/server.zig").ApiServer = null,
 
+    // Tracker executor (shares the event loop's ring)
+    tracker_executor: ?*@import("../daemon/tracker_executor.zig").TrackerExecutor = null,
+
     // Complete pieces bitfield (for seeding -- which pieces we can serve)
     complete_pieces: ?*const Bitfield = null,
 
@@ -755,21 +758,12 @@ pub const EventLoop = struct {
     max_half_open: u32 = 50,
     half_open_count: u32 = 0,
 
-    // Re-announce state
-    announce_url: ?[]const u8 = null,
+    // Re-announce result handoff: the daemon's tracker sessions store
+    // discovered peers here; the event loop picks them up on tick.
     announce_interval: u32 = 1800,
-    last_announce_time: i64 = 0,
-    announce_jitter_secs: i32 = 0, // random jitter applied to this torrent's interval
-    min_peers_for_reannounce: u16 = 20, // re-announce when below this
-    // Background announce thread state: announce runs on a background thread
-    // to avoid blocking the main event loop.
-    announcing: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
-    // Peers discovered by the background announce thread, picked up by the
-    // main thread on the next tick. Protected by announce_mutex.
     announce_result_peers: ?[]std.net.Address = null,
     announce_results_ready: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
     announce_mutex: std.Thread.Mutex = .{},
-    announce_thread: ?std.Thread = null,
 
     // Global rate limiter (applies across all torrents, 0 = unlimited)
     global_rate_limiter: RateLimiter = RateLimiter.initComptime(0, 0),
@@ -873,12 +867,6 @@ pub const EventLoop = struct {
     }
 
     pub fn deinit(self: *EventLoop) void {
-        // Wait for background announce thread to finish before freeing anything
-        if (self.announce_thread) |t| {
-            t.join();
-            self.announce_thread = null;
-        }
-
         if (self.hasher) |h| {
             h.deinit();
             self.allocator.destroy(h);
@@ -1555,19 +1543,6 @@ pub const EventLoop = struct {
         }
     }
 
-    /// Configure re-announce parameters.
-    pub fn setAnnounce(self: *EventLoop, url: []const u8, interval: u32) void {
-        self.announce_url = url;
-        self.announce_interval = interval;
-        self.last_announce_time = std.time.timestamp();
-    }
-
-    /// Force an immediate re-announce by resetting the last announce time.
-    /// Used when peer count drops to 0 to quickly recover new peers.
-    pub fn forceReannounce(self: *EventLoop) void {
-        self.last_announce_time = 0; // will expire immediately on next checkReannounce
-    }
-
     pub fn tick(self: *EventLoop) !void {
         // Check if ban list was updated by API handlers
         if (self.ban_list_dirty.swap(false, .acquire)) {
@@ -1586,6 +1561,7 @@ pub const EventLoop = struct {
         peer_policy.checkPartialSeed(self);
         utp_handler.utpTick(self);
         dht_handler.dhtTick(self);
+        if (self.tracker_executor) |te| te.tick();
 
         // Flush any queued SQEs before waiting
         _ = self.ring.submit() catch |err| {
@@ -1824,7 +1800,10 @@ pub const EventLoop = struct {
             },
             .utp_recv => utp_handler.handleUtpRecv(self, cqe),
             .utp_send => utp_handler.handleUtpSend(self, cqe),
-            .http_connect, .http_send, .http_recv, .cancel => {},
+            .http_connect, .http_send, .http_recv => {
+                if (self.tracker_executor) |te| te.dispatchCqe(cqe);
+            },
+            .cancel => {},
             .api_accept => if (self.api_server) |srv| srv.handleAcceptCqe(cqe),
             .api_recv => if (self.api_server) |srv| srv.handleRecvCqe(op.slot, op.context, cqe),
             .api_send => if (self.api_server) |srv| srv.handleSendCqe(op.slot, op.context, cqe),

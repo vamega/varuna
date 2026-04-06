@@ -1279,7 +1279,9 @@ fn runTrackerAnnounceExecutor(
         server_thread.join();
     }
 
-    const executor = try TrackerExecutor.create(allocator, .{});
+    var perf_ring = try linux.IoUring.init(32, 0);
+    defer perf_ring.deinit();
+    const executor = try TrackerExecutor.create(allocator, &perf_ring, .{});
     defer executor.destroy();
 
     std.Thread.sleep(10 * std.time.ns_per_ms);

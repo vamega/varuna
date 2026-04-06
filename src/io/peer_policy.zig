@@ -679,8 +679,9 @@ pub fn recalculateUnchokes(self: *EventLoop) void {
 
 // ── Re-announce ─────────────────────────────────────────
 
+/// Pick up peers discovered by daemon tracker sessions (via announce_result_peers).
+/// The standalone announce thread was removed — all announces go through TrackerExecutor.
 pub fn checkReannounce(self: *EventLoop) void {
-    // Pick up results from a previous background announce
     if (self.announce_results_ready.load(.acquire)) {
         const peers = blk: {
             self.announce_mutex.lock();
@@ -698,112 +699,6 @@ pub fn checkReannounce(self: *EventLoop) void {
             self.allocator.free(addrs);
         }
     }
-
-    const url = self.announce_url orelse return;
-    if (self.peer_count >= self.min_peers_for_reannounce) return;
-
-    const now = std.time.timestamp();
-    // When peer count is critically low, re-announce every 60 seconds.
-    // Otherwise respect the tracker's interval (with +-10% jitter).
-    const effective_interval: i64 = if (self.peer_count < 3) blk: {
-        break :blk 60;
-    } else blk: {
-        const jittered_interval = @as(i64, self.announce_interval) + @as(i64, self.announce_jitter_secs);
-        break :blk @max(jittered_interval, 60);
-    };
-    if (now - self.last_announce_time < effective_interval) return;
-
-    self.last_announce_time = now;
-    // Generate new jitter for next cycle: +-10% of interval
-    self.announce_jitter_secs = generateAnnounceJitter(self);
-
-    // Already announcing -- skip
-    if (self.announcing.load(.acquire)) return;
-
-    const tc = self.getTorrentContext(0) orelse return;
-    const pt = tc.piece_tracker orelse return;
-
-    // Spawn background thread for blocking DNS + HTTP announce.
-    // The background thread uses announce_ring (not the event loop ring)
-    // so it doesn't block peer I/O.
-    self.announcing.store(true, .release);
-
-    const thread = std.Thread.spawn(.{}, announceWorkerThread, .{
-        self,
-        url,
-        tc.info_hash,
-        tc.peer_id,
-        tc.tracker_key,
-        if (pt.isComplete()) 0 else pt.bytesRemaining(),
-    }) catch {
-        self.announcing.store(false, .release);
-        return;
-    };
-    // Store handle so deinit can join. Previous handle (if any) must have
-    // already finished since we checked announcing.load above.
-    self.announce_thread = thread;
-}
-
-/// Background thread for tracker re-announce. Uses blocking posix I/O.
-/// Results are stored in announce_result_peers and picked up on the next tick.
-fn announceWorkerThread(
-    self: *EventLoop,
-    url: []const u8,
-    info_hash: [20]u8,
-    peer_id: [20]u8,
-    tracker_key: ?[8]u8,
-    left: u64,
-) void {
-    defer self.announcing.store(false, .release);
-
-    const tracker_mod = @import("../tracker/root.zig");
-    const response = tracker_mod.announce.fetchAuto(self.allocator, .{
-        .announce_url = url,
-        .info_hash = info_hash,
-        .peer_id = peer_id,
-        .port = self.port,
-        .left = left,
-        .event = null,
-        .key = tracker_key,
-    }) catch return;
-    defer tracker_mod.announce.freeResponse(self.allocator, response);
-
-    if (response.peers.len == 0) return;
-
-    // Collect peer addresses for the main thread to add
-    var addrs = self.allocator.alloc(std.net.Address, response.peers.len) catch return;
-    var count: usize = 0;
-    for (response.peers) |peer| {
-        addrs[count] = peer.address;
-        count += 1;
-    }
-    if (count < addrs.len) {
-        addrs = self.allocator.realloc(addrs, count) catch {
-            self.allocator.free(addrs);
-            return;
-        };
-    }
-
-    // Store results for the main thread (mutex-protected handoff)
-    {
-        self.announce_mutex.lock();
-        defer self.announce_mutex.unlock();
-        self.announce_result_peers = addrs;
-        self.announce_results_ready.store(true, .release);
-    }
-}
-
-/// Generate random jitter for announce interval: +-10% of the interval.
-fn generateAnnounceJitter(self: *const EventLoop) i32 {
-    const interval: i32 = @intCast(self.announce_interval);
-    const jitter_range = @divTrunc(interval, 5); // 20% total range (+-10%)
-    if (jitter_range == 0) return 0;
-    // Use timestamp-based seed for simple PRNG (good enough for jitter)
-    const now: u64 = @bitCast(std.time.timestamp());
-    const hsh = now *% 6364136223846793005 +% 1442695040888963407;
-    const raw: u32 = @truncate(hsh >> 33);
-    const jitter: i32 = @as(i32, @intCast(raw % @as(u32, @intCast(jitter_range + 1)))) - @divTrunc(jitter_range, 2);
-    return jitter;
 }
 
 // ── BEP 11: Peer Exchange ─────────────────────────────

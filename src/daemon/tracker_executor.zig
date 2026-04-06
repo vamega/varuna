@@ -26,11 +26,9 @@ const log = std.log.scoped(.tracker_executor);
 /// io_uring SQEs.
 pub const TrackerExecutor = struct {
     allocator: std.mem.Allocator,
-    thread: ?std.Thread = null,
     running: std.atomic.Value(bool) = std.atomic.Value(bool).init(true),
 
-    ring: linux.IoUring,
-    wake_fd: posix.fd_t,
+    ring: *linux.IoUring,
     dns_event_fd: posix.fd_t,
 
     // Thread-safe job queue (producer: any thread, consumer: ring thread).
@@ -212,20 +210,16 @@ pub const TrackerExecutor = struct {
 
     // ── Public API ───────────────────────────────────────────
 
-    pub fn create(allocator: std.mem.Allocator, config: Config) !*TrackerExecutor {
+    pub fn create(allocator: std.mem.Allocator, ring: *linux.IoUring, config: Config) !*TrackerExecutor {
         const self = try allocator.create(TrackerExecutor);
         errdefer allocator.destroy(self);
-
-        const wake_fd = try posix.eventfd(0, linux.EFD.NONBLOCK | linux.EFD.CLOEXEC);
-        errdefer posix.close(wake_fd);
 
         const dns_event_fd = try posix.eventfd(0, linux.EFD.NONBLOCK | linux.EFD.CLOEXEC);
         errdefer posix.close(dns_event_fd);
 
         self.* = .{
             .allocator = allocator,
-            .ring = try linux.IoUring.init(32, 0), // must be power of 2
-            .wake_fd = wake_fd,
+            .ring = ring,
             .dns_event_fd = dns_event_fd,
             .pending_jobs = std.ArrayList(Job).empty,
             .deferred_jobs = std.ArrayList(Job).empty,
@@ -235,28 +229,20 @@ pub const TrackerExecutor = struct {
             .slots = undefined,
             .free_slot_count = config.max_concurrent,
         };
-        errdefer self.ring.deinit();
         errdefer self.dns_resolver.deinit(allocator);
 
         self.slots = try allocator.alloc(RequestSlot, config.max_concurrent);
         errdefer allocator.free(self.slots);
         for (self.slots) |*slot| slot.* = .{};
 
-        self.thread = try std.Thread.spawn(.{}, ringMain, .{self});
+        // Register DNS eventfd poll on the shared ring
+        self.submitDnsPoll();
 
         return self;
     }
 
     pub fn destroy(self: *TrackerExecutor) void {
         self.running.store(false, .release);
-        // Wake the ring thread so it notices the shutdown.
-        const val: u64 = 1;
-        _ = posix.write(self.wake_fd, std.mem.asBytes(&val)) catch {};
-
-        if (self.thread) |t| {
-            t.join();
-            self.thread = null;
-        }
 
         // Clean up in-flight slots.
         for (self.slots) |*slot| {
@@ -273,8 +259,7 @@ pub const TrackerExecutor = struct {
         while (iter.next()) |key| self.allocator.free(key.*);
         self.host_active.deinit(self.allocator);
 
-        self.ring.deinit();
-        posix.close(self.wake_fd);
+        // Ring is shared, not owned
         posix.close(self.dns_event_fd);
         self.dns_resolver.deinit(self.allocator);
         self.pending_jobs.deinit(self.allocator);
@@ -285,51 +270,23 @@ pub const TrackerExecutor = struct {
     /// Submit a tracker HTTP(S) GET request. Thread-safe.
     /// The callback is invoked on the ring thread when the response is ready.
     pub fn submit(self: *TrackerExecutor, job: Job) !void {
-        {
-            self.queue_mutex.lock();
-            defer self.queue_mutex.unlock();
-            if (!self.running.load(.acquire)) return error.ExecutorStopped;
-            try self.pending_jobs.append(self.allocator, job);
-        }
-        const val: u64 = 1;
-        _ = posix.write(self.wake_fd, std.mem.asBytes(&val)) catch {};
+        self.queue_mutex.lock();
+        defer self.queue_mutex.unlock();
+        if (!self.running.load(.acquire)) return error.ExecutorStopped;
+        try self.pending_jobs.append(self.allocator, job);
+        // No wake_fd needed — the main event loop ticks regularly and
+        // calls tick() which drains the job queue.
     }
 
-    // ── Ring thread event loop ───────────────────────────────
+    // ── Tick (called from event loop) ────────────────────────
 
-    fn ringMain(self: *TrackerExecutor) void {
-        // Register POLL_ADD for both eventfds.
-        self.submitWakePoll();
-        self.submitDnsPoll();
-        self.submitPeriodicTimeout();
-
-        while (self.running.load(.acquire) or self.active_count > 0) {
-            self.drainJobQueue();
-            self.startDeferredJobs();
-            self.checkTimeouts();
-
-            _ = self.ring.submit_and_wait(1) catch |err| {
-                log.warn("ring flush_and_wait: {s}", .{@errorName(err)});
-                continue;
-            };
-
-            var cqes: [cqe_batch_size]linux.io_uring_cqe = undefined;
-            const count = self.ring.copy_cqes(&cqes, 0) catch |err| {
-                log.warn("ring drain_cqes: {s}", .{@errorName(err)});
-                continue;
-            };
-
-            for (cqes[0..count]) |cqe| {
-                self.dispatch(cqe);
-            }
-
-            _ = self.ring.submit() catch {};
-        }
-    }
-
-    fn submitWakePoll(self: *TrackerExecutor) void {
-        const ud = encodeUserData(.{ .slot = sentinel_wake, .op_type = .http_connect, .context = 0 });
-        _ = self.ring.poll_add(ud, self.wake_fd, linux.POLL.IN) catch {};
+    /// Process pending jobs, check timeouts, and start deferred requests.
+    /// Called from the main event loop's tick(). DNS completions come via
+    /// CQEs on the shared ring (dns_event_fd polled with POLL_ADD).
+    pub fn tick(self: *TrackerExecutor) void {
+        self.drainJobQueue();
+        self.startDeferredJobs();
+        self.checkTimeouts();
     }
 
     fn submitDnsPoll(self: *TrackerExecutor) void {
@@ -337,21 +294,9 @@ pub const TrackerExecutor = struct {
         _ = self.ring.poll_add(ud, self.dns_event_fd, linux.POLL.IN) catch {};
     }
 
-    fn submitPeriodicTimeout(self: *TrackerExecutor) void {
-        const ud = encodeUserData(.{ .slot = sentinel_timeout, .op_type = .timeout, .context = 0 });
-        _ = self.ring.timeout(ud, &self.timeout_ts, 0, 0) catch {};
-    }
-
-    fn dispatch(self: *TrackerExecutor, cqe: linux.io_uring_cqe) void {
+    /// Dispatch a CQE from the shared event loop. Called by EventLoop.dispatch().
+    pub fn dispatchCqe(self: *TrackerExecutor, cqe: linux.io_uring_cqe) void {
         const op = decodeUserData(cqe.user_data);
-
-        // Sentinel: wake eventfd
-        if (op.slot == sentinel_wake) {
-            var buf: [8]u8 = undefined;
-            _ = posix.read(self.wake_fd, &buf) catch {};
-            self.submitWakePoll();
-            return;
-        }
 
         // Sentinel: DNS eventfd
         if (op.slot == sentinel_dns) {
@@ -359,12 +304,6 @@ pub const TrackerExecutor = struct {
             _ = posix.read(self.dns_event_fd, &buf) catch {};
             self.submitDnsPoll();
             self.processDnsCompletions();
-            return;
-        }
-
-        // Sentinel: periodic timeout
-        if (op.slot == sentinel_timeout) {
-            self.submitPeriodicTimeout();
             return;
         }
 
