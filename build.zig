@@ -1,5 +1,6 @@
 const std = @import("std");
 const boringssl = @import("build/boringssl.zig");
+const cares = @import("build/cares.zig");
 
 pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
@@ -16,6 +17,12 @@ pub fn build(b: *std.Build) void {
         "dns",
         "DNS resolver backend: 'threadpool' uses getaddrinfo on background threads (default), 'c-ares' uses the c-ares async DNS library",
     ) orelse .threadpool;
+
+    const cares_mode = b.option(
+        enum { system, bundled },
+        "cares",
+        "c-ares linking strategy (only used when -Ddns=c-ares): 'system' links the system libcares, 'bundled' compiles from vendor/c-ares/",
+    ) orelse .bundled;
 
     const tls_backend = b.option(
         TlsBackend,
@@ -81,7 +88,16 @@ pub fn build(b: *std.Build) void {
 
     // ── c-ares linking (when dns=c-ares) ────────────────────
     if (dns_backend == .c_ares) {
-        varuna_mod.linkSystemLibrary("cares", .{});
+        switch (cares_mode) {
+            .system => {
+                varuna_mod.linkSystemLibrary("cares", .{});
+            },
+            .bundled => {
+                const cares_lib = cares.create(b, target, optimize);
+                varuna_mod.linkLibrary(cares_lib.lib);
+                varuna_mod.addIncludePath(cares_lib.include_path);
+            },
+        }
     }
 
     // ── BoringSSL linking (when tls=boringssl) ──────────────

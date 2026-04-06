@@ -19,3 +19,6 @@
 [submodule "vendor/boringssl"]
 	path = vendor/boringssl
 	url = https://github.com/google/boringssl.git
+[submodule "vendor/c-ares"]
+	path = vendor/c-ares
+	url = https://github.com/c-ares/c-ares.git
