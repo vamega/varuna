@@ -404,6 +404,15 @@ pub fn main() !void {
     try stdout.flush();
 }
 
+/// Write all bytes to a file descriptor, looping until complete.
+fn sendAll(fd: std.posix.fd_t, buf: []const u8) !void {
+    var sent: usize = 0;
+    while (sent < buf.len) {
+        const n = try std.posix.write(fd, buf[sent..]);
+        sent += n;
+    }
+}
+
 /// Login to the daemon API and return the SID cookie value.
 /// Returns null if credentials are rejected, error on connection failure.
 fn doLogin(
@@ -415,15 +424,14 @@ fn doLogin(
     password: []const u8,
 ) !?[]u8 {
     _ = stdout;
-    var ring = varuna.io.ring.Ring.init(16) catch return error.IoUringUnavailable;
-    defer ring.deinit();
+    const posix = std.posix;
 
     const addr = std.net.Address.parseIp4(host, port) catch return error.InvalidAddress;
 
-    const fd = try ring.socket(addr.any.family, std.posix.SOCK.STREAM | std.posix.SOCK.CLOEXEC, std.posix.IPPROTO.TCP);
-    defer std.posix.close(fd);
+    const fd = try posix.socket(addr.any.family, posix.SOCK.STREAM | posix.SOCK.CLOEXEC, posix.IPPROTO.TCP);
+    defer posix.close(fd);
 
-    try ring.connect_timeout(fd, &addr.any, addr.getOsSockLen(), 5);
+    try posix.connect(fd, &addr.any, addr.getOsSockLen());
 
     // Build login body
     var body_buf = std.ArrayList(u8).empty;
@@ -436,11 +444,11 @@ fn doLogin(
     try request.print(allocator, "POST /api/v2/auth/login HTTP/1.1\r\nHost: {s}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n", .{ host, body_buf.items.len });
     try request.appendSlice(allocator, body_buf.items);
 
-    try ring.send_all(fd, request.items);
+    try sendAll(fd, request.items);
 
     // Read response
     var response_buf: [8192]u8 = undefined;
-    const n = try ring.recv(fd, &response_buf);
+    const n = try posix.read(fd, &response_buf);
     const response = response_buf[0..n];
 
     // Check for successful login (body should be "Ok.")
@@ -486,24 +494,20 @@ fn doGet(
     path: []const u8,
     sid: ?[]const u8,
 ) !void {
-    var ring = varuna.io.ring.Ring.init(16) catch {
-        try stdout.print("error: io_uring unavailable\n", .{});
-        return;
-    };
-    defer ring.deinit();
+    const posix = std.posix;
 
     const addr = std.net.Address.parseIp4(host, port) catch {
         try stdout.print("error: invalid daemon address\n", .{});
         return;
     };
 
-    const fd = ring.socket(addr.any.family, std.posix.SOCK.STREAM | std.posix.SOCK.CLOEXEC, std.posix.IPPROTO.TCP) catch {
+    const fd = posix.socket(addr.any.family, posix.SOCK.STREAM | posix.SOCK.CLOEXEC, posix.IPPROTO.TCP) catch {
         try stdout.print("error: could not create socket\n", .{});
         return;
     };
-    defer std.posix.close(fd);
+    defer posix.close(fd);
 
-    ring.connect_timeout(fd, &addr.any, addr.getOsSockLen(), 5) catch {
+    posix.connect(fd, &addr.any, addr.getOsSockLen()) catch {
         try stdout.print("error: could not connect to daemon\n", .{});
         return;
     };
@@ -517,14 +521,14 @@ fn doGet(
     }
     try request.appendSlice(allocator, "Connection: close\r\n\r\n");
 
-    ring.send_all(fd, request.items) catch {
+    sendAll(fd, request.items) catch {
         try stdout.print("error: failed to send request\n", .{});
         return;
     };
 
     // Read response
     var response_buf: [8192]u8 = undefined;
-    const n = ring.recv(fd, &response_buf) catch {
+    const n = posix.read(fd, &response_buf) catch {
         try stdout.print("error: failed to read response\n", .{});
         return;
     };
@@ -547,25 +551,21 @@ fn doPost(
     body: []const u8,
     sid: ?[]const u8,
 ) !void {
-    // Build a raw HTTP POST request and send via io_uring
-    var ring = varuna.io.ring.Ring.init(16) catch {
-        try stdout.print("error: io_uring unavailable\n", .{});
-        return;
-    };
-    defer ring.deinit();
+    // Build a raw HTTP POST request and send via POSIX syscalls
+    const posix = std.posix;
 
     const addr = std.net.Address.parseIp4(host, port) catch {
         try stdout.print("error: invalid daemon address\n", .{});
         return;
     };
 
-    const fd = ring.socket(addr.any.family, std.posix.SOCK.STREAM | std.posix.SOCK.CLOEXEC, std.posix.IPPROTO.TCP) catch {
+    const fd = posix.socket(addr.any.family, posix.SOCK.STREAM | posix.SOCK.CLOEXEC, posix.IPPROTO.TCP) catch {
         try stdout.print("error: could not create socket\n", .{});
         return;
     };
-    defer std.posix.close(fd);
+    defer posix.close(fd);
 
-    ring.connect_timeout(fd, &addr.any, addr.getOsSockLen(), 5) catch {
+    posix.connect(fd, &addr.any, addr.getOsSockLen()) catch {
         try stdout.print("error: could not connect to daemon\n", .{});
         return;
     };
@@ -580,14 +580,14 @@ fn doPost(
     try request.appendSlice(allocator, "Connection: close\r\n\r\n");
     try request.appendSlice(allocator, body);
 
-    ring.send_all(fd, request.items) catch {
+    sendAll(fd, request.items) catch {
         try stdout.print("error: failed to send request\n", .{});
         return;
     };
 
     // Read response
     var response_buf: [8192]u8 = undefined;
-    const n = ring.recv(fd, &response_buf) catch {
+    const n = posix.read(fd, &response_buf) catch {
         try stdout.print("error: failed to read response\n", .{});
         return;
     };

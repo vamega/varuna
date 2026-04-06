@@ -624,7 +624,7 @@ pub const SessionManager = struct {
 
     fn ensureTrackerExecutor(self: *SessionManager) !*TrackerExecutor {
         if (self.tracker_executor == null) {
-            self.tracker_executor = try TrackerExecutor.create(self.allocator);
+            self.tracker_executor = try TrackerExecutor.create(self.allocator, .{});
         }
         return self.tracker_executor.?;
     }
@@ -1598,8 +1598,8 @@ pub const SessionManager = struct {
 
 test "session manager add and list" {
     // This test needs io_uring for PieceStore, so skip if unavailable
-    const Ring = @import("../io/ring.zig").Ring;
-    _ = Ring.init(4) catch return error.SkipZigTest;
+    var ring = std.os.linux.IoUring.init(4, 0) catch return error.SkipZigTest;
+    ring.deinit();
 }
 
 test "checkTorrentShareLimit ratio enforcement" {

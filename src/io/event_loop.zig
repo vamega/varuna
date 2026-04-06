@@ -14,6 +14,7 @@ const socket_util = @import("../net/socket.zig");
 const utp_mod = @import("../net/utp.zig");
 const utp_mgr = @import("../net/utp_manager.zig");
 const mse = @import("../crypto/mse.zig");
+const ring_mod = @import("ring.zig");
 const SuperSeedState = @import("super_seed.zig").SuperSeedState;
 const HugePageCache = @import("../storage/huge_page_cache.zig").HugePageCache;
 const MerkleCache = @import("../torrent/merkle_cache.zig").MerkleCache;
@@ -31,16 +32,6 @@ pub const max_peers: u16 = 4096;
 const TorrentIdType = u32;
 pub const TorrentId = TorrentIdType;
 const cqe_batch_size = 64;
-
-/// Create an io_uring with performance optimization flags when the kernel supports them.
-/// Falls back to plain init(entries, 0) on older kernels.
-fn initIoUring(entries: u16) !linux.IoUring {
-    // COOP_TASKRUN (5.18): cooperative task work, avoids IPI interrupts
-    // SINGLE_ISSUER (6.0): skip internal locking for single-threaded submitters
-    const optimized_flags: u32 = linux.IORING_SETUP_COOP_TASKRUN | linux.IORING_SETUP_SINGLE_ISSUER;
-    return linux.IoUring.init(entries, optimized_flags) catch
-        linux.IoUring.init(entries, 0);
-}
 
 // ── User data encoding ────────────────────────────────────
 
@@ -765,9 +756,7 @@ pub const EventLoop = struct {
     announce_jitter_secs: i32 = 0, // random jitter applied to this torrent's interval
     min_peers_for_reannounce: u16 = 20, // re-announce when below this
     // Background announce thread state: announce runs on a background thread
-    // with its own io_uring ring to avoid blocking the main event loop.
-    // The ring is created once and reused across announces.
-    announce_ring: ?@import("ring.zig").Ring = null,
+    // to avoid blocking the main event loop.
     announcing: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
     // Peers discovered by the background announce thread, picked up by the
     // main thread on the next tick. Protected by announce_mutex.
@@ -810,7 +799,7 @@ pub const EventLoop = struct {
             null;
 
         return .{
-            .ring = try initIoUring(256),
+            .ring = try ring_mod.initIoUring(256, linux.IORING_SETUP_COOP_TASKRUN | linux.IORING_SETUP_SINGLE_ISSUER),
             .allocator = allocator,
             .peers = peers,
             .torrents = try std.ArrayList(?TorrentContext).initCapacity(allocator, default_torrent_capacity),
@@ -850,7 +839,7 @@ pub const EventLoop = struct {
             null;
 
         var el = EventLoop{
-            .ring = try initIoUring(256),
+            .ring = try ring_mod.initIoUring(256, linux.IORING_SETUP_COOP_TASKRUN | linux.IORING_SETUP_SINGLE_ISSUER),
             .allocator = allocator,
             .peers = peers,
             .torrents = try std.ArrayList(?TorrentContext).initCapacity(allocator, default_torrent_capacity),
@@ -1014,8 +1003,6 @@ pub const EventLoop = struct {
         self.active_torrent_ids.deinit(self.allocator);
         self.info_hash_to_torrent.deinit();
         self.mse_req2_to_hash.deinit();
-        // Clean up shared announce ring (created once, reused across announces)
-        if (self.announce_ring) |*r| r.deinit();
         if (self.announce_result_peers) |peers| self.allocator.free(peers);
         // Clean up uTP resources
         if (self.utp_manager) |mgr| self.allocator.destroy(mgr);

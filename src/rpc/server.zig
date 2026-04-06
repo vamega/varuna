@@ -1,7 +1,7 @@
 const std = @import("std");
 const posix = std.posix;
 const linux = std.os.linux;
-const Ring = @import("../io/ring.zig").Ring;
+const ring_mod = @import("../io/ring.zig");
 const socket_util = @import("../net/socket.zig");
 const auth = @import("auth.zig");
 
@@ -15,7 +15,7 @@ pub const response_header_inline_size = header_buf_size;
 /// HTTP API server running entirely on io_uring.
 /// Accept, recv, parse, route, send -- all via SQEs, no blocking I/O.
 pub const ApiServer = struct {
-    ring: Ring,
+    ring: linux.IoUring,
     allocator: std.mem.Allocator,
     listen_fd: posix.fd_t = -1,
     clients: [max_api_clients]ApiClient = [_]ApiClient{.{}} ** max_api_clients,
@@ -32,14 +32,14 @@ pub const ApiServer = struct {
     /// deinit() will close it.
     pub fn initWithFd(allocator: std.mem.Allocator, listen_fd: posix.fd_t) !ApiServer {
         return .{
-            .ring = try Ring.init(64),
+            .ring = try linux.IoUring.init(64, 0),
             .allocator = allocator,
             .listen_fd = listen_fd,
         };
     }
 
     pub fn initWithDevice(allocator: std.mem.Allocator, bind_addr: []const u8, port: u16, bind_device: ?[]const u8) !ApiServer {
-        const ring = try Ring.init(64);
+        const ring = try linux.IoUring.init(64, 0);
         errdefer {
             var r = ring;
             r.deinit();
@@ -99,10 +99,10 @@ pub const ApiServer = struct {
         try self.submitAccept();
 
         while (self.running) {
-            _ = try self.ring.inner.submit_and_wait(1);
+            _ = try self.ring.submit_and_wait(1);
 
             var cqes: [32]linux.io_uring_cqe = undefined;
-            const count = try self.ring.inner.copy_cqes(&cqes, 0);
+            const count = try self.ring.copy_cqes(&cqes, 0);
 
             for (cqes[0..count]) |cqe| {
                 self.dispatch(cqe);
@@ -113,10 +113,10 @@ pub const ApiServer = struct {
     /// Process one batch of CQEs. Non-blocking if no CQEs ready.
     /// Returns true if any CQEs were processed.
     pub fn poll(self: *ApiServer) !bool {
-        _ = try self.ring.inner.submit();
+        _ = try self.ring.submit();
 
         var cqes: [32]linux.io_uring_cqe = undefined;
-        const count = try self.ring.inner.copy_cqes(&cqes, 0);
+        const count = try self.ring.copy_cqes(&cqes, 0);
 
         for (cqes[0..count]) |cqe| {
             self.dispatch(cqe);
@@ -160,7 +160,7 @@ pub const ApiServer = struct {
         const new_fd: posix.fd_t = @intCast(cqe.res);
 
         const slot = self.allocClientSlot() orelse {
-            _ = self.ring.inner.close(0, new_fd) catch {};
+            _ = self.ring.close(0, new_fd) catch {};
             if (!more) self.submitAccept() catch {};
             return;
         };
@@ -227,7 +227,7 @@ pub const ApiServer = struct {
 
     pub fn submitAccept(self: *ApiServer) !void {
         const ud = encodeUd(0, 0, OP_ACCEPT);
-        _ = try self.ring.inner.accept_multishot(ud, self.listen_fd, null, null, posix.SOCK.CLOEXEC);
+        _ = try self.ring.accept_multishot(ud, self.listen_fd, null, null, posix.SOCK.CLOEXEC);
     }
 
     fn submitRecv(self: *ApiServer, slot: u8) !void {
@@ -235,7 +235,7 @@ pub const ApiServer = struct {
         if (client.fd < 0) return error.InvalidClientSlot;
         const ud = encodeUd(slot, self.client_generations[slot], OP_RECV);
         const storage = recvStorage(client);
-        _ = try self.ring.inner.recv(ud, client.fd, .{ .buffer = storage[client.recv_offset..] }, 0);
+        _ = try self.ring.recv(ud, client.fd, .{ .buffer = storage[client.recv_offset..] }, 0);
     }
 
     fn submitSend(self: *ApiServer, slot: u8) !void {
@@ -269,7 +269,7 @@ pub const ApiServer = struct {
             .flags = 0,
         };
         const ud = encodeUd(slot, self.client_generations[slot], OP_SEND);
-        _ = try self.ring.inner.sendmsg(ud, client.fd, &client.send_msg, 0);
+        _ = try self.ring.sendmsg(ud, client.fd, &client.send_msg, 0);
     }
 
     fn sendResponse(self: *ApiServer, slot: u8, response: Response) void {
@@ -383,7 +383,7 @@ pub const ApiServer = struct {
         const client = &self.clients[slot];
         var retained_recv_buf: ?[]u8 = null;
         if (client.fd >= 0) {
-            _ = self.ring.inner.close(0, client.fd) catch {};
+            _ = self.ring.close(0, client.fd) catch {};
             client.fd = -1;
         }
         if (client.recv_buf) |buf| {

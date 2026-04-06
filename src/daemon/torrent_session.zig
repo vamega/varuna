@@ -3,8 +3,6 @@ const posix = std.posix;
 const session_mod = @import("../torrent/session.zig");
 const storage = @import("../storage/root.zig");
 const tracker = @import("../tracker/root.zig");
-const Ring = @import("../io/ring.zig").Ring;
-const HttpClient = @import("../io/http.zig").HttpClient;
 const EventLoop = @import("../io/event_loop.zig").EventLoop;
 const PieceTracker = @import("../torrent/piece_tracker.zig").PieceTracker;
 const file_priority = @import("../torrent/file_priority.zig");
@@ -186,7 +184,6 @@ pub const TorrentSession = struct {
     session: ?session_mod.Session = null,
     piece_tracker: ?PieceTracker = null,
     store: ?storage.writer.PieceStore = null,
-    ring: ?Ring = null,
     shared_fds: ?[]posix.fd_t = null,
     shared_event_loop: ?*EventLoop = null,
     tracker_executor: ?*TrackerExecutor = null,
@@ -761,13 +758,10 @@ pub const TorrentSession = struct {
             // state transitions. Fall through to normal download path.
         }
 
-        const ring = try Ring.init(16);
-        self.ring = ring;
-
         const session = try session_mod.Session.load(self.allocator, self.torrent_bytes, self.save_path);
         self.session = session;
 
-        const store = try storage.writer.PieceStore.init(self.allocator, &self.session.?, &self.ring.?);
+        const store = try storage.writer.PieceStore.init(self.allocator, &self.session.?);
         self.store = store;
 
         // Open resume DB and load known-complete pieces (fast path: skip rehash)
@@ -992,10 +986,6 @@ pub const TorrentSession = struct {
             s.deinit(self.allocator);
             self.session = null;
         }
-        if (self.ring) |*r| {
-            r.deinit();
-            self.ring = null;
-        }
         self.torrent_id_in_shared = null;
         self.pending_seed_setup = false;
     }
@@ -1069,15 +1059,10 @@ pub const TorrentSession = struct {
         return true;
     }
 
-    fn performTrackerAnnounce(
-        self: *TorrentSession,
-        ring: *Ring,
-        http_client: *HttpClient,
-        event: ?tracker.announce.Request.Event,
-    ) void {
-        const session = &(self.session orelse return);
-        const announce_url = session.metainfo.announce orelse return;
-        const request: tracker.announce.Request = .{
+    fn makeAnnounceRequest(self: *TorrentSession, event: ?tracker.announce.Request.Event) ?tracker.announce.Request {
+        const session = &(self.session orelse return null);
+        const announce_url = session.metainfo.announce orelse return null;
+        return .{
             .announce_url = announce_url,
             .info_hash = session.metainfo.info_hash,
             .peer_id = self.peer_id,
@@ -1087,36 +1072,79 @@ pub const TorrentSession = struct {
             .key = self.tracker_key,
             .info_hash_v2 = self.info_hash_v2,
         };
+    }
 
-        if (tracker.announce.fetchAutoWithHttpClient(self.allocator, ring, http_client, request)) |resp| {
-            tracker.announce.freeResponse(self.allocator, resp);
-        } else |_| {}
+    fn getTrackerHost(self: *TorrentSession) ?[]const u8 {
+        const session = &(self.session orelse return null);
+        const url = session.metainfo.announce orelse return null;
+        return (@import("../io/http.zig").parseUrl(url) catch return null).host;
+    }
+
+    fn submitTrackerJob(self: *TorrentSession, url: []const u8, host: []const u8, on_complete: TrackerExecutor.CompletionFn) !void {
+        const executor = self.tracker_executor orelse return error.MissingTrackerExecutor;
+        if (url.len > 2048) return error.UrlTooLong;
+        if (host.len > 253) return error.HostNameTooLong;
+
+        var job = TrackerExecutor.Job{
+            .context = @ptrCast(self),
+            .on_complete = on_complete,
+            .url_len = @intCast(url.len),
+            .host_len = @intCast(host.len),
+        };
+        @memcpy(job.url[0..url.len], url);
+        @memcpy(job.host[0..host.len], host);
+        try executor.submit(job);
     }
 
     pub fn scheduleCompletedAnnounce(self: *TorrentSession) !void {
-        const executor = self.tracker_executor orelse return error.MissingTrackerExecutor;
+        const request = self.makeAnnounceRequest(.completed) orelse return;
+        const host = self.getTrackerHost() orelse return;
         if (self.announcing.swap(true, .acq_rel)) return;
         errdefer self.announcing.store(false, .release);
-        try executor.submit(self, trackerCompletedAnnounceJob);
+
+        const url = try tracker.announce.buildUrl(self.allocator, request);
+        defer self.allocator.free(url);
+        try self.submitTrackerJob(url, host, announceComplete);
     }
 
     pub fn scheduleReannounce(self: *TorrentSession) !void {
-        const executor = self.tracker_executor orelse return error.MissingTrackerExecutor;
+        const request = self.makeAnnounceRequest(null) orelse return;
+        const host = self.getTrackerHost() orelse return;
         if (self.announcing.swap(true, .acq_rel)) return;
         errdefer self.announcing.store(false, .release);
-        try executor.submit(self, trackerReannounceJob);
+
+        const url = try tracker.announce.buildUrl(self.allocator, request);
+        defer self.allocator.free(url);
+        try self.submitTrackerJob(url, host, announceComplete);
     }
 
-    fn trackerCompletedAnnounceJob(context: *anyopaque, ring: *Ring, http_client: *HttpClient) void {
+    fn announceComplete(context: *anyopaque, result: TrackerExecutor.RequestResult) void {
         const self: *TorrentSession = @ptrCast(@alignCast(context));
         defer self.announcing.store(false, .release);
-        self.performTrackerAnnounce(ring, http_client, .completed);
-    }
+        const body = result.body orelse return;
+        const resp = tracker.announce.parseResponse(self.allocator, body) catch return;
+        defer tracker.announce.freeResponse(self.allocator, resp);
 
-    fn trackerReannounceJob(context: *anyopaque, ring: *Ring, http_client: *HttpClient) void {
-        const self: *TorrentSession = @ptrCast(@alignCast(context));
-        defer self.announcing.store(false, .release);
-        self.performTrackerAnnounce(ring, http_client, null);
+        const el = self.shared_event_loop orelse return;
+
+        // Update the announce interval on the event loop.
+        if (resp.interval > 0) {
+            el.announce_interval = resp.interval;
+        }
+
+        // Collect peer addresses for the event loop to pick up.
+        if (resp.peers.len == 0) return;
+        const addrs = self.allocator.alloc(std.net.Address, resp.peers.len) catch return;
+        for (resp.peers, 0..) |peer, i| {
+            addrs[i] = peer.address;
+        }
+
+        // Store peers for the event loop's checkReannounce to pick up.
+        el.announce_mutex.lock();
+        defer el.announce_mutex.unlock();
+        if (el.announce_result_peers) |old| self.allocator.free(old);
+        el.announce_result_peers = addrs;
+        el.announce_results_ready.store(true, .release);
     }
 
     /// Trigger a background scrape if enough time has passed (30 minutes).
@@ -1138,29 +1166,24 @@ pub const TorrentSession = struct {
     }
 
     fn scheduleScrape(self: *TorrentSession) !void {
-        const executor = self.tracker_executor orelse return error.MissingTrackerExecutor;
-        try executor.submit(self, trackerScrapeJob);
-    }
-
-    fn performScrape(self: *TorrentSession, ring: *Ring, http_client: *HttpClient) void {
-        const session = &(self.session orelse return);
+        const session = &(self.session orelse return error.MissingSession);
         const announce_url = session.metainfo.announce orelse return;
+        const host = self.getTrackerHost() orelse return;
 
-        if (tracker.scrape.scrapeAutoWithHttpClient(
-            self.allocator,
-            ring,
-            http_client,
-            announce_url,
-            session.metainfo.info_hash,
-        )) |result| {
-            self.scrape_result = result;
-        } else |_| {}
+        const scrape_url = try tracker.scrape.buildScrapeUrl(self.allocator, announce_url, session.metainfo.info_hash);
+        defer self.allocator.free(scrape_url);
+        try self.submitTrackerJob(scrape_url, host, scrapeComplete);
     }
 
-    fn trackerScrapeJob(context: *anyopaque, ring: *Ring, http_client: *HttpClient) void {
+    fn scrapeComplete(context: *anyopaque, result: TrackerExecutor.RequestResult) void {
         const self: *TorrentSession = @ptrCast(@alignCast(context));
         defer self.scraping.store(false, .release);
-        self.performScrape(ring, http_client);
+        if (result.body) |body| {
+            const session = &(self.session orelse return);
+            if (tracker.scrape.parseScrapeResponse(self.allocator, body, session.metainfo.info_hash)) |scrape_result| {
+                self.scrape_result = scrape_result;
+            } else |_| {}
+        }
     }
 
     // ── Magnet metadata fetching (BEP 9) ────────────────────
@@ -1173,9 +1196,6 @@ pub const TorrentSession = struct {
         const log = std.log.scoped(.metadata_fetch);
 
         self.state = .metadata_fetching;
-
-        var ring = try Ring.init(16);
-        defer ring.deinit();
 
         // Get tracker URLs from magnet link
         const tracker_urls = self.magnet_trackers orelse {
@@ -1196,7 +1216,7 @@ pub const TorrentSession = struct {
         // Announce to all trackers to collect peers
         self.metadata_fetch_progress = .{ .state = .announcing };
         for (tracker_urls) |url| {
-            const resp = tracker.announce.fetchAuto(self.allocator, &ring, .{
+            const resp = tracker.announce.fetchAuto(self.allocator, .{
                 .announce_url = url,
                 .info_hash = self.info_hash,
                 .peer_id = self.peer_id,

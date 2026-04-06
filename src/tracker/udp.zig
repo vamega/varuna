@@ -1,17 +1,15 @@
 const std = @import("std");
 const posix = std.posix;
-const Ring = @import("../io/ring.zig").Ring;
 const announce_mod = @import("announce.zig");
 
 /// UDP tracker protocol (BEP 15).
-/// All I/O via io_uring sendmsg/recvmsg.
+/// Uses blocking posix I/O -- runs on background threads where blocking is fine.
 const protocol_id: u64 = 0x41727101980; // magic constant
 const action_connect: u32 = 0;
 const action_announce: u32 = 1;
 
 pub fn fetchViaUdp(
     allocator: std.mem.Allocator,
-    ring: *Ring,
     request: announce_mod.Request,
 ) !announce_mod.Response {
     const parsed = parseUdpUrl(request.announce_url) orelse return error.InvalidTrackerUrl;
@@ -20,7 +18,7 @@ pub fn fetchViaUdp(
     const address = try resolveAddress(allocator, parsed.host, parsed.port);
 
     // Create UDP socket
-    const fd = try ring.socket(
+    const fd = try posix.socket(
         address.any.family,
         posix.SOCK.DGRAM | posix.SOCK.CLOEXEC,
         posix.IPPROTO.UDP,
@@ -28,12 +26,11 @@ pub fn fetchViaUdp(
     defer posix.close(fd);
 
     // Set a receive timeout so we don't block forever on lost packets (BEP 15).
-    // Initial timeout is 15 seconds per BEP 15 specification.
     const timeout = posix.timeval{ .sec = 15, .usec = 0 };
     posix.setsockopt(fd, posix.SOL.SOCKET, posix.SO.RCVTIMEO, std.mem.asBytes(&timeout)) catch {};
 
     // Connect the UDP socket (allows send/recv instead of sendto/recvfrom)
-    try ring.connect(fd, &address.any, address.getOsSockLen());
+    try posix.connect(fd, &address.any, address.getOsSockLen());
 
     // Step 1: Connect
     const transaction_id = generateTransactionId();
@@ -51,10 +48,10 @@ pub fn fetchViaUdp(
         const to = posix.timeval{ .sec = timeout_secs, .usec = 0 };
         posix.setsockopt(fd, posix.SOL.SOCKET, posix.SO.RCVTIMEO, std.mem.asBytes(&to)) catch {};
 
-        ring.send_all(fd, &connect_buf) catch continue;
+        sendAll(fd, &connect_buf) catch continue;
 
         var connect_resp: [16]u8 = undefined;
-        const connect_n = ring.recv(fd, &connect_resp) catch continue;
+        const connect_n = posix.recv(fd, &connect_resp, 0) catch continue;
         if (connect_n < 16) continue;
 
         const resp_action = std.mem.readInt(u32, connect_resp[0..4], .big);
@@ -97,8 +94,8 @@ pub fn fetchViaUdp(
         const to = posix.timeval{ .sec = timeout_secs, .usec = 0 };
         posix.setsockopt(fd, posix.SOL.SOCKET, posix.SO.RCVTIMEO, std.mem.asBytes(&to)) catch {};
 
-        ring.send_all(fd, &announce_buf) catch continue;
-        resp_n = ring.recv(fd, &resp_buf) catch continue;
+        sendAll(fd, &announce_buf) catch continue;
+        resp_n = posix.recv(fd, &resp_buf, 0) catch continue;
         if (resp_n >= 20) {
             announce_ok = true;
             break;
@@ -151,23 +148,24 @@ pub fn parseUdpUrl(url: []const u8) ?ParsedUdpUrl {
     else
         return null;
 
-    const path_start = std.mem.indexOfScalar(u8, after_scheme, '/') orelse after_scheme.len;
-    const host_port = after_scheme[0..path_start];
+    // Strip trailing path (e.g., /announce)
+    const host_port = if (std.mem.indexOfScalar(u8, after_scheme, '/')) |slash|
+        after_scheme[0..slash]
+    else
+        after_scheme;
 
+    // Split host:port
     if (std.mem.lastIndexOfScalar(u8, host_port, ':')) |colon| {
-        const port = std.fmt.parseInt(u16, host_port[colon + 1 ..], 10) catch return null;
-        return .{ .host = host_port[0..colon], .port = port };
+        const host = host_port[0..colon];
+        const port = std.fmt.parseUnsigned(u16, host_port[colon + 1 ..], 10) catch return null;
+        return .{ .host = host, .port = port };
     }
 
-    return .{ .host = host_port, .port = 80 };
-}
-
-pub fn resolveAddress(allocator: std.mem.Allocator, host: []const u8, port: u16) !std.net.Address {
-    return @import("../io/dns.zig").resolveOnce(allocator, host, port);
+    return null; // No port
 }
 
 fn eventToInt(event: ?announce_mod.Request.Event) u32 {
-    const ev = event orelse return 0; // none
+    const ev = event orelse return 0;
     return switch (ev) {
         .completed => 1,
         .started => 2,
@@ -175,10 +173,31 @@ fn eventToInt(event: ?announce_mod.Request.Event) u32 {
     };
 }
 
+fn resolveAddress(allocator: std.mem.Allocator, host: []const u8, port: u16) !std.net.Address {
+    // Try numeric parse first
+    return std.net.Address.resolveIp(host, port) catch {
+        // Fall back to DNS resolution
+        const list = try std.net.getAddressList(allocator, host, port);
+        defer list.deinit();
+        if (list.addrs.len == 0) return error.DnsResolutionFailed;
+        return list.addrs[0];
+    };
+}
+
 fn generateTransactionId() u32 {
     var buf: [4]u8 = undefined;
     std.crypto.random.bytes(&buf);
     return std.mem.readInt(u32, &buf, .big);
+}
+
+/// Send the entire buffer via blocking posix.send, looping on partial writes.
+fn sendAll(fd: posix.fd_t, buffer: []const u8) !void {
+    var total: usize = 0;
+    while (total < buffer.len) {
+        const n = try posix.send(fd, buffer[total..], 0);
+        if (n == 0) return error.ConnectionResetByPeer;
+        total += n;
+    }
 }
 
 // ── Tests ─────────────────────────────────────────────────
@@ -195,6 +214,6 @@ test "parse udp url without path" {
     try std.testing.expectEqual(@as(u16, 1337), parsed.port);
 }
 
-test "reject non-udp url" {
+test "parse non-udp url returns null" {
     try std.testing.expect(parseUdpUrl("http://tracker.example.com:6969") == null);
 }

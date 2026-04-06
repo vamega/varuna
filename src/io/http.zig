@@ -1,15 +1,15 @@
 const std = @import("std");
 const posix = std.posix;
-const Ring = @import("ring.zig").Ring;
+const linux = std.os.linux;
 const DnsResolver = @import("dns.zig").DnsResolver;
 const build_options = @import("build_options");
 const TlsStream = @import("tls.zig").TlsStream;
 
-/// Minimal HTTP/1.1 GET client over io_uring.
+/// Minimal HTTP/1.1 GET client using blocking posix I/O.
 /// Designed for tracker announces: simple GET requests with small responses.
 /// Supports both HTTP and HTTPS (when built with -Dtls=boringssl).
+/// Runs on background threads -- no io_uring dependency.
 pub const HttpClient = struct {
-    ring: *Ring,
     allocator: std.mem.Allocator,
     dns_resolver: ?*DnsResolver = null,
     persistent_plain_http: bool = false,
@@ -26,17 +26,15 @@ pub const HttpClient = struct {
         reusable: bool,
     };
 
-    pub fn init(allocator: std.mem.Allocator, ring: *Ring) HttpClient {
+    pub fn init(allocator: std.mem.Allocator) HttpClient {
         return .{
-            .ring = ring,
             .allocator = allocator,
         };
     }
 
     /// Create an HttpClient with a shared DNS cache.
-    pub fn initWithDns(allocator: std.mem.Allocator, ring: *Ring, dns_resolver: *DnsResolver) HttpClient {
+    pub fn initWithDns(allocator: std.mem.Allocator, dns_resolver: *DnsResolver) HttpClient {
         return .{
-            .ring = ring,
             .allocator = allocator,
             .dns_resolver = dns_resolver,
         };
@@ -44,18 +42,16 @@ pub const HttpClient = struct {
 
     /// Create an HttpClient that keeps plain HTTP tracker connections open and
     /// reuses them across requests. HTTPS still falls back to one-shot sockets.
-    pub fn initPersistent(allocator: std.mem.Allocator, ring: *Ring) HttpClient {
+    pub fn initPersistent(allocator: std.mem.Allocator) HttpClient {
         return .{
-            .ring = ring,
             .allocator = allocator,
             .persistent_plain_http = true,
         };
     }
 
     /// Create a persistent HttpClient with a shared DNS cache.
-    pub fn initPersistentWithDns(allocator: std.mem.Allocator, ring: *Ring, dns_resolver: *DnsResolver) HttpClient {
+    pub fn initPersistentWithDns(allocator: std.mem.Allocator, dns_resolver: *DnsResolver) HttpClient {
         return .{
-            .ring = ring,
             .allocator = allocator,
             .dns_resolver = dns_resolver,
             .persistent_plain_http = true,
@@ -161,16 +157,25 @@ pub const HttpClient = struct {
         else
             try @import("dns.zig").resolveOnce(self.allocator, parsed.host, parsed.port);
 
-        const fd = try self.ring.socket(
+        const fd = try posix.socket(
             address.any.family,
             posix.SOCK.STREAM | posix.SOCK.CLOEXEC,
             posix.IPPROTO.TCP,
         );
         errdefer posix.close(fd);
 
-        self.ring.connect_timeout(fd, &address.any, address.getOsSockLen(), 10) catch |err| {
-            if (err == error.ConnectionTimedOut) return error.ConnectionTimedOut;
-            return err;
+        // Set a 10-second connect timeout via SO_SNDTIMEO
+        const timeout_val = posix.timeval{ .sec = 10, .usec = 0 };
+        posix.setsockopt(fd, posix.SOL.SOCKET, posix.SO.SNDTIMEO, std.mem.asBytes(&timeout_val)) catch {};
+
+        posix.connect(fd, &address.any, address.getOsSockLen()) catch |err| {
+            return switch (err) {
+                error.ConnectionTimedOut => error.ConnectionTimedOut,
+                error.ConnectionRefused => error.ConnectionRefused,
+                error.ConnectionResetByPeer => error.ConnectionResetByPeer,
+                error.NetworkUnreachable => error.NetworkUnreachable,
+                else => err,
+            };
         };
         return fd;
     }
@@ -197,7 +202,7 @@ pub const HttpClient = struct {
             if (keep_alive) "keep-alive" else "close",
         });
 
-        try self.ring.send_all(fd, request_buf.items);
+        try sendAll(fd, request_buf.items);
 
         var response_buf = std.ArrayList(u8).empty;
         errdefer response_buf.deinit(self.allocator);
@@ -205,7 +210,7 @@ pub const HttpClient = struct {
         var recv_buf: [8192]u8 = undefined;
         var saw_close = false;
         while (true) {
-            const n = self.ring.recv(fd, &recv_buf) catch |err| {
+            const n = posix.read(fd, &recv_buf) catch |err| {
                 if (response_buf.items.len > 0 and isRetryableKeepAliveError(err)) {
                     saw_close = true;
                     break;
@@ -302,17 +307,26 @@ pub const HttpClient = struct {
         else
             try @import("dns.zig").resolveOnce(self.allocator, parsed.host, parsed.port);
 
-        // Connect via io_uring
-        const fd = try self.ring.socket(
+        // Connect via posix
+        const fd = try posix.socket(
             address.any.family,
             posix.SOCK.STREAM | posix.SOCK.CLOEXEC,
             posix.IPPROTO.TCP,
         );
         errdefer posix.close(fd);
 
-        self.ring.connect_timeout(fd, &address.any, address.getOsSockLen(), 10) catch |err| {
-            if (err == error.ConnectionTimedOut) return error.ConnectionTimedOut;
-            return err;
+        // Set a 10-second connect timeout via SO_SNDTIMEO
+        const timeout_val = posix.timeval{ .sec = 10, .usec = 0 };
+        posix.setsockopt(fd, posix.SOL.SOCKET, posix.SO.SNDTIMEO, std.mem.asBytes(&timeout_val)) catch {};
+
+        posix.connect(fd, &address.any, address.getOsSockLen()) catch |err| {
+            return switch (err) {
+                error.ConnectionTimedOut => error.ConnectionTimedOut,
+                error.ConnectionRefused => error.ConnectionRefused,
+                error.ConnectionResetByPeer => error.ConnectionResetByPeer,
+                error.NetworkUnreachable => error.NetworkUnreachable,
+                else => err,
+            };
         };
 
         // Initialize TLS
@@ -378,9 +392,8 @@ pub const HttpClient = struct {
 
                     if (result == .want_read) {
                         // Need more data from the server
-                        const n = self.ring.recv(fd, &recv_buf) catch |err| {
-                            if (err == error.ConnectionClosed) return error.TlsHandshakeFailed;
-                            return err;
+                        const n = posix.read(fd, &recv_buf) catch {
+                            return error.TlsHandshakeFailed;
                         };
                         if (n == 0) return error.TlsHandshakeFailed;
                         tls_stream.feedRecv(recv_buf[0..n]) catch return error.TlsHandshakeFailed;
@@ -392,12 +405,12 @@ pub const HttpClient = struct {
         return error.TlsHandshakeFailed;
     }
 
-    /// Flush all pending outbound ciphertext from the TLS stream via io_uring send.
-    fn tlsFlushPending(self: *HttpClient, fd: posix.fd_t, tls_stream: *TlsStream, send_buf: []u8) !void {
+    /// Flush all pending outbound ciphertext from the TLS stream via posix send.
+    fn tlsFlushPending(_: *HttpClient, fd: posix.fd_t, tls_stream: *TlsStream, send_buf: []u8) !void {
         while (true) {
             const n = tls_stream.pendingSend(send_buf) catch return;
             if (n == 0) break;
-            try self.ring.send_all(fd, send_buf[0..n]);
+            try sendAll(fd, send_buf[0..n]);
         }
     }
 
@@ -439,9 +452,9 @@ pub const HttpClient = struct {
             }
 
             // No plaintext available -- need more ciphertext from the network
-            const n = self.ring.recv(fd, &recv_buf) catch |err| {
+            const n = posix.read(fd, &recv_buf) catch {
                 if (response_buf.items.len > 0) break;
-                return err;
+                return error.TlsReadFailed;
             };
             if (n == 0) break; // connection closed
 
@@ -465,6 +478,16 @@ pub const HttpClient = struct {
         return false;
     }
 };
+
+/// Send all data via posix write, handling short writes.
+fn sendAll(fd: posix.fd_t, buffer: []const u8) !void {
+    var total: usize = 0;
+    while (total < buffer.len) {
+        const n = try posix.write(fd, buffer[total..]);
+        if (n == 0) return error.ConnectionClosed;
+        total += n;
+    }
+}
 
 pub const HttpResponse = struct {
     status: u16,
@@ -720,9 +743,6 @@ test "parseUrl invalid port" {
 }
 
 test "http get against local fake server" {
-    var ring = Ring.init(16) catch return error.SkipZigTest;
-    defer ring.deinit();
-
     // Start a fake HTTP server
     var server = try std.net.Address.initIp4(.{ 127, 0, 0, 1 }, 0).listen(.{ .reuse_address = true });
     defer server.deinit();
@@ -748,7 +768,7 @@ test "http get against local fake server" {
     }.run, .{&server});
     defer server_thread.join();
 
-    var client = HttpClient.init(std.testing.allocator, &ring);
+    var client = HttpClient.init(std.testing.allocator);
 
     var url_buf = std.ArrayList(u8).empty;
     defer url_buf.deinit(std.testing.allocator);

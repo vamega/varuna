@@ -3,7 +3,7 @@ const posix = std.posix;
 const linux = std.os.linux;
 const ut_metadata = @import("ut_metadata.zig");
 const ext = @import("extensions.zig");
-const Ring = @import("../io/ring.zig").Ring;
+const peer_wire = @import("peer_wire.zig");
 const Sha1 = @import("../crypto/root.zig").Sha1;
 
 /// BEP 9 resilient metadata fetcher.
@@ -301,9 +301,6 @@ pub const MetadataFetcher = struct {
         const peer = &self.peers.items[peer_idx];
         const addr = peer.address;
 
-        var ring = Ring.init(16) catch return error.RingInitFailed;
-        defer ring.deinit();
-
         // Create socket
         const fd = posix.socket(
             addr.any.family,
@@ -312,11 +309,12 @@ pub const MetadataFetcher = struct {
         ) catch return error.SocketFailed;
         errdefer posix.close(fd);
 
-        // Set receive timeout on socket for per-peer timeout
+        // Set send/receive timeout on socket for per-peer timeout.
+        // SO_SNDTIMEO also governs the blocking connect() timeout on Linux.
         setSocketTimeout(fd, peer_timeout_secs) catch {};
 
-        // Connect with timeout
-        ring.connect_timeout(fd, &addr.any, addr.getOsSockLen(), 5) catch {
+        // Connect (blocking, timeout governed by SO_SNDTIMEO)
+        posix.connect(fd, &addr.any, addr.getOsSockLen()) catch {
             return error.ConnectFailed;
         };
 
@@ -329,11 +327,11 @@ pub const MetadataFetcher = struct {
         @memcpy(handshake[28..48], &self.info_hash);
         @memcpy(handshake[48..68], &self.peer_id);
 
-        ring.send_all(fd, &handshake) catch return error.SendFailed;
+        peer_wire.sendAll(fd, &handshake) catch return error.SendFailed;
 
         // Receive peer handshake
         var peer_handshake: [68]u8 = undefined;
-        ring.recv_exact(fd, &peer_handshake) catch return error.RecvFailed;
+        peer_wire.recvExact(fd, &peer_handshake) catch return error.RecvFailed;
 
         if (peer_handshake[0] != 19 or !std.mem.eql(u8, peer_handshake[1..20], "BitTorrent protocol")) {
             return error.InvalidHandshake;
@@ -352,7 +350,7 @@ pub const MetadataFetcher = struct {
             return error.EncodeFailed;
         defer self.allocator.free(ext_frame);
 
-        ring.send_all(fd, ext_frame) catch return error.SendFailed;
+        peer_wire.sendAll(fd, ext_frame) catch return error.SendFailed;
 
         // Read extension handshake from peer
         var peer_ut_metadata_id: u8 = 0;
@@ -361,14 +359,14 @@ pub const MetadataFetcher = struct {
         var msg_count: u32 = 0;
         while (msg_count < 20) : (msg_count += 1) {
             var len_buf: [4]u8 = undefined;
-            ring.recv_exact(fd, &len_buf) catch return error.RecvFailed;
+            peer_wire.recvExact(fd, &len_buf) catch return error.RecvFailed;
             const msg_len = std.mem.readInt(u32, &len_buf, .big);
             if (msg_len == 0) continue;
             if (msg_len > 1024 * 1024) return error.MessageTooLarge;
 
             const msg_buf = self.allocator.alloc(u8, msg_len) catch return error.OutOfMemory;
             defer self.allocator.free(msg_buf);
-            ring.recv_exact(fd, msg_buf) catch return error.RecvFailed;
+            peer_wire.recvExact(fd, msg_buf) catch return error.RecvFailed;
 
             if (msg_buf[0] == ext.msg_id and msg_buf.len >= 2 and msg_buf[1] == ext.handshake_sub_id) {
                 var result = ext.decodeExtensionHandshake(self.allocator, msg_buf[2..]) catch continue;
@@ -412,21 +410,21 @@ pub const MetadataFetcher = struct {
                 return error.EncodeFailed;
             defer self.allocator.free(req_frame);
 
-            ring.send_all(fd, req_frame) catch return error.SendFailed;
+            peer_wire.sendAll(fd, req_frame) catch return error.SendFailed;
 
             // Wait for response
             var got_response = false;
             var response_attempts: u32 = 0;
             while (!got_response and response_attempts < max_messages_per_exchange) : (response_attempts += 1) {
                 var len_buf: [4]u8 = undefined;
-                ring.recv_exact(fd, &len_buf) catch return error.RecvFailed;
+                peer_wire.recvExact(fd, &len_buf) catch return error.RecvFailed;
                 const msg_len = std.mem.readInt(u32, &len_buf, .big);
                 if (msg_len == 0) continue;
                 if (msg_len > 1024 * 1024) return error.MessageTooLarge;
 
                 const msg_buf = self.allocator.alloc(u8, msg_len) catch return error.OutOfMemory;
                 defer self.allocator.free(msg_buf);
-                ring.recv_exact(fd, msg_buf) catch return error.RecvFailed;
+                peer_wire.recvExact(fd, msg_buf) catch return error.RecvFailed;
 
                 if (msg_buf[0] != ext.msg_id or msg_buf.len < 2) continue;
                 if (msg_buf[1] != ext.local_ut_metadata_id) continue;
@@ -455,7 +453,7 @@ pub const MetadataFetcher = struct {
                         defer self.allocator.free(reject);
                         const reject_frame = ext.serializeExtensionMessage(self.allocator, peer_ut_metadata_id, reject) catch continue;
                         defer self.allocator.free(reject_frame);
-                        ring.send_all(fd, reject_frame) catch {};
+                        peer_wire.sendAll(fd, reject_frame) catch {};
                     },
                 }
             }
@@ -545,7 +543,6 @@ pub const FetchError = error{
     AllPeersExhausted,
     MetadataFetchFailed,
     InfoHashMismatch,
-    RingInitFailed,
     SocketFailed,
     ConnectFailed,
     SendFailed,
