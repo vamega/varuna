@@ -118,13 +118,15 @@ pub fn main() !void {
                 if (dht_db) |d| _ = sqlite.sqlite3_close(d);
                 dht_db = null;
             }
+            // DHT data is ephemeral — trade durability for speed.
+            if (dht_db) |d| {
+                _ = sqlite.sqlite3_exec(d, "PRAGMA synchronous = OFF", null, null, null);
+                _ = sqlite.sqlite3_exec(d, "PRAGMA journal_mode = MEMORY", null, null, null);
+            }
         }
     }
     defer {
-        if (dht_db) |d| {
-            _ = sqlite.sqlite3_exec(d, "PRAGMA wal_checkpoint(TRUNCATE)", null, null, null);
-            _ = sqlite.sqlite3_close(d);
-        }
+        if (dht_db) |d| _ = sqlite.sqlite3_close(d);
     }
 
     if (dht_db) |db| {
