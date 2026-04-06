@@ -3,6 +3,7 @@ const posix = std.posix;
 const linux = std.os.linux;
 
 const c = @cImport({
+    @cInclude("netdb.h");
     @cInclude("ares.h");
 });
 
@@ -224,7 +225,7 @@ pub const DnsResolver = struct {
         self.mutex.unlock();
 
         // Create an epoll instance to wait on c-ares fds
-        const epfd = try posix.epoll_create1(.{ .CLOEXEC = true });
+        const epfd = try posix.epoll_create1(linux.EPOLL.CLOEXEC);
         defer posix.close(epfd);
 
         // Process loop: wait on c-ares fds until done or timeout
@@ -269,9 +270,9 @@ pub const DnsResolver = struct {
                     .events = events,
                     .data = .{ .fd = fd },
                 };
-                posix.epoll_ctl(epfd, .ADD, fd, &ev) catch |err| {
+                posix.epoll_ctl(epfd, linux.EPOLL.CTL_ADD, fd, &ev) catch |err| {
                     if (err == error.FileDescriptorAlreadyPresentInSet) {
-                        posix.epoll_ctl(epfd, .MOD, fd, &ev) catch {};
+                        posix.epoll_ctl(epfd, linux.EPOLL.CTL_MOD, fd, &ev) catch {};
                     }
                 };
                 registered[reg_count] = fd;
@@ -314,7 +315,7 @@ pub const DnsResolver = struct {
 
             // Clean up epoll registrations for next iteration
             for (registered[0..reg_count]) |fd| {
-                posix.epoll_ctl(epfd, .DEL, fd, null) catch {};
+                posix.epoll_ctl(epfd, linux.EPOLL.CTL_DEL, fd, null) catch {};
             }
         }
 
@@ -332,8 +333,8 @@ pub const DnsResolver = struct {
         arg: ?*anyopaque,
         status: c_int,
         _timeouts: c_int,
-        hostent: ?*c.struct_hostent,
-    ) void {
+        hostent: ?*const c.struct_hostent,
+    ) callconv(.c) void {
         _ = _timeouts;
         const result: *QueryResult = @ptrCast(@alignCast(arg));
 
@@ -388,7 +389,7 @@ fn caresGetSock(
     write_fds: *[DnsResolver.max_ares_fds]c.ares_socket_t,
 ) usize {
     var raw_fds: [c.ARES_GETSOCK_MAXNUM]c.ares_socket_t = undefined;
-    const bitmask = c.ares_getsock(channel, &raw_fds, c.ARES_GETSOCK_MAXNUM);
+    const bitmask: c_uint = @bitCast(c.ares_getsock(channel, &raw_fds, c.ARES_GETSOCK_MAXNUM));
 
     var count: usize = 0;
     for (0..c.ARES_GETSOCK_MAXNUM) |i| {
