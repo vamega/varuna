@@ -49,6 +49,9 @@ pub const OpType = enum(u8) {
     cancel = 10,
     utp_recv = 11,
     utp_send = 12,
+    api_accept = 13,
+    api_recv = 14,
+    api_send = 15,
 };
 
 pub const OpData = struct {
@@ -704,6 +707,9 @@ pub const EventLoop = struct {
     // Shares the UDP socket with uTP. Incoming datagrams starting with 'd'
     // (bencode dict) are routed to DHT; others go to uTP.
     dht_engine: ?*@import("../dht/dht.zig").DhtEngine = null,
+
+    // API server (shares the event loop's ring)
+    api_server: ?*@import("../rpc/server.zig").ApiServer = null,
 
     // Complete pieces bitfield (for seeding -- which pieces we can serve)
     complete_pieces: ?*const Bitfield = null,
@@ -1819,6 +1825,9 @@ pub const EventLoop = struct {
             .utp_recv => utp_handler.handleUtpRecv(self, cqe),
             .utp_send => utp_handler.handleUtpSend(self, cqe),
             .http_connect, .http_send, .http_recv, .cancel => {},
+            .api_accept => if (self.api_server) |srv| srv.handleAcceptCqe(cqe),
+            .api_recv => if (self.api_server) |srv| srv.handleRecvCqe(op.slot, op.context, cqe),
+            .api_send => if (self.api_server) |srv| srv.handleSendCqe(op.slot, op.context, cqe),
         }
     }
 

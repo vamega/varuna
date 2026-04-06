@@ -267,12 +267,12 @@ pub fn main() !void {
             }
         }
         socket_activated = true;
-        break :blk varuna.rpc.server.ApiServer.initWithFd(allocator, api_fd) catch |err| {
+        break :blk varuna.rpc.server.ApiServer.initWithFd(allocator, &shared_el.ring, api_fd) catch |err| {
             try stdout.print("failed to init API server with socket activation: {s}\n", .{@errorName(err)});
             try stdout.flush();
             return err;
         };
-    } else varuna.rpc.server.ApiServer.initWithDevice(allocator, cfg.daemon.api_bind, cfg.daemon.api_port, cfg.network.bind_device) catch |err| {
+    } else varuna.rpc.server.ApiServer.initWithDevice(allocator, &shared_el.ring, cfg.daemon.api_bind, cfg.daemon.api_port, cfg.network.bind_device) catch |err| {
         try stdout.print("failed to start API server: {s}\n", .{@errorName(err)});
         try stdout.flush();
         return err;
@@ -293,6 +293,9 @@ pub fn main() !void {
     try stdout.flush();
 
     varuna.daemon.systemd.notifyReady();
+
+    // Wire API server into event loop for CQE dispatch
+    shared_el.api_server = &api_server;
 
     // Submit initial accept
     api_server.submitAccept() catch {};
@@ -316,11 +319,9 @@ pub fn main() !void {
     }
     defer if (listen_fd >= 0 and !peer_socket_activated) std.posix.close(listen_fd);
 
-    // Main loop: tick shared event loop + poll API server
+    // Main loop: tick shared event loop (API CQEs dispatched via shared ring)
     var resume_tick_counter: u32 = 0;
     while (!varuna.io.signal.isShutdownRequested()) {
-        // Poll API server (non-blocking)
-        _ = api_server.poll() catch {};
 
         // Check if any sessions need to be integrated into the event loop
         // (background recheck thread completed, peers ready)

@@ -12,10 +12,12 @@ const retained_recv_buf_limit = 256 * 1024;
 const max_request_size = 4 * 1024 * 1024; // 4 MiB max for torrent uploads
 pub const response_header_inline_size = header_buf_size;
 
-/// HTTP API server running entirely on io_uring.
-/// Accept, recv, parse, route, send -- all via SQEs, no blocking I/O.
+const event_loop_mod = @import("../io/event_loop.zig");
+
+/// HTTP API server running on a shared io_uring ring.
+/// Accept, recv, parse, route, send -- all via SQEs on the event loop's ring.
 pub const ApiServer = struct {
-    ring: linux.IoUring,
+    ring: *linux.IoUring,
     allocator: std.mem.Allocator,
     listen_fd: posix.fd_t = -1,
     clients: [max_api_clients]ApiClient = [_]ApiClient{.{}} ** max_api_clients,
@@ -23,28 +25,21 @@ pub const ApiServer = struct {
     handler: *const fn (std.mem.Allocator, Request) Response = defaultHandler,
     running: bool = true,
 
-    pub fn init(allocator: std.mem.Allocator, bind_addr: []const u8, port: u16) !ApiServer {
-        return initWithDevice(allocator, bind_addr, port, null);
+    pub fn init(allocator: std.mem.Allocator, ring: *linux.IoUring, bind_addr: []const u8, port: u16) !ApiServer {
+        return initWithDevice(allocator, ring, bind_addr, port, null);
     }
 
     /// Create an API server using a pre-existing listen socket (e.g. from
-    /// systemd socket activation). The caller retains ownership of the fd;
-    /// deinit() will close it.
-    pub fn initWithFd(allocator: std.mem.Allocator, listen_fd: posix.fd_t) !ApiServer {
+    /// systemd socket activation). The caller retains ownership of the fd.
+    pub fn initWithFd(allocator: std.mem.Allocator, ring: *linux.IoUring, listen_fd: posix.fd_t) !ApiServer {
         return .{
-            .ring = try linux.IoUring.init(64, 0),
+            .ring = ring,
             .allocator = allocator,
             .listen_fd = listen_fd,
         };
     }
 
-    pub fn initWithDevice(allocator: std.mem.Allocator, bind_addr: []const u8, port: u16, bind_device: ?[]const u8) !ApiServer {
-        const ring = try linux.IoUring.init(64, 0);
-        errdefer {
-            var r = ring;
-            r.deinit();
-        }
-
+    pub fn initWithDevice(allocator: std.mem.Allocator, ring: *linux.IoUring, bind_addr: []const u8, port: u16, bind_device: ?[]const u8) !ApiServer {
         // Create and bind listen socket
         const addr = try std.net.Address.parseIp4(bind_addr, port);
         const fd = try posix.socket(
@@ -86,41 +81,33 @@ pub const ApiServer = struct {
             releaseClientResponse(self, client);
         }
         if (self.listen_fd >= 0) posix.close(self.listen_fd);
-        self.ring.deinit();
+        // Ring is shared, not owned — don't deinit it
     }
 
     pub fn setHandler(self: *ApiServer, handler: *const fn (std.mem.Allocator, Request) Response) void {
         self.handler = handler;
     }
 
-    /// Run the API server event loop. Blocks until stopped.
-    pub fn run(self: *ApiServer) !void {
-        // Submit initial accept
-        try self.submitAccept();
+    // In production, CQEs are dispatched by the event loop via handleAcceptCqe/etc.
+    // The run() and poll() methods below are for standalone use (tests, benchmarks).
 
+    /// Run a standalone event loop. For tests and benchmarks only.
+    pub fn run(self: *ApiServer) !void {
+        try self.submitAccept();
         while (self.running) {
             _ = try self.ring.submit_and_wait(1);
-
             var cqes: [32]linux.io_uring_cqe = undefined;
             const count = try self.ring.copy_cqes(&cqes, 0);
-
-            for (cqes[0..count]) |cqe| {
-                self.dispatch(cqe);
-            }
+            for (cqes[0..count]) |cqe| self.dispatch(cqe);
         }
     }
 
-    /// Process one batch of CQEs. Non-blocking if no CQEs ready.
-    /// Returns true if any CQEs were processed.
+    /// Process one batch of CQEs. Non-blocking. For tests and benchmarks only.
     pub fn poll(self: *ApiServer) !bool {
         _ = try self.ring.submit();
-
         var cqes: [32]linux.io_uring_cqe = undefined;
         const count = try self.ring.copy_cqes(&cqes, 0);
-
-        for (cqes[0..count]) |cqe| {
-            self.dispatch(cqe);
-        }
+        for (cqes[0..count]) |cqe| self.dispatch(cqe);
         return count > 0;
     }
 
@@ -130,25 +117,39 @@ pub const ApiServer = struct {
 
     // ── CQE dispatch ──────────────────────────────────────
 
-    // user_data encoding: bits[63:16] = generation, bits[15:8] = slot, bits[7:0] = op
-    const OP_ACCEPT: u8 = 1;
-    const OP_RECV: u8 = 2;
-    const OP_SEND: u8 = 3;
+    // User data encoding uses the event loop's scheme:
+    //   slot:16 = API client index (0-63)
+    //   op_type:8 = api_accept/api_recv/api_send
+    //   context:40 = generation counter
 
-    fn encodeUd(slot: u8, generation: u32, op: u8) u64 {
-        return (@as(u64, generation) << 16) | (@as(u64, slot) << 8) | op;
+    fn encodeUd(slot: u8, generation: u32, op_type: event_loop_mod.OpType) u64 {
+        return event_loop_mod.encodeUserData(.{
+            .slot = slot,
+            .op_type = op_type,
+            .context = @intCast(generation),
+        });
     }
 
+    /// Dispatch a CQE from the shared event loop. Called by EventLoop.dispatch().
     fn dispatch(self: *ApiServer, cqe: linux.io_uring_cqe) void {
-        const op: u8 = @intCast(cqe.user_data & 0xFF);
-        const slot: u8 = @intCast((cqe.user_data >> 8) & 0xFF);
-        const generation: u32 = @intCast(cqe.user_data >> 16);
-        switch (op) {
-            OP_ACCEPT => self.handleAccept(cqe),
-            OP_RECV => self.handleRecv(slot, generation, cqe),
-            OP_SEND => self.handleSend(slot, generation, cqe),
+        const op = event_loop_mod.decodeUserData(cqe.user_data);
+        switch (op.op_type) {
+            .api_accept => self.handleAccept(cqe),
+            .api_recv => self.handleRecv(@intCast(op.slot), @intCast(op.context), cqe),
+            .api_send => self.handleSend(@intCast(op.slot), @intCast(op.context), cqe),
             else => {},
         }
+    }
+
+    // Public CQE handlers for the event loop's dispatch to call directly.
+    pub fn handleAcceptCqe(self: *ApiServer, cqe: linux.io_uring_cqe) void {
+        self.handleAccept(cqe);
+    }
+    pub fn handleRecvCqe(self: *ApiServer, slot: u16, context: u40, cqe: linux.io_uring_cqe) void {
+        self.handleRecv(@intCast(slot), @intCast(context), cqe);
+    }
+    pub fn handleSendCqe(self: *ApiServer, slot: u16, context: u40, cqe: linux.io_uring_cqe) void {
+        self.handleSend(@intCast(slot), @intCast(context), cqe);
     }
 
     fn handleAccept(self: *ApiServer, cqe: linux.io_uring_cqe) void {
@@ -160,7 +161,7 @@ pub const ApiServer = struct {
         const new_fd: posix.fd_t = @intCast(cqe.res);
 
         const slot = self.allocClientSlot() orelse {
-            _ = self.ring.close(0, new_fd) catch {};
+            posix.close(new_fd);
             if (!more) self.submitAccept() catch {};
             return;
         };
@@ -226,14 +227,14 @@ pub const ApiServer = struct {
     // ── SQE helpers ───────────────────────────────────────
 
     pub fn submitAccept(self: *ApiServer) !void {
-        const ud = encodeUd(0, 0, OP_ACCEPT);
+        const ud = encodeUd(0, 0, .api_accept);
         _ = try self.ring.accept_multishot(ud, self.listen_fd, null, null, posix.SOCK.CLOEXEC);
     }
 
     fn submitRecv(self: *ApiServer, slot: u8) !void {
         const client = &self.clients[slot];
         if (client.fd < 0) return error.InvalidClientSlot;
-        const ud = encodeUd(slot, self.client_generations[slot], OP_RECV);
+        const ud = encodeUd(slot, self.client_generations[slot], .api_recv);
         const storage = recvStorage(client);
         _ = try self.ring.recv(ud, client.fd, .{ .buffer = storage[client.recv_offset..] }, 0);
     }
@@ -268,7 +269,7 @@ pub const ApiServer = struct {
             .controllen = 0,
             .flags = 0,
         };
-        const ud = encodeUd(slot, self.client_generations[slot], OP_SEND);
+        const ud = encodeUd(slot, self.client_generations[slot], .api_send);
         _ = try self.ring.sendmsg(ud, client.fd, &client.send_msg, 0);
     }
 
@@ -697,12 +698,16 @@ test "parseContentLength returns null when missing" {
 }
 
 test "api server init and deinit" {
-    var server = ApiServer.init(std.testing.allocator, "127.0.0.1", 0) catch return error.SkipZigTest;
+    var test_ring = linux.IoUring.init(64, 0) catch return error.SkipZigTest;
+    defer test_ring.deinit();
+    var server = ApiServer.init(std.testing.allocator, &test_ring, "127.0.0.1", 0) catch return error.SkipZigTest;
     defer server.deinit();
 }
 
 test "api server handles request via io_uring" {
-    var server = ApiServer.init(std.testing.allocator, "127.0.0.1", 0) catch return error.SkipZigTest;
+    var test_ring = linux.IoUring.init(64, 0) catch return error.SkipZigTest;
+    defer test_ring.deinit();
+    var server = ApiServer.init(std.testing.allocator, &test_ring, "127.0.0.1", 0) catch return error.SkipZigTest;
     defer server.deinit();
 
     // Get the actual port
@@ -752,7 +757,9 @@ test "api server handles request via io_uring" {
 }
 
 test "api server keeps HTTP/1.1 connection alive for sequential requests" {
-    var server = ApiServer.init(std.testing.allocator, "127.0.0.1", 0) catch return error.SkipZigTest;
+    var test_ring = linux.IoUring.init(64, 0) catch return error.SkipZigTest;
+    defer test_ring.deinit();
+    var server = ApiServer.init(std.testing.allocator, &test_ring, "127.0.0.1", 0) catch return error.SkipZigTest;
     defer server.deinit();
 
     var addr: posix.sockaddr = undefined;

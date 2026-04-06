@@ -224,7 +224,7 @@ pub const TrackerExecutor = struct {
 
         self.* = .{
             .allocator = allocator,
-            .ring = try linux.IoUring.init(config.max_concurrent * 2 + 8, 0),
+            .ring = try linux.IoUring.init(32, 0), // must be power of 2
             .wake_fd = wake_fd,
             .dns_event_fd = dns_event_fd,
             .pending_jobs = std.ArrayList(Job).empty,
