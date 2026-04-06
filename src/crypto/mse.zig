@@ -393,17 +393,34 @@ pub fn selectCryptoMethod(provide: u32, mode: EncryptionMode) ?u32 {
     };
 }
 
-// ── Synchronous MSE Handshake (blocking Ring I/O) ──────────
+// ── Synchronous MSE Handshake (blocking POSIX I/O) ──────────
 
-const Ring = @import("../io/ring.zig").Ring;
 const posix = std.posix;
+
+/// Send all bytes in `buf` using blocking posix.write, looping on partial writes.
+fn sendAll(fd: posix.fd_t, buf: []const u8) !void {
+    var sent: usize = 0;
+    while (sent < buf.len) {
+        const n = try posix.write(fd, buf[sent..]);
+        sent += n;
+    }
+}
+
+/// Receive exactly `buf.len` bytes using blocking posix.read, looping on partial reads.
+fn recvExact(fd: posix.fd_t, buf: []u8) !void {
+    var received: usize = 0;
+    while (received < buf.len) {
+        const n = try posix.read(fd, buf[received..]);
+        if (n == 0) return error.EndOfStream;
+        received += n;
+    }
+}
 
 /// Perform MSE handshake as the initiator (outbound connection).
 ///
 /// The initiator knows which torrent it wants to connect to, so SKEY = info_hash.
-/// Uses blocking Ring I/O (submit one SQE, wait for CQE).
+/// Uses blocking POSIX I/O (suitable for background threads).
 pub fn handshakeInitiator(
-    ring: *Ring,
     fd: posix.fd_t,
     info_hash: [20]u8,
     mode: EncryptionMode,
@@ -424,11 +441,11 @@ pub fn handshakeInitiator(
     if (pad_a_len > 0) {
         std.crypto.random.bytes(send_buf[dh_key_size .. dh_key_size + pad_a_len]);
     }
-    try ring.send_all(fd, send_buf[0 .. dh_key_size + pad_a_len]);
+    try sendAll(fd, send_buf[0 .. dh_key_size + pad_a_len]);
 
     // Step 3: Receive Yb (96 bytes) -- ignore PadB for now (we scan for req1 hash)
     var peer_public_key: [dh_key_size]u8 = undefined;
-    try ring.recv_exact(fd, &peer_public_key);
+    try recvExact(fd, &peer_public_key);
 
     // Step 4: Compute shared secret S
     const shared_secret = computeSharedSecret(private_key, peer_public_key);
@@ -458,7 +475,7 @@ pub fn handshakeInitiator(
     var hash_msg: [40]u8 = undefined;
     @memcpy(hash_msg[0..20], &req1);
     @memcpy(hash_msg[20..40], &req2_xor_req3);
-    try ring.send_all(fd, &hash_msg);
+    try sendAll(fd, &hash_msg);
 
     // Step 7: Send encrypted: VC + crypto_provide + len(PadC) + PadC + len(IA)
     // IA (Initial Payload) = empty for now; the BT handshake follows after
@@ -484,7 +501,7 @@ pub fn handshakeInitiator(
 
     // Encrypt in-place
     enc_cipher.process(enc_payload, enc_payload);
-    try ring.send_all(fd, enc_payload);
+    try sendAll(fd, enc_payload);
 
     // Step 8: Receive responder's message.
     // After Yb (already consumed), the seeder sends: PadB (plaintext) || ENCRYPT(VC,...).
@@ -497,7 +514,7 @@ pub fn handshakeInitiator(
     var scan_bytes: usize = 0;
     var vc_found = false;
     while (scan_bytes < max_pad_len + 8) {
-        try ring.recv_exact(fd, scan_buf[scan_bytes .. scan_bytes + 1]);
+        try recvExact(fd, scan_buf[scan_bytes .. scan_bytes + 1]);
         scan_bytes += 1;
         if (scan_bytes >= 8) {
             const p = scan_bytes - 8;
@@ -517,7 +534,7 @@ pub fn handshakeInitiator(
 
     // Read crypto_select(4) + len(PadD)(2)
     var cs_buf: [6]u8 = undefined;
-    try ring.recv_exact(fd, &cs_buf);
+    try recvExact(fd, &cs_buf);
     dec_cipher.process(&cs_buf, &cs_buf);
 
     const crypto_select = std.mem.readInt(u32, cs_buf[0..4], .big);
@@ -532,7 +549,7 @@ pub fn handshakeInitiator(
     if (pad_d_len > 0) {
         const pad_d = try allocator.alloc(u8, pad_d_len);
         defer allocator.free(pad_d);
-        try ring.recv_exact(fd, pad_d);
+        try recvExact(fd, pad_d);
         dec_cipher.process(pad_d, pad_d);
     }
 
@@ -561,7 +578,6 @@ pub fn handshakeInitiator(
 /// The responder must identify the torrent from the SKEY hash sent by the initiator.
 /// `known_hashes` is the list of info-hashes we're willing to accept.
 pub fn handshakeResponder(
-    ring: *Ring,
     fd: posix.fd_t,
     known_hashes: []const [20]u8,
     mode: EncryptionMode,
@@ -569,7 +585,7 @@ pub fn handshakeResponder(
 ) !HandshakeResult {
     // Step 1: Receive Ya (96 bytes from the initiator's DH public key)
     var peer_public_key: [dh_key_size]u8 = undefined;
-    try ring.recv_exact(fd, &peer_public_key);
+    try recvExact(fd, &peer_public_key);
 
     // Step 2: Generate our DH keypair
     const private_key = generatePrivateKey();
@@ -585,7 +601,7 @@ pub fn handshakeResponder(
     if (pad_b_len > 0) {
         std.crypto.random.bytes(send_buf[dh_key_size .. dh_key_size + pad_b_len]);
     }
-    try ring.send_all(fd, send_buf[0 .. dh_key_size + pad_b_len]);
+    try sendAll(fd, send_buf[0 .. dh_key_size + pad_b_len]);
 
     // Step 4: Compute shared secret S
     const shared_secret = computeSharedSecret(private_key, peer_public_key);
@@ -609,7 +625,7 @@ pub fn handshakeResponder(
         const remaining = scan_buf.len - scan_len;
         if (remaining == 0) break;
         const to_read = @min(remaining, 64);
-        const n = try ring.recv(fd, scan_buf[scan_len .. scan_len + to_read]);
+        const n = try posix.read(fd, scan_buf[scan_len .. scan_len + to_read]);
         if (n == 0) return error.ConnectionClosed;
         scan_len += n;
 
@@ -640,7 +656,7 @@ pub fn handshakeResponder(
         if (already_have > 0) {
             @memcpy(req2_xor_req3[0..already_have], scan_buf[req1_end..scan_len]);
         }
-        try ring.recv_exact(fd, req2_xor_req3[already_have..]);
+        try recvExact(fd, req2_xor_req3[already_have..]);
     }
 
     // Step 6: Identify the SKEY (info_hash) from the known hashes
@@ -696,7 +712,7 @@ pub fn handshakeResponder(
         if (leftover_len > 0) {
             @memcpy(enc_header[0..leftover_len], leftover[0..leftover_len]);
         }
-        try ring.recv_exact(fd, enc_header[leftover_len..]);
+        try recvExact(fd, enc_header[leftover_len..]);
         leftover_len = 0;
     }
 
@@ -722,7 +738,7 @@ pub fn handshakeResponder(
         if (leftover_len > 0) {
             @memcpy(remaining_buf[0..leftover_len], leftover[0..leftover_len]);
         }
-        try ring.recv_exact(fd, remaining_buf[leftover_len..]);
+        try recvExact(fd, remaining_buf[leftover_len..]);
         leftover_len = 0;
     }
     dec_cipher.process(remaining_buf, remaining_buf);
@@ -733,7 +749,7 @@ pub fn handshakeResponder(
     var initial_payload: ?[]u8 = null;
     if (ia_len > 0) {
         const ia_buf = try allocator.alloc(u8, ia_len);
-        try ring.recv_exact(fd, ia_buf);
+        try recvExact(fd, ia_buf);
         dec_cipher.process(ia_buf, ia_buf);
         initial_payload = ia_buf;
     }
@@ -759,7 +775,7 @@ pub fn handshakeResponder(
     }
 
     enc_cipher.process(resp_buf, resp_buf);
-    try ring.send_all(fd, resp_buf);
+    try sendAll(fd, resp_buf);
 
     // Finalize
     if (crypto_select == crypto_plaintext) {
@@ -1869,10 +1885,6 @@ test "PeerCrypto bidirectional encrypt/decrypt with separate keys" {
 }
 
 test "full MSE handshake via loopback socket pair" {
-    // This test requires io_uring for the Ring
-    var ring = Ring.init(16) catch return error.SkipZigTest;
-    defer ring.deinit();
-
     // Create a socket pair for testing
     const fds = std.posix.socketpair(.{ .domain = .unix, .type = .stream }) catch return error.SkipZigTest;
     defer std.posix.close(fds[0]);
@@ -1953,12 +1965,10 @@ test "threaded full MSE handshake" {
 
     const Responder = struct {
         fn run(fd: posix.fd_t, hash: [20]u8) !void {
-            var ring = try Ring.init(16);
-            defer ring.deinit();
             defer posix.close(fd);
 
             const known = [_][20]u8{hash};
-            var result = try handshakeResponder(&ring, fd, &known, .preferred, std.testing.allocator);
+            var result = try handshakeResponder(fd, &known, .preferred, std.testing.allocator);
             defer result.deinit();
 
             try std.testing.expectEqual(crypto_rc4, result.crypto_method);
@@ -1975,15 +1985,9 @@ test "threaded full MSE handshake" {
 
     // Initiator side
     {
-        var ring = Ring.init(16) catch {
-            posix.close(fds[0]);
-            responder_thread.join();
-            return error.SkipZigTest;
-        };
-        defer ring.deinit();
         defer posix.close(fds[0]);
 
-        var result = handshakeInitiator(&ring, fds[0], info_hash, .preferred, std.testing.allocator) catch |err| {
+        var result = handshakeInitiator(fds[0], info_hash, .preferred, std.testing.allocator) catch |err| {
             log.err("initiator handshake failed: {s}", .{@errorName(err)});
             responder_thread.join();
             return err;
@@ -2005,13 +2009,11 @@ test "threaded MSE handshake with plaintext fallback" {
 
     const Responder = struct {
         fn run(fd: posix.fd_t, hash: [20]u8) !void {
-            var ring = try Ring.init(16);
-            defer ring.deinit();
             defer posix.close(fd);
 
             const known = [_][20]u8{hash};
             // Responder only allows plaintext
-            var result = try handshakeResponder(&ring, fd, &known, .disabled, std.testing.allocator);
+            var result = try handshakeResponder(fd, &known, .disabled, std.testing.allocator);
             defer result.deinit();
 
             try std.testing.expectEqual(crypto_plaintext, result.crypto_method);
@@ -2027,16 +2029,10 @@ test "threaded MSE handshake with plaintext fallback" {
     };
 
     {
-        var ring = Ring.init(16) catch {
-            posix.close(fds[0]);
-            responder_thread.join();
-            return error.SkipZigTest;
-        };
-        defer ring.deinit();
         defer posix.close(fds[0]);
 
         // Initiator allows both
-        var result = handshakeInitiator(&ring, fds[0], info_hash, .enabled, std.testing.allocator) catch |err| {
+        var result = handshakeInitiator(fds[0], info_hash, .enabled, std.testing.allocator) catch |err| {
             log.err("initiator handshake failed: {s}", .{@errorName(err)});
             responder_thread.join();
             return err;

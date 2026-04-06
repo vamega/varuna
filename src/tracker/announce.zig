@@ -73,48 +73,42 @@ pub fn fetch(
 }
 
 /// Fetch tracker announce, auto-selecting HTTP or UDP based on URL scheme.
-/// All I/O goes through io_uring. When a DnsResolver is provided, DNS
-/// results are cached across requests.
+/// When a DnsResolver is provided, DNS results are cached across requests.
 pub fn fetchAuto(
     allocator: std.mem.Allocator,
-    ring: *@import("../io/ring.zig").Ring,
     request: Request,
 ) !Response {
-    return fetchAutoWithDns(allocator, ring, null, request);
+    return fetchAutoWithDns(allocator, null, request);
 }
 
 /// Fetch tracker announce with an optional shared DNS cache.
 pub fn fetchAutoWithDns(
     allocator: std.mem.Allocator,
-    ring: *@import("../io/ring.zig").Ring,
     dns_resolver: ?*@import("../io/dns.zig").DnsResolver,
     request: Request,
 ) !Response {
     if (std.mem.startsWith(u8, request.announce_url, "udp://")) {
-        return @import("udp.zig").fetchViaUdp(allocator, ring, request);
+        return @import("udp.zig").fetchViaUdp(allocator, request);
     }
-    return fetchViaRing(allocator, ring, dns_resolver, request);
+    return fetchViaHttp(allocator, dns_resolver, request);
 }
 
 /// Fetch tracker announce using a caller-owned HTTP client. This allows a
 /// shared executor to reuse DNS state and keep-alive connections across jobs.
 pub fn fetchAutoWithHttpClient(
     allocator: std.mem.Allocator,
-    ring: *@import("../io/ring.zig").Ring,
     http_client: *@import("../io/http.zig").HttpClient,
     request: Request,
 ) !Response {
     if (std.mem.startsWith(u8, request.announce_url, "udp://")) {
-        return @import("udp.zig").fetchViaUdp(allocator, ring, request);
+        return @import("udp.zig").fetchViaUdp(allocator, request);
     }
     return fetchViaHttpClient(allocator, http_client, request);
 }
 
-/// Fetch tracker announce using our io_uring-based HTTP client.
-/// This replaces the std.http.Client path -- all I/O goes through io_uring.
-pub fn fetchViaRing(
+/// Fetch tracker announce using the posix-based HTTP client.
+pub fn fetchViaHttp(
     allocator: std.mem.Allocator,
-    ring: *@import("../io/ring.zig").Ring,
     dns_resolver: ?*@import("../io/dns.zig").DnsResolver,
     request: Request,
 ) !Response {
@@ -123,9 +117,9 @@ pub fn fetchViaRing(
 
     const http_mod = @import("../io/http.zig");
     var http_client = if (dns_resolver) |r|
-        http_mod.HttpClient.initWithDns(allocator, ring, r)
+        http_mod.HttpClient.initWithDns(allocator, r)
     else
-        http_mod.HttpClient.init(allocator, ring);
+        http_mod.HttpClient.init(allocator);
     var http_response = try http_client.get(url);
     defer http_response.deinit();
 

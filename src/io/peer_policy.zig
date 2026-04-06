@@ -710,12 +710,6 @@ pub fn checkReannounce(self: *EventLoop) void {
     // Already announcing -- skip
     if (self.announcing.load(.acquire)) return;
 
-    // Lazily create the shared announce ring (reused across announces)
-    if (self.announce_ring == null) {
-        const RingType = @import("ring.zig").Ring;
-        self.announce_ring = RingType.init(16) catch return;
-    }
-
     const tc = self.getTorrentContext(0) orelse return;
     const pt = tc.piece_tracker orelse return;
 
@@ -740,8 +734,7 @@ pub fn checkReannounce(self: *EventLoop) void {
     self.announce_thread = thread;
 }
 
-/// Background thread for tracker re-announce. Uses the shared announce_ring
-/// (separate from the main event loop ring) for blocking HTTP I/O.
+/// Background thread for tracker re-announce. Uses blocking posix I/O.
 /// Results are stored in announce_result_peers and picked up on the next tick.
 fn announceWorkerThread(
     self: *EventLoop,
@@ -753,9 +746,8 @@ fn announceWorkerThread(
 ) void {
     defer self.announcing.store(false, .release);
 
-    const ring = &(self.announce_ring orelse return);
     const tracker_mod = @import("../tracker/root.zig");
-    const response = tracker_mod.announce.fetchAuto(self.allocator, ring, .{
+    const response = tracker_mod.announce.fetchAuto(self.allocator, .{
         .announce_url = url,
         .info_hash = info_hash,
         .peer_id = peer_id,

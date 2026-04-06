@@ -1,6 +1,5 @@
 const std = @import("std");
 const announce = @import("announce.zig");
-const Ring = @import("../io/ring.zig").Ring;
 
 /// Result of a parallel multi-tracker announce. The first successful response
 /// wins; all other in-flight announces are ignored. Returns the winning
@@ -11,8 +10,8 @@ pub const MultiAnnounceResult = struct {
 };
 
 /// Announce to all tracker URLs simultaneously. Each URL gets its own
-/// background thread with a dedicated io_uring ring. The first tracker
-/// to return a successful response with peers wins.
+/// background thread. The first tracker to return a successful response
+/// with peers wins.
 ///
 /// Caller must free the response via announce.freeResponse().
 pub fn announceParallel(
@@ -23,11 +22,9 @@ pub fn announceParallel(
     if (urls.len == 0) return error.NoTrackerUrls;
     if (urls.len == 1) {
         // Optimization: single URL, no need for threading overhead
-        var ring = try Ring.init(16);
-        defer ring.deinit();
         var req = base_request;
         req.announce_url = urls[0];
-        const resp = try announce.fetchAuto(allocator, &ring, req);
+        const resp = try announce.fetchAuto(allocator, req);
         return .{ .response = resp, .url_index = 0 };
     }
 
@@ -82,13 +79,10 @@ fn announceWorker(
     // Early exit if another thread already won
     if (shared.winner_set.load(.acquire)) return;
 
-    var ring = Ring.init(16) catch return;
-    defer ring.deinit();
-
     var req = base_request;
     req.announce_url = url;
 
-    const resp = announce.fetchAuto(allocator, &ring, req) catch return;
+    const resp = announce.fetchAuto(allocator, req) catch return;
 
     // Only accept responses with peers
     if (resp.peers.len == 0) {

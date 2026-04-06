@@ -1,7 +1,23 @@
 const std = @import("std");
 const posix = std.posix;
-const Ring = @import("../io/ring.zig").Ring;
 const extensions = @import("extensions.zig");
+
+pub fn sendAll(fd: posix.fd_t, buf: []const u8) !void {
+    var sent: usize = 0;
+    while (sent < buf.len) {
+        const n = try posix.write(fd, buf[sent..]);
+        sent += n;
+    }
+}
+
+pub fn recvExact(fd: posix.fd_t, buf: []u8) !void {
+    var received: usize = 0;
+    while (received < buf.len) {
+        const n = try posix.read(fd, buf[received..]);
+        if (n == 0) return error.EndOfStream;
+        received += n;
+    }
+}
 
 pub const protocol_string = "BitTorrent protocol";
 pub const protocol_length: u8 = protocol_string.len;
@@ -56,24 +72,23 @@ pub fn serializeHandshake(info_hash: [20]u8, peer_id: [20]u8) [68]u8 {
 }
 
 pub fn writeHandshake(
-    ring: *Ring,
     fd: posix.fd_t,
     info_hash: [20]u8,
     peer_id: [20]u8,
 ) !void {
     var buffer = serializeHandshake(info_hash, peer_id);
-    try ring.send_all(fd, &buffer);
+    try sendAll(fd, &buffer);
 }
 
-pub fn readHandshake(ring: *Ring, fd: posix.fd_t) !Handshake {
+pub fn readHandshake(fd: posix.fd_t) !Handshake {
     var length_buffer: [1]u8 = undefined;
-    try ring.recv_exact(fd, &length_buffer);
+    try recvExact(fd, &length_buffer);
     if (length_buffer[0] != protocol_length) {
         return error.InvalidHandshakeProtocol;
     }
 
     var buffer: [67]u8 = undefined;
-    try ring.recv_exact(fd, &buffer);
+    try recvExact(fd, &buffer);
 
     if (!std.mem.eql(u8, buffer[0..protocol_string.len], protocol_string)) {
         return error.InvalidHandshakeProtocol;
@@ -95,11 +110,10 @@ pub fn readHandshake(ring: *Ring, fd: posix.fd_t) !Handshake {
 
 pub fn readMessageAlloc(
     allocator: std.mem.Allocator,
-    ring: *Ring,
     fd: posix.fd_t,
 ) !InboundMessage {
     var length_buffer: [4]u8 = undefined;
-    try ring.recv_exact(fd, &length_buffer);
+    try recvExact(fd, &length_buffer);
     const length = std.mem.readInt(u32, &length_buffer, .big);
     if (length == 0) {
         return .keep_alive;
@@ -109,7 +123,7 @@ pub fn readMessageAlloc(
     }
 
     var id_buffer: [1]u8 = undefined;
-    try ring.recv_exact(fd, &id_buffer);
+    try recvExact(fd, &id_buffer);
     const id = id_buffer[0];
     const payload_length = length - 1;
 
@@ -118,14 +132,14 @@ pub fn readMessageAlloc(
         1 => expectEmptyPayload(payload_length, .unchoke),
         2 => expectEmptyPayload(payload_length, .interested),
         3 => expectEmptyPayload(payload_length, .not_interested),
-        4 => .{ .have = try readU32Payload(ring, fd, payload_length) },
-        5 => .{ .bitfield = try readAllocatedPayload(allocator, ring, fd, payload_length) },
-        6 => .{ .request = try readRequest(ring, fd, payload_length) },
-        7 => .{ .piece = try readPiece(allocator, ring, fd, payload_length) },
-        8 => .{ .cancel = try readRequest(ring, fd, payload_length) },
-        9 => .{ .port = try readU16Payload(ring, fd, payload_length) },
+        4 => .{ .have = try readU32Payload(fd, payload_length) },
+        5 => .{ .bitfield = try readAllocatedPayload(allocator, fd, payload_length) },
+        6 => .{ .request = try readRequest(fd, payload_length) },
+        7 => .{ .piece = try readPiece(allocator, fd, payload_length) },
+        8 => .{ .cancel = try readRequest(fd, payload_length) },
+        9 => .{ .port = try readU16Payload(fd, payload_length) },
         else => {
-            try discardPayload(ring, fd, payload_length);
+            try discardPayload(fd, payload_length);
             return error.UnsupportedPeerMessage;
         },
     };
@@ -179,46 +193,45 @@ pub fn serializePieceHeader(piece_index: u32, block_offset: u32, block_len: usiz
     return header;
 }
 
-pub fn writeKeepAlive(ring: *Ring, fd: posix.fd_t) !void {
-    try ring.send_all(fd, &keepalive_bytes);
+pub fn writeKeepAlive(fd: posix.fd_t) !void {
+    try sendAll(fd, &keepalive_bytes);
 }
 
-pub fn writeInterested(ring: *Ring, fd: posix.fd_t) !void {
-    try writeMessageWithPayload(ring, fd, 2, &.{});
+pub fn writeInterested(fd: posix.fd_t) !void {
+    try writeMessageWithPayload(fd, 2, &.{});
 }
 
-pub fn writeNotInterested(ring: *Ring, fd: posix.fd_t) !void {
-    try writeMessageWithPayload(ring, fd, 3, &.{});
+pub fn writeNotInterested(fd: posix.fd_t) !void {
+    try writeMessageWithPayload(fd, 3, &.{});
 }
 
-pub fn writeUnchoke(ring: *Ring, fd: posix.fd_t) !void {
-    try writeMessageWithPayload(ring, fd, 1, &.{});
+pub fn writeUnchoke(fd: posix.fd_t) !void {
+    try writeMessageWithPayload(fd, 1, &.{});
 }
 
-pub fn writeBitfield(ring: *Ring, fd: posix.fd_t, bitfield: []const u8) !void {
-    try writeMessageWithPayload(ring, fd, 5, bitfield);
+pub fn writeBitfield(fd: posix.fd_t, bitfield: []const u8) !void {
+    try writeMessageWithPayload(fd, 5, bitfield);
 }
 
-pub fn writeHave(ring: *Ring, fd: posix.fd_t, piece_index: u32) !void {
+pub fn writeHave(fd: posix.fd_t, piece_index: u32) !void {
     var buf = serializeHave(piece_index);
-    try ring.send_all(fd, &buf);
+    try sendAll(fd, &buf);
 }
 
-pub fn writeRequest(ring: *Ring, fd: posix.fd_t, request: Request) !void {
+pub fn writeRequest(fd: posix.fd_t, request: Request) !void {
     var buf = serializeRequest(request);
-    try ring.send_all(fd, &buf);
+    try sendAll(fd, &buf);
 }
 
 pub fn writePiece(
-    ring: *Ring,
     fd: posix.fd_t,
     piece_index: u32,
     block_offset: u32,
     block: []const u8,
 ) !void {
     var header = try serializePieceHeader(piece_index, block_offset, block.len);
-    try ring.send_all(fd, &header);
-    try ring.send_all(fd, block);
+    try sendAll(fd, &header);
+    try sendAll(fd, block);
 }
 
 fn expectEmptyPayload(payload_length: u32, message: InboundMessage) !InboundMessage {
@@ -228,13 +241,13 @@ fn expectEmptyPayload(payload_length: u32, message: InboundMessage) !InboundMess
     return message;
 }
 
-fn readRequest(ring: *Ring, fd: posix.fd_t, payload_length: u32) !Request {
+fn readRequest(fd: posix.fd_t, payload_length: u32) !Request {
     if (payload_length != 12) {
         return error.InvalidMessageLength;
     }
 
     var payload: [12]u8 = undefined;
-    try ring.recv_exact(fd, &payload);
+    try recvExact(fd, &payload);
     return .{
         .piece_index = std.mem.readInt(u32, payload[0..4], .big),
         .block_offset = std.mem.readInt(u32, payload[4..8], .big),
@@ -244,7 +257,6 @@ fn readRequest(ring: *Ring, fd: posix.fd_t, payload_length: u32) !Request {
 
 fn readPiece(
     allocator: std.mem.Allocator,
-    ring: *Ring,
     fd: posix.fd_t,
     payload_length: u32,
 ) !Piece {
@@ -252,7 +264,7 @@ fn readPiece(
         return error.InvalidMessageLength;
     }
 
-    const payload = try readAllocatedPayload(allocator, ring, fd, payload_length);
+    const payload = try readAllocatedPayload(allocator, fd, payload_length);
     errdefer allocator.free(payload);
 
     return .{
@@ -263,58 +275,56 @@ fn readPiece(
     };
 }
 
-fn readU32Payload(ring: *Ring, fd: posix.fd_t, payload_length: u32) !u32 {
+fn readU32Payload(fd: posix.fd_t, payload_length: u32) !u32 {
     if (payload_length != 4) {
         return error.InvalidMessageLength;
     }
 
     var payload: [4]u8 = undefined;
-    try ring.recv_exact(fd, &payload);
+    try recvExact(fd, &payload);
     return std.mem.readInt(u32, &payload, .big);
 }
 
-fn readU16Payload(ring: *Ring, fd: posix.fd_t, payload_length: u32) !u16 {
+fn readU16Payload(fd: posix.fd_t, payload_length: u32) !u16 {
     if (payload_length != 2) {
         return error.InvalidMessageLength;
     }
 
     var payload: [2]u8 = undefined;
-    try ring.recv_exact(fd, &payload);
+    try recvExact(fd, &payload);
     return std.mem.readInt(u16, &payload, .big);
 }
 
 fn readAllocatedPayload(
     allocator: std.mem.Allocator,
-    ring: *Ring,
     fd: posix.fd_t,
     payload_length: u32,
 ) ![]u8 {
     const payload = try allocator.alloc(u8, payload_length);
     errdefer allocator.free(payload);
-    try ring.recv_exact(fd, payload);
+    try recvExact(fd, payload);
     return payload;
 }
 
-fn discardPayload(ring: *Ring, fd: posix.fd_t, payload_length: u32) !void {
+fn discardPayload(fd: posix.fd_t, payload_length: u32) !void {
     var remaining = payload_length;
     var buffer: [256]u8 = undefined;
 
     while (remaining > 0) {
         const chunk_length = @min(buffer.len, remaining);
-        try ring.recv_exact(fd, buffer[0..chunk_length]);
+        try recvExact(fd, buffer[0..chunk_length]);
         remaining -= @intCast(chunk_length);
     }
 }
 
 fn writeMessageWithPayload(
-    ring: *Ring,
     fd: posix.fd_t,
     id: u8,
     payload: []const u8,
 ) !void {
     var header = serializeHeader(id, payload);
-    try ring.send_all(fd, &header);
-    try ring.send_all(fd, payload);
+    try sendAll(fd, &header);
+    try sendAll(fd, payload);
 }
 
 // ── Tests ────────────────────────────────────────────────────

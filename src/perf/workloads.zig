@@ -15,7 +15,7 @@ const sync_mod = varuna.rpc.sync;
 const event_loop_mod = varuna.io.event_loop;
 const peer_handler = varuna.io.peer_handler;
 const http_mod = varuna.io.http;
-const Ring = varuna.io.ring.Ring;
+const IoUring = linux.IoUring;
 const mse_mod = varuna.crypto.mse;
 const tracker_announce = varuna.tracker.announce;
 const SessionManager = varuna.daemon.session_manager.SessionManager;
@@ -528,7 +528,7 @@ fn runSeedSendCopyBurst(
     iterations: usize,
     config: Config,
 ) !Result {
-    var ring = try Ring.init(64);
+    var ring = try IoUring.init(64, 0);
     defer ring.deinit();
 
     const pair = try createLoopbackTcpPair();
@@ -567,9 +567,9 @@ fn runSeedSendCopyBurst(
             offset += 13 + block_len;
         }
 
-        _ = try ring.inner.send(1, pair.sender_fd, send_buf, 0);
-        _ = try ring.inner.submit_and_wait(1);
-        const cqe = try ring.inner.copy_cqe();
+        _ = try ring.send(1, pair.sender_fd, send_buf, 0);
+        _ = try ring.submit_and_wait(1);
+        const cqe = try ring.copy_cqe();
         if (cqe.res < 0) return error.SeedCopySendFailed;
         if (@as(usize, @intCast(cqe.res)) != total_len) return error.PartialSeedCopySend;
 
@@ -586,7 +586,7 @@ fn runSeedSendmsgBurst(
     iterations: usize,
     config: Config,
 ) !Result {
-    var ring = try Ring.init(64);
+    var ring = try IoUring.init(64, 0);
     defer ring.deinit();
 
     const pair = try createLoopbackTcpPair();
@@ -643,9 +643,9 @@ fn runSeedSendmsgBurst(
             .flags = 0,
         };
 
-        _ = try ring.inner.sendmsg(1, pair.sender_fd, &msg, 0);
-        _ = try ring.inner.submit_and_wait(1);
-        const cqe = try ring.inner.copy_cqe();
+        _ = try ring.sendmsg(1, pair.sender_fd, &msg, 0);
+        _ = try ring.submit_and_wait(1);
+        const cqe = try ring.copy_cqe();
         if (cqe.res < 0) return error.SendmsgFailed;
         if (@as(usize, @intCast(cqe.res)) != total_len) return error.PartialSeedSendmsg;
 
@@ -662,7 +662,7 @@ fn runSeedSpliceBurst(
     iterations: usize,
     config: Config,
 ) !Result {
-    var ring = try Ring.init(64);
+    var ring = try IoUring.init(64, 0);
     defer ring.deinit();
 
     const pair = try createLoopbackTcpPair();
@@ -707,22 +707,22 @@ fn runSeedSpliceBurst(
             std.mem.writeInt(u32, header[5..9], @intCast(iter & 0xffff), .big);
             std.mem.writeInt(u32, header[9..13], @intCast(idx * block_len), .big);
 
-            _ = try ring.inner.send(10, pair.sender_fd, header[0..], 0);
-            _ = try ring.inner.submit_and_wait(1);
-            const header_cqe = try ring.inner.copy_cqe();
+            _ = try ring.send(10, pair.sender_fd, header[0..], 0);
+            _ = try ring.submit_and_wait(1);
+            const header_cqe = try ring.copy_cqe();
             if (header_cqe.res < 0) return error.SpliceHeaderSendFailed;
             if (header_cqe.res != header.len) return error.PartialSpliceHeader;
 
             const file_offset = idx * block_len;
-            _ = try ring.inner.splice(11, temp.file.handle, file_offset, pipe_fds[1], std.math.maxInt(u64), block_len);
-            _ = try ring.inner.submit_and_wait(1);
-            const in_cqe = try ring.inner.copy_cqe();
+            _ = try ring.splice(11, temp.file.handle, file_offset, pipe_fds[1], std.math.maxInt(u64), block_len);
+            _ = try ring.submit_and_wait(1);
+            const in_cqe = try ring.copy_cqe();
             if (in_cqe.res < 0) return error.SpliceFileToPipeFailed;
             if (in_cqe.res != block_len) return error.PartialSpliceFileToPipe;
 
-            _ = try ring.inner.splice(12, pipe_fds[0], std.math.maxInt(u64), pair.sender_fd, std.math.maxInt(u64), block_len);
-            _ = try ring.inner.submit_and_wait(1);
-            const out_cqe = try ring.inner.copy_cqe();
+            _ = try ring.splice(12, pipe_fds[0], std.math.maxInt(u64), pair.sender_fd, std.math.maxInt(u64), block_len);
+            _ = try ring.submit_and_wait(1);
+            const out_cqe = try ring.copy_cqe();
             if (out_cqe.res < 0) return error.SplicePipeToSocketFailed;
             if (out_cqe.res != block_len) return error.PartialSplicePipeToSocket;
         }
@@ -1160,9 +1160,6 @@ fn runTrackerHttpSeries(
         server_thread.join();
     }
 
-    var ring = try Ring.init(32);
-    defer ring.deinit();
-
     const url = try std.fmt.allocPrint(allocator, "http://127.0.0.1:{}/announce?info_hash=abc", .{port});
     defer allocator.free(url);
 
@@ -1173,7 +1170,7 @@ fn runTrackerHttpSeries(
 
     switch (mode) {
         .fresh => {
-            var client = http_mod.HttpClient.init(allocator, &ring);
+            var client = http_mod.HttpClient.init(allocator);
             for (0..iterations) |_| {
                 var response = try client.get(url);
                 checksum +%= response.status;
@@ -1233,9 +1230,6 @@ fn runTrackerAnnounceFresh(
         server_thread.join();
     }
 
-    var ring = try Ring.init(32);
-    defer ring.deinit();
-
     const request = try makeTrackerAnnounceRequest(allocator, port);
     defer allocator.free(request.announce_url);
 
@@ -1245,7 +1239,7 @@ fn runTrackerAnnounceFresh(
     var checksum: u64 = 0;
 
     for (0..iterations) |_| {
-        const response = try tracker_announce.fetchAutoWithDns(allocator, &ring, null, request);
+        const response = try tracker_announce.fetchAutoWithDns(allocator, null, request);
         defer tracker_announce.freeResponse(allocator, response);
         checksum +%= response.interval;
         checksum +%= response.peers.len;
@@ -1281,7 +1275,7 @@ fn runTrackerAnnounceExecutor(
         server_thread.join();
     }
 
-    const executor = try TrackerExecutor.create(allocator);
+    const executor = try TrackerExecutor.create(allocator, .{});
     defer executor.destroy();
 
     std.Thread.sleep(10 * std.time.ns_per_ms);
@@ -1292,11 +1286,23 @@ fn runTrackerAnnounceExecutor(
     };
     defer allocator.free(state.request.announce_url);
 
+    const url = try tracker_announce.buildUrl(allocator, state.request);
+    defer allocator.free(url);
+    const parsed = try http_mod.parseUrl(url);
+
     alloc_counter.stats = .{};
     var timer = try std.time.Timer.start();
 
     for (0..iterations) |_| {
-        try executor.submit(&state, trackerExecutorBenchJob);
+        var job = TrackerExecutor.Job{
+            .context = @ptrCast(&state),
+            .on_complete = trackerExecutorBenchCallback,
+            .url_len = @intCast(url.len),
+            .host_len = @intCast(parsed.host.len),
+        };
+        @memcpy(job.url[0..url.len], url);
+        @memcpy(job.host[0..parsed.host.len], parsed.host);
+        try executor.submit(job);
     }
 
     state.mutex.lock();
@@ -1309,25 +1315,28 @@ fn runTrackerAnnounceExecutor(
     return makeResult("tracker_announce_executor", iterations, &timer, checksum, alloc_counter);
 }
 
-fn trackerExecutorBenchJob(context: *anyopaque, ring: *Ring, http_client: *http_mod.HttpClient) void {
+fn trackerExecutorBenchCallback(context: *anyopaque, result: TrackerExecutor.RequestResult) void {
     const state: *TrackerExecutorBenchState = @ptrCast(@alignCast(context));
 
-    if (tracker_announce.fetchAutoWithHttpClient(state.allocator, ring, http_client, state.request)) |response| {
-        defer tracker_announce.freeResponse(state.allocator, response);
+    if (result.body) |body| {
+        if (tracker_announce.parseResponse(state.allocator, body)) |response| {
+            defer tracker_announce.freeResponse(state.allocator, response);
 
-        state.mutex.lock();
-        state.completed += 1;
-        state.checksum +%= response.interval;
-        state.checksum +%= response.peers.len;
-        state.cond.signal();
-        state.mutex.unlock();
-    } else |_| {
-        state.mutex.lock();
-        state.completed += 1;
-        state.failures += 1;
-        state.cond.signal();
-        state.mutex.unlock();
+            state.mutex.lock();
+            state.completed += 1;
+            state.checksum +%= response.interval;
+            state.checksum +%= response.peers.len;
+            state.cond.signal();
+            state.mutex.unlock();
+            return;
+        } else |_| {}
     }
+
+    state.mutex.lock();
+    state.completed += 1;
+    state.failures += 1;
+    state.cond.signal();
+    state.mutex.unlock();
 }
 
 fn createLoopbackListener() !posix.fd_t {

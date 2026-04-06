@@ -148,17 +148,13 @@ fn runVerify(
     target_root: []const u8,
     writer: *std.Io.Writer,
 ) !void {
-    const Ring = @import("io/ring.zig").Ring;
-    var ring = try Ring.init(16);
-    defer ring.deinit();
-
     const torrent_bytes = try std.fs.cwd().readFileAlloc(allocator, torrent_path, 16 * 1024 * 1024);
     defer allocator.free(torrent_bytes);
 
     const session = try torrent.session.Session.load(allocator, torrent_bytes, target_root);
     defer session.deinit(allocator);
 
-    var store = try @import("storage/root.zig").writer.PieceStore.init(allocator, &session, &ring);
+    var store = try @import("storage/root.zig").writer.PieceStore.init(allocator, &session);
     defer store.deinit();
 
     var recheck = try @import("storage/root.zig").verify.recheckExistingData(allocator, &session, &store, null);

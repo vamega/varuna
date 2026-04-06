@@ -1,6 +1,5 @@
 const std = @import("std");
 const bencode = @import("../torrent/bencode.zig");
-const Ring = @import("../io/ring.zig").Ring;
 const udp_mod = @import("udp.zig");
 
 /// Tracker scrape result: swarm statistics for a single info_hash.
@@ -38,7 +37,7 @@ pub fn deriveScrapeUrl(allocator: std.mem.Allocator, announce_url: []const u8) !
 }
 
 /// Build the full scrape request URL with the info_hash query parameter.
-fn buildScrapeUrl(allocator: std.mem.Allocator, announce_url: []const u8, info_hash: [20]u8) ![]u8 {
+pub fn buildScrapeUrl(allocator: std.mem.Allocator, announce_url: []const u8, info_hash: [20]u8) ![]u8 {
     const base = try deriveScrapeUrl(allocator, announce_url) orelse return error.ScrapeNotSupported;
     defer allocator.free(base);
 
@@ -53,20 +52,18 @@ fn buildScrapeUrl(allocator: std.mem.Allocator, announce_url: []const u8, info_h
     return url.toOwnedSlice(allocator);
 }
 
-/// Perform an HTTP scrape request via the io_uring-based HTTP client.
+/// Perform an HTTP scrape request via the posix-based HTTP client.
 pub fn scrapeHttp(
     allocator: std.mem.Allocator,
-    ring: *Ring,
     announce_url: []const u8,
     info_hash: [20]u8,
 ) !ScrapeResult {
-    return scrapeHttpWithDns(allocator, ring, null, announce_url, info_hash);
+    return scrapeHttpWithDns(allocator, null, announce_url, info_hash);
 }
 
 /// Perform an HTTP scrape with an optional shared DNS cache.
 pub fn scrapeHttpWithDns(
     allocator: std.mem.Allocator,
-    ring: *Ring,
     dns_resolver: ?*@import("../io/dns.zig").DnsResolver,
     announce_url: []const u8,
     info_hash: [20]u8,
@@ -76,9 +73,9 @@ pub fn scrapeHttpWithDns(
 
     const http_mod = @import("../io/http.zig");
     var http_client = if (dns_resolver) |r|
-        http_mod.HttpClient.initWithDns(allocator, ring, r)
+        http_mod.HttpClient.initWithDns(allocator, r)
     else
-        http_mod.HttpClient.init(allocator, ring);
+        http_mod.HttpClient.init(allocator);
     var http_response = try http_client.get(url);
     defer http_response.deinit();
 
@@ -108,10 +105,10 @@ pub fn scrapeHttpWithClient(
     return parseScrapeResponse(allocator, http_response.body, info_hash);
 }
 
-/// Perform a UDP scrape request (BEP 15, action=2) via io_uring.
+/// Perform a UDP scrape request (BEP 15, action=2) via blocking posix I/O.
+/// Runs on background threads where blocking is fine.
 pub fn scrapeUdp(
     allocator: std.mem.Allocator,
-    ring: *Ring,
     announce_url: []const u8,
     info_hash: [20]u8,
 ) !ScrapeResult {
@@ -120,14 +117,14 @@ pub fn scrapeUdp(
 
     const address = try udp_mod.resolveAddress(allocator, parsed.host, parsed.port);
 
-    const fd = try ring.socket(
+    const fd = try posix.socket(
         address.any.family,
         posix.SOCK.DGRAM | posix.SOCK.CLOEXEC,
         posix.IPPROTO.UDP,
     );
     defer posix.close(fd);
 
-    try ring.connect(fd, &address.any, address.getOsSockLen());
+    try posix.connect(fd, &address.any, address.getOsSockLen());
 
     // Step 1: UDP connect handshake
     const protocol_id: u64 = 0x41727101980;
@@ -140,10 +137,10 @@ pub fn scrapeUdp(
     std.mem.writeInt(u32, connect_buf[8..12], action_connect, .big);
     std.mem.writeInt(u32, connect_buf[12..16], transaction_id, .big);
 
-    try ring.send_all(fd, &connect_buf);
+    try sendAll(fd, &connect_buf);
 
     var connect_resp: [16]u8 = undefined;
-    const connect_n = try ring.recv(fd, &connect_resp);
+    const connect_n = try posix.recv(fd, &connect_resp, 0);
     if (connect_n < 16) return error.InvalidTrackerResponse;
 
     const resp_action = std.mem.readInt(u32, connect_resp[0..4], .big);
@@ -161,11 +158,11 @@ pub fn scrapeUdp(
     std.mem.writeInt(u32, scrape_buf[12..16], scrape_txid, .big);
     @memcpy(scrape_buf[16..36], info_hash[0..]);
 
-    try ring.send_all(fd, &scrape_buf);
+    try sendAll(fd, &scrape_buf);
 
     // Receive scrape response: 8 header + 12 per hash = 20 bytes minimum
     var resp_buf: [128]u8 = undefined;
-    const resp_n = try ring.recv(fd, &resp_buf);
+    const resp_n = try posix.recv(fd, &resp_buf, 0);
     if (resp_n < 20) return error.InvalidTrackerResponse;
 
     const scrape_resp_action = std.mem.readInt(u32, resp_buf[0..4], .big);
@@ -188,43 +185,40 @@ pub fn scrapeUdp(
 /// Scrape a tracker, auto-selecting HTTP or UDP based on the announce URL scheme.
 pub fn scrapeAuto(
     allocator: std.mem.Allocator,
-    ring: *Ring,
     announce_url: []const u8,
     info_hash: [20]u8,
 ) !ScrapeResult {
-    return scrapeAutoWithDns(allocator, ring, null, announce_url, info_hash);
+    return scrapeAutoWithDns(allocator, null, announce_url, info_hash);
 }
 
 /// Scrape a tracker with an optional shared DNS cache.
 pub fn scrapeAutoWithDns(
     allocator: std.mem.Allocator,
-    ring: *Ring,
     dns_resolver: ?*@import("../io/dns.zig").DnsResolver,
     announce_url: []const u8,
     info_hash: [20]u8,
 ) !ScrapeResult {
     if (std.mem.startsWith(u8, announce_url, "udp://")) {
-        return scrapeUdp(allocator, ring, announce_url, info_hash);
+        return scrapeUdp(allocator, announce_url, info_hash);
     }
-    return scrapeHttpWithDns(allocator, ring, dns_resolver, announce_url, info_hash);
+    return scrapeHttpWithDns(allocator, dns_resolver, announce_url, info_hash);
 }
 
 pub fn scrapeAutoWithHttpClient(
     allocator: std.mem.Allocator,
-    ring: *Ring,
     http_client: *@import("../io/http.zig").HttpClient,
     announce_url: []const u8,
     info_hash: [20]u8,
 ) !ScrapeResult {
     if (std.mem.startsWith(u8, announce_url, "udp://")) {
-        return scrapeUdp(allocator, ring, announce_url, info_hash);
+        return scrapeUdp(allocator, announce_url, info_hash);
     }
     return scrapeHttpWithClient(allocator, http_client, announce_url, info_hash);
 }
 
 // ── Response parsing ─────────────────────────────────────
 
-fn parseScrapeResponse(allocator: std.mem.Allocator, input: []const u8, info_hash: [20]u8) !ScrapeResult {
+pub fn parseScrapeResponse(allocator: std.mem.Allocator, input: []const u8, info_hash: [20]u8) !ScrapeResult {
     const root = try bencode.parse(allocator, input);
     defer bencode.freeValue(allocator, root);
 
@@ -305,6 +299,16 @@ fn generateTransactionId() u32 {
     var buf: [4]u8 = undefined;
     std.crypto.random.bytes(&buf);
     return std.mem.readInt(u32, &buf, .big);
+}
+
+/// Send the entire buffer via blocking posix.send, looping on partial writes.
+fn sendAll(fd: std.posix.fd_t, buffer: []const u8) !void {
+    var total: usize = 0;
+    while (total < buffer.len) {
+        const n = try std.posix.send(fd, buffer[total..], 0);
+        if (n == 0) return error.ConnectionResetByPeer;
+        total += n;
+    }
 }
 
 // ── Tests ────────────────────────────────────────────────

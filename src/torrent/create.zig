@@ -1,6 +1,5 @@
 const std = @import("std");
 const Sha1 = @import("../crypto/root.zig").Sha1;
-const Ring = @import("../io/ring.zig").Ring;
 
 pub const CreateOptions = struct {
     announce_url: []const u8,

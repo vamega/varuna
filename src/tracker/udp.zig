@@ -1,17 +1,15 @@
 const std = @import("std");
 const posix = std.posix;
-const Ring = @import("../io/ring.zig").Ring;
 const announce_mod = @import("announce.zig");
 
 /// UDP tracker protocol (BEP 15).
-/// All I/O via io_uring sendmsg/recvmsg.
+/// Uses blocking posix I/O -- runs on background threads where blocking is fine.
 const protocol_id: u64 = 0x41727101980; // magic constant
 const action_connect: u32 = 0;
 const action_announce: u32 = 1;
 
 pub fn fetchViaUdp(
     allocator: std.mem.Allocator,
-    ring: *Ring,
     request: announce_mod.Request,
 ) !announce_mod.Response {
     const parsed = parseUdpUrl(request.announce_url) orelse return error.InvalidTrackerUrl;
@@ -20,7 +18,7 @@ pub fn fetchViaUdp(
     const address = try resolveAddress(allocator, parsed.host, parsed.port);
 
     // Create UDP socket
-    const fd = try ring.socket(
+    const fd = try posix.socket(
         address.any.family,
         posix.SOCK.DGRAM | posix.SOCK.CLOEXEC,
         posix.IPPROTO.UDP,
@@ -28,7 +26,7 @@ pub fn fetchViaUdp(
     defer posix.close(fd);
 
     // Connect the UDP socket (allows send/recv instead of sendto/recvfrom)
-    try ring.connect(fd, &address.any, address.getOsSockLen());
+    try posix.connect(fd, &address.any, address.getOsSockLen());
 
     // Step 1: Connect
     const transaction_id = generateTransactionId();
@@ -37,11 +35,11 @@ pub fn fetchViaUdp(
     std.mem.writeInt(u32, connect_buf[8..12], action_connect, .big);
     std.mem.writeInt(u32, connect_buf[12..16], transaction_id, .big);
 
-    try ring.send_all(fd, &connect_buf);
+    try sendAll(fd, &connect_buf);
 
     // Receive connect response
     var connect_resp: [16]u8 = undefined;
-    const connect_n = try ring.recv(fd, &connect_resp);
+    const connect_n = try posix.recv(fd, &connect_resp, 0);
     if (connect_n < 16) return error.InvalidTrackerResponse;
 
     const resp_action = std.mem.readInt(u32, connect_resp[0..4], .big);
@@ -71,11 +69,11 @@ pub fn fetchViaUdp(
     std.mem.writeInt(i32, announce_buf[92..96], numwant_i32, .big); // numwant
     std.mem.writeInt(u16, announce_buf[96..98], request.port, .big);
 
-    try ring.send_all(fd, &announce_buf);
+    try sendAll(fd, &announce_buf);
 
     // Receive announce response
     var resp_buf: [4096]u8 = undefined;
-    const resp_n = try ring.recv(fd, &resp_buf);
+    const resp_n = try posix.recv(fd, &resp_buf, 0);
     if (resp_n < 20) return error.InvalidTrackerResponse;
 
     const ann_action = std.mem.readInt(u32, resp_buf[0..4], .big);
@@ -150,6 +148,16 @@ fn generateTransactionId() u32 {
     var buf: [4]u8 = undefined;
     std.crypto.random.bytes(&buf);
     return std.mem.readInt(u32, &buf, .big);
+}
+
+/// Send the entire buffer via blocking posix.send, looping on partial writes.
+fn sendAll(fd: posix.fd_t, buffer: []const u8) !void {
+    var total: usize = 0;
+    while (total < buffer.len) {
+        const n = try posix.send(fd, buffer[total..], 0);
+        if (n == 0) return error.ConnectionResetByPeer;
+        total += n;
+    }
 }
 
 // ── Tests ─────────────────────────────────────────────────
