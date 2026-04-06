@@ -92,15 +92,83 @@ pub fn main() !void {
     shared_el.port = cfg.network.port_min;
     shared_el.pex_enabled = cfg.network.pex;
 
+    // Initialize DHT persistence — load node ID and routing table from SQLite.
+    // This reuses the resume DB so DHT state survives daemon restarts.
+    var dht_persist: ?varuna.dht.persistence.DhtPersistence = null;
+    defer if (dht_persist) |*dp| dp.deinit();
+
+    // Open SQLite directly for DHT persistence (reuses the resume DB file)
+    const sqlite = @import("varuna").storage.sqlite3;
+    var dht_db: ?*sqlite.Db = null;
+    if (resume_db_path) |db_path| {
+        const flags = sqlite.SQLITE_OPEN_READWRITE | sqlite.SQLITE_OPEN_CREATE | sqlite.SQLITE_OPEN_FULLMUTEX;
+        if (sqlite.sqlite3_open_v2(db_path, &dht_db, flags, null) != sqlite.SQLITE_OK) {
+            if (dht_db) |d| _ = sqlite.sqlite3_close(d);
+            dht_db = null;
+        }
+    }
+    defer {
+        if (dht_db) |d| {
+            // Checkpoint WAL to ensure saved DHT nodes are durable
+            _ = sqlite.sqlite3_exec(d, "PRAGMA wal_checkpoint(TRUNCATE)", null, null, null);
+            _ = sqlite.sqlite3_close(d);
+        }
+    }
+
+    if (dht_db) |db| {
+        if (varuna.dht.persistence.DhtPersistence.init(db)) |dp| {
+            dht_persist = dp;
+        } else |_| {}
+    }
+
+    const dht_node_id: [20]u8 = blk: {
+        if (dht_persist) |*dp| {
+            if (dp.loadNodeId() catch null) |saved_id| {
+                break :blk saved_id;
+            }
+        }
+        break :blk varuna.dht.node_id.generate();
+    };
+
     const dht_engine: ?*varuna.dht.DhtEngine = if (cfg.network.dht) blk: {
-        const engine = varuna.dht.DhtEngine.create(allocator, varuna.dht.node_id.generate()) catch |err| {
+        const engine = varuna.dht.DhtEngine.create(allocator, dht_node_id) catch |err| {
             try stdout.print("warning: failed to create DHT engine: {s}\n", .{@errorName(err)});
             try stdout.flush();
             break :blk null;
         };
+
+        // Load persisted routing table nodes — skip slow bootstrap if we have enough
+        if (dht_persist) |*dp| {
+            if (dp.loadNodes(allocator)) |saved_nodes| {
+                defer allocator.free(saved_nodes);
+                engine.loadPersistedNodes(saved_nodes);
+                if (saved_nodes.len > 0) {
+                    try stdout.print("dht: loaded {d} persisted nodes\n", .{saved_nodes.len});
+                    try stdout.flush();
+                }
+            } else |_| {}
+        }
+
         break :blk engine;
     } else null;
     defer if (dht_engine) |engine| {
+        // Save routing table on shutdown for fast restart
+        if (dht_persist) |*dp| {
+            if (engine.exportNodes(allocator)) |nodes| {
+                defer allocator.free(nodes);
+                std.log.info("dht: saving {d} nodes to DB", .{nodes.len});
+                dp.saveNodes(nodes) catch |err| {
+                    std.log.err("dht: failed to save nodes: {s}", .{@errorName(err)});
+                };
+                dp.saveNodeId(engine.own_id) catch |err| {
+                    std.log.err("dht: failed to save node ID: {s}", .{@errorName(err)});
+                };
+            } else |err| {
+                std.log.err("dht: failed to export nodes: {s}", .{@errorName(err)});
+            }
+        } else {
+            std.log.warn("dht: no persistence DB, nodes not saved", .{});
+        }
         engine.deinit();
         allocator.destroy(engine);
     };
@@ -119,10 +187,15 @@ pub fn main() !void {
     };
 
     // Resolve bootstrap node hostnames (blocking DNS, after UDP socket is ready).
-    const bootstrap_addrs = varuna.dht.bootstrap.resolveBootstrapNodes(allocator) catch &.{};
+    // Skip if we loaded enough persisted nodes (table already warm).
+    const need_bootstrap = if (dht_engine) |e| e.table.nodeCount() < 8 else false;
+    const bootstrap_addrs = if (need_bootstrap)
+        (varuna.dht.bootstrap.resolveBootstrapNodes(allocator) catch &.{})
+    else
+        &.{};
     defer if (bootstrap_addrs.len > 0) allocator.free(bootstrap_addrs);
     if (dht_engine) |engine| {
-        if (shared_el.dht_engine != null) {
+        if (shared_el.dht_engine != null and bootstrap_addrs.len > 0) {
             engine.addBootstrapNodes(bootstrap_addrs);
         }
     }

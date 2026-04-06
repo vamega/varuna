@@ -86,6 +86,31 @@ pub const DhtEngine = struct {
         peers: []std.net.Address,
     };
 
+    /// Export all nodes from the routing table for persistence.
+    /// Caller owns the returned slice.
+    pub fn exportNodes(self: *const DhtEngine, allocator: std.mem.Allocator) ![]NodeInfo {
+        var nodes = std.ArrayList(NodeInfo).empty;
+        errdefer nodes.deinit(allocator);
+        for (&self.table.buckets) |*bucket| {
+            for (bucket.getNodes()) |node| {
+                try nodes.append(allocator, node);
+            }
+        }
+        return nodes.toOwnedSlice(allocator);
+    }
+
+    /// Seed the routing table from previously persisted nodes.
+    pub fn loadPersistedNodes(self: *DhtEngine, nodes: []const NodeInfo) void {
+        const now = std.time.timestamp();
+        for (nodes) |node| {
+            _ = self.table.addNode(node, now);
+        }
+        // If we loaded enough nodes, skip the slow bootstrap process
+        if (self.table.nodeCount() >= 8) {
+            self.bootstrapped = true;
+        }
+    }
+
     pub fn init(allocator: std.mem.Allocator, own_id: NodeId) DhtEngine {
         return .{
             .allocator = allocator,
