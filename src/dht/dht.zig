@@ -247,6 +247,20 @@ pub const DhtEngine = struct {
     /// Register an info_hash for peer search. The DHT engine will start
     /// get_peers lookups automatically once bootstrapped, and re-query
     /// periodically. Call this before or after the engine is bootstrapped.
+    /// Force an immediate requery for an already-registered info hash.
+    /// Used when a torrent is integrated into the event loop after the
+    /// initial get_peers results were dropped (torrent wasn't registered yet).
+    pub fn forceRequery(self: *DhtEngine, info_hash: [20]u8) void {
+        for (0..self.pending_search_count) |i| {
+            if (std.mem.eql(u8, &self.pending_searches[i], &info_hash)) {
+                self.pending_search_done[i] = false; // triggers immediate search on next tick
+                return;
+            }
+        }
+        // If not found, register it as new
+        self.requestPeers(info_hash);
+    }
+
     pub fn requestPeers(self: *DhtEngine, info_hash: [20]u8) void {
         // Check if already registered
         for (0..self.pending_search_count) |i| {

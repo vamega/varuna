@@ -466,11 +466,13 @@ pub const TorrentSession = struct {
             added += 1;
         }
 
-        // DHT peer discovery: register the info-hash with the DHT engine
-        // for automatic get_peers lookups. Disabled for private torrents (BEP 27).
+        // DHT peer discovery: force an immediate requery now that the torrent
+        // is registered in the event loop (findTorrentIdByInfoHash will work).
+        // Earlier requestPeers calls may have found peers that were silently
+        // dropped because the torrent wasn't integrated yet.
         if (!self.is_private) {
             if (sel.dht_engine) |engine| {
-                engine.requestPeers(self.info_hash);
+                engine.forceRequery(self.info_hash);
             }
         }
 

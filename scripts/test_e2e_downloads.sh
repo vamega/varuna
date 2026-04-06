@@ -36,13 +36,16 @@ cleanup() {
     if [ -n "$DAEMON_PID" ] && kill -0 "$DAEMON_PID" 2>/dev/null; then
         log "stopping daemon (pid $DAEMON_PID)"
         kill "$DAEMON_PID" 2>/dev/null || true
+        sleep 1
+        # Force kill if still alive
+        kill -0 "$DAEMON_PID" 2>/dev/null && kill -9 "$DAEMON_PID" 2>/dev/null || true
         wait "$DAEMON_PID" 2>/dev/null || true
     fi
     if [ -n "$WORK_DIR" ] && [ -d "$WORK_DIR" ]; then
         rm -rf "$WORK_DIR"
     fi
 }
-trap cleanup EXIT
+trap cleanup EXIT INT TERM
 
 start_daemon() {
     WORK_DIR=$(mktemp -d /tmp/varuna-e2e-XXXXXX)
