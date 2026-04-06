@@ -92,24 +92,36 @@ pub fn main() !void {
     shared_el.port = cfg.network.port_min;
     shared_el.pex_enabled = cfg.network.pex;
 
-    // Initialize DHT persistence — load node ID and routing table from SQLite.
-    // This reuses the resume DB so DHT state survives daemon restarts.
+    // Initialize DHT persistence — separate DB file so it can be blown away
+    // independently from torrent resume state.
     var dht_persist: ?varuna.dht.persistence.DhtPersistence = null;
     defer if (dht_persist) |*dp| dp.deinit();
 
-    // Open SQLite directly for DHT persistence (reuses the resume DB file)
     const sqlite = @import("varuna").storage.sqlite3;
     var dht_db: ?*sqlite.Db = null;
-    if (resume_db_path) |db_path| {
-        const flags = sqlite.SQLITE_OPEN_READWRITE | sqlite.SQLITE_OPEN_CREATE | sqlite.SQLITE_OPEN_FULLMUTEX;
-        if (sqlite.sqlite3_open_v2(db_path, &dht_db, flags, null) != sqlite.SQLITE_OK) {
-            if (dht_db) |d| _ = sqlite.sqlite3_close(d);
-            dht_db = null;
+    {
+        // DHT DB lives alongside the resume DB: ~/.local/share/varuna/dht.db
+        var dht_db_buf: [1024]u8 = undefined;
+        const dht_db_path: ?[*:0]const u8 = blk: {
+            const home = std.posix.getenv("HOME") orelse break :blk null;
+            const z = std.fmt.bufPrintZ(&dht_db_buf, "{s}/.local/share/varuna/dht.db", .{home}) catch break :blk null;
+            _ = z;
+            std.fs.makeDirAbsolute(dht_db_buf[0 .. std.mem.lastIndexOfScalar(u8, std.mem.span(@as([*:0]const u8, @ptrCast(&dht_db_buf))), '/') orelse 0]) catch |err| switch (err) {
+                error.PathAlreadyExists => {},
+                else => break :blk null,
+            };
+            break :blk @ptrCast(&dht_db_buf);
+        };
+        if (dht_db_path) |db_path| {
+            const flags = sqlite.SQLITE_OPEN_READWRITE | sqlite.SQLITE_OPEN_CREATE | sqlite.SQLITE_OPEN_FULLMUTEX;
+            if (sqlite.sqlite3_open_v2(db_path, &dht_db, flags, null) != sqlite.SQLITE_OK) {
+                if (dht_db) |d| _ = sqlite.sqlite3_close(d);
+                dht_db = null;
+            }
         }
     }
     defer {
         if (dht_db) |d| {
-            // Checkpoint WAL to ensure saved DHT nodes are durable
             _ = sqlite.sqlite3_exec(d, "PRAGMA wal_checkpoint(TRUNCATE)", null, null, null);
             _ = sqlite.sqlite3_close(d);
         }

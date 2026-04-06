@@ -77,11 +77,16 @@ pub const Lookup = struct {
     /// Returns slices into the candidate array. Caller should send queries
     /// and call markQueried() for each.
     pub fn nextToQuery(self: *Lookup, buf: *[alpha]NodeInfo) u8 {
+        return self.nextToQueryN(buf);
+    }
+
+    /// Like nextToQuery but accepts any buffer size (for bootstrap fan-out).
+    pub fn nextToQueryN(self: *Lookup, buf: []NodeInfo) u8 {
         if (self.state == .done) return 0;
 
         var count: u8 = 0;
         for (0..self.candidate_count) |ci| {
-            if (count >= alpha) break;
+            if (count >= buf.len) break;
             if (self.candidates[ci].state == .pending) {
                 buf[count] = self.candidates[ci].info;
                 self.candidates[ci].state = .queried;

@@ -611,6 +611,37 @@ pub const DhtEngine = struct {
         }
     }
 
+    /// Like sendLookupQueries but sends to ALL candidates (up to K=8),
+    /// not just alpha=3. Used during bootstrap to maximize initial discovery.
+    fn sendLookupQueriesAll(self: *DhtEngine, lookup_idx: usize) void {
+        const lk = &(self.active_lookups[lookup_idx] orelse return);
+
+        // Query all candidates, not just alpha
+        var buf: [routing_table.K]NodeInfo = undefined;
+        const count = lk.nextToQueryN(&buf);
+
+        for (0..count) |i| {
+            const info = buf[i];
+            const txn_id = self.allocTxnId();
+
+            var pkt_buf: [1024]u8 = undefined;
+            const len = switch (lk.kind) {
+                .find_node => krpc.encodeFindNodeQuery(&pkt_buf, txn_id, self.own_id, lk.target) catch continue,
+                .get_peers => krpc.encodeGetPeersQuery(&pkt_buf, txn_id, self.own_id, lk.target) catch continue,
+            };
+
+            self.queueSend(pkt_buf[0..len], info.address);
+            self.addPending(.{
+                .transaction_id = txn_id,
+                .target_id = info.id,
+                .target_addr = info.address,
+                .sent_at = std.time.timestamp(),
+                .lookup_idx = lookup_idx,
+                .method = if (lk.kind == .find_node) .find_node else .get_peers,
+            });
+        }
+    }
+
     fn completeLookup(self: *DhtEngine, idx: usize, now: i64) void {
         const lk = self.active_lookups[idx] orelse return;
 
@@ -666,23 +697,31 @@ pub const DhtEngine = struct {
         self.bootstrap_pending = true;
         _ = now;
 
-        // Send find_node for our own ID to bootstrap nodes.
-        // The actual DNS resolution of bootstrap hostnames should be done
-        // before the event loop starts. Here we just ping any nodes we have.
-        // If the routing table is empty, the event loop integration code
-        // should have seeded us with resolved bootstrap addresses.
+        // Strategy: launch multiple parallel find_node lookups to populate
+        // the routing table as fast as possible.
+        // 1. Find our own ID (populates nearby buckets)
+        // 2. Find a random ID (populates distant buckets)
+        // This doubles the discovery rate vs a single lookup.
 
-        // Do a find_node lookup for our own ID to populate nearby buckets
-        const idx = for (0..max_lookups) |i| {
-            if (self.active_lookups[i] == null) break i;
-        } else return;
+        const targets = [_][20]u8{
+            self.own_id,
+            node_id.generate(), // random target for breadth
+        };
 
-        var lk = Lookup.init(self.own_id, .find_node);
-        lk.seed(&self.table);
+        for (targets) |target| {
+            const idx = for (0..max_lookups) |i| {
+                if (self.active_lookups[i] == null) break i;
+            } else break;
 
-        if (lk.candidate_count > 0) {
-            self.active_lookups[idx] = lk;
-            self.sendLookupQueries(idx);
+            var lk = Lookup.init(target, .find_node);
+            lk.seed(&self.table);
+
+            if (lk.candidate_count > 0) {
+                self.active_lookups[idx] = lk;
+                // Send to ALL candidates during bootstrap (not just alpha=3)
+                // to maximize the number of nodes discovered in parallel.
+                self.sendLookupQueriesAll(idx);
+            }
         }
     }
 
