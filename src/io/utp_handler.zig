@@ -212,6 +212,10 @@ fn checkOutboundUtpConnect(self: *EventLoop, utp_slot: u16, mgr: *utp_mgr.UtpMan
     @memcpy(buf[1 .. 1 + pw.protocol_string.len], pw.protocol_string);
     @memset(buf[20..28], 0);
     buf[20 + ext.reserved_byte] |= ext.reserved_mask;
+    // BEP 52: advertise v2 protocol support for v2/hybrid torrents
+    if (tc.info_hash_v2 != null) {
+        buf[20 + pw.v2_reserved_byte] |= pw.v2_reserved_mask;
+    }
     @memcpy(buf[28..48], &tc.info_hash);
     @memcpy(buf[48..68], &tc.peer_id);
 
@@ -451,6 +455,10 @@ fn processUtpInboundHandshake(self: *EventLoop, peer_slot: u16) void {
     @memcpy(buf[1 .. 1 + pw.protocol_string.len], pw.protocol_string);
     @memset(buf[20..28], 0);
     buf[20 + ext.reserved_byte] |= ext.reserved_mask;
+    // BEP 52: advertise v2 protocol support for v2/hybrid torrents
+    if (tc.info_hash_v2 != null) {
+        buf[20 + pw.v2_reserved_byte] |= pw.v2_reserved_mask;
+    }
     @memcpy(buf[28..48], &tc.info_hash);
     @memcpy(buf[48..68], &tc.peer_id);
 
