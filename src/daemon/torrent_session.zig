@@ -187,6 +187,7 @@ pub const TorrentSession = struct {
     shared_fds: ?[]posix.fd_t = null,
     shared_event_loop: ?*EventLoop = null,
     tracker_executor: ?*TrackerExecutor = null,
+    udp_tracker_executor: ?*@import("udp_tracker_executor.zig").UdpTrackerExecutor = null,
     torrent_id_in_shared: ?@import("../io/event_loop.zig").TorrentId = null,
     pending_peers: ?[]std.net.Address = null, // peers waiting for main thread to add
     pending_seed_setup: bool = false, // signals main thread to set up seed mode
@@ -1098,10 +1099,13 @@ pub const TorrentSession = struct {
 
     pub fn scheduleCompletedAnnounce(self: *TorrentSession) !void {
         const request = self.makeAnnounceRequest(.completed) orelse return;
-        const host = self.getTrackerHost() orelse return;
         if (self.announcing.swap(true, .acq_rel)) return;
         errdefer self.announcing.store(false, .release);
 
+        // Route UDP tracker URLs to the UDP executor
+        if (self.trySubmitUdpAnnounce(request)) return;
+
+        const host = self.getTrackerHost() orelse return;
         const url = try tracker.announce.buildUrl(self.allocator, request);
         defer self.allocator.free(url);
         try self.submitTrackerJob(url, host, announceComplete);
@@ -1109,13 +1113,80 @@ pub const TorrentSession = struct {
 
     pub fn scheduleReannounce(self: *TorrentSession) !void {
         const request = self.makeAnnounceRequest(null) orelse return;
-        const host = self.getTrackerHost() orelse return;
         if (self.announcing.swap(true, .acq_rel)) return;
         errdefer self.announcing.store(false, .release);
 
+        // Route UDP tracker URLs to the UDP executor
+        if (self.trySubmitUdpAnnounce(request)) return;
+
+        const host = self.getTrackerHost() orelse return;
         const url = try tracker.announce.buildUrl(self.allocator, request);
         defer self.allocator.free(url);
         try self.submitTrackerJob(url, host, announceComplete);
+    }
+
+    /// Try to submit an announce via the UDP tracker executor.
+    /// Returns true if the URL was a UDP URL and the job was submitted.
+    fn trySubmitUdpAnnounce(self: *TorrentSession, request: tracker.announce.Request) bool {
+        const udp_mod = @import("../tracker/udp.zig");
+        const UdpTrackerExecutor = @import("udp_tracker_executor.zig").UdpTrackerExecutor;
+
+        const parsed = udp_mod.parseUdpUrl(request.announce_url) orelse return false;
+        const executor = self.udp_tracker_executor orelse return false;
+
+        const key_value: u32 = if (request.key) |k| std.mem.readInt(u32, k[0..4], .big) else udp_mod.generateTransactionId();
+        var job = UdpTrackerExecutor.Job{
+            .context = @ptrCast(self),
+            .on_complete = udpAnnounceComplete,
+            .kind = .announce,
+            .port = parsed.port,
+            .info_hash = request.info_hash,
+            .peer_id = request.peer_id,
+            .downloaded = request.downloaded,
+            .left = request.left,
+            .uploaded = request.uploaded,
+            .event = udp_mod.eventToUdp(request.event),
+            .key = key_value,
+            .num_want = @intCast(@min(request.numwant, std.math.maxInt(i32))),
+            .listen_port = request.port,
+            .host_len = @intCast(parsed.host.len),
+        };
+        @memcpy(job.host[0..parsed.host.len], parsed.host);
+        executor.submit(job) catch return false;
+        return true;
+    }
+
+    fn udpAnnounceComplete(context: *anyopaque, result: @import("udp_tracker_executor.zig").UdpTrackerExecutor.RequestResult) void {
+        const self: *TorrentSession = @ptrCast(@alignCast(context));
+        defer self.announcing.store(false, .release);
+
+        if (result.err) |_| return;
+        const body = result.body orelse return;
+        if (body.len < 20) return;
+
+        const udp_mod = @import("../tracker/udp.zig");
+        const ann_resp = udp_mod.AnnounceResponse.decode(body) catch return;
+        const peers = ann_resp.parsePeers(self.allocator) catch return;
+        defer self.allocator.free(peers);
+
+        const el = self.shared_event_loop orelse return;
+
+        // Update the announce interval on the event loop.
+        if (ann_resp.interval > 0) {
+            el.announce_interval = ann_resp.interval;
+        }
+
+        if (peers.len == 0) return;
+        const addrs = self.allocator.alloc(std.net.Address, peers.len) catch return;
+        for (peers, 0..) |peer, i| {
+            addrs[i] = peer.address;
+        }
+
+        el.announce_mutex.lock();
+        defer el.announce_mutex.unlock();
+        if (el.announce_result_peers) |old| self.allocator.free(old);
+        el.announce_result_peers = addrs;
+        el.announce_results_ready.store(true, .release);
     }
 
     fn announceComplete(context: *anyopaque, result: TrackerExecutor.RequestResult) void {
@@ -1168,11 +1239,53 @@ pub const TorrentSession = struct {
     fn scheduleScrape(self: *TorrentSession) !void {
         const session = &(self.session orelse return error.MissingSession);
         const announce_url = session.metainfo.announce orelse return;
-        const host = self.getTrackerHost() orelse return;
 
+        // Route UDP tracker URLs to the UDP scrape executor
+        if (self.trySubmitUdpScrape(announce_url, session.metainfo.info_hash)) return;
+
+        const host = self.getTrackerHost() orelse return;
         const scrape_url = try tracker.scrape.buildScrapeUrl(self.allocator, announce_url, session.metainfo.info_hash);
         defer self.allocator.free(scrape_url);
         try self.submitTrackerJob(scrape_url, host, scrapeComplete);
+    }
+
+    fn trySubmitUdpScrape(self: *TorrentSession, announce_url: []const u8, info_hash: [20]u8) bool {
+        const udp_mod = @import("../tracker/udp.zig");
+        const UdpTrackerExecutor = @import("udp_tracker_executor.zig").UdpTrackerExecutor;
+
+        const parsed = udp_mod.parseUdpUrl(announce_url) orelse return false;
+        const executor = self.udp_tracker_executor orelse return false;
+
+        var job = UdpTrackerExecutor.Job{
+            .context = @ptrCast(self),
+            .on_complete = udpScrapeComplete,
+            .kind = .scrape,
+            .port = parsed.port,
+            .info_hash = info_hash,
+            .host_len = @intCast(parsed.host.len),
+        };
+        @memcpy(job.host[0..parsed.host.len], parsed.host);
+        executor.submit(job) catch return false;
+        return true;
+    }
+
+    fn udpScrapeComplete(context: *anyopaque, result: @import("udp_tracker_executor.zig").UdpTrackerExecutor.RequestResult) void {
+        const self: *TorrentSession = @ptrCast(@alignCast(context));
+        defer self.scraping.store(false, .release);
+
+        if (result.err) |_| return;
+        const body = result.body orelse return;
+        if (body.len < 20) return;
+
+        const udp_mod = @import("../tracker/udp.zig");
+        const header = udp_mod.ScrapeResponse.decodeHeader(body) catch return;
+        const entry = udp_mod.ScrapeResponse.parseEntry(header.entry_data, 0) catch return;
+
+        self.scrape_result = .{
+            .complete = entry.seeders,
+            .incomplete = entry.leechers,
+            .downloaded = entry.completed,
+        };
     }
 
     fn scrapeComplete(context: *anyopaque, result: TrackerExecutor.RequestResult) void {

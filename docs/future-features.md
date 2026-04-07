@@ -61,12 +61,15 @@ port_max = 6889            # port range end
 
 Implemented in `src/daemon/systemd.zig`. Checks `$LISTEN_FDS` and `$LISTEN_PID` at startup per sd_listen_fds(3). If present, uses fd 3+ instead of creating listen sockets. Supports multiple inherited fds (first for API server, second for peer listener). Sets FD_CLOEXEC on inherited fds. Integrated into daemon startup in `src/main.zig` and `src/rpc/server.zig` (initWithFd).
 
-## 6. UDP tracker support (BEP 15)
+## 6. ~~UDP tracker support (BEP 15)~~ (DONE)
 
-Many real-world trackers are UDP-only. Our HTTP-only tracker client can't reach them. This is a significant gap for real-world usability.
+Implemented in `src/tracker/udp.zig` (protocol encode/decode, blocking client) and `src/daemon/udp_tracker_executor.zig` (io_uring-based async executor).
 
-Protocol: connect (transaction_id exchange) -> announce -> scrape. All UDP datagrams.
-Uses `IORING_OP_SENDMSG` / `IORING_OP_RECVMSG` for io_uring integration.
+- **Protocol layer**: Full BEP 15 packet encode/decode for connect, announce, scrape, and error responses. Transaction ID generation, connection ID caching with 2-minute TTL, compact peer parsing (IPv4 + IPv6).
+- **Blocking client** (`fetchViaUdp`, `scrapeViaUdp`): Used by `varuna-ctl`, multi-announce workers, and metadata fetching. Exponential backoff retries (15 * 2^n seconds, up to 8 retries per BEP 15). Connection ID reuse across announces. Error response handling with automatic re-connect on stale connection IDs.
+- **io_uring executor** (`UdpTrackerExecutor`): Async state machine for the daemon. Uses `IORING_OP_SENDMSG` / `IORING_OP_RECVMSG` on the shared ring. DNS offloaded to background threads. Retransmission timer with BEP 15 exponential backoff. Connection ID cache shared across requests.
+- **Daemon integration**: `UdpTrackerExecutor` wired into the event loop (`udp_tracker_send` / `udp_tracker_recv` OpTypes). Torrent sessions auto-detect `udp://` URLs and route announces and scrapes through the UDP executor. HTTP URLs continue through the existing `TrackerExecutor`.
+- **Tests**: 35+ unit tests (packet encode/decode, connection cache, retransmission timeouts, error responses). Integration tests with mock UDP servers over real loopback sockets (connect->announce, connect->scrape, error handling, connection ID reuse).
 
 ## 7. DHT (BEP 5) and PEX (BEP 11)
 

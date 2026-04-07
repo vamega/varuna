@@ -8,6 +8,7 @@ Update it whenever a milestone lands, the near-term backlog changes, or a new op
 ### Core Protocol
 - `.torrent` ingestion, bencode parsing, metainfo parsing, info-hash calculation, piece/file layout mapping.
 - HTTP, HTTPS, and UDP tracker announce (BEP 15) with compact peer lists, multi-tracker simultaneous announce (BEP 12). All tiers queried in parallel; first successful response wins. Async DNS resolution with TTL-based caching (`src/io/dns.zig`). Build-time configurable backend: threadpool (default) or c-ares (`-Ddns=c-ares`). HTTPS via vendored BoringSSL with BIO pair transport (all network I/O stays on io_uring); build-time configurable: `-Dtls=boringssl` (default) or `-Dtls=none`.
+- Full UDP tracker support (BEP 15): connect/announce/scrape protocol, connection ID caching (2-minute TTL), exponential backoff retries (15 * 2^n seconds), error response handling. io_uring-based async executor (`IORING_OP_SENDMSG`/`IORING_OP_RECVMSG`) for daemon hot path; blocking client for CLI tools. Daemon auto-detects `udp://` URLs and routes to UDP executor. 35+ tests including loopback socket integration tests.
 - Tracker scrape (HTTP + UDP): seeders/leechers/snatches queried every 30 minutes.
 - Private tracker support: private flag parsing and enforcement (BEP 27). Per-session key, numwant, compact=1. PEX disabled for private torrents.
 - IPv6 peer support (BEP 7): compact peers6, IPv6-aware connect.

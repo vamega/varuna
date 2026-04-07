@@ -10,6 +10,7 @@ pub const QueueConfig = @import("queue_manager.zig").QueueConfig;
 const ResumeDb = @import("../storage/resume.zig").ResumeDb;
 const BanList = @import("../net/ban_list.zig").BanList;
 const TrackerExecutor = @import("tracker_executor.zig").TrackerExecutor;
+const UdpTrackerExecutor = @import("udp_tracker_executor.zig").UdpTrackerExecutor;
 
 /// Manages multiple torrent sessions for the daemon.
 /// Thread-safe: the API server and event loop can access concurrently.
@@ -59,6 +60,9 @@ pub const SessionManager = struct {
 
     /// Shared tracker executor for daemon-side announces and scrapes.
     tracker_executor: ?*TrackerExecutor = null,
+
+    /// Shared UDP tracker executor for daemon-side UDP announces and scrapes (BEP 15).
+    udp_tracker_executor: ?*UdpTrackerExecutor = null,
 
     pub fn init(allocator: std.mem.Allocator) SessionManager {
         return .{
@@ -137,6 +141,10 @@ pub const SessionManager = struct {
             executor.destroy();
             self.tracker_executor = null;
         }
+        if (self.udp_tracker_executor) |executor| {
+            executor.destroy();
+            self.udp_tracker_executor = null;
+        }
         if (self.resume_db) |*db| db.close();
     }
 
@@ -180,6 +188,7 @@ pub const SessionManager = struct {
         session.resume_db_path = self.resume_db_path;
         session.shared_event_loop = self.shared_event_loop orelse return error.SharedEventLoopNotConfigured;
         session.tracker_executor = try self.ensureTrackerExecutor();
+        session.udp_tracker_executor = try self.ensureUdpTrackerExecutor();
         session.disable_trackers = self.disable_trackers;
     }
 
@@ -630,6 +639,16 @@ pub const SessionManager = struct {
             el.tracker_executor = self.tracker_executor;
         }
         return self.tracker_executor.?;
+    }
+
+    fn ensureUdpTrackerExecutor(self: *SessionManager) !*UdpTrackerExecutor {
+        if (self.udp_tracker_executor == null) {
+            const el = self.shared_event_loop orelse return error.SharedEventLoopNotConfigured;
+            self.udp_tracker_executor = try UdpTrackerExecutor.create(self.allocator, &el.ring, .{});
+            // Wire into event loop for CQE dispatch
+            el.udp_tracker_executor = self.udp_tracker_executor;
+        }
+        return self.udp_tracker_executor.?;
     }
 
     /// Force piece recheck for a torrent: stop, recheck, resume.
