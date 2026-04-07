@@ -120,9 +120,9 @@ Update it whenever a milestone lands, the near-term backlog changes, or a new op
 - v2 info-hash calculation (`src/torrent/info_hash.zig`): SHA-256 of bencoded info dict using `std.crypto.hash.sha2.Sha256` (hardware-accelerated).
 - Extended `Metainfo` struct: `version`, `info_hash_v2`, `file_tree_v2` fields. Pure v2 torrents populate v1 `files` array from file tree for backward compatibility.
 - File-aligned piece layout (`src/torrent/layout.zig`): v2 pieces never cross file boundaries, each file has its own piece range, `mapPieceV2` always returns single-file spans.
-- Dual-hash verification (`src/storage/verify.zig`): `PiecePlan.hash_type` selects SHA-1 or SHA-256, `verifyPieceBuffer` supports both.
+- Dual-hash verification (`src/storage/verify.zig`): `PiecePlan.hash_type` selects SHA-1 or SHA-256, `verifyPieceBuffer` supports both. Per-file Merkle root verification for multi-piece v2 files (`recheckV2`), `verifyV2FileComplete` and `verifyV2MerkleRoot` for file-level Merkle tree validation.
 - Hasher thread pool SHA-256 support (`src/io/hasher.zig`): `Job.hash_type` field, worker function dispatches to SHA-1 or SHA-256.
-- Dual info-hash handshake matching (`src/io/peer_handler.zig`, `src/io/utp_handler.zig`): inbound and outbound peers matched on v1 or truncated v2 info-hash for hybrid torrents.
+- Dual info-hash handshake matching (`src/io/peer_handler.zig`, `src/io/utp_handler.zig`): inbound and outbound peers matched on v1 or truncated v2 info-hash for hybrid torrents. BEP 52 v2 reserved bit (`reserved[7] & 0x10`) advertised in handshake for v2/hybrid torrents.
 - `TorrentContext.info_hash_v2` field: truncated 20-byte v2 hash stored per-torrent in the event loop for handshake matching.
 - Tracker announce v2 info-hash (`src/tracker/announce.zig`): `Request.info_hash_v2` field adds a second `info_hash` parameter with truncated v2 hash for v2-aware trackers.
 - Resume DB v2 info-hash (`src/storage/resume.zig`): `info_hash_v2` table stores the full 32-byte SHA-256 hash, `saveInfoHashV2`/`loadInfoHashV2` methods.
@@ -162,7 +162,7 @@ Update it whenever a milestone lands, the near-term backlog changes, or a new op
 - Private tracker simulation tests (25 tests): required announce fields (compact, numwant, key, event), per-session key generation, private flag enforcement (no ut_pex), tracker error responses (failure reason, missing fields, invalid formats, negative interval), compact peer parsing.
 - Soak test framework (`zig build soak-test`): multi-torrent piece tracker stress, allocator leak detection (GPA), FD leak monitoring, tick latency tracking, bitfield stress cycles.
 - 5 super-seed (BEP 16) tests, 4 partial seed (BEP 21) tests, 2 multi-announce tests, 7 huge page cache tests.
-- BEP 52 tests: 11 Merkle tree tests, 8 file tree parser tests, 7 v2 metainfo tests, 4 v2 layout tests, 1 v2 info-hash test, 8 hash exchange tests, 2 v2 announce URL tests, 2 v2 resume DB tests, 11 Merkle cache tests, 2 async Merkle hasher tests.
+- BEP 52 tests: 11 Merkle tree tests, 8 file tree parser tests, 7 v2 metainfo tests, 4 v2 layout tests, 1 v2 info-hash test, 8 hash exchange tests, 2 v2 announce URL tests, 2 v2 resume DB tests, 11 Merkle cache tests, 2 async Merkle hasher tests, 4 v2 Merkle verification tests (single-piece/multi-piece/file-complete/root-verify), 5 v2 handshake tests (v2 reserved bit, supportsV2, compatibility).
 - DHT tests: 7 node_id tests, 8 routing_table tests, 8 krpc tests, 8 token tests, 7 lookup tests, 5 dht_engine tests, 1 persistence test (44 total).
 - 4 tracker override persistence tests (add/load, edit with orig_url, remove/clear, per-torrent isolation).
 - 10 peer ID client identification tests (Azureus-style, Shadow-style, Mainline, unknown).

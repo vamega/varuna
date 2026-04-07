@@ -59,13 +59,33 @@ pub const InboundMessage = union(enum) {
     port: u16,
 };
 
+/// BEP 52: reserved byte/bit for v2 protocol support.
+/// Bit 0x10 in reserved[7] signals that this client supports BitTorrent v2.
+pub const v2_reserved_byte: usize = 7;
+pub const v2_reserved_mask: u8 = 0x10;
+
+/// Check whether a peer's reserved bytes indicate BEP 52 (v2) support.
+pub fn supportsV2(reserved: [8]u8) bool {
+    return (reserved[v2_reserved_byte] & v2_reserved_mask) != 0;
+}
+
 pub fn serializeHandshake(info_hash: [20]u8, peer_id: [20]u8) [68]u8 {
+    return serializeHandshakeV2(info_hash, peer_id, false);
+}
+
+/// Serialize a BitTorrent handshake with optional v2 (BEP 52) support flag.
+/// When `is_v2` is true, sets the v2 capability bit in the reserved bytes.
+pub fn serializeHandshakeV2(info_hash: [20]u8, peer_id: [20]u8, is_v2: bool) [68]u8 {
     var buffer: [68]u8 = undefined;
     buffer[0] = protocol_length;
     @memcpy(buffer[1 .. 1 + protocol_string.len], protocol_string);
     @memset(buffer[20..28], 0);
     // BEP 10: advertise extension protocol support
     buffer[20 + extensions.reserved_byte] |= extensions.reserved_mask;
+    // BEP 52: advertise v2 protocol support
+    if (is_v2) {
+        buffer[20 + v2_reserved_byte] |= v2_reserved_mask;
+    }
     @memcpy(buffer[28..48], info_hash[0..]);
     @memcpy(buffer[48..68], peer_id[0..]);
     return buffer;
@@ -485,4 +505,64 @@ test "protocol constants are correct" {
 
 test "max_message_length is 1 MiB" {
     try std.testing.expectEqual(@as(u32, 1048576), max_message_length);
+}
+
+// ── BEP 52 v2 handshake tests ────────────────────────────
+
+test "serializeHandshakeV2 sets v2 reserved bit when is_v2 is true" {
+    const info_hash = [_]u8{0xAA} ** 20;
+    const peer_id = [_]u8{0xBB} ** 20;
+    const buf = serializeHandshakeV2(info_hash, peer_id, true);
+
+    // BEP 10 extension bit should be set
+    var expected_reserved = [_]u8{0} ** 8;
+    expected_reserved[extensions.reserved_byte] = extensions.reserved_mask;
+    // BEP 52 v2 bit should be set
+    expected_reserved[v2_reserved_byte] |= v2_reserved_mask;
+    try std.testing.expectEqualSlices(u8, &expected_reserved, buf[20..28]);
+
+    // info_hash and peer_id should be correct
+    try std.testing.expectEqualSlices(u8, &info_hash, buf[28..48]);
+    try std.testing.expectEqualSlices(u8, &peer_id, buf[48..68]);
+}
+
+test "serializeHandshakeV2 does not set v2 bit when is_v2 is false" {
+    const info_hash = [_]u8{0xCC} ** 20;
+    const peer_id = [_]u8{0xDD} ** 20;
+    const buf = serializeHandshakeV2(info_hash, peer_id, false);
+
+    // BEP 52 v2 bit should NOT be set
+    try std.testing.expect((buf[20 + v2_reserved_byte] & v2_reserved_mask) == 0);
+
+    // BEP 10 extension bit should still be set
+    try std.testing.expect((buf[20 + extensions.reserved_byte] & extensions.reserved_mask) != 0);
+}
+
+test "supportsV2 detects v2 capability from reserved bytes" {
+    var reserved = [_]u8{0} ** 8;
+    try std.testing.expect(!supportsV2(reserved));
+
+    reserved[v2_reserved_byte] = v2_reserved_mask;
+    try std.testing.expect(supportsV2(reserved));
+
+    // Other bits in the same byte should not interfere
+    reserved[v2_reserved_byte] = 0xFF;
+    try std.testing.expect(supportsV2(reserved));
+
+    reserved[v2_reserved_byte] = 0x0F; // all bits except v2
+    try std.testing.expect(!supportsV2(reserved));
+}
+
+test "serializeHandshake is compatible with serializeHandshakeV2 false" {
+    const info_hash = [_]u8{0x11} ** 20;
+    const peer_id = [_]u8{0x22} ** 20;
+    const v1_buf = serializeHandshake(info_hash, peer_id);
+    const v2_buf = serializeHandshakeV2(info_hash, peer_id, false);
+    try std.testing.expectEqualSlices(u8, &v1_buf, &v2_buf);
+}
+
+test "v2 reserved byte and mask are correct per BEP 52" {
+    // BEP 52 specifies bit 0x10 in reserved byte 7
+    try std.testing.expectEqual(@as(usize, 7), v2_reserved_byte);
+    try std.testing.expectEqual(@as(u8, 0x10), v2_reserved_mask);
 }

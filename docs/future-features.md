@@ -74,13 +74,14 @@ Distributed Hash Table for trackerless peer discovery. Peer Exchange for discove
 
 See [dht-bep52-plan.md](dht-bep52-plan.md) for the detailed implementation plan covering DHT module layout, routing table design, KRPC protocol, io_uring integration, and phasing.
 
-## 7a. BEP 52 (BitTorrent v2 / Hybrid Torrents) -- Phase 1-3 DONE
+## 7a. ~~BEP 52 (BitTorrent v2 / Hybrid Torrents)~~ -- Phase 1-5 DONE
 
-Phase 1-3 implemented: version detection (v1/v2/hybrid), v2 file tree parsing (`src/torrent/file_tree.zig`), SHA-256 Merkle tree (`src/torrent/merkle.zig`), v2 info-hash calculation, file-aligned piece layout, dual-hash verification (SHA-1/SHA-256), hasher thread pool SHA-256 support. See [dht-bep52-plan.md](dht-bep52-plan.md) for the full plan.
+All phases implemented:
+- **Phase 1-3**: version detection (v1/v2/hybrid), v2 file tree parsing (`src/torrent/file_tree.zig`), SHA-256 Merkle tree (`src/torrent/merkle.zig`), v2 info-hash calculation, file-aligned piece layout, dual-hash verification (SHA-1/SHA-256), hasher thread pool SHA-256 support.
+- **Phase 4**: peer wire handshake dual info-hash matching (`src/io/peer_handler.zig`, `src/io/event_loop.zig`), tracker announce with v2 info-hash (`src/tracker/announce.zig`), resume DB schema for v2 info-hash (`src/storage/resume.zig`), BEP 52 v2 reserved bit in handshake (`src/net/peer_wire.zig`).
+- **Phase 5**: hash request/hashes/hash reject message exchange (`src/net/hash_exchange.zig`), Merkle proof exchange (`src/io/protocol.zig`), per-file Merkle tree cache (`src/torrent/merkle_cache.zig`), per-file Merkle root verification for multi-piece v2 files (`src/storage/verify.zig`).
 
-Remaining work:
-- **Phase 4**: peer wire handshake dual info-hash matching, tracker announce with v2 info-hash, resume DB schema extension for v2 info-hash.
-- **Phase 5 (deferred)**: hash request/hashes/hash reject message exchange (BEP 52 section 5), Merkle proof exchange with peers, piece-layer streaming.
+See [dht-bep52-plan.md](dht-bep52-plan.md) for the full plan.
 
 ## 8. ~~Magnet links (BEP 9)~~ (DONE)
 

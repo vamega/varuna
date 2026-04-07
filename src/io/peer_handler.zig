@@ -176,6 +176,10 @@ fn sendBtHandshake(self: *EventLoop, slot: u16) void {
     @memset(buf[20..28], 0);
     // BEP 10: advertise extension protocol support
     buf[20 + ext.reserved_byte] |= ext.reserved_mask;
+    // BEP 52: advertise v2 protocol support for v2/hybrid torrents
+    if (tc.info_hash_v2 != null) {
+        buf[20 + pw.v2_reserved_byte] |= pw.v2_reserved_mask;
+    }
     @memcpy(buf[28..48], tc.info_hash[0..]);
     @memcpy(buf[48..68], tc.peer_id[0..]);
     @memcpy(peer.handshake_buf[0..68], &buf);
@@ -491,6 +495,10 @@ pub fn handleRecv(self: *EventLoop, slot: u16, cqe: linux.io_uring_cqe) void {
             @memset(buf[20..28], 0);
             // BEP 10: advertise extension protocol support
             buf[20 + ext.reserved_byte] |= ext.reserved_mask;
+            // BEP 52: advertise v2 protocol support for v2/hybrid torrents
+            if (resp_tc.info_hash_v2 != null) {
+                buf[20 + pw.v2_reserved_byte] |= pw.v2_reserved_mask;
+            }
             @memcpy(buf[28..48], &resp_tc.info_hash);
             @memcpy(buf[48..68], &resp_tc.peer_id);
             @memcpy(peer.handshake_buf[0..68], &buf);
@@ -522,7 +530,7 @@ pub fn handleRecv(self: *EventLoop, slot: u16, cqe: linux.io_uring_cqe) void {
                 };
                 return;
             }
-                if (msg_len > pw.max_message_length) {
+            if (msg_len > pw.max_message_length) {
                 self.removePeer(slot);
                 return;
             }
