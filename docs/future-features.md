@@ -24,7 +24,7 @@ All `std.crypto.hash.Sha1` usages in the codebase replaced with `src/crypto/sha1
 
 Note: Zig std lib SHA-256 already has SHA-NI acceleration. SHA-256 for BEP 52 (BitTorrent v2) would use std lib directly.
 
-## 3. ~~uTP support (BEP 29)~~ (Protocol layer DONE, event loop integration TODO)
+## 3. ~~uTP support (BEP 29)~~ (DONE)
 
 Core protocol implemented in `src/net/utp.zig`, `src/net/ledbat.zig`, `src/net/utp_manager.zig`:
 - Packet header encoding/decoding (20-byte BEP 29 header, all 5 packet types)
@@ -43,6 +43,27 @@ Core protocol implemented in `src/net/utp.zig`, `src/net/ledbat.zig`, `src/net/u
 - ~~Outbound retransmission buffer with actual payload tracking~~ DONE
 - ~~Timer integration for RTO-based retransmission~~ DONE
 - ~~Outbound uTP connections (connect, handshake, peer wire bridge)~~ DONE
+- ~~Transport selection wiring: all peer sources (DHT, tracker, PEX) use uTP~~ DONE
+
+Config:
+```toml
+[network]
+enable_utp = true  # default: true
+```
+
+Runtime toggle via API: `POST /api/v2/app/setPreferences` with `enable_utp=true|false`.
+
+### Advanced Transport Disposition (Future)
+
+uTorrent exposes a `bt.transp_disposition` bitfield for fine-grained transport control:
+
+  1 allows outgoing TCP connections
+  2 allows outgoing uTP connections
+  4 allows incoming TCP connections
+  8 allows incoming uTP connections
+  16 use new uTP header (not backwards compatible)
+
+Values are additive (255 = all enabled). We may consider this level of granularity in the future. For now, varuna exposes a simpler `enable_utp` boolean toggle that controls both inbound and outbound uTP.
 
 ## 4. ~~SO_BINDTODEVICE support~~ (DONE)
 

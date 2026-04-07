@@ -694,7 +694,8 @@ pub fn checkReannounce(self: *EventLoop) void {
         if (peers) |addrs| {
             for (addrs) |addr| {
                 if (self.peer_count >= self.max_connections) break;
-                _ = self.addPeer(addr) catch continue;
+                // When uTP is enabled, alternate between TCP and uTP transports.
+                _ = self.addPeerAutoTransport(addr, 0) catch continue;
             }
             self.allocator.free(addrs);
         }

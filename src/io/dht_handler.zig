@@ -77,7 +77,8 @@ fn drainDhtPeerResults(self: *EventLoop) void {
             if (already_connected) continue;
 
             // Initiate connection via the standard peer pipeline.
-            _ = self.addPeerForTorrent(peer_addr, tid) catch continue;
+            // When uTP is enabled, alternate between TCP and uTP transports.
+            _ = self.addPeerAutoTransport(peer_addr, tid) catch continue;
         }
 
         log.info("DHT: fed {d} peers for torrent {x}", .{

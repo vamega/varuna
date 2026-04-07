@@ -76,6 +76,10 @@ pub const Config = struct {
         dht: bool = true,
         /// Enable PEX (BEP 11) for peer exchange between connected peers.
         pex: bool = true,
+        /// Enable uTP (BEP 29) transport for peer connections.
+        /// When true, new outbound connections alternate between TCP and uTP,
+        /// and the UDP listener starts at daemon startup for inbound uTP.
+        enable_utp: bool = true,
     };
 
     pub const Performance = struct {
@@ -198,4 +202,9 @@ test "default share ratio limits are disabled" {
     try std.testing.expectEqual(@as(u8, 0), config.daemon.max_ratio_act);
     try std.testing.expect(!config.daemon.max_seeding_time_enabled);
     try std.testing.expectEqual(@as(i64, -1), config.daemon.max_seeding_time);
+}
+
+test "default enable_utp is true" {
+    const config = Config{};
+    try std.testing.expect(config.network.enable_utp);
 }

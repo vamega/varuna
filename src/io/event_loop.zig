@@ -680,6 +680,10 @@ pub const EventLoop = struct {
 
     // Runtime feature toggles (can be changed via API)
     pex_enabled: bool = true,
+    utp_enabled: bool = true,
+    /// Monotonic counter for alternating between TCP and uTP connections.
+    /// When utp_enabled is true, even values use TCP and odd values use uTP.
+    utp_transport_counter: u32 = 0,
 
     // Accept socket for seeding (-1 if not seeding)
     listen_fd: posix.fd_t = -1,
@@ -1261,6 +1265,30 @@ pub const EventLoop = struct {
     }
 
     // ── Peer management ────────────────────────────────────
+
+    /// Select the transport for a new outbound connection based on the
+    /// `utp_enabled` toggle. When uTP is enabled, alternates between TCP
+    /// and uTP using a simple counter (approximately 50/50 split).
+    pub fn selectTransport(self: *EventLoop) Transport {
+        if (!self.utp_enabled) return .tcp;
+        const counter = self.utp_transport_counter;
+        self.utp_transport_counter = counter +% 1;
+        return if (counter % 2 == 0) .tcp else .utp;
+    }
+
+    /// Add a peer using the transport selected by `selectTransport()`.
+    /// When uTP is selected but the connection fails (e.g. no UDP socket),
+    /// falls back to TCP transparently.
+    pub fn addPeerAutoTransport(self: *EventLoop, address: std.net.Address, torrent_id: TorrentIdType) !u16 {
+        const transport = self.selectTransport();
+        if (transport == .utp) {
+            return self.addUtpPeer(address, torrent_id) catch |err| switch (err) {
+                error.NoUtpManager, error.UtpConnectFailed => return self.addPeerForTorrent(address, torrent_id),
+                else => return err,
+            };
+        }
+        return self.addPeerForTorrent(address, torrent_id);
+    }
 
     pub fn addPeer(self: *EventLoop, address: std.net.Address) !u16 {
         return self.addPeerForTorrent(address, 0);
@@ -2445,4 +2473,53 @@ test "peer and torrent membership indices stay consistent across swap-remove" {
     try std.testing.expectEqual(@as(?u32, 0), tc1.torrent_peer_list_index);
     try std.testing.expectEqual(@as(usize, 1), el.torrents_with_peers.items.len);
     try std.testing.expectEqual(tid1, el.torrents_with_peers.items[0]);
+}
+
+test "selectTransport always returns tcp when utp disabled" {
+    const allocator = std.testing.allocator;
+    var el = try EventLoop.initBare(allocator, 0);
+    defer el.deinit();
+
+    el.utp_enabled = false;
+
+    // All calls should return TCP
+    for (0..10) |_| {
+        try std.testing.expectEqual(Transport.tcp, el.selectTransport());
+    }
+}
+
+test "selectTransport alternates tcp and utp when enabled" {
+    const allocator = std.testing.allocator;
+    var el = try EventLoop.initBare(allocator, 0);
+    defer el.deinit();
+
+    el.utp_enabled = true;
+    el.utp_transport_counter = 0;
+
+    // Even counter -> TCP, odd counter -> uTP
+    try std.testing.expectEqual(Transport.tcp, el.selectTransport());
+    try std.testing.expectEqual(Transport.utp, el.selectTransport());
+    try std.testing.expectEqual(Transport.tcp, el.selectTransport());
+    try std.testing.expectEqual(Transport.utp, el.selectTransport());
+
+    // Verify counter is incrementing
+    try std.testing.expectEqual(@as(u32, 4), el.utp_transport_counter);
+}
+
+test "selectTransport yields approximately 50/50 split" {
+    const allocator = std.testing.allocator;
+    var el = try EventLoop.initBare(allocator, 0);
+    defer el.deinit();
+
+    el.utp_enabled = true;
+    el.utp_transport_counter = 0;
+
+    var tcp_count: u32 = 0;
+    var utp_count: u32 = 0;
+    for (0..100) |_| {
+        const t = el.selectTransport();
+        if (t == .tcp) tcp_count += 1 else utp_count += 1;
+    }
+    try std.testing.expectEqual(@as(u32, 50), tcp_count);
+    try std.testing.expectEqual(@as(u32, 50), utp_count);
 }

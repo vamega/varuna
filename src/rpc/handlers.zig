@@ -547,6 +547,7 @@ pub const ApiHandler = struct {
             \\"auto_tmm_enabled":false,"save_resume_data_interval":60,
             \\"start_paused_enabled":false,
             \\"dht":{s},"pex":{s},"lsd":false,"encryption":{},"anonymous_mode":false,
+            \\"enable_utp":{s},
             \\"piece_cache_enabled":{},
             \\"ip_filter_enabled":false,"ip_filter_path":"","ip_filter_trackers":false,
             \\"banned_IPs":"{f}"}}
@@ -566,6 +567,7 @@ pub const ApiHandler = struct {
             @as([]const u8, if (el) |e| (if (e.dht_engine != null) "true" else "false") else "false"),
             @as([]const u8, if (el) |e| (if (e.pex_enabled) "true" else "false") else "false"),
             enc_mode,
+            @as([]const u8, if (el) |e| (if (e.utp_enabled) "true" else "false") else "false"),
             @as(u8, if (piece_cache_enabled) 1 else 0),
             esc(banned_ips_str),
         }) catch
@@ -712,6 +714,13 @@ pub const ApiHandler = struct {
             el.pex_enabled = std.mem.eql(u8, v, "true");
         } else if (extractJsonBool(body, "pex")) |v| {
             el.pex_enabled = v;
+        }
+
+        // uTP toggle (runtime: controls whether new connections use uTP transport)
+        if (extractParam(body, "enable_utp")) |v| {
+            el.utp_enabled = std.mem.eql(u8, v, "true");
+        } else if (extractJsonBool(body, "enable_utp")) |v| {
+            el.utp_enabled = v;
         }
 
         return .{ .body = "{\"status\":\"ok\"}" };
@@ -2232,4 +2241,16 @@ test "serializeTorrentInfo handles zero-size torrent" {
     // amount_left should be 0 when total_size is 0
     try std.testing.expect(std.mem.indexOf(u8, body, "\"amount_left\":0") != null);
     try std.testing.expect(std.mem.indexOf(u8, body, "\"total_size\":0") != null);
+}
+
+test "enable_utp form param parsing" {
+    try std.testing.expectEqualStrings("true", extractParam("enable_utp=true", "enable_utp").?);
+    try std.testing.expectEqualStrings("false", extractParam("enable_utp=false", "enable_utp").?);
+    try std.testing.expectEqualStrings("true", extractParam("pex=true&enable_utp=true&dht=false", "enable_utp").?);
+}
+
+test "enable_utp json bool parsing" {
+    try std.testing.expectEqual(@as(?bool, true), extractJsonBool("{\"enable_utp\":true}", "enable_utp"));
+    try std.testing.expectEqual(@as(?bool, false), extractJsonBool("{\"enable_utp\":false}", "enable_utp"));
+    try std.testing.expectEqual(@as(?bool, true), extractJsonBool("{\"dht\":false,\"enable_utp\":true,\"pex\":true}", "enable_utp"));
 }

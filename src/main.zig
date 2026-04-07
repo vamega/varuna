@@ -91,6 +91,7 @@ pub fn main() !void {
     // to avoid placing the ~900 KB struct on main()'s stack.
     shared_el.port = cfg.network.port_min;
     shared_el.pex_enabled = cfg.network.pex;
+    shared_el.utp_enabled = cfg.network.enable_utp;
 
     // Initialize DHT persistence — separate DB file so it can be blown away
     // independently from torrent resume state.
@@ -193,12 +194,18 @@ pub fn main() !void {
     }
 
     // Start the shared UDP socket (used by both DHT and uTP). This must happen
-    // before the event loop so that DHT bootstrap pings can be submitted.
-    shared_el.startUtpListener() catch |err| {
-        try stdout.print("warning: failed to start UDP listener: {s}\n", .{@errorName(err)});
-        try stdout.flush();
-        shared_el.dht_engine = null; // Disable DHT if UDP socket failed
-    };
+    // before the event loop so that DHT bootstrap pings can be submitted and
+    // inbound uTP connections can be accepted immediately when enable_utp is true.
+    if (cfg.network.dht or cfg.network.enable_utp) {
+        shared_el.startUtpListener() catch |err| {
+            try stdout.print("warning: failed to start UDP listener: {s}\n", .{@errorName(err)});
+            try stdout.flush();
+            shared_el.dht_engine = null; // Disable DHT if UDP socket failed
+            if (cfg.network.enable_utp) {
+                shared_el.utp_enabled = false; // Disable uTP if UDP socket failed
+            }
+        };
+    }
 
     // Resolve bootstrap node hostnames (blocking DNS, after UDP socket is ready).
     // Skip if we loaded enough persisted nodes (table already warm).
