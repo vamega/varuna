@@ -94,7 +94,6 @@ fn renderProgressBar(alloc: Allocator, progress: f64, width: usize) []const u8 {
     const filled: usize = @intFromFloat(@round(progress * @as(f64, @floatFromInt(bar_width))));
     const empty = bar_width -| filled;
 
-    // Build the bar string using allocPrint
     const fill_str = makeRepeated(alloc, '#', filled);
     const empty_str = makeRepeated(alloc, '.', empty);
     return std.fmt.allocPrint(alloc, "[{s}{s}]", .{ fill_str, empty_str }) catch "[]";
@@ -274,10 +273,11 @@ pub fn renderKeyBar(alloc: Allocator, width: usize, mode: ViewMode) []const u8 {
     const hints = switch (mode) {
         .main => " q:Quit  a:Add  d:Delete  p:Pause/Resume  Enter:Details  P:Preferences  /:Filter",
         .details => " q/Esc:Back  Tab:Switch tab  p:Pause/Resume  d:Delete",
-        .add_torrent => " Enter:Confirm  Esc:Cancel  Tab:Switch field",
-        .confirm_delete => " y:Yes  n/Esc:No",
-        .preferences => " Esc:Back  Enter:Edit value",
+        .add_torrent => " Enter:Confirm  Esc:Cancel  Tab:Toggle file/magnet",
+        .confirm_delete => " y:Yes  n/Esc:No  f:Toggle delete files",
+        .preferences => " q/Esc:Back  j/k:Navigate  Enter:Edit  Esc:Cancel edit",
         .filter => " Enter:Apply  Esc:Cancel",
+        .login => " Tab:Switch field  Enter:Submit  Esc:Cancel",
     };
 
     return bar_style.render(alloc, hints) catch hints;
@@ -563,6 +563,9 @@ pub fn renderPreferencesView(
     prefs: api.Preferences,
     width: usize,
     _: usize,
+    selected: usize,
+    editing: bool,
+    edit_value: []const u8,
 ) []const u8 {
     var title_style = zz.Style{};
     title_style = title_style.bold(true);
@@ -579,33 +582,58 @@ pub fn renderPreferencesView(
     const dl_limit_str = if (prefs.dl_limit == 0) "Unlimited" else formatSpeed(alloc, prefs.dl_limit);
     const up_limit_str = if (prefs.up_limit == 0) "Unlimited" else formatSpeed(alloc, prefs.up_limit);
 
-    const body = std.fmt.allocPrint(alloc,
-        \\  Listen port:           {d}
-        \\  Download limit:        {s}
-        \\  Upload limit:          {s}
-        \\  Max connections:       {d}
-        \\  Max conn/torrent:      {d}
-        \\  Max uploads:           {d}
-        \\  Max uploads/torrent:   {d}
-        \\  DHT:                   {s}
-        \\  PEX:                   {s}
-        \\  uTP:                   {s}
-        \\  Save path:             {s}
-        \\  WebUI port:            {d}
-    , .{
-        prefs.listen_port,
+    const labels = [_][]const u8{
+        "Listen port",
+        "Download limit",
+        "Upload limit",
+        "Max connections",
+        "Max conn/torrent",
+        "Max uploads",
+        "Max uploads/torrent",
+        "DHT",
+        "PEX",
+        "Save path",
+        "uTP",
+        "WebUI port",
+    };
+
+    const values = [_][]const u8{
+        std.fmt.allocPrint(alloc, "{d}", .{prefs.listen_port}) catch "?",
         dl_limit_str,
         up_limit_str,
-        prefs.max_connec,
-        prefs.max_connec_per_torrent,
-        prefs.max_uploads,
-        prefs.max_uploads_per_torrent,
+        std.fmt.allocPrint(alloc, "{d}", .{prefs.max_connec}) catch "?",
+        std.fmt.allocPrint(alloc, "{d}", .{prefs.max_connec_per_torrent}) catch "?",
+        std.fmt.allocPrint(alloc, "{d}", .{prefs.max_uploads}) catch "?",
+        std.fmt.allocPrint(alloc, "{d}", .{prefs.max_uploads_per_torrent}) catch "?",
         @as([]const u8, if (prefs.dht) "Enabled" else "Disabled"),
         @as([]const u8, if (prefs.pex) "Enabled" else "Disabled"),
-        @as([]const u8, if (prefs.enable_utp) "Enabled" else "Disabled"),
         prefs.save_path,
-        prefs.web_ui_port,
-    }) catch "";
+        @as([]const u8, if (prefs.enable_utp) "Enabled" else "Disabled"),
+        std.fmt.allocPrint(alloc, "{d}", .{prefs.web_ui_port}) catch "?",
+    };
+
+    var body: []const u8 = "";
+    for (labels, 0..) |label, i| {
+        const is_sel = i == selected;
+        const prefix: []const u8 = if (is_sel) " > " else "   ";
+        const value = if (is_sel and editing)
+            std.fmt.allocPrint(alloc, "[{s}_]", .{edit_value}) catch values[i]
+        else
+            values[i];
+
+        const padded_label = padRight(alloc, label, 24);
+        var line = std.fmt.allocPrint(alloc, "{s}{s}{s}", .{ prefix, padded_label, value }) catch "";
+
+        if (is_sel) {
+            var sel_style = zz.Style{};
+            sel_style = sel_style.bold(true);
+            sel_style = sel_style.fg(colors.accent);
+            sel_style = sel_style.inline_style(true);
+            line = sel_style.render(alloc, line) catch line;
+        }
+
+        body = if (body.len == 0) line else std.fmt.allocPrint(alloc, "{s}\n{s}", .{ body, line }) catch body;
+    }
 
     return std.fmt.allocPrint(alloc, "{s}\n{s}\n{s}", .{ title, sep, body }) catch "";
 }
@@ -636,6 +664,58 @@ pub fn renderDisconnected(alloc: Allocator, host: []const u8, port: u16, width: 
     return zz.place.place(alloc, width, height, .center, .middle, boxed) catch boxed;
 }
 
+// ── Login dialog ─────────────────────────────────────────────────────
+
+pub fn renderLoginDialog(
+    alloc: Allocator,
+    user_buf: []const u8,
+    user_len: usize,
+    _: []const u8,
+    pass_len: usize,
+    username_active: bool,
+    error_msg: ?[]const u8,
+    width: usize,
+    height: usize,
+) []const u8 {
+    const dialog_w = toU16(@min(width -| 4, 50));
+
+    var box_style = zz.Style{};
+    box_style = box_style.borderAll(zz.Border.rounded);
+    box_style = box_style.borderForeground(colors.accent);
+    box_style = box_style.paddingAll(1);
+    box_style = box_style.width(dialog_w);
+    box_style = box_style.alignH(.center);
+
+    var title_style = zz.Style{};
+    title_style = title_style.bold(true);
+    title_style = title_style.fg(colors.title);
+    title_style = title_style.inline_style(true);
+
+    const title = title_style.render(alloc, "Login Required") catch "Login Required";
+
+    const user_prefix: []const u8 = if (username_active) "> " else "  ";
+    const pass_prefix: []const u8 = if (!username_active) "> " else "  ";
+
+    const user_display = if (user_len > 0) user_buf[0..user_len] else "";
+    const pass_display = makeRepeated(alloc, '*', pass_len);
+
+    const user_line = std.fmt.allocPrint(alloc, "{s}Username: {s}", .{ user_prefix, user_display }) catch "";
+    const pass_line = std.fmt.allocPrint(alloc, "{s}Password: {s}", .{ pass_prefix, pass_display }) catch "";
+
+    var inner = std.fmt.allocPrint(alloc, "{s}\n\n{s}\n{s}", .{ title, user_line, pass_line }) catch "";
+
+    if (error_msg) |err| {
+        var err_style = zz.Style{};
+        err_style = err_style.fg(colors.error_c);
+        err_style = err_style.inline_style(true);
+        const styled_err = err_style.render(alloc, err) catch err;
+        inner = std.fmt.allocPrint(alloc, "{s}\n\n{s}", .{ inner, styled_err }) catch inner;
+    }
+
+    const boxed = box_style.render(alloc, inner) catch inner;
+    return zz.place.place(alloc, width, height, .center, .middle, boxed) catch boxed;
+}
+
 // ── View mode enum ───────────────────────────────────────────────────
 
 pub const ViewMode = enum {
@@ -645,6 +725,7 @@ pub const ViewMode = enum {
     confirm_delete,
     preferences,
     filter,
+    login,
 };
 
 pub const DetailTab = enum {

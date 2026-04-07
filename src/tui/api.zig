@@ -1,11 +1,12 @@
 //! HTTP API client for communicating with the varuna daemon.
 //!
-//! Talks to the qBittorrent-compatible WebAPI over HTTP.  Uses standard
-//! library networking for HTTP transport (this code runs on background
-//! threads via zigzag's AsyncRunner, not on the main zio event loop).
-//! Parsing is done with std.json.
+//! Talks to the qBittorrent-compatible WebAPI over HTTP using dusty
+//! (a zio-native HTTP client library).  All I/O runs inside zio
+//! coroutines -- no blocking syscalls or extra threads.
+//! JSON parsing uses std.json.
 
 const std = @import("std");
+const dusty = @import("dusty");
 
 const Allocator = std.mem.Allocator;
 
@@ -109,26 +110,24 @@ pub const Preferences = struct {
 
 pub const ApiClient = struct {
     allocator: Allocator,
-    host: []const u8,
-    port: u16,
+    http: dusty.Client,
+    base_url: []const u8,
     sid: ?[]const u8,
 
-    /// Persistent buffer for HTTP request/response work.
-    buf: []u8,
-
     pub fn init(allocator: Allocator, host: []const u8, port: u16) !ApiClient {
+        const base_url = try std.fmt.allocPrint(allocator, "http://{s}:{d}", .{ host, port });
         return .{
             .allocator = allocator,
-            .host = host,
-            .port = port,
+            .http = dusty.Client.init(allocator, .{}),
+            .base_url = base_url,
             .sid = null,
-            .buf = try allocator.alloc(u8, 64 * 1024),
         };
     }
 
     pub fn deinit(self: *ApiClient) void {
+        self.http.deinit();
         if (self.sid) |s| self.allocator.free(s);
-        self.allocator.free(self.buf);
+        self.allocator.free(self.base_url);
     }
 
     /// Authenticate with the daemon. Returns true on success.
@@ -136,86 +135,66 @@ pub const ApiClient = struct {
         const body_str = try std.fmt.allocPrint(self.allocator, "username={s}&password={s}", .{ username, password });
         defer self.allocator.free(body_str);
 
-        const response = try self.httpPost("/api/v2/auth/login", body_str, "application/x-www-form-urlencoded");
-        defer self.allocator.free(response.body);
+        const url = try std.fmt.allocPrint(self.allocator, "{s}/api/v2/auth/login", .{self.base_url});
+        defer self.allocator.free(url);
 
-        if (response.status != 200) return false;
+        var headers: dusty.Headers = .{};
+        defer headers.deinit(self.allocator);
+        try headers.put(self.allocator, "Content-Type", "application/x-www-form-urlencoded");
+        self.addCookieHeader(&headers);
 
-        // Extract SID from Set-Cookie header if present
-        if (response.cookie) |cookie| {
-            if (self.sid) |old| self.allocator.free(old);
-            self.sid = try self.allocator.dupe(u8, cookie);
-        }
+        var response = self.http.fetch(url, .{
+            .method = .post,
+            .headers = &headers,
+            .body = body_str,
+        }) catch return false;
+        defer response.deinit();
+
+        const status = response.status();
+        if (status != .ok) return false;
+
+        // Extract SID from Set-Cookie header
+        self.extractSidCookie(&response);
         return true;
     }
 
     /// Fetch the list of all torrents.
-    pub fn getTorrents(self: *ApiClient) ![]TorrentInfo {
-        const response = try self.httpGet("/api/v2/torrents/info");
-        defer self.allocator.free(response.body);
-
-        if (response.status != 200) return &[_]TorrentInfo{};
-
-        return self.parseTorrentList(response.body) catch &[_]TorrentInfo{};
+    pub fn getTorrents(self: *ApiClient, arena: Allocator) ![]TorrentInfo {
+        const body = self.httpGet("/api/v2/torrents/info", arena) catch return &[_]TorrentInfo{};
+        return parseTorrentList(arena, body) catch &[_]TorrentInfo{};
     }
 
     /// Fetch global transfer statistics.
-    pub fn getTransferInfo(self: *ApiClient) !TransferInfo {
-        const response = try self.httpGet("/api/v2/transfer/info");
-        defer self.allocator.free(response.body);
-
-        if (response.status != 200) return .{};
-
-        return self.parseTransferInfo(response.body) catch .{};
+    pub fn getTransferInfo(self: *ApiClient, arena: Allocator) !TransferInfo {
+        const body = self.httpGet("/api/v2/transfer/info", arena) catch return .{};
+        return parseTransferInfo(arena, body) catch .{};
     }
 
     /// Fetch properties for a specific torrent.
-    pub fn getTorrentProperties(self: *ApiClient, hash: []const u8) !TorrentProperties {
-        const path = try std.fmt.allocPrint(self.allocator, "/api/v2/torrents/properties?hash={s}", .{hash});
-        defer self.allocator.free(path);
-
-        const response = try self.httpGet(path);
-        defer self.allocator.free(response.body);
-
-        if (response.status != 200) return .{};
-
-        return self.parseTorrentProperties(response.body) catch .{};
+    pub fn getTorrentProperties(self: *ApiClient, arena: Allocator, hash: []const u8) !TorrentProperties {
+        const path = try std.fmt.allocPrint(arena, "/api/v2/torrents/properties?hash={s}", .{hash});
+        const body = self.httpGet(path, arena) catch return .{};
+        return parseTorrentProperties(arena, body) catch .{};
     }
 
     /// Fetch files for a specific torrent.
-    pub fn getTorrentFiles(self: *ApiClient, hash: []const u8) ![]TorrentFile {
-        const path = try std.fmt.allocPrint(self.allocator, "/api/v2/torrents/files?hash={s}", .{hash});
-        defer self.allocator.free(path);
-
-        const response = try self.httpGet(path);
-        defer self.allocator.free(response.body);
-
-        if (response.status != 200) return &[_]TorrentFile{};
-
-        return self.parseTorrentFiles(response.body) catch &[_]TorrentFile{};
+    pub fn getTorrentFiles(self: *ApiClient, arena: Allocator, hash: []const u8) ![]TorrentFile {
+        const path = try std.fmt.allocPrint(arena, "/api/v2/torrents/files?hash={s}", .{hash});
+        const body = self.httpGet(path, arena) catch return &[_]TorrentFile{};
+        return parseTorrentFiles(arena, body) catch &[_]TorrentFile{};
     }
 
     /// Fetch trackers for a specific torrent.
-    pub fn getTorrentTrackers(self: *ApiClient, hash: []const u8) ![]TrackerEntry {
-        const path = try std.fmt.allocPrint(self.allocator, "/api/v2/torrents/trackers?hash={s}", .{hash});
-        defer self.allocator.free(path);
-
-        const response = try self.httpGet(path);
-        defer self.allocator.free(response.body);
-
-        if (response.status != 200) return &[_]TrackerEntry{};
-
-        return self.parseTrackerList(response.body) catch &[_]TrackerEntry{};
+    pub fn getTorrentTrackers(self: *ApiClient, arena: Allocator, hash: []const u8) ![]TrackerEntry {
+        const path = try std.fmt.allocPrint(arena, "/api/v2/torrents/trackers?hash={s}", .{hash});
+        const body = self.httpGet(path, arena) catch return &[_]TrackerEntry{};
+        return parseTrackerList(arena, body) catch &[_]TrackerEntry{};
     }
 
     /// Fetch daemon preferences.
-    pub fn getPreferences(self: *ApiClient) !Preferences {
-        const response = try self.httpGet("/api/v2/app/preferences");
-        defer self.allocator.free(response.body);
-
-        if (response.status != 200) return .{};
-
-        return self.parsePreferences(response.body) catch .{};
+    pub fn getPreferences(self: *ApiClient, arena: Allocator) !Preferences {
+        const body = self.httpGet("/api/v2/app/preferences", arena) catch return .{};
+        return parsePreferences(arena, body) catch .{};
     }
 
     /// Add a torrent by file path.
@@ -235,21 +214,14 @@ pub const ApiClient = struct {
         const content_type = try std.fmt.allocPrint(self.allocator, "multipart/form-data; boundary={s}", .{boundary});
         defer self.allocator.free(content_type);
 
-        const response = try self.httpPost("/api/v2/torrents/add", body_str, content_type);
-        defer self.allocator.free(response.body);
-
-        return response.status == 200;
+        return self.httpPostAction("/api/v2/torrents/add", body_str, content_type);
     }
 
     /// Add a torrent by magnet link.
     pub fn addTorrentMagnet(self: *ApiClient, magnet_uri: []const u8) !bool {
         const body_str = try std.fmt.allocPrint(self.allocator, "urls={s}", .{magnet_uri});
         defer self.allocator.free(body_str);
-
-        const response = try self.httpPost("/api/v2/torrents/add", body_str, "application/x-www-form-urlencoded");
-        defer self.allocator.free(response.body);
-
-        return response.status == 200;
+        return self.httpPostAction("/api/v2/torrents/add", body_str, "application/x-www-form-urlencoded");
     }
 
     /// Delete a torrent.
@@ -257,145 +229,105 @@ pub const ApiClient = struct {
         const df_str: []const u8 = if (delete_files) "true" else "false";
         const body_str = try std.fmt.allocPrint(self.allocator, "hashes={s}&deleteFiles={s}", .{ hash, df_str });
         defer self.allocator.free(body_str);
-
-        const response = try self.httpPost("/api/v2/torrents/delete", body_str, "application/x-www-form-urlencoded");
-        defer self.allocator.free(response.body);
-
-        return response.status == 200;
+        return self.httpPostAction("/api/v2/torrents/delete", body_str, "application/x-www-form-urlencoded");
     }
 
     /// Pause a torrent.
     pub fn pauseTorrent(self: *ApiClient, hash: []const u8) !bool {
         const body_str = try std.fmt.allocPrint(self.allocator, "hashes={s}", .{hash});
         defer self.allocator.free(body_str);
-
-        const response = try self.httpPost("/api/v2/torrents/pause", body_str, "application/x-www-form-urlencoded");
-        defer self.allocator.free(response.body);
-
-        return response.status == 200;
+        return self.httpPostAction("/api/v2/torrents/pause", body_str, "application/x-www-form-urlencoded");
     }
 
     /// Resume a torrent.
     pub fn resumeTorrent(self: *ApiClient, hash: []const u8) !bool {
         const body_str = try std.fmt.allocPrint(self.allocator, "hashes={s}", .{hash});
         defer self.allocator.free(body_str);
-
-        const response = try self.httpPost("/api/v2/torrents/resume", body_str, "application/x-www-form-urlencoded");
-        defer self.allocator.free(response.body);
-
-        return response.status == 200;
+        return self.httpPostAction("/api/v2/torrents/resume", body_str, "application/x-www-form-urlencoded");
     }
 
-    // ── HTTP transport (uses zio for non-blocking I/O) ───────────────
-
-    const HttpResponse = struct {
-        status: u16,
-        body: []const u8,
-        cookie: ?[]const u8,
-    };
-
-    fn httpGet(self: *ApiClient, path: []const u8) !HttpResponse {
-        return self.httpRequest("GET", path, null, null);
+    /// Set daemon preferences.
+    pub fn setPreferences(self: *ApiClient, json_body: []const u8) !bool {
+        const body_str = try std.fmt.allocPrint(self.allocator, "json={s}", .{json_body});
+        defer self.allocator.free(body_str);
+        return self.httpPostAction("/api/v2/app/setPreferences", body_str, "application/x-www-form-urlencoded");
     }
 
-    fn httpPost(self: *ApiClient, path: []const u8, body: []const u8, content_type: []const u8) !HttpResponse {
-        return self.httpRequest("POST", path, body, content_type);
+    // ── HTTP transport (uses dusty + zio) ────────────────────────────
+
+    fn httpGet(self: *ApiClient, path: []const u8, arena: Allocator) ![]const u8 {
+        const url = try std.fmt.allocPrint(arena, "{s}{s}", .{ self.base_url, path });
+
+        var headers: dusty.Headers = .{};
+        defer headers.deinit(self.allocator);
+        self.addCookieHeader(&headers);
+
+        var response = try self.http.fetch(url, .{
+            .headers = &headers,
+        });
+        defer response.deinit();
+
+        const status = response.status();
+
+        // Handle auth required
+        if (status == .forbidden or status == .unauthorized) {
+            return error.AuthRequired;
+        }
+
+        if (status != .ok) return error.HttpError;
+
+        const body = response.body() catch return error.HttpError;
+        if (body) |b| {
+            return try arena.dupe(u8, b);
+        }
+        return error.HttpError;
     }
 
-    fn httpRequest(self: *ApiClient, method: []const u8, path: []const u8, body: ?[]const u8, content_type: ?[]const u8) !HttpResponse {
-        // Build the HTTP request
-        var header_buf: [4096]u8 = undefined;
-        var header_len: usize = 0;
+    fn httpPostAction(self: *ApiClient, path: []const u8, body: []const u8, content_type: []const u8) bool {
+        const url = std.fmt.allocPrint(self.allocator, "{s}{s}", .{ self.base_url, path }) catch return false;
+        defer self.allocator.free(url);
 
-        // Request line
-        header_len += (try std.fmt.bufPrint(header_buf[header_len..], "{s} {s} HTTP/1.1\r\n", .{ method, path })).len;
-        header_len += (try std.fmt.bufPrint(header_buf[header_len..], "Host: {s}:{d}\r\n", .{ self.host, self.port })).len;
-        header_len += (try std.fmt.bufPrint(header_buf[header_len..], "Connection: close\r\n", .{})).len;
+        var headers: dusty.Headers = .{};
+        defer headers.deinit(self.allocator);
+        headers.put(self.allocator, "Content-Type", content_type) catch return false;
+        self.addCookieHeader(&headers);
 
+        var response = self.http.fetch(url, .{
+            .method = .post,
+            .headers = &headers,
+            .body = body,
+        }) catch return false;
+        defer response.deinit();
+
+        const status = response.status();
+        return status == .ok;
+    }
+
+    fn addCookieHeader(self: *const ApiClient, headers: *dusty.Headers) void {
         if (self.sid) |s| {
-            header_len += (try std.fmt.bufPrint(header_buf[header_len..], "Cookie: SID={s}\r\n", .{s})).len;
+            const cookie = std.fmt.allocPrint(self.allocator, "SID={s}", .{s}) catch return;
+            headers.put(self.allocator, "Cookie", cookie) catch {
+                self.allocator.free(cookie);
+            };
         }
-
-        if (content_type) |ct| {
-            header_len += (try std.fmt.bufPrint(header_buf[header_len..], "Content-Type: {s}\r\n", .{ct})).len;
-        }
-
-        if (body) |b| {
-            header_len += (try std.fmt.bufPrint(header_buf[header_len..], "Content-Length: {d}\r\n", .{b.len})).len;
-        }
-
-        header_len += (try std.fmt.bufPrint(header_buf[header_len..], "\r\n", .{})).len;
-
-        // Connect via standard library TCP
-        const addr = try std.net.Address.parseIp4(self.host, self.port);
-        const stream = try std.net.tcpConnectToAddress(addr);
-        defer stream.close();
-
-        // Send request headers
-        _ = try stream.write(header_buf[0..header_len]);
-        if (body) |b| {
-            _ = try stream.write(b);
-        }
-
-        // Read response into a growable buffer
-        var response_buf: std.ArrayList(u8) = .empty;
-        defer response_buf.deinit(self.allocator);
-
-        var read_buf: [8192]u8 = undefined;
-        while (true) {
-            const n = stream.read(&read_buf) catch break;
-            if (n == 0) break;
-            try response_buf.appendSlice(self.allocator, read_buf[0..n]);
-        }
-
-        const raw = try response_buf.toOwnedSlice(self.allocator);
-
-        // Parse HTTP response
-        return self.parseHttpResponse(raw);
     }
 
-    fn parseHttpResponse(self: *ApiClient, raw: []const u8) !HttpResponse {
-        // Find the header/body separator
-        const separator = "\r\n\r\n";
-        const sep_pos = std.mem.indexOf(u8, raw, separator) orelse {
-            return .{ .status = 0, .body = raw, .cookie = null };
-        };
-
-        const headers = raw[0..sep_pos];
-        const body_start = sep_pos + separator.len;
-        const body = try self.allocator.dupe(u8, raw[body_start..]);
-
-        // Parse status code from first line: "HTTP/1.1 200 OK"
-        var status: u16 = 0;
-        if (std.mem.indexOf(u8, headers, " ")) |space_pos| {
-            const after_space = headers[space_pos + 1 ..];
-            if (std.mem.indexOf(u8, after_space, " ")) |second_space| {
-                status = std.fmt.parseInt(u16, after_space[0..second_space], 10) catch 0;
-            }
+    fn extractSidCookie(self: *ApiClient, response: *dusty.ClientResponse) void {
+        const resp_headers = response.headers();
+        const cookie_val = resp_headers.get("Set-Cookie") orelse return;
+        if (std.mem.indexOf(u8, cookie_val, "SID=")) |sid_start| {
+            const sid_val = cookie_val[sid_start + 4 ..];
+            const end = std.mem.indexOfAny(u8, sid_val, ";, ") orelse sid_val.len;
+            const new_sid = self.allocator.dupe(u8, sid_val[0..end]) catch return;
+            if (self.sid) |old| self.allocator.free(old);
+            self.sid = new_sid;
         }
-
-        // Extract SID cookie
-        var cookie: ?[]const u8 = null;
-        var line_iter = std.mem.splitSequence(u8, headers, "\r\n");
-        while (line_iter.next()) |line| {
-            if (std.ascii.startsWithIgnoreCase(line, "set-cookie:")) {
-                const val = std.mem.trimLeft(u8, line["set-cookie:".len..], " ");
-                if (std.mem.indexOf(u8, val, "SID=")) |sid_start| {
-                    const sid_val = val[sid_start + 4 ..];
-                    const end = std.mem.indexOfAny(u8, sid_val, ";, ") orelse sid_val.len;
-                    cookie = try self.allocator.dupe(u8, sid_val[0..end]);
-                }
-            }
-        }
-
-        self.allocator.free(raw);
-        return .{ .status = status, .body = body, .cookie = cookie };
     }
 
     // ── JSON parsers ──────────────────────────────────────────────────
 
-    fn parseTorrentList(self: *ApiClient, body: []const u8) ![]TorrentInfo {
-        const parsed = try std.json.parseFromSlice(std.json.Value, self.allocator, body, .{});
+    fn parseTorrentList(arena: Allocator, body: []const u8) ![]TorrentInfo {
+        const parsed = try std.json.parseFromSlice(std.json.Value, arena, body, .{});
         defer parsed.deinit();
 
         const arr = switch (parsed.value) {
@@ -403,7 +335,7 @@ pub const ApiClient = struct {
             else => return &[_]TorrentInfo{},
         };
 
-        var list = try self.allocator.alloc(TorrentInfo, arr.items.len);
+        var list = try arena.alloc(TorrentInfo, arr.items.len);
         for (arr.items, 0..) |item, i| {
             list[i] = extractTorrentInfo(item);
         }
@@ -445,8 +377,8 @@ pub const ApiClient = struct {
         };
     }
 
-    fn parseTransferInfo(self: *ApiClient, body: []const u8) !TransferInfo {
-        const parsed = try std.json.parseFromSlice(std.json.Value, self.allocator, body, .{});
+    fn parseTransferInfo(arena: Allocator, body: []const u8) !TransferInfo {
+        const parsed = try std.json.parseFromSlice(std.json.Value, arena, body, .{});
         defer parsed.deinit();
 
         const obj = switch (parsed.value) {
@@ -465,8 +397,8 @@ pub const ApiClient = struct {
         };
     }
 
-    fn parseTorrentProperties(self: *ApiClient, body: []const u8) !TorrentProperties {
-        const parsed = try std.json.parseFromSlice(std.json.Value, self.allocator, body, .{});
+    fn parseTorrentProperties(arena: Allocator, body: []const u8) !TorrentProperties {
+        const parsed = try std.json.parseFromSlice(std.json.Value, arena, body, .{});
         defer parsed.deinit();
 
         const obj = switch (parsed.value) {
@@ -492,8 +424,8 @@ pub const ApiClient = struct {
         };
     }
 
-    fn parseTorrentFiles(self: *ApiClient, body: []const u8) ![]TorrentFile {
-        const parsed = try std.json.parseFromSlice(std.json.Value, self.allocator, body, .{});
+    fn parseTorrentFiles(arena: Allocator, body: []const u8) ![]TorrentFile {
+        const parsed = try std.json.parseFromSlice(std.json.Value, arena, body, .{});
         defer parsed.deinit();
 
         const arr = switch (parsed.value) {
@@ -501,7 +433,7 @@ pub const ApiClient = struct {
             else => return &[_]TorrentFile{},
         };
 
-        var list = try self.allocator.alloc(TorrentFile, arr.items.len);
+        var list = try arena.alloc(TorrentFile, arr.items.len);
         for (arr.items, 0..) |item, i| {
             const obj = switch (item) {
                 .object => |o| o,
@@ -522,8 +454,8 @@ pub const ApiClient = struct {
         return list;
     }
 
-    fn parseTrackerList(self: *ApiClient, body: []const u8) ![]TrackerEntry {
-        const parsed = try std.json.parseFromSlice(std.json.Value, self.allocator, body, .{});
+    fn parseTrackerList(arena: Allocator, body: []const u8) ![]TrackerEntry {
+        const parsed = try std.json.parseFromSlice(std.json.Value, arena, body, .{});
         defer parsed.deinit();
 
         const arr = switch (parsed.value) {
@@ -531,7 +463,7 @@ pub const ApiClient = struct {
             else => return &[_]TrackerEntry{},
         };
 
-        var list = try self.allocator.alloc(TrackerEntry, arr.items.len);
+        var list = try arena.alloc(TrackerEntry, arr.items.len);
         for (arr.items, 0..) |item, i| {
             const obj = switch (item) {
                 .object => |o| o,
@@ -553,8 +485,8 @@ pub const ApiClient = struct {
         return list;
     }
 
-    fn parsePreferences(self: *ApiClient, body: []const u8) !Preferences {
-        const parsed = try std.json.parseFromSlice(std.json.Value, self.allocator, body, .{});
+    fn parsePreferences(arena: Allocator, body: []const u8) !Preferences {
+        const parsed = try std.json.parseFromSlice(std.json.Value, arena, body, .{});
         defer parsed.deinit();
 
         const obj = switch (parsed.value) {

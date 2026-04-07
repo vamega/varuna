@@ -170,6 +170,10 @@ pub fn build(b: *std.Build) void {
         .target = target,
         .optimize = optimize,
     });
+    const dusty_dep = b.dependency("dusty", .{
+        .target = target,
+        .optimize = optimize,
+    });
     const tui_exe = b.addExecutable(.{
         .name = "varuna-tui",
         .root_module = b.createModule(.{
@@ -179,6 +183,7 @@ pub fn build(b: *std.Build) void {
             .imports = &.{
                 .{ .name = "zigzag", .module = zigzag_dep.module("zigzag") },
                 .{ .name = "zio", .module = zio_dep.module("zio") },
+                .{ .name = "dusty", .module = dusty_dep.module("dusty") },
             },
         }),
     });
