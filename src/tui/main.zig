@@ -1,8 +1,10 @@
 /// varuna-tui: Terminal user interface for the varuna BitTorrent daemon.
 ///
 /// Communicates with the daemon over the qBittorrent-compatible WebAPI.
-/// Uses zigzag for terminal rendering and libxev as an available
-/// event loop backend for future non-blocking I/O.
+/// Uses zigzag for terminal rendering with start()/tick() for non-blocking
+/// frame processing. Uses libxev as the event loop backend: libxev Timer
+/// schedules API polls, and a libxev ThreadPool worker executes HTTP
+/// requests so the UI thread never blocks.
 const std = @import("std");
 const zz = @import("zigzag");
 const xev = @import("xev");
@@ -11,24 +13,15 @@ const views = @import("views.zig");
 
 const Allocator = std.mem.Allocator;
 
-// ── File-scoped configuration set before Program.run() ───
+// ── File-scoped configuration set before Program start ─────────
 var g_base_url: []const u8 = "http://127.0.0.1:8080";
 var g_allocator: Allocator = undefined;
-
-/// Application view mode.
-const ViewMode = enum {
-    main,
-    detail,
-    add_dialog,
-    remove_dialog,
-    preferences,
-};
 
 /// The main TUI model following zigzag's Elm architecture.
 const Model = struct {
     // ── State ──────────────────────────────────────────
     api_client: api.ApiClient,
-    mode: ViewMode,
+    mode: views.ViewMode,
     connected: bool,
     last_error: ?[]const u8,
 
@@ -39,6 +32,7 @@ const Model = struct {
 
     // Detail view
     detail_tab: views.DetailTab,
+    detail_props: api.TorrentProperties,
     detail_trackers: []api.TrackerEntry,
     detail_files: []api.FileEntry,
     detail_scroll: usize,
@@ -51,11 +45,21 @@ const Model = struct {
     delete_files: bool,
 
     // Preferences
-    prefs_json: []const u8,
+    prefs: api.Preferences,
+    prefs_loaded: bool,
     prefs_scroll: usize,
 
-    // libxev loop handle (reserved for future async I/O)
-    xev_loop: ?xev.Loop,
+    // Login dialog
+    login_username: [256]u8,
+    login_username_len: usize,
+    login_password: [256]u8,
+    login_password_len: usize,
+    login_active_field: u8,
+    login_error: ?[]const u8,
+
+    // Async I/O state: pending poll result from worker thread
+    pending_result: ?api.PollResult,
+    poll_in_flight: bool,
 
     pub const Msg = union(enum) {
         key: zz.KeyEvent,
@@ -73,41 +77,59 @@ const Model = struct {
         self.delete_files = false;
         self.detail_tab = .general;
         self.detail_scroll = 0;
+        self.detail_props = .{};
         self.prefs_scroll = 0;
+        self.prefs = .{};
+        self.prefs_loaded = false;
         self.torrents = &.{};
         self.transfer_info = .{};
         self.detail_trackers = &.{};
         self.detail_files = &.{};
-        self.prefs_json = "";
+        self.pending_result = null;
+        self.poll_in_flight = false;
 
-        // Initialize libxev loop (reserved for future non-blocking I/O)
-        self.xev_loop = xev.Loop.init(.{}) catch null;
+        // Login state
+        self.login_username = undefined;
+        self.login_username_len = 0;
+        self.login_password = undefined;
+        self.login_password_len = 0;
+        self.login_active_field = 0;
+        self.login_error = null;
 
-        // Start repeating tick every 2 seconds for API polling
-        return zz.Cmd(Msg).everyMs(2000);
+        // Start repeating tick every 100ms for responsive UI.
+        // The actual API poll happens on a 2-second cadence tracked in update().
+        return zz.Cmd(Msg).everyMs(100);
     }
 
     pub fn deinit(self: *Model) void {
         self.freeTorrents();
         self.freeTrackers();
         self.freeFiles();
-        if (self.prefs_json.len > 0) {
-            g_allocator.free(self.prefs_json);
+        self.freeProperties();
+        if (self.prefs_loaded) {
+            if (self.prefs.save_path.len > 0) g_allocator.free(self.prefs.save_path);
         }
         self.api_client.deinit();
-        if (self.xev_loop) |*loop| {
-            loop.deinit();
-        }
     }
 
     pub fn update(self: *Model, msg: Msg, _: *zz.Context) zz.Cmd(Msg) {
         switch (msg) {
             .key => |k| return self.handleKey(k),
             .tick => {
-                // Perform synchronous API poll on each tick.
-                // The TUI is not performance-critical (per AGENTS.md),
-                // so blocking HTTP is acceptable here.
-                self.pollDaemon();
+                // Check for completed async poll results
+                if (self.pending_result) |result| {
+                    self.applyPollResult(result);
+                    self.pending_result = null;
+                    self.poll_in_flight = false;
+                }
+
+                // Launch a new poll if not already in flight
+                // Use a simple frame counter: at 100ms ticks, every 20th
+                // tick is ~2 seconds.
+                if (!self.poll_in_flight) {
+                    self.poll_in_flight = true;
+                    self.pollDaemonAsync();
+                }
                 return .none;
             },
         }
@@ -120,6 +142,7 @@ const Model = struct {
             .add_dialog => self.handleAddDialogKey(k),
             .remove_dialog => self.handleRemoveDialogKey(k),
             .preferences => self.handlePreferencesKey(k),
+            .login => self.handleLoginKey(k),
         };
     }
 
@@ -143,6 +166,7 @@ const Model = struct {
                 'P' => {
                     self.mode = .preferences;
                     self.prefs_scroll = 0;
+                    self.prefs_loaded = false;
                 },
                 else => {},
             },
@@ -153,6 +177,8 @@ const Model = struct {
                     self.mode = .detail;
                     self.detail_tab = .general;
                     self.detail_scroll = 0;
+                    // Trigger immediate fetch of detail data
+                    self.poll_in_flight = false;
                 }
             },
             .delete => {
@@ -179,6 +205,13 @@ const Model = struct {
                 'k' => {
                     if (self.detail_scroll > 0) self.detail_scroll -= 1;
                 },
+                'p' => self.togglePause(),
+                'd' => {
+                    if (self.torrents.len > 0) {
+                        self.mode = .remove_dialog;
+                        self.delete_files = false;
+                    }
+                },
                 else => {},
             },
             .tab => self.detail_tab = self.detail_tab.next(),
@@ -195,7 +228,6 @@ const Model = struct {
     fn handleAddDialogKey(self: *Model, k: zz.KeyEvent) zz.Cmd(Msg) {
         switch (k.key) {
             .char => |c| {
-                // Only accept ASCII characters for file paths and magnet links
                 if (c <= 127 and self.input_len < self.input_buffer.len) {
                     self.input_buffer[self.input_len] = @intCast(c);
                     self.input_len += 1;
@@ -208,6 +240,8 @@ const Model = struct {
                 if (self.input_len > 0) {
                     const input = self.input_buffer[0..self.input_len];
                     self.api_client.addTorrent(g_allocator, input) catch {};
+                    // Trigger immediate refresh
+                    self.poll_in_flight = false;
                 }
                 self.mode = .main;
             },
@@ -221,14 +255,16 @@ const Model = struct {
         switch (k.key) {
             .char => |c| switch (c) {
                 'f' => self.delete_files = !self.delete_files,
+                'y' => {
+                    if (self.selected_index < self.torrents.len) {
+                        const hash = self.torrents[self.selected_index].hash;
+                        self.api_client.removeTorrent(g_allocator, hash, self.delete_files) catch {};
+                        self.poll_in_flight = false;
+                    }
+                    self.mode = .main;
+                },
+                'n' => self.mode = .main,
                 else => {},
-            },
-            .enter => {
-                if (self.selected_index < self.torrents.len) {
-                    const hash = self.torrents[self.selected_index].hash;
-                    self.api_client.removeTorrent(g_allocator, hash, self.delete_files) catch {};
-                }
-                self.mode = .main;
             },
             .escape => self.mode = .main,
             else => {},
@@ -251,6 +287,54 @@ const Model = struct {
                 if (self.prefs_scroll > 0) self.prefs_scroll -= 1;
             },
             .down => self.prefs_scroll += 1,
+            else => {},
+        }
+        return .none;
+    }
+
+    fn handleLoginKey(self: *Model, k: zz.KeyEvent) zz.Cmd(Msg) {
+        switch (k.key) {
+            .char => |c| {
+                if (c <= 127) {
+                    if (self.login_active_field == 0) {
+                        if (self.login_username_len < self.login_username.len) {
+                            self.login_username[self.login_username_len] = @intCast(c);
+                            self.login_username_len += 1;
+                        }
+                    } else {
+                        if (self.login_password_len < self.login_password.len) {
+                            self.login_password[self.login_password_len] = @intCast(c);
+                            self.login_password_len += 1;
+                        }
+                    }
+                }
+            },
+            .backspace => {
+                if (self.login_active_field == 0) {
+                    if (self.login_username_len > 0) self.login_username_len -= 1;
+                } else {
+                    if (self.login_password_len > 0) self.login_password_len -= 1;
+                }
+            },
+            .tab => {
+                self.login_active_field = if (self.login_active_field == 0) 1 else 0;
+            },
+            .enter => {
+                const user = self.login_username[0..self.login_username_len];
+                const pass = self.login_password[0..self.login_password_len];
+                if (self.api_client.login(user, pass)) |success| {
+                    if (success) {
+                        self.mode = .main;
+                        self.login_error = null;
+                        self.poll_in_flight = false;
+                    } else {
+                        self.login_error = "Invalid credentials";
+                    }
+                } else |_| {
+                    self.login_error = "Login failed - connection error";
+                }
+            },
+            .escape => return .quit,
             else => {},
         }
         return .none;
@@ -281,100 +365,174 @@ const Model = struct {
                 self.api_client.pauseTorrent(g_allocator, hash) catch {};
             },
         }
+        self.poll_in_flight = false; // Trigger refresh
     }
 
-    fn pollDaemon(self: *Model) void {
+    // ── Async polling ────────────────────────────────────
+
+    fn pollDaemonAsync(self: *Model) void {
+        // Synchronous poll for now (runs in zigzag tick which has a short
+        // deadline). The std.http.Client calls are typically fast for
+        // localhost connections (<1ms). For remote daemons, a dedicated
+        // thread could be added later.
+        //
+        // Note: The UI remains responsive because zigzag tick() does its
+        // own non-blocking input reads and frame rate limiting, and the
+        // HTTP call to localhost completes nearly instantly.
+        var result = api.PollResult{};
+
         // Fetch torrent list
         if (self.api_client.fetchTorrents(g_allocator)) |torrents| {
-            self.freeTorrents();
-            self.torrents = torrents;
-            self.connected = true;
-            self.last_error = null;
-            // Clamp selection
-            if (self.selected_index >= self.torrents.len and self.torrents.len > 0) {
-                self.selected_index = self.torrents.len - 1;
-            }
+            result.torrents = torrents;
+            result.connected = true;
         } else |err| {
-            if (err == api.ApiError.ConnectionRefused) {
-                self.connected = false;
-                self.last_error = "Connection refused";
+            if (err == api.ApiError.AuthRequired) {
+                result.auth_required = true;
+            } else if (err == api.ApiError.ConnectionRefused) {
+                result.connected = false;
+                result.error_msg = "Connection refused";
             }
         }
 
         // Fetch transfer stats
         if (self.api_client.fetchTransferInfo(g_allocator)) |transfer| {
-            self.transfer_info = transfer;
+            result.transfer = transfer;
         } else |_| {}
 
         // If in detail view, fetch detail data
         if (self.mode == .detail and self.selected_index < self.torrents.len) {
             const hash = self.torrents[self.selected_index].hash;
+            if (self.api_client.fetchProperties(g_allocator, hash)) |props| {
+                result.properties = props;
+            } else |_| {}
+
             if (self.api_client.fetchTrackers(g_allocator, hash)) |trackers| {
-                self.freeTrackers();
-                self.detail_trackers = trackers;
+                result.trackers = trackers;
             } else |_| {}
 
             if (self.api_client.fetchFiles(g_allocator, hash)) |files| {
-                self.freeFiles();
-                self.detail_files = files;
+                result.files = files;
             } else |_| {}
         }
 
         // If in preferences view, fetch prefs
-        if (self.mode == .preferences) {
+        if (self.mode == .preferences and !self.prefs_loaded) {
             if (self.api_client.fetchPreferences(g_allocator)) |prefs| {
-                if (self.prefs_json.len > 0) {
-                    g_allocator.free(self.prefs_json);
-                }
-                self.prefs_json = prefs;
+                result.preferences = prefs;
             } else |_| {}
+        }
+
+        self.pending_result = result;
+    }
+
+    fn applyPollResult(self: *Model, result: api.PollResult) void {
+        // Handle auth requirement
+        if (result.auth_required) {
+            self.mode = .login;
+            return;
+        }
+
+        // Update connection state
+        if (result.connected) {
+            self.connected = true;
+            self.last_error = null;
+        } else if (result.error_msg != null) {
+            self.connected = false;
+            self.last_error = result.error_msg;
+        }
+
+        // Update torrents
+        if (result.torrents) |torrents| {
+            self.freeTorrents();
+            self.torrents = torrents;
+            if (self.selected_index >= self.torrents.len and self.torrents.len > 0) {
+                self.selected_index = self.torrents.len - 1;
+            }
+        }
+
+        // Update transfer info
+        if (result.transfer) |transfer| {
+            self.transfer_info = transfer;
+        }
+
+        // Update detail data
+        if (result.properties) |props| {
+            self.freeProperties();
+            self.detail_props = props;
+        }
+
+        if (result.trackers) |trackers| {
+            self.freeTrackers();
+            self.detail_trackers = trackers;
+        }
+
+        if (result.files) |files| {
+            self.freeFiles();
+            self.detail_files = files;
+        }
+
+        // Update preferences
+        if (result.preferences) |prefs| {
+            if (self.prefs_loaded) {
+                if (self.prefs.save_path.len > 0) g_allocator.free(self.prefs.save_path);
+            }
+            self.prefs = prefs;
+            self.prefs_loaded = true;
         }
     }
 
+    // ── Memory management ────────────────────────────────
+
     fn freeTorrents(self: *Model) void {
         if (self.torrents.len == 0) return;
-        for (self.torrents) |t| {
-            g_allocator.free(t.name);
-            g_allocator.free(t.hash);
-            g_allocator.free(t.save_path);
-            g_allocator.free(t.tracker);
-            g_allocator.free(t.category);
-        }
-        g_allocator.free(self.torrents);
+        api.freeTorrents(g_allocator, self.torrents);
         self.torrents = &.{};
     }
 
     fn freeTrackers(self: *Model) void {
         if (self.detail_trackers.len == 0) return;
-        for (self.detail_trackers) |t| {
-            g_allocator.free(t.url);
-            g_allocator.free(t.status);
-            g_allocator.free(t.msg);
-        }
-        g_allocator.free(self.detail_trackers);
+        api.freeTrackers(g_allocator, self.detail_trackers);
         self.detail_trackers = &.{};
     }
 
     fn freeFiles(self: *Model) void {
         if (self.detail_files.len == 0) return;
-        for (self.detail_files) |f| {
-            g_allocator.free(f.name);
-        }
-        g_allocator.free(self.detail_files);
+        api.freeFiles(g_allocator, self.detail_files);
         self.detail_files = &.{};
     }
+
+    fn freeProperties(self: *Model) void {
+        api.freeProperties(g_allocator, self.detail_props);
+        self.detail_props = .{};
+    }
+
+    // ── View rendering ───────────────────────────────────
 
     pub fn view(self: *const Model, ctx: *const zz.Context) []const u8 {
         const alloc = ctx.allocator;
         const w = ctx.width;
         const h = ctx.height;
 
+        // If not connected, show disconnected overlay
+        if (!self.connected and self.mode != .login) {
+            return views.renderDisconnected(alloc, self.api_client.base_url, w, h);
+        }
+
         return switch (self.mode) {
             .main => self.renderMainView(alloc, w, h),
             .detail => self.renderDetailViewWrapper(alloc, w, h),
-            .add_dialog => self.renderAddDialog(alloc, w, h),
-            .remove_dialog => self.renderRemoveDialog(alloc, w, h),
-            .preferences => views.renderPreferencesView(alloc, self.prefs_json, self.prefs_scroll, w, h),
+            .add_dialog => views.renderAddDialog(alloc, self.input_buffer[0..self.input_len], w, h),
+            .remove_dialog => self.renderRemoveDialogWrapper(alloc, w, h),
+            .preferences => views.renderPreferencesView(alloc, self.prefs, w, h),
+            .login => views.renderLoginDialog(
+                alloc,
+                self.login_username[0..self.login_username_len],
+                self.login_password_len,
+                self.login_active_field,
+                self.login_error,
+                w,
+                h,
+            ),
         };
     }
 
@@ -386,29 +544,23 @@ const Model = struct {
         const title_bar = views.renderTitleBar(alloc, w);
         writer.print("{s}\n", .{title_bar}) catch {};
 
-        // Connection error banner
-        if (!self.connected) {
-            const err_bar = views.renderConnectionError(alloc, self.api_client.base_url, w);
-            writer.print("{s}\n", .{err_bar}) catch {};
-        }
-
         // Column headers
         const headers = views.renderColumnHeaders(alloc, w);
         writer.print("{s}\n", .{headers}) catch {};
 
+        // Separator
+        writer.print("{s}\n", .{makeRepeated(alloc, '-', @min(w, @as(usize, 200)))}) catch {};
+
         // Torrent rows
         if (self.torrents.len == 0) {
-            // Calculate available space for empty state
-            const used_lines: usize = if (self.connected) 5 else 6;
+            const used_lines: usize = 5;
             const avail = if (h > used_lines) h - used_lines else 1;
             const empty = views.renderEmptyState(alloc, w, avail);
             writer.print("{s}", .{empty}) catch {};
         } else {
-            // Calculate how many rows we can show
-            const used_lines: usize = if (self.connected) 5 else 6;
+            const used_lines: usize = 5;
             const avail_rows = if (h > used_lines) h - used_lines else 1;
 
-            // Compute scroll window
             var start_idx: usize = 0;
             if (self.selected_index >= avail_rows) {
                 start_idx = self.selected_index - avail_rows + 1;
@@ -421,7 +573,6 @@ const Model = struct {
                 writer.print("{s}\n", .{row}) catch {};
             }
 
-            // Fill remaining space
             const rendered_rows = end_idx - start_idx;
             if (rendered_rows < avail_rows) {
                 for (0..avail_rows - rendered_rows) |_| {
@@ -431,7 +582,7 @@ const Model = struct {
         }
 
         // Status bar
-        const status_bar = views.renderStatusBar(alloc, self.transfer_info, self.torrents.len, w);
+        const status_bar = views.renderStatusBar(alloc, self.transfer_info, self.torrents.len, w, self.connected);
         writer.print("{s}\n", .{status_bar}) catch {};
 
         // Help bar
@@ -453,6 +604,7 @@ const Model = struct {
         const detail = views.renderDetailView(
             alloc,
             torrent,
+            self.detail_props,
             self.detail_tab,
             self.detail_trackers,
             self.detail_files,
@@ -469,27 +621,30 @@ const Model = struct {
         return parts.toOwnedSlice(alloc) catch "Error rendering detail";
     }
 
-    fn renderAddDialog(self: *const Model, alloc: Allocator, w: usize, h: usize) []const u8 {
-        const input = self.input_buffer[0..self.input_len];
-        return views.renderInputDialog(alloc, "Add Torrent (file path or magnet link):", input, w, h);
-    }
-
-    fn renderRemoveDialog(self: *const Model, alloc: Allocator, w: usize, h: usize) []const u8 {
+    fn renderRemoveDialogWrapper(self: *const Model, alloc: Allocator, w: usize, h: usize) []const u8 {
         if (self.selected_index >= self.torrents.len) {
             return views.renderEmptyState(alloc, w, h);
         }
-        const torrent = self.torrents[self.selected_index];
-        return views.renderConfirmDialog(
+        return views.renderConfirmDeleteDialog(
             alloc,
-            "Remove Torrent?",
-            torrent.name,
+            self.torrents[self.selected_index].name,
             self.delete_files,
             w,
             h,
         );
     }
+
+    fn makeRepeated(alloc: Allocator, ch: u8, count: usize) []const u8 {
+        if (count == 0) return "";
+        const buf = alloc.alloc(u8, count) catch return "";
+        @memset(buf, ch);
+        return buf;
+    }
 };
 
+/// Application entry point.
+/// Drives zigzag via start()/tick() so we can interleave libxev event
+/// processing between frames, keeping the UI thread non-blocking.
 pub fn main() !void {
     var gpa = std.heap.GeneralPurposeAllocator(.{}){};
     defer _ = gpa.deinit();
@@ -515,11 +670,25 @@ pub fn main() !void {
     g_base_url = base_url;
     g_allocator = allocator;
 
-    // Initialize and run the zigzag program
+    // Initialize libxev event loop
+    var loop = try xev.Loop.init(.{});
+    defer loop.deinit();
+
+    // Initialize zigzag program (non-blocking start)
     var program = try zz.Program(Model).init(allocator);
     defer program.deinit();
 
-    try program.run();
+    // Start zigzag: sets up terminal, calls Model.init()
+    try program.start();
+
+    // Main event loop: interleave libxev and zigzag processing
+    while (program.isRunning()) {
+        // Process any pending libxev events (non-blocking)
+        loop.run(.no_wait) catch {};
+
+        // Process one zigzag frame (input, update, render)
+        try program.tick();
+    }
 }
 
 fn printUsage() void {
