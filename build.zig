@@ -161,12 +161,41 @@ pub fn build(b: *std.Build) void {
     });
     b.installArtifact(tools_exe);
 
+    // ── varuna-tui (terminal UI) ─────────────────────────
+    const zigzag_dep = b.dependency("zigzag", .{
+        .target = target,
+        .optimize = optimize,
+    });
+    const libxev_dep = b.dependency("libxev", .{
+        .target = target,
+        .optimize = optimize,
+    });
+    const tui_exe = b.addExecutable(.{
+        .name = "varuna-tui",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/tui/main.zig"),
+            .target = target,
+            .optimize = optimize,
+            .imports = &.{
+                .{ .name = "zigzag", .module = zigzag_dep.module("zigzag") },
+                .{ .name = "xev", .module = libxev_dep.module("xev") },
+            },
+        }),
+    });
+    b.installArtifact(tui_exe);
+
     // ── Run targets ───────────────────────────────────────
     const run_step = b.step("run", "Run the varuna daemon");
     const run_cmd = b.addRunArtifact(daemon_exe);
     run_cmd.step.dependOn(b.getInstallStep());
     if (b.args) |args| run_cmd.addArgs(args);
     run_step.dependOn(&run_cmd.step);
+
+    const run_tui_step = b.step("run-tui", "Run the varuna TUI client");
+    const run_tui_cmd = b.addRunArtifact(tui_exe);
+    run_tui_cmd.step.dependOn(b.getInstallStep());
+    if (b.args) |args| run_tui_cmd.addArgs(args);
+    run_tui_step.dependOn(&run_tui_cmd.step);
 
     // ── Tests ─────────────────────────────────────────────
     const mod_tests = b.addTest(.{ .root_module = varuna_mod });
