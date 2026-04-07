@@ -52,6 +52,8 @@ pub const OpType = enum(u8) {
     api_accept = 13,
     api_recv = 14,
     api_send = 15,
+    udp_tracker_send = 16,
+    udp_tracker_recv = 17,
 };
 
 pub const OpData = struct {
@@ -717,6 +719,9 @@ pub const EventLoop = struct {
 
     // Tracker executor (shares the event loop's ring)
     tracker_executor: ?*@import("../daemon/tracker_executor.zig").TrackerExecutor = null,
+
+    // UDP tracker executor (shares the event loop's ring, BEP 15)
+    udp_tracker_executor: ?*@import("../daemon/udp_tracker_executor.zig").UdpTrackerExecutor = null,
 
     // Complete pieces bitfield (for seeding -- which pieces we can serve)
     complete_pieces: ?*const Bitfield = null,
@@ -1590,6 +1595,7 @@ pub const EventLoop = struct {
         utp_handler.utpTick(self);
         dht_handler.dhtTick(self);
         if (self.tracker_executor) |te| te.tick();
+        if (self.udp_tracker_executor) |ute| ute.tick();
 
         // Flush any queued SQEs before waiting
         _ = self.ring.submit() catch |err| {
@@ -1835,6 +1841,9 @@ pub const EventLoop = struct {
             .api_accept => if (self.api_server) |srv| srv.handleAcceptCqe(cqe),
             .api_recv => if (self.api_server) |srv| srv.handleRecvCqe(op.slot, op.context, cqe),
             .api_send => if (self.api_server) |srv| srv.handleSendCqe(op.slot, op.context, cqe),
+            .udp_tracker_send, .udp_tracker_recv => {
+                if (self.udp_tracker_executor) |ute| ute.dispatchCqe(cqe);
+            },
         }
     }
 

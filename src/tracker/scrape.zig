@@ -107,79 +107,13 @@ pub fn scrapeHttpWithClient(
 
 /// Perform a UDP scrape request (BEP 15, action=2) via blocking posix I/O.
 /// Runs on background threads where blocking is fine.
+/// Delegates to the unified UDP tracker implementation in udp.zig.
 pub fn scrapeUdp(
     allocator: std.mem.Allocator,
     announce_url: []const u8,
     info_hash: [20]u8,
 ) !ScrapeResult {
-    const posix = std.posix;
-    const parsed = udp_mod.parseUdpUrl(announce_url) orelse return error.InvalidTrackerUrl;
-
-    const address = try udp_mod.resolveAddress(allocator, parsed.host, parsed.port);
-
-    const fd = try posix.socket(
-        address.any.family,
-        posix.SOCK.DGRAM | posix.SOCK.CLOEXEC,
-        posix.IPPROTO.UDP,
-    );
-    defer posix.close(fd);
-
-    try posix.connect(fd, &address.any, address.getOsSockLen());
-
-    // Step 1: UDP connect handshake
-    const protocol_id: u64 = 0x41727101980;
-    const action_connect: u32 = 0;
-    const action_scrape: u32 = 2;
-
-    const transaction_id = generateTransactionId();
-    var connect_buf: [16]u8 = undefined;
-    std.mem.writeInt(u64, connect_buf[0..8], protocol_id, .big);
-    std.mem.writeInt(u32, connect_buf[8..12], action_connect, .big);
-    std.mem.writeInt(u32, connect_buf[12..16], transaction_id, .big);
-
-    try sendAll(fd, &connect_buf);
-
-    var connect_resp: [16]u8 = undefined;
-    const connect_n = try posix.recv(fd, &connect_resp, 0);
-    if (connect_n < 16) return error.InvalidTrackerResponse;
-
-    const resp_action = std.mem.readInt(u32, connect_resp[0..4], .big);
-    const resp_txid = std.mem.readInt(u32, connect_resp[4..8], .big);
-    if (resp_action != action_connect) return error.InvalidTrackerResponse;
-    if (resp_txid != transaction_id) return error.TransactionIdMismatch;
-
-    const connection_id = std.mem.readInt(u64, connect_resp[8..16], .big);
-
-    // Step 2: Scrape request (8 + 4 + 4 + 20 = 36 bytes for single hash)
-    const scrape_txid = generateTransactionId();
-    var scrape_buf: [36]u8 = undefined;
-    std.mem.writeInt(u64, scrape_buf[0..8], connection_id, .big);
-    std.mem.writeInt(u32, scrape_buf[8..12], action_scrape, .big);
-    std.mem.writeInt(u32, scrape_buf[12..16], scrape_txid, .big);
-    @memcpy(scrape_buf[16..36], info_hash[0..]);
-
-    try sendAll(fd, &scrape_buf);
-
-    // Receive scrape response: 8 header + 12 per hash = 20 bytes minimum
-    var resp_buf: [128]u8 = undefined;
-    const resp_n = try posix.recv(fd, &resp_buf, 0);
-    if (resp_n < 20) return error.InvalidTrackerResponse;
-
-    const scrape_resp_action = std.mem.readInt(u32, resp_buf[0..4], .big);
-    const scrape_resp_txid = std.mem.readInt(u32, resp_buf[4..8], .big);
-    if (scrape_resp_action != action_scrape) return error.InvalidTrackerResponse;
-    if (scrape_resp_txid != scrape_txid) return error.TransactionIdMismatch;
-
-    // Parse first (and only) hash result: seeders(4) + completed(4) + leechers(4)
-    const seeders = std.mem.readInt(u32, resp_buf[8..12], .big);
-    const completed = std.mem.readInt(u32, resp_buf[12..16], .big);
-    const leechers = std.mem.readInt(u32, resp_buf[16..20], .big);
-
-    return .{
-        .complete = seeders,
-        .incomplete = leechers,
-        .downloaded = completed,
-    };
+    return udp_mod.scrapeViaUdp(allocator, announce_url, info_hash);
 }
 
 /// Scrape a tracker, auto-selecting HTTP or UDP based on the announce URL scheme.
@@ -293,22 +227,6 @@ fn isUnreserved(byte: u8) bool {
         'A'...'Z', 'a'...'z', '0'...'9', '-', '.', '_', '~' => true,
         else => false,
     };
-}
-
-fn generateTransactionId() u32 {
-    var buf: [4]u8 = undefined;
-    std.crypto.random.bytes(&buf);
-    return std.mem.readInt(u32, &buf, .big);
-}
-
-/// Send the entire buffer via blocking posix.send, looping on partial writes.
-fn sendAll(fd: std.posix.fd_t, buffer: []const u8) !void {
-    var total: usize = 0;
-    while (total < buffer.len) {
-        const n = try std.posix.send(fd, buffer[total..], 0);
-        if (n == 0) return error.ConnectionResetByPeer;
-        total += n;
-    }
 }
 
 // ── Tests ────────────────────────────────────────────────

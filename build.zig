@@ -202,6 +202,17 @@ pub fn build(b: *std.Build) void {
     const run_private_tracker_tests = b.addRunArtifact(private_tracker_tests);
     test_step.dependOn(&run_private_tracker_tests.step);
 
+    const udp_tracker_tests = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("tests/udp_tracker_test.zig"),
+            .target = target,
+            .optimize = optimize,
+            .imports = &varuna_import,
+        }),
+    });
+    const run_udp_tracker_tests = b.addRunArtifact(udp_tracker_tests);
+    test_step.dependOn(&run_udp_tracker_tests.step);
+
     // ── Soak test (long-running resource leak detection) ──
     const soak_exe = b.addExecutable(.{
         .name = "varuna-soak-test",

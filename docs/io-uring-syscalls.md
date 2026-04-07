@@ -27,6 +27,8 @@ This document tracks which syscalls the `varuna` **daemon** uses, which are rout
 | timeout | `IORING_OP_TIMEOUT` | `Ring.timeout` -- native io_uring timers | Done |
 | linked timeout | `IORING_OP_LINK_TIMEOUT` | `Ring.link_timeout` -- per-operation deadlines | Done |
 | fixed buffers | `IORING_OP_READ_FIXED` / `WRITE_FIXED` | `Ring.pread_fixed` / `Ring.pwrite_fixed` with registered buffer pool | Done |
+| `sendmsg()` | `IORING_OP_SENDMSG` | uTP handler, DHT handler, UDP tracker executor, API server | Done |
+| `recvmsg()` | `IORING_OP_RECVMSG` | uTP handler, DHT handler, UDP tracker executor | Done |
 
 ### Remaining conventional I/O (not hot path)
 
@@ -52,8 +54,8 @@ This document tracks which syscalls the `varuna` **daemon** uses, which are rout
 | Syscall | io_uring Op | Kernel | Potential use in Varuna |
 |---------|------------|--------|------------------------|
 | `splice()` | `IORING_OP_SPLICE` | 5.7 | Zero-copy between fds |
-| `sendmsg()` | `IORING_OP_SENDMSG` | 5.3 | Scatter/gather for DHT UDP |
-| `recvmsg()` | `IORING_OP_RECVMSG` | 5.3 | Scatter/gather for DHT UDP |
+| ~~`sendmsg()`~~ | ~~`IORING_OP_SENDMSG`~~ | ~~5.3~~ | ~~Scatter/gather for DHT UDP~~ Done: uTP, DHT, UDP tracker, API vectored send |
+| ~~`recvmsg()`~~ | ~~`IORING_OP_RECVMSG`~~ | ~~5.3~~ | ~~Scatter/gather for DHT UDP~~ Done: uTP, DHT, UDP tracker |
 | `setsockopt()` | `IORING_OP_SETSOCKOPT` | 6.7 | Socket buffer sizes, TCP options |
 | `getsockopt()` | `IORING_OP_GETSOCKOPT` | 6.7 | Reading socket state |
 | `epoll_ctl()` | `IORING_OP_EPOLL_CTL` | 5.6 | Managing fd watch sets (unlikely needed if io_uring is primary) |
