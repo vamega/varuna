@@ -4,6 +4,8 @@
 /// expected by WebUI clients such as qui (autobrr/qui) and Flood.
 const std = @import("std");
 const TorrentState = @import("../daemon/torrent_session.zig").State;
+const TorrentStats = @import("../daemon/torrent_session.zig").Stats;
+const json_mod = @import("json.zig");
 
 /// Map Varuna's internal torrent state to qBittorrent-compatible state strings.
 /// qui and Flood read these values to determine torrent status, icon, and label.
@@ -77,6 +79,117 @@ pub fn formatInfoHashV2(v2: ?[32]u8) [64]u8 {
         return std.fmt.bytesToHex(hash, .lower);
     }
     return [_]u8{'0'} ** 64; // should not be used when null
+}
+
+/// Serialize a torrent stats object as a JSON object. Used by both
+/// the /torrents/info endpoint (handlers.zig) and /sync/maindata (sync.zig).
+///
+/// When `include_partial_seed` is true, the "partial_seed" field is included
+/// in the output (required by /torrents/info but not by /sync/maindata).
+pub fn serializeTorrentJson(allocator: std.mem.Allocator, json: *std.ArrayList(u8), stat: TorrentStats, include_partial_seed: bool) !void {
+    const esc = json_mod.jsonSafe;
+    const qbt_state = torrentStateString(stat.state, stat.progress);
+    const now = std.time.timestamp();
+    const time_active: i64 = now - stat.added_on;
+    const amount_left: u64 = if (stat.total_size > stat.bytes_downloaded) stat.total_size - stat.bytes_downloaded else 0;
+    const completion_on: i64 = if (stat.progress >= 1.0) stat.added_on else -1;
+
+    // Build content_path and magnet_uri
+    const content_path = buildContentPath(allocator, stat.save_path, stat.name) catch stat.save_path;
+    defer if (content_path.ptr != stat.save_path.ptr) allocator.free(content_path);
+
+    const magnet_uri = buildMagnetUri(allocator, &stat.info_hash_hex, stat.name, stat.tracker) catch "";
+    defer if (magnet_uri.len > 0) allocator.free(magnet_uri);
+
+    const v2_hex = if (stat.info_hash_v2 != null) formatInfoHashV2(stat.info_hash_v2) else [_]u8{0} ** 64;
+    const v2_str: []const u8 = if (stat.info_hash_v2 != null) &v2_hex else "";
+
+    // Split into two print calls to stay under the 32-argument limit.
+    try json.print(
+        allocator,
+        "{{\"name\":\"{f}\",\"hash\":\"{s}\",\"infohash_v1\":\"{s}\",\"infohash_v2\":\"{s}\",\"state\":\"{s}\",\"size\":{},\"total_size\":{},\"progress\":{d:.4},\"dlspeed\":{},\"upspeed\":{},\"num_seeds\":{},\"num_leechs\":{},\"num_complete\":{},\"num_incomplete\":{},\"added_on\":{},\"completion_on\":{},\"save_path\":\"{f}\",\"content_path\":\"{f}\",\"download_path\":\"\",\"pieces_have\":{},\"pieces_num\":{},\"dl_limit\":{},\"up_limit\":{},\"eta\":{},\"ratio\":{d:.4},\"seq_dl\":{s},\"private\":{s}",
+        .{
+            esc(stat.name),
+            stat.info_hash_hex,
+            stat.info_hash_hex,
+            v2_str,
+            qbt_state,
+            stat.total_size,
+            stat.total_size,
+            stat.progress,
+            stat.download_speed,
+            stat.upload_speed,
+            stat.scrape_complete,
+            stat.peers_connected,
+            stat.scrape_complete,
+            stat.scrape_incomplete,
+            stat.added_on,
+            completion_on,
+            esc(stat.save_path),
+            esc(content_path),
+            stat.pieces_have,
+            stat.pieces_total,
+            stat.dl_limit,
+            stat.ul_limit,
+            stat.eta,
+            stat.ratio,
+            @as([]const u8, if (stat.sequential_download) "true" else "false"),
+            @as([]const u8, if (stat.is_private) "true" else "false"),
+        },
+    );
+
+    if (include_partial_seed) {
+        try json.print(
+            allocator,
+            ",\"f_l_piece_prio\":false,\"force_start\":false,\"super_seeding\":{s},\"partial_seed\":{s},\"auto_tmm\":false,\"category\":\"{f}\",\"tags\":\"{f}\",\"tracker\":\"{f}\",\"trackers_count\":{},\"amount_left\":{},\"completed\":{},\"downloaded\":{},\"downloaded_session\":{},\"uploaded\":{},\"uploaded_session\":{},\"time_active\":{},\"seeding_time\":{},\"last_activity\":{},\"seen_complete\":-1,\"priority\":{},\"availability\":-1,\"max_ratio\":-1,\"max_seeding_time\":-1,\"ratio_limit\":{d:.4},\"seeding_time_limit\":{},\"popularity\":0,\"magnet_uri\":\"{f}\",\"reannounce\":0}}",
+            .{
+                @as([]const u8, if (stat.super_seeding) "true" else "false"),
+                @as([]const u8, if (stat.partial_seed) "true" else "false"),
+                esc(stat.category),
+                esc(stat.tags),
+                esc(stat.tracker),
+                stat.trackers_count,
+                amount_left,
+                stat.bytes_downloaded,
+                stat.bytes_downloaded,
+                stat.bytes_downloaded,
+                stat.bytes_uploaded,
+                stat.bytes_uploaded,
+                time_active,
+                stat.seeding_time,
+                now,
+                stat.queue_position,
+                stat.ratio_limit,
+                stat.seeding_time_limit,
+                esc(magnet_uri),
+            },
+        );
+    } else {
+        try json.print(
+            allocator,
+            ",\"f_l_piece_prio\":false,\"force_start\":false,\"super_seeding\":{s},\"auto_tmm\":false,\"category\":\"{f}\",\"tags\":\"{f}\",\"tracker\":\"{f}\",\"trackers_count\":{},\"amount_left\":{},\"completed\":{},\"downloaded\":{},\"downloaded_session\":{},\"uploaded\":{},\"uploaded_session\":{},\"time_active\":{},\"seeding_time\":{},\"last_activity\":{},\"seen_complete\":-1,\"priority\":{},\"availability\":-1,\"max_ratio\":-1,\"max_seeding_time\":-1,\"ratio_limit\":{d:.4},\"seeding_time_limit\":{},\"popularity\":0,\"magnet_uri\":\"{f}\",\"reannounce\":0}}",
+            .{
+                @as([]const u8, if (stat.super_seeding) "true" else "false"),
+                esc(stat.category),
+                esc(stat.tags),
+                esc(stat.tracker),
+                stat.trackers_count,
+                amount_left,
+                stat.bytes_downloaded,
+                stat.bytes_downloaded,
+                stat.bytes_downloaded,
+                stat.bytes_uploaded,
+                stat.bytes_uploaded,
+                time_active,
+                stat.seeding_time,
+                now,
+                stat.queue_position,
+                stat.ratio_limit,
+                stat.seeding_time_limit,
+                esc(magnet_uri),
+            },
+        );
+    }
 }
 
 // ── Tests ─────────────────────────────────────────────────

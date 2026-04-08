@@ -153,27 +153,10 @@ pub const ApiHandler = struct {
     }
 
     fn handleTransferInfo(self: *const ApiHandler, allocator: std.mem.Allocator) server.Response {
-        const stats = self.session_manager.getAllStats(allocator) catch
+        const info = self.session_manager.getTransferInfo(allocator) catch
             return .{ .status = 500, .body = "{\"error\":\"internal\"}" };
-        defer allocator.free(stats);
 
-        var total_dl_speed: u64 = 0;
-        var total_ul_speed: u64 = 0;
-        var total_dl_data: u64 = 0;
-        var total_ul_data: u64 = 0;
-        for (stats) |stat| {
-            total_dl_speed += stat.download_speed;
-            total_ul_speed += stat.upload_speed;
-            total_dl_data += stat.bytes_downloaded;
-            total_ul_data += stat.bytes_uploaded;
-        }
-
-        const el = self.session_manager.shared_event_loop;
-        const dl_limit: u64 = if (el) |e| e.getGlobalDlLimit() else 0;
-        const ul_limit: u64 = if (el) |e| e.getGlobalUlLimit() else 0;
-        const dht_nodes: usize = if (el) |e| e.getDhtNodeCount() else 0;
-
-        const body = std.fmt.allocPrint(allocator, "{{\"connection_status\":\"connected\",\"dht_nodes\":{},\"dl_info_speed\":{},\"up_info_speed\":{},\"dl_info_data\":{},\"up_info_data\":{},\"dl_rate_limit\":{},\"up_rate_limit\":{}}}", .{ dht_nodes, total_dl_speed, total_ul_speed, total_dl_data, total_ul_data, dl_limit, ul_limit }) catch
+        const body = std.fmt.allocPrint(allocator, "{{\"connection_status\":\"connected\",\"dht_nodes\":{},\"dl_info_speed\":{},\"up_info_speed\":{},\"dl_info_data\":{},\"up_info_data\":{},\"dl_rate_limit\":{},\"up_rate_limit\":{}}}", .{ info.dht_nodes, info.dl_speed, info.ul_speed, info.dl_data, info.ul_data, info.dl_limit, info.ul_limit }) catch
             return .{ .status = 500, .body = "{\"error\":\"internal\"}" };
         return .{ .body = body, .owned_body = body };
     }
@@ -1621,87 +1604,8 @@ pub const ApiHandler = struct {
 };
 
 fn serializeTorrentInfo(allocator: std.mem.Allocator, json: *std.ArrayList(u8), stat: TorrentSession.Stats) !void {
-    const esc = json_mod.jsonSafe;
-    const qbt_state = compat.torrentStateString(stat.state, stat.progress);
-    const now = std.time.timestamp();
-    const time_active: i64 = now - stat.added_on;
-    const amount_left: u64 = if (stat.total_size > stat.bytes_downloaded) stat.total_size - stat.bytes_downloaded else 0;
-    const completion_on: i64 = if (stat.progress >= 1.0) stat.added_on else -1;
-
-    // Build content_path: save_path + "/" + name for the full path
-    const content_path = buildContentPath(allocator, stat.save_path, stat.name) catch stat.save_path;
-    defer if (content_path.ptr != stat.save_path.ptr) allocator.free(content_path);
-
-    // Build magnet URI: magnet:?xt=urn:btih:<hex>&dn=<name>&tr=<tracker>
-    const magnet_uri = buildMagnetUri(allocator, &stat.info_hash_hex, stat.name, stat.tracker) catch "";
-    defer if (magnet_uri.len > 0) allocator.free(magnet_uri);
-
-    // Split into two print calls to stay under the 32-argument limit.
-    const v2_hex = if (stat.info_hash_v2 != null) compat.formatInfoHashV2(stat.info_hash_v2) else [_]u8{0} ** 64;
-    const v2_str: []const u8 = if (stat.info_hash_v2 != null) &v2_hex else "";
-    try json.print(
-        allocator,
-        "{{\"name\":\"{f}\",\"hash\":\"{s}\",\"infohash_v1\":\"{s}\",\"infohash_v2\":\"{s}\",\"state\":\"{s}\",\"size\":{},\"total_size\":{},\"progress\":{d:.4},\"dlspeed\":{},\"upspeed\":{},\"num_seeds\":{},\"num_leechs\":{},\"num_complete\":{},\"num_incomplete\":{},\"added_on\":{},\"completion_on\":{},\"save_path\":\"{f}\",\"content_path\":\"{f}\",\"download_path\":\"\",\"pieces_have\":{},\"pieces_num\":{},\"dl_limit\":{},\"up_limit\":{},\"eta\":{},\"ratio\":{d:.4},\"seq_dl\":{s},\"private\":{s}",
-        .{
-            esc(stat.name),
-            stat.info_hash_hex,
-            stat.info_hash_hex,
-            v2_str,
-            qbt_state,
-            stat.total_size,
-            stat.total_size,
-            stat.progress,
-            stat.download_speed,
-            stat.upload_speed,
-            stat.scrape_complete,
-            stat.peers_connected,
-            stat.scrape_complete,
-            stat.scrape_incomplete,
-            stat.added_on,
-            completion_on,
-            esc(stat.save_path),
-            esc(content_path),
-            stat.pieces_have,
-            stat.pieces_total,
-            stat.dl_limit,
-            stat.ul_limit,
-            stat.eta,
-            stat.ratio,
-            @as([]const u8, if (stat.sequential_download) "true" else "false"),
-            @as([]const u8, if (stat.is_private) "true" else "false"),
-        },
-    );
-
-    try json.print(
-        allocator,
-        ",\"f_l_piece_prio\":false,\"force_start\":false,\"super_seeding\":{s},\"partial_seed\":{s},\"auto_tmm\":false,\"category\":\"{f}\",\"tags\":\"{f}\",\"tracker\":\"{f}\",\"trackers_count\":{},\"amount_left\":{},\"completed\":{},\"downloaded\":{},\"downloaded_session\":{},\"uploaded\":{},\"uploaded_session\":{},\"time_active\":{},\"seeding_time\":{},\"last_activity\":{},\"seen_complete\":-1,\"priority\":{},\"availability\":-1,\"max_ratio\":-1,\"max_seeding_time\":-1,\"ratio_limit\":{d:.4},\"seeding_time_limit\":{},\"popularity\":0,\"magnet_uri\":\"{f}\",\"reannounce\":0}}",
-        .{
-            @as([]const u8, if (stat.super_seeding) "true" else "false"),
-            @as([]const u8, if (stat.partial_seed) "true" else "false"),
-            esc(stat.category),
-            esc(stat.tags),
-            esc(stat.tracker),
-            stat.trackers_count,
-            amount_left,
-            stat.bytes_downloaded,
-            stat.bytes_downloaded,
-            stat.bytes_downloaded,
-            stat.bytes_uploaded,
-            stat.bytes_uploaded,
-            time_active,
-            stat.seeding_time,
-            now,
-            stat.queue_position,
-            stat.ratio_limit,
-            stat.seeding_time_limit,
-            esc(magnet_uri),
-        },
-    );
+    return compat.serializeTorrentJson(allocator, json, stat, true);
 }
-
-// buildContentPath and buildMagnetUri are in compat.zig (shared with sync.zig).
-const buildContentPath = compat.buildContentPath;
-const buildMagnetUri = compat.buildMagnetUri;
 
 /// Structured JSON body for POST /api/v2/app/setPreferences.
 /// All fields are optional; only the fields present in the JSON body are applied.

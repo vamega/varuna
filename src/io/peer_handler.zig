@@ -75,11 +75,7 @@ pub fn handleAccept(self: *EventLoop, cqe: linux.io_uring_cqe) void {
     peer.handshake_offset = 0;
     self.peer_count += 1;
 
-    // Disable Nagle: send responses immediately without coalescing delay
-    posix.setsockopt(new_fd, posix.IPPROTO.TCP, linux.TCP.NODELAY, &std.mem.toBytes(@as(c_int, 1))) catch {};
-    // Increase socket buffers for high-throughput transfers
-    posix.setsockopt(new_fd, posix.SOL.SOCKET, posix.SO.RCVBUF, &std.mem.toBytes(@as(c_int, 2 * 1024 * 1024))) catch {};
-    posix.setsockopt(new_fd, posix.SOL.SOCKET, posix.SO.SNDBUF, &std.mem.toBytes(@as(c_int, 512 * 1024))) catch {};
+    socket_util.configurePeerSocket(new_fd);
 
     self.markActivePeer(slot);
 

@@ -519,6 +519,41 @@ pub const SessionManager = struct {
         return stats.toOwnedSlice(allocator);
     }
 
+    /// Aggregated global transfer statistics for the /api/v2/transfer/info
+    /// and /api/v2/sync/maindata server_state sections.
+    pub const TransferInfo = struct {
+        dl_speed: u64 = 0,
+        ul_speed: u64 = 0,
+        dl_data: u64 = 0,
+        ul_data: u64 = 0,
+        dl_limit: u64 = 0,
+        ul_limit: u64 = 0,
+        dht_nodes: usize = 0,
+    };
+
+    /// Aggregate per-torrent stats and global event loop state into a
+    /// single TransferInfo. Avoids duplicate logic in handlers.zig and sync.zig.
+    pub fn getTransferInfo(self: *SessionManager, allocator: std.mem.Allocator) !TransferInfo {
+        const stats = try self.getAllStats(allocator);
+        defer allocator.free(stats);
+
+        var info = TransferInfo{};
+        for (stats) |stat| {
+            info.dl_speed += stat.download_speed;
+            info.ul_speed += stat.upload_speed;
+            info.dl_data += stat.bytes_downloaded;
+            info.ul_data += stat.bytes_uploaded;
+        }
+
+        if (self.shared_event_loop) |el| {
+            info.dl_limit = el.getGlobalDlLimit();
+            info.ul_limit = el.getGlobalUlLimit();
+            info.dht_nodes = el.getDhtNodeCount();
+        }
+
+        return info;
+    }
+
     /// Get stats for a single torrent.
     pub fn getStats(self: *SessionManager, hash: []const u8) !Stats {
         self.mutex.lock();

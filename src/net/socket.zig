@@ -43,6 +43,18 @@ pub fn applyBindConfig(fd: posix.fd_t, bind_device: ?[]const u8, bind_address: ?
     }
 }
 
+/// Configure a peer socket for BitTorrent wire protocol transfers.
+/// Disables Nagle's algorithm (TCP_NODELAY) and increases socket
+/// buffer sizes to match libtorrent/qBittorrent defaults:
+/// - 2 MB receive buffer for high-pipeline-depth downloads
+/// - 512 KB send buffer for piece uploads
+pub fn configurePeerSocket(fd: posix.fd_t) void {
+    const linux = std.os.linux;
+    posix.setsockopt(fd, posix.IPPROTO.TCP, linux.TCP.NODELAY, &std.mem.toBytes(@as(c_int, 1))) catch {};
+    posix.setsockopt(fd, posix.SOL.SOCKET, posix.SO.RCVBUF, &std.mem.toBytes(@as(c_int, 2 * 1024 * 1024))) catch {};
+    posix.setsockopt(fd, posix.SOL.SOCKET, posix.SO.SNDBUF, &std.mem.toBytes(@as(c_int, 512 * 1024))) catch {};
+}
+
 test "applyBindDevice rejects empty name" {
     const fd = try posix.socket(posix.AF.INET, posix.SOCK.STREAM | posix.SOCK.CLOEXEC, posix.IPPROTO.TCP);
     defer posix.close(fd);

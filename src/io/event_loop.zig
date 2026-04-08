@@ -28,229 +28,24 @@ const peer_policy = @import("peer_policy.zig");
 const utp_handler = @import("utp_handler.zig");
 const dht_handler = @import("dht_handler.zig");
 
-pub const max_peers: u16 = 4096;
-const TorrentIdType = u32;
-pub const TorrentId = TorrentIdType;
+// ── Re-exported type definitions (moved to types.zig) ────
+
+pub const types = @import("types.zig");
+pub const max_peers = types.max_peers;
+const TorrentIdType = types.TorrentIdType;
+pub const TorrentId = types.TorrentId;
+pub const OpType = types.OpType;
+pub const OpData = types.OpData;
+pub const encodeUserData = types.encodeUserData;
+pub const decodeUserData = types.decodeUserData;
+pub const PeerMode = types.PeerMode;
+pub const Transport = types.Transport;
+pub const PeerState = types.PeerState;
+pub const Peer = types.Peer;
+pub const SpeedStats = types.SpeedStats;
+pub const TorrentContext = types.TorrentContext;
+
 const cqe_batch_size = 64;
-
-// ── User data encoding ────────────────────────────────────
-
-pub const OpType = enum(u8) {
-    peer_connect = 0,
-    peer_recv = 1,
-    peer_send = 2,
-    accept = 3,
-    disk_read = 4,
-    disk_write = 5,
-    http_connect = 6,
-    http_send = 7,
-    http_recv = 8,
-    timeout = 9,
-    cancel = 10,
-    utp_recv = 11,
-    utp_send = 12,
-    api_accept = 13,
-    api_recv = 14,
-    api_send = 15,
-    udp_tracker_send = 16,
-    udp_tracker_recv = 17,
-};
-
-pub const OpData = struct {
-    slot: u16,
-    op_type: OpType,
-    context: u40,
-};
-
-pub fn encodeUserData(op: OpData) u64 {
-    return (@as(u64, op.slot) << 48) |
-        (@as(u64, @intFromEnum(op.op_type)) << 40) |
-        @as(u64, op.context);
-}
-
-pub fn decodeUserData(user_data: u64) OpData {
-    return .{
-        .slot = @intCast(user_data >> 48),
-        .op_type = @enumFromInt(@as(u8, @intCast((user_data >> 40) & 0xFF))),
-        .context = @intCast(user_data & 0xFFFFFFFFFF),
-    };
-}
-
-// ── Peer ──────────────────────────────────────────────────
-
-pub const PeerMode = enum {
-    download, // we connected out -- we request pieces
-    seed, // peer connected to us -- we serve pieces
-};
-
-pub const Transport = enum {
-    tcp,
-    utp,
-};
-
-pub const PeerState = enum {
-    free,
-    connecting,
-    mse_handshake_send, // MSE/PE: sending during async MSE handshake (outbound)
-    mse_handshake_recv, // MSE/PE: receiving during async MSE handshake (outbound)
-    mse_resp_send, // MSE/PE: sending during async MSE handshake (inbound responder)
-    mse_resp_recv, // MSE/PE: receiving during async MSE handshake (inbound responder)
-    handshake_send,
-    handshake_recv,
-    extension_handshake_send, // BEP 10: sending extension handshake after peer handshake
-    inbound_handshake_recv,
-    inbound_handshake_send, // sending our handshake back
-    inbound_extension_handshake_send, // BEP 10: sending extension handshake (inbound)
-    inbound_bitfield_send, // sending bitfield
-    inbound_unchoke_send, // sending unchoke
-    active_recv_header,
-    active_recv_body,
-    disconnecting,
-};
-
-pub const Peer = struct {
-    fd: posix.fd_t = -1,
-    state: PeerState = .free,
-    mode: PeerMode = .download,
-    transport: Transport = .tcp,
-    torrent_id: TorrentIdType = 0,
-    address: std.net.Address = undefined,
-    utp_slot: ?u16 = null, // UtpManager slot index (only for uTP peers)
-
-    // Recv state: small header buffer, then body on demand
-    header_buf: [4]u8 = undefined,
-    header_offset: usize = 0,
-    handshake_buf: [68]u8 = undefined,
-    handshake_offset: usize = 0,
-    small_body_buf: [16]u8 = undefined,
-    body_buf: ?[]u8 = null,
-    body_is_heap: bool = false,
-    body_offset: usize = 0,
-    body_expected: usize = 0,
-
-    // Peer wire state
-    send_pending: bool = false,
-    peer_choking: bool = true,
-    am_choking: bool = true,
-    am_interested: bool = false,
-    peer_interested: bool = false,
-    availability_known: bool = false,
-    availability: ?Bitfield = null,
-
-    // Remote peer identification (from handshake)
-    remote_peer_id: [20]u8 = [_]u8{0} ** 20,
-    has_peer_id: bool = false,
-
-    // Timing and stats
-    last_activity: i64 = 0,
-    bytes_downloaded_from: u64 = 0, // bytes we received from this peer
-    bytes_uploaded_to: u64 = 0, // bytes we sent to this peer
-
-    // Per-peer speed tracking (rolling window, updated every ~2s in tick)
-    last_speed_check: i64 = 0,
-    last_dl_bytes: u64 = 0,
-    last_ul_bytes: u64 = 0,
-    current_dl_speed: u64 = 0,
-    current_ul_speed: u64 = 0,
-
-    // Piece download state
-    current_piece: ?u32 = null,
-    piece_buf: ?[]u8 = null,
-    torrent_peer_index: ?u16 = null,
-    idle_peer_index: ?u16 = null,
-    active_peer_index: ?u16 = null,
-    blocks_received: u32 = 0,
-    blocks_expected: u32 = 0,
-    pipeline_sent: u32 = 0,
-    inflight_requests: u32 = 0,
-
-    // Pre-claimed next piece (pipeline overlap: requests sent before current piece completes)
-    next_piece: ?u32 = null,
-    next_piece_buf: ?[]u8 = null,
-    next_blocks_expected: u32 = 0,
-    next_blocks_received: u32 = 0,
-    next_pipeline_sent: u32 = 0,
-
-    // BEP 10 extension protocol state
-    extensions_supported: bool = false, // peer advertised BEP 10 support
-    extension_ids: ?ext.ExtensionIds = null, // peer's extension ID mapping
-
-    // BEP 21: partial seed (upload_only) — peer has some pieces and is
-    // willing to upload but not interested in downloading from us.
-    upload_only: bool = false,
-
-    // BEP 11 PEX state (per-peer, tracks what we have sent to this peer)
-    pex_state: ?*pex_mod.PexState = null,
-
-    // MSE/PE (BEP 6) encryption state
-    crypto: mse.PeerCrypto = mse.PeerCrypto.plaintext,
-    // Async MSE handshake state (heap-allocated, freed on completion/disconnect)
-    mse_initiator: ?*mse.MseInitiatorHandshake = null,
-    mse_responder: ?*mse.MseResponderHandshake = null,
-    mse_known_hashes: ?[]const [20]u8 = null,
-    // Track whether this peer previously rejected MSE (don't retry on reconnect)
-    mse_rejected: bool = false,
-    // Track whether we're in MSE fallback (reconnecting without MSE)
-    mse_fallback: bool = false,
-    // Remaining bytes to send for the current MSE send operation.
-    // Used to handle partial sends during MSE handshake without prematurely
-    // advancing the state machine.
-    mse_send_remaining: []const u8 = &.{},
-};
-
-// ── Torrent context (per-torrent state within shared event loop) ──
-
-pub const SpeedStats = struct {
-    dl_speed: u64 = 0,
-    ul_speed: u64 = 0,
-    dl_total: u64 = 0,
-    ul_total: u64 = 0,
-};
-
-pub const TorrentContext = struct {
-    session: ?*const session_mod.Session = null,
-    piece_tracker: ?*PieceTracker = null,
-    shared_fds: []const posix.fd_t,
-    info_hash: [20]u8,
-    peer_id: [20]u8,
-    tracker_key: ?[8]u8 = null,
-    complete_pieces: ?*const Bitfield = null,
-    active: bool = true,
-    is_private: bool = false,
-
-    // BEP 52: v2 info-hash (SHA-256, truncated to 20 bytes for handshake matching).
-    // null for pure v1 torrents. For hybrid torrents, inbound peers may connect
-    // using either the v1 or v2 info-hash.
-    info_hash_v2: ?[20]u8 = null,
-
-    // Speed tracking (updated every ~2 seconds in tick)
-    last_speed_check: i64 = 0,
-    last_dl_bytes: u64 = 0,
-    last_ul_bytes: u64 = 0,
-    current_dl_speed: u64 = 0,
-    current_ul_speed: u64 = 0,
-    downloaded_bytes: u64 = 0,
-    uploaded_bytes: u64 = 0,
-
-    // Per-torrent rate limiters (0 = unlimited)
-    rate_limiter: RateLimiter = RateLimiter.initComptime(0, 0),
-
-    // BEP 11 PEX state (per-torrent, tracks currently connected peers)
-    pex_state: ?*pex_mod.TorrentPexState = null,
-
-    // BEP 16: super-seeding state (null if super-seeding is disabled)
-    super_seed: ?*SuperSeedState = null,
-
-    // BEP 21: we are a partial seed (upload_only). All wanted pieces are complete
-    // but not all pieces in the torrent. We upload what we have but don't download.
-    upload_only: bool = false,
-
-    // BEP 52: per-file Merkle tree cache for hash serving
-    merkle_cache: ?*MerkleCache = null,
-    // Slots of peers currently attached to this torrent.
-    peer_slots: std.ArrayList(u16) = std.ArrayList(u16).empty,
-    torrent_peer_list_index: ?u32 = null,
-};
 
 // ── Event loop ────────────────────────────────────────────
 
@@ -274,351 +69,16 @@ pub const EventLoop = struct {
         write_failed: bool = false,
     };
 
-    pub const PieceBuffer = struct {
-        buf: []u8,
-        storage: []u8 = &.{},
-        from_pool: bool = false,
-        ref_count: u32 = 1,
-        next_free: ?*PieceBuffer = null,
-    };
-
-    const PieceBufferPool = struct {
-        const retained_heap_limit: usize = 64 * 1024 * 1024;
-        const max_buffers_per_class: u16 = 8;
-        const class_sizes = [_]usize{
-            16 * 1024,
-            64 * 1024,
-            256 * 1024,
-            512 * 1024,
-            1024 * 1024,
-            2 * 1024 * 1024,
-            4 * 1024 * 1024,
-            8 * 1024 * 1024,
-        };
-
-        const RetainedClass = struct {
-            head: ?*PieceBuffer = null,
-            count: u16 = 0,
-        };
-
-        retained_heap_bytes: usize = 0,
-        retained_heap: std.AutoHashMapUnmanaged(usize, RetainedClass) = .empty,
-        free_wrappers: ?*PieceBuffer = null,
-
-        fn acquire(
-            self: *PieceBufferPool,
-            allocator: std.mem.Allocator,
-            huge_page_cache: ?*HugePageCache,
-            size: usize,
-        ) !*PieceBuffer {
-            const storage_size = preferredStorageSize(size);
-            if (huge_page_cache) |hpc| {
-                if (hpc.alloc(storage_size)) |storage| {
-                    const piece_buffer = try self.acquireWrapper(allocator);
-                    piece_buffer.* = .{
-                        .buf = storage[0..size],
-                        .storage = storage,
-                        .from_pool = true,
-                    };
-                    return piece_buffer;
-                }
-            }
-
-            if (self.acquireRetained(storage_size)) |piece_buffer| {
-                piece_buffer.* = .{
-                    .buf = piece_buffer.storage[0..size],
-                    .storage = piece_buffer.storage,
-                    .from_pool = false,
-                };
-                return piece_buffer;
-            }
-
-            const storage = try allocator.alloc(u8, storage_size);
-            errdefer allocator.free(storage);
-
-            const piece_buffer = try self.acquireWrapper(allocator);
-            piece_buffer.* = .{
-                .buf = storage[0..size],
-                .storage = storage,
-                .from_pool = false,
-            };
-            return piece_buffer;
-        }
-
-        fn release(
-            self: *PieceBufferPool,
-            allocator: std.mem.Allocator,
-            huge_page_cache: ?*HugePageCache,
-            piece_buffer: *PieceBuffer,
-        ) void {
-            if (piece_buffer.from_pool) {
-                if (huge_page_cache) |hpc| hpc.free(piece_buffer.storage);
-                self.recycleWrapper(piece_buffer);
-                return;
-            }
-
-            if (self.retainHeapBuffer(allocator, piece_buffer)) return;
-
-            allocator.free(piece_buffer.storage);
-            self.recycleWrapper(piece_buffer);
-        }
-
-        fn deinit(self: *PieceBufferPool, allocator: std.mem.Allocator) void {
-            var retained_it = self.retained_heap.iterator();
-            while (retained_it.next()) |entry| {
-                var head = entry.value_ptr.head;
-                while (head) |piece_buffer| {
-                    const next = piece_buffer.next_free;
-                    allocator.free(piece_buffer.storage);
-                    allocator.destroy(piece_buffer);
-                    head = next;
-                }
-            }
-            self.retained_heap.deinit(allocator);
-
-            var wrappers = self.free_wrappers;
-            while (wrappers) |piece_buffer| {
-                wrappers = piece_buffer.next_free;
-                allocator.destroy(piece_buffer);
-            }
-            self.* = .{};
-        }
-
-        fn acquireWrapper(self: *PieceBufferPool, allocator: std.mem.Allocator) !*PieceBuffer {
-            if (self.free_wrappers) |piece_buffer| {
-                self.free_wrappers = piece_buffer.next_free;
-                piece_buffer.next_free = null;
-                return piece_buffer;
-            }
-            return allocator.create(PieceBuffer);
-        }
-
-        fn recycleWrapper(self: *PieceBufferPool, piece_buffer: *PieceBuffer) void {
-            piece_buffer.next_free = self.free_wrappers;
-            self.free_wrappers = piece_buffer;
-        }
-
-        fn acquireRetained(self: *PieceBufferPool, storage_size: usize) ?*PieceBuffer {
-            const retained = self.retained_heap.getPtr(storage_size) orelse return null;
-            const piece_buffer = retained.head orelse return null;
-            retained.head = piece_buffer.next_free;
-            piece_buffer.next_free = null;
-            retained.count -= 1;
-            self.retained_heap_bytes -= piece_buffer.storage.len;
-            return piece_buffer;
-        }
-
-        fn retainHeapBuffer(self: *PieceBufferPool, allocator: std.mem.Allocator, piece_buffer: *PieceBuffer) bool {
-            const storage = piece_buffer.storage;
-            if (self.retained_heap_bytes + storage.len > retained_heap_limit) return false;
-
-            const gop = self.retained_heap.getOrPut(allocator, storage.len) catch return false;
-            if (!gop.found_existing) {
-                gop.value_ptr.* = .{};
-            }
-            if (gop.value_ptr.count >= max_buffers_per_class) return false;
-
-            piece_buffer.buf = storage;
-            piece_buffer.next_free = gop.value_ptr.head;
-            gop.value_ptr.head = piece_buffer;
-            gop.value_ptr.count += 1;
-            self.retained_heap_bytes += storage.len;
-            return true;
-        }
-
-        fn preferredStorageSize(size: usize) usize {
-            for (class_sizes) |class_size| {
-                if (size <= class_size) return class_size;
-            }
-            return size;
-        }
-    };
-
-    pub const VectoredSendState = struct {
-        backing: []align(@alignOf(posix.iovec_const)) u8,
-        backing_capacity: usize = 0,
-        pool_class: u8 = std.math.maxInt(u8),
-        next_free: ?*VectoredSendState = null,
-        headers: [][13]u8,
-        iovecs: []posix.iovec_const,
-        msg: posix.msghdr_const,
-        piece_buffers: []*PieceBuffer,
-        iov_index: usize = 0,
-
-        fn advance(self: *VectoredSendState, bytes_sent: usize) bool {
-            var remaining = bytes_sent;
-            while (remaining > 0 and self.iov_index < self.iovecs.len) {
-                const iov = &self.iovecs[self.iov_index];
-                if (remaining < iov.len) {
-                    iov.base += remaining;
-                    iov.len -= remaining;
-                    remaining = 0;
-                    break;
-                }
-                remaining -= iov.len;
-                self.iov_index += 1;
-            }
-
-            self.msg.iov = self.iovecs.ptr + self.iov_index;
-            self.msg.iovlen = self.iovecs.len - self.iov_index;
-            return self.iov_index < self.iovecs.len;
-        }
-    };
-
-    const vectored_send_backing_align = @max(
-        @alignOf(VectoredSendState),
-        @max(@alignOf([13]u8), @max(@alignOf(posix.iovec_const), @alignOf(*PieceBuffer))),
-    );
-
-    const VectoredSendLayout = struct {
-        total_bytes: usize,
-        headers_offset: usize,
-        iovecs_offset: usize,
-        refs_offset: usize,
-    };
-
-    const VectoredSendPool = struct {
-        const retained_limit: usize = 256 * 1024;
-        const max_blocks_per_class: u16 = 16;
-        const invalid_class: u8 = std.math.maxInt(u8);
-        const class_capacities = [_]usize{ 1, 2, 4, 8, 16, 32, 64 };
-
-        const RetainedClass = struct {
-            head: ?*VectoredSendState = null,
-            count: u16 = 0,
-        };
-
-        retained_bytes: usize = 0,
-        classes: [class_capacities.len]RetainedClass = [_]RetainedClass{.{}} ** class_capacities.len,
-
-        fn acquire(self: *VectoredSendPool, allocator: std.mem.Allocator, batch_len: usize) !*VectoredSendState {
-            const selection = selectClass(batch_len);
-            const layout = vectoredSendLayout(selection.capacity);
-
-            if (selection.class_index) |class_index| {
-                const retained = &self.classes[class_index];
-                if (retained.head) |state| {
-                    retained.head = state.next_free;
-                    retained.count -= 1;
-                    self.retained_bytes -= state.backing.len;
-                    state.backing_capacity = selection.capacity;
-                    state.pool_class = @intCast(class_index);
-                    state.next_free = null;
-                    return state;
-                }
-            }
-
-            const backing = try allocator.alignedAlloc(u8, std.mem.Alignment.fromByteUnits(vectored_send_backing_align), layout.total_bytes);
-            const state: *VectoredSendState = @ptrCast(@alignCast(backing.ptr));
-            state.backing = backing;
-            state.backing_capacity = selection.capacity;
-            state.pool_class = if (selection.class_index) |class_index| @intCast(class_index) else invalid_class;
-            state.next_free = null;
-            return state;
-        }
-
-        fn release(self: *VectoredSendPool, allocator: std.mem.Allocator, state: *VectoredSendState) void {
-            if (state.pool_class == invalid_class) {
-                allocator.free(state.backing);
-                return;
-            }
-
-            const class_index: usize = state.pool_class;
-            const retained = &self.classes[class_index];
-            if (retained.count >= max_blocks_per_class or self.retained_bytes + state.backing.len > retained_limit) {
-                allocator.free(state.backing);
-                return;
-            }
-
-            state.next_free = retained.head;
-            retained.head = state;
-            retained.count += 1;
-            self.retained_bytes += state.backing.len;
-        }
-
-        fn deinit(self: *VectoredSendPool, allocator: std.mem.Allocator) void {
-            for (&self.classes) |*retained| {
-                var head = retained.head;
-                while (head) |state| {
-                    const next = state.next_free;
-                    allocator.free(state.backing);
-                    head = next;
-                }
-                retained.* = .{};
-            }
-            self.* = .{};
-        }
-
-        fn selectClass(batch_len: usize) struct { capacity: usize, class_index: ?usize } {
-            for (class_capacities, 0..) |capacity, idx| {
-                if (batch_len <= capacity) return .{ .capacity = capacity, .class_index = idx };
-            }
-            return .{ .capacity = batch_len, .class_index = null };
-        }
-    };
-
-    pub const PendingSend = struct {
-        sent: usize = 0,
-        slot: u16,
-        /// Unique ID for matching CQEs to the correct PendingSend when
-        /// multiple sends are in-flight for the same slot.
-        send_id: u32,
-        storage: union(enum) {
-            owned: struct {
-                buf: []u8,
-                small_slot: ?u16 = null,
-            },
-            vectored: *VectoredSendState,
-        },
-    };
-
-    const SmallSendPool = struct {
-        storage: []u8,
-        free: []bool,
-
-        fn init(allocator: std.mem.Allocator) !SmallSendPool {
-            const storage = try allocator.alloc(u8, small_send_slots * small_send_capacity);
-            errdefer allocator.free(storage);
-
-            const free = try allocator.alloc(bool, small_send_slots);
-            @memset(free, true);
-
-            return .{
-                .storage = storage,
-                .free = free,
-            };
-        }
-
-        fn deinit(self: *SmallSendPool, allocator: std.mem.Allocator) void {
-            allocator.free(self.storage);
-            allocator.free(self.free);
-            self.* = undefined;
-        }
-
-        fn alloc(self: *SmallSendPool, bytes: []const u8) ?struct { slot: u16, buf: []u8 } {
-            if (bytes.len > small_send_capacity) return null;
-
-            for (self.free, 0..) |is_free, idx| {
-                if (!is_free) continue;
-                self.free[idx] = false;
-
-                const start = idx * small_send_capacity;
-                const slot_buf = self.storage[start .. start + bytes.len];
-                @memcpy(slot_buf, bytes);
-
-                return .{
-                    .slot = @intCast(idx),
-                    .buf = slot_buf,
-                };
-            }
-
-            return null;
-        }
-
-        fn release(self: *SmallSendPool, slot: u16) void {
-            self.free[slot] = true;
-        }
-    };
+    // ── Re-exported buffer pool types (moved to buffer_pools.zig) ──
+    const bp = @import("buffer_pools.zig");
+    pub const PieceBuffer = bp.PieceBuffer;
+    const PieceBufferPool = bp.PieceBufferPool;
+    pub const VectoredSendState = bp.VectoredSendState;
+    const vectored_send_backing_align = bp.vectored_send_backing_align;
+    const VectoredSendLayout = bp.VectoredSendLayout;
+    const VectoredSendPool = bp.VectoredSendPool;
+    pub const PendingSend = bp.PendingSend;
+    const SmallSendPool = bp.SmallSendPool;
 
     /// A uTP packet waiting to be sent over the UDP socket.
     /// Sized for a full UDP datagram (header + payload).
@@ -820,7 +280,7 @@ pub const EventLoop = struct {
             .pending_writes = .empty,
             .pending_write_lookup = .empty,
             .pending_sends = std.ArrayList(PendingSend).empty,
-            .small_send_pool = try SmallSendPool.init(allocator),
+            .small_send_pool = try SmallSendPool.init(allocator, small_send_slots, small_send_capacity),
             .pending_reads = std.ArrayList(PendingPieceRead).empty,
             .queued_responses = try std.ArrayList(QueuedBlockResponse).initCapacity(allocator, 256),
             .deferred_piece_buffers = std.ArrayList(DeferredPieceBuffer).empty,
@@ -838,36 +298,7 @@ pub const EventLoop = struct {
         peer_id: [20]u8,
         hasher_threads: u32,
     ) !EventLoop {
-        const peers = try allocator.alloc(Peer, max_peers);
-        @memset(peers, Peer{});
-
-        // Create hasher for SHA verification (download) and Merkle tree building (seed/BEP 52)
-        const hasher = if (hasher_threads > 0)
-            Hasher.create(allocator, hasher_threads) catch null
-        else
-            null;
-
-        var el = EventLoop{
-            .ring = try ring_mod.initIoUring(256, linux.IORING_SETUP_COOP_TASKRUN | linux.IORING_SETUP_SINGLE_ISSUER),
-            .allocator = allocator,
-            .peers = peers,
-            .torrents = try std.ArrayList(?TorrentContext).initCapacity(allocator, default_torrent_capacity),
-            .free_torrent_ids = std.ArrayList(TorrentIdType).empty,
-            .active_torrent_ids = try std.ArrayList(TorrentIdType).initCapacity(allocator, default_torrent_capacity),
-            .torrents_with_peers = std.ArrayList(TorrentIdType).empty,
-            .info_hash_to_torrent = std.AutoHashMap([20]u8, TorrentIdType).init(allocator),
-            .mse_req2_to_hash = std.AutoHashMap([20]u8, [20]u8).init(allocator),
-            .pending_writes = .empty,
-            .pending_write_lookup = .empty,
-            .pending_sends = std.ArrayList(PendingSend).empty,
-            .small_send_pool = try SmallSendPool.init(allocator),
-            .pending_reads = std.ArrayList(PendingPieceRead).empty,
-            .queued_responses = try std.ArrayList(QueuedBlockResponse).initCapacity(allocator, 256),
-            .deferred_piece_buffers = std.ArrayList(DeferredPieceBuffer).empty,
-            .idle_peers = std.ArrayList(u16).empty,
-            .active_peer_slots = std.ArrayList(u16).empty,
-            .hasher = hasher,
-        };
+        var el = try initBare(allocator, hasher_threads);
 
         const tid = try el.addTorrent(session, piece_tracker, shared_fds, peer_id);
         std.debug.assert(tid == 0);
@@ -1358,13 +789,7 @@ pub const EventLoop = struct {
         errdefer posix.close(fd);
         peer.fd = fd;
 
-        // Disable Nagle's algorithm: send small request batches immediately
-        // instead of waiting up to 40ms for more data. Every major BT client does this.
-        posix.setsockopt(fd, posix.IPPROTO.TCP, linux.TCP.NODELAY, &std.mem.toBytes(@as(c_int, 1))) catch {};
-        // Increase socket buffers for high-pipeline-depth transfers.
-        // libtorrent/qBittorrent use 2MB receive / 512KB send.
-        posix.setsockopt(fd, posix.SOL.SOCKET, posix.SO.RCVBUF, &std.mem.toBytes(@as(c_int, 2 * 1024 * 1024))) catch {};
-        posix.setsockopt(fd, posix.SOL.SOCKET, posix.SO.SNDBUF, &std.mem.toBytes(@as(c_int, 512 * 1024))) catch {};
+        socket_util.configurePeerSocket(fd);
 
         // Apply bind configuration (SO_BINDTODEVICE and/or local address) to outbound socket
         try socket_util.applyBindConfig(fd, self.bind_device, self.bind_address, 0);
@@ -2099,7 +1524,7 @@ pub const EventLoop = struct {
     }
 
     pub fn trackPendingSendCopy(self: *EventLoop, slot: u16, send_id: u32, data: []const u8) ![]const u8 {
-        if (self.small_send_pool.alloc(data)) |entry| {
+        if (self.small_send_pool.alloc(data, small_send_capacity)) |entry| {
             errdefer self.small_send_pool.release(entry.slot);
             try self.pending_sends.append(self.allocator, .{
                 .slot = slot,
@@ -2129,7 +1554,7 @@ pub const EventLoop = struct {
     }
 
     pub fn trackPendingSendOwned(self: *EventLoop, slot: u16, send_id: u32, buf: []u8) ![]const u8 {
-        if (self.small_send_pool.alloc(buf)) |entry| {
+        if (self.small_send_pool.alloc(buf, small_send_capacity)) |entry| {
             errdefer self.small_send_pool.release(entry.slot);
 
             try self.pending_sends.append(self.allocator, .{
@@ -2169,29 +1594,7 @@ pub const EventLoop = struct {
         });
     }
 
-    fn vectoredSendLayout(block_capacity: usize) VectoredSendLayout {
-        const state_bytes = @sizeOf(VectoredSendState);
-        const headers_bytes = @sizeOf([13]u8) * block_capacity;
-        const iovecs_bytes = @sizeOf(posix.iovec_const) * block_capacity * 2;
-        const refs_bytes = @sizeOf(*PieceBuffer) * block_capacity;
-
-        var total_bytes: usize = 0;
-        const state_offset = std.mem.alignForward(usize, total_bytes, @alignOf(VectoredSendState));
-        total_bytes = state_offset + state_bytes;
-        const headers_offset = std.mem.alignForward(usize, total_bytes, @alignOf([13]u8));
-        total_bytes = headers_offset + headers_bytes;
-        const iovecs_offset = std.mem.alignForward(usize, total_bytes, @alignOf(posix.iovec_const));
-        total_bytes = iovecs_offset + iovecs_bytes;
-        const refs_offset = std.mem.alignForward(usize, total_bytes, @alignOf(*PieceBuffer));
-        total_bytes = refs_offset + refs_bytes;
-
-        return .{
-            .total_bytes = total_bytes,
-            .headers_offset = headers_offset,
-            .iovecs_offset = iovecs_offset,
-            .refs_offset = refs_offset,
-        };
-    }
+    const vectoredSendLayout = bp.vectoredSendLayout;
 
     pub fn nextPendingWriteId(self: *EventLoop) u32 {
         const write_id = self.next_pending_write_id;

@@ -1,6 +1,8 @@
+pub const buffer_pools = @import("buffer_pools.zig");
 pub const dht_handler = @import("dht_handler.zig");
 pub const dns = @import("dns.zig");
 pub const event_loop = @import("event_loop.zig");
+pub const types = @import("types.zig");
 pub const peer_handler = @import("peer_handler.zig");
 pub const protocol = @import("protocol.zig");
 pub const seed_handler = @import("seed_handler.zig");
