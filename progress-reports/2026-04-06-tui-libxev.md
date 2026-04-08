@@ -90,7 +90,56 @@ GET  /api/v2/transfer/info          -- global transfer stats
 POST /api/v2/auth/login             -- authenticate
 ```
 
-## What was learned
+## Update: 2026-04-08 -- Async HTTP via libxev I/O thread
+
+### Problem
+
+The original implementation called `pollDaemonAsync()` synchronously from zigzag's `tick` callback. Every 2 seconds, `std.http.Client` would block the UI thread while the HTTP request completed. For localhost this was barely noticeable, but for remote daemons or slow networks the UI would freeze.
+
+libxev was imported and a loop was created, but `loop.run(.no_wait)` was a no-op since nothing was ever registered with libxev.
+
+### Solution: dedicated I/O thread + libxev Async + Timer
+
+Architecture:
+
+```
+Main thread:                     I/O thread:
+  loop.run(.no_wait)               blocks on request_queue.popWait()
+  program.tick()                   does synchronous HTTP via std.http.Client
+                                   pushes PollResult to result_queue
+  <--- xev.Async.notify() ----     signals main loop
+  drainResults()
+```
+
+Components:
+- `src/tui/io_thread.zig` -- new module containing:
+  - `ThreadSafeQueue(T)` -- mutex+condvar MPSC queue for both requests and results
+  - `IoThread` -- background worker that owns an `ApiClient` and processes requests
+  - `Request` union -- poll requests, action requests (add/remove/pause/resume/login), shutdown
+  - `ActionRequest` / `PollRequest` -- typed request structs
+
+- `src/tui/main.zig` -- rewritten integration:
+  - libxev `Async` handle: I/O thread calls `notify()` after posting results; main loop picks them up in the `asyncResultCallback` (returns `.rearm` for continuous notification)
+  - libxev `Timer`: fires every 2000ms, calls `submitPollRequest()` to enqueue a poll to the I/O thread (returns `.rearm` for repeating)
+  - Model no longer owns an `ApiClient` -- replaced with `base_url: []const u8`
+  - All action dispatches (add, remove, pause, resume, login, set preferences) post `ActionRequest` to the I/O thread queue instead of calling `ApiClient` directly
+  - `drainResults()` called both from zigzag tick and from the async callback
+
+### What was learned
+
+#### libxev Async for cross-thread wakeup
+`xev.Async` wraps `eventfd` on Linux. `init()` creates the fd, `wait()` registers it with the loop (poll-based on io_uring/epoll), `notify()` writes to wake. The callback must return `.rearm` to keep receiving notifications. Notifications may be coalesced, so you must drain the entire queue in the callback, not assume one notification per result.
+
+#### libxev Timer for repeating cadence
+`xev.Timer.run()` takes `next_ms` and fires once. Return `.rearm` from the callback to repeat. This is cleaner than zigzag's `everyMs()` for the poll cadence because the timer only fires when the event loop actually processes events.
+
+#### Thread-safe queue design
+A simple mutex+condvar linked-list queue works well for this use case. The I/O thread blocks on `popWait()` (condvar wait), the main thread uses `push()` (signals condvar) and `pop()` (non-blocking drain). No lock-free data structures needed since contention is minimal (one producer, one consumer, ~1 request every 2 seconds).
+
+#### Shutdown ordering
+The I/O thread must be stopped (joined) before the queues and async handle are deinitialized. Using `defer io.stop()` after `defer request_queue.deinit()` ensures correct LIFO ordering.
+
+## What was learned (original)
 
 ### zigzag start()/tick() API
 
@@ -112,12 +161,13 @@ In Zig 0.15, `FetchResult` only contains `status: http.Status` -- no access to r
 
 ## Key code references
 
-- `src/tui/main.zig:460-480` -- libxev + zigzag event loop integration
-- `src/tui/main.zig:28-450` -- Model with all TUI state and Elm architecture
-- `src/tui/api.zig:365-445` -- std.json parsing with typed structs
-- `src/tui/api.zig:195-260` -- ApiClient HTTP methods
-- `src/tui/views.zig:130-195` -- Torrent row with colored status symbols and progress bars
-- `src/tui/views.zig:275-320` -- Disconnection overlay dialog
-- `src/tui/views.zig:320-380` -- Login dialog
-- `tests/tui_test.sh` -- 14 integration tests with tmux
+- `src/tui/main.zig:660-750` -- libxev Async/Timer callbacks and main() with full event loop integration
+- `src/tui/main.zig:30-130` -- Model with async I/O state (no more ApiClient)
+- `src/tui/main.zig:400-430` -- submitPollRequest() builds and enqueues poll to I/O thread
+- `src/tui/io_thread.zig:1-50` -- Request/ActionRequest/PollRequest types
+- `src/tui/io_thread.zig:65-130` -- ThreadSafeQueue(T) with mutex+condvar
+- `src/tui/io_thread.zig:135-260` -- IoThread worker loop, handlePoll, handleAction
+- `src/tui/api.zig:195-475` -- ApiClient HTTP methods (now used only by I/O thread)
+- `src/tui/views.zig` -- View rendering (unchanged)
+- `tests/tui_test.sh` -- 14 integration tests with tmux (all passing)
 - `tests/tui_mock_server.py` -- Mock qBittorrent API server

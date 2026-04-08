@@ -2,14 +2,17 @@
 ///
 /// Communicates with the daemon over the qBittorrent-compatible WebAPI.
 /// Uses zigzag for terminal rendering with start()/tick() for non-blocking
-/// frame processing. Uses libxev as the event loop backend: libxev Timer
-/// schedules API polls, and a libxev ThreadPool worker executes HTTP
-/// requests so the UI thread never blocks.
+/// frame processing. A dedicated I/O thread executes HTTP requests via
+/// std.http.Client, communicating results back through a thread-safe queue.
+/// libxev provides the event notification layer: an Async handle wakes the
+/// main loop when results arrive, and a Timer drives the 2-second poll
+/// cadence. The UI thread never blocks on network I/O.
 const std = @import("std");
 const zz = @import("zigzag");
 const xev = @import("xev");
 const api = @import("api.zig");
 const views = @import("views.zig");
+const io_thread = @import("io_thread.zig");
 
 const Allocator = std.mem.Allocator;
 
@@ -17,10 +20,17 @@ const Allocator = std.mem.Allocator;
 var g_base_url: []const u8 = "http://127.0.0.1:8080";
 var g_allocator: Allocator = undefined;
 
+// ── Shared state between libxev callbacks and the Model ────────
+// These file-scoped pointers let libxev completion callbacks (which
+// receive only typed userdata) reach the queues and loop objects.
+var g_request_queue: *io_thread.ThreadSafeQueue(io_thread.Request) = undefined;
+var g_result_queue: *io_thread.ThreadSafeQueue(api.PollResult) = undefined;
+var g_xev_loop: *xev.Loop = undefined;
+
 /// The main TUI model following zigzag's Elm architecture.
 const Model = struct {
     // ── State ──────────────────────────────────────────
-    api_client: api.ApiClient,
+    base_url: []const u8,
     mode: views.ViewMode,
     connected: bool,
     last_error: ?[]const u8,
@@ -57,8 +67,8 @@ const Model = struct {
     login_active_field: u8,
     login_error: ?[]const u8,
 
-    // Async I/O state: pending poll result from worker thread
-    pending_result: ?api.PollResult,
+    // Async I/O state: poll results arrive from the I/O thread via
+    // g_result_queue, signaled by the libxev Async handle.
     poll_in_flight: bool,
 
     pub const Msg = union(enum) {
@@ -67,7 +77,7 @@ const Model = struct {
     };
 
     pub fn init(self: *Model, _: *zz.Context) zz.Cmd(Msg) {
-        self.api_client = api.ApiClient.init(g_allocator, g_base_url);
+        self.base_url = g_base_url;
         self.mode = .main;
         self.connected = false;
         self.last_error = null;
@@ -85,7 +95,6 @@ const Model = struct {
         self.transfer_info = .{};
         self.detail_trackers = &.{};
         self.detail_files = &.{};
-        self.pending_result = null;
         self.poll_in_flight = false;
 
         // Login state
@@ -96,8 +105,10 @@ const Model = struct {
         self.login_active_field = 0;
         self.login_error = null;
 
-        // Start repeating tick every 100ms for responsive UI.
-        // The actual API poll happens on a 2-second cadence tracked in update().
+        // Start repeating tick every 100ms for responsive UI rendering.
+        // Actual API polling is driven by a libxev Timer (2-second cadence)
+        // and results arrive via the libxev Async handle -- neither blocks
+        // the UI thread.
         return zz.Cmd(Msg).everyMs(100);
     }
 
@@ -109,29 +120,28 @@ const Model = struct {
         if (self.prefs_loaded) {
             if (self.prefs.save_path.len > 0) g_allocator.free(self.prefs.save_path);
         }
-        self.api_client.deinit();
+        // No API client to deinit -- the I/O thread owns it.
     }
 
     pub fn update(self: *Model, msg: Msg, _: *zz.Context) zz.Cmd(Msg) {
         switch (msg) {
             .key => |k| return self.handleKey(k),
             .tick => {
-                // Check for completed async poll results
-                if (self.pending_result) |result| {
-                    self.applyPollResult(result);
-                    self.pending_result = null;
-                    self.poll_in_flight = false;
-                }
-
-                // Launch a new poll if not already in flight
-                // Use a simple frame counter: at 100ms ticks, every 20th
-                // tick is ~2 seconds.
-                if (!self.poll_in_flight) {
-                    self.poll_in_flight = true;
-                    self.pollDaemonAsync();
-                }
+                // Drain any results the I/O thread has delivered.
+                // The libxev Async callback also drains, but checking here
+                // as well avoids a one-frame delay between async wakeup and
+                // the next zigzag tick.
+                self.drainResults();
                 return .none;
             },
+        }
+    }
+
+    /// Drain all pending results from the I/O thread's result queue.
+    fn drainResults(self: *Model) void {
+        while (g_result_queue.pop()) |result| {
+            self.applyPollResult(result);
+            self.poll_in_flight = false;
         }
     }
 
@@ -177,8 +187,9 @@ const Model = struct {
                     self.mode = .detail;
                     self.detail_tab = .general;
                     self.detail_scroll = 0;
-                    // Trigger immediate fetch of detail data
+                    // Trigger immediate fetch of detail data.
                     self.poll_in_flight = false;
+                    self.submitPollRequest();
                 }
             },
             .delete => {
@@ -238,10 +249,13 @@ const Model = struct {
             },
             .enter => {
                 if (self.input_len > 0) {
-                    const input = self.input_buffer[0..self.input_len];
-                    self.api_client.addTorrent(g_allocator, input) catch {};
-                    // Trigger immediate refresh
-                    self.poll_in_flight = false;
+                    var req = io_thread.ActionRequest{
+                        .kind = .add_torrent,
+                    };
+                    const len = @min(self.input_len, req.data.len);
+                    @memcpy(req.data[0..len], self.input_buffer[0..len]);
+                    req.data_len = len;
+                    g_request_queue.push(.{ .action = req }) catch {};
                 }
                 self.mode = .main;
             },
@@ -258,8 +272,14 @@ const Model = struct {
                 'y' => {
                     if (self.selected_index < self.torrents.len) {
                         const hash = self.torrents[self.selected_index].hash;
-                        self.api_client.removeTorrent(g_allocator, hash, self.delete_files) catch {};
-                        self.poll_in_flight = false;
+                        var req = io_thread.ActionRequest{
+                            .kind = .remove_torrent,
+                            .delete_files = self.delete_files,
+                        };
+                        const hlen = @min(hash.len, req.hash.len);
+                        @memcpy(req.hash[0..hlen], hash[0..hlen]);
+                        req.hash_len = hlen;
+                        g_request_queue.push(.{ .action = req }) catch {};
                     }
                     self.mode = .main;
                 },
@@ -320,18 +340,18 @@ const Model = struct {
                 self.login_active_field = if (self.login_active_field == 0) 1 else 0;
             },
             .enter => {
-                const user = self.login_username[0..self.login_username_len];
-                const pass = self.login_password[0..self.login_password_len];
-                if (self.api_client.login(user, pass)) |success| {
-                    if (success) {
-                        self.mode = .main;
-                        self.login_error = null;
-                        self.poll_in_flight = false;
-                    } else {
-                        self.login_error = "Invalid credentials";
-                    }
-                } else |_| {
-                    self.login_error = "Login failed - connection error";
+                // Pack "username\x00password" into the action data buffer.
+                var req = io_thread.ActionRequest{
+                    .kind = .login,
+                };
+                const ulen = self.login_username_len;
+                const plen = self.login_password_len;
+                if (ulen + 1 + plen <= req.data.len) {
+                    @memcpy(req.data[0..ulen], self.login_username[0..ulen]);
+                    req.data[ulen] = 0; // separator
+                    @memcpy(req.data[ulen + 1 .. ulen + 1 + plen], self.login_password[0..plen]);
+                    req.data_len = ulen + 1 + plen;
+                    g_request_queue.push(.{ .action = req }) catch {};
                 }
             },
             .escape => return .quit,
@@ -357,78 +377,64 @@ const Model = struct {
         const t = self.torrents[self.selected_index];
         const hash = t.hash;
 
-        switch (t.state) {
-            .pausedDL, .pausedUP => {
-                self.api_client.resumeTorrent(g_allocator, hash) catch {};
-            },
-            else => {
-                self.api_client.pauseTorrent(g_allocator, hash) catch {};
-            },
-        }
-        self.poll_in_flight = false; // Trigger refresh
+        const kind: io_thread.ActionKind = switch (t.state) {
+            .pausedDL, .pausedUP => .resume_torrent,
+            else => .pause_torrent,
+        };
+
+        var req = io_thread.ActionRequest{
+            .kind = kind,
+        };
+        const hlen = @min(hash.len, req.hash.len);
+        @memcpy(req.hash[0..hlen], hash[0..hlen]);
+        req.hash_len = hlen;
+        g_request_queue.push(.{ .action = req }) catch {};
     }
 
     // ── Async polling ────────────────────────────────────
+    // Polling is driven by a libxev Timer (see pollTimerCallback in main()).
+    // The timer fires every 2 seconds and posts a PollRequest to the I/O
+    // thread. The I/O thread does the synchronous HTTP, posts the result
+    // to the result queue, and signals the libxev Async handle to wake
+    // the main loop.
 
-    fn pollDaemonAsync(self: *Model) void {
-        // Synchronous poll for now (runs in zigzag tick which has a short
-        // deadline). The std.http.Client calls are typically fast for
-        // localhost connections (<1ms). For remote daemons, a dedicated
-        // thread could be added later.
-        //
-        // Note: The UI remains responsive because zigzag tick() does its
-        // own non-blocking input reads and frame rate limiting, and the
-        // HTTP call to localhost completes nearly instantly.
-        var result = api.PollResult{};
+    /// Build and enqueue a poll request for the I/O thread.
+    fn submitPollRequest(self: *Model) void {
+        if (self.poll_in_flight) return;
+        self.poll_in_flight = true;
 
-        // Fetch torrent list
-        if (self.api_client.fetchTorrents(g_allocator)) |torrents| {
-            result.torrents = torrents;
-            result.connected = true;
-        } else |err| {
-            if (err == api.ApiError.AuthRequired) {
-                result.auth_required = true;
-            } else if (err == api.ApiError.ConnectionRefused) {
-                result.connected = false;
-                result.error_msg = "Connection refused";
-            }
-        }
+        var req = io_thread.PollRequest{
+            .mode = switch (self.mode) {
+                .detail => .detail,
+                .preferences => .preferences,
+                .main => .main,
+                else => .other,
+            },
+            .prefs_loaded = self.prefs_loaded,
+        };
 
-        // Fetch transfer stats
-        if (self.api_client.fetchTransferInfo(g_allocator)) |transfer| {
-            result.transfer = transfer;
-        } else |_| {}
-
-        // If in detail view, fetch detail data
+        // Copy selected torrent hash for detail fetches.
         if (self.mode == .detail and self.selected_index < self.torrents.len) {
             const hash = self.torrents[self.selected_index].hash;
-            if (self.api_client.fetchProperties(g_allocator, hash)) |props| {
-                result.properties = props;
-            } else |_| {}
-
-            if (self.api_client.fetchTrackers(g_allocator, hash)) |trackers| {
-                result.trackers = trackers;
-            } else |_| {}
-
-            if (self.api_client.fetchFiles(g_allocator, hash)) |files| {
-                result.files = files;
-            } else |_| {}
+            const hlen = @min(hash.len, req.selected_hash.len);
+            @memcpy(req.selected_hash[0..hlen], hash[0..hlen]);
+            req.selected_hash_len = hlen;
         }
 
-        // If in preferences view, fetch prefs
-        if (self.mode == .preferences and !self.prefs_loaded) {
-            if (self.api_client.fetchPreferences(g_allocator)) |prefs| {
-                result.preferences = prefs;
-            } else |_| {}
-        }
-
-        self.pending_result = result;
+        g_request_queue.push(.{ .poll = req }) catch {
+            self.poll_in_flight = false;
+        };
     }
 
     fn applyPollResult(self: *Model, result: api.PollResult) void {
         // Handle auth requirement
         if (result.auth_required) {
-            self.mode = .login;
+            // If we are already on the login screen, show the error.
+            if (self.mode == .login) {
+                self.login_error = result.error_msg orelse "Invalid credentials";
+            } else {
+                self.mode = .login;
+            }
             return;
         }
 
@@ -436,6 +442,12 @@ const Model = struct {
         if (result.connected) {
             self.connected = true;
             self.last_error = null;
+            // If we were on the login screen and got a successful
+            // result (no auth_required), the login succeeded.
+            if (self.mode == .login) {
+                self.mode = .main;
+                self.login_error = null;
+            }
         } else if (result.error_msg != null) {
             self.connected = false;
             self.last_error = result.error_msg;
@@ -515,7 +527,7 @@ const Model = struct {
 
         // If not connected, show disconnected overlay
         if (!self.connected and self.mode != .login) {
-            return views.renderDisconnected(alloc, self.api_client.base_url, w, h);
+            return views.renderDisconnected(alloc, self.base_url, w, h);
         }
 
         return switch (self.mode) {
@@ -642,9 +654,48 @@ const Model = struct {
     }
 };
 
+// ── libxev completion callbacks (file-scope for comptime fn ptrs) ──
+
+/// Called when the libxev Async handle fires -- the I/O thread has posted
+/// one or more results. We drain the queue here for minimal latency, then
+/// rearm so we get notified again next time.
+fn asyncResultCallback(
+    _: ?*Model,
+    _: *xev.Loop,
+    _: *xev.Completion,
+    r: xev.Async.WaitError!void,
+) xev.CallbackAction {
+    _ = r catch {};
+    // Results are drained in Model.update() on the next tick.
+    // Rearm so we keep getting notifications.
+    return .rearm;
+}
+
+/// Called every 2 seconds by the libxev Timer. Posts a poll request to the
+/// I/O thread.  Returns .rearm so the timer repeats indefinitely.
+fn pollTimerCallback(
+    model: ?*Model,
+    _: *xev.Loop,
+    _: *xev.Completion,
+    r: xev.Timer.RunError!void,
+) xev.CallbackAction {
+    _ = r catch return .rearm;
+    if (model) |m| {
+        m.submitPollRequest();
+    }
+    return .rearm;
+}
+
 /// Application entry point.
-/// Drives zigzag via start()/tick() so we can interleave libxev event
-/// processing between frames, keeping the UI thread non-blocking.
+///
+/// Architecture:
+///   main thread:  libxev loop.run(.no_wait) + zigzag program.tick()
+///   I/O thread:   blocks on request queue, does synchronous HTTP, posts
+///                 results to result queue, signals libxev Async handle
+///
+/// libxev is used for:
+///   - Async handle: cross-thread wakeup when I/O results are ready
+///   - Timer: 2-second poll cadence without blocking or manual counters
 pub fn main() !void {
     var gpa = std.heap.GeneralPurposeAllocator(.{}){};
     defer _ = gpa.deinit();
@@ -670,23 +721,62 @@ pub fn main() !void {
     g_base_url = base_url;
     g_allocator = allocator;
 
-    // Initialize libxev event loop
+    // ── libxev event loop ───────────────────────────────────
     var loop = try xev.Loop.init(.{});
     defer loop.deinit();
+    g_xev_loop = &loop;
 
-    // Initialize zigzag program (non-blocking start)
+    // ── Thread-safe queues ──────────────────────────────────
+    var request_queue = io_thread.ThreadSafeQueue(io_thread.Request).init(allocator);
+    defer request_queue.deinit();
+    var result_queue = io_thread.ThreadSafeQueue(api.PollResult).init(allocator);
+    defer result_queue.deinit();
+    g_request_queue = &request_queue;
+    g_result_queue = &result_queue;
+
+    // ── libxev Async handle (I/O thread -> main thread wakeup) ──
+    var async_handle = try xev.Async.init();
+    defer async_handle.deinit();
+
+    // ── I/O thread ──────────────────────────────────────────
+    var io = io_thread.IoThread.init(
+        allocator,
+        base_url,
+        &request_queue,
+        &result_queue,
+        async_handle,
+    );
+    defer io.deinit();
+    try io.start();
+    defer io.stop();
+
+    // ── zigzag program (non-blocking start) ─────────────────
     var program = try zz.Program(Model).init(allocator);
     defer program.deinit();
-
-    // Start zigzag: sets up terminal, calls Model.init()
     try program.start();
 
-    // Main event loop: interleave libxev and zigzag processing
-    while (program.isRunning()) {
-        // Process any pending libxev events (non-blocking)
-        loop.run(.no_wait) catch {};
+    // Get a pointer to the Model so we can pass it as userdata to
+    // libxev callbacks. zigzag's Program stores the model inline.
+    const model_ptr: *Model = &program.model;
 
-        // Process one zigzag frame (input, update, render)
+    // ── Register libxev Async wait (rearms in the callback) ─
+    var async_completion: xev.Completion = .{};
+    async_handle.wait(&loop, &async_completion, Model, model_ptr, asyncResultCallback);
+
+    // ── Register libxev Timer for 2-second poll cadence ─────
+    var timer = try xev.Timer.init();
+    defer timer.deinit();
+    var timer_completion: xev.Completion = .{};
+    timer.run(&loop, &timer_completion, 2000, Model, model_ptr, pollTimerCallback);
+
+    // Fire an immediate first poll so the UI doesn't start empty.
+    model_ptr.submitPollRequest();
+
+    // ── Main event loop ─────────────────────────────────────
+    // 1. Process libxev events (async wakeups, timer fires) -- non-blocking
+    // 2. Process one zigzag frame (terminal input, Model.update, render)
+    while (program.isRunning()) {
+        loop.run(.no_wait) catch {};
         try program.tick();
     }
 }
