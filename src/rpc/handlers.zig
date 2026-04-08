@@ -411,9 +411,7 @@ pub const ApiHandler = struct {
         if (magnet_url) |magnet| {
             if (std.mem.startsWith(u8, magnet, "magnet:")) {
                 const session = self.session_manager.addMagnet(magnet, save_path) catch |err| {
-                    const msg = std.fmt.allocPrint(allocator, "{{\"error\":\"{s}\"}}", .{@errorName(err)}) catch
-                        return .{ .status = 500, .body = "{\"error\":\"internal\"}" };
-                    return .{ .status = 400, .body = msg, .owned_body = msg };
+                    return errorResponse(allocator, 400, err);
                 };
 
                 if (category_param) |cat| {
@@ -431,9 +429,7 @@ pub const ApiHandler = struct {
         }
 
         const session = self.session_manager.addTorrent(torrent_data, save_path) catch |err| {
-            const msg = std.fmt.allocPrint(allocator, "{{\"error\":\"{s}\"}}", .{@errorName(err)}) catch
-                return .{ .status = 500, .body = "{\"error\":\"internal\"}" };
-            return .{ .status = 400, .body = msg, .owned_body = msg };
+            return errorResponse(allocator, 400, err);
         };
 
         // Set category if provided (best-effort, don't fail the add)
@@ -448,7 +444,7 @@ pub const ApiHandler = struct {
 
     fn handleTorrentsDelete(self: *const ApiHandler, allocator: std.mem.Allocator, body: []const u8) server.Response {
         // Expect hash in body as form param: hashes=<hash>&deleteFiles=true
-        const hash = extractParam(body, "hashes") orelse
+        const hash = requireHashes(body) orelse
             return .{ .status = 400, .body = "{\"error\":\"missing hashes\"}" };
 
         const delete_files = if (extractParam(body, "deleteFiles")) |v|
@@ -457,35 +453,29 @@ pub const ApiHandler = struct {
             false;
 
         self.session_manager.removeTorrentEx(hash, delete_files) catch |err| {
-            const msg = std.fmt.allocPrint(allocator, "{{\"error\":\"{s}\"}}", .{@errorName(err)}) catch
-                return .{ .status = 500, .body = "{\"error\":\"internal\"}" };
-            return .{ .status = 404, .body = msg, .owned_body = msg };
+            return errorResponse(allocator, 404, err);
         };
 
         return .{ .body = "{\"status\":\"ok\"}" };
     }
 
     fn handleTorrentsPause(self: *const ApiHandler, allocator: std.mem.Allocator, body: []const u8) server.Response {
-        const hash = extractParam(body, "hashes") orelse
+        const hash = requireHashes(body) orelse
             return .{ .status = 400, .body = "{\"error\":\"missing hashes\"}" };
 
         self.session_manager.pauseTorrent(hash) catch |err| {
-            const msg = std.fmt.allocPrint(allocator, "{{\"error\":\"{s}\"}}", .{@errorName(err)}) catch
-                return .{ .status = 500, .body = "{\"error\":\"internal\"}" };
-            return .{ .status = 404, .body = msg, .owned_body = msg };
+            return errorResponse(allocator, 404, err);
         };
 
         return .{ .body = "{\"status\":\"ok\"}" };
     }
 
     fn handleTorrentsResume(self: *const ApiHandler, allocator: std.mem.Allocator, body: []const u8) server.Response {
-        const hash = extractParam(body, "hashes") orelse
+        const hash = requireHashes(body) orelse
             return .{ .status = 400, .body = "{\"error\":\"missing hashes\"}" };
 
         self.session_manager.resumeTorrent(hash) catch |err| {
-            const msg = std.fmt.allocPrint(allocator, "{{\"error\":\"{s}\"}}", .{@errorName(err)}) catch
-                return .{ .status = 500, .body = "{\"error\":\"internal\"}" };
-            return .{ .status = 404, .body = msg, .owned_body = msg };
+            return errorResponse(allocator, 404, err);
         };
 
         return .{ .body = "{\"status\":\"ok\"}" };
@@ -574,68 +564,106 @@ pub const ApiHandler = struct {
     }
 
     fn handleSetPreferences(self: *const ApiHandler, allocator: std.mem.Allocator, body: []const u8) server.Response {
-        _ = allocator;
         const el = self.session_manager.shared_event_loop orelse
             return .{ .status = 500, .body = "{\"error\":\"no event loop\"}" };
 
-        // Try form params first: dl_limit=N&up_limit=N
-        // Also try extracting from JSON body: {"dl_limit":N,"up_limit":N}
-        if (extractParam(body, "dl_limit")) |dl_str| {
-            if (std.fmt.parseInt(u64, dl_str, 10)) |dl| {
-                el.setGlobalDlLimit(dl);
-            } else |_| {}
-        } else if (extractJsonInt(body, "dl_limit")) |dl| {
-            el.setGlobalDlLimit(dl);
+        // The body is either:
+        //   - Form-encoded: json={"dl_limit":1024,...} (extract the JSON from "json" param)
+        //   - Direct JSON: {"dl_limit":1024,...}
+        //   - Plain form-encoded: dl_limit=1024&up_limit=512
+        // Try to parse as JSON first (either direct or from "json" form param).
+        const json_str = extractParam(body, "json") orelse body;
+        const maybe_prefs = std.json.parseFromSlice(PreferencesUpdate, allocator, json_str, .{ .ignore_unknown_fields = true });
+
+        if (maybe_prefs) |parsed| {
+            defer parsed.deinit();
+            const prefs = parsed.value;
+
+            // Speed limits
+            if (prefs.dl_limit) |dl| el.setGlobalDlLimit(dl);
+            if (prefs.up_limit) |ul| el.setGlobalUlLimit(ul);
+
+            // Share ratio and seeding time limits
+            {
+                const sm = self.session_manager;
+                if (prefs.max_ratio_enabled) |v| sm.max_ratio_enabled = v;
+                if (prefs.max_ratio) |v| sm.max_ratio = v;
+                if (prefs.max_ratio_act) |v| sm.max_ratio_act = @min(v, 1);
+                if (prefs.max_seeding_time_enabled) |v| sm.max_seeding_time_enabled = v;
+                if (prefs.max_seeding_time) |v| sm.max_seeding_time = v;
+            }
+
+            // Queue settings
+            var queue_changed = false;
+            if (prefs.queueing_enabled) |v| {
+                self.session_manager.queue_manager.config.enabled = v;
+                queue_changed = true;
+            }
+            if (prefs.max_active_downloads) |v| {
+                self.session_manager.queue_manager.config.max_active_downloads = v;
+                queue_changed = true;
+            }
+            if (prefs.max_active_uploads) |v| {
+                self.session_manager.queue_manager.config.max_active_uploads = v;
+                queue_changed = true;
+            }
+            if (prefs.max_active_torrents) |v| {
+                self.session_manager.queue_manager.config.max_active_torrents = v;
+                queue_changed = true;
+            }
+            if (queue_changed) self.session_manager.runQueueEnforcement();
+
+            // DHT / PEX toggles
+            if (prefs.dht) |v| self.session_manager.setDhtEnabled(v);
+            if (prefs.pex) |v| el.pex_enabled = v;
+        } else |_| {
+            // JSON parse failed -- fall back to form-encoded parameters.
+            if (extractParam(body, "dl_limit")) |dl_str| {
+                if (std.fmt.parseInt(u64, dl_str, 10)) |dl| el.setGlobalDlLimit(dl) else |_| {}
+            }
+            if (extractParam(body, "up_limit")) |ul_str| {
+                if (std.fmt.parseInt(u64, ul_str, 10)) |ul| el.setGlobalUlLimit(ul) else |_| {}
+            }
+
+            {
+                const sm = self.session_manager;
+                if (extractParam(body, "max_ratio_enabled")) |v| sm.max_ratio_enabled = std.mem.eql(u8, v, "true");
+                if (extractParam(body, "max_ratio")) |v| sm.max_ratio = std.fmt.parseFloat(f64, v) catch sm.max_ratio;
+                if (extractParam(body, "max_ratio_act")) |v| sm.max_ratio_act = std.fmt.parseInt(u8, v, 10) catch sm.max_ratio_act;
+                if (extractParam(body, "max_seeding_time_enabled")) |v| sm.max_seeding_time_enabled = std.mem.eql(u8, v, "true");
+                if (extractParam(body, "max_seeding_time")) |v| sm.max_seeding_time = std.fmt.parseInt(i64, v, 10) catch sm.max_seeding_time;
+            }
+
+            var queue_changed = false;
+            if (extractParam(body, "queueing_enabled")) |val| {
+                self.session_manager.queue_manager.config.enabled = std.mem.eql(u8, val, "true");
+                queue_changed = true;
+            }
+            if (extractParam(body, "max_active_downloads")) |val| {
+                if (std.fmt.parseInt(i32, val, 10)) |v| {
+                    self.session_manager.queue_manager.config.max_active_downloads = v;
+                    queue_changed = true;
+                } else |_| {}
+            }
+            if (extractParam(body, "max_active_uploads")) |val| {
+                if (std.fmt.parseInt(i32, val, 10)) |v| {
+                    self.session_manager.queue_manager.config.max_active_uploads = v;
+                    queue_changed = true;
+                } else |_| {}
+            }
+            if (extractParam(body, "max_active_torrents")) |val| {
+                if (std.fmt.parseInt(i32, val, 10)) |v| {
+                    self.session_manager.queue_manager.config.max_active_torrents = v;
+                    queue_changed = true;
+                } else |_| {}
+            }
+            if (queue_changed) self.session_manager.runQueueEnforcement();
+
+            if (extractParam(body, "dht")) |v| self.session_manager.setDhtEnabled(std.mem.eql(u8, v, "true"));
+            if (extractParam(body, "pex")) |v| el.pex_enabled = std.mem.eql(u8, v, "true");
         }
-        if (extractParam(body, "up_limit")) |ul_str| {
-            if (std.fmt.parseInt(u64, ul_str, 10)) |ul| {
-                el.setGlobalUlLimit(ul);
-            } else |_| {}
-        } else if (extractJsonInt(body, "up_limit")) |ul| {
-            el.setGlobalUlLimit(ul);
-        }
 
-        // Handle share ratio and seeding time limits
-        {
-            const sm = self.session_manager;
-
-            // max_ratio_enabled: bool
-            if (extractParam(body, "max_ratio_enabled")) |v| {
-                sm.max_ratio_enabled = std.mem.eql(u8, v, "true");
-            } else if (extractJsonBool(body, "max_ratio_enabled")) |v| {
-                sm.max_ratio_enabled = v;
-            }
-
-            // max_ratio: float
-            if (extractParam(body, "max_ratio")) |v| {
-                sm.max_ratio = std.fmt.parseFloat(f64, v) catch sm.max_ratio;
-            } else if (extractJsonFloat(body, "max_ratio")) |v| {
-                sm.max_ratio = v;
-            }
-
-            // max_ratio_act: 0=pause, 1=remove
-            if (extractParam(body, "max_ratio_act")) |v| {
-                sm.max_ratio_act = std.fmt.parseInt(u8, v, 10) catch sm.max_ratio_act;
-            } else if (extractJsonInt(body, "max_ratio_act")) |v| {
-                sm.max_ratio_act = @intCast(@min(v, 1));
-            }
-
-            // max_seeding_time_enabled: bool
-            if (extractParam(body, "max_seeding_time_enabled")) |v| {
-                sm.max_seeding_time_enabled = std.mem.eql(u8, v, "true");
-            } else if (extractJsonBool(body, "max_seeding_time_enabled")) |v| {
-                sm.max_seeding_time_enabled = v;
-            }
-
-            // max_seeding_time: minutes (-1=disabled)
-            if (extractParam(body, "max_seeding_time")) |v| {
-                sm.max_seeding_time = std.fmt.parseInt(i64, v, 10) catch sm.max_seeding_time;
-            } else if (extractJsonInt(body, "max_seeding_time")) |v| {
-                sm.max_seeding_time = @intCast(v);
-            }
-        }
-
-        // Handle banned_IPs: newline-separated list of IPs and CIDRs
+        // Handle banned_IPs: newline-separated list of IPs and CIDRs (form-encoded only)
         if (extractParam(body, "banned_IPs")) |banned_str| {
             if (self.session_manager.ban_list) |bl| {
                 // URL-decode newlines: %0A -> \n
@@ -658,62 +686,6 @@ pub const ApiHandler = struct {
             }
         }
 
-        // Handle queue settings
-        var queue_changed = false;
-        if (extractParam(body, "queueing_enabled")) |val| {
-            self.session_manager.queue_manager.config.enabled = std.mem.eql(u8, val, "true");
-            queue_changed = true;
-        } else if (extractJsonBool(body, "queueing_enabled")) |val| {
-            self.session_manager.queue_manager.config.enabled = val;
-            queue_changed = true;
-        }
-        if (extractParam(body, "max_active_downloads")) |val| {
-            if (std.fmt.parseInt(i32, val, 10)) |v| {
-                self.session_manager.queue_manager.config.max_active_downloads = v;
-                queue_changed = true;
-            } else |_| {}
-        } else if (extractJsonInt(body, "max_active_downloads")) |v| {
-            self.session_manager.queue_manager.config.max_active_downloads = @intCast(v);
-            queue_changed = true;
-        }
-        if (extractParam(body, "max_active_uploads")) |val| {
-            if (std.fmt.parseInt(i32, val, 10)) |v| {
-                self.session_manager.queue_manager.config.max_active_uploads = v;
-                queue_changed = true;
-            } else |_| {}
-        } else if (extractJsonInt(body, "max_active_uploads")) |v| {
-            self.session_manager.queue_manager.config.max_active_uploads = @intCast(v);
-            queue_changed = true;
-        }
-        if (extractParam(body, "max_active_torrents")) |val| {
-            if (std.fmt.parseInt(i32, val, 10)) |v| {
-                self.session_manager.queue_manager.config.max_active_torrents = v;
-                queue_changed = true;
-            } else |_| {}
-        } else if (extractJsonInt(body, "max_active_torrents")) |v| {
-            self.session_manager.queue_manager.config.max_active_torrents = @intCast(v);
-            queue_changed = true;
-        }
-
-        // If queue settings changed, re-evaluate the queue
-        if (queue_changed) {
-            self.session_manager.runQueueEnforcement();
-        }
-
-        // DHT toggle (runtime: stops/starts DHT peer discovery)
-        if (extractParam(body, "dht")) |v| {
-            self.session_manager.setDhtEnabled(std.mem.eql(u8, v, "true"));
-        } else if (extractJsonBool(body, "dht")) |v| {
-            self.session_manager.setDhtEnabled(v);
-        }
-
-        // PEX toggle (runtime: stops sending/receiving PEX messages)
-        if (extractParam(body, "pex")) |v| {
-            el.pex_enabled = std.mem.eql(u8, v, "true");
-        } else if (extractJsonBool(body, "pex")) |v| {
-            el.pex_enabled = v;
-        }
-
         return .{ .body = "{\"status\":\"ok\"}" };
     }
 
@@ -724,7 +696,7 @@ pub const ApiHandler = struct {
     }
 
     fn handleSetTorrentDlLimit(self: *const ApiHandler, allocator: std.mem.Allocator, body: []const u8) server.Response {
-        const hash = extractParam(body, "hashes") orelse
+        const hash = requireHashes(body) orelse
             return .{ .status = 400, .body = "{\"error\":\"missing hashes\"}" };
         const limit_str = extractParam(body, "limit") orelse
             return .{ .status = 400, .body = "{\"error\":\"missing limit\"}" };
@@ -732,15 +704,13 @@ pub const ApiHandler = struct {
             return .{ .status = 400, .body = "{\"error\":\"invalid limit\"}" };
 
         self.session_manager.setTorrentDlLimit(hash, limit) catch |err| {
-            const msg = std.fmt.allocPrint(allocator, "{{\"error\":\"{s}\"}}", .{@errorName(err)}) catch
-                return .{ .status = 500, .body = "{\"error\":\"internal\"}" };
-            return .{ .status = 404, .body = msg, .owned_body = msg };
+            return errorResponse(allocator, 404, err);
         };
         return .{ .body = "{\"status\":\"ok\"}" };
     }
 
     fn handleSetTorrentUlLimit(self: *const ApiHandler, allocator: std.mem.Allocator, body: []const u8) server.Response {
-        const hash = extractParam(body, "hashes") orelse
+        const hash = requireHashes(body) orelse
             return .{ .status = 400, .body = "{\"error\":\"missing hashes\"}" };
         const limit_str = extractParam(body, "limit") orelse
             return .{ .status = 400, .body = "{\"error\":\"missing limit\"}" };
@@ -748,15 +718,13 @@ pub const ApiHandler = struct {
             return .{ .status = 400, .body = "{\"error\":\"invalid limit\"}" };
 
         self.session_manager.setTorrentUlLimit(hash, limit) catch |err| {
-            const msg = std.fmt.allocPrint(allocator, "{{\"error\":\"{s}\"}}", .{@errorName(err)}) catch
-                return .{ .status = 500, .body = "{\"error\":\"internal\"}" };
-            return .{ .status = 404, .body = msg, .owned_body = msg };
+            return errorResponse(allocator, 404, err);
         };
         return .{ .body = "{\"status\":\"ok\"}" };
     }
 
     fn handleGetTorrentDlLimit(self: *const ApiHandler, allocator: std.mem.Allocator, body: []const u8) server.Response {
-        const hash = extractParam(body, "hashes") orelse
+        const hash = requireHashes(body) orelse
             return .{ .status = 400, .body = "{\"error\":\"missing hashes\"}" };
 
         const stats = self.session_manager.getStats(hash) catch
@@ -768,7 +736,7 @@ pub const ApiHandler = struct {
     }
 
     fn handleGetTorrentUlLimit(self: *const ApiHandler, allocator: std.mem.Allocator, body: []const u8) server.Response {
-        const hash = extractParam(body, "hashes") orelse
+        const hash = requireHashes(body) orelse
             return .{ .status = 400, .body = "{\"error\":\"missing hashes\"}" };
 
         const stats = self.session_manager.getStats(hash) catch
@@ -954,9 +922,7 @@ pub const ApiHandler = struct {
         }
 
         self.session_manager.setFilePriority(hash, indices.items, priority) catch |err| {
-            const msg = std.fmt.allocPrint(allocator, "{{\"error\":\"{s}\"}}", .{@errorName(err)}) catch
-                return .{ .status = 500, .body = "{\"error\":\"internal\"}" };
-            return .{ .status = 404, .body = msg, .owned_body = msg };
+            return errorResponse(allocator, 404, err);
         };
 
         return .{ .body = "{\"status\":\"ok\"}" };
@@ -971,26 +937,22 @@ pub const ApiHandler = struct {
         const enabled = std.mem.eql(u8, value_str, "true");
 
         self.session_manager.setSequentialDownload(hash, enabled) catch |err| {
-            const msg = std.fmt.allocPrint(allocator, "{{\"error\":\"{s}\"}}", .{@errorName(err)}) catch
-                return .{ .status = 500, .body = "{\"error\":\"internal\"}" };
-            return .{ .status = 404, .body = msg, .owned_body = msg };
+            return errorResponse(allocator, 404, err);
         };
 
         return .{ .body = "{\"status\":\"ok\"}" };
     }
 
     fn handleTorrentsSetSuperSeeding(self: *const ApiHandler, allocator: std.mem.Allocator, body: []const u8) server.Response {
-        const hash = extractParam(body, "hashes") orelse (extractParam(body, "hash") orelse
-            return .{ .status = 400, .body = "{\"error\":\"missing hash\"}" });
+        const hash = requireHashes(body) orelse
+            return .{ .status = 400, .body = "{\"error\":\"missing hash\"}" };
         const value_str = extractParam(body, "value") orelse
             return .{ .status = 400, .body = "{\"error\":\"missing value\"}" };
 
         const enabled = std.mem.eql(u8, value_str, "true");
 
         self.session_manager.setSuperSeeding(hash, enabled) catch |err| {
-            const msg = std.fmt.allocPrint(allocator, "{{\"error\":\"{s}\"}}", .{@errorName(err)}) catch
-                return .{ .status = 500, .body = "{\"error\":\"internal\"}" };
-            return .{ .status = 404, .body = msg, .owned_body = msg };
+            return errorResponse(allocator, 404, err);
         };
 
         return .{ .body = "{\"status\":\"ok\"}" };
@@ -1024,9 +986,7 @@ pub const ApiHandler = struct {
         }
 
         self.session_manager.addTrackers(hash, url_list.items) catch |err| {
-            const msg = std.fmt.allocPrint(allocator, "{{\"error\":\"{s}\"}}", .{@errorName(err)}) catch
-                return .{ .status = 500, .body = "{\"error\":\"internal\"}" };
-            return .{ .status = 404, .body = msg, .owned_body = msg };
+            return errorResponse(allocator, 404, err);
         };
 
         return .{ .body = "{\"status\":\"ok\"}" };
@@ -1057,9 +1017,7 @@ pub const ApiHandler = struct {
         }
 
         self.session_manager.removeTrackers(hash, url_list.items) catch |err| {
-            const msg = std.fmt.allocPrint(allocator, "{{\"error\":\"{s}\"}}", .{@errorName(err)}) catch
-                return .{ .status = 500, .body = "{\"error\":\"internal\"}" };
-            return .{ .status = 404, .body = msg, .owned_body = msg };
+            return errorResponse(allocator, 404, err);
         };
 
         return .{ .body = "{\"status\":\"ok\"}" };
@@ -1074,42 +1032,36 @@ pub const ApiHandler = struct {
             return .{ .status = 400, .body = "{\"error\":\"missing newUrl\"}" };
 
         self.session_manager.editTracker(hash, orig_url, new_url) catch |err| {
-            const msg = std.fmt.allocPrint(allocator, "{{\"error\":\"{s}\"}}", .{@errorName(err)}) catch
-                return .{ .status = 500, .body = "{\"error\":\"internal\"}" };
-            return .{ .status = 404, .body = msg, .owned_body = msg };
+            return errorResponse(allocator, 404, err);
         };
 
         return .{ .body = "{\"status\":\"ok\"}" };
     }
 
     fn handleTorrentsForceReannounce(self: *const ApiHandler, allocator: std.mem.Allocator, body: []const u8) server.Response {
-        const hash = extractParam(body, "hashes") orelse
+        const hash = requireHashes(body) orelse
             return .{ .status = 400, .body = "{\"error\":\"missing hashes\"}" };
 
         self.session_manager.forceReannounce(hash) catch |err| {
-            const msg = std.fmt.allocPrint(allocator, "{{\"error\":\"{s}\"}}", .{@errorName(err)}) catch
-                return .{ .status = 500, .body = "{\"error\":\"internal\"}" };
-            return .{ .status = 404, .body = msg, .owned_body = msg };
+            return errorResponse(allocator, 404, err);
         };
 
         return .{ .body = "{\"status\":\"ok\"}" };
     }
 
     fn handleTorrentsRecheck(self: *const ApiHandler, allocator: std.mem.Allocator, body: []const u8) server.Response {
-        const hash = extractParam(body, "hashes") orelse
+        const hash = requireHashes(body) orelse
             return .{ .status = 400, .body = "{\"error\":\"missing hashes\"}" };
 
         self.session_manager.forceRecheck(hash) catch |err| {
-            const msg = std.fmt.allocPrint(allocator, "{{\"error\":\"{s}\"}}", .{@errorName(err)}) catch
-                return .{ .status = 500, .body = "{\"error\":\"internal\"}" };
-            return .{ .status = 404, .body = msg, .owned_body = msg };
+            return errorResponse(allocator, 404, err);
         };
 
         return .{ .body = "{\"status\":\"ok\"}" };
     }
 
     fn handleTorrentsSetLocation(self: *const ApiHandler, allocator: std.mem.Allocator, body: []const u8) server.Response {
-        const hash = extractParam(body, "hashes") orelse
+        const hash = requireHashes(body) orelse
             return .{ .status = 400, .body = "{\"error\":\"missing hashes\"}" };
         const location = extractParam(body, "location") orelse
             return .{ .status = 400, .body = "{\"error\":\"missing location\"}" };
@@ -1119,9 +1071,7 @@ pub const ApiHandler = struct {
         }
 
         self.session_manager.setLocation(hash, location) catch |err| {
-            const msg = std.fmt.allocPrint(allocator, "{{\"error\":\"{s}\"}}", .{@errorName(err)}) catch
-                return .{ .status = 500, .body = "{\"error\":\"internal\"}" };
-            return .{ .status = 409, .body = msg, .owned_body = msg };
+            return errorResponse(allocator, 409, err);
         };
 
         return .{ .body = "{\"status\":\"ok\"}" };
@@ -1147,7 +1097,7 @@ pub const ApiHandler = struct {
 
     fn handleSetShareLimits(self: *const ApiHandler, allocator: std.mem.Allocator, body: []const u8) server.Response {
         // hashes=<hash1>|<hash2>&ratioLimit=<float>&seedingTimeLimit=<int>
-        const hashes_str = extractParam(body, "hashes") orelse
+        const hashes_str = requireHashes(body) orelse
             return .{ .status = 400, .body = "{\"error\":\"missing hashes\"}" };
 
         // Parse ratio limit (-2 = use global, -1 = no limit, >=0 = specific)
@@ -1167,9 +1117,7 @@ pub const ApiHandler = struct {
         while (hash_iter.next()) |hash| {
             if (hash.len == 0) continue;
             self.session_manager.setShareLimits(hash, ratio_limit, seeding_time_limit) catch |err| {
-                const msg = std.fmt.allocPrint(allocator, "{{\"error\":\"{s}\"}}", .{@errorName(err)}) catch
-                    return .{ .status = 500, .body = "{\"error\":\"internal\"}" };
-                return .{ .status = 404, .body = msg, .owned_body = msg };
+                return errorResponse(allocator, 404, err);
             };
         }
         return .{ .body = "{\"status\":\"ok\"}" };
@@ -1221,9 +1169,7 @@ pub const ApiHandler = struct {
         defer self.session_manager.mutex.unlock();
 
         self.session_manager.category_store.create(name, save_path) catch |err| {
-            const msg = std.fmt.allocPrint(allocator, "{{\"error\":\"{s}\"}}", .{@errorName(err)}) catch
-                return .{ .status = 500, .body = "{\"error\":\"internal\"}" };
-            return .{ .status = 409, .body = msg, .owned_body = msg };
+            return errorResponse(allocator, 409, err);
         };
 
         // Persist to DB
@@ -1277,9 +1223,7 @@ pub const ApiHandler = struct {
         defer self.session_manager.mutex.unlock();
 
         self.session_manager.category_store.edit(name, save_path) catch |err| {
-            const msg = std.fmt.allocPrint(allocator, "{{\"error\":\"{s}\"}}", .{@errorName(err)}) catch
-                return .{ .status = 500, .body = "{\"error\":\"internal\"}" };
-            return .{ .status = 409, .body = msg, .owned_body = msg };
+            return errorResponse(allocator, 409, err);
         };
 
         // Persist to DB (saveCategory upserts)
@@ -1289,14 +1233,12 @@ pub const ApiHandler = struct {
     }
 
     fn handleSetCategory(self: *const ApiHandler, allocator: std.mem.Allocator, params: []const u8) server.Response {
-        const hash = extractParam(params, "hashes") orelse
+        const hash = requireHashes(params) orelse
             return .{ .status = 400, .body = "{\"error\":\"missing hashes\"}" };
         const category = extractParam(params, "category") orelse "";
 
         self.session_manager.setTorrentCategory(hash, category) catch |err| {
-            const msg = std.fmt.allocPrint(allocator, "{{\"error\":\"{s}\"}}", .{@errorName(err)}) catch
-                return .{ .status = 500, .body = "{\"error\":\"internal\"}" };
-            return .{ .status = 404, .body = msg, .owned_body = msg };
+            return errorResponse(allocator, 404, err);
         };
 
         return .{ .body = "{\"status\":\"ok\"}" };
@@ -1371,30 +1313,26 @@ pub const ApiHandler = struct {
     }
 
     fn handleAddTags(self: *const ApiHandler, allocator: std.mem.Allocator, params: []const u8) server.Response {
-        const hash = extractParam(params, "hashes") orelse
+        const hash = requireHashes(params) orelse
             return .{ .status = 400, .body = "{\"error\":\"missing hashes\"}" };
         const tags_str = extractParam(params, "tags") orelse
             return .{ .status = 400, .body = "{\"error\":\"missing tags\"}" };
 
         self.session_manager.addTorrentTags(hash, tags_str) catch |err| {
-            const msg = std.fmt.allocPrint(allocator, "{{\"error\":\"{s}\"}}", .{@errorName(err)}) catch
-                return .{ .status = 500, .body = "{\"error\":\"internal\"}" };
-            return .{ .status = 404, .body = msg, .owned_body = msg };
+            return errorResponse(allocator, 404, err);
         };
 
         return .{ .body = "{\"status\":\"ok\"}" };
     }
 
     fn handleRemoveTags(self: *const ApiHandler, allocator: std.mem.Allocator, params: []const u8) server.Response {
-        const hash = extractParam(params, "hashes") orelse
+        const hash = requireHashes(params) orelse
             return .{ .status = 400, .body = "{\"error\":\"missing hashes\"}" };
         const tags_str = extractParam(params, "tags") orelse
             return .{ .status = 400, .body = "{\"error\":\"missing tags\"}" };
 
         self.session_manager.removeTorrentTags(hash, tags_str) catch |err| {
-            const msg = std.fmt.allocPrint(allocator, "{{\"error\":\"{s}\"}}", .{@errorName(err)}) catch
-                return .{ .status = 500, .body = "{\"error\":\"internal\"}" };
-            return .{ .status = 404, .body = msg, .owned_body = msg };
+            return errorResponse(allocator, 404, err);
         };
 
         return .{ .body = "{\"status\":\"ok\"}" };
@@ -1656,7 +1594,7 @@ pub const ApiHandler = struct {
     const QueueAction = enum { increase, decrease, top, bottom };
 
     fn handleQueuePrioAction(self: *const ApiHandler, allocator: std.mem.Allocator, body: []const u8, action: QueueAction) server.Response {
-        const hashes_str = extractParam(body, "hashes") orelse
+        const hashes_str = requireHashes(body) orelse
             return .{ .status = 400, .body = "{\"error\":\"missing hashes\"}" };
 
         // Support multiple hashes separated by |
@@ -1670,9 +1608,7 @@ pub const ApiHandler = struct {
                 .bottom => self.session_manager.queueBottomPrio(hash),
             };
             result catch |err| {
-                const msg = std.fmt.allocPrint(allocator, "{{\"error\":\"{s}\"}}", .{@errorName(err)}) catch
-                    return .{ .status = 500, .body = "{\"error\":\"internal\"}" };
-                return .{ .status = 404, .body = msg, .owned_body = msg };
+                return errorResponse(allocator, 404, err);
             };
         }
 
@@ -1763,6 +1699,40 @@ fn serializeTorrentInfo(allocator: std.mem.Allocator, json: *std.ArrayList(u8), 
 const buildContentPath = compat.buildContentPath;
 const buildMagnetUri = compat.buildMagnetUri;
 
+/// Structured JSON body for POST /api/v2/app/setPreferences.
+/// All fields are optional; only the fields present in the JSON body are applied.
+/// Parsed with `std.json.parseFromSlice` and `ignore_unknown_fields = true`.
+const PreferencesUpdate = struct {
+    dl_limit: ?u64 = null,
+    up_limit: ?u64 = null,
+    max_ratio_enabled: ?bool = null,
+    max_ratio: ?f64 = null,
+    max_ratio_act: ?u8 = null,
+    max_seeding_time_enabled: ?bool = null,
+    max_seeding_time: ?i64 = null,
+    queueing_enabled: ?bool = null,
+    max_active_downloads: ?i32 = null,
+    max_active_uploads: ?i32 = null,
+    max_active_torrents: ?i32 = null,
+    dht: ?bool = null,
+    pex: ?bool = null,
+};
+
+/// Build a `server.Response` carrying a JSON error body.
+/// `owned_body` is set so the caller's arena or response-send path can free it.
+fn errorResponse(allocator: std.mem.Allocator, status: u16, err: anyerror) server.Response {
+    const msg = std.fmt.allocPrint(allocator, "{{\"error\":\"{s}\"}}", .{@errorName(err)}) catch
+        return .{ .status = 500, .body = "{\"error\":\"internal\"}" };
+    return .{ .status = status, .body = msg, .owned_body = msg };
+}
+
+/// Extract a torrent hash from the request body.  Tries `hashes` first (the
+/// multi-torrent key used by most qBittorrent endpoints), then falls back to
+/// the single-torrent `hash` key.
+fn requireHashes(body: []const u8) ?[]const u8 {
+    return extractParam(body, "hashes") orelse extractParam(body, "hash");
+}
+
 fn extractParam(body: []const u8, key: []const u8) ?[]const u8 {
     // Simple form-encoded parameter extraction: key=value&key2=value2
     var iter = std.mem.splitScalar(u8, body, '&');
@@ -1776,113 +1746,10 @@ fn extractParam(body: []const u8, key: []const u8) ?[]const u8 {
     return null;
 }
 
-/// Extract an integer value from a simple JSON object by key.
-/// Handles: {"key":123} or {"key": 123} patterns without a full JSON parser.
-fn extractJsonInt(body: []const u8, key: []const u8) ?u64 {
-    // Search for "key": or "key":
-    var needle_buf: [128]u8 = undefined;
-    if (key.len + 3 > needle_buf.len) return null;
-    needle_buf[0] = '"';
-    @memcpy(needle_buf[1..][0..key.len], key);
-    needle_buf[key.len + 1] = '"';
-    needle_buf[key.len + 2] = ':';
-    const needle = needle_buf[0 .. key.len + 3];
-
-    const key_pos = std.mem.indexOf(u8, body, needle) orelse return null;
-    var val_start = key_pos + needle.len;
-
-    // Skip whitespace
-    while (val_start < body.len and body[val_start] == ' ') val_start += 1;
-    if (val_start >= body.len) return null;
-
-    // Read digits
-    var val_end = val_start;
-    while (val_end < body.len and body[val_end] >= '0' and body[val_end] <= '9') val_end += 1;
-    if (val_end == val_start) return null;
-
-    return std.fmt.parseInt(u64, body[val_start..val_end], 10) catch null;
-}
-
-/// Extract a boolean value from a simple JSON object by key.
-/// Handles: {"key":true} or {"key": false} patterns without a full JSON parser.
-fn extractJsonBool(body: []const u8, key: []const u8) ?bool {
-    var needle_buf: [128]u8 = undefined;
-    if (key.len + 3 > needle_buf.len) return null;
-    needle_buf[0] = '"';
-    @memcpy(needle_buf[1..][0..key.len], key);
-    needle_buf[key.len + 1] = '"';
-    needle_buf[key.len + 2] = ':';
-    const needle = needle_buf[0 .. key.len + 3];
-
-    const key_pos = std.mem.indexOf(u8, body, needle) orelse return null;
-    var val_start = key_pos + needle.len;
-
-    // Skip whitespace
-    while (val_start < body.len and body[val_start] == ' ') val_start += 1;
-    if (val_start >= body.len) return null;
-
-    if (val_start + 4 <= body.len and std.mem.eql(u8, body[val_start..][0..4], "true")) return true;
-    if (val_start + 5 <= body.len and std.mem.eql(u8, body[val_start..][0..5], "false")) return false;
-    return null;
-}
-
-/// Extract a float value from a simple JSON object by key.
-/// Handles: {"key":1.5} or {"key": -1} patterns without a full JSON parser.
-fn extractJsonFloat(body: []const u8, key: []const u8) ?f64 {
-    var needle_buf: [128]u8 = undefined;
-    if (key.len + 3 > needle_buf.len) return null;
-    needle_buf[0] = '"';
-    @memcpy(needle_buf[1..][0..key.len], key);
-    needle_buf[key.len + 1] = '"';
-    needle_buf[key.len + 2] = ':';
-    const needle = needle_buf[0 .. key.len + 3];
-
-    const key_pos = std.mem.indexOf(u8, body, needle) orelse return null;
-    var val_start = key_pos + needle.len;
-
-    // Skip whitespace
-    while (val_start < body.len and body[val_start] == ' ') val_start += 1;
-    if (val_start >= body.len) return null;
-
-    // Read number characters (digits, minus, dot)
-    var val_end = val_start;
-    while (val_end < body.len and (body[val_end] == '-' or body[val_end] == '.' or (body[val_end] >= '0' and body[val_end] <= '9'))) val_end += 1;
-    if (val_end == val_start) return null;
-
-    return std.fmt.parseFloat(f64, body[val_start..val_end]) catch null;
-}
-
 test "extract form param" {
     try std.testing.expectEqualStrings("abc123", extractParam("hashes=abc123&deleteFiles=false", "hashes").?);
     try std.testing.expectEqualStrings("false", extractParam("hashes=abc123&deleteFiles=false", "deleteFiles").?);
     try std.testing.expect(extractParam("hashes=abc", "missing") == null);
-}
-
-test "extract json int" {
-    try std.testing.expectEqual(@as(?u64, 1024), extractJsonInt("{\"dl_limit\":1024,\"up_limit\":512}", "dl_limit"));
-    try std.testing.expectEqual(@as(?u64, 512), extractJsonInt("{\"dl_limit\":1024,\"up_limit\":512}", "up_limit"));
-    try std.testing.expectEqual(@as(?u64, 100), extractJsonInt("{\"dl_limit\": 100}", "dl_limit"));
-    try std.testing.expect(extractJsonInt("{\"dl_limit\":1024}", "missing") == null);
-    try std.testing.expect(extractJsonInt("dl_limit=1024", "dl_limit") == null);
-}
-
-test "extract json bool" {
-    try std.testing.expectEqual(@as(?bool, true), extractJsonBool("{\"max_ratio_enabled\":true}", "max_ratio_enabled"));
-    try std.testing.expectEqual(@as(?bool, false), extractJsonBool("{\"max_ratio_enabled\":false}", "max_ratio_enabled"));
-    try std.testing.expectEqual(@as(?bool, true), extractJsonBool("{\"max_ratio_enabled\": true}", "max_ratio_enabled"));
-    try std.testing.expect(extractJsonBool("{\"max_ratio_enabled\":1}", "max_ratio_enabled") == null);
-    try std.testing.expect(extractJsonBool("{}", "max_ratio_enabled") == null);
-}
-
-test "extract json float" {
-    const eps = 0.0001;
-    const v1 = extractJsonFloat("{\"max_ratio\":2.5}", "max_ratio").?;
-    try std.testing.expect(@abs(v1 - 2.5) < eps);
-    const v2 = extractJsonFloat("{\"max_ratio\":-1}", "max_ratio").?;
-    try std.testing.expect(@abs(v2 - (-1.0)) < eps);
-    const v3 = extractJsonFloat("{\"max_ratio\": 0.75}", "max_ratio").?;
-    try std.testing.expect(@abs(v3 - 0.75) < eps);
-    try std.testing.expect(extractJsonFloat("{}", "max_ratio") == null);
 }
 
 // ── Additional parameter extraction tests ────────────────
@@ -1917,70 +1784,166 @@ test "extractParam handles url-encoded special chars in value" {
     try std.testing.expectEqualStrings("hello%20world", extractParam("name=hello%20world", "name").?);
 }
 
-test "extractJsonInt returns null for non-numeric value" {
-    try std.testing.expect(extractJsonInt("{\"dl_limit\":\"abc\"}", "dl_limit") == null);
+// ── PreferencesUpdate JSON parsing tests ────────────────
+
+test "parsePreferencesJson parses integer fields" {
+    const json_body = "{\"dl_limit\":1024,\"up_limit\":512}";
+    const parsed = std.json.parseFromSlice(PreferencesUpdate, std.testing.allocator, json_body, .{ .ignore_unknown_fields = true }) catch |err| {
+        std.debug.print("JSON parse error: {}\n", .{err});
+        return error.TestUnexpectedResult;
+    };
+    defer parsed.deinit();
+    try std.testing.expectEqual(@as(?u64, 1024), parsed.value.dl_limit);
+    try std.testing.expectEqual(@as(?u64, 512), parsed.value.up_limit);
 }
 
-test "extractJsonInt handles zero value" {
-    try std.testing.expectEqual(@as(?u64, 0), extractJsonInt("{\"dl_limit\":0}", "dl_limit"));
+test "parsePreferencesJson parses boolean fields" {
+    const json_body = "{\"max_ratio_enabled\":true,\"max_seeding_time_enabled\":false,\"queueing_enabled\":true}";
+    const parsed = std.json.parseFromSlice(PreferencesUpdate, std.testing.allocator, json_body, .{ .ignore_unknown_fields = true }) catch
+        return error.TestUnexpectedResult;
+    defer parsed.deinit();
+    try std.testing.expectEqual(@as(?bool, true), parsed.value.max_ratio_enabled);
+    try std.testing.expectEqual(@as(?bool, false), parsed.value.max_seeding_time_enabled);
+    try std.testing.expectEqual(@as(?bool, true), parsed.value.queueing_enabled);
 }
 
-test "extractJsonInt handles large value" {
-    try std.testing.expectEqual(@as(?u64, 999999999), extractJsonInt("{\"dl_limit\":999999999}", "dl_limit"));
-}
-
-test "extractJsonInt returns null for empty body" {
-    try std.testing.expect(extractJsonInt("", "dl_limit") == null);
-}
-
-test "extractJsonInt handles multiple spaces after colon" {
-    try std.testing.expectEqual(@as(?u64, 42), extractJsonInt("{\"dl_limit\":  42}", "dl_limit"));
-}
-
-test "extractJsonBool returns null for empty body" {
-    try std.testing.expect(extractJsonBool("", "enabled") == null);
-}
-
-test "extractJsonBool handles key with multiple whitespace" {
-    try std.testing.expectEqual(@as(?bool, false), extractJsonBool("{\"enabled\":   false}", "enabled"));
-}
-
-test "extractJsonBool returns null for string true" {
-    // "true" in quotes should not match
-    try std.testing.expect(extractJsonBool("{\"enabled\":\"true\"}", "enabled") == null);
-}
-
-test "extractJsonFloat handles zero" {
+test "parsePreferencesJson parses float fields" {
     const eps = 0.0001;
-    const v = extractJsonFloat("{\"ratio\":0.0}", "ratio").?;
-    try std.testing.expect(@abs(v) < eps);
+    const json_body = "{\"max_ratio\":2.5}";
+    const parsed = std.json.parseFromSlice(PreferencesUpdate, std.testing.allocator, json_body, .{ .ignore_unknown_fields = true }) catch
+        return error.TestUnexpectedResult;
+    defer parsed.deinit();
+    const v = parsed.value.max_ratio orelse return error.TestUnexpectedResult;
+    try std.testing.expect(@abs(v - 2.5) < eps);
 }
 
-test "extractJsonFloat handles negative decimal" {
-    const eps = 0.0001;
-    const v = extractJsonFloat("{\"ratio\":-2.5}", "ratio").?;
-    try std.testing.expect(@abs(v - (-2.5)) < eps);
+test "parsePreferencesJson parses queue config fields" {
+    const json_body = "{\"queueing_enabled\":true,\"max_active_downloads\":5,\"max_active_uploads\":3,\"max_active_torrents\":10}";
+    const parsed = std.json.parseFromSlice(PreferencesUpdate, std.testing.allocator, json_body, .{ .ignore_unknown_fields = true }) catch
+        return error.TestUnexpectedResult;
+    defer parsed.deinit();
+    try std.testing.expectEqual(@as(?bool, true), parsed.value.queueing_enabled);
+    try std.testing.expectEqual(@as(?i32, 5), parsed.value.max_active_downloads);
+    try std.testing.expectEqual(@as(?i32, 3), parsed.value.max_active_uploads);
+    try std.testing.expectEqual(@as(?i32, 10), parsed.value.max_active_torrents);
 }
 
-test "extractJsonFloat returns null for boolean value" {
-    try std.testing.expect(extractJsonFloat("{\"ratio\":true}", "ratio") == null);
+test "parsePreferencesJson parses seeding time as signed int" {
+    const json_body = "{\"max_seeding_time\":-1}";
+    const parsed = std.json.parseFromSlice(PreferencesUpdate, std.testing.allocator, json_body, .{ .ignore_unknown_fields = true }) catch
+        return error.TestUnexpectedResult;
+    defer parsed.deinit();
+    try std.testing.expectEqual(@as(?i64, -1), parsed.value.max_seeding_time);
 }
 
-test "extractJsonFloat returns null for empty body" {
-    try std.testing.expect(extractJsonFloat("", "ratio") == null);
+test "parsePreferencesJson parses multiple fields in one request" {
+    const json_body = "{\"dl_limit\":2048,\"up_limit\":1024,\"max_ratio_enabled\":true,\"max_ratio\":3.0,\"dht\":false,\"pex\":true}";
+    const parsed = std.json.parseFromSlice(PreferencesUpdate, std.testing.allocator, json_body, .{ .ignore_unknown_fields = true }) catch
+        return error.TestUnexpectedResult;
+    defer parsed.deinit();
+    try std.testing.expectEqual(@as(?u64, 2048), parsed.value.dl_limit);
+    try std.testing.expectEqual(@as(?u64, 1024), parsed.value.up_limit);
+    try std.testing.expectEqual(@as(?bool, true), parsed.value.max_ratio_enabled);
+    try std.testing.expectEqual(@as(?bool, false), parsed.value.dht);
+    try std.testing.expectEqual(@as(?bool, true), parsed.value.pex);
 }
 
-test "extractJsonInt key length near buffer limit" {
-    // Key that is exactly 125 chars (128 - 3 for quotes and colon)
-    const long_key = "a" ** 125;
-    const body = "\"" ++ long_key ++ "\":42";
-    try std.testing.expectEqual(@as(?u64, 42), extractJsonInt(body, long_key));
+test "parsePreferencesJson missing fields are null" {
+    const json_body = "{\"dl_limit\":100}";
+    const parsed = std.json.parseFromSlice(PreferencesUpdate, std.testing.allocator, json_body, .{ .ignore_unknown_fields = true }) catch
+        return error.TestUnexpectedResult;
+    defer parsed.deinit();
+    try std.testing.expectEqual(@as(?u64, 100), parsed.value.dl_limit);
+    try std.testing.expect(parsed.value.up_limit == null);
+    try std.testing.expect(parsed.value.max_ratio_enabled == null);
+    try std.testing.expect(parsed.value.max_ratio == null);
+    try std.testing.expect(parsed.value.queueing_enabled == null);
+    try std.testing.expect(parsed.value.dht == null);
+    try std.testing.expect(parsed.value.pex == null);
 }
 
-test "extractJsonInt key too long for needle buffer" {
-    // Key that exceeds 125 chars should return null gracefully
-    const long_key = "a" ** 126;
-    try std.testing.expect(extractJsonInt("{}", long_key) == null);
+test "parsePreferencesJson ignores unknown fields" {
+    const json_body = "{\"dl_limit\":100,\"totally_unknown_field\":42,\"another_unknown\":\"value\"}";
+    const parsed = std.json.parseFromSlice(PreferencesUpdate, std.testing.allocator, json_body, .{ .ignore_unknown_fields = true }) catch
+        return error.TestUnexpectedResult;
+    defer parsed.deinit();
+    try std.testing.expectEqual(@as(?u64, 100), parsed.value.dl_limit);
+}
+
+test "parsePreferencesJson handles empty object" {
+    const json_body = "{}";
+    const parsed = std.json.parseFromSlice(PreferencesUpdate, std.testing.allocator, json_body, .{ .ignore_unknown_fields = true }) catch
+        return error.TestUnexpectedResult;
+    defer parsed.deinit();
+    try std.testing.expect(parsed.value.dl_limit == null);
+    try std.testing.expect(parsed.value.up_limit == null);
+}
+
+test "parsePreferencesJson parses dht and pex toggles" {
+    const json_body = "{\"dht\":true,\"pex\":false}";
+    const parsed = std.json.parseFromSlice(PreferencesUpdate, std.testing.allocator, json_body, .{ .ignore_unknown_fields = true }) catch
+        return error.TestUnexpectedResult;
+    defer parsed.deinit();
+    try std.testing.expectEqual(@as(?bool, true), parsed.value.dht);
+    try std.testing.expectEqual(@as(?bool, false), parsed.value.pex);
+}
+
+test "parsePreferencesJson parses max_ratio_act" {
+    const json_body = "{\"max_ratio_act\":1}";
+    const parsed = std.json.parseFromSlice(PreferencesUpdate, std.testing.allocator, json_body, .{ .ignore_unknown_fields = true }) catch
+        return error.TestUnexpectedResult;
+    defer parsed.deinit();
+    try std.testing.expectEqual(@as(?u8, 1), parsed.value.max_ratio_act);
+}
+
+test "parsePreferencesJson handles whitespace" {
+    const json_body = "{ \"dl_limit\" : 100 , \"up_limit\" : 200 }";
+    const parsed = std.json.parseFromSlice(PreferencesUpdate, std.testing.allocator, json_body, .{ .ignore_unknown_fields = true }) catch
+        return error.TestUnexpectedResult;
+    defer parsed.deinit();
+    try std.testing.expectEqual(@as(?u64, 100), parsed.value.dl_limit);
+    try std.testing.expectEqual(@as(?u64, 200), parsed.value.up_limit);
+}
+
+// ── requireHashes helper tests ──────────────────────────
+
+test "requireHashes returns hashes param" {
+    try std.testing.expectEqualStrings("abc123", requireHashes("hashes=abc123&deleteFiles=false").?);
+}
+
+test "requireHashes falls back to hash param" {
+    try std.testing.expectEqualStrings("def456", requireHashes("hash=def456").?);
+}
+
+test "requireHashes prefers hashes over hash" {
+    try std.testing.expectEqualStrings("first", requireHashes("hashes=first&hash=second").?);
+}
+
+test "requireHashes returns null when neither present" {
+    try std.testing.expect(requireHashes("other=value") == null);
+}
+
+test "requireHashes returns null for empty body" {
+    try std.testing.expect(requireHashes("") == null);
+}
+
+// ── errorResponse helper tests ──────────────────────────
+
+test "errorResponse formats error message" {
+    const resp = errorResponse(std.testing.allocator, 404, error.TorrentNotFound);
+    if (resp.owned_body) |body| {
+        defer std.testing.allocator.free(body);
+        try std.testing.expectEqualStrings("{\"error\":\"TorrentNotFound\"}", body);
+        try std.testing.expectEqual(@as(u16, 404), resp.status);
+    }
+}
+
+test "errorResponse uses correct status code" {
+    const resp = errorResponse(std.testing.allocator, 500, error.OutOfMemory);
+    if (resp.owned_body) |body| {
+        defer std.testing.allocator.free(body);
+        try std.testing.expectEqual(@as(u16, 500), resp.status);
+    }
 }
 
 // ── serializeTorrentInfo tests ───────────────────────────
