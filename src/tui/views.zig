@@ -63,24 +63,8 @@ pub fn formatEta(alloc: Allocator, eta_secs: i64) []const u8 {
     return std.fmt.allocPrint(alloc, "{d}m{d:0>2}s", .{ m, s }) catch "?";
 }
 
-fn statusSymbol(state: []const u8) []const u8 {
-    if (std.mem.eql(u8, state, "downloading") or std.mem.eql(u8, state, "metaDL") or std.mem.eql(u8, state, "forcedMetaDL")) return "v";
-    if (std.mem.eql(u8, state, "uploading") or std.mem.eql(u8, state, "stalledUP") or std.mem.eql(u8, state, "forcedUP")) return "^";
-    if (std.mem.eql(u8, state, "pausedDL") or std.mem.eql(u8, state, "pausedUP")) return "||";
-    if (std.mem.eql(u8, state, "stalledDL")) return "..";
-    if (std.mem.eql(u8, state, "checkingDL") or std.mem.eql(u8, state, "checkingUP") or std.mem.eql(u8, state, "checkingResumeData")) return "?";
-    if (std.mem.eql(u8, state, "queuedDL") or std.mem.eql(u8, state, "queuedUP")) return "Q";
-    if (std.mem.eql(u8, state, "error") or std.mem.eql(u8, state, "missingFiles")) return "!";
-    return "-";
-}
-
-fn statusColor(state: []const u8) zz.Color {
-    if (std.mem.eql(u8, state, "downloading") or std.mem.eql(u8, state, "metaDL") or std.mem.eql(u8, state, "forcedMetaDL")) return colors.speed_dl;
-    if (std.mem.eql(u8, state, "uploading") or std.mem.eql(u8, state, "stalledUP") or std.mem.eql(u8, state, "forcedUP")) return colors.speed_up;
-    if (std.mem.eql(u8, state, "pausedDL") or std.mem.eql(u8, state, "pausedUP")) return colors.paused;
-    if (std.mem.eql(u8, state, "error") or std.mem.eql(u8, state, "missingFiles")) return colors.error_c;
-    return colors.muted;
-}
+// Status symbol and color are now methods on api.TorrentState in api.zig.
+// Views call t.state.statusSymbol() and t.state.statusColor() directly.
 
 fn toU16(val: usize) u16 {
     return @intCast(@min(val, std.math.maxInt(u16)));
@@ -188,8 +172,8 @@ pub fn renderTorrentList(
         const is_selected = idx == selected;
 
         // Status symbol
-        const sym = statusSymbol(t.state);
-        const sym_color = statusColor(t.state);
+        const sym = t.state.statusSymbol();
+        const sym_color = t.state.statusColor();
 
         var sym_style = zz.Style{};
         sym_style = sym_style.fg(sym_color);
@@ -318,7 +302,7 @@ pub fn renderDetailView(
         alloc,
         " Status: {s}  Progress: {d:.1}%  DL: {s}  UP: {s}  Seeds: {d}/{d}  Peers: {d}/{d}",
         .{
-            torrent.state,
+            torrent.state.displayString(),
             torrent.progress * 100.0,
             formatSpeed(alloc, torrent.dlspeed),
             formatSpeed(alloc, torrent.upspeed),

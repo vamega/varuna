@@ -279,7 +279,7 @@ const Model = struct {
                 list[i] = src;
                 list[i].hash = arena.dupe(u8, src.hash) catch "";
                 list[i].name = arena.dupe(u8, src.name) catch "";
-                list[i].state = arena.dupe(u8, src.state) catch "";
+                // state is an enum value, no deep copy needed
                 list[i].save_path = arena.dupe(u8, src.save_path) catch "";
                 list[i].category = arena.dupe(u8, src.category) catch "";
                 list[i].tags = arena.dupe(u8, src.tags) catch "";
@@ -587,7 +587,7 @@ const Model = struct {
     fn doPauseResume(self: *Model) void {
         const t = self.getSelectedTorrent() orelse return;
         var cmd = ActionCmd{};
-        const is_paused = std.mem.eql(u8, t.state, "pausedDL") or std.mem.eql(u8, t.state, "pausedUP");
+        const is_paused = t.state == .pausedDL or t.state == .pausedUP;
         cmd.kind = if (is_paused) .@"resume" else .pause;
         const len = @min(t.hash.len, cmd.hash.len);
         @memcpy(cmd.hash[0..len], t.hash[0..len]);

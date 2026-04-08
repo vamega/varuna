@@ -7,10 +7,107 @@
 
 const std = @import("std");
 const dusty = @import("dusty");
+const zz = @import("zigzag");
 
 const Allocator = std.mem.Allocator;
 
 // ── Data types mirroring the qBittorrent WebAPI JSON schema ──────────
+
+/// Torrent state as reported by the daemon's qBittorrent-compatible WebAPI.
+/// Maps the raw JSON state strings to a type-safe enum so the compiler can
+/// enforce exhaustive switches and catch typos at build time.
+pub const TorrentState = enum {
+    downloading,
+    stalledDL,
+    uploading,
+    stalledUP,
+    pausedDL,
+    pausedUP,
+    queuedDL,
+    queuedUP,
+    checkingDL,
+    checkingUP,
+    forcedDL,
+    forcedUP,
+    metaDL,
+    moving,
+    missingFiles,
+    error_state,
+    unknown,
+
+    const string_map = std.StaticStringMap(TorrentState).initComptime(.{
+        .{ "downloading", .downloading },
+        .{ "stalledDL", .stalledDL },
+        .{ "uploading", .uploading },
+        .{ "stalledUP", .stalledUP },
+        .{ "pausedDL", .pausedDL },
+        .{ "pausedUP", .pausedUP },
+        .{ "queuedDL", .queuedDL },
+        .{ "queuedUP", .queuedUP },
+        .{ "checkingDL", .checkingDL },
+        .{ "checkingUP", .checkingUP },
+        .{ "checkingResumeData", .checkingDL },
+        .{ "forcedDL", .forcedDL },
+        .{ "forcedUP", .forcedUP },
+        .{ "forcedMetaDL", .metaDL },
+        .{ "metaDL", .metaDL },
+        .{ "moving", .moving },
+        .{ "missingFiles", .missingFiles },
+        .{ "error", .error_state },
+    });
+
+    pub fn fromString(s: []const u8) TorrentState {
+        return string_map.get(s) orelse .unknown;
+    }
+
+    pub fn displayString(self: TorrentState) []const u8 {
+        return switch (self) {
+            .downloading => "Downloading",
+            .stalledDL => "Stalled DL",
+            .uploading => "Seeding",
+            .stalledUP => "Stalled UP",
+            .pausedDL => "Paused",
+            .pausedUP => "Paused",
+            .queuedDL => "Queued DL",
+            .queuedUP => "Queued UP",
+            .checkingDL => "Checking",
+            .checkingUP => "Checking",
+            .forcedDL => "Forced DL",
+            .forcedUP => "Forced UP",
+            .metaDL => "Fetching",
+            .moving => "Moving",
+            .missingFiles => "Missing",
+            .error_state => "Error",
+            .unknown => "Unknown",
+        };
+    }
+
+    pub fn statusSymbol(self: TorrentState) []const u8 {
+        return switch (self) {
+            .downloading, .metaDL, .forcedDL => "v",
+            .uploading, .stalledUP, .forcedUP => "^",
+            .pausedDL, .pausedUP => "||",
+            .stalledDL => "..",
+            .checkingDL, .checkingUP => "?",
+            .queuedDL, .queuedUP => "Q",
+            .error_state, .missingFiles => "!",
+            .moving => ">",
+            .unknown => "-",
+        };
+    }
+
+    pub fn statusColor(self: TorrentState) zz.Color {
+        return switch (self) {
+            .downloading, .metaDL, .forcedDL => zz.Color.fromRgb(80, 200, 120),
+            .uploading, .stalledUP, .forcedUP => zz.Color.fromRgb(255, 140, 60),
+            .pausedDL, .pausedUP => zz.Color.gray(8),
+            .error_state, .missingFiles => zz.Color.red(),
+            .stalledDL => zz.Color.fromRgb(200, 200, 80),
+            .checkingDL, .checkingUP => zz.Color.cyan(),
+            .queuedDL, .queuedUP, .moving, .unknown => zz.Color.gray(12),
+        };
+    }
+};
 
 pub const TorrentInfo = struct {
     hash: []const u8 = "",
@@ -21,7 +118,7 @@ pub const TorrentInfo = struct {
     upspeed: i64 = 0,
     num_seeds: i64 = 0,
     num_leechs: i64 = 0,
-    state: []const u8 = "",
+    state: TorrentState = .unknown,
     eta: i64 = 0,
     ratio: f64 = 0,
     added_on: i64 = 0,
@@ -356,7 +453,7 @@ pub const ApiClient = struct {
             .upspeed = getInt(obj, "upspeed"),
             .num_seeds = getInt(obj, "num_seeds"),
             .num_leechs = getInt(obj, "num_leechs"),
-            .state = getStr(obj, "state"),
+            .state = TorrentState.fromString(getStr(obj, "state")),
             .eta = getInt(obj, "eta"),
             .ratio = getFloat(obj, "ratio"),
             .added_on = getInt(obj, "added_on"),
