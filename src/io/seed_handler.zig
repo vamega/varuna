@@ -23,6 +23,17 @@ fn findPendingSeedReadIndex(items: []const EventLoop.PendingPieceRead, read_id: 
     return null;
 }
 
+fn encodeSeedReadContext(read_id: u32, span_index: u8) u40 {
+    return @as(u40, read_id) | (@as(u40, span_index) << 32);
+}
+
+fn decodeSeedReadContext(context: u40) struct { read_id: u32, span_index: u8 } {
+    return .{
+        .read_id = @truncate(context),
+        .span_index = @truncate(context >> 32),
+    };
+}
+
 fn queuePieceBlockResponse(
     self: *EventLoop,
     slot: u16,
@@ -228,6 +239,7 @@ pub fn servePieceRequest(self: *EventLoop, slot: u16, payload: []const u8) void 
         .block_length = block_length,
         .piece_buffer = piece_buffer,
         .reads_remaining = 0,
+        .submitted_span_count = 0,
     }) catch {
         self.releasePieceBuffer(piece_buffer);
         return;
@@ -237,13 +249,18 @@ pub fn servePieceRequest(self: *EventLoop, slot: u16, payload: []const u8) void 
     var submitted_reads: u32 = 0;
 
     // Submit one io_uring read per span (all non-blocking)
-    for (plan.spans) |span| {
+    for (plan.spans, 0..) |span, span_index| {
         const target = piece_buffer.buf[span.piece_offset .. span.piece_offset + span.length];
-        const ud = encodeUserData(.{ .slot = slot, .op_type = .disk_read, .context = @intCast(read_id) });
+        const ud = encodeUserData(.{
+            .slot = slot,
+            .op_type = .disk_read,
+            .context = encodeSeedReadContext(read_id, @intCast(span_index)),
+        });
         _ = self.ring.read(ud, tc.shared_fds[span.file_index], .{ .buffer = target }, span.file_offset) catch |err| {
             log.warn("disk read submit for piece {d}: {s}", .{ piece_index, @errorName(err) });
             continue;
         };
+        self.pending_reads.items[pending_index].expected_read_lengths[submitted_reads] = @intCast(span.length);
         submitted_reads += 1;
     }
 
@@ -254,16 +271,31 @@ pub fn servePieceRequest(self: *EventLoop, slot: u16, payload: []const u8) void 
     }
 
     self.pending_reads.items[pending_index].reads_remaining = submitted_reads;
+    self.pending_reads.items[pending_index].submitted_span_count = @intCast(submitted_reads);
 }
 
 pub fn handleSeedDiskRead(self: *EventLoop, cqe: @import("std").os.linux.io_uring_cqe) void {
     const op = decodeUserData(cqe.user_data);
-    const read_id: u32 = @intCast(op.context);
+    const read_ctx = decodeSeedReadContext(op.context);
+    const read_id = read_ctx.read_id;
 
     const idx = findPendingSeedReadIndex(self.pending_reads.items, read_id) orelse return;
     var pending = self.pending_reads.items[idx];
+    if (read_ctx.span_index >= pending.submitted_span_count) {
+        self.releasePieceBuffer(pending.piece_buffer);
+        _ = self.pending_reads.swapRemove(idx);
+        return;
+    }
 
     if (cqe.res <= 0) {
+        self.releasePieceBuffer(pending.piece_buffer);
+        _ = self.pending_reads.swapRemove(idx);
+        return;
+    }
+
+    const expected_len = pending.expected_read_lengths[read_ctx.span_index];
+    const actual_len: u32 = @intCast(cqe.res);
+    if (actual_len != expected_len) {
         self.releasePieceBuffer(pending.piece_buffer);
         _ = self.pending_reads.swapRemove(idx);
         return;
@@ -470,4 +502,12 @@ test "findPendingSeedReadIndex matches by unique read id" {
     try std.testing.expectEqual(@as(?usize, 0), findPendingSeedReadIndex(reads[0..], 11));
     try std.testing.expectEqual(@as(?usize, 1), findPendingSeedReadIndex(reads[0..], 12));
     try std.testing.expectEqual(@as(?usize, null), findPendingSeedReadIndex(reads[0..], 99));
+}
+
+test "seed read context roundtrips read id and span index" {
+    const encoded = encodeSeedReadContext(0x1234_5678, 7);
+    const decoded = decodeSeedReadContext(encoded);
+
+    try std.testing.expectEqual(@as(u32, 0x1234_5678), decoded.read_id);
+    try std.testing.expectEqual(@as(u8, 7), decoded.span_index);
 }

@@ -106,6 +106,8 @@ pub const EventLoop = struct {
     /// For multi-span pieces, multiple io_uring reads are submitted.
     /// When all reads complete, the piece response is sent.
     pub const PendingPieceRead = struct {
+        pub const max_spans: usize = 8;
+
         read_id: u32,
         slot: u16,
         piece_index: u32,
@@ -113,6 +115,13 @@ pub const EventLoop = struct {
         block_length: u32,
         piece_buffer: *PieceBuffer,
         reads_remaining: u32, // number of successfully submitted read CQEs still pending
+        submitted_span_count: u8 = 0,
+        expected_read_lengths: [max_spans]u32 = [_]u32{0} ** max_spans,
+    };
+
+    pub const AnnounceResult = struct {
+        torrent_id: TorrentIdType,
+        peers: []std.net.Address,
     };
 
     ring: linux.IoUring,
@@ -227,11 +236,10 @@ pub const EventLoop = struct {
     max_half_open: u32 = 50,
     half_open_count: u32 = 0,
 
-    // Re-announce result handoff: the daemon's tracker sessions store
-    // discovered peers here; the event loop picks them up on tick.
+    // Re-announce result handoff: daemon tracker sessions enqueue
+    // per-torrent peer results here; the event loop drains them on tick.
     announce_interval: u32 = 1800,
-    announce_result_peers: ?[]std.net.Address = null,
-    announce_results_ready: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
+    announce_results: std.ArrayList(AnnounceResult),
     announce_mutex: std.Thread.Mutex = .{},
 
     // Global rate limiter (applies across all torrents, 0 = unlimited)
@@ -284,6 +292,7 @@ pub const EventLoop = struct {
             .pending_reads = std.ArrayList(PendingPieceRead).empty,
             .queued_responses = try std.ArrayList(QueuedBlockResponse).initCapacity(allocator, 256),
             .deferred_piece_buffers = std.ArrayList(DeferredPieceBuffer).empty,
+            .announce_results = std.ArrayList(AnnounceResult).empty,
             .idle_peers = std.ArrayList(u16).empty,
             .active_peer_slots = std.ArrayList(u16).empty,
             .hasher = hasher,
@@ -437,7 +446,8 @@ pub const EventLoop = struct {
         self.active_torrent_ids.deinit(self.allocator);
         self.info_hash_to_torrent.deinit();
         self.mse_req2_to_hash.deinit();
-        if (self.announce_result_peers) |peers| self.allocator.free(peers);
+        for (self.announce_results.items) |result| self.allocator.free(result.peers);
+        self.announce_results.deinit(self.allocator);
         // Clean up uTP resources
         if (self.utp_manager) |mgr| self.allocator.destroy(mgr);
         self.utp_send_queue.deinit(self.allocator);
@@ -453,16 +463,48 @@ pub const EventLoop = struct {
         // Submit any queued SQEs so they complete (with errors, since fds are closed)
         _ = self.ring.submit() catch {};
 
-        // Drain CQEs in batches until none remain.  Use a bounded loop
-        // to avoid hanging if the ring keeps producing completions.
+        // Keep dispatching until tracked buffer-owning operations are gone.
+        // This ensures late CQEs release the resources they reference before
+        // we free backing memory during deinit.
         var drain_rounds: u32 = 0;
-        while (drain_rounds < 64) : (drain_rounds += 1) {
+        while (drain_rounds < 256 and self.pendingBufferOperations() > 0) : (drain_rounds += 1) {
+            _ = self.ring.submit_and_wait(1) catch break;
+            var cqes: [cqe_batch_size]linux.io_uring_cqe = undefined;
+            const count = self.ring.copy_cqes(&cqes, 0) catch break;
+            if (count == 0) continue;
+            for (cqes[0..count]) |cqe| {
+                self.dispatch(cqe);
+            }
+        }
+
+        // Best-effort final sweep for non-owning completions that may still be queued.
+        drain_rounds = 0;
+        while (drain_rounds < 32) : (drain_rounds += 1) {
             var cqes: [cqe_batch_size]linux.io_uring_cqe = undefined;
             const count = self.ring.copy_cqes(&cqes, 0) catch break;
             if (count == 0) break;
-            // Discard all completions -- we only care that the kernel
-            // has finished touching the buffer memory.
+            for (cqes[0..count]) |cqe| {
+                self.dispatch(cqe);
+            }
         }
+
+        if (self.pendingBufferOperations() > 0) {
+            log.warn(
+                "event loop shutdown left tracked resources pending (writes={d}, sends={d}, reads={d}, timeout_pending={})",
+                .{
+                    self.pending_writes.count(),
+                    self.pending_sends.items.len,
+                    self.pending_reads.items.len,
+                    self.timeout_pending,
+                },
+            );
+        }
+    }
+
+    fn pendingBufferOperations(self: *const EventLoop) usize {
+        var count = self.pending_writes.count() + self.pending_sends.items.len + self.pending_reads.items.len;
+        if (self.timeout_pending) count += 1;
+        return count;
     }
 
     // ── Torrent management ─────────────────────────────────
@@ -1652,6 +1694,15 @@ pub const EventLoop = struct {
         return if (self.torrents.items[torrent_id]) |*tc| tc else null;
     }
 
+    pub fn enqueueAnnounceResult(self: *EventLoop, torrent_id: TorrentIdType, peers: []std.net.Address) !void {
+        self.announce_mutex.lock();
+        defer self.announce_mutex.unlock();
+        try self.announce_results.append(self.allocator, .{
+            .torrent_id = torrent_id,
+            .peers = peers,
+        });
+    }
+
     pub fn findTorrentIdByInfoHash(self: *const EventLoop, info_hash: []const u8) ?TorrentIdType {
         if (info_hash.len != 20) return null;
         var key: [20]u8 = undefined;
@@ -1817,6 +1868,28 @@ test "event loop supports high torrent counts with hashed lookup and slot reuse"
     });
     try std.testing.expectEqual(@as(TorrentIdType, 4_096), replacement_id);
     try std.testing.expectEqual(@as(?TorrentIdType, replacement_id), el.findTorrentIdByInfoHash(&replacement_hash));
+}
+
+test "announce results are queued per torrent" {
+    var el = try EventLoop.initBare(std.testing.allocator, 0);
+    defer el.deinit();
+
+    const peers_a = try std.testing.allocator.alloc(std.net.Address, 1);
+    peers_a[0] = try std.net.Address.parseIp4("127.0.0.1", 6881);
+    const peers_b = try std.testing.allocator.alloc(std.net.Address, 2);
+    peers_b[0] = try std.net.Address.parseIp4("127.0.0.2", 6882);
+    peers_b[1] = try std.net.Address.parseIp4("127.0.0.3", 6883);
+
+    try el.enqueueAnnounceResult(3, peers_a);
+    try el.enqueueAnnounceResult(7, peers_b);
+
+    el.announce_mutex.lock();
+    defer el.announce_mutex.unlock();
+    try std.testing.expectEqual(@as(usize, 2), el.announce_results.items.len);
+    try std.testing.expectEqual(@as(TorrentIdType, 3), el.announce_results.items[0].torrent_id);
+    try std.testing.expectEqual(@as(TorrentIdType, 7), el.announce_results.items[1].torrent_id);
+    try std.testing.expectEqual(@as(usize, 1), el.announce_results.items[0].peers.len);
+    try std.testing.expectEqual(@as(usize, 2), el.announce_results.items[1].peers.len);
 }
 
 test "peer and torrent membership indices stay consistent across swap-remove" {

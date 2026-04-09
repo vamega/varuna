@@ -18,11 +18,12 @@ pub const ApiHandler = struct {
     session_manager: *SessionManager,
     session_store: auth.SessionStore = .{},
     sync_state: sync_mod.SyncState,
+    peer_sync_state: sync_mod.PeerSyncState,
     api_username: []const u8 = "admin",
     api_password: []const u8 = "adminadmin",
 
     /// Standard CORS headers attached to every API response.
-    const cors_headers = "Access-Control-Allow-Origin: *\r\nAccess-Control-Allow-Methods: GET, POST, OPTIONS\r\nAccess-Control-Allow-Headers: Content-Type, Cookie, Authorization\r\nAccess-Control-Allow-Credentials: true\r\n";
+    const cors_headers = "Access-Control-Allow-Origin: *\r\nAccess-Control-Allow-Methods: GET, POST, OPTIONS\r\nAccess-Control-Allow-Headers: Content-Type, Authorization\r\n";
 
     /// Wrap a response with CORS headers.
     fn withCors(resp: server.Response) server.Response {
@@ -135,7 +136,7 @@ pub const ApiHandler = struct {
         }
 
         const sid = self.session_store.createSession();
-        const header = std.fmt.allocPrint(allocator, "Set-Cookie: SID={s}; HttpOnly; path=/\r\n" ++ cors_headers, .{sid}) catch
+        const header = std.fmt.allocPrint(allocator, "Set-Cookie: SID={s}; HttpOnly; SameSite=Lax; path=/\r\n" ++ cors_headers, .{sid}) catch
             return .{ .status = 500, .body = "{\"error\":\"internal\"}" };
         return .{
             .body = "Ok.",
@@ -552,15 +553,14 @@ pub const ApiHandler = struct {
         const el = self.session_manager.shared_event_loop orelse
             return .{ .status = 500, .body = "{\"error\":\"no event loop\"}" };
 
-        // The body is either:
-        //   - Form-encoded: json={"dl_limit":1024,...} (extract the JSON from "json" param)
-        //   - Direct JSON: {"dl_limit":1024,...}
-        //   - Plain form-encoded: dl_limit=1024&up_limit=512
-        // Try to parse as JSON first (either direct or from "json" form param).
-        const json_str = extractParam(body, "json") orelse body;
-        const maybe_prefs = std.json.parseFromSlice(PreferencesUpdate, allocator, json_str, .{ .ignore_unknown_fields = true });
+        const trimmed_body = std.mem.trim(u8, body, " \t\r\n");
+        const json_param = extractParam(body, "json");
+        const expects_json = json_param != null or bodyLooksLikeJson(trimmed_body);
 
-        if (maybe_prefs) |parsed| {
+        if (expects_json) {
+            const json_str = json_param orelse trimmed_body;
+            const parsed = std.json.parseFromSlice(PreferencesUpdate, allocator, json_str, .{ .ignore_unknown_fields = true }) catch
+                return .{ .status = 400, .body = "{\"error\":\"invalid preferences json\"}" };
             defer parsed.deinit();
             const prefs = parsed.value;
 
@@ -602,72 +602,71 @@ pub const ApiHandler = struct {
             if (prefs.dht) |v| self.session_manager.setDhtEnabled(v);
             if (prefs.pex) |v| el.pex_enabled = v;
             if (prefs.enable_utp) |v| el.utp_enabled = v;
-        } else |_| {
-            // JSON parse failed -- fall back to form-encoded parameters.
+        } else {
             if (extractParam(body, "dl_limit")) |dl_str| {
-                if (std.fmt.parseInt(u64, dl_str, 10)) |dl| el.setGlobalDlLimit(dl) else |_| {}
+                const dl = std.fmt.parseInt(u64, dl_str, 10) catch
+                    return .{ .status = 400, .body = "{\"error\":\"invalid dl_limit\"}" };
+                el.setGlobalDlLimit(dl);
             }
             if (extractParam(body, "up_limit")) |ul_str| {
-                if (std.fmt.parseInt(u64, ul_str, 10)) |ul| el.setGlobalUlLimit(ul) else |_| {}
+                const ul = std.fmt.parseInt(u64, ul_str, 10) catch
+                    return .{ .status = 400, .body = "{\"error\":\"invalid up_limit\"}" };
+                el.setGlobalUlLimit(ul);
             }
 
             {
                 const sm = self.session_manager;
-                if (extractParam(body, "max_ratio_enabled")) |v| sm.max_ratio_enabled = std.mem.eql(u8, v, "true");
-                if (extractParam(body, "max_ratio")) |v| sm.max_ratio = std.fmt.parseFloat(f64, v) catch sm.max_ratio;
-                if (extractParam(body, "max_ratio_act")) |v| sm.max_ratio_act = std.fmt.parseInt(u8, v, 10) catch sm.max_ratio_act;
-                if (extractParam(body, "max_seeding_time_enabled")) |v| sm.max_seeding_time_enabled = std.mem.eql(u8, v, "true");
-                if (extractParam(body, "max_seeding_time")) |v| sm.max_seeding_time = std.fmt.parseInt(i64, v, 10) catch sm.max_seeding_time;
+                if (extractParam(body, "max_ratio_enabled")) |v| sm.max_ratio_enabled = parseBoolPreference(v) catch
+                    return .{ .status = 400, .body = "{\"error\":\"invalid max_ratio_enabled\"}" };
+                if (extractParam(body, "max_ratio")) |v| sm.max_ratio = std.fmt.parseFloat(f64, v) catch
+                    return .{ .status = 400, .body = "{\"error\":\"invalid max_ratio\"}" };
+                if (extractParam(body, "max_ratio_act")) |v| sm.max_ratio_act = std.fmt.parseInt(u8, v, 10) catch
+                    return .{ .status = 400, .body = "{\"error\":\"invalid max_ratio_act\"}" };
+                if (extractParam(body, "max_seeding_time_enabled")) |v| sm.max_seeding_time_enabled = parseBoolPreference(v) catch
+                    return .{ .status = 400, .body = "{\"error\":\"invalid max_seeding_time_enabled\"}" };
+                if (extractParam(body, "max_seeding_time")) |v| sm.max_seeding_time = std.fmt.parseInt(i64, v, 10) catch
+                    return .{ .status = 400, .body = "{\"error\":\"invalid max_seeding_time\"}" };
             }
 
             var queue_changed = false;
             if (extractParam(body, "queueing_enabled")) |val| {
-                self.session_manager.queue_manager.config.enabled = std.mem.eql(u8, val, "true");
+                self.session_manager.queue_manager.config.enabled = parseBoolPreference(val) catch
+                    return .{ .status = 400, .body = "{\"error\":\"invalid queueing_enabled\"}" };
                 queue_changed = true;
             }
             if (extractParam(body, "max_active_downloads")) |val| {
-                if (std.fmt.parseInt(i32, val, 10)) |v| {
-                    self.session_manager.queue_manager.config.max_active_downloads = v;
-                    queue_changed = true;
-                } else |_| {}
+                const v = std.fmt.parseInt(i32, val, 10) catch
+                    return .{ .status = 400, .body = "{\"error\":\"invalid max_active_downloads\"}" };
+                self.session_manager.queue_manager.config.max_active_downloads = v;
+                queue_changed = true;
             }
             if (extractParam(body, "max_active_uploads")) |val| {
-                if (std.fmt.parseInt(i32, val, 10)) |v| {
-                    self.session_manager.queue_manager.config.max_active_uploads = v;
-                    queue_changed = true;
-                } else |_| {}
+                const v = std.fmt.parseInt(i32, val, 10) catch
+                    return .{ .status = 400, .body = "{\"error\":\"invalid max_active_uploads\"}" };
+                self.session_manager.queue_manager.config.max_active_uploads = v;
+                queue_changed = true;
             }
             if (extractParam(body, "max_active_torrents")) |val| {
-                if (std.fmt.parseInt(i32, val, 10)) |v| {
-                    self.session_manager.queue_manager.config.max_active_torrents = v;
-                    queue_changed = true;
-                } else |_| {}
+                const v = std.fmt.parseInt(i32, val, 10) catch
+                    return .{ .status = 400, .body = "{\"error\":\"invalid max_active_torrents\"}" };
+                self.session_manager.queue_manager.config.max_active_torrents = v;
+                queue_changed = true;
             }
             if (queue_changed) self.session_manager.runQueueEnforcement();
 
-            if (extractParam(body, "dht")) |v| self.session_manager.setDhtEnabled(std.mem.eql(u8, v, "true"));
-            if (extractParam(body, "pex")) |v| el.pex_enabled = std.mem.eql(u8, v, "true");
-            if (extractParam(body, "enable_utp")) |v| el.utp_enabled = std.mem.eql(u8, v, "true");
+            if (extractParam(body, "dht")) |v| self.session_manager.setDhtEnabled(parseBoolPreference(v) catch
+                return .{ .status = 400, .body = "{\"error\":\"invalid dht\"}" });
+            if (extractParam(body, "pex")) |v| el.pex_enabled = parseBoolPreference(v) catch
+                return .{ .status = 400, .body = "{\"error\":\"invalid pex\"}" };
+            if (extractParam(body, "enable_utp")) |v| el.utp_enabled = parseBoolPreference(v) catch
+                return .{ .status = 400, .body = "{\"error\":\"invalid enable_utp\"}" };
         }
 
         // Handle banned_IPs: newline-separated list of IPs and CIDRs (form-encoded only)
         if (extractParam(body, "banned_IPs")) |banned_str| {
             if (self.session_manager.ban_list) |bl| {
-                // URL-decode newlines: %0A -> \n
-                const alloc = self.session_manager.allocator;
-                var decoded = std.ArrayList(u8).empty;
-                defer decoded.deinit(alloc);
-                var i: usize = 0;
-                while (i < banned_str.len) {
-                    if (i + 2 < banned_str.len and banned_str[i] == '%' and banned_str[i + 1] == '0' and (banned_str[i + 2] == 'A' or banned_str[i + 2] == 'a')) {
-                        decoded.append(alloc, '\n') catch break;
-                        i += 3;
-                    } else {
-                        decoded.append(alloc, banned_str[i]) catch break;
-                        i += 1;
-                    }
-                }
-                bl.setBannedIpsFromString(decoded.items) catch {};
+                bl.setBannedIpsFromString(banned_str) catch
+                    return .{ .status = 400, .body = "{\"error\":\"invalid banned_IPs\"}" };
                 el.ban_list_dirty.store(true, .release);
                 self.session_manager.persistBanList();
             }
@@ -1325,51 +1324,23 @@ pub const ApiHandler = struct {
         return .{ .body = "{\"status\":\"ok\"}" };
     }
 
-    fn handleSyncTorrentPeers(self: *const ApiHandler, allocator: std.mem.Allocator, path: []const u8) server.Response {
+    fn handleSyncTorrentPeers(self: *ApiHandler, allocator: std.mem.Allocator, path: []const u8) server.Response {
         // Parse hash from query string: /api/v2/sync/torrentPeers?hash=...&rid=...
         var hash: ?[]const u8 = null;
+        var request_rid: u64 = 0;
         if (std.mem.indexOf(u8, path, "?")) |q| {
             const query = path[q + 1 ..];
             hash = extractParam(query, "hash");
+            if (extractParam(query, "rid")) |rid_str| {
+                request_rid = std.fmt.parseInt(u64, rid_str, 10) catch 0;
+            }
         }
 
         const hash_val = hash orelse
             return .{ .body = "{\"rid\":1,\"full_update\":true,\"peers\":{}}" };
 
-        const peers = self.session_manager.getTorrentPeers(allocator, hash_val) catch
+        const body = self.peer_sync_state.computeDelta(self.session_manager, allocator, hash_val, request_rid) catch
             return .{ .body = "{\"rid\":1,\"full_update\":true,\"peers\":{}}" };
-        defer SessionManager.freePeerInfos(allocator, peers);
-
-        var json = std.ArrayList(u8).empty;
-        defer json.deinit(allocator);
-
-        json.appendSlice(allocator, "{\"rid\":1,\"full_update\":true,\"peers\":{") catch
-            return .{ .status = 500, .body = "{\"error\":\"internal\"}" };
-
-        const esc = json_mod.jsonSafe;
-
-        for (peers, 0..) |peer, i| {
-            if (i > 0) json.append(allocator, ',') catch {};
-            // Key is ip:port, value is peer object
-            json.print(allocator, "\"{f}\":{{\"client\":\"{f}\",\"connection\":\"\",\"country\":\"\",\"country_code\":\"\",\"dl_speed\":{},\"downloaded\":{},\"files\":\"\",\"flags\":\"{f}\",\"flags_desc\":\"\",\"ip\":\"{f}\",\"port\":{},\"progress\":{d:.4},\"relevance\":1,\"up_speed\":{},\"uploaded\":{},\"upload_only\":{}}}", .{
-                esc(peer.ip),
-                esc(peer.client),
-                peer.dl_speed,
-                peer.downloaded,
-                esc(peer.flags),
-                esc(peer.ip),
-                peer.port,
-                peer.progress,
-                peer.ul_speed,
-                peer.uploaded,
-                peer.upload_only,
-            }) catch {};
-        }
-
-        json.appendSlice(allocator, "}}") catch {};
-
-        const body = json.toOwnedSlice(allocator) catch
-            return .{ .status = 500, .body = "{\"error\":\"internal\"}" };
         return .{ .body = body, .owned_body = body };
     }
 
@@ -1383,18 +1354,11 @@ pub const ApiHandler = struct {
             }
         }
 
-        var arena_state = std.heap.ArenaAllocator.init(allocator);
-        defer arena_state.deinit();
-        const arena = arena_state.allocator();
-
-        const arena_body = self.sync_state.computeDelta(
+        const body = self.sync_state.computeDelta(
             self.session_manager,
-            arena,
+            allocator,
             request_rid,
         ) catch
-            return .{ .status = 500, .body = "{\"error\":\"internal\"}" };
-
-        const body = allocator.dupe(u8, arena_body) catch
             return .{ .status = 500, .body = "{\"error\":\"internal\"}" };
         return .{ .body = body, .owned_body = body };
     }
@@ -1642,17 +1606,68 @@ fn requireHashes(body: []const u8) ?[]const u8 {
     return extractParam(body, "hashes") orelse extractParam(body, "hash");
 }
 
+fn bodyLooksLikeJson(body: []const u8) bool {
+    return body.len > 0 and (body[0] == '{' or body[0] == '[');
+}
+
+fn parseBoolPreference(value: []const u8) error{InvalidBoolean}!bool {
+    if (std.ascii.eqlIgnoreCase(value, "true") or std.mem.eql(u8, value, "1")) return true;
+    if (std.ascii.eqlIgnoreCase(value, "false") or std.mem.eql(u8, value, "0")) return false;
+    return error.InvalidBoolean;
+}
+
 fn extractParam(body: []const u8, key: []const u8) ?[]const u8 {
     // Simple form-encoded parameter extraction: key=value&key2=value2
     var iter = std.mem.splitScalar(u8, body, '&');
     while (iter.next()) |pair| {
         if (std.mem.indexOfScalar(u8, pair, '=')) |eq| {
             if (std.mem.eql(u8, pair[0..eq], key)) {
-                return pair[eq + 1 ..];
+                const raw_value = pair[eq + 1 ..];
+                const decoded_len = urlDecodeComponentInPlace(@constCast(raw_value));
+                return raw_value[0..decoded_len];
             }
         }
     }
     return null;
+}
+
+fn urlDecodeComponentInPlace(buf: []u8) usize {
+    var read_idx: usize = 0;
+    var write_idx: usize = 0;
+
+    while (read_idx < buf.len) {
+        const ch = buf[read_idx];
+        if (ch == '+') {
+            buf[write_idx] = ' ';
+            read_idx += 1;
+            write_idx += 1;
+            continue;
+        }
+        if (ch == '%' and read_idx + 2 < buf.len) {
+            const hi = std.fmt.charToDigit(buf[read_idx + 1], 16) catch {
+                buf[write_idx] = ch;
+                read_idx += 1;
+                write_idx += 1;
+                continue;
+            };
+            const lo = std.fmt.charToDigit(buf[read_idx + 2], 16) catch {
+                buf[write_idx] = ch;
+                read_idx += 1;
+                write_idx += 1;
+                continue;
+            };
+            buf[write_idx] = @intCast((hi << 4) | lo);
+            read_idx += 3;
+            write_idx += 1;
+            continue;
+        }
+
+        buf[write_idx] = ch;
+        read_idx += 1;
+        write_idx += 1;
+    }
+
+    return write_idx;
 }
 
 test "extract form param" {
@@ -1675,6 +1690,11 @@ test "extractParam handles single param without ampersand" {
     try std.testing.expectEqualStrings("val", extractParam("key=val", "key").?);
 }
 
+test "extractParam percent-decodes values" {
+    var body = "hash=abc%20123%2Fxyz+ok".*;
+    try std.testing.expectEqualStrings("abc 123/xyz ok", extractParam(body[0..], "hash").?);
+}
+
 test "extractParam returns null for empty body" {
     try std.testing.expect(extractParam("", "key") == null);
 }
@@ -1686,11 +1706,18 @@ test "extractParam does not match partial key names" {
 
 test "extractParam handles value with equals sign" {
     // "url=http://host?a=b" -- value contains '='
-    try std.testing.expectEqualStrings("http://host?a", extractParam("url=http://host?a=b", "url").?);
+    try std.testing.expectEqualStrings("http://host?a=b", extractParam("url=http://host?a=b", "url").?);
 }
 
 test "extractParam handles url-encoded special chars in value" {
-    try std.testing.expectEqualStrings("hello%20world", extractParam("name=hello%20world", "name").?);
+    var body = "name=hello%20world".*;
+    try std.testing.expectEqualStrings("hello world", extractParam(body[0..], "name").?);
+}
+
+test "parseBoolPreference accepts booleans and rejects garbage" {
+    try std.testing.expect(try parseBoolPreference("true"));
+    try std.testing.expect(!(try parseBoolPreference("0")));
+    try std.testing.expectError(error.InvalidBoolean, parseBoolPreference("maybe"));
 }
 
 // ── PreferencesUpdate JSON parsing tests ────────────────

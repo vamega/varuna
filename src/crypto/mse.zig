@@ -54,6 +54,7 @@ pub const vc_bytes = [8]u8{ 0, 0, 0, 0, 0, 0, 0, 0 };
 
 /// Maximum padding length per the spec (512 bytes).
 pub const max_pad_len: u16 = 512;
+pub const max_initial_payload_len: u16 = 512;
 
 /// Crypto method flags.
 pub const crypto_plaintext: u32 = 0x01;
@@ -319,6 +320,14 @@ fn computeSharedSecret(private_key: [dh_key_size]u8, other_public: [dh_key_size]
     return result;
 }
 
+fn isValidDhPublicKey(other_public: [dh_key_size]u8) bool {
+    const p = U768.fromBytes(dh_prime_bytes);
+    const y = U768.fromBytes(other_public);
+    const one = U768.fromU64(1);
+    const p_minus_one = U768.sub(p, one);
+    return U768.cmp(y, one) > 0 and U768.cmp(y, p_minus_one) < 0;
+}
+
 /// Compute HASH('req1', S) per BEP 6.
 fn hashReq1(shared_secret: [dh_key_size]u8) [20]u8 {
     var h = Sha1.init(.{});
@@ -446,6 +455,7 @@ pub fn handshakeInitiator(
     // Step 3: Receive Yb (96 bytes) -- ignore PadB for now (we scan for req1 hash)
     var peer_public_key: [dh_key_size]u8 = undefined;
     try recvExact(fd, &peer_public_key);
+    if (!isValidDhPublicKey(peer_public_key)) return error.InvalidDhPublicKey;
 
     // Step 4: Compute shared secret S
     const shared_secret = computeSharedSecret(private_key, peer_public_key);
@@ -586,6 +596,7 @@ pub fn handshakeResponder(
     // Step 1: Receive Ya (96 bytes from the initiator's DH public key)
     var peer_public_key: [dh_key_size]u8 = undefined;
     try recvExact(fd, &peer_public_key);
+    if (!isValidDhPublicKey(peer_public_key)) return error.InvalidDhPublicKey;
 
     // Step 2: Generate our DH keypair
     const private_key = generatePrivateKey();
@@ -747,6 +758,7 @@ pub fn handshakeResponder(
 
     // Read IA if present
     var initial_payload: ?[]u8 = null;
+    if (ia_len > max_initial_payload_len) return error.InitialPayloadTooLarge;
     if (ia_len > 0) {
         const ia_buf = try allocator.alloc(u8, ia_len);
         try recvExact(fd, ia_buf);
@@ -869,6 +881,7 @@ pub const MseAction = union(enum) {
 };
 
 pub const MseError = enum {
+    invalid_dh_public_key,
     invalid_shared_secret,
     vc_not_found,
     req1_not_found,
@@ -878,6 +891,7 @@ pub const MseError = enum {
     invalid_crypto_select,
     padding_too_large,
     no_crypto_method_available,
+    initial_payload_too_large,
     connection_closed,
     internal,
 };
@@ -1018,6 +1032,7 @@ pub const MseInitiatorHandshake = struct {
                     return .{ .recv = self.peer_public_key[self.recv_offset..] };
                 }
                 // DH key received -- derive shared secret and build crypto request
+                if (!isValidDhPublicKey(self.peer_public_key)) return .{ .failed = .invalid_dh_public_key };
                 self.shared_secret = computeSharedSecret(self.private_key, self.peer_public_key);
                 const s_val = U768.fromBytes(self.shared_secret);
                 if (s_val.isZero()) return .{ .failed = .invalid_shared_secret };
@@ -1282,6 +1297,7 @@ pub const MseResponderHandshake = struct {
                     self.peer_public_key[64], self.peer_public_key[65], self.peer_public_key[66], self.peer_public_key[67],
                     self.peer_public_key[68], self.peer_public_key[69], self.peer_public_key[70], self.peer_public_key[71],
                 });
+                if (!isValidDhPublicKey(self.peer_public_key)) return .{ .failed = .invalid_dh_public_key };
                 self.shared_secret = computeSharedSecret(self.private_key, self.peer_public_key);
                 const s_val = U768.fromBytes(self.shared_secret);
                 if (s_val.isZero()) return .{ .failed = .invalid_shared_secret };
@@ -1394,6 +1410,9 @@ pub const MseResponderHandshake = struct {
                     dec.process(self.remaining_buf[0..self.remaining_len], self.remaining_buf[0..self.remaining_len]);
                 }
                 self.ia_len = std.mem.readInt(u16, self.remaining_buf[self.pad_c_len..][0..2], .big);
+                if (self.ia_len > max_initial_payload_len or self.ia_len > self.ia_buf.len) {
+                    return .{ .failed = .initial_payload_too_large };
+                }
 
                 if (self.ia_len > 0) {
                     self.phase = .recv_ia;
@@ -1476,6 +1495,9 @@ pub const MseResponderHandshake = struct {
                         dec.process(self.remaining_buf[0..self.remaining_len], self.remaining_buf[0..self.remaining_len]);
                     }
                     self.ia_len = std.mem.readInt(u16, self.remaining_buf[self.pad_c_len..][0..2], .big);
+                    if (self.ia_len > max_initial_payload_len or self.ia_len > self.ia_buf.len) {
+                        return .{ .failed = .initial_payload_too_large };
+                    }
                     if (self.ia_len > 0) {
                         self.phase = .recv_ia;
                         self.ia_offset = 0;
@@ -1767,6 +1789,17 @@ test "DH public key is not trivial" {
         }
     }
     try std.testing.expect(!all_zero);
+}
+
+test "reject invalid DH public keys" {
+    const zero = [_]u8{0} ** dh_key_size;
+    try std.testing.expect(!isValidDhPublicKey(zero));
+
+    var one = [_]u8{0} ** dh_key_size;
+    one[dh_key_size - 1] = 1;
+    try std.testing.expect(!isValidDhPublicKey(one));
+
+    try std.testing.expect(isValidDhPublicKey(computePublicKey(generatePrivateKey())));
 }
 
 test "hash derivation functions produce different outputs" {
@@ -2171,6 +2204,37 @@ test "MseResponderHandshake recv_dh_key transitions to send_dh_key" {
         else => return error.ExpectedSend,
     }
     try std.testing.expectEqual(ResponderPhase.send_dh_key, hs.phase);
+}
+
+test "MseInitiatorHandshake rejects invalid DH public key" {
+    const info_hash = [_]u8{0x42} ** 20;
+    var hs = MseInitiatorHandshake.init(info_hash, .preferred);
+    _ = hs.start();
+    _ = hs.feedSend();
+    hs.peer_public_key = [_]u8{0} ** dh_key_size;
+
+    const action = hs.feedRecv(dh_key_size);
+    switch (action) {
+        .failed => |err| try std.testing.expectEqual(MseError.invalid_dh_public_key, err),
+        else => return error.ExpectedFailed,
+    }
+}
+
+test "MseResponderHandshake rejects oversized initial payload" {
+    const info_hash = [_]u8{0x42} ** 20;
+    const known = [_][20]u8{info_hash};
+    var hs = MseResponderHandshake.init(&known, .preferred);
+    hs.phase = .recv_pad_c_ia_len;
+    hs.pad_c_len = 0;
+    hs.remaining_len = 2;
+    hs.remaining_offset = 2;
+    std.mem.writeInt(u16, hs.remaining_buf[0..2], max_initial_payload_len + 1, .big);
+
+    const action = hs.feedRecv(0 + hs.remaining_len);
+    switch (action) {
+        .failed => |err| try std.testing.expectEqual(MseError.initial_payload_too_large, err),
+        else => return error.ExpectedFailed,
+    }
 }
 
 test "MseResponderHandshake send_dh_key transitions to recv_req1_scan" {

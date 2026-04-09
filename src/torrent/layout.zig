@@ -35,7 +35,7 @@ pub const Layout = struct {
             return error.InvalidPieceIndex;
         }
 
-        if (self.version == .v2 or self.version == .hybrid) {
+        if (self.version == .v2) {
             return self.pieceSizeV2(piece_index);
         }
 
@@ -70,7 +70,7 @@ pub const Layout = struct {
 
     pub fn pieceOffset(self: Layout, piece_index: u32) !u64 {
         _ = try self.pieceSize(piece_index);
-        if (self.version == .v2 or self.version == .hybrid) {
+        if (self.version == .v2) {
             // For v2, piece offset is within the file, not global
             // Return the global torrent offset for compatibility
             for (self.files) |file| {
@@ -88,6 +88,9 @@ pub const Layout = struct {
         if (piece_index >= self.piece_count) {
             return error.InvalidPieceIndex;
         }
+        if (self.version == .v2) {
+            return error.UnsupportedForV2;
+        }
 
         const start = @as(usize, piece_index) * 20;
         return self.piece_hashes[start .. start + 20];
@@ -96,7 +99,7 @@ pub const Layout = struct {
     pub fn pieceSpanCount(self: Layout, piece_index: u32) !usize {
         _ = try self.pieceSize(piece_index);
 
-        if (self.version == .v2 or self.version == .hybrid) {
+        if (self.version == .v2) {
             // v2 pieces are file-aligned: always exactly 1 span
             return 1;
         }
@@ -112,7 +115,7 @@ pub const Layout = struct {
     }
 
     pub fn mapPiece(self: Layout, piece_index: u32, buffer: []Span) ![]Span {
-        if (self.version == .v2 or self.version == .hybrid) {
+        if (self.version == .v2) {
             return self.mapPieceV2(piece_index, buffer);
         }
         return self.mapPieceV1(piece_index, buffer);
@@ -578,4 +581,66 @@ test "v2 pieceSpanCount is always 1" {
     for (0..built.piece_count) |i| {
         try std.testing.expectEqual(@as(usize, 1), try built.pieceSpanCount(@intCast(i)));
     }
+}
+
+test "pure v2 layout rejects v1 piece hashes" {
+    const path0 = [_][]const u8{"a.bin"};
+    const v1_files = [_]metainfo.Metainfo.File{
+        .{ .length = 4, .path = path0[0..] },
+    };
+    const v2_files = [_]metainfo.V2File{
+        .{ .path = path0[0..], .length = 4, .pieces_root = [_]u8{0} ** 32 },
+    };
+    const source = metainfo.Metainfo{
+        .info_hash = [_]u8{0} ** 20,
+        .announce = null,
+        .created_by = null,
+        .name = "root",
+        .piece_length = 4,
+        .files = @constCast(v1_files[0..]),
+        .version = .v2,
+        .file_tree_v2 = @constCast(v2_files[0..]),
+    };
+
+    const built = try build(std.testing.allocator, &source);
+    defer freeLayout(std.testing.allocator, built);
+
+    try std.testing.expectError(error.UnsupportedForV2, built.pieceHash(0));
+}
+
+test "hybrid layout keeps v1 piece mapping semantics" {
+    const path0 = [_][]const u8{"alpha"};
+    const path1 = [_][]const u8{"beta"};
+    const files = [_]metainfo.Metainfo.File{
+        .{ .length = 3, .path = path0[0..] },
+        .{ .length = 5, .path = path1[0..] },
+    };
+    const v2_files = [_]metainfo.V2File{
+        .{ .path = path0[0..], .length = 3, .pieces_root = [_]u8{0xAA} ** 32 },
+        .{ .path = path1[0..], .length = 5, .pieces_root = [_]u8{0xBB} ** 32 },
+    };
+    const hashes = "aaaaaaaaaaaaaaaaaaaabbbbbbbbbbbbbbbbbbbb";
+    const source = metainfo.Metainfo{
+        .info_hash = [_]u8{0} ** 20,
+        .announce = null,
+        .created_by = null,
+        .name = "root",
+        .piece_length = 4,
+        .pieces = hashes,
+        .files = files[0..],
+        .version = .hybrid,
+        .file_tree_v2 = @constCast(v2_files[0..]),
+        .info_hash_v2 = [_]u8{0x11} ** 32,
+    };
+
+    const built = try build(std.testing.allocator, &source);
+    defer freeLayout(std.testing.allocator, built);
+
+    var spans: [2]Layout.Span = undefined;
+    const piece0 = try built.mapPiece(0, spans[0..]);
+    try std.testing.expectEqual(@as(usize, 2), piece0.len);
+    try std.testing.expectEqual(@as(u32, 3), piece0[0].length);
+    try std.testing.expectEqual(@as(u32, 1), piece0[1].length);
+    try std.testing.expectEqual(@as(usize, 2), try built.pieceSpanCount(0));
+    try std.testing.expectEqualStrings("aaaaaaaaaaaaaaaaaaaa", try built.pieceHash(0));
 }

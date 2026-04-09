@@ -163,6 +163,7 @@ pub const Stats = struct {
 
 pub const TorrentSession = struct {
     allocator: std.mem.Allocator,
+    mutex: std.Thread.Mutex = .{},
     state: State = .stopped,
     torrent_bytes: []const u8,
     save_path: []const u8,
@@ -194,6 +195,7 @@ pub const TorrentSession = struct {
     dht_registered: bool = false, // whether DHT requestPeers has been called
     thread: ?std.Thread = null,
     announcing: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
+    announce_jobs_in_flight: std.atomic.Value(u32) = std.atomic.Value(u32).init(0),
 
     // Resume state persistence (runs on background thread)
     resume_writer: ?ResumeWriter = null,
@@ -262,6 +264,7 @@ pub const TorrentSession = struct {
     scrape_result: ?tracker.scrape.ScrapeResult = null,
     last_scrape_time: i64 = 0,
     scraping: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
+    scrape_jobs_in_flight: std.atomic.Value(u32) = std.atomic.Value(u32).init(0),
 
     // Magnet link state (BEP 9)
     is_magnet: bool = false,
@@ -371,6 +374,12 @@ pub const TorrentSession = struct {
 
     /// Start in daemon mode with the configured shared event loop.
     pub fn start(self: *TorrentSession) void {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        self.startLocked();
+    }
+
+    fn startLocked(self: *TorrentSession) void {
         if (self.state == .downloading or self.state == .seeding or self.state == .checking or self.state == .metadata_fetching) return;
         if (self.shared_event_loop == null) {
             self.state = .@"error";
@@ -426,6 +435,8 @@ pub const TorrentSession = struct {
     /// event loop after the background recheck thread completes.
     /// Returns true if peers were added.
     pub fn integrateIntoEventLoop(self: *TorrentSession) bool {
+        self.mutex.lock();
+        defer self.mutex.unlock();
         const sel = self.shared_event_loop orelse return false;
         const peers = self.pending_peers orelse return false;
         defer {
@@ -614,6 +625,8 @@ pub const TorrentSession = struct {
     }
 
     pub fn getStats(self: *TorrentSession) Stats {
+        self.mutex.lock();
+        defer self.mutex.unlock();
         const pieces_have = if (self.piece_tracker) |*pt| pt.completedCount() else 0;
         const progress = if (self.piece_count > 0)
             @as(f64, @floatFromInt(pieces_have)) / @as(f64, @floatFromInt(self.piece_count))
@@ -745,6 +758,8 @@ pub const TorrentSession = struct {
     // ── Background thread ─────────────────────────────────
 
     fn startWorker(self: *TorrentSession) void {
+        self.mutex.lock();
+        defer self.mutex.unlock();
         self.doStart() catch |err| {
             self.state = .@"error";
             self.error_message = std.fmt.allocPrint(self.allocator, "{s}", .{@errorName(err)}) catch null;
@@ -770,7 +785,7 @@ pub const TorrentSession = struct {
         defer if (resume_pieces) |*rp| rp.deinit(self.allocator);
 
         if (self.resume_db_path) |db_path| {
-            if (ResumeWriter.init(db_path, session.metainfo.info_hash)) |rw| {
+            if (ResumeWriter.init(self.allocator, db_path, session.metainfo.info_hash)) |rw| {
                 self.resume_writer = rw;
                 // Load known-complete pieces from DB
                 var bf = storage.verify.PieceSet.init(self.allocator, session.pieceCount()) catch null;
@@ -967,7 +982,7 @@ pub const TorrentSession = struct {
         self.persistNewCompletions();
         self.flushResume();
         if (self.resume_writer) |*rw| {
-            rw.deinit(self.allocator);
+            rw.deinit();
             self.resume_writer = null;
         }
 
@@ -1062,9 +1077,8 @@ pub const TorrentSession = struct {
 
     fn makeAnnounceRequest(self: *TorrentSession, event: ?tracker.announce.Request.Event) ?tracker.announce.Request {
         const session = &(self.session orelse return null);
-        const announce_url = session.metainfo.announce orelse return null;
         return .{
-            .announce_url = announce_url,
+            .announce_url = "",
             .info_hash = session.metainfo.info_hash,
             .peer_id = self.peer_id,
             .port = self.port,
@@ -1075,9 +1089,7 @@ pub const TorrentSession = struct {
         };
     }
 
-    fn getTrackerHost(self: *TorrentSession) ?[]const u8 {
-        const session = &(self.session orelse return null);
-        const url = session.metainfo.announce orelse return null;
+    fn getTrackerHostForUrl(url: []const u8) ?[]const u8 {
         return (@import("../io/http.zig").parseUrl(url) catch return null).host;
     }
 
@@ -1101,28 +1113,47 @@ pub const TorrentSession = struct {
         const request = self.makeAnnounceRequest(.completed) orelse return;
         if (self.announcing.swap(true, .acq_rel)) return;
         errdefer self.announcing.store(false, .release);
-
-        // Route UDP tracker URLs to the UDP executor
-        if (self.trySubmitUdpAnnounce(request)) return;
-
-        const host = self.getTrackerHost() orelse return;
-        const url = try tracker.announce.buildUrl(self.allocator, request);
-        defer self.allocator.free(url);
-        try self.submitTrackerJob(url, host, announceComplete);
+        try self.scheduleAnnounceJobs(request);
     }
 
     pub fn scheduleReannounce(self: *TorrentSession) !void {
         const request = self.makeAnnounceRequest(null) orelse return;
         if (self.announcing.swap(true, .acq_rel)) return;
         errdefer self.announcing.store(false, .release);
+        try self.scheduleAnnounceJobs(request);
+    }
 
-        // Route UDP tracker URLs to the UDP executor
-        if (self.trySubmitUdpAnnounce(request)) return;
+    fn scheduleAnnounceJobs(self: *TorrentSession, base_request: tracker.announce.Request) !void {
+        const session = &(self.session orelse return error.MissingSession);
+        const tracker_urls = try self.buildTrackerUrls(session);
+        defer self.allocator.free(tracker_urls);
+        if (tracker_urls.len == 0) return error.NoTrackers;
 
-        const host = self.getTrackerHost() orelse return;
-        const url = try tracker.announce.buildUrl(self.allocator, request);
-        defer self.allocator.free(url);
-        try self.submitTrackerJob(url, host, announceComplete);
+        self.announce_jobs_in_flight.store(0, .release);
+        var submitted: u32 = 0;
+
+        for (tracker_urls) |tracker_url| {
+            var request = base_request;
+            request.announce_url = tracker_url;
+
+            if (self.trySubmitUdpAnnounce(request)) {
+                _ = self.announce_jobs_in_flight.fetchAdd(1, .acq_rel);
+                submitted += 1;
+                continue;
+            }
+
+            const host = getTrackerHostForUrl(tracker_url) orelse continue;
+            const url = tracker.announce.buildUrl(self.allocator, request) catch continue;
+            defer self.allocator.free(url);
+            self.submitTrackerJob(url, host, announceComplete) catch continue;
+            _ = self.announce_jobs_in_flight.fetchAdd(1, .acq_rel);
+            submitted += 1;
+        }
+
+        if (submitted == 0) {
+            self.announcing.store(false, .release);
+            return error.NoTrackers;
+        }
     }
 
     /// Try to submit an announce via the UDP tracker executor.
@@ -1158,7 +1189,7 @@ pub const TorrentSession = struct {
 
     fn udpAnnounceComplete(context: *anyopaque, result: @import("udp_tracker_executor.zig").UdpTrackerExecutor.RequestResult) void {
         const self: *TorrentSession = @ptrCast(@alignCast(context));
-        defer self.announcing.store(false, .release);
+        defer self.finishAnnounceJob();
 
         if (result.err) |_| return;
         const body = result.body orelse return;
@@ -1182,16 +1213,18 @@ pub const TorrentSession = struct {
             addrs[i] = peer.address;
         }
 
-        el.announce_mutex.lock();
-        defer el.announce_mutex.unlock();
-        if (el.announce_result_peers) |old| self.allocator.free(old);
-        el.announce_result_peers = addrs;
-        el.announce_results_ready.store(true, .release);
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        const tid = self.torrent_id_in_shared orelse {
+            self.allocator.free(addrs);
+            return;
+        };
+        el.enqueueAnnounceResult(tid, addrs) catch self.allocator.free(addrs);
     }
 
     fn announceComplete(context: *anyopaque, result: TrackerExecutor.RequestResult) void {
         const self: *TorrentSession = @ptrCast(@alignCast(context));
-        defer self.announcing.store(false, .release);
+        defer self.finishAnnounceJob();
         const body = result.body orelse return;
         const resp = tracker.announce.parseResponse(self.allocator, body) catch return;
         defer tracker.announce.freeResponse(self.allocator, resp);
@@ -1210,18 +1243,21 @@ pub const TorrentSession = struct {
             addrs[i] = peer.address;
         }
 
-        // Store peers for the event loop's checkReannounce to pick up.
-        el.announce_mutex.lock();
-        defer el.announce_mutex.unlock();
-        if (el.announce_result_peers) |old| self.allocator.free(old);
-        el.announce_result_peers = addrs;
-        el.announce_results_ready.store(true, .release);
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        const tid = self.torrent_id_in_shared orelse {
+            self.allocator.free(addrs);
+            return;
+        };
+        el.enqueueAnnounceResult(tid, addrs) catch self.allocator.free(addrs);
     }
 
     /// Trigger a background scrape if enough time has passed (30 minutes).
     /// Safe to call from any thread. The shared tracker executor performs the
     /// scrape and updates scrape_result atomically.
     pub fn maybeScrape(self: *TorrentSession) void {
+        self.mutex.lock();
+        defer self.mutex.unlock();
         if (self.state != .downloading and self.state != .seeding) return;
         const now = std.time.timestamp();
         const scrape_interval: i64 = 30 * 60; // 30 minutes
@@ -1238,15 +1274,32 @@ pub const TorrentSession = struct {
 
     fn scheduleScrape(self: *TorrentSession) !void {
         const session = &(self.session orelse return error.MissingSession);
-        const announce_url = session.metainfo.announce orelse return;
+        const tracker_urls = try self.buildTrackerUrls(session);
+        defer self.allocator.free(tracker_urls);
+        if (tracker_urls.len == 0) return error.NoTrackers;
 
-        // Route UDP tracker URLs to the UDP scrape executor
-        if (self.trySubmitUdpScrape(announce_url, session.metainfo.info_hash)) return;
+        self.scrape_jobs_in_flight.store(0, .release);
+        var submitted: u32 = 0;
 
-        const host = self.getTrackerHost() orelse return;
-        const scrape_url = try tracker.scrape.buildScrapeUrl(self.allocator, announce_url, session.metainfo.info_hash);
-        defer self.allocator.free(scrape_url);
-        try self.submitTrackerJob(scrape_url, host, scrapeComplete);
+        for (tracker_urls) |announce_url| {
+            if (self.trySubmitUdpScrape(announce_url, session.metainfo.info_hash)) {
+                _ = self.scrape_jobs_in_flight.fetchAdd(1, .acq_rel);
+                submitted += 1;
+                continue;
+            }
+
+            const host = getTrackerHostForUrl(announce_url) orelse continue;
+            const scrape_url = tracker.scrape.buildScrapeUrl(self.allocator, announce_url, session.metainfo.info_hash) catch continue;
+            defer self.allocator.free(scrape_url);
+            self.submitTrackerJob(scrape_url, host, scrapeComplete) catch continue;
+            _ = self.scrape_jobs_in_flight.fetchAdd(1, .acq_rel);
+            submitted += 1;
+        }
+
+        if (submitted == 0) {
+            self.scraping.store(false, .release);
+            return error.NoTrackers;
+        }
     }
 
     fn trySubmitUdpScrape(self: *TorrentSession, announce_url: []const u8, info_hash: [20]u8) bool {
@@ -1271,7 +1324,7 @@ pub const TorrentSession = struct {
 
     fn udpScrapeComplete(context: *anyopaque, result: @import("udp_tracker_executor.zig").UdpTrackerExecutor.RequestResult) void {
         const self: *TorrentSession = @ptrCast(@alignCast(context));
-        defer self.scraping.store(false, .release);
+        defer self.finishScrapeJob();
 
         if (result.err) |_| return;
         const body = result.body orelse return;
@@ -1281,6 +1334,8 @@ pub const TorrentSession = struct {
         const header = udp_mod.ScrapeResponse.decodeHeader(body) catch return;
         const entry = udp_mod.ScrapeResponse.parseEntry(header.entry_data, 0) catch return;
 
+        self.mutex.lock();
+        defer self.mutex.unlock();
         self.scrape_result = .{
             .complete = entry.seeders,
             .incomplete = entry.leechers,
@@ -1290,13 +1345,25 @@ pub const TorrentSession = struct {
 
     fn scrapeComplete(context: *anyopaque, result: TrackerExecutor.RequestResult) void {
         const self: *TorrentSession = @ptrCast(@alignCast(context));
-        defer self.scraping.store(false, .release);
+        defer self.finishScrapeJob();
         if (result.body) |body| {
+            self.mutex.lock();
+            defer self.mutex.unlock();
             const session = &(self.session orelse return);
             if (tracker.scrape.parseScrapeResponse(self.allocator, body, session.metainfo.info_hash)) |scrape_result| {
                 self.scrape_result = scrape_result;
             } else |_| {}
         }
+    }
+
+    fn finishAnnounceJob(self: *TorrentSession) void {
+        const remaining = self.announce_jobs_in_flight.fetchSub(1, .acq_rel) - 1;
+        if (remaining == 0) self.announcing.store(false, .release);
+    }
+
+    fn finishScrapeJob(self: *TorrentSession) void {
+        const remaining = self.scrape_jobs_in_flight.fetchSub(1, .acq_rel) - 1;
+        if (remaining == 0) self.scraping.store(false, .release);
     }
 
     // ── Magnet metadata fetching (BEP 9) ────────────────────
@@ -1677,7 +1744,7 @@ pub const TorrentSession = struct {
         var i: u32 = 0;
         while (i < self.piece_count) : (i += 1) {
             if (pt.isPieceComplete(i)) {
-                rw.recordPiece(self.allocator, i) catch {};
+                rw.recordPiece(i) catch {};
             }
         }
         self.resume_last_count = current_count;
@@ -1705,6 +1772,8 @@ pub const TorrentSession = struct {
     }
 
     fn detachFromSharedEventLoop(self: *TorrentSession) void {
+        self.mutex.lock();
+        defer self.mutex.unlock();
         const sel = self.shared_event_loop orelse return;
         if (self.torrent_id_in_shared) |tid| {
             sel.removeTorrent(tid);
@@ -1877,4 +1946,51 @@ test "resume_session preserves shared event loop mode" {
         std.testing.allocator.free(msg);
         session.error_message = null;
     }
+}
+
+test "buildTrackerUrls includes effective tracker set with overrides" {
+    const torrent_bytes =
+        "d8:announce18:http://primary.test13:announce-listll20:http://backup1.testel20:http://backup2.testee4:infod6:lengthi4e4:name8:test.bin12:piece lengthi4e6:pieces20:abcdefghijklmnopqrstee";
+
+    var loaded = try session_mod.Session.load(std.testing.allocator, torrent_bytes, "/tmp");
+    defer loaded.deinit(std.testing.allocator);
+
+    var ts = TorrentSession{
+        .allocator = std.testing.allocator,
+        .torrent_bytes = "",
+        .save_path = "",
+        .info_hash = [_]u8{0} ** 20,
+        .info_hash_hex = [_]u8{'0'} ** 40,
+        .name = "",
+        .total_size = 0,
+        .piece_count = 0,
+        .added_on = 0,
+        .peer_id = [_]u8{0} ** 20,
+        .tracker_key = [_]u8{0} ** 8,
+        .session = loaded,
+    };
+    defer ts.tracker_overrides.deinit(std.testing.allocator);
+    ts.session = null;
+
+    const edited_primary = try std.testing.allocator.dupe(u8, "http://edited-primary.test");
+    const removed_backup = try std.testing.allocator.dupe(u8, "http://backup1.test");
+    const added_tracker = try std.testing.allocator.dupe(u8, "http://added.test");
+
+    try ts.tracker_overrides.edits.append(std.testing.allocator, .{
+        .orig_url = try std.testing.allocator.dupe(u8, "http://primary.test"),
+        .new_url = edited_primary,
+    });
+    try ts.tracker_overrides.removed.append(std.testing.allocator, removed_backup);
+    try ts.tracker_overrides.added.append(std.testing.allocator, .{
+        .url = added_tracker,
+        .tier = 3,
+    });
+
+    const urls = try ts.buildTrackerUrls(&loaded);
+    defer std.testing.allocator.free(urls);
+
+    try std.testing.expectEqual(@as(usize, 3), urls.len);
+    try std.testing.expectEqualStrings("http://edited-primary.test", urls[0]);
+    try std.testing.expectEqualStrings("http://backup2.test", urls[1]);
+    try std.testing.expectEqualStrings("http://added.test", urls[2]);
 }

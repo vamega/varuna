@@ -13,7 +13,23 @@ pub fn main() !void {
     var stdout_writer = std.fs.File.stdout().writer(&stdout_buffer);
     const stdout = &stdout_writer.interface;
 
-    var loaded_cfg = varuna.config.loadDefault(allocator);
+    if (args.len <= 1) {
+        const cfg = varuna.config.Config{};
+        try printUsage(stdout, cfg.daemon.api_bind, cfg.daemon.api_port);
+        try stdout.flush();
+        return;
+    }
+
+    for (args[1..]) |arg| {
+        if (std.mem.eql(u8, arg, "--help") or std.mem.eql(u8, arg, "-h")) {
+            const cfg = varuna.config.Config{};
+            try printUsage(stdout, cfg.daemon.api_bind, cfg.daemon.api_port);
+            try stdout.flush();
+            return;
+        }
+    }
+
+    var loaded_cfg = try varuna.config.loadDefault(allocator);
     defer loaded_cfg.deinit();
     const cfg = loaded_cfg.value;
     const api_port = cfg.daemon.api_port;

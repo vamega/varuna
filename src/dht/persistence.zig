@@ -224,11 +224,20 @@ pub const DhtPersistence = struct {
 };
 
 fn formatAddress(addr: std.net.Address, buf: *[46]u8) ?[]const u8 {
-    const bytes: [4]u8 = @bitCast(addr.in.sa.addr);
-    const result = std.fmt.bufPrint(buf, "{d}.{d}.{d}.{d}", .{
-        bytes[0], bytes[1], bytes[2], bytes[3],
-    }) catch return null;
-    return result;
+    return switch (addr.any.family) {
+        std.posix.AF.INET => blk: {
+            const ip4 = @as(*const std.posix.sockaddr.in, @ptrCast(@alignCast(&addr.any)));
+            const bytes = std.mem.asBytes(&ip4.addr);
+            break :blk std.fmt.bufPrint(buf, "{d}.{d}.{d}.{d}", .{
+                bytes[0], bytes[1], bytes[2], bytes[3],
+            }) catch null;
+        },
+        std.posix.AF.INET6 => blk: {
+            const ip6 = @as(*const std.posix.sockaddr.in6, @ptrCast(@alignCast(&addr.any)));
+            break :blk std.fmt.bufPrint(buf, "{}", .{std.net.Ip6Address.init(ip6.addr, 0, 0)}) catch null;
+        },
+        else => null,
+    };
 }
 
 test "DhtPersistence format address" {
@@ -237,4 +246,12 @@ test "DhtPersistence format address" {
     const result = formatAddress(addr, &buf);
     try std.testing.expect(result != null);
     try std.testing.expectEqualStrings("192.168.1.100", result.?);
+}
+
+test "DhtPersistence format IPv6 address" {
+    var buf: [46]u8 = undefined;
+    const addr = std.net.Address.initIp6(.{ 0x20, 0x01, 0x0d, 0xb8 } ++ ([_]u8{0} ** 12), 6881, 0, 0);
+    const result = formatAddress(addr, &buf);
+    try std.testing.expect(result != null);
+    try std.testing.expect(std.mem.indexOf(u8, result.?, "2001:db8") != null);
 }

@@ -77,9 +77,9 @@ pub const UtpManager = struct {
         }
 
         // For non-SYN packets, look up by connection_id matching recv_id.
-        const slot = self.findByRecvId(hdr.connection_id) orelse {
+        const slot = self.findByRecvIdRemote(hdr.connection_id, remote) orelse {
             // Unknown connection -- send RESET.
-            return self.makeResetResponse(hdr, now_us);
+            return self.makeResetResponse(hdr, remote, now_us);
         };
 
         var sock = &self.connections[slot];
@@ -187,7 +187,7 @@ pub const UtpManager = struct {
 
     fn handleSyn(self: *UtpManager, hdr: Header, remote: std.net.Address, now_us: u32) ?PacketResult {
         // Check for duplicate SYN (existing connection with matching recv_id).
-        const existing = self.findByRecvId(hdr.connection_id +% 1);
+        const existing = self.findByRecvIdRemote(hdr.connection_id +% 1, remote);
         if (existing) |slot| {
             // Resend SYN-ACK.
             const response = self.connections[slot].makeAck(now_us);
@@ -232,7 +232,20 @@ pub const UtpManager = struct {
         return null;
     }
 
-    fn makeResetResponse(self: *UtpManager, hdr: Header, now_us: u32) ?PacketResult {
+    fn findByRecvIdRemote(self: *const UtpManager, conn_id: u16, remote: std.net.Address) ?u16 {
+        const remote_key = @import("pex.zig").CompactPeer.fromAddress(remote);
+        for (0..max_connections) |i| {
+            if (!self.slot_active[i]) continue;
+            if (self.connections[i].recv_id != conn_id) continue;
+            const candidate_key = @import("pex.zig").CompactPeer.fromAddress(self.connections[i].remote_addr);
+            if (candidate_key.len == remote_key.len and std.mem.eql(u8, candidate_key.data[0..candidate_key.len], remote_key.data[0..remote_key.len])) {
+                return @intCast(i);
+            }
+        }
+        return null;
+    }
+
+    fn makeResetResponse(self: *UtpManager, hdr: Header, remote: std.net.Address, now_us: u32) ?PacketResult {
         _ = self;
         const rst = Header{
             .packet_type = .st_reset,
@@ -249,7 +262,7 @@ pub const UtpManager = struct {
             .response = rst.encode(),
             .data = null,
             .data_len = 0,
-            .remote = undefined,
+            .remote = remote,
             .new_connection = false,
         };
     }

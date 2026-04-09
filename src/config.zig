@@ -42,7 +42,6 @@ pub const Config = struct {
         port_min: u16 = 6881,
         port_max: u16 = 6889,
         max_peers: u32 = 50,
-        connect_timeout_secs: u32 = 10,
         /// Global maximum number of connections across all torrents.
         max_connections: u32 = 500,
         /// Maximum number of peers per individual torrent.
@@ -84,8 +83,6 @@ pub const Config = struct {
 
     pub const Performance = struct {
         hasher_threads: u32 = 4,
-        pipeline_depth: u32 = 5,
-        ring_entries: u16 = 256,
         /// Piece cache size in bytes. 0 = use default (64 MB).
         piece_cache_size: u64 = 0,
     };
@@ -109,57 +106,81 @@ pub const LoadedConfig = struct {
 
 pub fn load(allocator: std.mem.Allocator, path: []const u8) !LoadedConfig {
     var parser = toml.Parser(Config).init(allocator);
-    const result = parser.parseFile(path) catch |err| switch (err) {
-        error.FileNotFound => return .{ .value = Config{} },
-        else => return err,
-    };
+    const result = try parser.parseFile(path);
+    errdefer {
+        var copy = result;
+        copy.deinit();
+    }
+    try validateConfig(result.value);
     // Do NOT deinit result — the Config's string slices point into its memory.
     // Ownership transfers to the caller via LoadedConfig.
     return .{ .value = result.value, ._parse_result = result };
 }
 
-pub fn loadDefault(allocator: std.mem.Allocator) LoadedConfig {
-    // Try well-known paths in order
-    const paths = [_][]const u8{
-        "varuna.toml",
-        "/etc/varuna/config.toml",
+fn loadOptional(allocator: std.mem.Allocator, path: []const u8) !?LoadedConfig {
+    return load(allocator, path) catch |err| switch (err) {
+        error.FileNotFound => null,
+        else => return err,
     };
+}
 
+fn loadFromCandidates(
+    allocator: std.mem.Allocator,
+    paths: []const []const u8,
+    xdg_config_home: ?[]const u8,
+    home: ?[]const u8,
+) !LoadedConfig {
     for (paths) |path| {
-        if (load(allocator, path)) |config| {
+        if (try loadOptional(allocator, path)) |config| {
             return config;
-        } else |_| {}
+        }
     }
 
     // Check $XDG_CONFIG_HOME/varuna/config.toml
-    if (std.posix.getenv("XDG_CONFIG_HOME")) |xdg| {
+    if (xdg_config_home) |xdg| {
         var buf: [1024]u8 = undefined;
-        const path = std.fmt.bufPrint(&buf, "{s}/varuna/config.toml", .{xdg}) catch return .{ .value = Config{} };
-        if (load(allocator, path)) |config| {
+        const path = try std.fmt.bufPrint(&buf, "{s}/varuna/config.toml", .{xdg});
+        if (try loadOptional(allocator, path)) |config| {
             return config;
-        } else |_| {}
+        }
     }
 
     // Check ~/.config/varuna/config.toml
-    if (std.posix.getenv("HOME")) |home| {
+    if (home) |home_dir| {
         var buf: [1024]u8 = undefined;
-        const path = std.fmt.bufPrint(&buf, "{s}/.config/varuna/config.toml", .{home}) catch return .{ .value = Config{} };
-        if (load(allocator, path)) |config| {
+        const path = try std.fmt.bufPrint(&buf, "{s}/.config/varuna/config.toml", .{home_dir});
+        if (try loadOptional(allocator, path)) |config| {
             return config;
-        } else |_| {}
+        }
     }
 
     return .{ .value = Config{} };
 }
 
+pub fn loadDefault(allocator: std.mem.Allocator) !LoadedConfig {
+    const paths = [_][]const u8{
+        "varuna.toml",
+        "/etc/varuna/config.toml",
+    };
+    return loadFromCandidates(
+        allocator,
+        &paths,
+        std.posix.getenv("XDG_CONFIG_HOME"),
+        std.posix.getenv("HOME"),
+    );
+}
+
+pub fn validateConfig(config: Config) !void {
+    _ = try parseEncryptionMode(config.network.encryption);
+}
+
 /// Parse the encryption config string into an EncryptionMode enum.
-pub fn parseEncryptionMode(value: []const u8) mse.EncryptionMode {
+pub fn parseEncryptionMode(value: []const u8) !mse.EncryptionMode {
     if (std.mem.eql(u8, value, "forced")) return .forced;
     if (std.mem.eql(u8, value, "preferred")) return .preferred;
     if (std.mem.eql(u8, value, "enabled")) return .enabled;
     if (std.mem.eql(u8, value, "disabled")) return .disabled;
-    // Default to preferred for unknown values
-    return .preferred;
+    return error.InvalidEncryptionMode;
 }
 
 test "default config has sensible values" {
@@ -171,23 +192,70 @@ test "default config has sensible values" {
     try std.testing.expectEqual(@as(u32, 100), config.network.max_peers_per_torrent);
     try std.testing.expectEqual(@as(u32, 50), config.network.max_half_open);
     try std.testing.expectEqual(@as(u32, 4), config.performance.hasher_threads);
-    try std.testing.expectEqual(@as(u32, 5), config.performance.pipeline_depth);
     try std.testing.expectEqual(@as(?[]const u8, null), config.network.bind_device);
     try std.testing.expectEqual(@as(?[]const u8, null), config.network.bind_address);
 }
 
-test "load missing file returns defaults" {
-    const config = load(std.testing.allocator, "nonexistent.toml") catch Config{};
-    try std.testing.expectEqual(@as(u16, 6881), config.network.port_min);
+test "load missing file returns FileNotFound" {
+    try std.testing.expectError(error.FileNotFound, load(std.testing.allocator, "nonexistent.toml"));
 }
 
 test "parseEncryptionMode recognizes all modes" {
-    try std.testing.expectEqual(mse.EncryptionMode.forced, parseEncryptionMode("forced"));
-    try std.testing.expectEqual(mse.EncryptionMode.preferred, parseEncryptionMode("preferred"));
-    try std.testing.expectEqual(mse.EncryptionMode.enabled, parseEncryptionMode("enabled"));
-    try std.testing.expectEqual(mse.EncryptionMode.disabled, parseEncryptionMode("disabled"));
-    // Unknown defaults to preferred
-    try std.testing.expectEqual(mse.EncryptionMode.preferred, parseEncryptionMode("unknown"));
+    try std.testing.expectEqual(mse.EncryptionMode.forced, try parseEncryptionMode("forced"));
+    try std.testing.expectEqual(mse.EncryptionMode.preferred, try parseEncryptionMode("preferred"));
+    try std.testing.expectEqual(mse.EncryptionMode.enabled, try parseEncryptionMode("enabled"));
+    try std.testing.expectEqual(mse.EncryptionMode.disabled, try parseEncryptionMode("disabled"));
+    try std.testing.expectError(error.InvalidEncryptionMode, parseEncryptionMode("unknown"));
+}
+
+test "loadDefault stops on malformed config in current directory" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const cwd = try std.fs.cwd().openDir(".", .{});
+    defer cwd.close();
+
+    try tmp.dir.writeFile(.{
+        .sub_path = "varuna.toml",
+        .data = "[daemon]\napi_port = \"not-a-number\"\n",
+    });
+    try tmp.dir.setAsCwd();
+    defer cwd.setAsCwd() catch unreachable;
+
+    if (loadDefault(std.testing.allocator)) |_| {
+        return error.TestExpectedError;
+    } else |_| {}
+}
+
+test "loadDefault returns defaults when no config is discovered" {
+    const loaded = try loadFromCandidates(std.testing.allocator, &.{}, null, null);
+    defer {
+        var copy = loaded;
+        copy.deinit();
+    }
+
+    try std.testing.expectEqual(@as(u16, 8080), loaded.value.daemon.api_port);
+    try std.testing.expectEqualSlices(u8, "preferred", loaded.value.network.encryption);
+}
+
+test "load rejects invalid encryption mode" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const cwd = try std.fs.cwd().openDir(".", .{});
+    defer cwd.close();
+
+    try tmp.dir.writeFile(.{
+        .sub_path = "invalid-encryption.toml",
+        .data = "[network]\nencryption = \"bad-mode\"\n",
+    });
+    try tmp.dir.setAsCwd();
+    defer cwd.setAsCwd() catch unreachable;
+
+    try std.testing.expectError(
+        error.InvalidEncryptionMode,
+        load(std.testing.allocator, "invalid-encryption.toml"),
+    );
 }
 
 test "default encryption config is preferred" {

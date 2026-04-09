@@ -169,17 +169,11 @@ pub fn verifyPieceBuffer(plan: PiecePlan, piece_data: []const u8) !bool {
 
         // For single-piece files, expected_hash_v2 is the direct SHA-256 hash.
         // For multi-piece files, expected_hash_v2 is all zeros (sentinel) and
-        // we cannot verify without the full file's piece hashes to build a
-        // Merkle tree. In that case, return true to accept the piece for now --
-        // full Merkle root verification happens during recheckV2FileComplete
-        // once all pieces for the file are available.
+        // a stand-alone piece cannot be trusted here because we do not have the
+        // per-piece Merkle proof. Callers must defer acceptance until they can
+        // verify the complete file Merkle root.
         if (plan.v2_file_piece_count > 1) {
-            // Multi-piece file: we can only do a per-piece SHA-256 hash check.
-            // The actual Merkle root verification needs all pieces for the file.
-            // Store the computed hash for later Merkle root verification.
-            // For now, accept any non-zero-length piece with a valid SHA-256.
-            // Full verification is done per-file (see recheckV2FileComplete).
-            return true;
+            return error.DeferredMerkleVerificationRequired;
         }
 
         return std.mem.eql(u8, actual[0..], plan.expected_hash_v2[0..]);
@@ -460,10 +454,7 @@ test "verify v2 single-piece file uses direct SHA-256 comparison" {
     try std.testing.expect(!(try verifyPieceBuffer(plan, "nope")));
 }
 
-test "verify v2 multi-piece file accepts pieces for deferred Merkle verification" {
-    // Multi-piece files cannot be fully verified per-piece; they need all
-    // pieces to build the Merkle tree. verifyPieceBuffer should return true
-    // for multi-piece plans (deferred to recheckV2/verifyV2FileComplete).
+test "verify v2 multi-piece file requires deferred Merkle verification" {
     const plan = PiecePlan{
         .piece_index = 0,
         .piece_length = 4,
@@ -476,8 +467,7 @@ test "verify v2 multi-piece file accepts pieces for deferred Merkle verification
         .v2_file_piece_count = 3,
     };
 
-    // Should accept piece (deferred verification)
-    try std.testing.expect(try verifyPieceBuffer(plan, "data"));
+    try std.testing.expectError(error.DeferredMerkleVerificationRequired, verifyPieceBuffer(plan, "data"));
 }
 
 test "verifyV2MerkleRoot matches correct piece hashes" {

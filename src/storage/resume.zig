@@ -401,11 +401,42 @@ pub const ResumeDb = struct {
 
     /// Clear all resume state for a torrent.
     pub fn clearTorrent(self: *ResumeDb, info_hash: [20]u8) !void {
+        const info_hash_hex = std.fmt.bytesToHex(info_hash, .lower);
+
+        if (sqlite.sqlite3_exec(self.db, "BEGIN IMMEDIATE", null, null, null) != sqlite.SQLITE_OK) {
+            return error.SqliteTransactionFailed;
+        }
+        errdefer _ = sqlite.sqlite3_exec(self.db, "ROLLBACK", null, null, null);
+
         _ = sqlite.sqlite3_reset(self.delete_stmt);
         _ = sqlite.sqlite3_bind_blob(self.delete_stmt, 1, &info_hash, 20, sqlite.SQLITE_TRANSIENT);
 
         if (sqlite.sqlite3_step(self.delete_stmt) != sqlite.SQLITE_DONE) {
             return error.SqliteDeleteFailed;
+        }
+
+        inline for ([_][]const u8{
+            "DELETE FROM transfer_stats WHERE info_hash = ?1",
+            "DELETE FROM torrent_categories WHERE info_hash = ?1",
+            "DELETE FROM torrent_tags WHERE info_hash = ?1",
+            "DELETE FROM rate_limits WHERE info_hash = ?1",
+            "DELETE FROM info_hash_v2 WHERE info_hash = ?1",
+            "DELETE FROM tracker_overrides WHERE info_hash = ?1",
+            "DELETE FROM share_limits WHERE info_hash = ?1",
+        }) |sql| {
+            const stmt = try self.execOneShot(sql);
+            _ = sqlite.sqlite3_bind_blob(stmt, 1, &info_hash, 20, sqlite.SQLITE_TRANSIENT);
+            try stepAndFinalize(stmt);
+        }
+
+        {
+            const stmt = try self.execOneShot("DELETE FROM queue_positions WHERE info_hash_hex = ?1");
+            _ = sqlite.sqlite3_bind_text(stmt, 1, &info_hash_hex, 40, sqlite.SQLITE_TRANSIENT);
+            try stepAndFinalize(stmt);
+        }
+
+        if (sqlite.sqlite3_exec(self.db, "COMMIT", null, null, null) != sqlite.SQLITE_OK) {
+            return error.SqliteCommitFailed;
         }
     }
 
@@ -1106,51 +1137,56 @@ pub const ResumeDb = struct {
 /// Background resume writer that batches piece completions.
 /// Run on a dedicated thread -- call flush() periodically or on shutdown.
 pub const ResumeWriter = struct {
+    allocator: std.mem.Allocator,
     db: ResumeDb,
     info_hash: [20]u8,
     pending: std.ArrayList(u32),
     mutex: std.Thread.Mutex = .{},
 
-    pub fn init(db_path: [*:0]const u8, info_hash: [20]u8) !ResumeWriter {
+    pub fn init(allocator: std.mem.Allocator, db_path: [*:0]const u8, info_hash: [20]u8) !ResumeWriter {
         return .{
+            .allocator = allocator,
             .db = try ResumeDb.open(db_path),
             .info_hash = info_hash,
             .pending = std.ArrayList(u32).empty,
         };
     }
 
-    pub fn deinit(self: *ResumeWriter, allocator: std.mem.Allocator) void {
+    pub fn deinit(self: *ResumeWriter) void {
         self.flush() catch {};
-        self.pending.deinit(allocator);
+        self.pending.deinit(self.allocator);
         self.db.close();
     }
 
     /// Queue a piece for persistence. Thread-safe.
-    pub fn recordPiece(self: *ResumeWriter, allocator: std.mem.Allocator, piece_index: u32) !void {
+    pub fn recordPiece(self: *ResumeWriter, piece_index: u32) !void {
         self.mutex.lock();
         defer self.mutex.unlock();
-        try self.pending.append(allocator, piece_index);
+        try self.pending.append(self.allocator, piece_index);
     }
 
     /// Flush all pending pieces to SQLite. Thread-safe.
     pub fn flush(self: *ResumeWriter) !void {
+        var to_flush = std.ArrayList(u32).empty;
         self.mutex.lock();
-        const items = self.pending.items;
-        if (items.len == 0) {
+        if (self.pending.items.len == 0) {
             self.mutex.unlock();
             return;
         }
-        // Take ownership of pending items
-        const to_flush = self.pending.allocatedSlice();
-        _ = to_flush;
+        std.mem.swap(std.ArrayList(u32), &to_flush, &self.pending);
         self.mutex.unlock();
+        defer to_flush.deinit(self.allocator);
 
         // Write batch to SQLite (this blocks, which is fine on the background thread)
-        self.db.markCompleteBatch(self.info_hash, items) catch {};
-
-        self.mutex.lock();
-        self.pending.clearRetainingCapacity();
-        self.mutex.unlock();
+        self.db.markCompleteBatch(self.info_hash, to_flush.items) catch |err| {
+            self.mutex.lock();
+            defer self.mutex.unlock();
+            try self.pending.ensureUnusedCapacity(self.allocator, to_flush.items.len);
+            for (to_flush.items) |piece_index| {
+                self.pending.appendAssumeCapacity(piece_index);
+            }
+            return err;
+        };
     }
 
     /// Persist lifetime transfer stats. Thread-safe.
@@ -1231,6 +1267,60 @@ test "resume db clear torrent" {
 
     const count = try db.loadCompletePieces(info_hash, &bf);
     try std.testing.expectEqual(@as(u32, 0), count);
+}
+
+test "resume db clear torrent removes auxiliary state" {
+    var db = ResumeDb.open(":memory:") catch return error.SkipZigTest;
+    defer db.close();
+
+    const info_hash = [_]u8{0xCD} ** 20;
+    const info_hash_hex = std.fmt.bytesToHex(info_hash, .lower);
+    const v2_hash = [_]u8{0xEF} ** 32;
+
+    try db.markComplete(info_hash, 0);
+    try db.saveTransferStats(info_hash, .{ .total_uploaded = 10, .total_downloaded = 20 });
+    try db.saveTorrentCategory(info_hash, "movies");
+    try db.saveTorrentTag(info_hash, "tag-a");
+    try db.saveRateLimits(info_hash, 100, 200);
+    try db.saveShareLimits(info_hash, 1.5, 30, 1234);
+    try db.saveInfoHashV2(info_hash, v2_hash);
+    try db.saveTrackerOverride(info_hash, "https://tracker.example/announce", 0, "add", null);
+    try db.saveQueuePosition(info_hash_hex, 7);
+
+    try db.clearTorrent(info_hash);
+
+    var bf = try Bitfield.init(std.testing.allocator, 8);
+    defer bf.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(u32, 0), try db.loadCompletePieces(info_hash, &bf));
+
+    const stats = db.loadTransferStats(info_hash);
+    try std.testing.expectEqual(@as(u64, 0), stats.total_uploaded);
+    try std.testing.expectEqual(@as(u64, 0), stats.total_downloaded);
+
+    try std.testing.expectEqual(@as(?[]const u8, null), try db.loadTorrentCategory(std.testing.allocator, info_hash));
+
+    const tags = try db.loadTorrentTags(std.testing.allocator, info_hash);
+    defer std.testing.allocator.free(tags);
+    try std.testing.expectEqual(@as(usize, 0), tags.len);
+
+    const limits = db.loadRateLimits(info_hash);
+    try std.testing.expectEqual(@as(u64, 0), limits.dl_limit);
+    try std.testing.expectEqual(@as(u64, 0), limits.ul_limit);
+
+    const share = db.loadShareLimits(info_hash);
+    try std.testing.expectEqual(@as(f64, -2.0), share.ratio_limit);
+    try std.testing.expectEqual(@as(i64, -2), share.seeding_time_limit);
+    try std.testing.expectEqual(@as(i64, 0), share.completion_on);
+
+    try std.testing.expectEqual(@as(?[32]u8, null), db.loadInfoHashV2(info_hash));
+
+    const overrides = try db.loadTrackerOverrides(std.testing.allocator, info_hash);
+    defer ResumeDb.freeTrackerOverrides(std.testing.allocator, overrides);
+    try std.testing.expectEqual(@as(usize, 0), overrides.len);
+
+    const queue_entries = try db.loadQueuePositions(std.testing.allocator);
+    defer std.testing.allocator.free(queue_entries);
+    try std.testing.expectEqual(@as(usize, 0), queue_entries.len);
 }
 
 test "resume db save and load transfer stats" {

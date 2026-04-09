@@ -13,14 +13,10 @@ pub fn main() !void {
     var stdout_writer = std.fs.File.stdout().writer(&stdout_buffer);
     const stdout = &stdout_writer.interface;
 
-    varuna.io.signal.installHandlers();
-    var loaded_cfg = varuna.config.loadDefault(allocator);
-    defer loaded_cfg.deinit();
-    const cfg = loaded_cfg.value;
-
     // Check for --help
     for (args[1..]) |arg| {
         if (std.mem.eql(u8, arg, "--help") or std.mem.eql(u8, arg, "-h")) {
+            const cfg = varuna.config.Config{};
             try stdout.print("varuna: BitTorrent daemon with io_uring and qBittorrent-compatible API\n\n", .{});
             try stdout.print("usage: varuna [--help]\n\n", .{});
             try stdout.print("Config: varuna.toml or ~/.config/varuna/config.toml\n", .{});
@@ -32,9 +28,38 @@ pub fn main() !void {
         }
     }
 
+    varuna.io.signal.installHandlers();
+    var loaded_cfg = try varuna.config.loadDefault(allocator);
+    defer loaded_cfg.deinit();
+    const cfg = loaded_cfg.value;
+
+    var startup_arena = std.heap.ArenaAllocator.init(allocator);
+    defer startup_arena.deinit();
+    const startup_summary = try varuna.runtime.probe.detectCurrent(startup_arena.allocator());
+
     // Banner
     try stdout.print("varuna daemon starting\n", .{});
-    try varuna.app.writeStartupBanner(stdout);
+    try varuna.app.writeStartupBannerForSummary(stdout, startup_summary);
+    varuna.runtime.probe.ensureSupported(startup_summary) catch |err| {
+        switch (err) {
+            error.UnsupportedKernel => {
+                try stdout.print(
+                    "startup blocked: kernel {s} is below the supported minimum {}.{}\n",
+                    .{
+                        startup_summary.release,
+                        varuna.runtime.requirements.minimum_supported.major,
+                        varuna.runtime.requirements.minimum_supported.minor,
+                    },
+                );
+            },
+            error.IoUringUnavailable => {
+                try stdout.print("startup blocked: io_uring is unavailable on this host\n", .{});
+            },
+            else => return err,
+        }
+        try stdout.flush();
+        return err;
+    };
     try stdout.flush();
 
     // Shared event loop for all torrents (single-threaded I/O)
@@ -72,7 +97,7 @@ pub fn main() !void {
     shared_el.bind_address = cfg.network.bind_address;
 
     // Apply MSE/PE encryption mode from config
-    shared_el.encryption_mode = varuna.config.parseEncryptionMode(cfg.network.encryption);
+    shared_el.encryption_mode = try varuna.config.parseEncryptionMode(cfg.network.encryption);
 
     // Apply connection limits from config
     shared_el.max_connections = cfg.network.max_connections;
@@ -253,10 +278,12 @@ pub fn main() !void {
     var api_handler = varuna.rpc.handlers.ApiHandler{
         .session_manager = &session_manager,
         .sync_state = varuna.rpc.sync.SyncState.init(allocator),
+        .peer_sync_state = varuna.rpc.sync.PeerSyncState.init(allocator),
         .api_username = cfg.daemon.api_username,
         .api_password = cfg.daemon.api_password,
     };
     defer api_handler.sync_state.deinit();
+    defer api_handler.peer_sync_state.deinit();
 
     // HTTP API server (all I/O via io_uring)
     // Check for systemd socket activation first

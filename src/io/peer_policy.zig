@@ -679,25 +679,29 @@ pub fn recalculateUnchokes(self: *EventLoop) void {
 
 // ── Re-announce ─────────────────────────────────────────
 
-/// Pick up peers discovered by daemon tracker sessions (via announce_result_peers).
+/// Pick up peers discovered by daemon tracker sessions.
 /// The standalone announce thread was removed — all announces go through TrackerExecutor.
 pub fn checkReannounce(self: *EventLoop) void {
-    if (self.announce_results_ready.load(.acquire)) {
-        const peers = blk: {
-            self.announce_mutex.lock();
-            defer self.announce_mutex.unlock();
-            const p = self.announce_result_peers;
-            self.announce_result_peers = null;
-            self.announce_results_ready.store(false, .release);
-            break :blk p;
-        };
-        if (peers) |addrs| {
-            for (addrs) |addr| {
+    const results = blk: {
+        self.announce_mutex.lock();
+        defer self.announce_mutex.unlock();
+        if (self.announce_results.items.len == 0) break :blk null;
+        const drained = self.announce_results;
+        self.announce_results = std.ArrayList(EventLoop.AnnounceResult).empty;
+        break :blk drained;
+    };
+    if (results) |owned_results| {
+        defer {
+            for (owned_results.items) |result| self.allocator.free(result.peers);
+            var drained = owned_results;
+            drained.deinit(self.allocator);
+        }
+        for (owned_results.items) |result| {
+            if (self.getTorrentContext(result.torrent_id) == null) continue;
+            for (result.peers) |addr| {
                 if (self.peer_count >= self.max_connections) break;
-                // When uTP is enabled, alternate between TCP and uTP transports.
-                _ = self.addPeerAutoTransport(addr, 0) catch continue;
+                _ = self.addPeerAutoTransport(addr, result.torrent_id) catch continue;
             }
-            self.allocator.free(addrs);
         }
     }
 }

@@ -14,6 +14,11 @@ pub const Summary = struct {
     io_uring_available: bool,
 };
 
+pub fn ensureSupported(summary: Summary) !void {
+    if (summary.support == .unsupported) return error.UnsupportedKernel;
+    if (!summary.io_uring_available) return error.IoUringUnavailable;
+}
+
 pub fn detectCurrent(allocator: std.mem.Allocator) !Summary {
     const uts = std.posix.uname();
     return fromStrings(
@@ -87,4 +92,29 @@ test "classify preferred non WSL kernel summary" {
 
     try std.testing.expectEqual(.preferred, summary.support);
     try std.testing.expect(!summary.is_wsl);
+}
+
+test "ensureSupported rejects unsupported kernels" {
+    const summary = try fromStrings(
+        std.testing.allocator,
+        "6.5.0-custom",
+        "#1 SMP",
+        "x86_64",
+    );
+    defer freeSummary(std.testing.allocator, summary);
+
+    try std.testing.expectError(error.UnsupportedKernel, ensureSupported(summary));
+}
+
+test "ensureSupported rejects missing io_uring" {
+    var summary = try fromStrings(
+        std.testing.allocator,
+        "6.8.12-generic",
+        "#12-Ubuntu SMP",
+        "x86_64",
+    );
+    defer freeSummary(std.testing.allocator, summary);
+    summary.io_uring_available = false;
+
+    try std.testing.expectError(error.IoUringUnavailable, ensureSupported(summary));
 }

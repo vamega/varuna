@@ -101,9 +101,8 @@ pub const DhtEngine = struct {
 
     /// Seed the routing table from previously persisted nodes.
     pub fn loadPersistedNodes(self: *DhtEngine, nodes: []const NodeInfo) void {
-        const now = std.time.timestamp();
         for (nodes) |node| {
-            _ = self.table.addNode(node, now);
+            _ = self.table.addNode(node, node.last_seen);
         }
         // If we loaded enough nodes, skip the slow bootstrap process
         if (self.table.nodeCount() >= 8) {
@@ -458,7 +457,7 @@ pub const DhtEngine = struct {
         const now = std.time.timestamp();
 
         // Find and remove the pending query
-        const pending = self.findAndRemovePending(r.transaction_id) orelse {
+        const pending = self.findAndRemovePending(r.transaction_id, sender) orelse {
             log.debug("response for unknown txn from {any}", .{sender});
             return;
         };
@@ -614,14 +613,17 @@ pub const DhtEngine = struct {
             };
 
             self.queueSend(pkt_buf[0..len], info.address);
-            self.addPending(.{
+            if (!self.addPending(.{
                 .transaction_id = txn_id,
                 .target_id = info.id,
                 .target_addr = info.address,
                 .sent_at = std.time.timestamp(),
                 .lookup_idx = lookup_idx,
                 .method = if (lk.kind == .find_node) .find_node else .get_peers,
-            });
+            })) {
+                lk.markPending(info.id);
+                break;
+            }
         }
     }
 
@@ -645,14 +647,17 @@ pub const DhtEngine = struct {
             };
 
             self.queueSend(pkt_buf[0..len], info.address);
-            self.addPending(.{
+            if (!self.addPending(.{
                 .transaction_id = txn_id,
                 .target_id = info.id,
                 .target_addr = info.address,
                 .sent_at = std.time.timestamp(),
                 .lookup_idx = lookup_idx,
                 .method = if (lk.kind == .find_node) .find_node else .get_peers,
-            });
+            })) {
+                lk.markPending(info.id);
+                break;
+            }
         }
     }
 
@@ -749,7 +754,7 @@ pub const DhtEngine = struct {
             var buf: [512]u8 = undefined;
             const len = krpc.encodePingQuery(&buf, txn_id, self.own_id) catch continue;
             self.queueSend(buf[0..len], addr);
-            self.addPending(.{
+            _ = self.addPending(.{
                 .transaction_id = txn_id,
                 .target_id = [_]u8{0} ** 20, // unknown ID
                 .target_addr = addr,
@@ -821,24 +826,24 @@ pub const DhtEngine = struct {
         return id;
     }
 
-    fn addPending(self: *DhtEngine, query: PendingQuery) void {
+    fn addPending(self: *DhtEngine, query: PendingQuery) bool {
         for (&self.pending) |*slot| {
             if (slot.* == null) {
                 slot.* = query;
-                return;
+                return true;
             }
         }
-        // No free slot -- drop the oldest
         log.warn("DHT pending query table full", .{});
+        return false;
     }
 
-    fn findAndRemovePending(self: *DhtEngine, txn_id_bytes: []const u8) ?PendingQuery {
+    fn findAndRemovePending(self: *DhtEngine, txn_id_bytes: []const u8, sender: std.net.Address) ?PendingQuery {
         if (txn_id_bytes.len != 2) return null;
         const txn_id = std.mem.readInt(u16, txn_id_bytes[0..2], .big);
 
         for (&self.pending) |*slot| {
             if (slot.*) |pending| {
-                if (pending.transaction_id == txn_id) {
+                if (pending.transaction_id == txn_id and addressEql(pending.target_addr, sender)) {
                     const result = pending;
                     slot.* = null;
                     return result;
@@ -848,6 +853,13 @@ pub const DhtEngine = struct {
         return null;
     }
 };
+
+fn addressEql(a: std.net.Address, b: std.net.Address) bool {
+    const pex = @import("../net/pex.zig");
+    const a_key = pex.CompactPeer.fromAddress(a);
+    const b_key = pex.CompactPeer.fromAddress(b);
+    return a_key.len == b_key.len and std.mem.eql(u8, a_key.data[0..a_key.len], b_key.data[0..b_key.len]);
+}
 
 /// Return a stable byte representation of an address for token generation.
 /// For IPv4, returns the 4-byte address. For IPv6, returns the first 4 bytes

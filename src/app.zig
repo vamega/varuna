@@ -3,6 +3,30 @@ const runtime = @import("runtime/root.zig");
 const torrent = @import("torrent/root.zig");
 
 pub fn writeStartupBanner(writer: *std.Io.Writer) !void {
+    var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+    defer arena.deinit();
+
+    const summary = runtime.probe.detectCurrent(arena.allocator()) catch |err| {
+        try writer.print("varuna bootstrap\n", .{});
+        try writer.print("minimum kernel: {}.{}\n", .{
+            runtime.requirements.minimum_supported.major,
+            runtime.requirements.minimum_supported.minor,
+        });
+        try writer.print("preferred kernel: {}.{}\n", .{
+            runtime.requirements.preferred_supported.major,
+            runtime.requirements.preferred_supported.minor,
+        });
+        try writer.print("kernel probe: unavailable ({s})\n", .{@errorName(err)});
+        return;
+    };
+
+    try writeStartupBannerForSummary(writer, summary);
+}
+
+pub fn writeStartupBannerForSummary(
+    writer: *std.Io.Writer,
+    summary: runtime.probe.Summary,
+) !void {
     try writer.print("varuna bootstrap\n", .{});
     try writer.print("minimum kernel: {}.{}\n", .{
         runtime.requirements.minimum_supported.major,
@@ -12,14 +36,6 @@ pub fn writeStartupBanner(writer: *std.Io.Writer) !void {
         runtime.requirements.preferred_supported.major,
         runtime.requirements.preferred_supported.minor,
     });
-
-    var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
-    defer arena.deinit();
-
-    const summary = runtime.probe.detectCurrent(arena.allocator()) catch |err| {
-        try writer.print("kernel probe: unavailable ({s})\n", .{@errorName(err)});
-        return;
-    };
 
     try writer.print("current kernel: {s} ({s})\n", .{ summary.release, summary.machine });
     try writer.print("kernel support: {s}\n", .{@tagName(summary.support)});

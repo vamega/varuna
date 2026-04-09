@@ -49,6 +49,8 @@ pub const SessionManager = struct {
 
     /// Queue manager for controlling how many torrents are active.
     queue_manager: QueueManager,
+    /// Torrents currently being relocated by setLocation().
+    relocating_torrents: std.AutoHashMap([40]u8, void),
 
     /// Shared resume DB for category/tag persistence. Opened once, shared
     /// with all sessions. null if no resume_db_path is configured.
@@ -71,6 +73,7 @@ pub const SessionManager = struct {
             .category_store = CategoryStore.init(allocator),
             .tag_store = TagStore.init(allocator),
             .queue_manager = QueueManager.init(allocator),
+            .relocating_torrents = std.AutoHashMap([40]u8, void).init(allocator),
         };
     }
 
@@ -110,17 +113,12 @@ pub const SessionManager = struct {
         self.loadBanList();
     }
 
-    /// Enable or disable DHT at runtime. When disabled, the DHT engine is
-    /// detached from the event loop so no queries are sent or received.
+    /// Enable or disable DHT at runtime. If no engine was created at startup,
+    /// toggling remains a no-op.
     pub fn setDhtEnabled(self: *SessionManager, enabled: bool) void {
         const el = self.shared_event_loop orelse return;
-        if (enabled) {
-            // Re-enable: nothing to do if already enabled or no engine was created
-            // (If DHT was disabled at startup via config, there's no engine to re-enable)
-        } else {
-            // Disable: detach engine from event loop so ticks become no-ops
-            el.dht_engine = null;
-        }
+        const engine = el.dht_engine orelse return;
+        engine.enabled = enabled;
     }
 
     pub fn deinit(self: *SessionManager) void {
@@ -133,6 +131,7 @@ pub const SessionManager = struct {
         self.category_store.deinit();
         self.tag_store.deinit();
         self.queue_manager.deinit();
+        self.relocating_torrents.deinit();
         if (self.ban_list) |bl| {
             bl.deinit();
             self.allocator.destroy(bl);
@@ -225,6 +224,15 @@ pub const SessionManager = struct {
     /// directories under the torrent's save_path.
     pub fn removeTorrentEx(self: *SessionManager, hash: []const u8, delete_files: bool) !void {
         self.mutex.lock();
+
+        if (hash.len == 40) {
+            var hash_buf: [40]u8 = undefined;
+            @memcpy(&hash_buf, hash[0..40]);
+            if (self.relocating_torrents.contains(hash_buf)) {
+                self.mutex.unlock();
+                return error.TorrentBusy;
+            }
+        }
 
         const kv = self.sessions.fetchRemove(hash) orelse {
             self.mutex.unlock();
@@ -756,9 +764,61 @@ pub const SessionManager = struct {
     fn runQueueEnforcementLocked(self: *SessionManager) void {
         if (!self.queue_manager.config.enabled) return;
 
-        const result = self.queue_manager.enforceQueue(&self.sessions);
-        for (0..result.start_count) |i| {
-            const hash = result.to_start[i];
+        var to_queue: [32][40]u8 = undefined;
+        var to_queue_count: usize = 0;
+        var to_start: [32][40]u8 = undefined;
+        var to_start_count: usize = 0;
+        var active_downloads: u32 = 0;
+        var active_uploads: u32 = 0;
+        var active_total: u32 = 0;
+
+        for (self.queue_manager.queue.items) |hash| {
+            if (self.sessions.get(&hash)) |session| {
+                const state = session.state;
+                if (!(state == .downloading or state == .seeding or state == .queued)) continue;
+
+                const is_download = state != .seeding;
+                const within_total = self.queue_manager.config.max_active_torrents < 0 or
+                    active_total < @as(u32, @intCast(self.queue_manager.config.max_active_torrents));
+                const within_type = if (is_download)
+                    (self.queue_manager.config.max_active_downloads < 0 or
+                        active_downloads < @as(u32, @intCast(self.queue_manager.config.max_active_downloads)))
+                else
+                    (self.queue_manager.config.max_active_uploads < 0 or
+                        active_uploads < @as(u32, @intCast(self.queue_manager.config.max_active_uploads)));
+
+                if (within_total and within_type) {
+                    active_total += 1;
+                    if (is_download) {
+                        active_downloads += 1;
+                    } else {
+                        active_uploads += 1;
+                    }
+
+                    if (state == .queued and to_start_count < to_start.len) {
+                        to_start[to_start_count] = hash;
+                        to_start_count += 1;
+                    }
+                    continue;
+                }
+
+                if ((state == .downloading or state == .seeding) and to_queue_count < to_queue.len) {
+                    to_queue[to_queue_count] = hash;
+                    to_queue_count += 1;
+                }
+            }
+        }
+
+        for (to_queue[0..to_queue_count]) |hash| {
+            if (self.sessions.get(&hash)) |session| {
+                if (session.state == .downloading or session.state == .seeding) {
+                    session.pause();
+                    session.state = .queued;
+                }
+            }
+        }
+
+        for (to_start[0..to_start_count]) |hash| {
             if (self.sessions.get(&hash)) |session| {
                 if (session.state == .queued) {
                     session.state = .paused; // so resume_session sees .paused
@@ -884,32 +944,51 @@ pub const SessionManager = struct {
     /// thread (which is the RPC handler thread, not the event loop).
     pub fn setLocation(self: *SessionManager, hash: []const u8, new_path: []const u8) !void {
         self.mutex.lock();
-        defer self.mutex.unlock();
 
         const session = self.sessions.get(hash) orelse return error.TorrentNotFound;
+        if (self.relocating_torrents.contains(session.info_hash_hex)) {
+            self.mutex.unlock();
+            return error.TorrentBusy;
+        }
+        try self.relocating_torrents.put(session.info_hash_hex, {});
         const was_active = session.state == .downloading or session.state == .seeding;
+        const info_hash_hex = session.info_hash_hex;
+        const old_path = try self.allocator.dupe(u8, session.save_path);
+        errdefer self.allocator.free(old_path);
 
         // Pause if active (stop I/O to the files)
         if (was_active) {
             session.pause();
         }
+        self.mutex.unlock();
+        defer self.allocator.free(old_path);
 
         // Move files from old save_path to new_path
-        const old_path = session.save_path;
         moveDataFiles(old_path, new_path) catch |err| {
-            // Resume if we paused
-            if (was_active) session.resume_session();
+            self.mutex.lock();
+            defer self.mutex.unlock();
+            _ = self.relocating_torrents.remove(info_hash_hex);
+            if (self.sessions.get(hash)) |live_session| {
+                if (was_active and live_session.state != .queued) {
+                    live_session.resume_session();
+                }
+            }
             return err;
         };
 
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        _ = self.relocating_torrents.remove(info_hash_hex);
+        const live_session = self.sessions.get(hash) orelse return error.TorrentNotFound;
+
         // Update save_path
         const owned_new_path = try self.allocator.dupe(u8, new_path);
-        self.allocator.free(old_path);
-        session.save_path = owned_new_path;
+        self.allocator.free(live_session.save_path);
+        live_session.save_path = owned_new_path;
 
         // Resume if it was active
         if (was_active) {
-            session.resume_session();
+            live_session.resume_session();
         }
     }
 

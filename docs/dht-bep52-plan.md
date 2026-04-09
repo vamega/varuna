@@ -1,6 +1,13 @@
 # DHT (BEP 5) and BEP 52 (BitTorrent v2 / Hybrid Torrents) Implementation Plan
 
-This document is an implementation plan only. It describes module structure, data types, integration points, and phasing for two large features. Nothing here should be built until the plan is reviewed and approved.
+This document is a planning and follow-up document, not a statement of current implementation status.
+
+DHT and most BEP 52 runtime support are already implemented in the tree. What remains here is primarily:
+- architectural context for how those systems were designed
+- follow-up work that was intentionally deferred
+- the remaining BitTorrent v2 / hybrid torrent creation work
+
+Before assuming an item in this document is still pending, check [STATUS.md](../STATUS.md) and the current code under `src/dht/`, `src/torrent/`, `src/storage/`, `src/net/`, and `src/tracker/`.
 
 Links: [STATUS.md](../STATUS.md) | [DECISIONS.md](../DECISIONS.md) | [future-features.md](future-features.md) | [io-uring-syscalls.md](io-uring-syscalls.md)
 

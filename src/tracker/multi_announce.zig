@@ -9,6 +9,22 @@ pub const MultiAnnounceResult = struct {
     url_index: usize,
 };
 
+const SharedState = struct {
+    winner_set: std.atomic.Value(bool),
+    winner_response: ?announce.Response,
+    winner_url_index: usize,
+    mutex: std.Thread.Mutex,
+    cond: std.Thread.Condition,
+    completed_count: usize,
+    expected_count: usize,
+};
+
+const CleanupState = struct {
+    allocator: std.mem.Allocator,
+    shared: *SharedState,
+    threads: []?std.Thread,
+};
+
 /// Announce to all tracker URLs simultaneously. Each URL gets its own
 /// background thread. The first tracker to return a successful response
 /// with peers wins.
@@ -28,45 +44,97 @@ pub fn announceParallel(
         return .{ .response = resp, .url_index = 0 };
     }
 
-    // Shared state for the race: first thread to set winner wins.
-    const SharedState = struct {
-        winner_set: std.atomic.Value(bool),
-        winner_response: ?announce.Response,
-        winner_url_index: usize,
-        mutex: std.Thread.Mutex,
-    };
+    const page_allocator = std.heap.page_allocator;
 
-    var shared = SharedState{
+    const shared = try page_allocator.create(SharedState);
+    shared.* = .{
         .winner_set = std.atomic.Value(bool).init(false),
         .winner_response = null,
         .winner_url_index = 0,
         .mutex = .{},
+        .cond = .{},
+        .completed_count = 0,
+        .expected_count = urls.len,
     };
+    errdefer page_allocator.destroy(shared);
 
-    // Spawn one thread per URL (capped at 8 to avoid excessive thread creation)
-    const max_threads = 8;
-    const thread_count = @min(urls.len, max_threads);
-    var threads: [max_threads]?std.Thread = [_]?std.Thread{null} ** max_threads;
+    const threads = try page_allocator.alloc(?std.Thread, urls.len);
+    errdefer page_allocator.free(threads);
+    @memset(threads, null);
 
-    for (0..thread_count) |i| {
+    var started_count: usize = 0;
+    errdefer {
+        for (threads[0..started_count]) |maybe_thread| {
+            if (maybe_thread) |thread| thread.join();
+        }
+    }
+
+    for (urls, 0..) |url, i| {
         threads[i] = std.Thread.spawn(.{}, announceWorker, .{
-            allocator,
-            urls[i],
+            page_allocator,
+            url,
             base_request,
-            &shared,
+            shared,
             i,
         }) catch null;
+        if (threads[i] != null) {
+            started_count += 1;
+        } else {
+            shared.mutex.lock();
+            shared.completed_count += 1;
+            shared.cond.broadcast();
+            shared.mutex.unlock();
+        }
     }
 
-    // Wait for all threads to finish
-    for (0..thread_count) |i| {
-        if (threads[i]) |t| t.join();
+    shared.mutex.lock();
+    defer shared.mutex.unlock();
+    while (!shared.winner_set.load(.acquire) and shared.completed_count < shared.expected_count) {
+        shared.cond.wait(&shared.mutex);
     }
 
-    if (shared.winner_response) |resp| {
-        return .{ .response = resp, .url_index = shared.winner_url_index };
+    const winner_response = shared.winner_response;
+    const winner_url_index = shared.winner_url_index;
+    shared.winner_response = null;
+
+    const cleanup = try page_allocator.create(CleanupState);
+    cleanup.* = .{
+        .allocator = page_allocator,
+        .shared = shared,
+        .threads = threads,
+    };
+    errdefer page_allocator.destroy(cleanup);
+
+    const cleanup_thread = try std.Thread.spawn(.{}, cleanupWorkers, .{cleanup});
+    cleanup_thread.detach();
+
+    if (winner_response) |resp| {
+        const peers = try allocator.dupe(announce.Peer, resp.peers);
+        defer announce.freeResponse(page_allocator, resp);
+        return .{
+            .response = .{
+                .interval = resp.interval,
+                .peers = peers,
+                .complete = resp.complete,
+                .incomplete = resp.incomplete,
+                .warning_message = resp.warning_message,
+            },
+            .url_index = winner_url_index,
+        };
     }
     return error.AllTrackersFailed;
+}
+
+fn cleanupWorkers(state: *CleanupState) void {
+    for (state.threads) |maybe_thread| {
+        if (maybe_thread) |thread| thread.join();
+    }
+    state.allocator.free(state.threads);
+    if (state.shared.winner_response) |resp| {
+        announce.freeResponse(state.allocator, resp);
+    }
+    state.allocator.destroy(state.shared);
+    state.allocator.destroy(state);
 }
 
 fn announceWorker(
@@ -76,6 +144,13 @@ fn announceWorker(
     shared: anytype,
     url_index: usize,
 ) void {
+    defer {
+        shared.mutex.lock();
+        shared.completed_count += 1;
+        shared.cond.broadcast();
+        shared.mutex.unlock();
+    }
+
     // Early exit if another thread already won
     if (shared.winner_set.load(.acquire)) return;
 
@@ -103,6 +178,7 @@ fn announceWorker(
     shared.winner_response = resp;
     shared.winner_url_index = url_index;
     shared.winner_set.store(true, .release);
+    shared.cond.broadcast();
 }
 
 /// Background worker version: announces to all URLs in parallel using the

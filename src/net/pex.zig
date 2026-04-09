@@ -272,6 +272,8 @@ pub fn buildPexMessage(
     defer added_v6.deinit(allocator);
     var added_v6_flags = std.ArrayList(u8).empty;
     defer added_v6_flags.deinit(allocator);
+    var added_keys = std.ArrayList(CompactPeer).empty;
+    defer added_keys.deinit(allocator);
 
     var added_count: usize = 0;
     var it = torrent_pex.connected_peers.iterator();
@@ -286,6 +288,7 @@ pub fn buildPexMessage(
                 try added_v6.appendSlice(allocator, key.data[0..compact_ipv6_size]);
                 try added_v6_flags.append(allocator, @bitCast(entry.value_ptr.*));
             }
+            try added_keys.append(allocator, key);
             added_count += 1;
         }
     }
@@ -295,6 +298,8 @@ pub fn buildPexMessage(
     defer dropped_v4.deinit(allocator);
     var dropped_v6 = std.ArrayList(u8).empty;
     defer dropped_v6.deinit(allocator);
+    var dropped_keys = std.ArrayList(CompactPeer).empty;
+    defer dropped_keys.deinit(allocator);
 
     var dropped_count: usize = 0;
     var sent_it = peer_pex.sent_peers.iterator();
@@ -307,6 +312,7 @@ pub fn buildPexMessage(
             } else if (key.len == compact_ipv6_size) {
                 try dropped_v6.appendSlice(allocator, key.data[0..compact_ipv6_size]);
             }
+            try dropped_keys.append(allocator, key);
             dropped_count += 1;
         }
     }
@@ -351,11 +357,13 @@ pub fn buildPexMessage(
 
     const payload = try bencode_encode.encode(allocator, .{ .dict = entries[0..idx] });
 
-    // Update peer's sent_peers to reflect the current state
-    peer_pex.sent_peers.clearRetainingCapacity();
-    var cp_it = torrent_pex.connected_peers.iterator();
-    while (cp_it.next()) |entry| {
-        peer_pex.sent_peers.put(allocator, entry.key_ptr.*, {}) catch {};
+    // Update peer's sent_peers only for peers reflected in this delta.
+    // This preserves capped additions/drops for later messages.
+    for (added_keys.items) |key| {
+        peer_pex.sent_peers.put(allocator, key, {}) catch {};
+    }
+    for (dropped_keys.items) |key| {
+        _ = peer_pex.sent_peers.remove(key);
     }
 
     return payload;
@@ -612,6 +620,34 @@ test "max_added_per_message is respected" {
 
     // Should be capped at max_added_per_message
     try std.testing.expect(msg.added.len <= max_added_per_message);
+}
+
+test "capped dropped peers remain pending for later messages" {
+    var torrent_pex = TorrentPexState{};
+    defer torrent_pex.deinit(std.testing.allocator);
+
+    var peer_pex = PexState{};
+    defer peer_pex.deinit(std.testing.allocator);
+
+    for (0..max_dropped_per_message + 10) |i| {
+        const port: u16 = @intCast(10000 + i);
+        const addr = std.net.Address.initIp4(.{ 10, 0, 0, @intCast((i % 250) + 1) }, port);
+        try peer_pex.sent_peers.put(std.testing.allocator, CompactPeer.fromAddress(addr), {});
+    }
+
+    const payload1 = try buildPexMessage(std.testing.allocator, &torrent_pex, &peer_pex) orelse
+        return error.TestUnexpectedResult;
+    defer std.testing.allocator.free(payload1);
+    var msg1 = try parsePexMessage(std.testing.allocator, payload1);
+    defer msg1.deinit(std.testing.allocator);
+    try std.testing.expectEqual(max_dropped_per_message, msg1.dropped.len);
+
+    const payload2 = try buildPexMessage(std.testing.allocator, &torrent_pex, &peer_pex) orelse
+        return error.TestUnexpectedResult;
+    defer std.testing.allocator.free(payload2);
+    var msg2 = try parsePexMessage(std.testing.allocator, payload2);
+    defer msg2.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(usize, 10), msg2.dropped.len);
 }
 
 test "parse PEX message with multiple IPv4 peers" {

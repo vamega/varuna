@@ -76,6 +76,9 @@ pub const Metainfo = struct {
         if (piece_index >= try self.pieceCount()) {
             return error.InvalidPieceIndex;
         }
+        if (self.version == .v2) {
+            return error.UnsupportedForV2;
+        }
 
         const start = @as(usize, piece_index) * 20;
         return self.pieces[start .. start + 20];
@@ -128,6 +131,7 @@ pub fn parse(allocator: std.mem.Allocator, input: []const u8) !Metainfo {
     const version = detectVersion(info);
     const name = try expectBytes(try getRequired(info, "name"));
     const piece_length = try expectPositiveU32(try getRequired(info, "piece length"));
+    if (piece_length == 0) return error.InvalidPieceLength;
 
     // v1 pieces field: required for v1 and hybrid, absent for pure v2
     var pieces: []const u8 = "";
@@ -482,6 +486,15 @@ test "reject non-integer piece length" {
     );
 }
 
+test "reject zero piece length" {
+    const input =
+        "d4:infod6:lengthi5e4:name8:test.bin12:piece lengthi0e6:pieces20:abcdefghijklmnopqrstee";
+    try std.testing.expectError(
+        error.InvalidPieceLength,
+        parse(std.testing.allocator, input),
+    );
+}
+
 test "reject negative file length" {
     const input =
         "d4:infod6:lengthi-1e4:name8:test.bin12:piece lengthi4e6:pieces20:abcdefghijklmnopqrstee";
@@ -545,6 +558,7 @@ test "parse pure v2 torrent" {
     try std.testing.expectEqual(@as(u64, 5), meta.file_tree_v2.?[0].length);
     try std.testing.expectEqual(pr, meta.file_tree_v2.?[0].pieces_root);
     try std.testing.expectEqualStrings("test.bin", meta.file_tree_v2.?[0].path[0]);
+    try std.testing.expectError(error.UnsupportedForV2, meta.pieceHash(0));
 
     // v1 files array should be populated from file tree
     try std.testing.expectEqual(@as(usize, 1), meta.files.len);

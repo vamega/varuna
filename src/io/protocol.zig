@@ -400,46 +400,30 @@ pub fn submitMessage(self: *EventLoop, slot: u16, id: u8, payload: []const u8) !
     const peer = &self.peers[slot];
     // Build framed message: 4-byte length + id + payload
     const msg_len = @as(u32, @intCast(1 + payload.len));
-    var header: [5]u8 = undefined;
-    std.mem.writeInt(u32, header[0..4], msg_len, .big);
-    header[4] = id;
+    const total_len = 5 + payload.len;
+    const ts = self.nextTrackedSendUserData(slot);
 
-    // For small messages, combine into one send
-    if (payload.len <= 12) {
-        var combined: [17]u8 = undefined; // 5 + 12
-        @memcpy(combined[0..5], &header);
-        @memcpy(combined[5 .. 5 + payload.len], payload);
-        // Store in handshake_buf (reused as small send buffer)
-        @memcpy(peer.handshake_buf[0 .. 5 + payload.len], combined[0 .. 5 + payload.len]);
-        // MSE/PE: encrypt in-place before sending
-        peer.crypto.encryptBuf(peer.handshake_buf[0 .. 5 + payload.len]);
-        const ud = encodeUserData(.{ .slot = slot, .op_type = .peer_send, .context = 0 });
-        _ = try self.ring.send(ud, peer.fd, peer.handshake_buf[0 .. 5 + payload.len], 0);
-        peer.send_pending = true;
+    if (total_len <= EventLoop.small_send_capacity) {
+        var stack_buf: [EventLoop.small_send_capacity]u8 = undefined;
+        std.mem.writeInt(u32, stack_buf[0..4], msg_len, .big);
+        stack_buf[4] = id;
+        @memcpy(stack_buf[5..total_len], payload);
+        peer.crypto.encryptBuf(stack_buf[0..total_len]);
+
+        const tracked = try self.trackPendingSendCopy(slot, ts.send_id, stack_buf[0..total_len]);
+        _ = try self.ring.send(ts.ud, peer.fd, tracked, 0);
     } else {
-        // For larger messages, allocate a buffer for the complete message
-        const total_len = 5 + payload.len;
-        const ts = self.nextTrackedSendUserData(slot);
-        if (total_len <= EventLoop.small_send_capacity) {
-            var stack_buf: [EventLoop.small_send_capacity]u8 = undefined;
-            @memcpy(stack_buf[0..5], &header);
-            @memcpy(stack_buf[5..total_len], payload);
-            peer.crypto.encryptBuf(stack_buf[0..total_len]);
+        const send_buf = try self.allocator.alloc(u8, total_len);
+        errdefer self.allocator.free(send_buf);
+        std.mem.writeInt(u32, send_buf[0..4], msg_len, .big);
+        send_buf[4] = id;
+        @memcpy(send_buf[5..total_len], payload);
+        peer.crypto.encryptBuf(send_buf);
 
-            const tracked = try self.trackPendingSendCopy(slot, ts.send_id, stack_buf[0..total_len]);
-            _ = try self.ring.send(ts.ud, peer.fd, tracked, 0);
-        } else {
-            const send_buf = try self.allocator.alloc(u8, total_len);
-            errdefer self.allocator.free(send_buf);
-            @memcpy(send_buf[0..5], &header);
-            @memcpy(send_buf[5..total_len], payload);
-            peer.crypto.encryptBuf(send_buf);
-
-            const tracked = try self.trackPendingSendOwned(slot, ts.send_id, send_buf);
-            _ = try self.ring.send(ts.ud, peer.fd, tracked, 0);
-        }
-        peer.send_pending = true;
+        const tracked = try self.trackPendingSendOwned(slot, ts.send_id, send_buf);
+        _ = try self.ring.send(ts.ud, peer.fd, tracked, 0);
     }
+    peer.send_pending = true;
 }
 
 /// Send our BEP 10 extension handshake as a tracked (heap-allocated) send.

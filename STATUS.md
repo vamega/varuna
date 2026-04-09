@@ -28,9 +28,19 @@ Update it whenever a milestone lands, the near-term backlog changes, or a new op
 ### Architecture
 - **Single-threaded io_uring event loop**: all peer I/O, disk I/O, HTTP API, tracker HTTP through io_uring. Split into focused sub-modules: event_loop.zig (core), peer_handler.zig, protocol.zig, seed_handler.zig, peer_policy.zig, utp_handler.zig.
 - **3-binary architecture**: `varuna` (daemon), `varuna-ctl` (CLI client), `varuna-tools` (standalone utilities).
+- **Fail-closed startup/config policy**: malformed config files now abort startup instead of silently falling back to defaults; invalid encryption modes are rejected; daemon startup now blocks on unsupported kernels or missing `io_uring`; removed dead config knobs `connect_timeout_secs`, `performance.pipeline_depth`, and `performance.ring_entries`.
 - **Shared multi-torrent event loop**: all torrents on one EventLoop thread with TorrentContext per torrent.
 - **Dynamic shared-torrent registry**: the shared EventLoop now uses dynamic slot storage, free-list reuse, `u32` torrent IDs, and hashed info-hash lookup instead of the old fixed 64-slot table.
 - **Shared announce ring**: tracker announces reuse a single ring instead of spawning per-announce threads.
+- **Per-torrent announce handoff**: background tracker callbacks now queue discovered peers against the correct `torrent_id` instead of using one global mailbox, and background reannounce/scrape fan out across the full effective tracker set (metainfo plus overrides).
+- **Tracked peer-wire control sends and shutdown drain**: `submitMessage` now routes all peer-wire messages through tracked send ownership instead of borrowing `handshake_buf`, seed reads validate per-span completion lengths, and EventLoop shutdown now dispatches late CQEs until tracked read/write/send state is retired before freeing buffers.
+- **Resume/state integrity hardening**: `ResumeWriter.flush()` now swaps and re-queues batches instead of clearing a shared pending slice after unlock, `clearTorrent()` now removes all torrent-scoped resume tables in one transaction, and v2 multi-piece piece checks now fail closed with `DeferredMerkleVerificationRequired` instead of accepting arbitrary payloads.
+- **Torrent-core v2/hybrid consistency**: pure-v2 layouts now reject flat v1 `pieceHash()` access, hybrids keep v1 piece-grid mapping semantics instead of being treated like file-aligned v2 layouts, and metainfo parsing now rejects `piece length = 0`.
+- **Tracker announce failover correctness**: `multi_announce` now returns as soon as the first tracker with peers wins instead of blocking on every worker thread, and UDP announce retries now validate against the live retry transaction ID after cached-connection recovery.
+- **Peer/DHT routing correctness**: uTP packets are keyed by remote address plus connection ID, unknown-connection resets preserve the real sender address, PEX dropped-peer deltas remain pending when capped, DHT lookups requeue candidates when the pending table is full, DHT replies match on sender as well as transaction ID, and persisted IPv6 nodes now round-trip correctly.
+- **RPC delta/auth hardening**: form/query parameters are centrally URL-decoded, `/sync/torrentPeers` now uses rid-based per-torrent peer deltas with `peers_removed`, login cookies are explicitly `SameSite=Lax`, wildcard CORS no longer advertises credentialed cookie access, and `setPreferences` now rejects malformed JSON/form values instead of silently ignoring them.
+- **MSE / RC4 input hardening**: MSE now rejects invalid DH public keys before shared-secret derivation, both blocking and async responder paths bound initial payload length, and RC4 initialization rejects empty keys.
+- **Queue/runtime operational cleanup**: queue enforcement now demotes over-limit active torrents as well as promoting queued torrents, runtime DHT toggles flip `engine.enabled` instead of dropping the engine pointer, `setLocation()` no longer holds the global session mutex across filesystem moves, and `/sync/maindata` now returns the sync body directly instead of arena-building then duplicating it.
 - **Connection limits**: global (500), per-torrent (100), half-open (50). Announce jitter ±10% with initial stagger.
 - **Peer listener multishot accept**: the shared `EventLoop` listener now uses `accept_multishot` and only re-arms when the kernel ends the multishot stream.
 - **API vectored-send path**: the HTTP API server now sends headers and body as separate iovecs through `io_uring` `sendmsg` instead of concatenating them into one response buffer first.
@@ -50,9 +60,9 @@ Update it whenever a milestone lands, the near-term backlog changes, or a new op
 - io_uring op coverage: shutdown, statx, renameat, unlinkat, send_zc, cancel, timeout, link_timeout, fixed buffers (READ_FIXED/WRITE_FIXED with registered buffer pool).
 
 ### Configuration
-- TOML config file with daemon, storage, network, performance sections. XDG config path support.
+- TOML config file with daemon, storage, network, performance sections. XDG config path support. Malformed discovered config now aborts startup instead of silently falling back to defaults.
 - Bind interface (SO_BINDTODEVICE), bind address, port ranges (port_min/port_max).
-- Download/upload speed limits (per-torrent + global), connection limits, hasher threads, pipeline depth.
+- Download/upload speed limits (per-torrent + global), connection limits, hasher threads, piece cache sizing.
 - API credentials (api_username, api_password).
 - Build options: `-Dsqlite=system|bundled`, `-Ddns=threadpool|c-ares`, `-Dtls=boringssl|none`, `-Dcrypto=varuna|stdlib|boringssl`.
 - Configurable crypto backend (`-Dcrypto`): `varuna` (default, SHA-1 with runtime SHA-NI/AArch64 hardware detection), `stdlib` (Zig std.crypto), `boringssl` (vendored BoringSSL SHA/RC4). Unified dispatch via `src/crypto/backend.zig`. Build-time validation prevents `-Dcrypto=boringssl` when `-Dtls=none`.
@@ -148,6 +158,7 @@ Update it whenever a milestone lands, the near-term backlog changes, or a new op
 
 ### Testing
 - 19 peer wire protocol tests, 16 BEP 10 extension tests (including 6 BEP 21 upload_only tests), 15 PEX tests, 31 uTP/LEDBAT tests, 5 categories tests, 10 resume DB tests, 25 MSE/RC4 tests, 13 magnet URI tests, 13 ut_metadata tests, 12 metadata fetch resilience tests.
+- Focused build-driven subsystem test entrypoints now exist for faster iteration, starting with `zig build test-torrent-session` for `src/daemon/torrent_session.zig`. Direct-file `zig test src/...` remains unsupported for repo modules wired through `build.zig`.
 - 13 async MSE state machine tests (initiator phases, responder phases, VC scan limit, fallback, first-byte detection).
 - Bencode fuzz + edge case tests, HTTP parser fuzz tests.
 - Fuzz tests for: multipart parser, tracker response, uTP packets, BEP 10 extensions, scrape response (18 fuzz tests total).
@@ -199,6 +210,7 @@ Update it whenever a milestone lands, the near-term backlog changes, or a new op
 - **uTP outbound queueing**: the UDP path still has room for a ring queue and multiple in-flight sends if uTP becomes hot in real swarms.
 - **uTP multishot receive**: `recvmsg_multishot` plus a provided-buffer strategy still needs a workload and a measured implementation before it should land.
 - **Tracker work on the shared peer ring**: the daemon now shares tracker I/O through one executor, but the executor still owns its own ring. Moving tracker work onto the shared peer `EventLoop` ring requires an async tracker state machine rather than the current synchronous HTTP helper.
+- **Wave 5 BEP 52 creation**: `src/torrent/create.zig` still only emits v1 torrents. Pure-v2 / hybrid torrent creation remains the largest unfinished item from the review plan.
 
 ## Known Issues
 
@@ -210,6 +222,13 @@ Update it whenever a milestone lands, the near-term backlog changes, or a new op
 - The shared EventLoop no longer has a 64-torrent cap, and the sparse peer/torrent registry pass removed the main cross-product scans. Cached live byte totals further reduced `/sync` stats cost, but a broader hot-summary registry may still be needed for `10k+` torrents.
 - The first outbound uTP queue cleanup experiment removed allocator churn but did not show a convincing wall-clock improvement on the loopback workload, so it was not kept in production.
 - `splice` / sendfile-style upload is currently a poor fit for BitTorrent framing and multi-file spans. The benchmark prototype was slower than both contiguous copy and `sendmsg`.
+- `zig build test-torrent-session` now uses the correct project-module wrapper, but this host still intermittently hits Zig cache/toolchain failures (`manifest_create Unexpected`) before the focused step finishes compiling.
+
+## Documentation Notes
+
+- `AGENTS.md` now reflects the current subsystem layout and build-driven testing workflow instead of the earlier mostly-forward-looking repository template.
+- `docs/future-features.md` is now explicitly documented as deferred/follow-up work only, not a source-of-truth list of missing features.
+- `docs/dht-bep52-plan.md` is now explicitly documented as a planning/follow-up document. DHT and most BEP 52 runtime support are implemented; the main remaining BEP 52 gap is torrent creation.
 
 ## Last Verified Milestone
 

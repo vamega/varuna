@@ -1,6 +1,13 @@
 # Future Features
 
-Features to implement eventually, tracked here for reference. Not prioritized for immediate work.
+Deferred features, follow-up work, and historical completion notes. This is not a source-of-truth inventory of what the codebase currently lacks.
+
+Before treating an item as unimplemented, check:
+- [STATUS.md](../STATUS.md) for the current implementation state
+- the relevant subsystem under `src/`
+- recent reports in `../progress-reports/`
+
+Several major areas that used to be planned work already exist in the tree, including uTP, UDP tracker support, DHT, PEX, magnet support, and encryption. Items in this document are either completed historical milestones, deferred work, or remaining follow-up within those areas.
 
 ## 0. ~~Blocking Call Removal~~ (DONE)
 
@@ -92,9 +99,9 @@ Implemented in `src/tracker/udp.zig` (protocol encode/decode, blocking client) a
 - **Daemon integration**: `UdpTrackerExecutor` wired into the event loop (`udp_tracker_send` / `udp_tracker_recv` OpTypes). Torrent sessions auto-detect `udp://` URLs and route announces and scrapes through the UDP executor. HTTP URLs continue through the existing `TrackerExecutor`.
 - **Tests**: 35+ unit tests (packet encode/decode, connection cache, retransmission timeouts, error responses). Integration tests with mock UDP servers over real loopback sockets (connect->announce, connect->scrape, error handling, connection ID reuse).
 
-## 7. DHT (BEP 5) and PEX (BEP 11)
+## 7. DHT (BEP 5) and PEX (BEP 11) Follow-up
 
-Distributed Hash Table for trackerless peer discovery. Peer Exchange for discovering peers through existing connections. Both essential for public torrents.
+Distributed Hash Table for trackerless peer discovery and Peer Exchange for discovering peers through existing connections are implemented. Remaining work is follow-up and refinement rather than initial bring-up.
 
 See [dht-bep52-plan.md](dht-bep52-plan.md) for the detailed implementation plan covering DHT module layout, routing table design, KRPC protocol, io_uring integration, and phasing.
 
@@ -109,7 +116,7 @@ See [dht-bep52-plan.md](dht-bep52-plan.md) for the full plan.
 
 ## 8. ~~Magnet links (BEP 9)~~ (DONE)
 
-Download torrent metadata from peers via the extension protocol. Implemented: magnet URI parsing, metadata download via ut_metadata, metadata serving to peers, CLI and API support. Remaining: parallel piece requests, trackerless magnet support (needs DHT).
+Download torrent metadata from peers via the extension protocol. Implemented: magnet URI parsing, metadata download via ut_metadata, metadata serving to peers, CLI and API support. Remaining: parallel piece requests and further trackerless-magnet polish on top of the existing DHT implementation.
 
 ## 9. ~~Encryption (BEP 6 / MSE)~~ (DONE)
 

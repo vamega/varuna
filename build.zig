@@ -213,6 +213,19 @@ pub fn build(b: *std.Build) void {
     const run_udp_tracker_tests = b.addRunArtifact(udp_tracker_tests);
     test_step.dependOn(&run_udp_tracker_tests.step);
 
+    const torrent_session_tests = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("tests/torrent_session_test.zig"),
+            .target = target,
+            .optimize = optimize,
+            .imports = &varuna_import,
+        }),
+    });
+    const run_torrent_session_tests = b.addRunArtifact(torrent_session_tests);
+
+    const test_torrent_session_step = b.step("test-torrent-session", "Run the focused TorrentSession test binary");
+    test_torrent_session_step.dependOn(&run_torrent_session_tests.step);
+
     // ── Soak test (long-running resource leak detection) ──
     const soak_exe = b.addExecutable(.{
         .name = "varuna-soak-test",

@@ -14,6 +14,7 @@ pub const Rc4 = struct {
 
     /// Initialize the RC4 state with the given key using the KSA.
     pub fn init(key: []const u8) Rc4 {
+        if (key.len == 0) @panic("RC4 key must not be empty");
         var rc4 = Rc4{ .s = undefined };
         // Key-Scheduling Algorithm (KSA)
         for (0..256) |idx| {

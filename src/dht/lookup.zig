@@ -175,6 +175,17 @@ pub const Lookup = struct {
         }
     }
 
+    /// Return a candidate from queried back to pending when the engine
+    /// could not actually enqueue the outbound query.
+    pub fn markPending(self: *Lookup, id: NodeId) void {
+        for (0..self.candidate_count) |ci| {
+            if (std.mem.eql(u8, &self.candidates[ci].info.id, &id) and self.candidates[ci].state == .queried) {
+                self.candidates[ci].state = .pending;
+                break;
+            }
+        }
+    }
+
     /// Check if the lookup is complete.
     pub fn isDone(self: *const Lookup) bool {
         return self.state == .done;

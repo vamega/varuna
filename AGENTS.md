@@ -1,90 +1,117 @@
 # Repository Guidelines
 
-## Project Structure & Module Organization
-Keep the root minimal and move implementation under `src/` as the codebase forms. Use `src/main.zig` for the entrypoint, and split major subsystems into focused directories such as `src/core/`, `src/net/`, `src/storage/`, `src/tracker/`, and `src/rpc/`. Put reusable test fixtures in `testdata/`. Keep benchmarking and profiling helpers in `perf/` or `scripts/`. Use `reference-codebases/` for local study of `rtorrent`, both `libtorrent` codebases, `qbittorrent`, and `vortex` when validating protocol behavior, startup strategies, storage design, or API compatibility.
+## Current Layout
+Keep implementation under `src/`. The current major subsystems are:
+- `src/daemon/` - session orchestration, torrent lifecycle, queueing, relocation
+- `src/io/` - io_uring event loop, peer handlers, protocol I/O, HTTP client, sockets
+- `src/torrent/` - metainfo parsing, piece tracking, layouts, torrent state, creation
+- `src/storage/` - piece storage, verification, resume persistence, disk integrity
+- `src/net/` - peer helpers, web seeds, metadata fetch, PEX, uTP
+- `src/tracker/` - HTTP/UDP tracker announce and scrape behavior
+- `src/dht/` - DHT engine, lookups, KRPC, routing, persistence
+- `src/rpc/` - qBittorrent-compatible WebAPI handlers, sync state, auth, HTTP server
+- `src/crypto/` - MSE, hashing helpers, RC4, crypto backends
+- `src/runtime/` - runtime/kernel probing and startup gating
+- `src/perf/` - benchmarks and profiling helpers exposed through `build.zig`
 
-Keep [DECISIONS.md](DECISIONS.md) updated whenever scope, constraints, architecture choices, or profiling strategy change. Keep [STATUS.md](STATUS.md) updated with completed work, next work, and known issues. Keep [perf/README.md](perf/README.md) aligned with the actual profiling workflow and available build steps. When existing markdown files are no longer enough to capture ongoing decisions, plans, workflows, compatibility notes, or risks, add a new markdown file in the appropriate location and link it from `AGENTS.md` plus the most relevant existing document so later agents can discover it quickly.
+Keep reusable fixtures in `testdata/`. Keep profiling helpers in `perf/` or `scripts/`.
 
-## Progress Reports & Work Log
-After completing meaningful work (bug fixes, new features, architectural changes), write a short report in `progress-reports/`. Each file should be named descriptively (e.g., `2026-03-27-connect-sqe-dangling-pointer.md`) and contain:
-- What was done and why
-- What was learned (especially non-obvious things about io_uring, Zig, or BitTorrent protocol)
-- Any remaining issues or follow-up work
-- Code references (file:line) for key changes
+Read these first when orienting:
+- [STATUS.md](STATUS.md) - current implementation state, completed work, known issues, next work
+- [progress-reports/2026-04-06-codebase-review.md](progress-reports/2026-04-06-codebase-review.md) - subsystem inventory and review notes
+- [docs/api-compatibility.md](docs/api-compatibility.md) - qBittorrent WebAPI compatibility status
+- [docs/dht-bep52-plan.md](docs/dht-bep52-plan.md) - remaining BEP 52 creation work and longer-range DHT follow-up
 
-This serves as institutional memory -- future agents can read these to understand past decisions, pitfalls encountered, and patterns that worked. Keep entries concise but include enough detail that someone unfamiliar with the change can understand the root cause and fix.
+Keep [DECISIONS.md](DECISIONS.md), [STATUS.md](STATUS.md), and [perf/README.md](perf/README.md) current. If new markdown is needed for plans, risks, workflows, or compatibility notes, add it in the right location and link it from `AGENTS.md` and the most relevant existing doc.
 
-## Build, Test, and Development Commands
-Use Zig stable only: Zig `0.15.2` or the latest stable release, never nightly.
-Use `mise` to install project tools locally, and keep tool versions pinned in `mise.toml`. When working in a new checkout or worktree, run `mise trust` first so that `mise.toml` is recognized and `mise exec` commands work. Without this, scripts that use `mise exec -- node` (e.g., `scripts/create_torrent.mjs`) will fail with a trust error.
+## Progress Reports
+After meaningful work, add a short file under `progress-reports/` named like `2026-03-27-connect-sqe-dangling-pointer.md` with:
+- what changed and why
+- what was learned
+- remaining issues or follow-up
+- key code references (`file:line`)
 
-SQLite3 is required for resume state persistence. Install `libsqlite3-dev` on Ubuntu/Debian. If the `-dev` package is not available, the `lib/libsqlite3.so` symlink in the project root points to the system shared library. SQLite operations MUST run on a background thread, never on the io_uring event loop thread (see `docs/io-uring-syscalls.md`).
+These reports are institutional memory. Keep them concise but specific.
 
-Ensure local developer documentation is available before doing substantial Linux or `io_uring` work. On Ubuntu 24.04 this means keeping `man-db`, `manpages`, `manpages-dev`, `manpages-posix`, `manpages-posix-dev`, and `liburing-dev` installed so syscall, POSIX, and `io_uring` man pages are locally searchable. `liburing-dev` specifically provides the `io_uring_*` man pages and the `io_uring_setup(2)` / `io_uring_enter(2)` / `io_uring_register(2)` pages.
+## Build And Test
+Use Zig stable only: `0.15.2` or the latest stable release, never nightly.
 
-The repositories under `reference-codebases/` and `vendor/` are git submodules. Initialize them with `git submodule update --init` after cloning. In particular, `vendor/boringssl` **must** be initialized for the build to succeed (it provides the TLS library for HTTPS tracker support). If you see a `failed to open file` panic from `build/boringssl.zig` during `zig build`, run `git submodule update --init vendor/boringssl`.
+Use `mise` for pinned tools in `mise.toml`:
+- run `mise trust` in new checkouts/worktrees before `mise exec`
+- run `mise install` to install pinned tools
 
-Reference repositories:
-- `reference-codebases/libtorrent` — arvidn/libtorrent (C++ BitTorrent library)
-- `reference-codebases/libtorrent-rakshasa` — rakshasa/libtorrent (rtorrent backend)
-- `reference-codebases/qbittorrent` — qBittorrent (reference WebAPI implementation)
-- `reference-codebases/rtorrent` — rakshasa/rtorrent (C++ client)
-- `reference-codebases/vortex` — Nehliin/vortex (Rust client)
-- `reference-codebases/qui` — autobrr/qui (alternative qBittorrent-compatible WebUI)
+Required local setup:
+- SQLite dev package: `libsqlite3-dev` on Ubuntu/Debian
+- local Linux/io_uring docs for substantial kernel work: `man-db`, `manpages`, `manpages-dev`, `manpages-posix`, `manpages-posix-dev`, `liburing-dev`
+- git submodules initialized with `git submodule update --init`
+- `vendor/boringssl` initialized or `zig build` will fail
 
-- `mise install`: install pinned developer tools from `mise.toml`.
-- `zig build`: compile the daemon and default targets.
-- `zig build test`: run the full unit and integration test suite.
-- `zig build bench`: run microbenchmarks and storage/network performance checks.
-- `zig build trace-syscalls -- ...`: run `varuna` under `strace` and write `perf/output/strace.log`.
-- `zig build perf-stat -- ...`: run `varuna` under `perf stat` and write `perf/output/perf-stat.txt`.
-- `zig build perf-record -- ...`: run `varuna` under `perf record` and write `perf/output/perf.data`.
-- `zig fmt .`: format all Zig sources.
-- `./scripts/demo_swarm.sh`: build a local `.torrent`, start the packaged `opentracker`, run one `varuna seed` and one `varuna download`, and verify the payload transfer.
+Reference repos under `reference-codebases/`:
+- `libtorrent` - arvidn/libtorrent
+- `libtorrent-rakshasa` - rakshasa/libtorrent
+- `qbittorrent` - qBittorrent
+- `rtorrent` - rakshasa/rtorrent
+- `vortex` - Nehliin/vortex
+- `qui` - autobrr/qui
 
-Add new commands to `build.zig` instead of ad hoc shell scripts when practical.
+Core commands:
+- `zig build`
+- `zig build test`
+- `zig build test-torrent-session`
+- `zig build bench`
+- `zig build trace-syscalls -- ...`
+- `zig build perf-stat -- ...`
+- `zig build perf-record -- ...`
+- `zig fmt .`
+- `./scripts/demo_swarm.sh`
 
-For local tracker validation, prefer `scripts/tracker.sh` plus `varuna inspect` or `scripts/demo_swarm.sh` instead of inventing new one-off workflows. The Ubuntu `opentracker` package in this repository is built in whitelist mode, so agents must pass `--whitelist-hash <info-hash>` to `scripts/tracker.sh` for any torrent they expect the tracker to authorize.
+Rules:
+- add practical new commands to `build.zig` instead of one-off shell scripts
+- do not rely on direct-file `zig test src/...`; this repo is wired through `build.zig`
+- when a subsystem becomes a repeated hotspot, add a focused `zig build <step>` target for it
+- for tracker validation, prefer `scripts/tracker.sh` plus `varuna inspect` or `scripts/demo_swarm.sh`
+- the packaged Ubuntu `opentracker` runs in whitelist mode; pass `--whitelist-hash <info-hash>` to `scripts/tracker.sh`
 
-## io_uring Policy (IMPORTANT -- applies to `varuna` daemon only)
-The `varuna` daemon is the performance-critical binary. All hot-path I/O in the daemon MUST go through `io_uring` via `src/io/ring.zig`. Do NOT use `std.fs.File` read/write/sync methods or `std.net.Stream` read/write methods for daemon I/O. These generate conventional syscalls instead of `io_uring_enter`.
+## io_uring Policy
+This is a current operating rule for the daemon, not a design aspiration.
 
-**Daemon I/O (`varuna`) -- must use io_uring:**
-- Piece storage reads and writes (`PieceStore` in `src/storage/writer.zig`)
-- Peer wire protocol send and receive (event loop in `src/io/event_loop.zig`)
-- TCP connect, accept, and socket creation for peer connections
-- HTTP API server accept, recv, send (`src/rpc/server.zig`)
-- HTTP tracker client connect, send, recv (`src/io/http.zig`)
-- File fsync/fdatasync, fallocate
+The `varuna` daemon is performance-critical. All hot-path daemon I/O must go through the `io_uring`-backed event loop and ring plumbing in `src/io/`. Do not use `std.fs.File` read/write/sync methods or `std.net.Stream` read/write methods for daemon hot paths.
 
-**`varuna-ctl` and `varuna-tools` -- no io_uring requirement:**
-These are short-lived CLI tools, not performance-critical. They MAY use io_uring if convenient (and currently do for HTTP), but standard library I/O (`std.net`, `std.fs`, `std.http`) is perfectly acceptable. Simplicity and correctness matter more than syscall efficiency for these binaries.
+Daemon paths that must use `io_uring`:
+- piece storage reads and writes
+- peer wire send and receive
+- peer TCP connect, accept, and socket creation
+- RPC server accept, recv, and send
+- HTTP tracker client connect, send, and recv
+- fsync/fdatasync and fallocate
 
-**Acceptable exceptions in the daemon** (not hot path):
-- File creation, directory setup, and truncation during `PieceStore.init` (one-time setup)
-- Stdout logging via `std.Io.Writer` (infrequent status messages)
-- Test helpers that simulate peers/trackers (not production code)
-- The `uname` syscall in runtime probing
-- SQLite operations (run on a background thread, not the event loop)
+`varuna-ctl` and `varuna-tools` are different: standard library I/O is acceptable there.
 
-When adding new I/O paths to the daemon, always use the Ring or event loop. Verify with `strace -f -yy -c` that daemon hot paths route through `io_uring_enter`.
+Allowed daemon exceptions:
+- one-time file creation, directory setup, and truncation during `PieceStore.init`
+- stdout logging
+- test helpers that simulate peers or trackers
+- `uname` for runtime probing
+- SQLite work on a background thread, never on the event-loop thread
 
-See [docs/io-uring-syscalls.md](docs/io-uring-syscalls.md) for the full syscall reference, current io_uring coverage, and notes on DNS resolution, SHA hardware acceleration, and SQLite resume state.
+When adding daemon I/O, use the ring or event loop and verify hot paths with `strace -f -yy -c`.
 
-See [docs/future-features.md](docs/future-features.md) for planned features: systemd-notify, SHA-NI acceleration, uTP, SO_BINDTODEVICE, socket activation, UDP tracker, DHT/PEX, magnet links, encryption.
+## Key Docs
+- [docs/io-uring-syscalls.md](docs/io-uring-syscalls.md) - syscall reference and current io_uring coverage
+- [docs/future-features.md](docs/future-features.md) - deferred and follow-up work only, not a missing-feature inventory
+- [docs/dht-bep52-plan.md](docs/dht-bep52-plan.md) - planning/follow-up context; check [STATUS.md](STATUS.md) before assuming items are still pending
+- [docs/api-compatibility.md](docs/api-compatibility.md) - endpoint coverage, placeholders, unsupported endpoints
 
-See [docs/dht-bep52-plan.md](docs/dht-bep52-plan.md) for the detailed implementation plan for DHT (BEP 5) and BitTorrent v2 / hybrid torrents (BEP 52).
+Before assuming a feature is absent, check [STATUS.md](STATUS.md), recent `progress-reports/`, and the relevant subsystem under `src/`.
 
-See [docs/api-compatibility.md](docs/api-compatibility.md) for the full qBittorrent WebAPI compatibility matrix: implemented endpoints, remaining placeholder fields, and explicitly unsupported endpoints.
+## Style
+Use `zig fmt`. Prefer small modules, explicit ownership, and low-allocation designs. Use `snake_case` for files/functions/locals and `PascalCase` for types. Keep Linux- and io_uring-specific code explicit.
 
-## Coding Style & Naming Conventions
-Use `zig fmt` as the formatting authority. Prefer small modules, explicit ownership, and low-allocation designs. Default to arena or slab-backed allocation where dynamic memory is unavoidable. Use `snake_case` for files, functions, and local variables; `PascalCase` for types; and descriptive subsystem names like `piece_picker.zig` or `disk_scheduler.zig`. Keep Linux- and io_uring-specific code explicit rather than hidden behind generic abstractions.
+## Testing
+Write unit tests inline with `test` blocks. Put broader scenarios under `tests/`. Prioritize protocol correctness, piece verification, persistence safety, and performance regressions. Name tests after behavior, for example `test "rejects invalid bencode length"`.
 
-## Testing Guidelines
-Write tests alongside code with `test` blocks for unit coverage, and place broader scenarios under `tests/` as the suite grows. Prioritize protocol correctness, piece verification, persistence safety, and performance regressions. Include benchmarks for HDD, SSD, and mergerfs-oriented access patterns. Name tests after behavior, for example `test "rejects invalid bencode length"`.
+## Commits And PRs
+Use short imperative commit subjects, for example `storage: add piece file mapper`. Keep commits scoped to one subsystem. PRs should include intent, design tradeoffs, test coverage, and benchmark deltas for performance-sensitive changes.
 
-## Commit & Pull Request Guidelines
-There is no history yet, so start with short imperative commit subjects, for example `storage: add piece file mapper`. Keep commits scoped to one subsystem. Pull requests should include intent, major design tradeoffs, test coverage, and benchmark deltas when performance-sensitive code changes. Include kernel or filesystem assumptions when relevant.
-
-## Scope Notes
-Target Linux only, modern kernels only, and a headless daemon first. Private-tracker BEPs come before public-tracker features. Network filesystems are out of scope.
+## Scope
+Linux only, modern kernels only, headless daemon first. Private-tracker BEPs come before public-tracker features. Network filesystems are out of scope.

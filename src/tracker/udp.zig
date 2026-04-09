@@ -497,7 +497,7 @@ pub fn fetchViaUdp(
         try performConnect(fd, parsed.host, parsed.port);
 
     // Step 2: Announce
-    const announce_txid = generateTransactionId();
+    var announce_txid = generateTransactionId();
     const key_value: u32 = if (request.key) |k| std.mem.readInt(u32, k[0..4], .big) else generateTransactionId();
     const announce_req = AnnounceRequest{
         .connection_id = connection_id,
@@ -543,7 +543,8 @@ pub fn fetchViaUdp(
                 // Rebuild announce with fresh connection ID
                 var retry_req = announce_req;
                 retry_req.connection_id = fresh_id;
-                retry_req.transaction_id = generateTransactionId();
+                announce_txid = generateTransactionId();
+                retry_req.transaction_id = announce_txid;
                 const retry_buf = retry_req.encode();
                 sendAll(fd, &retry_buf) catch continue;
                 resp_n = posix.recv(fd, &resp_buf, 0) catch continue;
