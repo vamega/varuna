@@ -234,7 +234,7 @@ fn formatAddress(addr: std.net.Address, buf: *[46]u8) ?[]const u8 {
         },
         std.posix.AF.INET6 => blk: {
             const ip6 = @as(*const std.posix.sockaddr.in6, @ptrCast(@alignCast(&addr.any)));
-            break :blk std.fmt.bufPrint(buf, "{}", .{std.net.Ip6Address.init(ip6.addr, 0, 0)}) catch null;
+            break :blk std.fmt.bufPrint(buf, "{any}", .{std.net.Ip6Address.init(ip6.addr, 0, 0, 0)}) catch null;
         },
         else => null,
     };

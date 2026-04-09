@@ -8,6 +8,7 @@ pub const info_hash = @import("info_hash.zig");
 pub const layout = @import("layout.zig");
 pub const magnet = @import("magnet.zig");
 pub const merkle = @import("merkle.zig");
+pub const merkle_cache = @import("merkle_cache.zig");
 pub const metainfo = @import("metainfo.zig");
 pub const peer_id = @import("peer_id.zig");
 pub const piece_tracker = @import("piece_tracker.zig");

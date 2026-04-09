@@ -110,7 +110,7 @@ fn runInspect(
     try writer.print("pieces={}\n", .{try metainfo.pieceCount()});
     try writer.print("total_size={}\n", .{metainfo.totalSize()});
     try writer.print("mode={s}\n", .{if (metainfo.isMultiFile()) "multi-file" else "single-file"});
-    if (metainfo.isPrivate()) {
+    if (metainfo.private) {
         try writer.print("private=yes\n", .{});
     }
     try writer.flush();

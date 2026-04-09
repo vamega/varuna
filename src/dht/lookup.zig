@@ -1,18 +1,17 @@
 const std = @import("std");
+const address = @import("../net/address.zig");
 const node_id = @import("node_id.zig");
 const NodeId = node_id.NodeId;
 const NodeInfo = node_id.NodeInfo;
 const routing_table = @import("routing_table.zig");
 const RoutingTable = routing_table.RoutingTable;
+pub const K = routing_table.K;
 
 /// Maximum number of candidates tracked during a lookup.
 const max_candidates: usize = 64;
 
 /// Alpha: number of concurrent queries per lookup round.
 pub const alpha: u8 = 3;
-
-/// K: number of closest nodes to converge on.
-pub const K: u8 = 8;
 
 /// State of a candidate node during iterative lookup.
 const CandidateState = enum {
@@ -60,7 +59,7 @@ pub const Lookup = struct {
     /// Seed the lookup with initial candidates from the routing table.
     pub fn seed(self: *Lookup, table: *const RoutingTable) void {
         var buf: [K]NodeInfo = undefined;
-        const count = table.findClosest(self.target, K, &buf);
+        const count = table.findClosest(self.target, @intCast(K), &buf);
         for (buf[0..count]) |info| {
             self.addCandidate(info);
         }
@@ -151,7 +150,7 @@ pub const Lookup = struct {
                     // Deduplicate
                     var dup = false;
                     for (self.peers[0..self.peer_count]) |existing| {
-                        if (addressEql(existing, addr)) {
+                        if (address.addressEql(existing, addr)) {
                             dup = true;
                             break;
                         }
@@ -261,32 +260,28 @@ pub const Lookup = struct {
     }
 };
 
-fn addressEql(a: std.net.Address, b: std.net.Address) bool {
-    return a.in.sa.addr == b.in.sa.addr and a.in.sa.port == b.in.sa.port;
-}
-
 // ── Tests ──────────────────────────────────────────────
 
 test "lookup initializes empty" {
-    const target = node_id.generate();
+    const target = node_id.generateRandom();
     const lk = Lookup.init(target, .find_node);
     try std.testing.expect(!lk.isDone());
     try std.testing.expectEqual(@as(usize, 0), lk.candidate_count);
 }
 
 test "lookup seed populates candidates" {
-    const own_id = node_id.generate();
+    const own_id = node_id.generateRandom();
     var table = RoutingTable.init(own_id);
     const now: i64 = 1000000;
 
     for (0..10) |_| {
         _ = table.addNode(.{
-            .id = node_id.generate(),
+            .id = node_id.generateRandom(),
             .address = std.net.Address.initIp4(.{ 10, 0, 0, 1 }, 6881),
         }, now);
     }
 
-    const target = node_id.generate();
+    const target = node_id.generateRandom();
     var lk = Lookup.init(target, .find_node);
     lk.seed(&table);
     try std.testing.expect(lk.candidate_count > 0);
@@ -294,7 +289,7 @@ test "lookup seed populates candidates" {
 }
 
 test "nextToQuery returns alpha nodes" {
-    var lk = Lookup.init(node_id.generate(), .find_node);
+    var lk = Lookup.init(node_id.generateRandom(), .find_node);
 
     for (0..5) |i| {
         var id: NodeId = [_]u8{0} ** 20;
@@ -311,7 +306,7 @@ test "nextToQuery returns alpha nodes" {
 }
 
 test "lookup completes when no pending candidates" {
-    var lk = Lookup.init(node_id.generate(), .find_node);
+    var lk = Lookup.init(node_id.generateRandom(), .find_node);
 
     var id: NodeId = [_]u8{0} ** 20;
     id[19] = 1;
@@ -330,7 +325,7 @@ test "lookup completes when no pending candidates" {
 }
 
 test "handleResponse adds new candidates" {
-    var lk = Lookup.init(node_id.generate(), .find_node);
+    var lk = Lookup.init(node_id.generateRandom(), .find_node);
 
     var id1: NodeId = [_]u8{0} ** 20;
     id1[19] = 1;
@@ -357,7 +352,7 @@ test "handleResponse adds new candidates" {
 }
 
 test "handleResponse collects peers" {
-    var lk = Lookup.init(node_id.generate(), .get_peers);
+    var lk = Lookup.init(node_id.generateRandom(), .get_peers);
 
     var id1: NodeId = [_]u8{0} ** 20;
     id1[19] = 1;
@@ -379,7 +374,7 @@ test "handleResponse collects peers" {
 }
 
 test "peer deduplication" {
-    var lk = Lookup.init(node_id.generate(), .get_peers);
+    var lk = Lookup.init(node_id.generateRandom(), .get_peers);
 
     var id1: NodeId = [_]u8{0} ** 20;
     id1[19] = 1;
@@ -407,7 +402,7 @@ test "peer deduplication" {
 }
 
 test "candidate deduplication" {
-    var lk = Lookup.init(node_id.generate(), .find_node);
+    var lk = Lookup.init(node_id.generateRandom(), .find_node);
 
     var id: NodeId = [_]u8{0} ** 20;
     id[19] = 1;

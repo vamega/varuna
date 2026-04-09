@@ -167,7 +167,7 @@ pub fn main() !void {
                 break :blk saved_id;
             }
         }
-        break :blk varuna.dht.node_id.generate();
+        break :blk varuna.dht.node_id.generateRandom();
     };
 
     const dht_engine: ?*varuna.dht.DhtEngine = if (cfg.network.dht) blk: {

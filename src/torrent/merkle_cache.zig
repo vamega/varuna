@@ -1,7 +1,7 @@
 const std = @import("std");
 const merkle = @import("merkle.zig");
 const metainfo = @import("metainfo.zig");
-const layout_mod = @import("layout.zig");
+const layout = @import("layout.zig");
 const hash_exchange = @import("../net/hash_exchange.zig");
 const Bitfield = @import("../bitfield.zig").Bitfield;
 const Sha256 = @import("../crypto/root.zig").Sha256;
@@ -42,7 +42,7 @@ pub const MerkleCache = struct {
     max_cached_trees: u32,
 
     /// Layout for piece-to-file mapping.
-    layout: *const layout_mod.Layout,
+    layout: *const layout.Layout,
 
     /// v2 file metadata (for pieces_root validation).
     v2_files: []const metainfo.V2File,
@@ -64,7 +64,7 @@ pub const MerkleCache = struct {
 
     pub fn init(
         allocator: std.mem.Allocator,
-        layout: *const layout_mod.Layout,
+        torrent_layout: *const layout.Layout,
         v2_files: []const metainfo.V2File,
         max_cached: u32,
     ) !MerkleCache {
@@ -79,7 +79,7 @@ pub const MerkleCache = struct {
             .trees = trees,
             .access_order = access_order,
             .max_cached_trees = if (max_cached == 0) @intCast(@max(file_count, 1)) else max_cached,
-            .layout = layout,
+            .layout = torrent_layout,
             .v2_files = v2_files,
             .pending_requests = std.ArrayList(PendingHashRequest).empty,
             .building_files = std.ArrayList(u32).empty,
@@ -301,7 +301,7 @@ pub fn computePieceHashes(
     allocator: std.mem.Allocator,
     first_piece: u32,
     piece_count: u32,
-    layout: *const layout_mod.Layout,
+    _: *const layout.Layout,
     piece_data_fn: *const fn (u32) ?[]const u8,
 ) !?[][32]u8 {
     const hashes = try allocator.alloc([32]u8, piece_count);
@@ -313,14 +313,6 @@ pub fn computePieceHashes(
             allocator.free(hashes);
             return null;
         };
-        // For v2, piece hash = SHA-256 of the piece data, then pad with
-        // SHA-256 of 16KiB blocks per BEP 52 spec. But for the Merkle tree
-        // leaves, we use SHA-256 of the full piece data as stored in the tree.
-        const piece_size = layout.pieceSize(global_piece) catch {
-            allocator.free(hashes);
-            return null;
-        };
-        _ = piece_size;
         hashes[i] = merkle.hashLeaf(data);
     }
 
@@ -333,7 +325,7 @@ test "merkle cache init and deinit" {
     const allocator = std.testing.allocator;
 
     // Create a minimal v2 file layout
-    var files = [_]layout_mod.Layout.File{
+    var files = [_]layout.Layout.File{
         .{
             .length = 1024,
             .torrent_offset = 0,
@@ -368,7 +360,7 @@ test "merkle cache init and deinit" {
         .{ .path = &.{}, .length = 512, .pieces_root = tree1.root() },
     };
 
-    var lo = layout_mod.Layout{
+    var lo = layout.Layout{
         .piece_length = 512,
         .piece_count = 3,
         .total_size = 1536,
@@ -395,7 +387,7 @@ test "merkle cache build and retrieve" {
     var expected_tree = try merkle.MerkleTree.fromPieceHashes(allocator, &[_][32]u8{ h0, h1 });
     defer expected_tree.deinit();
 
-    var files = [_]layout_mod.Layout.File{
+    var files = [_]layout.Layout.File{
         .{
             .length = 1024,
             .torrent_offset = 0,
@@ -408,7 +400,7 @@ test "merkle cache build and retrieve" {
     var v2_files = [_]metainfo.V2File{
         .{ .path = &.{}, .length = 1024, .pieces_root = expected_tree.root() },
     };
-    var lo = layout_mod.Layout{
+    var lo = layout.Layout{
         .piece_length = 512,
         .piece_count = 2,
         .total_size = 1024,
@@ -440,7 +432,7 @@ test "merkle cache rejects wrong root" {
     const h0 = merkle.hashLeaf("piece0");
     const h1 = merkle.hashLeaf("piece1");
 
-    var files = [_]layout_mod.Layout.File{
+    var files = [_]layout.Layout.File{
         .{
             .length = 1024,
             .torrent_offset = 0,
@@ -454,7 +446,7 @@ test "merkle cache rejects wrong root" {
     var v2_files = [_]metainfo.V2File{
         .{ .path = &.{}, .length = 1024, .pieces_root = [_]u8{0} ** 32 },
     };
-    var lo = layout_mod.Layout{
+    var lo = layout.Layout{
         .piece_length = 512,
         .piece_count = 2,
         .total_size = 1024,
@@ -485,7 +477,7 @@ test "merkle cache LRU eviction" {
     var tree2 = try merkle.MerkleTree.fromPieceHashes(allocator, &[_][32]u8{h2});
     defer tree2.deinit();
 
-    var files = [_]layout_mod.Layout.File{
+    var files = [_]layout.Layout.File{
         .{ .length = 512, .torrent_offset = 0, .first_piece = 0, .end_piece_exclusive = 1, .path = &.{}, .v2_piece_offset = 0 },
         .{ .length = 512, .torrent_offset = 512, .first_piece = 1, .end_piece_exclusive = 2, .path = &.{}, .v2_piece_offset = 1 },
         .{ .length = 512, .torrent_offset = 1024, .first_piece = 2, .end_piece_exclusive = 3, .path = &.{}, .v2_piece_offset = 2 },
@@ -495,7 +487,7 @@ test "merkle cache LRU eviction" {
         .{ .path = &.{}, .length = 512, .pieces_root = tree1.root() },
         .{ .path = &.{}, .length = 512, .pieces_root = tree2.root() },
     };
-    var lo = layout_mod.Layout{
+    var lo = layout.Layout{
         .piece_length = 512,
         .piece_count = 3,
         .total_size = 1536,
@@ -531,13 +523,13 @@ test "merkle cache invalidate" {
     var tree0 = try merkle.MerkleTree.fromPieceHashes(allocator, &[_][32]u8{h0});
     defer tree0.deinit();
 
-    var files = [_]layout_mod.Layout.File{
+    var files = [_]layout.Layout.File{
         .{ .length = 512, .torrent_offset = 0, .first_piece = 0, .end_piece_exclusive = 1, .path = &.{}, .v2_piece_offset = 0 },
     };
     var v2_files = [_]metainfo.V2File{
         .{ .path = &.{}, .length = 512, .pieces_root = tree0.root() },
     };
-    var lo = layout_mod.Layout{
+    var lo = layout.Layout{
         .piece_length = 512,
         .piece_count = 1,
         .total_size = 512,
@@ -561,7 +553,7 @@ test "merkle cache invalidate" {
 test "merkle cache isFileComplete" {
     const allocator = std.testing.allocator;
 
-    var files = [_]layout_mod.Layout.File{
+    var files = [_]layout.Layout.File{
         .{ .length = 1024, .torrent_offset = 0, .first_piece = 0, .end_piece_exclusive = 2, .path = &.{}, .v2_piece_offset = 0 },
         .{ .length = 512, .torrent_offset = 1024, .first_piece = 2, .end_piece_exclusive = 3, .path = &.{}, .v2_piece_offset = 2 },
     };
@@ -569,7 +561,7 @@ test "merkle cache isFileComplete" {
         .{ .path = &.{}, .length = 1024, .pieces_root = [_]u8{0} ** 32 },
         .{ .path = &.{}, .length = 512, .pieces_root = [_]u8{0} ** 32 },
     };
-    var lo = layout_mod.Layout{
+    var lo = layout.Layout{
         .piece_length = 512,
         .piece_count = 3,
         .total_size = 1536,
@@ -606,7 +598,7 @@ test "merkle cache isFileComplete" {
 test "merkle cache filePieceRange" {
     const allocator = std.testing.allocator;
 
-    var files = [_]layout_mod.Layout.File{
+    var files = [_]layout.Layout.File{
         .{ .length = 1024, .torrent_offset = 0, .first_piece = 0, .end_piece_exclusive = 2, .path = &.{}, .v2_piece_offset = 0 },
         .{ .length = 0, .torrent_offset = 1024, .first_piece = 2, .end_piece_exclusive = 2, .path = &.{}, .v2_piece_offset = 2 },
         .{ .length = 512, .torrent_offset = 1024, .first_piece = 2, .end_piece_exclusive = 3, .path = &.{}, .v2_piece_offset = 2 },
@@ -616,7 +608,7 @@ test "merkle cache filePieceRange" {
         .{ .path = &.{}, .length = 0, .pieces_root = [_]u8{0} ** 32 },
         .{ .path = &.{}, .length = 512, .pieces_root = [_]u8{0} ** 32 },
     };
-    var lo = layout_mod.Layout{
+    var lo = layout.Layout{
         .piece_length = 512,
         .piece_count = 3,
         .total_size = 1536,
@@ -655,13 +647,13 @@ test "merkle cache serves hashes via buildHashesFromTree" {
     var expected_tree = try merkle.MerkleTree.fromPieceHashes(allocator, &[_][32]u8{ h0, h1, h2, h3 });
     defer expected_tree.deinit();
 
-    var files = [_]layout_mod.Layout.File{
+    var files = [_]layout.Layout.File{
         .{ .length = 2048, .torrent_offset = 0, .first_piece = 0, .end_piece_exclusive = 4, .path = &.{}, .v2_piece_offset = 0 },
     };
     var v2_files = [_]metainfo.V2File{
         .{ .path = &.{}, .length = 2048, .pieces_root = expected_tree.root() },
     };
-    var lo = layout_mod.Layout{
+    var lo = layout.Layout{
         .piece_length = 512,
         .piece_count = 4,
         .total_size = 2048,
@@ -699,13 +691,13 @@ test "merkle cache serves hashes via buildHashesFromTree" {
 test "merkle cache pending request tracking" {
     const allocator = std.testing.allocator;
 
-    var files = [_]layout_mod.Layout.File{
+    var files = [_]layout.Layout.File{
         .{ .length = 1024, .torrent_offset = 0, .first_piece = 0, .end_piece_exclusive = 2, .path = &.{}, .v2_piece_offset = 0 },
     };
     var v2_files = [_]metainfo.V2File{
         .{ .path = &.{}, .length = 1024, .pieces_root = [_]u8{0} ** 32 },
     };
-    var lo = layout_mod.Layout{
+    var lo = layout.Layout{
         .piece_length = 512,
         .piece_count = 2,
         .total_size = 1024,
@@ -747,7 +739,7 @@ test "merkle cache pending request tracking" {
 test "merkle cache pending request removal on disconnect" {
     const allocator = std.testing.allocator;
 
-    var files = [_]layout_mod.Layout.File{
+    var files = [_]layout.Layout.File{
         .{ .length = 1024, .torrent_offset = 0, .first_piece = 0, .end_piece_exclusive = 2, .path = &.{}, .v2_piece_offset = 0 },
         .{ .length = 512, .torrent_offset = 1024, .first_piece = 2, .end_piece_exclusive = 3, .path = &.{}, .v2_piece_offset = 2 },
     };
@@ -755,7 +747,7 @@ test "merkle cache pending request removal on disconnect" {
         .{ .path = &.{}, .length = 1024, .pieces_root = [_]u8{0} ** 32 },
         .{ .path = &.{}, .length = 512, .pieces_root = [_]u8{0} ** 32 },
     };
-    var lo = layout_mod.Layout{
+    var lo = layout.Layout{
         .piece_length = 512,
         .piece_count = 3,
         .total_size = 1536,
@@ -803,13 +795,13 @@ test "merkle cache pending request removal on disconnect" {
 test "merkle cache coalesces multiple peers requesting same file" {
     const allocator = std.testing.allocator;
 
-    var files = [_]layout_mod.Layout.File{
+    var files = [_]layout.Layout.File{
         .{ .length = 2048, .torrent_offset = 0, .first_piece = 0, .end_piece_exclusive = 4, .path = &.{}, .v2_piece_offset = 0 },
     };
     var v2_files = [_]metainfo.V2File{
         .{ .path = &.{}, .length = 2048, .pieces_root = [_]u8{0} ** 32 },
     };
-    var lo = layout_mod.Layout{
+    var lo = layout.Layout{
         .piece_length = 512,
         .piece_count = 4,
         .total_size = 2048,

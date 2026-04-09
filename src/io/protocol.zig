@@ -14,6 +14,10 @@ const EventLoop = @import("event_loop.zig").EventLoop;
 const Peer = @import("event_loop.zig").Peer;
 const TorrentContext = @import("event_loop.zig").TorrentContext;
 const encodeUserData = @import("event_loop.zig").encodeUserData;
+const TorrentId = @import("event_loop.zig").TorrentId;
+const address = @import("../net/address.zig");
+const policy = @import("peer_policy.zig");
+const seed_handler = @import("seed_handler.zig");
 
 // ── Peer wire protocol message processing ─────────────────
 
@@ -55,7 +59,6 @@ pub fn processMessage(self: *EventLoop, slot: u16) void {
             if (peer.current_piece != null) {
                 // Peer was choked mid-download — resume the interrupted piece
                 // instead of calling markIdle (which requires current_piece==null).
-                const policy = @import("peer_policy.zig");
                 policy.tryFillPipeline(self, slot) catch {};
             } else {
                 self.markIdle(slot);
@@ -65,7 +68,7 @@ pub fn processMessage(self: *EventLoop, slot: u16) void {
             peer.peer_interested = true;
             // For seed mode, unchoking is now handled by recalculateUnchokes
             // But for immediate responsiveness, unchoke if under the limit
-            if (peer.mode == .seed and peer.am_choking) {
+            if (peer.mode == .inbound and peer.am_choking) {
                 peer.am_choking = false;
                 submitMessage(self, slot, 1, &.{}) catch {};
             }
@@ -130,13 +133,14 @@ pub fn processMessage(self: *EventLoop, slot: u16) void {
                 bf.importBitfield(payload);
             }
             peer.availability_known = true;
-            if (tc_bf.piece_tracker) |pt| pt.addBitfieldAvailability(payload);
+            if (peer.availability) |*bf| {
+                if (tc_bf.piece_tracker) |pt| pt.addBitfieldAvailability(bf);
+            }
             self.markIdle(slot);
         },
         6 => { // request
-            if (peer.mode == .seed and !peer.am_choking and payload.len >= 12) {
-                const seed = @import("seed_handler.zig");
-                seed.servePieceRequest(self, slot, payload);
+            if (peer.mode == .inbound and !peer.am_choking and payload.len >= 12) {
+                seed_handler.servePieceRequest(self, slot, payload);
             }
         },
         7 => { // piece
@@ -162,11 +166,8 @@ pub fn processMessage(self: *EventLoop, slot: u16) void {
                             self.accountTorrentBytes(peer.torrent_id, block_data.len, 0);
 
                             if (peer.blocks_received >= peer.blocks_expected) {
-                                const policy = @import("peer_policy.zig");
                                 policy.completePieceDownload(self, slot);
                             } else {
-                                // Refill pipeline — request more blocks if slots available.
-                                const policy = @import("peer_policy.zig");
                                 policy.tryFillPipeline(self, slot) catch |err| {
                                     log.debug("pipeline refill failed for slot {d}: {s}", .{ slot, @errorName(err) });
                                 };
@@ -184,7 +185,6 @@ pub fn processMessage(self: *EventLoop, slot: u16) void {
                             peer.bytes_downloaded_from += block_data.len;
                             self.accountTorrentBytes(peer.torrent_id, block_data.len, 0);
                             // Refill pipeline with more blocks for next_piece or claim further piece
-                            const policy = @import("peer_policy.zig");
                             policy.tryFillPipeline(self, slot) catch {};
                         }
                     }
@@ -196,8 +196,7 @@ pub fn processMessage(self: *EventLoop, slot: u16) void {
             // Drop the request from the seed handler's queued responses so we
             // don't waste bandwidth sending a block the peer no longer wants.
             if (payload.len >= 12) {
-                const seed = @import("seed_handler.zig");
-                seed.cancelQueuedResponse(self, slot, payload);
+                seed_handler.cancelQueuedResponse(self, slot, payload);
             }
         },
         hash_exchange.msg_hash_request => {
@@ -220,21 +219,20 @@ pub fn processMessage(self: *EventLoop, slot: u16) void {
 
             if (sub_id == ext.handshake_sub_id) {
                 // Extension handshake: parse peer's extension map
-                var result = ext.decodeExtensionHandshake(self.allocator, ext_payload) catch {
+                const result = ext.decodeExtensionHandshake(ext_payload) catch {
                     log.debug("slot {d}: failed to decode extension handshake", .{slot});
                     return;
                 };
-                peer.extension_ids = result.handshake.extensions;
+                peer.extension_ids = result.extensions;
                 // BEP 21: store upload_only (partial seed) flag
-                peer.upload_only = result.handshake.upload_only;
+                peer.upload_only = result.upload_only;
                 log.debug("slot {d}: peer extensions: ut_metadata={d} ut_pex={d} upload_only={} client={s}", .{
                     slot,
-                    result.handshake.extensions.ut_metadata,
-                    result.handshake.extensions.ut_pex,
-                    result.handshake.upload_only,
-                    result.handshake.client,
+                    result.extensions.ut_metadata,
+                    result.extensions.ut_pex,
+                    result.upload_only,
+                    result.client,
                 });
-                ext.freeDecoded(self.allocator, &result);
             } else {
                 // BEP 27: reject PEX messages for private torrents
                 if (peer.extension_ids) |ids| {
@@ -500,32 +498,15 @@ fn handlePexMessage(self: *EventLoop, slot: u16, payload: []const u8) void {
 }
 
 /// Check if we already have a connection to the given address for this torrent.
-fn isPeerAlreadyConnected(self: *EventLoop, torrent_id: @import("event_loop.zig").TorrentId, addr: std.net.Address) bool {
+fn isPeerAlreadyConnected(self: *EventLoop, torrent_id: TorrentId, addr: std.net.Address) bool {
     const tc = self.getTorrentContext(torrent_id) orelse return false;
     for (tc.peer_slots.items) |slot| {
         const p = &self.peers[slot];
         if (p.state == .free) continue;
         // Compare address family, IP, and port
-        if (addressesEqual(p.address, addr)) return true;
+        if (address.addressEql(p.address, addr)) return true;
     }
     return false;
-}
-
-fn addressesEqual(a: std.net.Address, b: std.net.Address) bool {
-    if (a.any.family != b.any.family) return false;
-    return switch (a.any.family) {
-        posix.AF.INET => blk: {
-            const a4 = @as(*const posix.sockaddr.in, @ptrCast(@alignCast(&a.any)));
-            const b4 = @as(*const posix.sockaddr.in, @ptrCast(@alignCast(&b.any)));
-            break :blk a4.addr == b4.addr and a4.port == b4.port;
-        },
-        posix.AF.INET6 => blk: {
-            const a6 = @as(*const posix.sockaddr.in6, @ptrCast(@alignCast(&a.any)));
-            const b6 = @as(*const posix.sockaddr.in6, @ptrCast(@alignCast(&b.any)));
-            break :blk std.mem.eql(u8, std.mem.asBytes(&a6.addr), std.mem.asBytes(&b6.addr)) and a6.port == b6.port;
-        },
-        else => false,
-    };
 }
 
 /// Build and send a PEX message to the given peer slot.
@@ -867,7 +848,7 @@ fn setupTestPeer(el: *EventLoop) !u16 {
     peer.* = Peer{};
     peer.fd = -1;
     peer.state = .active_recv_header;
-    peer.mode = .download;
+    peer.mode = .outbound;
     peer.torrent_id = 0;
     peer.peer_choking = true;
     peer.am_choking = true;
@@ -1461,7 +1442,7 @@ test "cancel removes matching queued response" {
     try setupTestTorrent(&el, null);
     const slot = try setupTestPeer(&el);
     const peer = &el.peers[slot];
-    peer.mode = .seed;
+    peer.mode = .inbound;
 
     // Create a fake PieceBuffer for the queued response
     const piece_buffer = try testing.allocator.create(EventLoop.PieceBuffer);
@@ -1500,7 +1481,7 @@ test "cancel does not remove non-matching queued response" {
     try setupTestTorrent(&el, null);
     const slot = try setupTestPeer(&el);
     const peer = &el.peers[slot];
-    peer.mode = .seed;
+    peer.mode = .inbound;
 
     const piece_buffer = try testing.allocator.create(EventLoop.PieceBuffer);
     piece_buffer.* = .{

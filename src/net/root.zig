@@ -1,3 +1,4 @@
+pub const address = @import("address.zig");
 pub const ban_list = @import("ban_list.zig");
 pub const extensions = @import("extensions.zig");
 pub const hash_exchange = @import("hash_exchange.zig");

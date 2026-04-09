@@ -1,6 +1,7 @@
 const std = @import("std");
 const posix = std.posix;
 const linux = std.os.linux;
+const address = @import("address.zig");
 const ut_metadata = @import("ut_metadata.zig");
 const ext = @import("extensions.zig");
 const peer_wire = @import("peer_wire.zig");
@@ -180,7 +181,7 @@ pub const MetadataFetcher = struct {
     pub fn addPeer(self: *MetadataFetcher, addr: std.net.Address) void {
         // Check for duplicates
         for (self.peers.items) |*p| {
-            if (addressEqual(p.address, addr)) return;
+            if (address.addressEql(p.address, addr)) return;
         }
         self.peers.append(self.allocator, .{ .address = addr }) catch {};
     }
@@ -369,11 +370,10 @@ pub const MetadataFetcher = struct {
             peer_wire.recvExact(fd, msg_buf) catch return error.RecvFailed;
 
             if (msg_buf[0] == ext.msg_id and msg_buf.len >= 2 and msg_buf[1] == ext.handshake_sub_id) {
-                var result = ext.decodeExtensionHandshake(self.allocator, msg_buf[2..]) catch continue;
-                defer ext.freeDecoded(self.allocator, &result);
+                const result = ext.decodeExtensionHandshake(msg_buf[2..]) catch continue;
 
-                peer_ut_metadata_id = result.handshake.extensions.ut_metadata;
-                metadata_size = result.handshake.metadata_size;
+                peer_ut_metadata_id = result.extensions.ut_metadata;
+                metadata_size = result.metadata_size;
 
                 log.debug("peer ext handshake: ut_metadata={d} metadata_size={d}", .{
                     peer_ut_metadata_id, metadata_size,
@@ -524,19 +524,6 @@ fn setSocketTimeout(fd: posix.fd_t, timeout_secs: u32) !void {
     posix.setsockopt(fd, posix.SOL.SOCKET, posix.SO.SNDTIMEO, std.mem.asBytes(&tv)) catch return;
 }
 
-fn addressEqual(a: std.net.Address, b: std.net.Address) bool {
-    if (a.any.family != b.any.family) return false;
-    switch (a.any.family) {
-        posix.AF.INET => {
-            return a.in.sa.addr == b.in.sa.addr and a.in.sa.port == b.in.sa.port;
-        },
-        posix.AF.INET6 => {
-            return std.mem.eql(u8, &a.in6.sa.addr, &b.in6.sa.addr) and a.in6.sa.port == b.in6.sa.port;
-        },
-        else => return false,
-    }
-}
-
 pub const FetchError = error{
     NoPeers,
     OverallTimeout,
@@ -558,7 +545,6 @@ pub const FetchError = error{
     PeerRejectedMetadata,
     MetadataPieceTimeout,
     PieceAddFailed,
-    NoTrackers,
 };
 
 // ── Tests ──────────────────────────────────────────────────
@@ -712,15 +698,15 @@ test "MetadataFetcher selectNextPeer returns null when all exhausted" {
     try std.testing.expect(idx == null);
 }
 
-test "addressEqual detects same and different addresses" {
+test "addressEql detects same and different addresses" {
     const a = std.net.Address.initIp4(.{ 1, 2, 3, 4 }, 6881);
     const b = std.net.Address.initIp4(.{ 1, 2, 3, 4 }, 6881);
     const c = std.net.Address.initIp4(.{ 1, 2, 3, 4 }, 6882);
     const d = std.net.Address.initIp4(.{ 5, 6, 7, 8 }, 6881);
 
-    try std.testing.expect(addressEqual(a, b));
-    try std.testing.expect(!addressEqual(a, c));
-    try std.testing.expect(!addressEqual(a, d));
+    try std.testing.expect(address.addressEql(a, b));
+    try std.testing.expect(!address.addressEql(a, c));
+    try std.testing.expect(!address.addressEql(a, d));
 }
 
 test "FetchProgress default values" {

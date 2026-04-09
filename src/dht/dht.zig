@@ -1,16 +1,17 @@
 const std = @import("std");
 const log = std.log.scoped(.dht);
+const address = @import("../net/address.zig");
 const node_id = @import("node_id.zig");
 const NodeId = node_id.NodeId;
 const NodeInfo = node_id.NodeInfo;
 const routing_table = @import("routing_table.zig");
 const RoutingTable = routing_table.RoutingTable;
 const krpc = @import("krpc.zig");
-const token_mod = @import("token.zig");
-const TokenManager = token_mod.TokenManager;
-const lookup_mod = @import("lookup.zig");
-const Lookup = lookup_mod.Lookup;
-const bootstrap_mod = @import("bootstrap.zig");
+const token = @import("token.zig");
+const TokenManager = token.TokenManager;
+const lookup = @import("lookup.zig");
+const Lookup = lookup.Lookup;
+const bootstrap = @import("bootstrap.zig");
 
 /// Maximum number of concurrent lookups.
 const max_lookups: usize = 16;
@@ -395,7 +396,7 @@ pub const DhtEngine = struct {
 
         // Generate token for this querier
         const ip_bytes = addressToBytes(sender);
-        const token = self.tokens.generateToken(&ip_bytes);
+        const peer_token = self.tokens.generateToken(&ip_bytes);
 
         // We don't store peer lists ourselves (we're not a tracker).
         // Return closest IPv4 nodes instead (BEP 32 "nodes6" field would be
@@ -417,7 +418,7 @@ pub const DhtEngine = struct {
             &buf,
             q.transaction_id,
             self.own_id,
-            &token,
+            &peer_token,
             nodes_buf[0..nodes_len],
         ) catch return;
         self.queueSend(buf[0..len], sender);
@@ -425,13 +426,13 @@ pub const DhtEngine = struct {
 
     fn respondAnnouncePeer(self: *DhtEngine, q: krpc.Query, sender: std.net.Address) void {
         // Validate token
-        const token = q.token orelse {
+        const announce_token = q.token orelse {
             self.sendError(q.transaction_id, @intFromEnum(krpc.ErrorCode.protocol), "missing token", sender);
             return;
         };
 
         const ip_bytes = addressToBytes(sender);
-        if (!self.tokens.validateToken(token, &ip_bytes)) {
+        if (!self.tokens.validateToken(announce_token, &ip_bytes)) {
             self.sendError(q.transaction_id, @intFromEnum(krpc.ErrorCode.protocol), "invalid token", sender);
             return;
         }
@@ -598,7 +599,7 @@ pub const DhtEngine = struct {
 
     fn sendLookupQueries(self: *DhtEngine, lookup_idx: usize) void {
         const lk = &(self.active_lookups[lookup_idx] orelse return);
-        var buf: [lookup_mod.alpha]NodeInfo = undefined;
+        var buf: [lookup.alpha]NodeInfo = undefined;
         const count = lk.nextToQuery(&buf);
 
         for (0..count) |i| {
@@ -682,7 +683,7 @@ pub const DhtEngine = struct {
             }
 
             // Send announce_peer to the closest responded nodes
-            var closest: [lookup_mod.K]NodeInfo = undefined;
+            var closest: [lookup.K]NodeInfo = undefined;
             const closest_count = lk.getClosestResponded(&closest);
             for (0..closest_count) |i| {
                 const tok = lk.getToken(closest[i].id) orelse continue;
@@ -724,7 +725,7 @@ pub const DhtEngine = struct {
 
         const targets = [_][20]u8{
             self.own_id,
-            node_id.generate(), // random target for breadth
+            node_id.generateRandom(), // random target for breadth
         };
 
         for (targets) |target| {
@@ -843,7 +844,7 @@ pub const DhtEngine = struct {
 
         for (&self.pending) |*slot| {
             if (slot.*) |pending| {
-                if (pending.transaction_id == txn_id and addressEql(pending.target_addr, sender)) {
+                if (pending.transaction_id == txn_id and address.addressEql(pending.target_addr, sender)) {
                     const result = pending;
                     slot.* = null;
                     return result;
@@ -853,13 +854,6 @@ pub const DhtEngine = struct {
         return null;
     }
 };
-
-fn addressEql(a: std.net.Address, b: std.net.Address) bool {
-    const pex = @import("../net/pex.zig");
-    const a_key = pex.CompactPeer.fromAddress(a);
-    const b_key = pex.CompactPeer.fromAddress(b);
-    return a_key.len == b_key.len and std.mem.eql(u8, a_key.data[0..a_key.len], b_key.data[0..b_key.len]);
-}
 
 /// Return a stable byte representation of an address for token generation.
 /// For IPv4, returns the 4-byte address. For IPv6, returns the first 4 bytes
@@ -876,7 +870,7 @@ fn addressToBytes(addr: std.net.Address) [4]u8 {
 
 test "DhtEngine init and deinit" {
     const allocator = std.testing.allocator;
-    const own_id = node_id.generate();
+    const own_id = node_id.generateRandom();
     var engine = DhtEngine.init(allocator, own_id);
     defer engine.deinit();
 
@@ -886,7 +880,7 @@ test "DhtEngine init and deinit" {
 
 test "DhtEngine handles ping query" {
     const allocator = std.testing.allocator;
-    const own_id = node_id.generate();
+    const own_id = node_id.generateRandom();
     var engine = DhtEngine.init(allocator, own_id);
     defer engine.deinit();
 
@@ -909,7 +903,7 @@ test "DhtEngine handles ping query" {
 
 test "DhtEngine handles find_node query" {
     const allocator = std.testing.allocator;
-    const own_id = node_id.generate();
+    const own_id = node_id.generateRandom();
     var engine = DhtEngine.init(allocator, own_id);
     defer engine.deinit();
 
@@ -917,7 +911,7 @@ test "DhtEngine handles find_node query" {
     const now: i64 = 1000000;
     for (0..5) |i| {
         _ = engine.table.addNode(.{
-            .id = node_id.generate(),
+            .id = node_id.generateRandom(),
             .address = std.net.Address.initIp4(.{ 10, 0, 0, @intCast(i + 1) }, 6881),
         }, now);
     }
@@ -925,7 +919,7 @@ test "DhtEngine handles find_node query" {
     var query_buf: [512]u8 = undefined;
     var sender_id: NodeId = undefined;
     @memset(&sender_id, 0x42);
-    const target = node_id.generate();
+    const target = node_id.generateRandom();
     const len = try krpc.encodeFindNodeQuery(&query_buf, 0x1234, sender_id, target);
 
     const sender_addr = std.net.Address.initIp4(.{ 10, 0, 0, 99 }, 6881);
@@ -938,7 +932,7 @@ test "DhtEngine handles find_node query" {
 
 test "DhtEngine disabled ignores messages" {
     const allocator = std.testing.allocator;
-    var engine = DhtEngine.init(allocator, node_id.generate());
+    var engine = DhtEngine.init(allocator, node_id.generateRandom());
     defer engine.deinit();
     engine.enabled = false;
 
@@ -954,7 +948,7 @@ test "DhtEngine disabled ignores messages" {
 
 test "DhtEngine tick rotates tokens" {
     const allocator = std.testing.allocator;
-    var engine = DhtEngine.init(allocator, node_id.generate());
+    var engine = DhtEngine.init(allocator, node_id.generateRandom());
     defer engine.deinit();
 
     const ip = [_]u8{ 10, 0, 0, 1 };
@@ -970,14 +964,14 @@ test "DhtEngine tick rotates tokens" {
 
 test "DhtEngine get_peers starts lookup" {
     const allocator = std.testing.allocator;
-    var engine = DhtEngine.init(allocator, node_id.generate());
+    var engine = DhtEngine.init(allocator, node_id.generateRandom());
     defer engine.deinit();
 
     // Add nodes so lookup has candidates
     const now: i64 = 1000000;
     for (0..10) |i| {
         _ = engine.table.addNode(.{
-            .id = node_id.generate(),
+            .id = node_id.generateRandom(),
             .address = std.net.Address.initIp4(.{ 10, 0, 0, @intCast(i + 1) }, 6881),
         }, now);
     }

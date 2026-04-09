@@ -32,6 +32,8 @@ pub const Request = struct {
     length: u32,
 };
 
+/// payload is the owned allocation; block is payload[8..] (the piece data without header).
+/// Only payload should be freed.
 pub const Piece = struct {
     piece_index: u32,
     block_offset: u32,

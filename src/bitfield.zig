@@ -41,6 +41,16 @@ pub const Bitfield = struct {
         self.count += 1;
     }
 
+    pub fn clear(self: *Bitfield, piece_index: u32) void {
+        if (piece_index >= self.piece_count) return;
+        if (!self.has(piece_index)) return;
+
+        const byte_index: usize = @intCast(piece_index / 8);
+        const bit_index: u3 = @intCast(7 - (piece_index % 8));
+        self.bits[byte_index] &= ~(@as(u8, 1) << bit_index);
+        self.count -= 1;
+    }
+
     pub fn importBitfield(self: *Bitfield, bitfield: []const u8) void {
         @memset(self.bits, 0);
         const copy_length = @min(self.bits.len, bitfield.len);

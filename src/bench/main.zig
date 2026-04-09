@@ -99,7 +99,7 @@ fn benchSha1DirectShaNi(
     buffer: []const u8,
     iterations: usize,
 ) !void {
-    const Sha1 = varuna.crypto.VarunaSha1;
+    const Sha1 = varuna.crypto.varuna_sha1;
     var timer = try std.time.Timer.start();
     var checksum: u64 = 0;
     for (0..iterations) |_| {
@@ -139,7 +139,7 @@ fn benchSha1Noop(
 }
 
 fn benchSha1(stdout: *std.Io.Writer) !void {
-    const VarunaSha1 = varuna.crypto.VarunaSha1;
+    const VarunaSha1 = varuna.crypto.varuna_sha1;
     const ActiveSha1 = varuna.crypto.Sha1;
     const StdSha1 = std.crypto.hash.Sha1;
 
@@ -157,7 +157,7 @@ fn benchSha1(stdout: *std.Io.Writer) !void {
     try stdout.print("crypto_backend={s}, sha1_accel={s}, hw_enabled={}\n", .{
         @tagName(varuna.crypto.crypto_backend),
         @tagName(VarunaSha1.accel()),
-        VarunaSha1.hasShaNi(),
+        VarunaSha1.hasHwAccel(),
     });
     try stdout.flush();
 

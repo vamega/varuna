@@ -1,76 +1,10 @@
 const std = @import("std");
 const bencode = @import("../torrent/bencode.zig");
+const types = @import("types.zig");
 
-pub const Request = struct {
-    announce_url: []const u8,
-    info_hash: [20]u8,
-    peer_id: [20]u8,
-    port: u16,
-    uploaded: u64 = 0,
-    downloaded: u64 = 0,
-    left: u64,
-    event: ?Event = .started,
-    key: ?[8]u8 = null,
-    numwant: u32 = 50,
-
-    // BEP 52: full v2 info-hash for hybrid/v2 torrents. When set, an additional
-    // `info_hash` parameter with the truncated v2 hash is appended to the announce
-    // URL. Some trackers use this to return v2-capable peers.
-    info_hash_v2: ?[32]u8 = null,
-
-    pub const Event = enum {
-        started,
-        completed,
-        stopped,
-    };
-
-    /// Generate a random 8-character hex key for tracker authentication.
-    /// This should be called once per session and reused across announces.
-    pub fn generateKey() [8]u8 {
-        const hex = "0123456789abcdef";
-        var buf: [8]u8 = undefined;
-        var random_bytes: [8]u8 = undefined;
-        std.crypto.random.bytes(&random_bytes);
-        for (random_bytes, 0..) |byte, i| {
-            buf[i] = hex[byte & 0x0f];
-        }
-        return buf;
-    }
-};
-
-pub const Peer = struct {
-    address: std.net.Address,
-};
-
-pub const Response = struct {
-    interval: u32,
-    peers: []Peer,
-    complete: ?u32 = null,
-    incomplete: ?u32 = null,
-    warning_message: ?[]const u8 = null,
-};
-
-pub fn fetch(
-    allocator: std.mem.Allocator,
-    client: *std.http.Client,
-    request: Request,
-) !Response {
-    const url = try buildUrl(allocator, request);
-    defer allocator.free(url);
-
-    var body = std.Io.Writer.Allocating.init(allocator);
-    defer body.deinit();
-
-    const result = try client.fetch(.{
-        .location = .{ .url = url },
-        .response_writer = &body.writer,
-    });
-    if (result.status != .ok) {
-        return error.UnexpectedTrackerStatus;
-    }
-
-    return parseResponse(allocator, body.writer.buffer[0..body.writer.end]);
-}
+pub const Request = types.Request;
+pub const Peer = types.Peer;
+pub const Response = types.Response;
 
 /// Fetch tracker announce, auto-selecting HTTP or UDP based on URL scheme.
 /// When a DnsResolver is provided, DNS results are cached across requests.
@@ -159,25 +93,25 @@ pub fn buildUrl(allocator: std.mem.Allocator, request: Request) ![]u8 {
     try url.appendSlice(allocator, request.announce_url);
     try url.append(allocator, if (std.mem.indexOfScalar(u8, request.announce_url, '?') == null) '?' else '&');
 
-    try appendQueryBytes(allocator, &url, "info_hash", request.info_hash[0..]);
-    try appendQueryBytes(allocator, &url, "peer_id", request.peer_id[0..]);
+    try appendQueryParam(allocator, &url, "info_hash", request.info_hash[0..]);
+    try appendQueryParam(allocator, &url, "peer_id", request.peer_id[0..]);
     try appendQueryInt(allocator, &url, "port", request.port);
     try appendQueryInt(allocator, &url, "uploaded", request.uploaded);
     try appendQueryInt(allocator, &url, "downloaded", request.downloaded);
     try appendQueryInt(allocator, &url, "left", request.left);
     try appendQueryInt(allocator, &url, "compact", 1);
     if (request.event) |event| {
-        try appendQueryString(allocator, &url, "event", @tagName(event));
+        try appendQueryParam(allocator, &url, "event", @tagName(event));
     }
     if (request.key) |key| {
-        try appendQueryString(allocator, &url, "key", &key);
+        try appendQueryParam(allocator, &url, "key", &key);
     }
     try appendQueryInt(allocator, &url, "numwant", request.numwant);
 
     // BEP 52: for hybrid torrents, include the truncated v2 info-hash as a
     // second info_hash parameter so v2-aware trackers can match both swarms.
     if (request.info_hash_v2) |v2_hash| {
-        try appendQueryBytes(allocator, &url, "info_hash", v2_hash[0..20]);
+        try appendQueryParam(allocator, &url, "info_hash", v2_hash[0..20]);
     }
 
     return url.toOwnedSlice(allocator);
@@ -197,7 +131,7 @@ pub fn parseResponse(allocator: std.mem.Allocator, input: []const u8) !Response 
 
     // Merge IPv6 compact peers (BEP 7) if present
     if (bencode.dictGet(dict, "peers6")) |peers6_value| {
-        const peers6 = try parseCompactPeers6(allocator, try expectBytes(peers6_value));
+        const peers6 = try types.parseCompactPeers6(allocator, try expectBytes(peers6_value));
         defer allocator.free(peers6);
         if (peers6.len > 0) {
             const merged = try allocator.alloc(Peer, peers.len + peers6.len);
@@ -209,60 +143,20 @@ pub fn parseResponse(allocator: std.mem.Allocator, input: []const u8) !Response 
     }
 
     return .{
-        .interval = if (bencode.dictGet(dict, "interval")) |value| try expectPositiveU32(value) else 1800,
+        .interval = if (bencode.dictGet(dict, "interval")) |value| try expectU32(value) else 1800,
         .peers = peers,
-        .complete = if (bencode.dictGet(dict, "complete")) |value| try expectPositiveU32(value) else null,
-        .incomplete = if (bencode.dictGet(dict, "incomplete")) |value| try expectPositiveU32(value) else null,
+        .complete = if (bencode.dictGet(dict, "complete")) |value| try expectU32(value) else null,
+        .incomplete = if (bencode.dictGet(dict, "incomplete")) |value| try expectU32(value) else null,
         .warning_message = if (bencode.dictGet(dict, "warning message")) |v| try expectBytes(v) else null,
     };
 }
 
 fn parsePeers(allocator: std.mem.Allocator, value: bencode.Value) ![]Peer {
     return switch (value) {
-        .bytes => |bytes| parseCompactPeers(allocator, bytes),
+        .bytes => |bytes| types.parseCompactPeers(allocator, bytes),
         .list => |list| parsePeerList(allocator, list),
         else => error.InvalidPeersField,
     };
-}
-
-fn parseCompactPeers6(allocator: std.mem.Allocator, bytes: []const u8) ![]Peer {
-    if (bytes.len % 18 != 0) {
-        return error.InvalidPeersField;
-    }
-
-    const count = bytes.len / 18;
-    const peers = try allocator.alloc(Peer, count);
-    errdefer allocator.free(peers);
-
-    for (peers, 0..) |*peer, index| {
-        const chunk = bytes[index * 18 ..][0..18];
-        const port = std.mem.readInt(u16, chunk[16..18], .big);
-        peer.* = .{
-            .address = std.net.Address.initIp6(chunk[0..16].*, port, 0, 0),
-        };
-    }
-
-    return peers;
-}
-
-fn parseCompactPeers(allocator: std.mem.Allocator, bytes: []const u8) ![]Peer {
-    if (bytes.len % 6 != 0) {
-        return error.InvalidPeersField;
-    }
-
-    const count = bytes.len / 6;
-    const peers = try allocator.alloc(Peer, count);
-    errdefer allocator.free(peers);
-
-    for (peers, 0..) |*peer, index| {
-        const chunk = bytes[index * 6 ..][0..6];
-        const port = std.mem.readInt(u16, chunk[4..6], .big);
-        peer.* = .{
-            .address = std.net.Address.initIp4(.{ chunk[0], chunk[1], chunk[2], chunk[3] }, port),
-        };
-    }
-
-    return peers;
 }
 
 fn parsePeerList(allocator: std.mem.Allocator, values: []const bencode.Value) ![]Peer {
@@ -272,7 +166,7 @@ fn parsePeerList(allocator: std.mem.Allocator, values: []const bencode.Value) ![
     for (values, 0..) |value, index| {
         const dict = try expectDict(value);
         const ip = try expectBytes(try getRequired(dict, "ip"));
-        const port = try expectPositiveU16(try getRequired(dict, "port"));
+        const port = try expectU16(try getRequired(dict, "port"));
 
         peers[index] = .{
             .address = try std.net.Address.parseIp(ip, port),
@@ -282,7 +176,7 @@ fn parsePeerList(allocator: std.mem.Allocator, values: []const bencode.Value) ![
     return peers;
 }
 
-fn appendQueryBytes(
+fn appendQueryParam(
     allocator: std.mem.Allocator,
     url: *std.ArrayList(u8),
     key: []const u8,
@@ -294,7 +188,7 @@ fn appendQueryBytes(
 
     try url.appendSlice(allocator, key);
     try url.append(allocator, '=');
-    try appendPercentEncoded(allocator, url, value);
+    try types.appendPercentEncoded(allocator, url, value);
 }
 
 fn appendQueryInt(
@@ -305,47 +199,7 @@ fn appendQueryInt(
 ) !void {
     var buffer: [32]u8 = undefined;
     const rendered = try std.fmt.bufPrint(&buffer, "{}", .{value});
-    try appendQueryString(allocator, url, key, rendered);
-}
-
-fn appendQueryString(
-    allocator: std.mem.Allocator,
-    url: *std.ArrayList(u8),
-    key: []const u8,
-    value: []const u8,
-) !void {
-    if (url.items[url.items.len - 1] != '?' and url.items[url.items.len - 1] != '&') {
-        try url.append(allocator, '&');
-    }
-
-    try url.appendSlice(allocator, key);
-    try url.append(allocator, '=');
-    try appendPercentEncoded(allocator, url, value);
-}
-
-fn appendPercentEncoded(
-    allocator: std.mem.Allocator,
-    url: *std.ArrayList(u8),
-    bytes: []const u8,
-) !void {
-    const hex = "0123456789ABCDEF";
-
-    for (bytes) |byte| {
-        if (isUnreserved(byte)) {
-            try url.append(allocator, byte);
-        } else {
-            try url.append(allocator, '%');
-            try url.append(allocator, hex[byte >> 4]);
-            try url.append(allocator, hex[byte & 0x0f]);
-        }
-    }
-}
-
-fn isUnreserved(byte: u8) bool {
-    return switch (byte) {
-        'A'...'Z', 'a'...'z', '0'...'9', '-', '.', '_', '~' => true,
-        else => false,
-    };
+    try appendQueryParam(allocator, url, key, rendered);
 }
 
 fn getRequired(dict: []const bencode.Value.Entry, key: []const u8) !bencode.Value {
@@ -372,15 +226,15 @@ fn expectBytes(value: bencode.Value) BencodeTypeError![]const u8 {
     };
 }
 
-fn expectPositiveU16(value: bencode.Value) BencodeTypeError!u16 {
-    return std.math.cast(u16, try expectPositiveU64(value)) orelse error.IntegerOverflow;
+fn expectU16(value: bencode.Value) BencodeTypeError!u16 {
+    return std.math.cast(u16, try expectU64(value)) orelse error.IntegerOverflow;
 }
 
-fn expectPositiveU32(value: bencode.Value) BencodeTypeError!u32 {
-    return std.math.cast(u32, try expectPositiveU64(value)) orelse error.IntegerOverflow;
+fn expectU32(value: bencode.Value) BencodeTypeError!u32 {
+    return std.math.cast(u32, try expectU64(value)) orelse error.IntegerOverflow;
 }
 
-fn expectPositiveU64(value: bencode.Value) BencodeTypeError!u64 {
+fn expectU64(value: bencode.Value) BencodeTypeError!u64 {
     return switch (value) {
         .integer => |integer| {
             if (integer < 0) return error.NegativeInteger;

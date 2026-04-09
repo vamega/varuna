@@ -237,7 +237,7 @@ test "write piece data across multiple files" {
     defer store.deinit();
 
     const plan = try @import("verify.zig").planPieceVerification(std.testing.allocator, &session, 0);
-    defer @import("verify.zig").freePiecePlan(std.testing.allocator, plan);
+    defer plan.deinit(std.testing.allocator);
 
     try store.writePiece(plan.spans, "spam");
     try store.sync();
@@ -273,7 +273,7 @@ test "read piece data across multiple files" {
     defer store.deinit();
 
     const plan = try @import("verify.zig").planPieceVerification(std.testing.allocator, &session, 0);
-    defer @import("verify.zig").freePiecePlan(std.testing.allocator, plan);
+    defer plan.deinit(std.testing.allocator);
 
     try store.writePiece(plan.spans, "spam");
 

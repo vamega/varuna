@@ -5,7 +5,7 @@
 const std = @import("std");
 const TorrentState = @import("../daemon/torrent_session.zig").State;
 const TorrentStats = @import("../daemon/torrent_session.zig").Stats;
-const json_mod = @import("json.zig");
+const json_esc = @import("json.zig");
 
 /// Map Varuna's internal torrent state to qBittorrent-compatible state strings.
 /// qui and Flood read these values to determine torrent status, icon, and label.
@@ -74,11 +74,11 @@ pub fn percentEncode(allocator: std.mem.Allocator, buf: *std.ArrayList(u8), inpu
 
 /// Format a BEP 52 v2 info-hash (32-byte SHA-256) as a 64-character lowercase
 /// hex string. Returns "" if the hash is null (pure v1 torrent).
-pub fn formatInfoHashV2(v2: ?[32]u8) [64]u8 {
+pub fn formatInfoHashV2(v2: ?[32]u8) ?[64]u8 {
     if (v2) |hash| {
         return std.fmt.bytesToHex(hash, .lower);
     }
-    return [_]u8{'0'} ** 64; // should not be used when null
+    return null;
 }
 
 /// Serialize a torrent stats object as a JSON object. Used by both
@@ -87,7 +87,7 @@ pub fn formatInfoHashV2(v2: ?[32]u8) [64]u8 {
 /// When `include_partial_seed` is true, the "partial_seed" field is included
 /// in the output (required by /torrents/info but not by /sync/maindata).
 pub fn serializeTorrentJson(allocator: std.mem.Allocator, json: *std.ArrayList(u8), stat: TorrentStats, include_partial_seed: bool) !void {
-    const esc = json_mod.jsonSafe;
+    const esc = json_esc.jsonSafe;
     const qbt_state = torrentStateString(stat.state, stat.progress);
     const now = std.time.timestamp();
     const time_active: i64 = now - stat.added_on;
@@ -101,8 +101,8 @@ pub fn serializeTorrentJson(allocator: std.mem.Allocator, json: *std.ArrayList(u
     const magnet_uri = buildMagnetUri(allocator, &stat.info_hash_hex, stat.name, stat.tracker) catch "";
     defer if (magnet_uri.len > 0) allocator.free(magnet_uri);
 
-    const v2_hex = if (stat.info_hash_v2 != null) formatInfoHashV2(stat.info_hash_v2) else [_]u8{0} ** 64;
-    const v2_str: []const u8 = if (stat.info_hash_v2 != null) &v2_hex else "";
+    const v2_hex = formatInfoHashV2(stat.info_hash_v2);
+    const v2_str: []const u8 = if (v2_hex) |*hex| hex else "";
 
     // Split into two print calls to stay under the 32-argument limit.
     try json.print(
@@ -271,17 +271,16 @@ test "buildMagnetUri without tracker" {
 
 test "formatInfoHashV2 returns 64-char hex for non-null hash" {
     var hash: [32]u8 = undefined;
-    // Set hash to 0x00..0x1f for a known pattern
     for (&hash, 0..) |*b, i| {
         b.* = @intCast(i);
     }
-    const hex = formatInfoHashV2(hash);
+    const hex = formatInfoHashV2(hash).?;
     try std.testing.expectEqualStrings("000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f", &hex);
 }
 
-test "formatInfoHashV2 returns zeros for null hash" {
+test "formatInfoHashV2 returns null for null hash" {
     const hex = formatInfoHashV2(null);
-    try std.testing.expectEqualStrings("0" ** 64, &hex);
+    try std.testing.expect(hex == null);
 }
 
 test "percentEncode encodes special characters" {

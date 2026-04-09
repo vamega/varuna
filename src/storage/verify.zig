@@ -38,6 +38,10 @@ pub const PiecePlan = struct {
     v2_piece_in_file: u32 = 0,
     /// Total number of pieces in the file this piece belongs to.
     v2_file_piece_count: u32 = 0,
+
+    pub fn deinit(self: PiecePlan, allocator: std.mem.Allocator) void {
+        if (self.spans_owned) allocator.free(self.spans);
+    }
 };
 
 pub fn planPieceVerification(
@@ -126,7 +130,7 @@ fn findV2PieceHash(
             if (file.length == 0) continue;
             if (piece_index >= file.first_piece and piece_index < file.end_piece_exclusive) {
                 if (file_idx < v2_files.len) {
-                    const file_pieces = if (file.length == 0) @as(u32, 0) else @as(u32, @intCast((file.length + session.layout.piece_length - 1) / session.layout.piece_length));
+                    const file_pieces: u32 = @intCast((file.length + session.layout.piece_length - 1) / session.layout.piece_length);
                     if (file_pieces <= 1) {
                         // Single-piece file: pieces_root is the SHA-256 of the piece data
                         return .{
@@ -155,7 +159,7 @@ const V2PieceHashResult = struct {
 };
 
 pub fn freePiecePlan(allocator: std.mem.Allocator, plan: PiecePlan) void {
-    if (plan.spans_owned) allocator.free(plan.spans);
+    plan.deinit(allocator);
 }
 
 pub fn verifyPieceBuffer(plan: PiecePlan, piece_data: []const u8) !bool {
@@ -252,7 +256,6 @@ pub fn recheckExistingData(
     defer allocator.free(scratch);
 
     var bytes_complete: u64 = 0;
-    var pieces_skipped: u32 = 0;
 
     // For v2 torrents, verify per-file Merkle roots
     if (session.layout.version == .v2) {
@@ -270,7 +273,6 @@ pub fn recheckExistingData(
                 defer freePiecePlan(allocator, plan);
                 try complete_pieces.set(piece_index);
                 bytes_complete += plan.piece_length;
-                pieces_skipped += 1;
                 continue;
             }
         }

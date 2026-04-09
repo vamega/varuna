@@ -224,7 +224,7 @@ pub fn servePieceRequest(self: *EventLoop, slot: u16, payload: []const u8) void 
     // Submit async io_uring reads for all spans (no blocking)
     var span_scratch: [8]LayoutSpan = undefined;
     const plan = storage.verify.planPieceVerificationWithScratch(self.allocator, sess, piece_index, span_scratch[0..]) catch return;
-    defer storage.verify.freePiecePlan(self.allocator, plan);
+    defer plan.deinit(self.allocator);
 
     if (plan.spans.len == 0) return;
 

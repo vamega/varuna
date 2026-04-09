@@ -1,7 +1,7 @@
 const std = @import("std");
 const TorrentSession = @import("torrent_session.zig").TorrentSession;
 const TorrentState = @import("torrent_session.zig").State;
-const ResumeDb = @import("../storage/resume.zig").ResumeDb;
+const ResumeDb = @import("../storage/state_db.zig").ResumeDb;
 
 /// Queue configuration (from TOML config or API preferences).
 pub const QueueConfig = struct {
@@ -277,14 +277,15 @@ pub const QueueManager = struct {
 
     /// Load queue positions from SQLite and rebuild the ordered list.
     pub fn loadFromDb(self: *QueueManager, db: *ResumeDb) void {
+        const QueuePosition = @import("../storage/state_db.zig").QueuePosition;
         const entries = db.loadQueuePositions(self.allocator) catch return;
         defer {
             self.allocator.free(entries);
         }
 
         // Sort by position
-        std.mem.sort(QueueEntry, entries, {}, struct {
-            fn lessThan(_: void, a: QueueEntry, b: QueueEntry) bool {
+        std.mem.sort(QueuePosition, entries, {}, struct {
+            fn lessThan(_: void, a: QueuePosition, b: QueuePosition) bool {
                 return a.position < b.position;
             }
         }.lessThan);
@@ -296,12 +297,7 @@ pub const QueueManager = struct {
         }
     }
 
-    /// Helper: is this torrent in download mode? (progress < 100%)
     fn isDownloading(session: *const TorrentSession) bool {
-        if (session.state == .seeding) return false;
-        if (session.piece_count == 0) return true; // magnet or unknown
-        // Use the session's progress heuristic: if progress >= 1.0, it's a seed.
-        // We can't call completedCount() on a const pointer, so check the state.
         return session.state != .seeding;
     }
 };

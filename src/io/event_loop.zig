@@ -32,7 +32,6 @@ const dht_handler = @import("dht_handler.zig");
 
 pub const types = @import("types.zig");
 pub const max_peers = types.max_peers;
-const TorrentIdType = types.TorrentIdType;
 pub const TorrentId = types.TorrentId;
 pub const OpType = types.OpType;
 pub const OpData = types.OpData;
@@ -56,13 +55,13 @@ pub const EventLoop = struct {
 
     pub const PendingWriteKey = struct {
         piece_index: u32,
-        torrent_id: TorrentIdType,
+        torrent_id: TorrentId,
     };
 
     pub const PendingWrite = struct {
         write_id: u32,
         piece_index: u32,
-        torrent_id: TorrentIdType,
+        torrent_id: TorrentId,
         slot: u16,
         buf: []u8,
         spans_remaining: u32,
@@ -120,7 +119,7 @@ pub const EventLoop = struct {
     };
 
     pub const AnnounceResult = struct {
-        torrent_id: TorrentIdType,
+        torrent_id: TorrentId,
         peers: []std.net.Address,
     };
 
@@ -132,12 +131,12 @@ pub const EventLoop = struct {
 
     // Multi-torrent contexts
     torrents: std.ArrayList(?TorrentContext),
-    free_torrent_ids: std.ArrayList(TorrentIdType),
-    active_torrent_ids: std.ArrayList(TorrentIdType),
-    torrents_with_peers: std.ArrayList(TorrentIdType),
-    info_hash_to_torrent: std.AutoHashMap([20]u8, TorrentIdType),
+    free_torrent_ids: std.ArrayList(TorrentId),
+    active_torrent_ids: std.ArrayList(TorrentId),
+    torrents_with_peers: std.ArrayList(TorrentId),
+    info_hash_to_torrent: std.AutoHashMap([20]u8, TorrentId),
     mse_req2_to_hash: std.AutoHashMap([20]u8, [20]u8),
-    torrent_count: TorrentIdType = 0,
+    torrent_count: TorrentId = 0,
 
     // Listening port for tracker announces
     port: u16 = 6881,
@@ -280,10 +279,10 @@ pub const EventLoop = struct {
             .allocator = allocator,
             .peers = peers,
             .torrents = try std.ArrayList(?TorrentContext).initCapacity(allocator, default_torrent_capacity),
-            .free_torrent_ids = std.ArrayList(TorrentIdType).empty,
-            .active_torrent_ids = try std.ArrayList(TorrentIdType).initCapacity(allocator, default_torrent_capacity),
-            .torrents_with_peers = std.ArrayList(TorrentIdType).empty,
-            .info_hash_to_torrent = std.AutoHashMap([20]u8, TorrentIdType).init(allocator),
+            .free_torrent_ids = std.ArrayList(TorrentId).empty,
+            .active_torrent_ids = try std.ArrayList(TorrentId).initCapacity(allocator, default_torrent_capacity),
+            .torrents_with_peers = std.ArrayList(TorrentId).empty,
+            .info_hash_to_torrent = std.AutoHashMap([20]u8, TorrentId).init(allocator),
             .mse_req2_to_hash = std.AutoHashMap([20]u8, [20]u8).init(allocator),
             .pending_writes = .empty,
             .pending_write_lookup = .empty,
@@ -516,7 +515,7 @@ pub const EventLoop = struct {
         piece_tracker: *PieceTracker,
         shared_fds: []const posix.fd_t,
         peer_id: [20]u8,
-    ) !TorrentIdType {
+    ) !TorrentId {
         return self.addTorrentWithKey(session, piece_tracker, shared_fds, peer_id, null, false);
     }
 
@@ -529,7 +528,7 @@ pub const EventLoop = struct {
         peer_id: [20]u8,
         tracker_key: ?[8]u8,
         is_private: bool,
-    ) !TorrentIdType {
+    ) !TorrentId {
         // BEP 52: derive truncated v2 info-hash for handshake matching
         const v2_hash: ?[20]u8 = if (session.metainfo.info_hash_v2) |full_v2| blk: {
             var truncated: [20]u8 = undefined;
@@ -549,11 +548,11 @@ pub const EventLoop = struct {
         });
     }
 
-    pub fn addTorrentContext(self: *EventLoop, tc: TorrentContext) !TorrentIdType {
+    pub fn addTorrentContext(self: *EventLoop, tc: TorrentContext) !TorrentId {
         const torrent_id = if (self.free_torrent_ids.pop()) |free_id|
             free_id
         else blk: {
-            const new_id: TorrentIdType = @intCast(self.torrents.items.len);
+            const new_id: TorrentId = @intCast(self.torrents.items.len);
             try self.torrents.append(self.allocator, null);
             break :blk new_id;
         };
@@ -571,7 +570,7 @@ pub const EventLoop = struct {
 
     /// Check whether peer discovery (DHT, PEX, LSD) is allowed for a torrent.
     /// Private torrents MUST only use tracker-provided peers.
-    pub fn isPeerDiscoveryAllowed(self: *EventLoop, torrent_id: TorrentIdType) bool {
+    pub fn isPeerDiscoveryAllowed(self: *EventLoop, torrent_id: TorrentId) bool {
         if (self.getTorrentContext(torrent_id)) |tc| {
             return !tc.is_private;
         }
@@ -579,7 +578,7 @@ pub const EventLoop = struct {
     }
 
     /// Set the complete_pieces bitfield for a torrent (enables seed mode).
-    pub fn setTorrentCompletePieces(self: *EventLoop, torrent_id: TorrentIdType, cp: *const Bitfield) void {
+    pub fn setTorrentCompletePieces(self: *EventLoop, torrent_id: TorrentId, cp: *const Bitfield) void {
         if (self.getTorrentContext(torrent_id)) |tc| {
             tc.complete_pieces = cp;
         }
@@ -590,7 +589,7 @@ pub const EventLoop = struct {
     /// Initialize the BEP 52 Merkle tree cache for a v2/hybrid torrent.
     /// Must be called after the torrent is added and has a valid session.
     /// Safe to call for v1 torrents (no-op) or multiple times (idempotent).
-    pub fn initMerkleCache(self: *EventLoop, torrent_id: TorrentIdType) void {
+    pub fn initMerkleCache(self: *EventLoop, torrent_id: TorrentId) void {
         const tc = self.getTorrentContext(torrent_id) orelse return;
         if (tc.merkle_cache != null) return; // already initialized
 
@@ -620,7 +619,7 @@ pub const EventLoop = struct {
     }
 
     /// Count the number of active peers for a specific torrent.
-    pub fn peerCountForTorrent(self: *const EventLoop, torrent_id: TorrentIdType) u16 {
+    pub fn peerCountForTorrent(self: *const EventLoop, torrent_id: TorrentId) u16 {
         const tc = self.getTorrentContextConst(torrent_id) orelse return 0;
         return @intCast(@min(tc.peer_slots.items.len, std.math.maxInt(u16)));
     }
@@ -631,7 +630,7 @@ pub const EventLoop = struct {
     }
 
     /// Get speed and total byte stats for a specific torrent.
-    pub fn getSpeedStats(self: *const EventLoop, torrent_id: TorrentIdType) SpeedStats {
+    pub fn getSpeedStats(self: *const EventLoop, torrent_id: TorrentId) SpeedStats {
         const tc = self.getTorrentContextConst(torrent_id) orelse return .{};
 
         return .{
@@ -642,7 +641,7 @@ pub const EventLoop = struct {
         };
     }
 
-    pub fn accountTorrentBytes(self: *EventLoop, torrent_id: TorrentIdType, dl_bytes: usize, ul_bytes: usize) void {
+    pub fn accountTorrentBytes(self: *EventLoop, torrent_id: TorrentId, dl_bytes: usize, ul_bytes: usize) void {
         if (self.getTorrentContext(torrent_id)) |tc| {
             if (dl_bytes != 0) tc.downloaded_bytes +%= @intCast(dl_bytes);
             if (ul_bytes != 0) tc.uploaded_bytes +%= @intCast(ul_bytes);
@@ -650,7 +649,7 @@ pub const EventLoop = struct {
     }
 
     /// Remove a torrent context and disconnect all its peers.
-    pub fn removeTorrent(self: *EventLoop, torrent_id: TorrentIdType) void {
+    pub fn removeTorrent(self: *EventLoop, torrent_id: TorrentId) void {
         // Disconnect all peers for this torrent
         var to_remove = std.ArrayList(u16).empty;
         defer to_remove.deinit(self.allocator);
@@ -690,7 +689,7 @@ pub const EventLoop = struct {
         if (self.torrent_count > 0) self.torrent_count -= 1;
     }
 
-    pub fn attachPeerToTorrent(self: *EventLoop, torrent_id: TorrentIdType, slot: u16) void {
+    pub fn attachPeerToTorrent(self: *EventLoop, torrent_id: TorrentId, slot: u16) void {
         const tc = self.getTorrentContext(torrent_id) orelse return;
         const peer = &self.peers[slot];
         if (peer.torrent_peer_index != null) return;
@@ -711,7 +710,7 @@ pub const EventLoop = struct {
         }
     }
 
-    fn detachPeerFromTorrent(self: *EventLoop, torrent_id: TorrentIdType, slot: u16) void {
+    fn detachPeerFromTorrent(self: *EventLoop, torrent_id: TorrentId, slot: u16) void {
         const tc = self.getTorrentContext(torrent_id) orelse return;
         const peer = &self.peers[slot];
         const idx = peer.torrent_peer_index orelse return;
@@ -757,7 +756,7 @@ pub const EventLoop = struct {
     /// Add a peer using the transport selected by `selectTransport()`.
     /// When uTP is selected but the connection fails (e.g. no UDP socket),
     /// falls back to TCP transparently.
-    pub fn addPeerAutoTransport(self: *EventLoop, address: std.net.Address, torrent_id: TorrentIdType) !u16 {
+    pub fn addPeerAutoTransport(self: *EventLoop, address: std.net.Address, torrent_id: TorrentId) !u16 {
         const transport = self.selectTransport();
         if (transport == .utp) {
             return self.addUtpPeer(address, torrent_id) catch |err| switch (err) {
@@ -772,7 +771,7 @@ pub const EventLoop = struct {
         return self.addPeerForTorrent(address, 0);
     }
 
-    pub fn addPeerForTorrent(self: *EventLoop, address: std.net.Address, torrent_id: TorrentIdType) !u16 {
+    pub fn addPeerForTorrent(self: *EventLoop, address: std.net.Address, torrent_id: TorrentId) !u16 {
         // Validate address family
         const family = address.any.family;
         if (family != posix.AF.INET and family != posix.AF.INET6) {
@@ -850,7 +849,7 @@ pub const EventLoop = struct {
     /// Initiate an outbound uTP connection to a peer. Creates the uTP
     /// socket via the UtpManager, sends the SYN packet, and allocates a
     /// peer slot in the event loop.
-    pub fn addUtpPeer(self: *EventLoop, address: std.net.Address, torrent_id: TorrentIdType) !u16 {
+    pub fn addUtpPeer(self: *EventLoop, address: std.net.Address, torrent_id: TorrentId) !u16 {
         // Check ban list before allocating uTP socket
         if (self.ban_list) |bl| {
             if (bl.isBanned(address)) {
@@ -889,7 +888,7 @@ pub const EventLoop = struct {
         peer.* = Peer{
             .fd = -1,
             .state = .connecting,
-            .mode = .download,
+            .mode = .outbound,
             .transport = .utp,
             .torrent_id = torrent_id,
             .utp_slot = conn.slot,
@@ -1156,27 +1155,27 @@ pub const EventLoop = struct {
     }
 
     /// Set per-torrent download rate limit (bytes/sec). 0 = unlimited.
-    pub fn setTorrentDlLimit(self: *EventLoop, torrent_id: TorrentIdType, rate: u64) void {
+    pub fn setTorrentDlLimit(self: *EventLoop, torrent_id: TorrentId, rate: u64) void {
         if (self.getTorrentContext(torrent_id)) |tc| {
             tc.rate_limiter.setDownloadRate(rate);
         }
     }
 
     /// Set per-torrent upload rate limit (bytes/sec). 0 = unlimited.
-    pub fn setTorrentUlLimit(self: *EventLoop, torrent_id: TorrentIdType, rate: u64) void {
+    pub fn setTorrentUlLimit(self: *EventLoop, torrent_id: TorrentId, rate: u64) void {
         if (self.getTorrentContext(torrent_id)) |tc| {
             tc.rate_limiter.setUploadRate(rate);
         }
     }
 
     /// Get per-torrent download rate limit (bytes/sec). 0 = unlimited.
-    pub fn getTorrentDlLimit(self: *const EventLoop, torrent_id: TorrentIdType) u64 {
+    pub fn getTorrentDlLimit(self: *const EventLoop, torrent_id: TorrentId) u64 {
         const tc = self.getTorrentContextConst(torrent_id) orelse return 0;
         return tc.rate_limiter.download.rate;
     }
 
     /// Get per-torrent upload rate limit (bytes/sec). 0 = unlimited.
-    pub fn getTorrentUlLimit(self: *const EventLoop, torrent_id: TorrentIdType) u64 {
+    pub fn getTorrentUlLimit(self: *const EventLoop, torrent_id: TorrentId) u64 {
         const tc = self.getTorrentContextConst(torrent_id) orelse return 0;
         return tc.rate_limiter.upload.rate;
     }
@@ -1184,7 +1183,7 @@ pub const EventLoop = struct {
     /// Enable BEP 16 super-seeding for a torrent. The seeder will send
     /// individual HAVE messages instead of a full bitfield, tracking
     /// which pieces each peer has seen to maximize piece diversity.
-    pub fn enableSuperSeed(self: *EventLoop, torrent_id: TorrentIdType) !void {
+    pub fn enableSuperSeed(self: *EventLoop, torrent_id: TorrentId) !void {
         const tc = self.getTorrentContext(torrent_id) orelse return error.TorrentNotFound;
         if (tc.super_seed != null) return; // already enabled
         const sess = tc.session orelse return error.NoSession;
@@ -1195,7 +1194,7 @@ pub const EventLoop = struct {
     }
 
     /// Disable BEP 16 super-seeding for a torrent.
-    pub fn disableSuperSeed(self: *EventLoop, torrent_id: TorrentIdType) void {
+    pub fn disableSuperSeed(self: *EventLoop, torrent_id: TorrentId) void {
         const tc = self.getTorrentContext(torrent_id) orelse return;
         if (tc.super_seed) |ss| {
             ss.deinit();
@@ -1205,7 +1204,7 @@ pub const EventLoop = struct {
     }
 
     /// Check if super-seeding is enabled for a torrent.
-    pub fn isSuperSeedEnabled(self: *const EventLoop, torrent_id: TorrentIdType) bool {
+    pub fn isSuperSeedEnabled(self: *const EventLoop, torrent_id: TorrentId) bool {
         const tc = self.getTorrentContextConst(torrent_id) orelse return false;
         return tc.super_seed != null;
     }
@@ -1227,7 +1226,7 @@ pub const EventLoop = struct {
     /// Check if a download of `amount` bytes is allowed by both per-torrent
     /// and global rate limiters. Returns the number of bytes allowed (may be
     /// less than requested). Returns 0 if throttled.
-    pub fn consumeDownloadTokens(self: *EventLoop, torrent_id: TorrentIdType, amount: u64) u64 {
+    pub fn consumeDownloadTokens(self: *EventLoop, torrent_id: TorrentId, amount: u64) u64 {
         // Check per-torrent limit first
         var allowed = amount;
         if (self.getTorrentContext(torrent_id)) |tc| {
@@ -1245,7 +1244,7 @@ pub const EventLoop = struct {
 
     /// Check if an upload of `amount` bytes is allowed by both per-torrent
     /// and global rate limiters. Returns the number of bytes allowed.
-    pub fn consumeUploadTokens(self: *EventLoop, torrent_id: TorrentIdType, amount: u64) u64 {
+    pub fn consumeUploadTokens(self: *EventLoop, torrent_id: TorrentId, amount: u64) u64 {
         var allowed = amount;
         if (self.getTorrentContext(torrent_id)) |tc| {
             if (tc.rate_limiter.upload.isActive()) {
@@ -1260,7 +1259,7 @@ pub const EventLoop = struct {
     }
 
     /// Check if download is currently throttled for a torrent.
-    pub fn isDownloadThrottled(self: *EventLoop, torrent_id: TorrentIdType) bool {
+    pub fn isDownloadThrottled(self: *EventLoop, torrent_id: TorrentId) bool {
         if (self.global_rate_limiter.download.isActive()) {
             if (self.global_rate_limiter.download.available() == 0) return true;
         }
@@ -1273,7 +1272,7 @@ pub const EventLoop = struct {
     }
 
     /// Check if upload is currently throttled for a torrent.
-    pub fn isUploadThrottled(self: *EventLoop, torrent_id: TorrentIdType) bool {
+    pub fn isUploadThrottled(self: *EventLoop, torrent_id: TorrentId) bool {
         if (self.global_rate_limiter.upload.isActive()) {
             if (self.global_rate_limiter.upload.available() == 0) return true;
         }
@@ -1450,8 +1449,6 @@ pub const EventLoop = struct {
         self.piece_buffer_pool.release(self.allocator, if (self.huge_page_cache) |*hpc| hpc else null, piece_buffer);
     }
 
-    /// Allocate a unique send_id for a new PendingSend and return the
-    /// encoded user data with the send_id in the context field.
     /// Allocate a unique send_id for a new PendingSend and return the
     /// encoded user data with the send_id in the context field.
     /// send_id is never 0, since context=0 means "untracked send".
@@ -1684,17 +1681,17 @@ pub const EventLoop = struct {
         return removed.value;
     }
 
-    pub fn getTorrentContext(self: *EventLoop, torrent_id: TorrentIdType) ?*TorrentContext {
+    pub fn getTorrentContext(self: *EventLoop, torrent_id: TorrentId) ?*TorrentContext {
         if (torrent_id >= self.torrents.items.len) return null;
         return if (self.torrents.items[torrent_id]) |*tc| tc else null;
     }
 
-    pub fn getTorrentContextConst(self: *const EventLoop, torrent_id: TorrentIdType) ?*const TorrentContext {
+    pub fn getTorrentContextConst(self: *const EventLoop, torrent_id: TorrentId) ?*const TorrentContext {
         if (torrent_id >= self.torrents.items.len) return null;
         return if (self.torrents.items[torrent_id]) |*tc| tc else null;
     }
 
-    pub fn enqueueAnnounceResult(self: *EventLoop, torrent_id: TorrentIdType, peers: []std.net.Address) !void {
+    pub fn enqueueAnnounceResult(self: *EventLoop, torrent_id: TorrentId, peers: []std.net.Address) !void {
         self.announce_mutex.lock();
         defer self.announce_mutex.unlock();
         try self.announce_results.append(self.allocator, .{
@@ -1703,7 +1700,7 @@ pub const EventLoop = struct {
         });
     }
 
-    pub fn findTorrentIdByInfoHash(self: *const EventLoop, info_hash: []const u8) ?TorrentIdType {
+    pub fn findTorrentIdByInfoHash(self: *const EventLoop, info_hash: []const u8) ?TorrentId {
         if (info_hash.len != 20) return null;
         var key: [20]u8 = undefined;
         @memcpy(&key, info_hash[0..20]);
@@ -1751,7 +1748,7 @@ pub const EventLoop = struct {
         if (peer.mse_responder) |mr| self.allocator.destroy(mr);
     }
 
-    fn registerTorrentHashes(self: *EventLoop, torrent_id: TorrentIdType, info_hash: [20]u8, info_hash_v2: ?[20]u8) !void {
+    fn registerTorrentHashes(self: *EventLoop, torrent_id: TorrentId, info_hash: [20]u8, info_hash_v2: ?[20]u8) !void {
         const hash_slot = try self.info_hash_to_torrent.getOrPut(info_hash);
         if (hash_slot.found_existing and hash_slot.value_ptr.* != torrent_id) return error.DuplicateInfoHash;
         hash_slot.value_ptr.* = torrent_id;
@@ -1782,7 +1779,7 @@ pub const EventLoop = struct {
         }
     }
 
-    fn removeActiveTorrentId(self: *EventLoop, torrent_id: TorrentIdType) void {
+    fn removeActiveTorrentId(self: *EventLoop, torrent_id: TorrentId) void {
         for (self.active_torrent_ids.items, 0..) |active_id, idx| {
             if (active_id == torrent_id) {
                 _ = self.active_torrent_ids.swapRemove(idx);
@@ -1842,14 +1839,14 @@ test "event loop supports high torrent counts with hashed lookup and slot reuse"
             .info_hash = info_hash,
             .peer_id = peer_id,
         });
-        try std.testing.expectEqual(@as(TorrentIdType, @intCast(idx)), torrent_id);
+        try std.testing.expectEqual(@as(TorrentId, @intCast(idx)), torrent_id);
         try std.testing.expectEqual(torrent_id, el.findTorrentIdByInfoHash(&info_hash));
 
         if (idx == 4_096) reused_hash = info_hash;
     }
 
     try std.testing.expectEqual(torrent_count, el.torrent_count);
-    try std.testing.expectEqual(@as(?TorrentIdType, 4_096), el.findTorrentIdByInfoHash(&reused_hash));
+    try std.testing.expectEqual(@as(?TorrentId, 4_096), el.findTorrentIdByInfoHash(&reused_hash));
 
     el.removeTorrent(4_096);
     try std.testing.expect(el.findTorrentIdByInfoHash(&reused_hash) == null);
@@ -1866,8 +1863,8 @@ test "event loop supports high torrent counts with hashed lookup and slot reuse"
         .info_hash = replacement_hash,
         .peer_id = [_]u8{1} ** 20,
     });
-    try std.testing.expectEqual(@as(TorrentIdType, 4_096), replacement_id);
-    try std.testing.expectEqual(@as(?TorrentIdType, replacement_id), el.findTorrentIdByInfoHash(&replacement_hash));
+    try std.testing.expectEqual(@as(TorrentId, 4_096), replacement_id);
+    try std.testing.expectEqual(@as(?TorrentId, replacement_id), el.findTorrentIdByInfoHash(&replacement_hash));
 }
 
 test "announce results are queued per torrent" {
@@ -1886,8 +1883,8 @@ test "announce results are queued per torrent" {
     el.announce_mutex.lock();
     defer el.announce_mutex.unlock();
     try std.testing.expectEqual(@as(usize, 2), el.announce_results.items.len);
-    try std.testing.expectEqual(@as(TorrentIdType, 3), el.announce_results.items[0].torrent_id);
-    try std.testing.expectEqual(@as(TorrentIdType, 7), el.announce_results.items[1].torrent_id);
+    try std.testing.expectEqual(@as(TorrentId, 3), el.announce_results.items[0].torrent_id);
+    try std.testing.expectEqual(@as(TorrentId, 7), el.announce_results.items[1].torrent_id);
     try std.testing.expectEqual(@as(usize, 1), el.announce_results.items[0].peers.len);
     try std.testing.expectEqual(@as(usize, 2), el.announce_results.items[1].peers.len);
 }

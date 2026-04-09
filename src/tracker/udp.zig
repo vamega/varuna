@@ -1,6 +1,6 @@
 const std = @import("std");
 const posix = std.posix;
-const announce_mod = @import("announce.zig");
+const types = @import("types.zig");
 const scrape_mod = @import("scrape.zig");
 
 const log = std.log.scoped(.udp_tracker);
@@ -26,8 +26,9 @@ pub const UdpEvent = enum(u32) {
     stopped = 3,
 };
 
-/// Maximum retries per BEP 15: timeout = 15 * 2^n, n = 0..8.
-pub const max_retries: u32 = 8;
+/// BEP 15 allows up to 8 retries (timeout = 15 * 2^n), but we cap at 4
+/// to avoid excessively long waits (15 + 30 + 60 + 120 = 225s max).
+pub const max_retries: u32 = 4;
 
 /// Base timeout in seconds (BEP 15).
 pub const base_timeout_secs: u64 = 15;
@@ -151,7 +152,7 @@ pub const AnnounceResponse = struct {
     }
 
     /// Parse compact IPv4 peers from the response.
-    pub fn parsePeers(self: AnnounceResponse, allocator: std.mem.Allocator) ![]announce_mod.Peer {
+    pub fn parsePeers(self: AnnounceResponse, allocator: std.mem.Allocator) ![]types.Peer {
         return parseCompactPeers(allocator, self.peers_data);
     }
 };
@@ -186,12 +187,8 @@ pub const ScrapeRequest = struct {
     }
 };
 
-/// Scrape response: 8-byte header + 12 bytes per info_hash result.
+/// Scrape response codec: 8-byte header + 12 bytes per info_hash result.
 pub const ScrapeResponse = struct {
-    action: Action,
-    transaction_id: u32,
-    results: []const ScrapeEntry,
-
     pub const ScrapeEntry = struct {
         seeders: u32,
         completed: u32,
@@ -335,7 +332,7 @@ pub const ConnectionCache = struct {
 // ── Helper functions ────────────────────────────────────
 
 /// Convert announce event to BEP 15 UDP event code.
-pub fn eventToUdp(event: ?announce_mod.Request.Event) UdpEvent {
+pub fn eventToUdp(event: ?types.Request.Event) UdpEvent {
     const ev = event orelse return .none;
     return switch (ev) {
         .completed => .completed,
@@ -357,37 +354,8 @@ pub fn generateTransactionId() u32 {
     return std.mem.readInt(u32, &buf, .big);
 }
 
-/// Parse compact IPv4 peers (6 bytes each: 4 IP + 2 port).
-pub fn parseCompactPeers(allocator: std.mem.Allocator, data: []const u8) ![]announce_mod.Peer {
-    if (data.len % 6 != 0) return error.InvalidPeersField;
-    const count = data.len / 6;
-    const peers = try allocator.alloc(announce_mod.Peer, count);
-    errdefer allocator.free(peers);
-    for (peers, 0..) |*peer, i| {
-        const chunk = data[i * 6 ..][0..6];
-        const port = std.mem.readInt(u16, chunk[4..6], .big);
-        peer.* = .{
-            .address = std.net.Address.initIp4(.{ chunk[0], chunk[1], chunk[2], chunk[3] }, port),
-        };
-    }
-    return peers;
-}
-
-/// Parse compact IPv6 peers (18 bytes each: 16 IP + 2 port).
-pub fn parseCompactPeers6(allocator: std.mem.Allocator, data: []const u8) ![]announce_mod.Peer {
-    if (data.len % 18 != 0) return error.InvalidPeersField;
-    const count = data.len / 18;
-    const peers = try allocator.alloc(announce_mod.Peer, count);
-    errdefer allocator.free(peers);
-    for (peers, 0..) |*peer, i| {
-        const chunk = data[i * 18 ..][0..18];
-        const port = std.mem.readInt(u16, chunk[16..18], .big);
-        peer.* = .{
-            .address = std.net.Address.initIp6(chunk[0..16].*, port, 0, 0),
-        };
-    }
-    return peers;
-}
+pub const parseCompactPeers = types.parseCompactPeers;
+pub const parseCompactPeers6 = types.parseCompactPeers6;
 
 /// Check if the first 4 bytes of a response indicate an error action.
 pub fn isErrorResponse(buf: []const u8) bool {
@@ -472,8 +440,8 @@ pub fn resetGlobalCache() void {
 /// Implements BEP 15 connect + announce with exponential backoff retries.
 pub fn fetchViaUdp(
     allocator: std.mem.Allocator,
-    request: announce_mod.Request,
-) !announce_mod.Response {
+    request: types.Request,
+) !types.Response {
     const parsed = parseUdpUrl(request.announce_url) orelse return error.InvalidTrackerUrl;
 
     // Resolve address
@@ -519,7 +487,7 @@ pub fn fetchViaUdp(
     var resp_buf: [max_response_size]u8 = undefined;
     var resp_n: usize = 0;
     var announce_ok = false;
-    for (0..@min(max_retries, 4)) |attempt| {
+    for (0..max_retries) |attempt| {
         const timeout_secs = retransmitTimeout(@intCast(attempt));
         const to = posix.timeval{ .sec = @intCast(timeout_secs), .usec = 0 };
         posix.setsockopt(fd, posix.SOL.SOCKET, posix.SO.RCVTIMEO, std.mem.asBytes(&to)) catch {};
@@ -584,7 +552,7 @@ fn performConnect(fd: posix.fd_t, host: []const u8, port: u16) !u64 {
     const connect_req = ConnectRequest{ .transaction_id = transaction_id };
     const connect_buf = connect_req.encode();
 
-    for (0..@min(max_retries, 4)) |attempt| {
+    for (0..max_retries) |attempt| {
         const timeout_secs = retransmitTimeout(@intCast(attempt));
         const to = posix.timeval{ .sec = @intCast(timeout_secs), .usec = 0 };
         posix.setsockopt(fd, posix.SOL.SOCKET, posix.SO.RCVTIMEO, std.mem.asBytes(&to)) catch {};
@@ -644,7 +612,7 @@ pub fn scrapeViaUdp(
     var resp_buf: [128]u8 = undefined;
     var resp_n: usize = 0;
     var scrape_ok = false;
-    for (0..@min(max_retries, 4)) |attempt| {
+    for (0..max_retries) |attempt| {
         const timeout_secs = retransmitTimeout(@intCast(attempt));
         const to = posix.timeval{ .sec = @intCast(timeout_secs), .usec = 0 };
         posix.setsockopt(fd, posix.SOL.SOCKET, posix.SO.RCVTIMEO, std.mem.asBytes(&to)) catch {};

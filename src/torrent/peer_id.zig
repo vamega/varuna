@@ -74,14 +74,14 @@ pub fn parseMasquerade(spec: []const u8) ?MasqueradeResult {
     if (vi == 0) return null;
 
     // Match client name (case-insensitive)
-    if (eqlIgnoreCase(client_name, "qBittorrent") or eqlIgnoreCase(client_name, "qbittorrent")) {
+    if (eqlIgnoreCase(client_name, "qBittorrent")) {
         return .{
             .client = .qbittorrent,
             .prefix = azureusPrefix("qB", version),
         };
     }
 
-    if (eqlIgnoreCase(client_name, "rTorrent") or eqlIgnoreCase(client_name, "rtorrent")) {
+    if (eqlIgnoreCase(client_name, "rTorrent")) {
         // rTorrent uses libtorrent-rakshasa's peer ID: -ltXYZW-
         // Version encoding: major as digit, minor as char (0-9 for 0-9, A=10, B=11, ...G=16, etc.)
         // patch and build as digits. e.g. 0.16 -> -lt0G60-
@@ -92,7 +92,6 @@ pub fn parseMasquerade(spec: []const u8) ?MasqueradeResult {
     }
 
     if (eqlIgnoreCase(client_name, "uTorrent") or
-        eqlIgnoreCase(client_name, "utorrent") or
         std.mem.eql(u8, client_name, "\xc2\xb5Torrent") or // UTF-8 µ
         std.mem.eql(u8, client_name, "\xb5Torrent")) // Latin-1 µ
     {
@@ -102,14 +101,14 @@ pub fn parseMasquerade(spec: []const u8) ?MasqueradeResult {
         };
     }
 
-    if (eqlIgnoreCase(client_name, "Deluge") or eqlIgnoreCase(client_name, "deluge")) {
+    if (eqlIgnoreCase(client_name, "Deluge")) {
         return .{
             .client = .deluge,
             .prefix = azureusPrefix("DE", version),
         };
     }
 
-    if (eqlIgnoreCase(client_name, "Transmission") or eqlIgnoreCase(client_name, "transmission")) {
+    if (eqlIgnoreCase(client_name, "Transmission")) {
         return .{
             .client = .transmission,
             .prefix = azureusPrefix("TR", version),

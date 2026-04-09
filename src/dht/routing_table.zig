@@ -25,6 +25,13 @@ pub const NodeStatus = enum {
     bad,
 };
 
+/// Classify a node's status per BEP 5 section 2.
+pub fn classifyNode(n: *const NodeInfo, now: i64) NodeStatus {
+    if (n.failed_queries >= 2) return .bad;
+    if (n.ever_responded and (now - n.last_seen) < good_timeout_secs) return .good;
+    return .questionable;
+}
+
 pub const KBucket = struct {
     nodes: [K]NodeInfo = undefined,
     count: u8 = 0,
@@ -36,16 +43,6 @@ pub const KBucket = struct {
 
     pub fn nodeCount(self: *const KBucket) u8 {
         return self.count;
-    }
-
-    /// Classify a node's status per BEP 5 section 2.
-    pub fn classifyNode(n: *const NodeInfo, now: i64) NodeStatus {
-        // Bad: failed to respond to multiple consecutive queries
-        if (n.failed_queries >= 2) return .bad;
-        // Good: responded in last 15 minutes, or ever responded and seen recently
-        if (n.ever_responded and (now - n.last_seen) < good_timeout_secs) return .good;
-        // Questionable: not seen recently
-        return .questionable;
     }
 
     /// Add a new node or update an existing one.
@@ -216,7 +213,7 @@ pub const RoutingTable = struct {
         var count: usize = 0;
         for (&self.buckets) |*bucket| {
             for (bucket.getNodes()) |*n| {
-                if (KBucket.classifyNode(n, now) == .good) {
+                if (classifyNode(n, now) == .good) {
                     count += 1;
                 }
             }
@@ -249,8 +246,8 @@ pub const RoutingTable = struct {
         for (&self.buckets) |*bucket| {
             for (bucket.getNodes()) |*n| {
                 if (count >= buf.len) return count;
-                if (KBucket.classifyNode(n, now) == .good or
-                    KBucket.classifyNode(n, now) == .questionable)
+                if (classifyNode(n, now) == .good or
+                    classifyNode(n, now) == .questionable)
                 {
                     buf[count] = n.*;
                     count += 1;
@@ -264,18 +261,18 @@ pub const RoutingTable = struct {
 // ── Tests ──────────────────────────────────────────────
 
 test "empty routing table has zero nodes" {
-    const own_id = node_id.generate();
+    const own_id = node_id.generateRandom();
     const table = RoutingTable.init(own_id);
     try std.testing.expectEqual(@as(usize, 0), table.nodeCount());
 }
 
 test "add node to routing table" {
-    const own_id = node_id.generate();
+    const own_id = node_id.generateRandom();
     var table = RoutingTable.init(own_id);
     const now: i64 = 1000000;
 
     const other = NodeInfo{
-        .id = node_id.generate(),
+        .id = node_id.generateRandom(),
         .address = std.net.Address.initIp4(.{ 10, 0, 0, 1 }, 6881),
     };
 
@@ -285,11 +282,11 @@ test "add node to routing table" {
 }
 
 test "update existing node" {
-    const own_id = node_id.generate();
+    const own_id = node_id.generateRandom();
     var table = RoutingTable.init(own_id);
     const now: i64 = 1000000;
 
-    const other_id = node_id.generate();
+    const other_id = node_id.generateRandom();
     const info = NodeInfo{
         .id = other_id,
         .address = std.net.Address.initIp4(.{ 10, 0, 0, 1 }, 6881),
@@ -371,19 +368,19 @@ test "bad node gets replaced" {
 }
 
 test "findClosest returns sorted results" {
-    const own_id = node_id.generate();
+    const own_id = node_id.generateRandom();
     var table = RoutingTable.init(own_id);
     const now: i64 = 1000000;
 
     // Add several nodes
     for (0..20) |_| {
         _ = table.addNode(.{
-            .id = node_id.generate(),
+            .id = node_id.generateRandom(),
             .address = std.net.Address.initIp4(.{ 10, 0, 0, 1 }, 6881),
         }, now);
     }
 
-    const target = node_id.generate();
+    const target = node_id.generateRandom();
     var buf: [8]NodeInfo = undefined;
     const count = table.findClosest(target, 8, &buf);
     try std.testing.expect(count > 0);
@@ -395,13 +392,13 @@ test "findClosest returns sorted results" {
 }
 
 test "needsRefresh detects stale buckets" {
-    const own_id = node_id.generate();
+    const own_id = node_id.generateRandom();
     var table = RoutingTable.init(own_id);
     const now: i64 = 1000000;
 
     // Add a node -- bucket is fresh
     const other = NodeInfo{
-        .id = node_id.generate(),
+        .id = node_id.generateRandom(),
         .address = std.net.Address.initIp4(.{ 10, 0, 0, 1 }, 6881),
     };
     _ = table.addNode(other, now);
@@ -418,31 +415,31 @@ test "node classification" {
 
     // Good: responded recently
     const good_node = NodeInfo{
-        .id = node_id.generate(),
+        .id = node_id.generateRandom(),
         .address = undefined,
         .last_seen = now - 100,
         .ever_responded = true,
         .failed_queries = 0,
     };
-    try std.testing.expect(KBucket.classifyNode(&good_node, now) == .good);
+    try std.testing.expect(classifyNode(&good_node, now) == .good);
 
     // Questionable: not seen recently
     const questionable_node = NodeInfo{
-        .id = node_id.generate(),
+        .id = node_id.generateRandom(),
         .address = undefined,
         .last_seen = now - good_timeout_secs - 1,
         .ever_responded = true,
         .failed_queries = 0,
     };
-    try std.testing.expect(KBucket.classifyNode(&questionable_node, now) == .questionable);
+    try std.testing.expect(classifyNode(&questionable_node, now) == .questionable);
 
     // Bad: multiple failures
     const bad_node = NodeInfo{
-        .id = node_id.generate(),
+        .id = node_id.generateRandom(),
         .address = undefined,
         .last_seen = now,
         .ever_responded = true,
         .failed_queries = 2,
     };
-    try std.testing.expect(KBucket.classifyNode(&bad_node, now) == .bad);
+    try std.testing.expect(classifyNode(&bad_node, now) == .bad);
 }

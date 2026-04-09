@@ -71,26 +71,6 @@ pub fn freeManifest(allocator: std.mem.Allocator, manifest: Manifest) void {
     allocator.free(manifest.files);
 }
 
-fn joinValidatedPath(
-    allocator: std.mem.Allocator,
-    root_name: []const u8,
-    components: []const []const u8,
-) ![]const u8 {
-    try validateComponent(root_name);
-
-    var path = std.ArrayList(u8).empty;
-    defer path.deinit(allocator);
-
-    try path.appendSlice(allocator, root_name);
-    for (components) |component| {
-        try validateComponent(component);
-        try path.append(allocator, std.fs.path.sep);
-        try path.appendSlice(allocator, component);
-    }
-
-    return path.toOwnedSlice(allocator);
-}
-
 fn validatePath(path: []const u8) !void {
     var iterator = std.mem.splitScalar(u8, path, std.fs.path.sep);
     while (iterator.next()) |component| {

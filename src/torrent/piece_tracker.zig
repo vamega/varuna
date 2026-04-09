@@ -132,14 +132,12 @@ pub const PieceTracker = struct {
     }
 
     /// Report a full bitfield from a peer (from bitfield message).
-    pub fn addBitfieldAvailability(self: *PieceTracker, bitfield_data: []const u8) void {
+    pub fn addBitfieldAvailability(self: *PieceTracker, bitfield_data: *const Bitfield) void {
         self.mutex.lock();
         defer self.mutex.unlock();
         var index: u32 = 0;
         while (index < self.piece_count) : (index += 1) {
-            const byte_index: usize = @intCast(index / 8);
-            const bit_index: u3 = @intCast(7 - (index % 8));
-            if (byte_index < bitfield_data.len and (bitfield_data[byte_index] & (@as(u8, 1) << bit_index)) != 0) {
+            if (bitfield_data.has(index)) {
                 self.availability[index] +|= 1;
             }
         }
@@ -402,11 +400,7 @@ pub const PieceTracker = struct {
     }
 
     fn clearInProgress(self: *PieceTracker, piece_index: u32) void {
-        if (piece_index >= self.piece_count) return;
-        const byte_index: usize = @intCast(piece_index / 8);
-        const bit_index: u3 = @intCast(7 - (piece_index % 8));
-        self.in_progress.bits[byte_index] &= ~(@as(u8, 1) << bit_index);
-        if (self.in_progress.count > 0) self.in_progress.count -= 1;
+        self.in_progress.clear(piece_index);
     }
 };
 
@@ -524,8 +518,13 @@ test "addBitfieldAvailability updates counts" {
     var tracker = try PieceTracker.init(std.testing.allocator, 8, 4, 32, &bf, 0);
     defer tracker.deinit(std.testing.allocator);
 
-    // Peer has pieces 0, 2, 4 (bits: 10101000)
-    tracker.addBitfieldAvailability(&[_]u8{0b10101000});
+    // Peer has pieces 0, 2, 4
+    var peer_bf = try Bitfield.init(std.testing.allocator, 8);
+    defer peer_bf.deinit(std.testing.allocator);
+    try peer_bf.set(0);
+    try peer_bf.set(2);
+    try peer_bf.set(4);
+    tracker.addBitfieldAvailability(&peer_bf);
 
     try std.testing.expectEqual(@as(u16, 1), tracker.availability[0]);
     try std.testing.expectEqual(@as(u16, 0), tracker.availability[1]);

@@ -6,12 +6,18 @@ const ring_mod = @import("../io/ring.zig");
 
 pub const Summary = struct {
     release: []const u8,
-    version_text: []const u8,
+    build_info: []const u8,
     machine: []const u8,
     kernel_version: kernel.Version,
-    support: @TypeOf(requirements.classify(requirements.minimum_supported)),
+    support: requirements.SupportLevel,
     is_wsl: bool,
     io_uring_available: bool,
+
+    pub fn deinit(self: Summary, allocator: std.mem.Allocator) void {
+        allocator.free(self.release);
+        allocator.free(self.build_info);
+        allocator.free(self.machine);
+    }
 };
 
 pub fn ensureSupported(summary: Summary) !void {
@@ -32,13 +38,13 @@ pub fn detectCurrent(allocator: std.mem.Allocator) !Summary {
 pub fn fromStrings(
     allocator: std.mem.Allocator,
     release: []const u8,
-    version_text: []const u8,
+    build_info: []const u8,
     machine: []const u8,
 ) !Summary {
     const release_copy = try allocator.dupe(u8, release);
     errdefer allocator.free(release_copy);
 
-    const version_copy = try allocator.dupe(u8, version_text);
+    const version_copy = try allocator.dupe(u8, build_info);
     errdefer allocator.free(version_copy);
 
     const machine_copy = try allocator.dupe(u8, machine);
@@ -47,19 +53,13 @@ pub fn fromStrings(
     const parsed = try kernel.parseRelease(release);
     return .{
         .release = release_copy,
-        .version_text = version_copy,
+        .build_info = version_copy,
         .machine = machine_copy,
         .kernel_version = parsed,
         .support = requirements.classify(parsed),
-        .is_wsl = containsInsensitive(release, "microsoft") or containsInsensitive(version_text, "microsoft"),
+        .is_wsl = containsInsensitive(release, "microsoft") or containsInsensitive(build_info, "microsoft"),
         .io_uring_available = ring_mod.probe(),
     };
-}
-
-pub fn freeSummary(allocator: std.mem.Allocator, summary: Summary) void {
-    allocator.free(summary.release);
-    allocator.free(summary.version_text);
-    allocator.free(summary.machine);
 }
 
 fn containsInsensitive(haystack: []const u8, needle: []const u8) bool {
@@ -73,7 +73,7 @@ test "classify WSL kernel summary" {
         "#1 SMP PREEMPT_DYNAMIC Microsoft",
         "x86_64",
     );
-    defer freeSummary(std.testing.allocator, summary);
+    defer summary.deinit(std.testing.allocator);
 
     try std.testing.expectEqual(@as(u32, 6), summary.kernel_version.major);
     try std.testing.expectEqual(@as(u32, 6), summary.kernel_version.minor);
@@ -88,7 +88,7 @@ test "classify preferred non WSL kernel summary" {
         "#12-Ubuntu SMP",
         "x86_64",
     );
-    defer freeSummary(std.testing.allocator, summary);
+    defer summary.deinit(std.testing.allocator);
 
     try std.testing.expectEqual(.preferred, summary.support);
     try std.testing.expect(!summary.is_wsl);
@@ -101,7 +101,7 @@ test "ensureSupported rejects unsupported kernels" {
         "#1 SMP",
         "x86_64",
     );
-    defer freeSummary(std.testing.allocator, summary);
+    defer summary.deinit(std.testing.allocator);
 
     try std.testing.expectError(error.UnsupportedKernel, ensureSupported(summary));
 }
@@ -113,7 +113,7 @@ test "ensureSupported rejects missing io_uring" {
         "#12-Ubuntu SMP",
         "x86_64",
     );
-    defer freeSummary(std.testing.allocator, summary);
+    defer summary.deinit(std.testing.allocator);
     summary.io_uring_available = false;
 
     try std.testing.expectError(error.IoUringUnavailable, ensureSupported(summary));

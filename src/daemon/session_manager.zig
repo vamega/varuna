@@ -7,7 +7,7 @@ pub const CategoryStore = categories_mod.CategoryStore;
 pub const TagStore = categories_mod.TagStore;
 pub const QueueManager = @import("queue_manager.zig").QueueManager;
 pub const QueueConfig = @import("queue_manager.zig").QueueConfig;
-const ResumeDb = @import("../storage/resume.zig").ResumeDb;
+const ResumeDb = @import("../storage/state_db.zig").ResumeDb;
 const BanList = @import("../net/ban_list.zig").BanList;
 const TrackerExecutor = @import("tracker_executor.zig").TrackerExecutor;
 const UdpTrackerExecutor = @import("udp_tracker_executor.zig").UdpTrackerExecutor;
@@ -497,18 +497,18 @@ pub const SessionManager = struct {
                 // Actually, just run enforcement which will pick this one up
                 // if there is a slot available
                 session.state = .paused; // mark as "wants to run"
-                session.resume_session();
+                session.unpause();
                 // If enforcement says it can't be active, queue it again
                 if (!self.queue_manager.shouldBeActive(session.info_hash_hex, &self.sessions)) {
                     session.pause();
                     session.state = .queued;
                 }
             } else {
-                session.state = .paused; // so resume_session sees .paused
-                session.resume_session();
+                session.state = .paused; // so unpause sees .paused
+                session.unpause();
             }
         } else {
-            session.resume_session();
+            session.unpause();
         }
     }
 
@@ -821,8 +821,8 @@ pub const SessionManager = struct {
         for (to_start[0..to_start_count]) |hash| {
             if (self.sessions.get(&hash)) |session| {
                 if (session.state == .queued) {
-                    session.state = .paused; // so resume_session sees .paused
-                    session.resume_session();
+                    session.state = .paused; // so unpause sees .paused
+                    session.unpause();
                 }
             }
         }
@@ -970,7 +970,7 @@ pub const SessionManager = struct {
             _ = self.relocating_torrents.remove(info_hash_hex);
             if (self.sessions.get(hash)) |live_session| {
                 if (was_active and live_session.state != .queued) {
-                    live_session.resume_session();
+                    live_session.unpause();
                 }
             }
             return err;
@@ -988,7 +988,7 @@ pub const SessionManager = struct {
 
         // Resume if it was active
         if (was_active) {
-            live_session.resume_session();
+            live_session.unpause();
         }
     }
 
@@ -1487,7 +1487,7 @@ pub const SessionManager = struct {
         info_hash_v2: ?[32]u8 = null,
         name: []const u8, // owned, caller must free
         created_by: []const u8, // owned, caller must free
-        creation_date: i64,
+        creation_date: ?i64,
         trackers_count: u32,
         web_seeds_count: u32 = 0, // BEP 19 url-list + BEP 17 httpseeds
         /// Tracker scrape: total seeders.
@@ -1551,7 +1551,7 @@ pub const SessionManager = struct {
             .info_hash_v2 = stats.info_hash_v2,
             .name = try allocator.dupe(u8, name),
             .created_by = try allocator.dupe(u8, created_by),
-            .creation_date = if (meta_opt) |m| m.creation_date else -1,
+            .creation_date = if (meta_opt) |m| m.creation_date else null,
             .trackers_count = stats.trackers_count,
             .web_seeds_count = if (meta_opt) |m| @intCast(m.url_list.len + m.http_seeds.len) else 0,
             .scrape_complete = stats.scrape_complete,

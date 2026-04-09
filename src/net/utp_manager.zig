@@ -224,21 +224,11 @@ pub const UtpManager = struct {
         };
     }
 
-    fn findByRecvId(self: *const UtpManager, conn_id: u16) ?u16 {
-        for (0..max_connections) |i| {
-            if (!self.slot_active[i]) continue;
-            if (self.connections[i].recv_id == conn_id) return @intCast(i);
-        }
-        return null;
-    }
-
     fn findByRecvIdRemote(self: *const UtpManager, conn_id: u16, remote: std.net.Address) ?u16 {
-        const remote_key = @import("pex.zig").CompactPeer.fromAddress(remote);
         for (0..max_connections) |i| {
             if (!self.slot_active[i]) continue;
             if (self.connections[i].recv_id != conn_id) continue;
-            const candidate_key = @import("pex.zig").CompactPeer.fromAddress(self.connections[i].remote_addr);
-            if (candidate_key.len == remote_key.len and std.mem.eql(u8, candidate_key.data[0..candidate_key.len], remote_key.data[0..remote_key.len])) {
+            if (@import("address.zig").addressEql(self.connections[i].remote_addr, remote)) {
                 return @intCast(i);
             }
         }

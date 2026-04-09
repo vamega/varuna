@@ -1,5 +1,6 @@
 const std = @import("std");
 const bencode = @import("../torrent/bencode.zig");
+const types = @import("types.zig");
 const udp_mod = @import("udp.zig");
 
 /// Tracker scrape result: swarm statistics for a single info_hash.
@@ -47,7 +48,7 @@ pub fn buildScrapeUrl(allocator: std.mem.Allocator, announce_url: []const u8, in
     try url.appendSlice(allocator, base);
     try url.append(allocator, if (std.mem.indexOfScalar(u8, base, '?') == null) '?' else '&');
     try url.appendSlice(allocator, "info_hash=");
-    try appendPercentEncoded(allocator, &url, info_hash[0..]);
+    try types.appendPercentEncoded(allocator, &url, info_hash[0..]);
 
     return url.toOwnedSlice(allocator);
 }
@@ -200,32 +201,6 @@ fn expectU32(value: bencode.Value) !u32 {
             return std.math.cast(u32, i) orelse error.IntegerOverflow;
         },
         else => error.UnexpectedBencodeType,
-    };
-}
-
-// ── Helpers ──────────────────────────────────────────────
-
-fn appendPercentEncoded(
-    allocator: std.mem.Allocator,
-    url: *std.ArrayList(u8),
-    bytes: []const u8,
-) !void {
-    const hex = "0123456789ABCDEF";
-    for (bytes) |byte| {
-        if (isUnreserved(byte)) {
-            try url.append(allocator, byte);
-        } else {
-            try url.append(allocator, '%');
-            try url.append(allocator, hex[byte >> 4]);
-            try url.append(allocator, hex[byte & 0x0f]);
-        }
-    }
-}
-
-fn isUnreserved(byte: u8) bool {
-    return switch (byte) {
-        'A'...'Z', 'a'...'z', '0'...'9', '-', '.', '_', '~' => true,
-        else => false,
     };
 }
 

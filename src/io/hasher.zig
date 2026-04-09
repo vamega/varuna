@@ -117,13 +117,6 @@ pub const Hasher = struct {
         return self;
     }
 
-    // Keep init as a convenience that returns the struct (for tests only)
-    pub fn init(allocator: std.mem.Allocator, thread_count: ?u32) !Hasher {
-        _ = thread_count;
-        _ = allocator;
-        return error.UseCreateInstead;
-    }
-
     pub fn deinit(self: *Hasher) void {
         self.running.store(false, .release);
         self.queue_cond.broadcast();

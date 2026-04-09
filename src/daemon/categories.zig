@@ -95,8 +95,8 @@ pub const CategoryStore = struct {
     }
 
     /// Serialize all categories as JSON: {"name":{"name":"...","savePath":"..."},...}
-    pub fn serializeJson(self: *const CategoryStore, allocator: std.mem.Allocator) ![]u8 {
-        const cached = try @constCast(self).cachedJson();
+    pub fn serializeJson(self: *CategoryStore, allocator: std.mem.Allocator) ![]u8 {
+        const cached = try self.cachedJson();
         return allocator.dupe(u8, cached);
     }
 
@@ -173,8 +173,8 @@ pub const TagStore = struct {
     }
 
     /// Serialize all tags as JSON array: ["tag1","tag2",...]
-    pub fn serializeJson(self: *const TagStore, allocator: std.mem.Allocator) ![]u8 {
-        const cached = try @constCast(self).cachedJson();
+    pub fn serializeJson(self: *TagStore, allocator: std.mem.Allocator) ![]u8 {
+        const cached = try self.cachedJson();
         return allocator.dupe(u8, cached);
     }
 

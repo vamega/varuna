@@ -13,8 +13,7 @@ const MerkleCache = @import("../torrent/merkle_cache.zig").MerkleCache;
 // ── Constants ────────────────────────────────────────────
 
 pub const max_peers: u16 = 4096;
-pub const TorrentIdType = u32;
-pub const TorrentId = TorrentIdType;
+pub const TorrentId = u32;
 
 // ── User data encoding ────────────────────────────────────
 
@@ -62,8 +61,8 @@ pub fn decodeUserData(user_data: u64) OpData {
 // ── Peer ──────────────────────────────────────────────────
 
 pub const PeerMode = enum {
-    download, // we connected out -- we request pieces
-    seed, // peer connected to us -- we serve pieces
+    outbound, // we connected out -- we request pieces
+    inbound, // peer connected to us -- we serve pieces
 };
 
 pub const Transport = enum {
@@ -94,9 +93,9 @@ pub const PeerState = enum {
 pub const Peer = struct {
     fd: posix.fd_t = -1,
     state: PeerState = .free,
-    mode: PeerMode = .download,
+    mode: PeerMode = .outbound,
     transport: Transport = .tcp,
-    torrent_id: TorrentIdType = 0,
+    torrent_id: TorrentId = 0,
     address: std.net.Address = undefined,
     utp_slot: ?u16 = null, // UtpManager slot index (only for uTP peers)
 

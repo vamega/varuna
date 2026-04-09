@@ -13,11 +13,13 @@ pub const preferred_supported = kernel.Version{
     .patch = 0,
 };
 
-pub fn classify(version: kernel.Version) enum {
+pub const SupportLevel = enum {
     unsupported,
     baseline,
     preferred,
-} {
+};
+
+pub fn classify(version: kernel.Version) SupportLevel {
     if (version.order(minimum_supported) == .lt) {
         return .unsupported;
     }

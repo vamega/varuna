@@ -2,7 +2,7 @@ const std = @import("std");
 const TorrentStats = @import("../daemon/torrent_session.zig").Stats;
 const SessionManager = @import("../daemon/session_manager.zig").SessionManager;
 const compat = @import("compat.zig");
-const json_mod = @import("json.zig");
+const json_esc = @import("json.zig");
 
 /// Delta sync state for the /api/v2/sync/maindata endpoint.
 /// Tracks torrent snapshots across request IDs so that only changes
@@ -22,8 +22,7 @@ pub const SyncState = struct {
         /// Map of info_hash_hex -> hash of the serialized stats, for cheap change detection.
         torrent_hashes: std.AutoHashMap([40]u8, u64),
 
-        fn deinit(self: *Snapshot, allocator: std.mem.Allocator) void {
-            _ = allocator;
+        fn deinit(self: *Snapshot) void {
             self.torrent_hashes.deinit();
         }
     };
@@ -35,7 +34,7 @@ pub const SyncState = struct {
     pub fn deinit(self: *SyncState) void {
         for (&self.snapshots) |*slot| {
             if (slot.*) |*snap| {
-                snap.deinit(self.allocator);
+                snap.deinit();
                 slot.* = null;
             }
         }
@@ -184,7 +183,7 @@ pub const SyncState = struct {
 
         // Free previous snapshot in this slot
         if (self.snapshots[slot]) |*old| {
-            old.deinit(self.allocator);
+            old.deinit();
         }
 
         var hashes = std.AutoHashMap([40]u8, u64).init(self.allocator);
@@ -290,7 +289,7 @@ pub const PeerSyncState = struct {
                     if (!current_hashes.contains(entry.key_ptr.*)) {
                         if (!first_removed) try out.append(allocator, ',');
                         first_removed = false;
-                        try out.writer(allocator).print("\"{f}\"", .{json_mod.jsonSafe(entry.key_ptr.*)});
+                        try out.writer(allocator).print("\"{f}\"", .{json_esc.jsonSafe(entry.key_ptr.*)});
                     }
                 }
             }
@@ -390,7 +389,7 @@ fn serializePeerObject(
     json_buf: *std.ArrayList(u8),
     peer: SessionManager.PeerInfo,
 ) !void {
-    const esc = json_mod.jsonSafe;
+    const esc = json_esc.jsonSafe;
     try json_buf.writer(allocator).print("\"{f}\":{{\"client\":\"{f}\",\"connection\":\"\",\"country\":\"\",\"country_code\":\"\",\"dl_speed\":{},\"downloaded\":{},\"files\":\"\",\"flags\":\"{f}\",\"flags_desc\":\"\",\"ip\":\"{f}\",\"port\":{},\"progress\":{d:.4},\"relevance\":1,\"up_speed\":{},\"uploaded\":{},\"upload_only\":{}}}", .{
         esc(peer.ip),
         esc(peer.client),

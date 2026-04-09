@@ -95,12 +95,12 @@ pub const HttpClient = struct {
         return self.getWithHeaders(url, &headers);
     }
 
-    /// Plain HTTP GET over io_uring.
+    /// Plain HTTP GET over blocking posix I/O.
     fn getHttp(self: *HttpClient, parsed: ParsedUrl) !HttpResponse {
         return self.getHttpWithHeaders(parsed, &.{});
     }
 
-    /// Plain HTTP GET over io_uring with additional headers.
+    /// Plain HTTP GET over blocking posix I/O with additional headers.
     fn getHttpWithHeaders(self: *HttpClient, parsed: ParsedUrl, extra_headers: []const []const u8) !HttpResponse {
         if (self.persistent_plain_http) {
             return self.getHttpWithReuse(parsed, extra_headers);

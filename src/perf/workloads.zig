@@ -152,7 +152,7 @@ fn runPeerScan(
     for (peers, 0..) |*peer, idx| {
         if (active_stride > 1 and idx % active_stride != 0) continue;
         peer.state = if (idx % 7 == 0) .disconnecting else .active_recv_header;
-        peer.mode = if (idx % 3 == 0) .seed else .download;
+        peer.mode = if (idx % 3 == 0) .inbound else .outbound;
         peer.torrent_id = @intCast(idx % @max(config.torrents, 1));
         peer.peer_interested = (idx & 1) == 0;
         peer.am_choking = (idx & 3) == 0;
@@ -174,7 +174,7 @@ fn runPeerScan(
         for (active_slots.items) |slot| {
             const peer = &peers[slot];
             if (peer.state == .free or peer.state == .disconnecting) continue;
-            if (peer.mode == .seed) continue;
+            if (peer.mode == .inbound) continue;
             if (peer.last_activity != 0 and (std.time.timestamp() - peer.last_activity) > 60) {
                 timeout_count += 1;
             }
@@ -184,7 +184,7 @@ fn runPeerScan(
         for (active_slots.items) |idx| {
             const peer = &peers[idx];
             if (peer.state == .free or peer.state == .disconnecting) continue;
-            if (peer.mode != .seed) continue;
+            if (peer.mode != .inbound) continue;
             if (!peer.peer_interested) continue;
             interested_slots[interested_count] = idx;
             interested_count += 1;
@@ -491,7 +491,7 @@ fn runSeedPlaintextBurst(
     event_loop.peers[0] = .{
         .fd = fds[0],
         .state = .active_recv_header,
-        .mode = .seed,
+        .mode = .inbound,
         .torrent_id = 0,
         .crypto = mse_mod.PeerCrypto.plaintext,
     };
@@ -784,13 +784,12 @@ fn runExtensionDecode(
     var checksum: u64 = 0;
 
     for (0..iterations) |_| {
-        var decoded = try varuna.net.extensions.decodeExtensionHandshake(allocator, payload);
-        checksum +%= decoded.handshake.extensions.ut_metadata;
-        checksum +%= decoded.handshake.extensions.ut_pex;
-        checksum +%= decoded.handshake.port;
-        checksum +%= decoded.handshake.metadata_size;
-        checksum +%= @intFromBool(decoded.handshake.upload_only);
-        varuna.net.extensions.freeDecoded(allocator, &decoded);
+        const decoded = try varuna.net.extensions.decodeExtensionHandshake(payload);
+        checksum +%= decoded.extensions.ut_metadata;
+        checksum +%= decoded.extensions.ut_pex;
+        checksum +%= decoded.port;
+        checksum +%= decoded.metadata_size;
+        checksum +%= @intFromBool(decoded.upload_only);
     }
 
     return makeResult("extension_decode", iterations, &timer, checksum, alloc_counter);
@@ -1759,7 +1758,7 @@ fn runSyncStatsLive(
             const peer = &event_loop.peers[slot];
             peer.* = .{
                 .state = .active_recv_header,
-                .mode = .seed,
+                .mode = .inbound,
                 .torrent_id = torrent_id,
                 .availability_known = true,
                 .peer_choking = false,
@@ -1870,7 +1869,7 @@ fn runTickSparseTorrents(
             const peer = &el.peers[slot];
             peer.* = .{
                 .state = .active_recv_header,
-                .mode = .seed,
+                .mode = .inbound,
                 .torrent_id = torrent_id,
                 .availability_known = true,
                 .peer_choking = false,

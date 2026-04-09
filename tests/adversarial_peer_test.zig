@@ -165,7 +165,7 @@ test "bitfield import with empty data sets nothing" {
 // ═══════════════════════════════════════════════════════════════
 
 test "extension handshake rejects empty input" {
-    const result = ext.decodeExtensionHandshake(std.testing.allocator, "");
+    const result = ext.decodeExtensionHandshake("");
     try std.testing.expectError(error.InvalidExtensionHandshake, result);
 }
 
@@ -173,20 +173,20 @@ test "extension handshake rejects non-dict input" {
     // Integer, list, byte string -- all invalid as extension handshake
     const bad_inputs = [_][]const u8{ "i42e", "le", "4:spam" };
     for (bad_inputs) |input| {
-        const result = ext.decodeExtensionHandshake(std.testing.allocator, input);
+        const result = ext.decodeExtensionHandshake(input);
         try std.testing.expectError(error.InvalidExtensionHandshake, result);
     }
 }
 
 test "extension handshake rejects truncated dict" {
     // dict that opens but never closes
-    const result = ext.decodeExtensionHandshake(std.testing.allocator, "d");
+    const result = ext.decodeExtensionHandshake("d");
     try std.testing.expectError(error.InvalidExtensionHandshake, result);
 }
 
 test "extension handshake rejects truncated key" {
     // dict with a key whose length exceeds remaining data
-    const result = ext.decodeExtensionHandshake(std.testing.allocator, "d99:");
+    const result = ext.decodeExtensionHandshake("d99:");
     try std.testing.expectError(error.InvalidExtensionHandshake, result);
 }
 
@@ -198,107 +198,99 @@ test "extension handshake rejects garbage bytes" {
         "d\xff",
     };
     for (garbage_inputs) |input| {
-        const result = ext.decodeExtensionHandshake(std.testing.allocator, input);
+        const result = ext.decodeExtensionHandshake(input);
         try std.testing.expect(std.meta.isError(result));
     }
 }
 
 test "extension handshake rejects trailing data after dict" {
     // Valid dict followed by extra bytes
-    const result = ext.decodeExtensionHandshake(std.testing.allocator, "deextra");
+    const result = ext.decodeExtensionHandshake("deextra");
     try std.testing.expectError(error.InvalidExtensionHandshake, result);
 }
 
 test "extension handshake rejects oversized bencode string claim" {
     // Key claims 99999999 bytes but the input is tiny
-    const result = ext.decodeExtensionHandshake(std.testing.allocator, "d99999999:xe");
+    const result = ext.decodeExtensionHandshake("d99999999:xe");
     try std.testing.expectError(error.InvalidExtensionHandshake, result);
 }
 
 test "extension handshake with negative port yields port=0" {
     const input = "d1:pi-1ee";
-    var result = ext.decodeExtensionHandshake(std.testing.allocator, input) catch {
+    const result = ext.decodeExtensionHandshake(input) catch {
         // Parser might reject this; that's fine
         return;
     };
-    defer ext.freeDecoded(std.testing.allocator, &result);
-    try std.testing.expectEqual(@as(u16, 0), result.handshake.port);
+    try std.testing.expectEqual(@as(u16, 0), result.port);
 }
 
 test "extension handshake with port overflow yields port=0" {
     const input = "d1:pi99999ee";
-    var result = ext.decodeExtensionHandshake(std.testing.allocator, input) catch {
+    const result = ext.decodeExtensionHandshake(input) catch {
         return;
     };
-    defer ext.freeDecoded(std.testing.allocator, &result);
-    try std.testing.expectEqual(@as(u16, 0), result.handshake.port);
+    try std.testing.expectEqual(@as(u16, 0), result.port);
 }
 
 test "extension handshake parses valid minimal dict" {
-    var result = try ext.decodeExtensionHandshake(std.testing.allocator, "de");
-    defer ext.freeDecoded(std.testing.allocator, &result);
-    try std.testing.expectEqual(@as(u16, 0), result.handshake.port);
-    try std.testing.expectEqual(@as(u8, 0), result.handshake.extensions.ut_metadata);
+    const result = try ext.decodeExtensionHandshake("de");
+    try std.testing.expectEqual(@as(u16, 0), result.port);
+    try std.testing.expectEqual(@as(u8, 0), result.extensions.ut_metadata);
 }
 
 test "extension handshake with wrong value types for known keys" {
     // "m" should be a dict but we give it an integer
-    const result1 = ext.decodeExtensionHandshake(std.testing.allocator, "d1:mi42ee");
+    const result1 = ext.decodeExtensionHandshake("d1:mi42ee");
     try std.testing.expect(std.meta.isError(result1));
 
     // "p" should be an integer but we give it a string
-    const result2 = ext.decodeExtensionHandshake(std.testing.allocator, "d1:p3:fooe");
+    const result2 = ext.decodeExtensionHandshake("d1:p3:fooe");
     try std.testing.expect(std.meta.isError(result2));
 
     // "v" should be a string but we give it an integer
-    const result3 = ext.decodeExtensionHandshake(std.testing.allocator, "d1:vi42ee");
+    const result3 = ext.decodeExtensionHandshake("d1:vi42ee");
     try std.testing.expect(std.meta.isError(result3));
 }
 
 test "extension handshake with nested extension map entries" {
     // Valid extension map with metadata ID
     const input = "d1:md11:ut_metadatai3eee";
-    var result = try ext.decodeExtensionHandshake(std.testing.allocator, input);
-    defer ext.freeDecoded(std.testing.allocator, &result);
-    try std.testing.expectEqual(@as(u8, 3), result.handshake.extensions.ut_metadata);
+    const result = try ext.decodeExtensionHandshake(input);
+    try std.testing.expectEqual(@as(u8, 3), result.extensions.ut_metadata);
 }
 
 test "extension handshake with negative extension ID is ignored" {
     // Negative IDs are out of range for u8, should be silently skipped
     const input = "d1:md11:ut_metadatai-1eee";
-    var result = try ext.decodeExtensionHandshake(std.testing.allocator, input);
-    defer ext.freeDecoded(std.testing.allocator, &result);
-    try std.testing.expectEqual(@as(u8, 0), result.handshake.extensions.ut_metadata);
+    const result = try ext.decodeExtensionHandshake(input);
+    try std.testing.expectEqual(@as(u8, 0), result.extensions.ut_metadata);
 }
 
 test "extension handshake with extension ID > 255 is ignored" {
     const input = "d1:md11:ut_metadatai999eee";
-    var result = try ext.decodeExtensionHandshake(std.testing.allocator, input);
-    defer ext.freeDecoded(std.testing.allocator, &result);
-    try std.testing.expectEqual(@as(u8, 0), result.handshake.extensions.ut_metadata);
+    const result = try ext.decodeExtensionHandshake(input);
+    try std.testing.expectEqual(@as(u8, 0), result.extensions.ut_metadata);
 }
 
 test "extension encode/decode roundtrip preserves fields" {
     const payload = try ext.encodeExtensionHandshake(std.testing.allocator, 6881, false);
     defer std.testing.allocator.free(payload);
 
-    var result = try ext.decodeExtensionHandshake(std.testing.allocator, payload);
-    defer ext.freeDecoded(std.testing.allocator, &result);
+    const result = try ext.decodeExtensionHandshake(payload);
 
-    try std.testing.expectEqual(@as(u16, 6881), result.handshake.port);
-    try std.testing.expectEqual(@as(u8, ext.local_ut_metadata_id), result.handshake.extensions.ut_metadata);
-    try std.testing.expect(result.handshake.extensions.ut_pex != 0);
+    try std.testing.expectEqual(@as(u16, 6881), result.port);
+    try std.testing.expectEqual(@as(u8, ext.local_ut_metadata_id), result.extensions.ut_metadata);
+    try std.testing.expect(result.extensions.ut_pex != 0);
 }
 
 test "private torrent extension handshake omits ut_pex" {
     const payload = try ext.encodeExtensionHandshake(std.testing.allocator, 6881, true);
     defer std.testing.allocator.free(payload);
 
-    var result = try ext.decodeExtensionHandshake(std.testing.allocator, payload);
-    defer ext.freeDecoded(std.testing.allocator, &result);
+    const result = try ext.decodeExtensionHandshake(payload);
 
-    try std.testing.expectEqual(@as(u8, ext.local_ut_metadata_id), result.handshake.extensions.ut_metadata);
-    try std.testing.expectEqual(@as(u8, 0), result.handshake.extensions.ut_pex);
+    try std.testing.expectEqual(@as(u8, ext.local_ut_metadata_id), result.extensions.ut_metadata);
+    try std.testing.expectEqual(@as(u8, 0), result.extensions.ut_pex);
 }
 
 // ── BEP 10 reserved bit detection ──────────────────────────

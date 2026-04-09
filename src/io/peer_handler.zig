@@ -70,7 +70,7 @@ pub fn handleAccept(self: *EventLoop, cqe: linux.io_uring_cqe) void {
     peer.* = Peer{
         .fd = new_fd,
         .state = .inbound_handshake_recv,
-        .mode = .seed,
+        .mode = .inbound,
     };
     peer.handshake_offset = 0;
     self.peer_count += 1;
@@ -648,7 +648,7 @@ fn executeMseAction(self: *EventLoop, slot: u16, action: mse.MseAction, is_initi
                     peer.mse_initiator = null;
                     log.info("slot {d}: MSE handshake complete (initiator, method={s})", .{
                         slot,
-                        if (peer.crypto.method == mse.crypto_rc4) "RC4" else "plaintext",
+                        if (peer.crypto.crypto_method == mse.crypto_rc4) "RC4" else "plaintext",
                     });
                     // Proceed to BT handshake
                     sendBtHandshake(self, slot);
@@ -669,7 +669,7 @@ fn executeMseAction(self: *EventLoop, slot: u16, action: mse.MseAction, is_initi
                     peer.mse_responder = null;
                     log.info("slot {d}: MSE handshake complete (responder, method={s})", .{
                         slot,
-                        if (peer.crypto.method == mse.crypto_rc4) "RC4" else "plaintext",
+                        if (peer.crypto.crypto_method == mse.crypto_rc4) "RC4" else "plaintext",
                     });
                     // Now receive the BT handshake (which follows MSE)
                     peer.state = .inbound_handshake_recv;

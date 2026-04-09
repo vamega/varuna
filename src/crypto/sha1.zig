@@ -125,18 +125,12 @@ pub fn accel() Accel {
 }
 
 /// Returns true when SHA-NI (x86_64) or SHA1 (AArch64) hardware is in use.
-pub fn hasShaNi() bool {
+pub fn hasHwAccel() bool {
     const a = accel();
     return a != .software and a != .undetected;
 }
 
 var cached_accel: std.atomic.Value(Accel) = std.atomic.Value(Accel).init(.undetected);
-
-fn ensureDetected() void {
-    if (cached_accel.load(.acquire) == .undetected) {
-        detectAndCache();
-    }
-}
 
 fn detectAndCache() void {
     var result: Accel = .software;
@@ -233,9 +227,9 @@ fn round(d: *Sha1, b: *const [64]u8) void {
         return;
     }
 
-    ensureDetected();
+    const a = accel();
 
-    switch (cached_accel.load(.acquire)) {
+    switch (a) {
         .x86_sha_ni => {
             // Guard: only call SHA-NI asm on x86_64 targets.
             if (builtin.cpu.arch == .x86_64) {
@@ -970,11 +964,11 @@ test "sha1 runtime detection reports valid backend" {
     switch (a) {
         .software, .x86_sha_ni, .aarch64_sha1 => {},
     }
-    // hasShaNi must be consistent with accel.
+    // hasHwAccel must be consistent with accel.
     if (a == .software) {
-        try std.testing.expect(!Sha1.hasShaNi());
+        try std.testing.expect(!Sha1.hasHwAccel());
     } else {
-        try std.testing.expect(Sha1.hasShaNi());
+        try std.testing.expect(Sha1.hasHwAccel());
     }
 }
 

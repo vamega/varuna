@@ -123,23 +123,21 @@ test "private torrent extension handshake omits ut_pex" {
     const payload = try ext.encodeExtensionHandshake(std.testing.allocator, 6881, true);
     defer std.testing.allocator.free(payload);
 
-    var result = try ext.decodeExtensionHandshake(std.testing.allocator, payload);
-    defer ext.freeDecoded(std.testing.allocator, &result);
+    const result = try ext.decodeExtensionHandshake(payload);
 
     // ut_metadata should still be present (needed for magnet links)
-    try std.testing.expect(result.handshake.extensions.ut_metadata != 0);
+    try std.testing.expect(result.extensions.ut_metadata != 0);
     // ut_pex MUST be 0 for private torrents (BEP 27)
-    try std.testing.expectEqual(@as(u8, 0), result.handshake.extensions.ut_pex);
+    try std.testing.expectEqual(@as(u8, 0), result.extensions.ut_pex);
 }
 
 test "public torrent extension handshake includes ut_pex" {
     const payload = try ext.encodeExtensionHandshake(std.testing.allocator, 6881, false);
     defer std.testing.allocator.free(payload);
 
-    var result = try ext.decodeExtensionHandshake(std.testing.allocator, payload);
-    defer ext.freeDecoded(std.testing.allocator, &result);
+    const result = try ext.decodeExtensionHandshake(payload);
 
-    try std.testing.expect(result.handshake.extensions.ut_pex != 0);
+    try std.testing.expect(result.extensions.ut_pex != 0);
 }
 
 // ── Tracker error responses ─────────────────────────────────

@@ -8,12 +8,17 @@ const Bitfield = @import("../bitfield.zig").Bitfield;
 ///
 /// Runs on a dedicated background thread -- SQLite operations
 /// block and must NOT run on the io_uring event loop thread.
-pub const TransferStats = struct {
-    total_uploaded: u64 = 0,
-    total_downloaded: u64 = 0,
+pub const QueuePosition = struct {
+    info_hash_hex: [40]u8,
+    position: u32,
 };
 
 pub const ResumeDb = struct {
+    pub const TransferStats = struct {
+        total_uploaded: u64 = 0,
+        total_downloaded: u64 = 0,
+    };
+
     db: *sqlite.Db,
     insert_stmt: *sqlite.Stmt,
     query_stmt: *sqlite.Stmt,
@@ -415,7 +420,7 @@ pub const ResumeDb = struct {
             return error.SqliteDeleteFailed;
         }
 
-        inline for ([_][]const u8{
+        inline for ([_][*:0]const u8{
             "DELETE FROM transfer_stats WHERE info_hash = ?1",
             "DELETE FROM torrent_categories WHERE info_hash = ?1",
             "DELETE FROM torrent_tags WHERE info_hash = ?1",
@@ -1109,19 +1114,18 @@ pub const ResumeDb = struct {
     }
 
     /// Load all queue positions from SQLite.
-    pub fn loadQueuePositions(self: *ResumeDb, allocator: std.mem.Allocator) ![]@import("../daemon/queue_manager.zig").QueueEntry {
-        const QueueEntry = @import("../daemon/queue_manager.zig").QueueEntry;
+    pub fn loadQueuePositions(self: *ResumeDb, allocator: std.mem.Allocator) ![]QueuePosition {
         const stmt = try self.execOneShot(
             "SELECT info_hash_hex, position FROM queue_positions ORDER BY position ASC",
         );
-        var entries = std.ArrayList(QueueEntry).empty;
+        var entries = std.ArrayList(QueuePosition).empty;
         while (sqlite.sqlite3_step(stmt) == sqlite.SQLITE_ROW) {
             const hex_ptr: ?[*]const u8 = @ptrCast(sqlite.sqlite3_column_text(stmt, 0));
             const hex_len: usize = @intCast(sqlite.sqlite3_column_bytes(stmt, 0));
             const position: u32 = @intCast(sqlite.sqlite3_column_int(stmt, 1));
 
             if (hex_ptr != null and hex_len == 40) {
-                var entry: QueueEntry = .{
+                var entry: QueuePosition = .{
                     .info_hash_hex = undefined,
                     .position = position,
                 };
@@ -1190,14 +1194,14 @@ pub const ResumeWriter = struct {
     }
 
     /// Persist lifetime transfer stats. Thread-safe.
-    pub fn saveTransferStats(self: *ResumeWriter, stats: TransferStats) void {
+    pub fn saveTransferStats(self: *ResumeWriter, stats: ResumeDb.TransferStats) void {
         self.mutex.lock();
         defer self.mutex.unlock();
         self.db.saveTransferStats(self.info_hash, stats) catch {};
     }
 
     /// Load lifetime transfer stats. Thread-safe.
-    pub fn loadTransferStats(self: *ResumeWriter) TransferStats {
+    pub fn loadTransferStats(self: *ResumeWriter) ResumeDb.TransferStats {
         self.mutex.lock();
         defer self.mutex.unlock();
         return self.db.loadTransferStats(self.info_hash);

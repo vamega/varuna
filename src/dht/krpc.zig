@@ -66,8 +66,6 @@ pub const Response = struct {
     nodes6: ?[]const u8 = null,
     /// Token (from get_peers response).
     token: ?[]const u8 = null,
-    /// Compact peer values (from get_peers "values" list).
-    values: ?[]const []const u8 = null,
     /// Raw bytes of the bencoded IPv4 "values" list (slice into original packet).
     /// Use this to extract compact peers without allocation.
     values_raw: ?[]const u8 = null,
@@ -338,17 +336,17 @@ fn skipValue(data: []const u8, pos: *usize) ?void {
 
 /// Encode a ping query.
 pub fn encodePingQuery(buf: []u8, txn_id: u16, our_id: NodeId) !usize {
-    return encodeQuery(buf, txn_id, "ping", our_id, null, null, null, false);
+    return encodeQuery(buf, txn_id, .ping, our_id, null, null, null, false);
 }
 
 /// Encode a find_node query.
 pub fn encodeFindNodeQuery(buf: []u8, txn_id: u16, our_id: NodeId, target: NodeId) !usize {
-    return encodeQuery(buf, txn_id, "find_node", our_id, &target, null, null, false);
+    return encodeQuery(buf, txn_id, .find_node, our_id, &target, null, null, false);
 }
 
 /// Encode a get_peers query.
 pub fn encodeGetPeersQuery(buf: []u8, txn_id: u16, our_id: NodeId, info_hash: [20]u8) !usize {
-    return encodeQuery(buf, txn_id, "get_peers", our_id, &info_hash, null, null, false);
+    return encodeQuery(buf, txn_id, .get_peers, our_id, &info_hash, null, null, false);
 }
 
 /// Encode an announce_peer query.
@@ -361,13 +359,13 @@ pub fn encodeAnnouncePeerQuery(
     token: []const u8,
     implied_port: bool,
 ) !usize {
-    return encodeQuery(buf, txn_id, "announce_peer", our_id, &info_hash, port, token, implied_port);
+    return encodeQuery(buf, txn_id, .announce_peer, our_id, &info_hash, port, token, implied_port);
 }
 
 fn encodeQuery(
     buf: []u8,
     txn_id: u16,
-    method: []const u8,
+    method: Method,
     our_id: NodeId,
     target_or_hash: ?*const [20]u8,
     port: ?u16,
@@ -389,37 +387,38 @@ fn encodeQuery(
     pos += writeByteString(buf[pos..], "id");
     pos += writeByteString(buf[pos..], &our_id);
 
-    if (std.mem.eql(u8, method, "announce_peer")) {
-        // "implied_port"
-        if (implied_port) {
-            pos += writeByteString(buf[pos..], "implied_port");
-            pos += writeInteger(buf[pos..], 1);
-        }
-        // "info_hash"
-        if (target_or_hash) |th| {
-            pos += writeByteString(buf[pos..], "info_hash");
-            pos += writeByteString(buf[pos..], th);
-        }
-        // "port"
-        if (port) |p| {
-            pos += writeByteString(buf[pos..], "port");
-            pos += writeInteger(buf[pos..], @intCast(p));
-        }
-        // "token"
-        if (token) |t| {
-            pos += writeByteString(buf[pos..], "token");
-            pos += writeByteString(buf[pos..], t);
-        }
-    } else if (std.mem.eql(u8, method, "get_peers")) {
-        if (target_or_hash) |th| {
-            pos += writeByteString(buf[pos..], "info_hash");
-            pos += writeByteString(buf[pos..], th);
-        }
-    } else if (std.mem.eql(u8, method, "find_node")) {
-        if (target_or_hash) |th| {
-            pos += writeByteString(buf[pos..], "target");
-            pos += writeByteString(buf[pos..], th);
-        }
+    switch (method) {
+        .announce_peer => {
+            if (implied_port) {
+                pos += writeByteString(buf[pos..], "implied_port");
+                pos += writeInteger(buf[pos..], 1);
+            }
+            if (target_or_hash) |th| {
+                pos += writeByteString(buf[pos..], "info_hash");
+                pos += writeByteString(buf[pos..], th);
+            }
+            if (port) |p| {
+                pos += writeByteString(buf[pos..], "port");
+                pos += writeInteger(buf[pos..], @intCast(p));
+            }
+            if (token) |t| {
+                pos += writeByteString(buf[pos..], "token");
+                pos += writeByteString(buf[pos..], t);
+            }
+        },
+        .get_peers => {
+            if (target_or_hash) |th| {
+                pos += writeByteString(buf[pos..], "info_hash");
+                pos += writeByteString(buf[pos..], th);
+            }
+        },
+        .find_node => {
+            if (target_or_hash) |th| {
+                pos += writeByteString(buf[pos..], "target");
+                pos += writeByteString(buf[pos..], th);
+            }
+        },
+        .ping => {},
     }
 
     buf[pos] = 'e'; // end "a" dict
@@ -427,7 +426,7 @@ fn encodeQuery(
 
     // "q"
     pos += writeByteString(buf[pos..], "q");
-    pos += writeByteString(buf[pos..], method);
+    pos += writeByteString(buf[pos..], method.toString());
 
     // "t"
     pos += writeByteString(buf[pos..], "t");

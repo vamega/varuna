@@ -28,13 +28,9 @@ pub const ApiHandler = struct {
     /// Wrap a response with CORS headers.
     fn withCors(resp: server.Response) server.Response {
         var r = resp;
-        r.extra_headers = if (r.extra_headers) |existing| blk: {
-            // Caller already has extra headers (e.g. Set-Cookie from login).
-            // We must not overwrite them -- the sendResponse path concatenates
-            // extra_headers into the response verbatim, so we concatenate here.
-            _ = existing;
-            break :blk r.extra_headers;
-        } else cors_headers;
+        if (r.extra_headers == null) {
+            r.extra_headers = cors_headers;
+        }
         return r;
     }
 
@@ -126,9 +122,9 @@ pub const ApiHandler = struct {
     }
 
     fn handleLogin(self: *ApiHandler, allocator: std.mem.Allocator, body: []const u8) server.Response {
-        const username = extractParam(body, "username") orelse
+        const username = extractParamMut(body, "username") orelse
             return withCors(.{ .status = 400, .body = "missing username" });
-        const password = extractParam(body, "password") orelse
+        const password = extractParamMut(body, "password") orelse
             return withCors(.{ .status = 400, .body = "missing password" });
 
         if (!std.mem.eql(u8, username, self.api_username) or !std.mem.eql(u8, password, self.api_password)) {
@@ -181,7 +177,7 @@ pub const ApiHandler = struct {
             return self.handleTorrentsAddTrackers(allocator, body);
         }
 
-        if (std.mem.startsWith(u8, action_name, "add") and std.mem.eql(u8, method, "POST")) {
+        if (std.mem.eql(u8, action_name, "add") and std.mem.eql(u8, method, "POST")) {
             return self.handleTorrentsAdd(allocator, body, query, content_type);
         }
 
@@ -352,9 +348,9 @@ pub const ApiHandler = struct {
 
     fn handleTorrentsAdd(self: *const ApiHandler, allocator: std.mem.Allocator, body: []const u8, query: []const u8, content_type: ?[]const u8) server.Response {
         var torrent_data: []const u8 = body;
-        var save_path: []const u8 = extractParam(query, "savepath") orelse self.session_manager.default_save_path;
-        var category_param: ?[]const u8 = extractParam(query, "category");
-        var magnet_url: ?[]const u8 = extractParam(query, "urls") orelse extractParam(body, "urls");
+        var save_path: []const u8 = extractParamMut(query, "savepath") orelse self.session_manager.default_save_path;
+        var category_param: ?[]const u8 = extractParamMut(query, "category");
+        var magnet_url: ?[]const u8 = extractParamMut(query, "urls") orelse extractParamMut(body, "urls");
 
         // Parse multipart/form-data if that's the content type (qBittorrent/Flood WebUI)
         if (multipart.isMultipart(content_type)) {
@@ -387,7 +383,7 @@ pub const ApiHandler = struct {
         } else {
             // Also check body for form-encoded category param
             if (category_param == null) {
-                category_param = extractParam(body, "category");
+                category_param = extractParamMut(body, "category");
             }
         }
 
@@ -431,7 +427,7 @@ pub const ApiHandler = struct {
         const hash = requireHashes(body) orelse
             return .{ .status = 400, .body = "{\"error\":\"missing hashes\"}" };
 
-        const delete_files = if (extractParam(body, "deleteFiles")) |v|
+        const delete_files = if (extractParamMut(body, "deleteFiles")) |v|
             std.mem.eql(u8, v, "true")
         else
             false;
@@ -554,7 +550,7 @@ pub const ApiHandler = struct {
             return .{ .status = 500, .body = "{\"error\":\"no event loop\"}" };
 
         const trimmed_body = std.mem.trim(u8, body, " \t\r\n");
-        const json_param = extractParam(body, "json");
+        const json_param = extractParamMut(body, "json");
         const expects_json = json_param != null or bodyLooksLikeJson(trimmed_body);
 
         if (expects_json) {
@@ -603,12 +599,12 @@ pub const ApiHandler = struct {
             if (prefs.pex) |v| el.pex_enabled = v;
             if (prefs.enable_utp) |v| el.utp_enabled = v;
         } else {
-            if (extractParam(body, "dl_limit")) |dl_str| {
+            if (extractParamMut(body, "dl_limit")) |dl_str| {
                 const dl = std.fmt.parseInt(u64, dl_str, 10) catch
                     return .{ .status = 400, .body = "{\"error\":\"invalid dl_limit\"}" };
                 el.setGlobalDlLimit(dl);
             }
-            if (extractParam(body, "up_limit")) |ul_str| {
+            if (extractParamMut(body, "up_limit")) |ul_str| {
                 const ul = std.fmt.parseInt(u64, ul_str, 10) catch
                     return .{ .status = 400, .body = "{\"error\":\"invalid up_limit\"}" };
                 el.setGlobalUlLimit(ul);
@@ -616,37 +612,37 @@ pub const ApiHandler = struct {
 
             {
                 const sm = self.session_manager;
-                if (extractParam(body, "max_ratio_enabled")) |v| sm.max_ratio_enabled = parseBoolPreference(v) catch
+                if (extractParamMut(body, "max_ratio_enabled")) |v| sm.max_ratio_enabled = parseBoolPreference(v) catch
                     return .{ .status = 400, .body = "{\"error\":\"invalid max_ratio_enabled\"}" };
-                if (extractParam(body, "max_ratio")) |v| sm.max_ratio = std.fmt.parseFloat(f64, v) catch
+                if (extractParamMut(body, "max_ratio")) |v| sm.max_ratio = std.fmt.parseFloat(f64, v) catch
                     return .{ .status = 400, .body = "{\"error\":\"invalid max_ratio\"}" };
-                if (extractParam(body, "max_ratio_act")) |v| sm.max_ratio_act = std.fmt.parseInt(u8, v, 10) catch
+                if (extractParamMut(body, "max_ratio_act")) |v| sm.max_ratio_act = std.fmt.parseInt(u8, v, 10) catch
                     return .{ .status = 400, .body = "{\"error\":\"invalid max_ratio_act\"}" };
-                if (extractParam(body, "max_seeding_time_enabled")) |v| sm.max_seeding_time_enabled = parseBoolPreference(v) catch
+                if (extractParamMut(body, "max_seeding_time_enabled")) |v| sm.max_seeding_time_enabled = parseBoolPreference(v) catch
                     return .{ .status = 400, .body = "{\"error\":\"invalid max_seeding_time_enabled\"}" };
-                if (extractParam(body, "max_seeding_time")) |v| sm.max_seeding_time = std.fmt.parseInt(i64, v, 10) catch
+                if (extractParamMut(body, "max_seeding_time")) |v| sm.max_seeding_time = std.fmt.parseInt(i64, v, 10) catch
                     return .{ .status = 400, .body = "{\"error\":\"invalid max_seeding_time\"}" };
             }
 
             var queue_changed = false;
-            if (extractParam(body, "queueing_enabled")) |val| {
+            if (extractParamMut(body, "queueing_enabled")) |val| {
                 self.session_manager.queue_manager.config.enabled = parseBoolPreference(val) catch
                     return .{ .status = 400, .body = "{\"error\":\"invalid queueing_enabled\"}" };
                 queue_changed = true;
             }
-            if (extractParam(body, "max_active_downloads")) |val| {
+            if (extractParamMut(body, "max_active_downloads")) |val| {
                 const v = std.fmt.parseInt(i32, val, 10) catch
                     return .{ .status = 400, .body = "{\"error\":\"invalid max_active_downloads\"}" };
                 self.session_manager.queue_manager.config.max_active_downloads = v;
                 queue_changed = true;
             }
-            if (extractParam(body, "max_active_uploads")) |val| {
+            if (extractParamMut(body, "max_active_uploads")) |val| {
                 const v = std.fmt.parseInt(i32, val, 10) catch
                     return .{ .status = 400, .body = "{\"error\":\"invalid max_active_uploads\"}" };
                 self.session_manager.queue_manager.config.max_active_uploads = v;
                 queue_changed = true;
             }
-            if (extractParam(body, "max_active_torrents")) |val| {
+            if (extractParamMut(body, "max_active_torrents")) |val| {
                 const v = std.fmt.parseInt(i32, val, 10) catch
                     return .{ .status = 400, .body = "{\"error\":\"invalid max_active_torrents\"}" };
                 self.session_manager.queue_manager.config.max_active_torrents = v;
@@ -654,16 +650,16 @@ pub const ApiHandler = struct {
             }
             if (queue_changed) self.session_manager.runQueueEnforcement();
 
-            if (extractParam(body, "dht")) |v| self.session_manager.setDhtEnabled(parseBoolPreference(v) catch
+            if (extractParamMut(body, "dht")) |v| self.session_manager.setDhtEnabled(parseBoolPreference(v) catch
                 return .{ .status = 400, .body = "{\"error\":\"invalid dht\"}" });
-            if (extractParam(body, "pex")) |v| el.pex_enabled = parseBoolPreference(v) catch
+            if (extractParamMut(body, "pex")) |v| el.pex_enabled = parseBoolPreference(v) catch
                 return .{ .status = 400, .body = "{\"error\":\"invalid pex\"}" };
-            if (extractParam(body, "enable_utp")) |v| el.utp_enabled = parseBoolPreference(v) catch
+            if (extractParamMut(body, "enable_utp")) |v| el.utp_enabled = parseBoolPreference(v) catch
                 return .{ .status = 400, .body = "{\"error\":\"invalid enable_utp\"}" };
         }
 
         // Handle banned_IPs: newline-separated list of IPs and CIDRs (form-encoded only)
-        if (extractParam(body, "banned_IPs")) |banned_str| {
+        if (extractParamMut(body, "banned_IPs")) |banned_str| {
             if (self.session_manager.ban_list) |bl| {
                 bl.setBannedIpsFromString(banned_str) catch
                     return .{ .status = 400, .body = "{\"error\":\"invalid banned_IPs\"}" };
@@ -684,7 +680,7 @@ pub const ApiHandler = struct {
     fn handleSetTorrentDlLimit(self: *const ApiHandler, allocator: std.mem.Allocator, body: []const u8) server.Response {
         const hash = requireHashes(body) orelse
             return .{ .status = 400, .body = "{\"error\":\"missing hashes\"}" };
-        const limit_str = extractParam(body, "limit") orelse
+        const limit_str = extractParamMut(body, "limit") orelse
             return .{ .status = 400, .body = "{\"error\":\"missing limit\"}" };
         const limit = std.fmt.parseInt(u64, limit_str, 10) catch
             return .{ .status = 400, .body = "{\"error\":\"invalid limit\"}" };
@@ -698,7 +694,7 @@ pub const ApiHandler = struct {
     fn handleSetTorrentUlLimit(self: *const ApiHandler, allocator: std.mem.Allocator, body: []const u8) server.Response {
         const hash = requireHashes(body) orelse
             return .{ .status = 400, .body = "{\"error\":\"missing hashes\"}" };
-        const limit_str = extractParam(body, "limit") orelse
+        const limit_str = extractParamMut(body, "limit") orelse
             return .{ .status = 400, .body = "{\"error\":\"missing limit\"}" };
         const limit = std.fmt.parseInt(u64, limit_str, 10) catch
             return .{ .status = 400, .body = "{\"error\":\"invalid limit\"}" };
@@ -736,7 +732,7 @@ pub const ApiHandler = struct {
     // ── New endpoints ────────────────────────────────────
 
     fn handleTorrentsFiles(self: *const ApiHandler, allocator: std.mem.Allocator, body: []const u8) server.Response {
-        const hash = extractParam(body, "hash") orelse
+        const hash = extractParamMut(body, "hash") orelse
             return .{ .status = 400, .body = "{\"error\":\"missing hash\"}" };
 
         const files = self.session_manager.getSessionFiles(allocator, hash) catch |err| switch (err) {
@@ -772,7 +768,7 @@ pub const ApiHandler = struct {
     }
 
     fn handleTorrentsTrackers(self: *const ApiHandler, allocator: std.mem.Allocator, body: []const u8) server.Response {
-        const hash = extractParam(body, "hash") orelse
+        const hash = extractParamMut(body, "hash") orelse
             return .{ .status = 400, .body = "{\"error\":\"missing hash\"}" };
 
         const trackers = self.session_manager.getSessionTrackers(allocator, hash) catch |err| switch (err) {
@@ -806,7 +802,7 @@ pub const ApiHandler = struct {
     }
 
     fn handleTorrentsProperties(self: *const ApiHandler, allocator: std.mem.Allocator, body: []const u8) server.Response {
-        const hash = extractParam(body, "hash") orelse
+        const hash = extractParamMut(body, "hash") orelse
             return .{ .status = 400, .body = "{\"error\":\"missing hash\"}" };
 
         const info = self.session_manager.getSessionProperties(allocator, hash) catch |err| switch (err) {
@@ -820,8 +816,8 @@ pub const ApiHandler = struct {
         const time_active: i64 = now - info.added_on;
         const esc = json_mod.jsonSafe;
 
-        const v2_hex = if (info.info_hash_v2 != null) compat.formatInfoHashV2(info.info_hash_v2) else [_]u8{0} ** 64;
-        const v2_str: []const u8 = if (info.info_hash_v2 != null) &v2_hex else "";
+        const v2_hex = compat.formatInfoHashV2(info.info_hash_v2);
+        const v2_str: []const u8 = if (v2_hex) |*hex| hex else "";
         const completion_date: i64 = if (info.completion_on > 0) info.completion_on else if (info.state == .seeding) info.added_on else -1;
 
         var json = std.ArrayList(u8).empty;
@@ -830,7 +826,7 @@ pub const ApiHandler = struct {
         // Split into two print calls to stay under Zig's 32-argument format limit
         json.print(allocator, "{{\"save_path\":\"{f}\",\"download_path\":\"\",\"creation_date\":{},\"piece_size\":{},\"comment\":\"{f}\",\"created_by\":\"{f}\",\"total_size\":{},\"pieces_have\":{},\"pieces_num\":{},\"dl_speed\":{},\"dl_speed_avg\":0,\"up_speed\":{},\"up_speed_avg\":0,\"dl_limit\":{},\"up_limit\":{},\"eta\":{},\"hash\":\"{s}\",\"infohash_v1\":\"{s}\",\"infohash_v2\":\"{s}\",\"name\":\"{f}\",\"ratio\":{d:.4},\"share_ratio\":{d:.4},\"time_elapsed\":{},\"time_active\":{},\"seeding_time\":{},\"nb_connections\":{},\"nb_connections_limit\":500,", .{
             esc(info.save_path),
-            info.creation_date,
+            info.creation_date orelse -1,
             info.piece_size,
             esc(info.comment),
             esc(info.created_by),
@@ -878,11 +874,11 @@ pub const ApiHandler = struct {
     }
 
     fn handleTorrentsFilePrio(self: *const ApiHandler, allocator: std.mem.Allocator, body: []const u8) server.Response {
-        const hash = extractParam(body, "hash") orelse
+        const hash = extractParamMut(body, "hash") orelse
             return .{ .status = 400, .body = "{\"error\":\"missing hash\"}" };
-        const id_str = extractParam(body, "id") orelse
+        const id_str = extractParamMut(body, "id") orelse
             return .{ .status = 400, .body = "{\"error\":\"missing id\"}" };
-        const prio_str = extractParam(body, "priority") orelse
+        const prio_str = extractParamMut(body, "priority") orelse
             return .{ .status = 400, .body = "{\"error\":\"missing priority\"}" };
 
         const priority = std.fmt.parseInt(u8, prio_str, 10) catch
@@ -915,9 +911,9 @@ pub const ApiHandler = struct {
     }
 
     fn handleTorrentsSetSequentialDownload(self: *const ApiHandler, allocator: std.mem.Allocator, body: []const u8) server.Response {
-        const hash = extractParam(body, "hash") orelse
+        const hash = extractParamMut(body, "hash") orelse
             return .{ .status = 400, .body = "{\"error\":\"missing hash\"}" };
-        const value_str = extractParam(body, "value") orelse
+        const value_str = extractParamMut(body, "value") orelse
             return .{ .status = 400, .body = "{\"error\":\"missing value\"}" };
 
         const enabled = std.mem.eql(u8, value_str, "true");
@@ -932,7 +928,7 @@ pub const ApiHandler = struct {
     fn handleTorrentsSetSuperSeeding(self: *const ApiHandler, allocator: std.mem.Allocator, body: []const u8) server.Response {
         const hash = requireHashes(body) orelse
             return .{ .status = 400, .body = "{\"error\":\"missing hash\"}" };
-        const value_str = extractParam(body, "value") orelse
+        const value_str = extractParamMut(body, "value") orelse
             return .{ .status = 400, .body = "{\"error\":\"missing value\"}" };
 
         const enabled = std.mem.eql(u8, value_str, "true");
@@ -947,9 +943,9 @@ pub const ApiHandler = struct {
     // ── Tracker editing handlers ────────────────────────────
 
     fn handleTorrentsAddTrackers(self: *const ApiHandler, allocator: std.mem.Allocator, body: []const u8) server.Response {
-        const hash = extractParam(body, "hash") orelse
+        const hash = extractParamMut(body, "hash") orelse
             return .{ .status = 400, .body = "{\"error\":\"missing hash\"}" };
-        const urls_str = extractParam(body, "urls") orelse
+        const urls_str = extractParamMut(body, "urls") orelse
             return .{ .status = 400, .body = "{\"error\":\"missing urls\"}" };
 
         // URLs are newline-separated (qBittorrent compat: %0A is \n)
@@ -979,9 +975,9 @@ pub const ApiHandler = struct {
     }
 
     fn handleTorrentsRemoveTrackers(self: *const ApiHandler, allocator: std.mem.Allocator, body: []const u8) server.Response {
-        const hash = extractParam(body, "hash") orelse
+        const hash = extractParamMut(body, "hash") orelse
             return .{ .status = 400, .body = "{\"error\":\"missing hash\"}" };
-        const urls_str = extractParam(body, "urls") orelse
+        const urls_str = extractParamMut(body, "urls") orelse
             return .{ .status = 400, .body = "{\"error\":\"missing urls\"}" };
 
         // URLs are pipe-separated (qBittorrent compat: %7C is |)
@@ -1010,11 +1006,11 @@ pub const ApiHandler = struct {
     }
 
     fn handleTorrentsEditTracker(self: *const ApiHandler, allocator: std.mem.Allocator, body: []const u8) server.Response {
-        const hash = extractParam(body, "hash") orelse
+        const hash = extractParamMut(body, "hash") orelse
             return .{ .status = 400, .body = "{\"error\":\"missing hash\"}" };
-        const orig_url = extractParam(body, "origUrl") orelse
+        const orig_url = extractParamMut(body, "origUrl") orelse
             return .{ .status = 400, .body = "{\"error\":\"missing origUrl\"}" };
-        const new_url = extractParam(body, "newUrl") orelse
+        const new_url = extractParamMut(body, "newUrl") orelse
             return .{ .status = 400, .body = "{\"error\":\"missing newUrl\"}" };
 
         self.session_manager.editTracker(hash, orig_url, new_url) catch |err| {
@@ -1049,7 +1045,7 @@ pub const ApiHandler = struct {
     fn handleTorrentsSetLocation(self: *const ApiHandler, allocator: std.mem.Allocator, body: []const u8) server.Response {
         const hash = requireHashes(body) orelse
             return .{ .status = 400, .body = "{\"error\":\"missing hashes\"}" };
-        const location = extractParam(body, "location") orelse
+        const location = extractParamMut(body, "location") orelse
             return .{ .status = 400, .body = "{\"error\":\"missing location\"}" };
 
         if (location.len == 0) {
@@ -1064,7 +1060,7 @@ pub const ApiHandler = struct {
     }
 
     fn handleTorrentsConnDiagnostics(self: *const ApiHandler, allocator: std.mem.Allocator, params: []const u8) server.Response {
-        const hash = extractParam(params, "hash") orelse
+        const hash = extractParamMut(params, "hash") orelse
             return .{ .status = 400, .body = "{\"error\":\"missing hash\"}" };
 
         const diag = self.session_manager.getConnDiagnostics(hash) catch
@@ -1087,13 +1083,13 @@ pub const ApiHandler = struct {
             return .{ .status = 400, .body = "{\"error\":\"missing hashes\"}" };
 
         // Parse ratio limit (-2 = use global, -1 = no limit, >=0 = specific)
-        const ratio_limit: f64 = if (extractParam(body, "ratioLimit")) |v|
+        const ratio_limit: f64 = if (extractParamMut(body, "ratioLimit")) |v|
             std.fmt.parseFloat(f64, v) catch -2.0
         else
             -2.0;
 
         // Parse seeding time limit in minutes (-2 = use global, -1 = no limit, >=0 = minutes)
-        const seeding_time_limit: i64 = if (extractParam(body, "seedingTimeLimit")) |v|
+        const seeding_time_limit: i64 = if (extractParamMut(body, "seedingTimeLimit")) |v|
             std.fmt.parseInt(i64, v, 10) catch -2
         else
             -2;
@@ -1110,7 +1106,7 @@ pub const ApiHandler = struct {
     }
 
     fn handleTorrentsWebSeeds(self: *const ApiHandler, allocator: std.mem.Allocator, params: []const u8) server.Response {
-        const hash = extractParam(params, "hash") orelse
+        const hash = extractParamMut(params, "hash") orelse
             return .{ .status = 400, .body = "{\"error\":\"missing hash\"}" };
 
         const urls = self.session_manager.getWebSeedUrls(allocator, hash) catch
@@ -1147,9 +1143,9 @@ pub const ApiHandler = struct {
     }
 
     fn handleCreateCategory(self: *const ApiHandler, allocator: std.mem.Allocator, params: []const u8) server.Response {
-        const name = extractParam(params, "category") orelse
+        const name = extractParamMut(params, "category") orelse
             return .{ .status = 400, .body = "{\"error\":\"missing category\"}" };
-        const save_path = extractParam(params, "savePath") orelse "";
+        const save_path = extractParamMut(params, "savePath") orelse "";
 
         self.session_manager.mutex.lock();
         defer self.session_manager.mutex.unlock();
@@ -1165,7 +1161,7 @@ pub const ApiHandler = struct {
     }
 
     fn handleRemoveCategories(self: *const ApiHandler, params: []const u8) server.Response {
-        const names = extractParam(params, "categories") orelse
+        const names = extractParamMut(params, "categories") orelse
             return .{ .status = 400, .body = "{\"error\":\"missing categories\"}" };
 
         self.session_manager.mutex.lock();
@@ -1201,9 +1197,9 @@ pub const ApiHandler = struct {
     }
 
     fn handleEditCategory(self: *const ApiHandler, allocator: std.mem.Allocator, params: []const u8) server.Response {
-        const name = extractParam(params, "category") orelse
+        const name = extractParamMut(params, "category") orelse
             return .{ .status = 400, .body = "{\"error\":\"missing category\"}" };
-        const save_path = extractParam(params, "savePath") orelse "";
+        const save_path = extractParamMut(params, "savePath") orelse "";
 
         self.session_manager.mutex.lock();
         defer self.session_manager.mutex.unlock();
@@ -1221,7 +1217,7 @@ pub const ApiHandler = struct {
     fn handleSetCategory(self: *const ApiHandler, allocator: std.mem.Allocator, params: []const u8) server.Response {
         const hash = requireHashes(params) orelse
             return .{ .status = 400, .body = "{\"error\":\"missing hashes\"}" };
-        const category = extractParam(params, "category") orelse "";
+        const category = extractParamMut(params, "category") orelse "";
 
         self.session_manager.setTorrentCategory(hash, category) catch |err| {
             return errorResponse(allocator, 404, err);
@@ -1242,7 +1238,7 @@ pub const ApiHandler = struct {
     }
 
     fn handleCreateTags(self: *const ApiHandler, params: []const u8) server.Response {
-        const tags_str = extractParam(params, "tags") orelse
+        const tags_str = extractParamMut(params, "tags") orelse
             return .{ .status = 400, .body = "{\"error\":\"missing tags\"}" };
 
         self.session_manager.mutex.lock();
@@ -1260,7 +1256,7 @@ pub const ApiHandler = struct {
     }
 
     fn handleDeleteTags(self: *const ApiHandler, params: []const u8) server.Response {
-        const tags_str = extractParam(params, "tags") orelse
+        const tags_str = extractParamMut(params, "tags") orelse
             return .{ .status = 400, .body = "{\"error\":\"missing tags\"}" };
 
         self.session_manager.mutex.lock();
@@ -1301,7 +1297,7 @@ pub const ApiHandler = struct {
     fn handleAddTags(self: *const ApiHandler, allocator: std.mem.Allocator, params: []const u8) server.Response {
         const hash = requireHashes(params) orelse
             return .{ .status = 400, .body = "{\"error\":\"missing hashes\"}" };
-        const tags_str = extractParam(params, "tags") orelse
+        const tags_str = extractParamMut(params, "tags") orelse
             return .{ .status = 400, .body = "{\"error\":\"missing tags\"}" };
 
         self.session_manager.addTorrentTags(hash, tags_str) catch |err| {
@@ -1314,7 +1310,7 @@ pub const ApiHandler = struct {
     fn handleRemoveTags(self: *const ApiHandler, allocator: std.mem.Allocator, params: []const u8) server.Response {
         const hash = requireHashes(params) orelse
             return .{ .status = 400, .body = "{\"error\":\"missing hashes\"}" };
-        const tags_str = extractParam(params, "tags") orelse
+        const tags_str = extractParamMut(params, "tags") orelse
             return .{ .status = 400, .body = "{\"error\":\"missing tags\"}" };
 
         self.session_manager.removeTorrentTags(hash, tags_str) catch |err| {
@@ -1330,8 +1326,8 @@ pub const ApiHandler = struct {
         var request_rid: u64 = 0;
         if (std.mem.indexOf(u8, path, "?")) |q| {
             const query = path[q + 1 ..];
-            hash = extractParam(query, "hash");
-            if (extractParam(query, "rid")) |rid_str| {
+            hash = extractParamMut(query, "hash");
+            if (extractParamMut(query, "rid")) |rid_str| {
                 request_rid = std.fmt.parseInt(u64, rid_str, 10) catch 0;
             }
         }
@@ -1349,7 +1345,7 @@ pub const ApiHandler = struct {
         var request_rid: u64 = 0;
         if (std.mem.indexOf(u8, path, "?")) |q| {
             const query = path[q + 1 ..];
-            if (extractParam(query, "rid")) |rid_str| {
+            if (extractParamMut(query, "rid")) |rid_str| {
                 request_rid = std.fmt.parseInt(u64, rid_str, 10) catch 0;
             }
         }
@@ -1372,7 +1368,7 @@ pub const ApiHandler = struct {
         const bl = self.session_manager.ban_list orelse
             return .{ .status = 500, .body = "{\"error\":\"ban list not initialized\"}" };
 
-        const peers_str = extractParam(body, "peers") orelse
+        const peers_str = extractParamMut(body, "peers") orelse
             return .{ .status = 400, .body = "{\"error\":\"missing peers parameter\"}" };
 
         // Parse pipe-separated peer list
@@ -1402,7 +1398,7 @@ pub const ApiHandler = struct {
         const bl = self.session_manager.ban_list orelse
             return .{ .status = 500, .body = "{\"error\":\"ban list not initialized\"}" };
 
-        const ips_str = extractParam(body, "ips") orelse
+        const ips_str = extractParamMut(body, "ips") orelse
             return .{ .status = 400, .body = "{\"error\":\"missing ips parameter\"}" };
 
         var removed: usize = 0;
@@ -1496,10 +1492,10 @@ pub const ApiHandler = struct {
             return .{ .status = 500, .body = "{\"error\":\"ban list not initialized\"}" };
 
         // Extract file content: try form-encoded file= parameter first, then raw body
-        const file_data: []const u8 = extractParam(body, "file") orelse body;
+        const file_data: []const u8 = extractParamMut(body, "file") orelse body;
 
         // Determine format from form-encoded format= parameter
-        const format_str = extractParam(body, "format") orelse "auto";
+        const format_str = extractParamMut(body, "format") orelse "auto";
         const format: ipfilter_parser.Format = if (std.mem.eql(u8, format_str, "dat"))
             .dat
         else if (std.mem.eql(u8, format_str, "p2p"))
@@ -1603,7 +1599,7 @@ fn errorResponse(allocator: std.mem.Allocator, status: u16, err: anyerror) serve
 /// multi-torrent key used by most qBittorrent endpoints), then falls back to
 /// the single-torrent `hash` key.
 fn requireHashes(body: []const u8) ?[]const u8 {
-    return extractParam(body, "hashes") orelse extractParam(body, "hash");
+    return extractParamMut(body, "hashes") orelse extractParamMut(body, "hash");
 }
 
 fn bodyLooksLikeJson(body: []const u8) bool {
@@ -1616,7 +1612,8 @@ fn parseBoolPreference(value: []const u8) error{InvalidBoolean}!bool {
     return error.InvalidBoolean;
 }
 
-fn extractParam(body: []const u8, key: []const u8) ?[]const u8 {
+/// Warning: mutates body in-place for URL decoding.
+fn extractParamMut(body: []const u8, key: []const u8) ?[]const u8 {
     // Simple form-encoded parameter extraction: key=value&key2=value2
     var iter = std.mem.splitScalar(u8, body, '&');
     while (iter.next()) |pair| {
@@ -1671,47 +1668,47 @@ fn urlDecodeComponentInPlace(buf: []u8) usize {
 }
 
 test "extract form param" {
-    try std.testing.expectEqualStrings("abc123", extractParam("hashes=abc123&deleteFiles=false", "hashes").?);
-    try std.testing.expectEqualStrings("false", extractParam("hashes=abc123&deleteFiles=false", "deleteFiles").?);
-    try std.testing.expect(extractParam("hashes=abc", "missing") == null);
+    try std.testing.expectEqualStrings("abc123", extractParamMut("hashes=abc123&deleteFiles=false", "hashes").?);
+    try std.testing.expectEqualStrings("false", extractParamMut("hashes=abc123&deleteFiles=false", "deleteFiles").?);
+    try std.testing.expect(extractParamMut("hashes=abc", "missing") == null);
 }
 
 // ── Additional parameter extraction tests ────────────────
 
 test "extractParam returns empty string for key with no value" {
-    try std.testing.expectEqualStrings("", extractParam("hashes=&deleteFiles=true", "hashes").?);
+    try std.testing.expectEqualStrings("", extractParamMut("hashes=&deleteFiles=true", "hashes").?);
 }
 
 test "extractParam returns first match for duplicate keys" {
-    try std.testing.expectEqualStrings("first", extractParam("key=first&key=second", "key").?);
+    try std.testing.expectEqualStrings("first", extractParamMut("key=first&key=second", "key").?);
 }
 
 test "extractParam handles single param without ampersand" {
-    try std.testing.expectEqualStrings("val", extractParam("key=val", "key").?);
+    try std.testing.expectEqualStrings("val", extractParamMut("key=val", "key").?);
 }
 
 test "extractParam percent-decodes values" {
     var body = "hash=abc%20123%2Fxyz+ok".*;
-    try std.testing.expectEqualStrings("abc 123/xyz ok", extractParam(body[0..], "hash").?);
+    try std.testing.expectEqualStrings("abc 123/xyz ok", extractParamMut(body[0..], "hash").?);
 }
 
 test "extractParam returns null for empty body" {
-    try std.testing.expect(extractParam("", "key") == null);
+    try std.testing.expect(extractParamMut("", "key") == null);
 }
 
 test "extractParam does not match partial key names" {
     // "hash" should not match "hashes=abc"
-    try std.testing.expect(extractParam("hashes=abc", "hash") == null);
+    try std.testing.expect(extractParamMut("hashes=abc", "hash") == null);
 }
 
 test "extractParam handles value with equals sign" {
     // "url=http://host?a=b" -- value contains '='
-    try std.testing.expectEqualStrings("http://host?a=b", extractParam("url=http://host?a=b", "url").?);
+    try std.testing.expectEqualStrings("http://host?a=b", extractParamMut("url=http://host?a=b", "url").?);
 }
 
 test "extractParam handles url-encoded special chars in value" {
     var body = "name=hello%20world".*;
-    try std.testing.expectEqualStrings("hello world", extractParam(body[0..], "name").?);
+    try std.testing.expectEqualStrings("hello world", extractParamMut(body[0..], "name").?);
 }
 
 test "parseBoolPreference accepts booleans and rejects garbage" {
@@ -2134,9 +2131,9 @@ test "serializeTorrentInfo handles zero-size torrent" {
 }
 
 test "enable_utp form param parsing" {
-    try std.testing.expectEqualStrings("true", extractParam("enable_utp=true", "enable_utp").?);
-    try std.testing.expectEqualStrings("false", extractParam("enable_utp=false", "enable_utp").?);
-    try std.testing.expectEqualStrings("true", extractParam("pex=true&enable_utp=true&dht=false", "enable_utp").?);
+    try std.testing.expectEqualStrings("true", extractParamMut("enable_utp=true", "enable_utp").?);
+    try std.testing.expectEqualStrings("false", extractParamMut("enable_utp=false", "enable_utp").?);
+    try std.testing.expectEqualStrings("true", extractParamMut("pex=true&enable_utp=true&dht=false", "enable_utp").?);
 }
 
 test "enable_utp json parsing via PreferencesUpdate" {

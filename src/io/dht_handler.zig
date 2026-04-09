@@ -3,6 +3,7 @@ const log = std.log.scoped(.event_loop);
 const DhtEngine = @import("../dht/dht.zig").DhtEngine;
 const EventLoop = @import("event_loop.zig").EventLoop;
 const utp_handler = @import("utp_handler.zig");
+const address = @import("../net/address.zig");
 
 /// Process a UDP datagram as a DHT/KRPC message.
 /// Called from the uTP recv handler when the first byte is 'd' (bencode dict).
@@ -69,7 +70,7 @@ fn drainDhtPeerResults(self: *EventLoop) void {
             // Deduplicate: skip if already connected to this address
             var already_connected = false;
             for (self.peers) |*peer| {
-                if (peer.state != .free and addressEql(peer.address, peer_addr)) {
+                if (peer.state != .free and address.addressEql(peer.address, peer_addr)) {
                     already_connected = true;
                     break;
                 }
@@ -86,13 +87,4 @@ fn drainDhtPeerResults(self: *EventLoop) void {
             result.info_hash[0..4].*,
         });
     }
-}
-
-fn addressEql(a: std.net.Address, b: std.net.Address) bool {
-    if (a.any.family != b.any.family) return false;
-    return switch (a.any.family) {
-        std.posix.AF.INET => a.in.sa.addr == b.in.sa.addr and a.in.sa.port == b.in.sa.port,
-        std.posix.AF.INET6 => std.mem.eql(u8, &a.in6.sa.addr, &b.in6.sa.addr) and a.in6.sa.port == b.in6.sa.port,
-        else => false,
-    };
 }

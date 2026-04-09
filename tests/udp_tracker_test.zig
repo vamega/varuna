@@ -339,13 +339,13 @@ test "scrape single hash request is 36 bytes" {
 }
 
 test "retransmit timeouts follow BEP 15 spec" {
-    // BEP 15: 15 * 2^n seconds, n = 0..8
+    // BEP 15: 15 * 2^n seconds, capped at max_retries=4
     try std.testing.expectEqual(@as(u64, 15), udp.retransmitTimeout(0));
     try std.testing.expectEqual(@as(u64, 30), udp.retransmitTimeout(1));
     try std.testing.expectEqual(@as(u64, 60), udp.retransmitTimeout(2));
     try std.testing.expectEqual(@as(u64, 120), udp.retransmitTimeout(3));
-    try std.testing.expectEqual(@as(u64, 3840), udp.retransmitTimeout(8)); // max
-    try std.testing.expectEqual(@as(u64, 3840), udp.retransmitTimeout(20)); // clamped
+    try std.testing.expectEqual(@as(u64, 240), udp.retransmitTimeout(4)); // max
+    try std.testing.expectEqual(@as(u64, 240), udp.retransmitTimeout(20)); // clamped
 }
 
 test "connection cache TTL expiry" {

@@ -15,13 +15,14 @@ pub const crypto_backend = backend.crypto_backend;
 
 /// Direct access to our custom SHA-1 with hardware acceleration,
 /// regardless of which backend is active. Useful for benchmarks.
-pub const VarunaSha1 = @import("sha1.zig");
+pub const varuna_sha1 = @import("sha1.zig");
 
 pub const rc4 = @import("rc4.zig");
 pub const mse = @import("mse.zig");
 
 test {
     _ = backend;
+    _ = @import("bigint.zig");
     _ = @import("sha1.zig");
     _ = @import("rc4.zig");
     _ = @import("mse.zig");

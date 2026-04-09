@@ -14,6 +14,8 @@ const metadata_fetch = @import("../net/metadata_fetch.zig");
 const ResumeWriter = storage.resume_state.ResumeWriter;
 const ResumeDb = storage.resume_state.ResumeDb;
 const TrackerExecutor = @import("tracker_executor.zig").TrackerExecutor;
+const UdpTrackerExecutor = @import("udp_tracker_executor.zig").UdpTrackerExecutor;
+const TorrentId = @import("../io/event_loop.zig").TorrentId;
 
 /// Mutable tracker URL storage. Tracks user-added, user-removed,
 /// and user-edited tracker URLs as overlays on top of the metainfo
@@ -188,8 +190,8 @@ pub const TorrentSession = struct {
     shared_fds: ?[]posix.fd_t = null,
     shared_event_loop: ?*EventLoop = null,
     tracker_executor: ?*TrackerExecutor = null,
-    udp_tracker_executor: ?*@import("udp_tracker_executor.zig").UdpTrackerExecutor = null,
-    torrent_id_in_shared: ?@import("../io/event_loop.zig").TorrentId = null,
+    udp_tracker_executor: ?*UdpTrackerExecutor = null,
+    torrent_id_in_shared: ?TorrentId = null,
     pending_peers: ?[]std.net.Address = null, // peers waiting for main thread to add
     pending_seed_setup: bool = false, // signals main thread to set up seed mode
     dht_registered: bool = false, // whether DHT requestPeers has been called
@@ -346,7 +348,7 @@ pub const TorrentSession = struct {
             .added_on = std.time.timestamp(),
             .peer_id = try peer_id_mod.generate(masquerade_as),
             .tracker_key = tracker.announce.Request.generateKey(),
-            .is_private = meta.isPrivate(),
+            .is_private = meta.private,
             .info_hash_v2 = meta.info_hash_v2,
         };
     }
@@ -411,7 +413,7 @@ pub const TorrentSession = struct {
         }
     }
 
-    pub fn resume_session(self: *TorrentSession) void {
+    pub fn unpause(self: *TorrentSession) void {
         if (self.state == .paused) {
             // Clean up old resources before restarting
             self.waitForBackgroundNetworkJobs();
@@ -1160,7 +1162,6 @@ pub const TorrentSession = struct {
     /// Returns true if the URL was a UDP URL and the job was submitted.
     fn trySubmitUdpAnnounce(self: *TorrentSession, request: tracker.announce.Request) bool {
         const udp_mod = @import("../tracker/udp.zig");
-        const UdpTrackerExecutor = @import("udp_tracker_executor.zig").UdpTrackerExecutor;
 
         const parsed = udp_mod.parseUdpUrl(request.announce_url) orelse return false;
         const executor = self.udp_tracker_executor orelse return false;
@@ -1304,7 +1305,6 @@ pub const TorrentSession = struct {
 
     fn trySubmitUdpScrape(self: *TorrentSession, announce_url: []const u8, info_hash: [20]u8) bool {
         const udp_mod = @import("../tracker/udp.zig");
-        const UdpTrackerExecutor = @import("udp_tracker_executor.zig").UdpTrackerExecutor;
 
         const parsed = udp_mod.parseUdpUrl(announce_url) orelse return false;
         const executor = self.udp_tracker_executor orelse return false;
@@ -1913,7 +1913,7 @@ test "stop detaches torrent from shared event loop" {
     try std.testing.expectEqual(@as(u32, 0), el.torrent_count);
 }
 
-test "resume_session preserves shared event loop mode" {
+test "unpause preserves shared event loop mode" {
     var el = try initTestEventLoop(std.testing.allocator);
     defer deinitTestEventLoop(std.testing.allocator, &el);
 
@@ -1933,7 +1933,7 @@ test "resume_session preserves shared event loop mode" {
         .shared_event_loop = &el,
     };
 
-    session.resume_session();
+    session.unpause();
     if (session.thread) |t| {
         t.join();
         session.thread = null;

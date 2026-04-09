@@ -137,8 +137,7 @@ pub fn encodeExtensionHandshakeFull(allocator: std.mem.Allocator, listen_port: u
 ///
 /// The returned struct references no heap memory beyond what the caller
 /// already holds in `data`; no allocations are made for the result.
-pub fn decodeExtensionHandshake(allocator: std.mem.Allocator, data: []const u8) !DecodeResult {
-    _ = allocator;
+pub fn decodeExtensionHandshake(data: []const u8) !ExtensionHandshake {
     var parser = Parser{ .input = data };
     try parser.expectByte('d');
 
@@ -174,18 +173,7 @@ pub fn decodeExtensionHandshake(allocator: std.mem.Allocator, data: []const u8) 
     }
 
     if (!parser.isAtEnd()) return error.InvalidExtensionHandshake;
-    return .{ .handshake = result };
-}
-
-/// Result of decoding an extension handshake.  Holds ownership of the
-/// parsed bencode tree so that string slices in `handshake` remain valid.
-pub const DecodeResult = struct {
-    handshake: ExtensionHandshake,
-};
-
-pub fn freeDecoded(allocator: std.mem.Allocator, result: *DecodeResult) void {
-    _ = allocator;
-    result.* = undefined;
+    return result;
 }
 
 const Parser = struct {
@@ -377,49 +365,45 @@ test "decode extension handshake roundtrip" {
     const payload = try encodeExtensionHandshake(std.testing.allocator, 6881, false);
     defer std.testing.allocator.free(payload);
 
-    var result = try decodeExtensionHandshake(std.testing.allocator, payload);
-    defer freeDecoded(std.testing.allocator, &result);
+    const result = try decodeExtensionHandshake(payload);
 
-    try std.testing.expectEqual(@as(u8, local_ut_metadata_id), result.handshake.extensions.ut_metadata);
-    try std.testing.expectEqual(@as(u8, local_ut_pex_id), result.handshake.extensions.ut_pex);
-    try std.testing.expectEqual(@as(u16, 6881), result.handshake.port);
-    try std.testing.expectEqualStrings(client_version, result.handshake.client);
+    try std.testing.expectEqual(@as(u8, local_ut_metadata_id), result.extensions.ut_metadata);
+    try std.testing.expectEqual(@as(u8, local_ut_pex_id), result.extensions.ut_pex);
+    try std.testing.expectEqual(@as(u16, 6881), result.port);
+    try std.testing.expectEqualStrings(client_version, result.client);
 }
 
 test "decode extension handshake with metadata_size" {
     // Hand-craft a bencode dict with metadata_size
     const input = "d1:md11:ut_metadatai3ee13:metadata_sizei12345e1:pi9999e1:v7:delugexe";
-    var result = try decodeExtensionHandshake(std.testing.allocator, input);
-    defer freeDecoded(std.testing.allocator, &result);
+    const result = try decodeExtensionHandshake(input);
 
-    try std.testing.expectEqual(@as(u8, 3), result.handshake.extensions.ut_metadata);
-    try std.testing.expectEqual(@as(u8, 0), result.handshake.extensions.ut_pex);
-    try std.testing.expectEqual(@as(u16, 9999), result.handshake.port);
-    try std.testing.expectEqualStrings("delugex", result.handshake.client);
-    try std.testing.expectEqual(@as(u32, 12345), result.handshake.metadata_size);
+    try std.testing.expectEqual(@as(u8, 3), result.extensions.ut_metadata);
+    try std.testing.expectEqual(@as(u8, 0), result.extensions.ut_pex);
+    try std.testing.expectEqual(@as(u16, 9999), result.port);
+    try std.testing.expectEqualStrings("delugex", result.client);
+    try std.testing.expectEqual(@as(u32, 12345), result.metadata_size);
 }
 
 test "decode extension handshake with empty m dict" {
     const input = "d1:mdee";
-    var result = try decodeExtensionHandshake(std.testing.allocator, input);
-    defer freeDecoded(std.testing.allocator, &result);
+    const result = try decodeExtensionHandshake(input);
 
-    try std.testing.expectEqual(@as(u8, 0), result.handshake.extensions.ut_metadata);
-    try std.testing.expectEqual(@as(u8, 0), result.handshake.extensions.ut_pex);
+    try std.testing.expectEqual(@as(u8, 0), result.extensions.ut_metadata);
+    try std.testing.expectEqual(@as(u8, 0), result.extensions.ut_pex);
 }
 
 test "decode extension handshake with minimal dict" {
     const input = "de";
-    var result = try decodeExtensionHandshake(std.testing.allocator, input);
-    defer freeDecoded(std.testing.allocator, &result);
+    const result = try decodeExtensionHandshake(input);
 
-    try std.testing.expectEqual(@as(u16, 0), result.handshake.port);
+    try std.testing.expectEqual(@as(u16, 0), result.port);
 }
 
 test "decode rejects non-dict input" {
     try std.testing.expectError(
         error.InvalidExtensionHandshake,
-        decodeExtensionHandshake(std.testing.allocator, "i42e"),
+        decodeExtensionHandshake("i42e"),
     );
 }
 
@@ -440,14 +424,13 @@ test "private torrent extension handshake omits ut_pex" {
     const payload = try encodeExtensionHandshake(std.testing.allocator, 6881, true);
     defer std.testing.allocator.free(payload);
 
-    var result = try decodeExtensionHandshake(std.testing.allocator, payload);
-    defer freeDecoded(std.testing.allocator, &result);
+    const result = try decodeExtensionHandshake(payload);
 
     // ut_metadata should still be advertised
-    try std.testing.expectEqual(@as(u8, local_ut_metadata_id), result.handshake.extensions.ut_metadata);
+    try std.testing.expectEqual(@as(u8, local_ut_metadata_id), result.extensions.ut_metadata);
     // ut_pex must NOT be advertised for private torrents (BEP 27)
-    try std.testing.expectEqual(@as(u8, 0), result.handshake.extensions.ut_pex);
-    try std.testing.expectEqual(@as(u16, 6881), result.handshake.port);
+    try std.testing.expectEqual(@as(u8, 0), result.extensions.ut_pex);
+    try std.testing.expectEqual(@as(u16, 6881), result.port);
 }
 
 test "serializeExtensionMessage with empty payload" {
@@ -465,8 +448,7 @@ test "serializeExtensionMessage with empty payload" {
 test "fuzz BEP 10 extension handshake decoder" {
     try std.testing.fuzz({}, struct {
         fn run(_: void, input: []const u8) anyerror!void {
-            var result = decodeExtensionHandshake(std.testing.allocator, input) catch return;
-            freeDecoded(std.testing.allocator, &result);
+            _ = decodeExtensionHandshake(input) catch return;
         }
     }.run, .{
         .corpus = &.{
@@ -505,16 +487,14 @@ test "extension handshake decoder edge cases: single byte inputs" {
     var byte: u16 = 0;
     while (byte <= 0xFF) : (byte += 1) {
         buf[0] = @intCast(byte);
-        var result = decodeExtensionHandshake(std.testing.allocator, &buf) catch continue;
-        freeDecoded(std.testing.allocator, &result);
+        _ = decodeExtensionHandshake(&buf) catch continue;
     }
 }
 
 test "extension handshake decoder handles truncated valid input" {
     const valid = "d1:md11:ut_metadatai3e6:ut_pexi2ee13:metadata_sizei12345e1:pi9999e1:v7:delugexe";
     for (0..valid.len) |i| {
-        var result = decodeExtensionHandshake(std.testing.allocator, valid[0..i]) catch continue;
-        freeDecoded(std.testing.allocator, &result);
+        _ = decodeExtensionHandshake(valid[0..i]) catch continue;
     }
 }
 
@@ -522,39 +502,35 @@ test "extension handshake decoder handles truncated valid input" {
 
 test "decode extension handshake with upload_only=1" {
     const input = "d1:md11:ut_metadatai1ee1:pi6881e11:upload_onlyi1e1:v6:varunae";
-    var result = try decodeExtensionHandshake(std.testing.allocator, input);
-    defer freeDecoded(std.testing.allocator, &result);
+    const result = try decodeExtensionHandshake(input);
 
-    try std.testing.expect(result.handshake.upload_only);
-    try std.testing.expectEqual(@as(u8, 1), result.handshake.extensions.ut_metadata);
-    try std.testing.expectEqual(@as(u16, 6881), result.handshake.port);
+    try std.testing.expect(result.upload_only);
+    try std.testing.expectEqual(@as(u8, 1), result.extensions.ut_metadata);
+    try std.testing.expectEqual(@as(u16, 6881), result.port);
 }
 
 test "decode extension handshake with upload_only=0" {
     const input = "d1:md11:ut_metadatai1ee11:upload_onlyi0ee";
-    var result = try decodeExtensionHandshake(std.testing.allocator, input);
-    defer freeDecoded(std.testing.allocator, &result);
+    const result = try decodeExtensionHandshake(input);
 
-    try std.testing.expect(!result.handshake.upload_only);
+    try std.testing.expect(!result.upload_only);
 }
 
 test "decode extension handshake without upload_only defaults to false" {
     const input = "d1:md11:ut_metadatai1ee1:pi6881ee";
-    var result = try decodeExtensionHandshake(std.testing.allocator, input);
-    defer freeDecoded(std.testing.allocator, &result);
+    const result = try decodeExtensionHandshake(input);
 
-    try std.testing.expect(!result.handshake.upload_only);
+    try std.testing.expect(!result.upload_only);
 }
 
 test "encode extension handshake with upload_only" {
     const payload = try encodeExtensionHandshakeFull(std.testing.allocator, 6881, false, 0, true);
     defer std.testing.allocator.free(payload);
 
-    var result = try decodeExtensionHandshake(std.testing.allocator, payload);
-    defer freeDecoded(std.testing.allocator, &result);
+    const result = try decodeExtensionHandshake(payload);
 
-    try std.testing.expect(result.handshake.upload_only);
-    try std.testing.expectEqual(@as(u16, 6881), result.handshake.port);
+    try std.testing.expect(result.upload_only);
+    try std.testing.expectEqual(@as(u16, 6881), result.port);
 }
 
 test "encode extension handshake without upload_only omits key" {
@@ -564,19 +540,18 @@ test "encode extension handshake without upload_only omits key" {
     // The bencoded output should not contain "upload_only"
     try std.testing.expect(std.mem.indexOf(u8, payload, "upload_only") == null);
 
-    var result = try decodeExtensionHandshake(std.testing.allocator, payload);
-    defer freeDecoded(std.testing.allocator, &result);
-    try std.testing.expect(!result.handshake.upload_only);
+    const result = try decodeExtensionHandshake(payload);
+
+    try std.testing.expect(!result.upload_only);
 }
 
 test "encode extension handshake with upload_only and metadata_size" {
     const payload = try encodeExtensionHandshakeFull(std.testing.allocator, 6881, false, 42000, true);
     defer std.testing.allocator.free(payload);
 
-    var result = try decodeExtensionHandshake(std.testing.allocator, payload);
-    defer freeDecoded(std.testing.allocator, &result);
+    const result = try decodeExtensionHandshake(payload);
 
-    try std.testing.expect(result.handshake.upload_only);
-    try std.testing.expectEqual(@as(u32, 42000), result.handshake.metadata_size);
-    try std.testing.expectEqual(@as(u16, 6881), result.handshake.port);
+    try std.testing.expect(result.upload_only);
+    try std.testing.expectEqual(@as(u32, 42000), result.metadata_size);
+    try std.testing.expectEqual(@as(u16, 6881), result.port);
 }

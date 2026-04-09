@@ -301,7 +301,7 @@ pub fn completePieceDownload(self: *EventLoop, slot: u16) void {
                 self.markIdle(slot);
                 return;
             };
-            defer storage.verify.freePiecePlan(self.allocator, plan);
+            defer plan.deinit(self.allocator);
 
             const span_count: u32 = @intCast(plan.spans.len);
             if (span_count == 0) {
@@ -417,7 +417,7 @@ pub fn processHashResults(self: *EventLoop) void {
                 self.allocator.free(result.piece_buf);
                 continue;
             };
-            defer storage.verify.freePiecePlan(self.allocator, plan);
+            defer plan.deinit(self.allocator);
 
             const span_count: u32 = @intCast(plan.spans.len);
             if (span_count == 0) {
@@ -551,7 +551,7 @@ pub fn checkPeerTimeouts(self: *EventLoop) void {
         const peer = &self.peers[slot];
         if (peer.state == .free or peer.state == .disconnecting) continue;
         if (peer.last_activity == 0) continue;
-        if (peer.mode == .seed) continue; // don't timeout seed peers
+        if (peer.mode == .inbound) continue; // don't timeout inbound peers
 
         if (now - peer.last_activity > peer_timeout_secs) {
             to_remove.append(self.allocator, slot) catch break;
@@ -605,7 +605,7 @@ pub fn recalculateUnchokes(self: *EventLoop) void {
         const peer = &self.peers[slot];
         if (peer.state == .free or peer.state == .disconnecting) continue;
         if (!peer.peer_interested) continue;
-        if (peer.mode == .download) is_seeding = false;
+        if (peer.mode == .outbound) is_seeding = false;
         if (interested_count < max_peers) {
             interested_peers[interested_count] = slot;
             interested_count += 1;
@@ -740,7 +740,7 @@ pub fn checkPex(self: *EventLoop) void {
             const torrent_pex = tc.pex_state orelse break;
 
             const flags = pex_mod.PeerFlags{
-                .seed = peer.mode == .seed or peer.upload_only,
+                .seed = peer.mode == .inbound or peer.upload_only,
                 .utp = peer.transport == .utp,
             };
             torrent_pex.addPeer(self.allocator, peer.address, flags);
@@ -936,7 +936,7 @@ test "promoteNextPieceOrMarkIdle promotes next piece to current" {
     const slot: u16 = 0;
     const peer = &el.peers[slot];
     peer.state = .active_recv_header;
-    peer.mode = .download;
+    peer.mode = .outbound;
     peer.availability_known = true;
     peer.peer_choking = false;
 
@@ -973,7 +973,7 @@ test "promoteNextPieceOrMarkIdle marks idle when no next piece" {
     const slot: u16 = 0;
     const peer = &el.peers[slot];
     peer.state = .active_recv_header;
-    peer.mode = .download;
+    peer.mode = .outbound;
     peer.availability_known = true;
     peer.peer_choking = false;
     peer.current_piece = null;
@@ -1002,7 +1002,7 @@ test "recalculateUnchokes unchokes top peers by download speed" {
     for (slots, speeds) |slot, speed| {
         const peer = &el.peers[slot];
         peer.state = .active_recv_header;
-        peer.mode = .download; // download mode: sort by dl speed
+        peer.mode = .outbound; // download mode: sort by dl speed
         peer.peer_interested = true;
         peer.am_choking = true;
         peer.current_dl_speed = speed;
@@ -1037,7 +1037,7 @@ test "recalculateUnchokes uses upload speed in seed mode" {
     for (slots, ul_speeds) |slot, speed| {
         const peer = &el.peers[slot];
         peer.state = .active_recv_header;
-        peer.mode = .seed; // all seed mode -> is_seeding = true
+        peer.mode = .inbound; // all seed mode -> is_seeding = true
         peer.peer_interested = true;
         peer.am_choking = true;
         peer.current_ul_speed = speed;
@@ -1063,7 +1063,7 @@ test "recalculateUnchokes skips uninterested peers" {
 
     // Peer 0: interested, speed 100
     el.peers[0].state = .active_recv_header;
-    el.peers[0].mode = .download;
+    el.peers[0].mode = .outbound;
     el.peers[0].peer_interested = true;
     el.peers[0].am_choking = true;
     el.peers[0].current_dl_speed = 100;
@@ -1071,7 +1071,7 @@ test "recalculateUnchokes skips uninterested peers" {
 
     // Peer 1: NOT interested, speed 999
     el.peers[1].state = .active_recv_header;
-    el.peers[1].mode = .download;
+    el.peers[1].mode = .outbound;
     el.peers[1].peer_interested = false;
     el.peers[1].am_choking = true;
     el.peers[1].current_dl_speed = 999;
@@ -1093,7 +1093,7 @@ test "recalculateUnchokes respects interval gating" {
     el.last_unchoke_recalc = std.time.timestamp();
 
     el.peers[0].state = .active_recv_header;
-    el.peers[0].mode = .download;
+    el.peers[0].mode = .outbound;
     el.peers[0].peer_interested = true;
     el.peers[0].am_choking = true;
     el.peers[0].current_dl_speed = 100;
@@ -1111,7 +1111,7 @@ test "checkPeerTimeouts removes inactive download peers" {
 
     // Peer 0: download mode, last activity is old (should be timed out)
     el.peers[0].state = .active_recv_header;
-    el.peers[0].mode = .download;
+    el.peers[0].mode = .outbound;
     el.peers[0].last_activity = std.time.timestamp() - (peer_timeout_secs + 10);
     el.peer_count = 1;
     el.markActivePeer(0);
@@ -1129,7 +1129,7 @@ test "checkPeerTimeouts does not remove seed mode peers" {
 
     // Peer 0: seed mode, last activity is old -- should NOT be timed out
     el.peers[0].state = .active_recv_header;
-    el.peers[0].mode = .seed;
+    el.peers[0].mode = .inbound;
     el.peers[0].last_activity = std.time.timestamp() - (peer_timeout_secs + 100);
     el.peer_count = 1;
     el.markActivePeer(0);
@@ -1147,7 +1147,7 @@ test "checkPeerTimeouts does not remove recently active peers" {
 
     // Peer 0: download mode, recently active -- should NOT be timed out
     el.peers[0].state = .active_recv_header;
-    el.peers[0].mode = .download;
+    el.peers[0].mode = .outbound;
     el.peers[0].last_activity = std.time.timestamp() - 5; // 5 seconds ago
     el.peer_count = 1;
     el.markActivePeer(0);
@@ -1164,12 +1164,12 @@ test "checkPeerTimeouts skips free and disconnecting peers" {
 
     // Peer 0: free state with old timestamp -- should be skipped
     el.peers[0].state = .free;
-    el.peers[0].mode = .download;
+    el.peers[0].mode = .outbound;
     el.peers[0].last_activity = std.time.timestamp() - (peer_timeout_secs + 100);
 
     // Peer 1: disconnecting state with old timestamp -- should be skipped
     el.peers[1].state = .disconnecting;
-    el.peers[1].mode = .download;
+    el.peers[1].mode = .outbound;
     el.peers[1].last_activity = std.time.timestamp() - (peer_timeout_secs + 100);
     el.markActivePeer(1);
 
@@ -1188,7 +1188,7 @@ test "sendKeepAlives queues send for quiet peer" {
     const slot: u16 = 0;
     const peer = &el.peers[slot];
     peer.state = .active_recv_header;
-    peer.mode = .download;
+    peer.mode = .outbound;
     peer.send_pending = false;
     // Set last_activity well beyond the keepalive interval
     peer.last_activity = std.time.timestamp() - (keepalive_interval_secs + 10);
@@ -1218,7 +1218,7 @@ test "sendKeepAlives skips peer with recent activity" {
     const slot: u16 = 0;
     const peer = &el.peers[slot];
     peer.state = .active_recv_header;
-    peer.mode = .download;
+    peer.mode = .outbound;
     peer.send_pending = false;
     peer.last_activity = std.time.timestamp() - 10; // only 10 seconds ago, well within interval
     peer.fd = -1;
@@ -1239,7 +1239,7 @@ test "sendKeepAlives skips peer with send already pending" {
     const slot: u16 = 0;
     const peer = &el.peers[slot];
     peer.state = .active_recv_header;
-    peer.mode = .download;
+    peer.mode = .outbound;
     peer.send_pending = true; // already has a send in flight
     peer.last_activity = std.time.timestamp() - (keepalive_interval_secs + 10);
     peer.fd = -1;
@@ -1260,7 +1260,7 @@ test "sendKeepAlives skips non-active peers" {
     const slot: u16 = 0;
     const peer = &el.peers[slot];
     peer.state = .handshake_send;
-    peer.mode = .download;
+    peer.mode = .outbound;
     peer.send_pending = false;
     peer.last_activity = std.time.timestamp() - (keepalive_interval_secs + 10);
     peer.fd = -1;

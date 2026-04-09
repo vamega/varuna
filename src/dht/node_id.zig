@@ -13,7 +13,7 @@ pub const NodeInfo = struct {
 };
 
 /// Generate a random 160-bit node ID.
-pub fn generate() NodeId {
+pub fn generateRandom() NodeId {
     var id: NodeId = undefined;
     std.crypto.random.bytes(&id);
     return id;
@@ -165,21 +165,21 @@ pub fn encodeCompactNodes(allocator: std.mem.Allocator, nodes: []const NodeInfo)
 // ── Tests ──────────────────────────────────────────────
 
 test "xorDistance is symmetric" {
-    const a = generate();
-    const b = generate();
+    const a = generateRandom();
+    const b = generateRandom();
     const d1 = xorDistance(a, b);
     const d2 = xorDistance(b, a);
     try std.testing.expectEqual(d1, d2);
 }
 
 test "xorDistance with self is zero" {
-    const a = generate();
+    const a = generateRandom();
     const d = xorDistance(a, a);
     try std.testing.expectEqual(d, [_]u8{0} ** 20);
 }
 
 test "distanceBucket returns null for same ID" {
-    const a = generate();
+    const a = generateRandom();
     try std.testing.expect(distanceBucket(a, a) == null);
 }
 
@@ -223,7 +223,7 @@ test "isCloser picks the closer node" {
 }
 
 test "compact node encode/decode roundtrip" {
-    const id = generate();
+    const id = generateRandom();
     const node = NodeInfo{
         .id = id,
         .address = std.net.Address.initIp4(.{ 192, 168, 1, 100 }, 6881),
@@ -240,7 +240,7 @@ test "compact nodes batch encode/decode" {
     var nodes: [3]NodeInfo = undefined;
     for (&nodes, 0..) |*n, i| {
         n.* = .{
-            .id = generate(),
+            .id = generateRandom(),
             .address = std.net.Address.initIp4(.{ 10, 0, 0, @intCast(i + 1) }, @intCast(6881 + i)),
         };
     }
@@ -257,7 +257,7 @@ test "compact nodes batch encode/decode" {
 }
 
 test "randomIdInBucket generates ID in correct bucket" {
-    const own_id = generate();
+    const own_id = generateRandom();
     // Test several bucket indices
     for ([_]u8{ 0, 1, 10, 50, 100, 150, 159 }) |bucket| {
         const id = randomIdInBucket(own_id, bucket);

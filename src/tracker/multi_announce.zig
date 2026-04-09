@@ -181,22 +181,6 @@ fn announceWorker(
     shared.cond.broadcast();
 }
 
-/// Background worker version: announces to all URLs in parallel using the
-/// shared announce ring's mutex for serialization, but spawns threads for
-/// each URL so they run concurrently. Results go into `result_peers` and
-/// `result_url_index` atomically.
-///
-/// This is the version used by the event loop re-announce path.
-pub fn announceParallelWithRing(
-    allocator: std.mem.Allocator,
-    urls: []const []const u8,
-    base_request: announce.Request,
-) !MultiAnnounceResult {
-    // For the background re-announce case, each thread creates its own
-    // short-lived ring (the shared ring is for serialized access only).
-    return announceParallel(allocator, urls, base_request);
-}
-
 // ── Tests ────────────────────────────────────────────────
 
 test "parallel announce with single URL falls back to direct call" {

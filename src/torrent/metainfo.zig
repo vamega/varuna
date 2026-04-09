@@ -23,7 +23,7 @@ pub const Metainfo = struct {
     announce_list: []const []const u8 = &.{},
     comment: ?[]const u8,
     created_by: ?[]const u8,
-    creation_date: i64 = -1,
+    creation_date: ?i64 = null,
     name: []const u8,
     piece_length: u32,
     pieces: []const u8 = "", // may be empty for pure v2
@@ -55,21 +55,16 @@ pub const Metainfo = struct {
 
     /// Compute piece count for v2 torrents from file tree metadata.
     /// In v2, pieces are file-aligned, so each file contributes ceil(length / piece_length) pieces.
+    /// Requires v2 file tree metadata; returns error.V2FileTreeRequired if absent.
     pub fn pieceCountFromFiles(self: Metainfo) !u32 {
-        if (self.file_tree_v2) |v2_files| {
-            var total: u64 = 0;
-            for (v2_files) |f| {
-                if (f.length > 0) {
-                    total += (f.length + self.piece_length - 1) / self.piece_length;
-                }
+        const v2_files = self.file_tree_v2 orelse return error.V2FileTreeRequired;
+        var total: u64 = 0;
+        for (v2_files) |f| {
+            if (f.length > 0) {
+                total += (f.length + self.piece_length - 1) / self.piece_length;
             }
-            return std.math.cast(u32, total) orelse error.PieceCountOverflow;
         }
-        // Fallback to v1 method for files array
-        const total = self.totalSize();
-        if (total == 0) return error.PieceCountOverflow;
-        const count = (total + self.piece_length - 1) / self.piece_length;
-        return std.math.cast(u32, count) orelse error.PieceCountOverflow;
+        return std.math.cast(u32, total) orelse error.PieceCountOverflow;
     }
 
     pub fn pieceHash(self: Metainfo, piece_index: u32) ![]const u8 {
@@ -94,10 +89,6 @@ pub const Metainfo = struct {
 
     pub fn isMultiFile(self: Metainfo) bool {
         return self.files.len > 1;
-    }
-
-    pub fn isPrivate(self: Metainfo) bool {
-        return self.private;
     }
 
     /// Returns true if this torrent has v2 metadata (pure v2 or hybrid).
@@ -130,7 +121,7 @@ pub fn parse(allocator: std.mem.Allocator, input: []const u8) !Metainfo {
 
     const version = detectVersion(info);
     const name = try expectBytes(try getRequired(info, "name"));
-    const piece_length = try expectPositiveU32(try getRequired(info, "piece length"));
+    const piece_length = try expectU32(try getRequired(info, "piece length"));
     if (piece_length == 0) return error.InvalidPieceLength;
 
     // v1 pieces field: required for v1 and hybrid, absent for pure v2
@@ -148,7 +139,7 @@ pub fn parse(allocator: std.mem.Allocator, input: []const u8) !Metainfo {
         files = if (bencode.dictGet(info, "files")) |value|
             try parseMultiFileList(allocator, try expectList(value))
         else
-            try parseSingleFileList(allocator, try expectPositiveU64(try getRequired(info, "length")), name);
+            try parseSingleFileList(allocator, try expectU64(try getRequired(info, "length")), name);
     }
     errdefer {
         for (files) |f| allocator.free(f.path);
@@ -212,11 +203,11 @@ pub fn parse(allocator: std.mem.Allocator, input: []const u8) !Metainfo {
         .http_seeds = http_seeds,
         .comment = if (bencode.dictGet(root_dict, "comment")) |value| try expectBytes(value) else null,
         .created_by = if (bencode.dictGet(root_dict, "created by")) |value| try expectBytes(value) else null,
-        .creation_date = if (bencode.dictGet(root_dict, "creation date")) |value| @as(i64, @intCast(try expectPositiveU64(value))) else -1,
+        .creation_date = if (bencode.dictGet(root_dict, "creation date")) |value| @as(i64, @intCast(try expectU64(value))) else null,
         .name = name,
         .piece_length = piece_length,
         .pieces = pieces,
-        .private = if (bencode.dictGet(info, "private")) |v| (try expectPositiveU64(v)) == 1 else false,
+        .private = if (bencode.dictGet(info, "private")) |v| (try expectU64(v)) == 1 else false,
         .files = files,
         .version = version,
         .info_hash_v2 = info_hash_v2,
@@ -317,7 +308,7 @@ fn parseMultiFileList(
 
     for (values, 0..) |value, index| {
         const entry = try expectDict(value);
-        const length = try expectPositiveU64(try getRequired(entry, "length"));
+        const length = try expectU64(try getRequired(entry, "length"));
         const path = try parsePath(allocator, try expectList(try getRequired(entry, "path")));
         files[index] = .{
             .length = length,
@@ -377,12 +368,12 @@ fn expectBytes(value: bencode.Value) BencodeTypeError![]const u8 {
     };
 }
 
-fn expectPositiveU32(value: bencode.Value) BencodeTypeError!u32 {
-    const integer = try expectPositiveU64(value);
+fn expectU32(value: bencode.Value) BencodeTypeError!u32 {
+    const integer = try expectU64(value);
     return std.math.cast(u32, integer) orelse error.IntegerOverflow;
 }
 
-fn expectPositiveU64(value: bencode.Value) BencodeTypeError!u64 {
+fn expectU64(value: bencode.Value) BencodeTypeError!u64 {
     return switch (value) {
         .integer => |integer| {
             if (integer < 0) return error.NegativeInteger;
@@ -457,7 +448,7 @@ test "parse private flag in metainfo" {
     const metainfo = try parse(std.testing.allocator, input);
     defer freeMetainfo(std.testing.allocator, metainfo);
 
-    try std.testing.expect(metainfo.isPrivate());
+    try std.testing.expect(metainfo.private);
 }
 
 test "non-private torrent defaults to false" {
@@ -467,7 +458,7 @@ test "non-private torrent defaults to false" {
     const metainfo = try parse(std.testing.allocator, input);
     defer freeMetainfo(std.testing.allocator, metainfo);
 
-    try std.testing.expect(!metainfo.isPrivate());
+    try std.testing.expect(!metainfo.private);
 }
 
 test "reject non-dictionary torrent root" {

@@ -1,5 +1,5 @@
 const std = @import("std");
-const layout_mod = @import("layout.zig");
+const layout = @import("layout.zig");
 const Bitfield = @import("../bitfield.zig").Bitfield;
 
 pub const FilePriority = enum(u2) {
@@ -15,7 +15,7 @@ pub const FilePriority = enum(u2) {
 /// skipped file) are still downloaded -- they contain data for the wanted file.
 pub fn buildPieceMask(
     allocator: std.mem.Allocator,
-    lay: *const layout_mod.Layout,
+    lay: *const layout.Layout,
     file_priorities: []const FilePriority,
 ) !Bitfield {
     std.debug.assert(file_priorities.len == lay.files.len);
@@ -71,8 +71,8 @@ test "all files wanted produces full mask" {
         .files = files[0..],
     };
 
-    const lay = try layout_mod.build(std.testing.allocator, &source);
-    defer layout_mod.freeLayout(std.testing.allocator, lay);
+    const lay = try layout.build(std.testing.allocator, &source);
+    defer layout.freeLayout(std.testing.allocator, lay);
 
     const priorities = [_]FilePriority{ .normal, .normal };
     var mask = try buildPieceMask(std.testing.allocator, &lay, priorities[0..]);
@@ -106,8 +106,8 @@ test "skip second file still downloads boundary piece" {
         .files = files[0..],
     };
 
-    const lay = try layout_mod.build(std.testing.allocator, &source);
-    defer layout_mod.freeLayout(std.testing.allocator, lay);
+    const lay = try layout.build(std.testing.allocator, &source);
+    defer layout.freeLayout(std.testing.allocator, lay);
 
     const priorities = [_]FilePriority{ .normal, .do_not_download };
     var mask = try buildPieceMask(std.testing.allocator, &lay, priorities[0..]);
@@ -138,8 +138,8 @@ test "skip first file, want second file downloads boundary" {
         .files = files[0..],
     };
 
-    const lay = try layout_mod.build(std.testing.allocator, &source);
-    defer layout_mod.freeLayout(std.testing.allocator, lay);
+    const lay = try layout.build(std.testing.allocator, &source);
+    defer layout.freeLayout(std.testing.allocator, lay);
 
     const priorities = [_]FilePriority{ .do_not_download, .normal };
     var mask = try buildPieceMask(std.testing.allocator, &lay, priorities[0..]);

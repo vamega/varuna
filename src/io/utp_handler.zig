@@ -258,7 +258,7 @@ fn acceptUtpConnection(self: *EventLoop, mgr: *utp_mgr.UtpManager) void {
         peer.* = Peer{
             .fd = -1, // uTP peers don't have a direct fd
             .state = .inbound_handshake_recv,
-            .mode = .seed,
+            .mode = .inbound,
             .transport = .utp,
             .utp_slot = utp_slot,
             .address = remote_addr,
