@@ -75,26 +75,32 @@ Rules:
 ## io_uring Policy
 This is a current operating rule for the daemon, not a design aspiration.
 
-The `varuna` daemon is performance-critical. All hot-path daemon I/O must go through the `io_uring`-backed event loop and ring plumbing in `src/io/`. Do not use `std.fs.File` read/write/sync methods or `std.net.Stream` read/write methods for daemon hot paths.
+The `varuna` daemon is performance-critical. **All daemon networking and file I/O must go through `io_uring`** via the event loop and ring plumbing in `src/io/`. Do not use `std.fs.File` read/write/sync methods, `std.net.Stream` read/write methods, or raw `posix.connect`/`posix.read`/`posix.write`/`posix.sendto`/`posix.recvfrom` for any daemon I/O. This applies to all paths, not just "hot" paths.
 
 Daemon paths that must use `io_uring`:
-- piece storage reads and writes
+- piece storage reads and writes (including recheck/verification)
 - peer wire send and receive
 - peer TCP connect, accept, and socket creation
 - RPC server accept, recv, and send
 - HTTP tracker client connect, send, and recv
+- UDP tracker client sendto and recvfrom
+- metadata fetch (BEP 9) peer connections and wire I/O
 - fsync/fdatasync and fallocate
+- timers and delays (use timerfd on the ring, not `Thread.sleep`)
 
 `varuna-ctl` and `varuna-tools` are different: standard library I/O is acceptable there.
 
-Allowed daemon exceptions:
+Allowed daemon exceptions (background threads only):
+- SQLite operations -- must run on a dedicated background thread, never on the event-loop thread
+- CPU-bound piece hashing -- the hasher thread pool in `src/io/hasher.zig`
 - one-time file creation, directory setup, and truncation during `PieceStore.init`
 - stdout logging
 - test helpers that simulate peers or trackers
 - `uname` for runtime probing
-- SQLite work on a background thread, never on the event-loop thread
 
-When adding daemon I/O, use the ring or event loop and verify hot paths with `strace -f -yy -c`.
+**Do not spawn background threads for I/O.** If something needs to happen concurrently, submit it as io_uring SQEs. Background threads are only for CPU-bound work (hashing) and APIs that cannot use io_uring (SQLite, DNS without c-ares). The multi-tracker announce thread pool and the `startWorker` blocking-I/O patterns are known violations being removed.
+
+When adding daemon I/O, use the ring or event loop and verify with `strace -f -yy -c` that it routes through `io_uring_enter`.
 
 ## Key Docs
 - [docs/io-uring-syscalls.md](docs/io-uring-syscalls.md) - syscall reference and current io_uring coverage
