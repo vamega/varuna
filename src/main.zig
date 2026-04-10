@@ -65,13 +65,25 @@ pub fn main() !void {
     };
     try stdout.flush();
 
-    // Shared event loop for all torrents (single-threaded I/O)
-    var shared_el = varuna.io.event_loop.EventLoop.initBare(allocator, cfg.performance.hasher_threads) catch |err| {
-        try stdout.print("failed to create event loop: {s}\n", .{@errorName(err)});
+    // Shared event loop for all torrents (single-threaded I/O).
+    // Heap-allocated because EventLoop is very large (peers array, torrent
+    // contexts, etc.) and would overflow the stack alongside the GPA state.
+    const shared_el_heap = allocator.create(varuna.io.event_loop.EventLoop) catch |err| {
+        try stdout.print("failed to allocate event loop: {s}\n", .{@errorName(err)});
         try stdout.flush();
         return err;
     };
-    defer shared_el.deinit();
+    shared_el_heap.* = varuna.io.event_loop.EventLoop.initBare(allocator, cfg.performance.hasher_threads) catch |err| {
+        try stdout.print("failed to create event loop: {s}\n", .{@errorName(err)});
+        try stdout.flush();
+        allocator.destroy(shared_el_heap);
+        return err;
+    };
+    const shared_el = shared_el_heap;
+    defer {
+        shared_el.deinit();
+        allocator.destroy(shared_el_heap);
+    }
 
     // Resolve resume DB path (config override or default XDG location)
     var resume_db_buf: [1024]u8 = undefined;
@@ -251,7 +263,7 @@ pub fn main() !void {
 
     // Session manager
     var session_manager = varuna.daemon.session_manager.SessionManager.init(allocator);
-    session_manager.shared_event_loop = &shared_el;
+    session_manager.shared_event_loop = shared_el;
     session_manager.port = cfg.network.port_min;
     session_manager.max_peers = cfg.network.max_peers;
     session_manager.hasher_threads = cfg.performance.hasher_threads;

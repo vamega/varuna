@@ -504,7 +504,7 @@ fn isPeerAlreadyConnected(self: *EventLoop, torrent_id: TorrentId, addr: std.net
         const p = &self.peers[slot];
         if (p.state == .free) continue;
         // Compare address family, IP, and port
-        if (address.addressEql(p.address, addr)) return true;
+        if (address.addressEql(&p.address, &addr)) return true;
     }
     return false;
 }

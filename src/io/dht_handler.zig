@@ -70,7 +70,7 @@ fn drainDhtPeerResults(self: *EventLoop) void {
             // Deduplicate: skip if already connected to this address
             var already_connected = false;
             for (self.peers) |*peer| {
-                if (peer.state != .free and address.addressEql(peer.address, peer_addr)) {
+                if (peer.state != .free and address.addressEql(&peer.address, &peer_addr)) {
                     already_connected = true;
                     break;
                 }

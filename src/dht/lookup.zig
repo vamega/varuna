@@ -150,7 +150,7 @@ pub const Lookup = struct {
                     // Deduplicate
                     var dup = false;
                     for (self.peers[0..self.peer_count]) |existing| {
-                        if (address.addressEql(existing, addr)) {
+                        if (address.addressEql(&existing, &addr)) {
                             dup = true;
                             break;
                         }

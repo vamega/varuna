@@ -844,7 +844,7 @@ pub const DhtEngine = struct {
 
         for (&self.pending) |*slot| {
             if (slot.*) |pending| {
-                if (pending.transaction_id == txn_id and address.addressEql(pending.target_addr, sender)) {
+                if (pending.transaction_id == txn_id and address.addressEql(&pending.target_addr, &sender)) {
                     const result = pending;
                     slot.* = null;
                     return result;

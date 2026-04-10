@@ -181,7 +181,7 @@ pub const MetadataFetcher = struct {
     pub fn addPeer(self: *MetadataFetcher, addr: std.net.Address) void {
         // Check for duplicates
         for (self.peers.items) |*p| {
-            if (address.addressEql(p.address, addr)) return;
+            if (address.addressEql(&p.address, &addr)) return;
         }
         self.peers.append(self.allocator, .{ .address = addr }) catch {};
     }
@@ -704,9 +704,9 @@ test "addressEql detects same and different addresses" {
     const c = std.net.Address.initIp4(.{ 1, 2, 3, 4 }, 6882);
     const d = std.net.Address.initIp4(.{ 5, 6, 7, 8 }, 6881);
 
-    try std.testing.expect(address.addressEql(a, b));
-    try std.testing.expect(!address.addressEql(a, c));
-    try std.testing.expect(!address.addressEql(a, d));
+    try std.testing.expect(address.addressEql(&a, &b));
+    try std.testing.expect(!address.addressEql(&a, &c));
+    try std.testing.expect(!address.addressEql(&a, &d));
 }
 
 test "FetchProgress default values" {

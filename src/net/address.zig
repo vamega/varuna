@@ -3,7 +3,8 @@ const posix = std.posix;
 
 /// Compare two network addresses for equality (IPv4 and IPv6).
 /// Checks both address and port.
-pub fn addressEql(a: std.net.Address, b: std.net.Address) bool {
+/// Takes pointers to avoid 128-byte copies in loops (std.net.Address is a large union).
+pub fn addressEql(a: *const std.net.Address, b: *const std.net.Address) bool {
     if (a.any.family != b.any.family) return false;
     return switch (a.any.family) {
         posix.AF.INET => a.in.sa.addr == b.in.sa.addr and a.in.sa.port == b.in.sa.port,

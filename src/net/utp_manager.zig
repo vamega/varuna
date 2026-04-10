@@ -228,7 +228,7 @@ pub const UtpManager = struct {
         for (0..max_connections) |i| {
             if (!self.slot_active[i]) continue;
             if (self.connections[i].recv_id != conn_id) continue;
-            if (@import("address.zig").addressEql(self.connections[i].remote_addr, remote)) {
+            if (@import("address.zig").addressEql(&self.connections[i].remote_addr, &remote)) {
                 return @intCast(i);
             }
         }
