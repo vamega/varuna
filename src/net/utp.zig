@@ -174,13 +174,13 @@ pub const max_payload: u16 = 1400 - Header.size;
 /// An outbound packet waiting for acknowledgement.
 /// Owns a copy of the payload for retransmission.
 pub const OutPacket = struct {
-    seq_nr: u16,
+    seq_nr: u16 = 0,
     /// Owned copy of the full UDP datagram (header + payload) for retransmission.
     /// Null for slots that have been acked and reclaimed.
     packet_buf: ?[]u8 = null,
     /// Length of the payload portion (excluding header).
     payload_len: u16 = 0,
-    send_time_us: u32,
+    send_time_us: u32 = 0,
     retransmit_count: u8 = 0,
     acked: bool = false,
     /// Whether this packet needs retransmission (set on timeout/loss detection).
@@ -240,7 +240,7 @@ pub const UtpSocket = struct {
     rtt_initialized: bool = false,
 
     /// Outbound packet buffer (circular, max_outbuf entries).
-    out_buf: [max_outbuf]OutPacket = undefined,
+    out_buf: [max_outbuf]OutPacket = [_]OutPacket{.{}} ** max_outbuf,
     out_buf_count: u16 = 0,
     /// Sequence number of the oldest unacknowledged packet.
     out_seq_start: u16 = 1,
