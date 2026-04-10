@@ -556,7 +556,6 @@ pub const TrackerExecutor = struct {
         };
     }
 
-
     fn buildRequest(self: *TrackerExecutor, slot: *RequestSlot) void {
         const parsed = slot.parsed;
         slot.send_buf.clearRetainingCapacity();
