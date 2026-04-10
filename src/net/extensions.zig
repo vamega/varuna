@@ -138,143 +138,57 @@ pub fn encodeExtensionHandshakeFull(allocator: std.mem.Allocator, listen_port: u
 /// The returned struct references no heap memory beyond what the caller
 /// already holds in `data`; no allocations are made for the result.
 pub fn decodeExtensionHandshake(data: []const u8) !ExtensionHandshake {
-    var parser = Parser{ .input = data };
-    try parser.expectByte('d');
+    var scanner = Scanner.init(data);
+    try scanner.expectByte('d');
 
     var result = ExtensionHandshake{};
 
     while (true) {
-        const next = parser.peek() orelse return error.InvalidExtensionHandshake;
+        const next = scanner.peek() orelse return error.InvalidExtensionHandshake;
         if (next == 'e') {
-            parser.index += 1;
+            scanner.pos += 1;
             break;
         }
 
-        const key = try parser.parseBytes();
+        const key = try scanner.parseBytes();
         if (std.mem.eql(u8, key, "m")) {
-            try parseExtensionMap(&parser, &result.extensions);
+            try parseExtensionMap(&scanner, &result.extensions);
         } else if (std.mem.eql(u8, key, "p")) {
-            const port = try parser.parseInteger();
+            const port = try scanner.parseInteger();
             if (port >= 0 and port <= 65535) {
                 result.port = @intCast(port);
             }
         } else if (std.mem.eql(u8, key, "v")) {
-            result.client = try parser.parseBytes();
+            result.client = try scanner.parseBytes();
         } else if (std.mem.eql(u8, key, "metadata_size")) {
-            const metadata_size = try parser.parseInteger();
+            const metadata_size = try scanner.parseInteger();
             if (metadata_size >= 0 and metadata_size <= std.math.maxInt(u32)) {
                 result.metadata_size = @intCast(metadata_size);
             }
         } else if (std.mem.eql(u8, key, "upload_only")) {
-            result.upload_only = (try parser.parseInteger()) != 0;
+            result.upload_only = (try scanner.parseInteger()) != 0;
         } else {
-            try parser.skipValue();
+            try scanner.skipValue();
         }
     }
 
-    if (!parser.isAtEnd()) return error.InvalidExtensionHandshake;
+    if (!scanner.isAtEnd()) return error.InvalidExtensionHandshake;
     return result;
 }
 
-const Parser = struct {
-    input: []const u8,
-    index: usize = 0,
+const Scanner = @import("bencode_scanner.zig").BencodeScanner(error{InvalidExtensionHandshake});
 
-    fn peek(self: *const Parser) ?u8 {
-        if (self.index >= self.input.len) return null;
-        return self.input[self.index];
-    }
-
-    fn isAtEnd(self: *const Parser) bool {
-        return self.index == self.input.len;
-    }
-
-    fn expectByte(self: *Parser, byte: u8) !void {
-        if (self.peek() != byte) return error.InvalidExtensionHandshake;
-        self.index += 1;
-    }
-
-    fn parseBytes(self: *Parser) ![]const u8 {
-        const start = self.index;
-        while (self.peek()) |byte| {
-            if (byte == ':') break;
-            if (!std.ascii.isDigit(byte)) return error.InvalidExtensionHandshake;
-            self.index += 1;
-        }
-        if (self.peek() != ':') return error.InvalidExtensionHandshake;
-
-        const len_slice = self.input[start..self.index];
-        if (len_slice.len == 0) return error.InvalidExtensionHandshake;
-
-        self.index += 1;
-        const len = std.fmt.parseUnsigned(usize, len_slice, 10) catch return error.InvalidExtensionHandshake;
-        const end = self.index + len;
-        if (end > self.input.len) return error.InvalidExtensionHandshake;
-
-        defer self.index = end;
-        return self.input[self.index..end];
-    }
-
-    fn parseInteger(self: *Parser) !i64 {
-        try self.expectByte('i');
-        const start = self.index;
-        while (self.peek()) |byte| {
-            if (byte == 'e') break;
-            self.index += 1;
-        }
-        if (self.peek() != 'e') return error.InvalidExtensionHandshake;
-
-        const digits = self.input[start..self.index];
-        if (digits.len == 0) return error.InvalidExtensionHandshake;
-
-        self.index += 1;
-        return std.fmt.parseInt(i64, digits, 10) catch error.InvalidExtensionHandshake;
-    }
-
-    fn skipValue(self: *Parser) !void {
-        const next = self.peek() orelse return error.InvalidExtensionHandshake;
-        switch (next) {
-            'i' => _ = try self.parseInteger(),
-            'l' => {
-                self.index += 1;
-                while (true) {
-                    const item = self.peek() orelse return error.InvalidExtensionHandshake;
-                    if (item == 'e') {
-                        self.index += 1;
-                        return;
-                    }
-                    try self.skipValue();
-                }
-            },
-            'd' => {
-                self.index += 1;
-                while (true) {
-                    const item = self.peek() orelse return error.InvalidExtensionHandshake;
-                    if (item == 'e') {
-                        self.index += 1;
-                        return;
-                    }
-                    _ = try self.parseBytes();
-                    try self.skipValue();
-                }
-            },
-            '0'...'9' => _ = try self.parseBytes(),
-            else => return error.InvalidExtensionHandshake,
-        }
-    }
-};
-
-fn parseExtensionMap(parser: *Parser, ids: *ExtensionIds) !void {
-    try parser.expectByte('d');
+fn parseExtensionMap(scanner: *Scanner, ids: *ExtensionIds) !void {
+    try scanner.expectByte('d');
     while (true) {
-        const next = parser.peek() orelse return error.InvalidExtensionHandshake;
+        const next = scanner.peek() orelse return error.InvalidExtensionHandshake;
         if (next == 'e') {
-            parser.index += 1;
+            scanner.pos += 1;
             return;
         }
 
-        const key = try parser.parseBytes();
-        const value = try parser.parseInteger();
+        const key = try scanner.parseBytes();
+        const value = try scanner.parseInteger();
         if (value < 0 or value > 255) continue;
 
         if (std.mem.eql(u8, key, ext_ut_metadata)) {
