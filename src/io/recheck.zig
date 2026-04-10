@@ -202,8 +202,10 @@ pub const AsyncRecheck = struct {
         }
 
         // The hasher returns the piece_buf pointer but does not free it.
-        // We must free it here after checking the result.
-        defer self.allocator.free(piece_buf);
+        // Save allocator locally because the completion callback may destroy
+        // self (via cancelRecheck) before this defer runs.
+        const alloc = self.allocator;
+        defer alloc.free(piece_buf);
 
         if (slot_idx) |idx| {
             // Clear the slot's buf reference so finishSlot does not double-free.
