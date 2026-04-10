@@ -87,25 +87,7 @@ pub fn main() !void {
 
     // Resolve resume DB path (config override or default XDG location)
     var resume_db_buf: [1024]u8 = undefined;
-    const resume_db_path: ?[*:0]const u8 = blk: {
-        if (cfg.storage.resume_db) |p| {
-            const z = std.fmt.bufPrintZ(&resume_db_buf, "{s}", .{p}) catch break :blk null;
-            _ = z;
-            break :blk @ptrCast(&resume_db_buf);
-        }
-        // Default: ~/.local/share/varuna/resume.db
-        const home = std.posix.getenv("HOME") orelse break :blk null;
-        const z = std.fmt.bufPrintZ(&resume_db_buf, "{s}/.local/share/varuna/resume.db", .{home}) catch break :blk null;
-        _ = z;
-        // Ensure parent directory exists (e.g. ~/.local/share/varuna/)
-        const path_str = std.mem.span(@as([*:0]const u8, @ptrCast(&resume_db_buf)));
-        const dir_end = std.mem.lastIndexOfScalar(u8, path_str, '/') orelse break :blk null;
-        std.fs.makeDirAbsolute(resume_db_buf[0..dir_end]) catch |err| switch (err) {
-            error.PathAlreadyExists => {},
-            else => break :blk null,
-        };
-        break :blk @ptrCast(&resume_db_buf);
-    };
+    const resume_db_path = resolveDbPath(&resume_db_buf, cfg.storage.resume_db, "resume.db");
 
     // Apply bind configuration to event loop for outbound peer sockets
     shared_el.bind_device = cfg.network.bind_device;
@@ -126,112 +108,13 @@ pub fn main() !void {
     // Initialize the reusable piece cache. A zero size means the default 64 MB.
     shared_el.initHugePageCache(cfg.performance.piece_cache_size);
 
-    // Initialize DHT engine (BEP 5). Runs on the shared UDP socket alongside uTP.
-    // DhtEngine.create() heap-allocates and initializes via explicit field assignment
-    // to avoid placing the ~900 KB struct on main()'s stack.
+    // Initialize DHT engine (BEP 5), persistence DB, and bootstrap nodes.
     shared_el.port = cfg.network.port_min;
     shared_el.pex_enabled = cfg.network.pex;
     shared_el.utp_enabled = cfg.network.enable_utp;
 
-    // Initialize DHT persistence — separate DB file so it can be blown away
-    // independently from torrent resume state.
-    var dht_persist: ?varuna.dht.persistence.DhtPersistence = null;
-    defer if (dht_persist) |*dp| dp.deinit();
-
-    const sqlite = @import("varuna").storage.sqlite3;
-    var dht_db: ?*sqlite.Db = null;
-    {
-        // DHT DB lives alongside the resume DB: ~/.local/share/varuna/dht.db
-        var dht_db_buf: [1024]u8 = undefined;
-        const dht_db_path: ?[*:0]const u8 = blk: {
-            const home = std.posix.getenv("HOME") orelse break :blk null;
-            const z = std.fmt.bufPrintZ(&dht_db_buf, "{s}/.local/share/varuna/dht.db", .{home}) catch break :blk null;
-            _ = z;
-            std.fs.makeDirAbsolute(dht_db_buf[0 .. std.mem.lastIndexOfScalar(u8, std.mem.span(@as([*:0]const u8, @ptrCast(&dht_db_buf))), '/') orelse 0]) catch |err| switch (err) {
-                error.PathAlreadyExists => {},
-                else => break :blk null,
-            };
-            break :blk @ptrCast(&dht_db_buf);
-        };
-        if (dht_db_path) |db_path| {
-            const flags = sqlite.SQLITE_OPEN_READWRITE | sqlite.SQLITE_OPEN_CREATE | sqlite.SQLITE_OPEN_FULLMUTEX;
-            if (sqlite.sqlite3_open_v2(db_path, &dht_db, flags, null) != sqlite.SQLITE_OK) {
-                if (dht_db) |d| _ = sqlite.sqlite3_close(d);
-                dht_db = null;
-            }
-            // DHT data is ephemeral — trade durability for speed.
-            if (dht_db) |d| {
-                _ = sqlite.sqlite3_exec(d, "PRAGMA synchronous = OFF", null, null, null);
-                _ = sqlite.sqlite3_exec(d, "PRAGMA journal_mode = MEMORY", null, null, null);
-            }
-        }
-    }
-    defer {
-        if (dht_db) |d| _ = sqlite.sqlite3_close(d);
-    }
-
-    if (dht_db) |db| {
-        if (varuna.dht.persistence.DhtPersistence.init(db)) |dp| {
-            dht_persist = dp;
-        } else |_| {}
-    }
-
-    const dht_node_id: [20]u8 = blk: {
-        if (dht_persist) |*dp| {
-            if (dp.loadNodeId() catch null) |saved_id| {
-                break :blk saved_id;
-            }
-        }
-        break :blk varuna.dht.node_id.generateRandom();
-    };
-
-    const dht_engine: ?*varuna.dht.DhtEngine = if (cfg.network.dht) blk: {
-        const engine = varuna.dht.DhtEngine.create(allocator, dht_node_id) catch |err| {
-            try stdout.print("warning: failed to create DHT engine: {s}\n", .{@errorName(err)});
-            try stdout.flush();
-            break :blk null;
-        };
-
-        // Load persisted routing table nodes — skip slow bootstrap if we have enough
-        if (dht_persist) |*dp| {
-            if (dp.loadNodes(allocator)) |saved_nodes| {
-                defer allocator.free(saved_nodes);
-                engine.loadPersistedNodes(saved_nodes);
-                if (saved_nodes.len > 0) {
-                    try stdout.print("dht: loaded {d} persisted nodes\n", .{saved_nodes.len});
-                    try stdout.flush();
-                }
-            } else |_| {}
-        }
-
-        break :blk engine;
-    } else null;
-    defer if (dht_engine) |engine| {
-        // Save routing table on shutdown for fast restart
-        if (dht_persist) |*dp| {
-            if (engine.exportNodes(allocator)) |nodes| {
-                defer allocator.free(nodes);
-                std.log.info("dht: saving {d} nodes to DB", .{nodes.len});
-                dp.saveNodes(nodes) catch |err| {
-                    std.log.err("dht: failed to save nodes: {s}", .{@errorName(err)});
-                };
-                dp.saveNodeId(engine.own_id) catch |err| {
-                    std.log.err("dht: failed to save node ID: {s}", .{@errorName(err)});
-                };
-            } else |err| {
-                std.log.err("dht: failed to export nodes: {s}", .{@errorName(err)});
-            }
-        } else {
-            std.log.warn("dht: no persistence DB, nodes not saved", .{});
-        }
-        engine.deinit();
-        allocator.destroy(engine);
-    };
-
-    // Wire the DHT engine into the shared event loop before starting the UDP socket.
-    if (dht_engine) |engine| {
-        shared_el.dht_engine = engine;
-    }
+    var dht_state = try initDht(allocator, shared_el, cfg, stdout);
+    defer dht_state.deinit(allocator);
 
     // Start the shared UDP socket (used by both DHT and uTP). This must happen
     // before the event loop so that DHT bootstrap pings can be submitted and
@@ -249,44 +132,20 @@ pub fn main() !void {
 
     // Resolve bootstrap node hostnames (blocking DNS, after UDP socket is ready).
     // Skip if we loaded enough persisted nodes (table already warm).
-    const need_bootstrap = if (dht_engine) |e| e.table.nodeCount() < 8 else false;
+    const need_bootstrap = if (dht_state.engine) |e| e.table.nodeCount() < 8 else false;
     const bootstrap_addrs = if (need_bootstrap)
         (varuna.dht.bootstrap.resolveBootstrapNodes(allocator) catch &.{})
     else
         &.{};
     defer if (bootstrap_addrs.len > 0) allocator.free(bootstrap_addrs);
-    if (dht_engine) |engine| {
+    if (dht_state.engine) |engine| {
         if (shared_el.dht_engine != null and bootstrap_addrs.len > 0) {
             engine.addBootstrapNodes(bootstrap_addrs);
         }
     }
 
     // Session manager
-    var session_manager = varuna.daemon.session_manager.SessionManager.init(allocator);
-    session_manager.shared_event_loop = shared_el;
-    session_manager.port = cfg.network.port_min;
-    session_manager.max_peers = cfg.network.max_peers;
-    session_manager.hasher_threads = cfg.performance.hasher_threads;
-    session_manager.resume_db_path = resume_db_path;
-    session_manager.masquerade_as = cfg.network.masquerade_as;
-    session_manager.disable_trackers = cfg.network.disable_trackers;
-    if (cfg.storage.data_dir) |dir| session_manager.default_save_path = dir;
-    // Apply queue config from TOML
-    session_manager.queue_manager.config = .{
-        .enabled = cfg.daemon.queueing_enabled,
-        .max_active_downloads = cfg.daemon.max_active_downloads,
-        .max_active_uploads = cfg.daemon.max_active_uploads,
-        .max_active_torrents = cfg.daemon.max_active_torrents,
-    };
-
-    // Apply share ratio / seeding time limits from config
-    session_manager.max_ratio_enabled = cfg.daemon.max_ratio_enabled;
-    session_manager.max_ratio = cfg.daemon.max_ratio;
-    session_manager.max_ratio_act = cfg.daemon.max_ratio_act;
-    session_manager.max_seeding_time_enabled = cfg.daemon.max_seeding_time_enabled;
-    session_manager.max_seeding_time = cfg.daemon.max_seeding_time;
-    // Load persisted categories and tags from the resume DB
-    session_manager.loadCategoriesAndTags();
+    var session_manager = initSessionManager(allocator, shared_el, cfg, resume_db_path);
     defer session_manager.deinit();
 
     // API handler
@@ -301,31 +160,9 @@ pub fn main() !void {
     defer api_handler.peer_sync_state.deinit();
 
     // HTTP API server (all I/O via io_uring)
-    // Check for systemd socket activation first
     const systemd_fds = varuna.daemon.systemd.listenFds();
     var socket_activated = false;
-    var api_server = if (systemd_fds) |fds| blk: {
-        // Use the first inherited fd as the API listen socket.
-        // If systemd passes multiple sockets, the first one on api_port
-        // is preferred; otherwise just use fd 3.
-        var api_fd = fds[0];
-        for (fds) |fd| {
-            if (varuna.daemon.systemd.isListenSocketOnPort(fd, cfg.daemon.api_port)) {
-                api_fd = fd;
-                break;
-            }
-        }
-        socket_activated = true;
-        break :blk varuna.rpc.server.ApiServer.initWithFd(allocator, &shared_el.ring, api_fd) catch |err| {
-            try stdout.print("failed to init API server with socket activation: {s}\n", .{@errorName(err)});
-            try stdout.flush();
-            return err;
-        };
-    } else varuna.rpc.server.ApiServer.initWithDevice(allocator, &shared_el.ring, cfg.daemon.api_bind, cfg.daemon.api_port, cfg.network.bind_device) catch |err| {
-        try stdout.print("failed to start API server: {s}\n", .{@errorName(err)});
-        try stdout.flush();
-        return err;
-    };
+    var api_server = try initApiServer(allocator, shared_el, cfg, systemd_fds, stdout, &socket_activated);
     defer api_server.deinit();
 
     // Set handler via a closure-like wrapper
@@ -484,6 +321,211 @@ pub fn main() !void {
     varuna.daemon.systemd.notifyStopping();
     try stdout.print("\nshutting down...\n", .{});
     try stdout.flush();
+}
+
+// ── Initialization helpers ──────────────────────────────────
+
+const sqlite = varuna.storage.sqlite3;
+
+/// Resolve a database path from an explicit config value or the default XDG
+/// data directory (~/.local/share/varuna/<filename>). Returns a sentinel-
+/// terminated pointer into `buf`, or null if the path cannot be determined.
+fn resolveDbPath(buf: *[1024]u8, config_path: ?[]const u8, filename: []const u8) ?[*:0]const u8 {
+    if (config_path) |p| {
+        const z = std.fmt.bufPrintZ(buf, "{s}", .{p}) catch return null;
+        _ = z;
+        return @ptrCast(buf);
+    }
+    // Default: ~/.local/share/varuna/<filename>
+    const home = std.posix.getenv("HOME") orelse return null;
+    const z = std.fmt.bufPrintZ(buf, "{s}/.local/share/varuna/{s}", .{ home, filename }) catch return null;
+    _ = z;
+    // Ensure parent directory exists (e.g. ~/.local/share/varuna/)
+    const path_str = std.mem.span(@as([*:0]const u8, @ptrCast(buf)));
+    const dir_end = std.mem.lastIndexOfScalar(u8, path_str, '/') orelse return null;
+    std.fs.makeDirAbsolute(buf[0..dir_end]) catch |err| switch (err) {
+        error.PathAlreadyExists => {},
+        else => return null,
+    };
+    return @ptrCast(buf);
+}
+
+/// Bundled DHT state: persistence DB, persistence layer, and engine.
+/// Returned by `initDht` so that `main()` can defer a single `deinit` call.
+const DhtState = struct {
+    persist: ?varuna.dht.persistence.DhtPersistence = null,
+    db: ?*sqlite.Db = null,
+    engine: ?*varuna.dht.DhtEngine = null,
+
+    fn deinit(self: *DhtState, allocator: std.mem.Allocator) void {
+        // Save routing table on shutdown for fast restart
+        if (self.engine) |engine| {
+            if (self.persist) |*dp| {
+                if (engine.exportNodes(allocator)) |nodes| {
+                    defer allocator.free(nodes);
+                    std.log.info("dht: saving {d} nodes to DB", .{nodes.len});
+                    dp.saveNodes(nodes) catch |err| {
+                        std.log.err("dht: failed to save nodes: {s}", .{@errorName(err)});
+                    };
+                    dp.saveNodeId(engine.own_id) catch |err| {
+                        std.log.err("dht: failed to save node ID: {s}", .{@errorName(err)});
+                    };
+                } else |err| {
+                    std.log.err("dht: failed to export nodes: {s}", .{@errorName(err)});
+                }
+            } else {
+                std.log.warn("dht: no persistence DB, nodes not saved", .{});
+            }
+            engine.deinit();
+            allocator.destroy(engine);
+        }
+        if (self.persist) |*dp| dp.deinit();
+        if (self.db) |d| _ = sqlite.sqlite3_close(d);
+    }
+};
+
+/// Create the DHT persistence database, load persisted state, and create the
+/// DHT engine. Wires the engine into `shared_el.dht_engine` on success.
+fn initDht(
+    allocator: std.mem.Allocator,
+    shared_el: *varuna.io.event_loop.EventLoop,
+    cfg: varuna.config.Config,
+    stdout: *std.Io.Writer,
+) !DhtState {
+    var state = DhtState{};
+    errdefer state.deinit(allocator);
+
+    // Open DHT DB — separate file so it can be blown away independently
+    // from torrent resume state.
+    {
+        var dht_db_buf: [1024]u8 = undefined;
+        const dht_db_path = resolveDbPath(&dht_db_buf, null, "dht.db");
+        if (dht_db_path) |db_path| {
+            const flags = sqlite.SQLITE_OPEN_READWRITE | sqlite.SQLITE_OPEN_CREATE | sqlite.SQLITE_OPEN_FULLMUTEX;
+            if (sqlite.sqlite3_open_v2(db_path, &state.db, flags, null) != sqlite.SQLITE_OK) {
+                if (state.db) |d| _ = sqlite.sqlite3_close(d);
+                state.db = null;
+            }
+            // DHT data is ephemeral — trade durability for speed.
+            if (state.db) |d| {
+                _ = sqlite.sqlite3_exec(d, "PRAGMA synchronous = OFF", null, null, null);
+                _ = sqlite.sqlite3_exec(d, "PRAGMA journal_mode = MEMORY", null, null, null);
+            }
+        }
+    }
+
+    if (state.db) |db| {
+        if (varuna.dht.persistence.DhtPersistence.init(db)) |dp| {
+            state.persist = dp;
+        } else |_| {}
+    }
+
+    const dht_node_id: [20]u8 = blk: {
+        if (state.persist) |*dp| {
+            if (dp.loadNodeId() catch null) |saved_id| {
+                break :blk saved_id;
+            }
+        }
+        break :blk varuna.dht.node_id.generateRandom();
+    };
+
+    if (cfg.network.dht) {
+        const engine = varuna.dht.DhtEngine.create(allocator, dht_node_id) catch |err| {
+            try stdout.print("warning: failed to create DHT engine: {s}\n", .{@errorName(err)});
+            try stdout.flush();
+            return state;
+        };
+        state.engine = engine;
+
+        // Load persisted routing table nodes — skip slow bootstrap if we have enough
+        if (state.persist) |*dp| {
+            if (dp.loadNodes(allocator)) |saved_nodes| {
+                defer allocator.free(saved_nodes);
+                engine.loadPersistedNodes(saved_nodes);
+                if (saved_nodes.len > 0) {
+                    try stdout.print("dht: loaded {d} persisted nodes\n", .{saved_nodes.len});
+                    try stdout.flush();
+                }
+            } else |_| {}
+        }
+
+        // Wire the DHT engine into the shared event loop before starting the UDP socket.
+        shared_el.dht_engine = engine;
+    }
+
+    return state;
+}
+
+/// Create and configure a SessionManager from the loaded config.
+fn initSessionManager(
+    allocator: std.mem.Allocator,
+    shared_el: *varuna.io.event_loop.EventLoop,
+    cfg: varuna.config.Config,
+    resume_db_path: ?[*:0]const u8,
+) varuna.daemon.session_manager.SessionManager {
+    var sm = varuna.daemon.session_manager.SessionManager.init(allocator);
+    sm.shared_event_loop = shared_el;
+    sm.port = cfg.network.port_min;
+    sm.max_peers = cfg.network.max_peers;
+    sm.hasher_threads = cfg.performance.hasher_threads;
+    sm.resume_db_path = resume_db_path;
+    sm.masquerade_as = cfg.network.masquerade_as;
+    sm.disable_trackers = cfg.network.disable_trackers;
+    if (cfg.storage.data_dir) |dir| sm.default_save_path = dir;
+    // Apply queue config from TOML
+    sm.queue_manager.config = .{
+        .enabled = cfg.daemon.queueing_enabled,
+        .max_active_downloads = cfg.daemon.max_active_downloads,
+        .max_active_uploads = cfg.daemon.max_active_uploads,
+        .max_active_torrents = cfg.daemon.max_active_torrents,
+    };
+
+    // Apply share ratio / seeding time limits from config
+    sm.max_ratio_enabled = cfg.daemon.max_ratio_enabled;
+    sm.max_ratio = cfg.daemon.max_ratio;
+    sm.max_ratio_act = cfg.daemon.max_ratio_act;
+    sm.max_seeding_time_enabled = cfg.daemon.max_seeding_time_enabled;
+    sm.max_seeding_time = cfg.daemon.max_seeding_time;
+    // Load persisted categories and tags from the resume DB
+    sm.loadCategoriesAndTags();
+    return sm;
+}
+
+/// Create the HTTP API server, using systemd socket activation if available,
+/// otherwise binding to the configured address and port.
+fn initApiServer(
+    allocator: std.mem.Allocator,
+    shared_el: *varuna.io.event_loop.EventLoop,
+    cfg: varuna.config.Config,
+    systemd_fds: ?[]const std.posix.fd_t,
+    stdout: *std.Io.Writer,
+    socket_activated: *bool,
+) !varuna.rpc.server.ApiServer {
+    if (systemd_fds) |fds| {
+        // Use the first inherited fd as the API listen socket.
+        // If systemd passes multiple sockets, the first one on api_port
+        // is preferred; otherwise just use fd 3.
+        var api_fd = fds[0];
+        for (fds) |fd| {
+            if (varuna.daemon.systemd.isListenSocketOnPort(fd, cfg.daemon.api_port)) {
+                api_fd = fd;
+                break;
+            }
+        }
+        socket_activated.* = true;
+        return varuna.rpc.server.ApiServer.initWithFd(allocator, &shared_el.ring, api_fd) catch |err| {
+            try stdout.print("failed to init API server with socket activation: {s}\n", .{@errorName(err)});
+            try stdout.flush();
+            return err;
+        };
+    } else {
+        socket_activated.* = false;
+        return varuna.rpc.server.ApiServer.initWithDevice(allocator, &shared_el.ring, cfg.daemon.api_bind, cfg.daemon.api_port, cfg.network.bind_device) catch |err| {
+            try stdout.print("failed to start API server: {s}\n", .{@errorName(err)});
+            try stdout.flush();
+            return err;
+        };
+    }
 }
 
 /// Create a non-blocking listen socket for accepting inbound peer connections.
