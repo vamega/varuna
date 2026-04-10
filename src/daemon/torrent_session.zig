@@ -548,6 +548,12 @@ pub const TorrentSession = struct {
         ) catch return false;
         self.torrent_id_in_shared = tid;
 
+        // Set complete_pieces immediately so peers see the bitfield
+        // during handshake. Must happen before addPeerForTorrent.
+        if (self.piece_tracker) |*pt| {
+            sel.setTorrentCompletePieces(tid, &pt.complete);
+        }
+
         // Apply per-torrent speed limits to the event loop context
         if (self.dl_limit > 0) sel.setTorrentDlLimit(tid, self.dl_limit);
         if (self.ul_limit > 0) sel.setTorrentUlLimit(tid, self.ul_limit);
