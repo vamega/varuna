@@ -621,19 +621,30 @@ pub const TorrentSession = struct {
         self.resume_last_count = recheck.complete_pieces.count;
 
         // Create PieceTracker from recheck results
+        // Snapshot recheck results before destroying it
+        const recheck_bytes_complete = recheck.bytes_complete;
+        const recheck_pieces_count = recheck.complete_pieces.count;
+
         const piece_tracker = PieceTracker.init(
             self.allocator,
             session.pieceCount(),
             session.layout.piece_length,
             session.totalSize(),
             &recheck.complete_pieces,
-            recheck.bytes_complete,
+            recheck_bytes_complete,
         ) catch {
             self.state = .@"error";
             self.error_message = std.fmt.allocPrint(self.allocator, "failed to create piece tracker", .{}) catch null;
+            // Still clean up the recheck
+            if (self.shared_event_loop) |sel| sel.cancelRecheck();
             return;
         };
         self.piece_tracker = piece_tracker;
+
+        // Clean up the async recheck on the event loop (frees recheck struct)
+        if (self.shared_event_loop) |sel| {
+            sel.cancelRecheck();
+        }
 
         // Free resume_pieces now that recheck is done
         if (self.resume_pieces) |*rp| {
@@ -641,7 +652,7 @@ pub const TorrentSession = struct {
             self.resume_pieces = null;
         }
 
-        if (recheck.bytes_complete == session.totalSize()) {
+        if (recheck_bytes_complete == session.totalSize()) {
             self.state = .seeding;
             if (self.completion_on == 0) {
                 self.completion_on = std.time.timestamp();
@@ -651,7 +662,7 @@ pub const TorrentSession = struct {
         } else {
             self.state = .downloading;
             log.info("recheck complete: {d}/{d} pieces, entering download mode", .{
-                recheck.complete_pieces.count,
+                recheck_pieces_count,
                 session.pieceCount(),
             });
         }

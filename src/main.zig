@@ -2,6 +2,9 @@ const std = @import("std");
 const varuna = @import("varuna");
 
 pub fn main() !void {
+    // Install SEGV handler to get a stack trace instead of silent crash
+    std.debug.attachSegfaultHandler();
+
     var gpa_state = std.heap.GeneralPurposeAllocator(.{}){};
     defer _ = gpa_state.deinit();
     const allocator = gpa_state.allocator();
