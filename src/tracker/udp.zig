@@ -1,7 +1,6 @@
 const std = @import("std");
 const posix = std.posix;
 const types = @import("types.zig");
-const scrape_mod = @import("scrape.zig");
 
 const log = std.log.scoped(.udp_tracker);
 
@@ -425,7 +424,7 @@ pub fn resolveAddress(allocator: std.mem.Allocator, host: []const u8, port: u16)
 }
 
 // ── Blocking UDP tracker client ─────────────────────────
-// Used by background threads (varuna-ctl, multi_announce workers).
+// Used by background threads (magnet peer collection).
 // The daemon uses the io_uring-based UdpTrackerExecutor instead.
 
 /// Connection cache for blocking UDP tracker calls.
@@ -578,71 +577,6 @@ fn performConnect(fd: posix.fd_t, host: []const u8, port: u16) !u64 {
         return resp.connection_id;
     }
     return error.TrackerTimeout;
-}
-
-/// Perform a UDP scrape via blocking posix I/O (BEP 15, action=2).
-pub fn scrapeViaUdp(
-    allocator: std.mem.Allocator,
-    announce_url: []const u8,
-    info_hash: [20]u8,
-) !scrape_mod.ScrapeResult {
-    const parsed = parseUdpUrl(announce_url) orelse return error.InvalidTrackerUrl;
-    const address = try resolveAddress(allocator, parsed.host, parsed.port);
-
-    const fd = try posix.socket(
-        address.any.family,
-        posix.SOCK.DGRAM | posix.SOCK.CLOEXEC,
-        posix.IPPROTO.UDP,
-    );
-    defer posix.close(fd);
-
-    try posix.connect(fd, &address.any, address.getOsSockLen());
-
-    // Step 1: Connect
-    const connection_id = if (global_conn_cache.get(parsed.host, parsed.port)) |cached_id|
-        cached_id
-    else
-        try performConnect(fd, parsed.host, parsed.port);
-
-    // Step 2: Scrape
-    const scrape_txid = generateTransactionId();
-    const scrape_buf = ScrapeRequest.encodeSingle(connection_id, scrape_txid, info_hash);
-
-    // BEP 15: retry with exponential backoff
-    var resp_buf: [128]u8 = undefined;
-    var resp_n: usize = 0;
-    var scrape_ok = false;
-    for (0..max_retries) |attempt| {
-        const timeout_secs = retransmitTimeout(@intCast(attempt));
-        const to = posix.timeval{ .sec = @intCast(timeout_secs), .usec = 0 };
-        posix.setsockopt(fd, posix.SOL.SOCKET, posix.SO.RCVTIMEO, std.mem.asBytes(&to)) catch {};
-
-        sendAll(fd, &scrape_buf) catch continue;
-        resp_n = posix.recv(fd, &resp_buf, 0) catch continue;
-        if (resp_n >= 20) {
-            scrape_ok = true;
-            break;
-        }
-    }
-    if (!scrape_ok) return error.TrackerTimeout;
-
-    // Check for error
-    if (isErrorResponse(resp_buf[0..resp_n])) {
-        const msg = parseErrorMessage(resp_buf[0..resp_n]);
-        if (msg) |m| log.warn("UDP tracker scrape error: {s}", .{m});
-        return error.TrackerError;
-    }
-
-    const header = ScrapeResponse.decodeHeader(resp_buf[0..resp_n]) catch return error.InvalidTrackerResponse;
-    if (header.transaction_id != scrape_txid) return error.TransactionIdMismatch;
-
-    const entry = ScrapeResponse.parseEntry(header.entry_data, 0) catch return error.InvalidTrackerResponse;
-
-    return .{
-        .complete = entry.seeders,
-        .incomplete = entry.leechers,
-        .downloaded = entry.completed,
-    };
 }
 
 /// Send the entire buffer via blocking posix.send.

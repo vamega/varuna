@@ -1242,7 +1242,7 @@ fn runTrackerAnnounceFresh(
     var checksum: u64 = 0;
 
     for (0..iterations) |_| {
-        const response = try tracker_announce.fetchAutoWithDns(allocator, null, request);
+        const response = try tracker_announce.fetchAuto(allocator, request);
         defer tracker_announce.freeResponse(allocator, response);
         checksum +%= response.interval;
         checksum +%= response.peers.len;

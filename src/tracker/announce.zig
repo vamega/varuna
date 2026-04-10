@@ -27,19 +27,6 @@ pub fn fetchAutoWithDns(
     return fetchViaHttp(allocator, dns_resolver, request);
 }
 
-/// Fetch tracker announce using a caller-owned HTTP client. This allows a
-/// shared executor to reuse DNS state and keep-alive connections across jobs.
-pub fn fetchAutoWithHttpClient(
-    allocator: std.mem.Allocator,
-    http_client: *@import("../io/http.zig").HttpClient,
-    request: Request,
-) !Response {
-    if (std.mem.startsWith(u8, request.announce_url, "udp://")) {
-        return @import("udp.zig").fetchViaUdp(allocator, request);
-    }
-    return fetchViaHttpClient(allocator, http_client, request);
-}
-
 /// Fetch tracker announce using the posix-based HTTP client.
 pub fn fetchViaHttp(
     allocator: std.mem.Allocator,
@@ -54,24 +41,6 @@ pub fn fetchViaHttp(
         http_mod.HttpClient.initWithDns(allocator, r)
     else
         http_mod.HttpClient.init(allocator);
-    var http_response = try http_client.get(url);
-    defer http_response.deinit();
-
-    if (http_response.status != 200) {
-        return error.UnexpectedTrackerStatus;
-    }
-
-    return parseResponse(allocator, http_response.body);
-}
-
-pub fn fetchViaHttpClient(
-    allocator: std.mem.Allocator,
-    http_client: *@import("../io/http.zig").HttpClient,
-    request: Request,
-) !Response {
-    const url = try buildUrl(allocator, request);
-    defer allocator.free(url);
-
     var http_response = try http_client.get(url);
     defer http_response.deinit();
 

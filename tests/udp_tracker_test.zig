@@ -125,31 +125,6 @@ test "full UDP connect then announce over real sockets" {
     thread.join();
 }
 
-test "full UDP connect then scrape over real sockets" {
-    // Clear the global connection cache from any previous tests
-    udp.resetGlobalCache();
-
-    const server_fd = try createBoundUdpSocket(0);
-    defer std.posix.close(server_fd);
-    const port = try getBoundPort(server_fd);
-
-    var ready = std.atomic.Value(bool).init(false);
-    const thread = try std.Thread.spawn(.{}, mockTrackerServer, .{ server_fd, &ready });
-
-    while (!ready.load(.acquire)) {}
-
-    var url_buf: [64]u8 = undefined;
-    const url = std.fmt.bufPrint(&url_buf, "udp://127.0.0.1:{d}/announce", .{port}) catch unreachable;
-
-    const result = try udp.scrapeViaUdp(std.testing.allocator, url, [_]u8{0xCC} ** 20);
-
-    try std.testing.expectEqual(@as(u32, 42), result.complete);
-    try std.testing.expectEqual(@as(u32, 5), result.incomplete);
-    try std.testing.expectEqual(@as(u32, 100), result.downloaded);
-
-    thread.join();
-}
-
 /// Mock server that sends an error response.
 fn mockErrorServer(server_fd: std.posix.fd_t, ready: *std.atomic.Value(bool)) void {
     ready.store(true, .release);

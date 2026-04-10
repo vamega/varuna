@@ -1,7 +1,6 @@
 const std = @import("std");
 const bencode = @import("../torrent/bencode.zig");
 const types = @import("types.zig");
-const udp_mod = @import("udp.zig");
 
 /// Tracker scrape result: swarm statistics for a single info_hash.
 pub const ScrapeResult = struct {
@@ -51,104 +50,6 @@ pub fn buildScrapeUrl(allocator: std.mem.Allocator, announce_url: []const u8, in
     try types.appendPercentEncoded(allocator, &url, info_hash[0..]);
 
     return url.toOwnedSlice(allocator);
-}
-
-/// Perform an HTTP scrape request via the posix-based HTTP client.
-pub fn scrapeHttp(
-    allocator: std.mem.Allocator,
-    announce_url: []const u8,
-    info_hash: [20]u8,
-) !ScrapeResult {
-    return scrapeHttpWithDns(allocator, null, announce_url, info_hash);
-}
-
-/// Perform an HTTP scrape with an optional shared DNS cache.
-pub fn scrapeHttpWithDns(
-    allocator: std.mem.Allocator,
-    dns_resolver: ?*@import("../io/dns.zig").DnsResolver,
-    announce_url: []const u8,
-    info_hash: [20]u8,
-) !ScrapeResult {
-    const url = try buildScrapeUrl(allocator, announce_url, info_hash);
-    defer allocator.free(url);
-
-    const http_mod = @import("../io/http.zig");
-    var http_client = if (dns_resolver) |r|
-        http_mod.HttpClient.initWithDns(allocator, r)
-    else
-        http_mod.HttpClient.init(allocator);
-    var http_response = try http_client.get(url);
-    defer http_response.deinit();
-
-    if (http_response.status != 200) {
-        return error.UnexpectedTrackerStatus;
-    }
-
-    return parseScrapeResponse(allocator, http_response.body, info_hash);
-}
-
-pub fn scrapeHttpWithClient(
-    allocator: std.mem.Allocator,
-    http_client: *@import("../io/http.zig").HttpClient,
-    announce_url: []const u8,
-    info_hash: [20]u8,
-) !ScrapeResult {
-    const url = try buildScrapeUrl(allocator, announce_url, info_hash);
-    defer allocator.free(url);
-
-    var http_response = try http_client.get(url);
-    defer http_response.deinit();
-
-    if (http_response.status != 200) {
-        return error.UnexpectedTrackerStatus;
-    }
-
-    return parseScrapeResponse(allocator, http_response.body, info_hash);
-}
-
-/// Perform a UDP scrape request (BEP 15, action=2) via blocking posix I/O.
-/// Runs on background threads where blocking is fine.
-/// Delegates to the unified UDP tracker implementation in udp.zig.
-pub fn scrapeUdp(
-    allocator: std.mem.Allocator,
-    announce_url: []const u8,
-    info_hash: [20]u8,
-) !ScrapeResult {
-    return udp_mod.scrapeViaUdp(allocator, announce_url, info_hash);
-}
-
-/// Scrape a tracker, auto-selecting HTTP or UDP based on the announce URL scheme.
-pub fn scrapeAuto(
-    allocator: std.mem.Allocator,
-    announce_url: []const u8,
-    info_hash: [20]u8,
-) !ScrapeResult {
-    return scrapeAutoWithDns(allocator, null, announce_url, info_hash);
-}
-
-/// Scrape a tracker with an optional shared DNS cache.
-pub fn scrapeAutoWithDns(
-    allocator: std.mem.Allocator,
-    dns_resolver: ?*@import("../io/dns.zig").DnsResolver,
-    announce_url: []const u8,
-    info_hash: [20]u8,
-) !ScrapeResult {
-    if (std.mem.startsWith(u8, announce_url, "udp://")) {
-        return scrapeUdp(allocator, announce_url, info_hash);
-    }
-    return scrapeHttpWithDns(allocator, dns_resolver, announce_url, info_hash);
-}
-
-pub fn scrapeAutoWithHttpClient(
-    allocator: std.mem.Allocator,
-    http_client: *@import("../io/http.zig").HttpClient,
-    announce_url: []const u8,
-    info_hash: [20]u8,
-) !ScrapeResult {
-    if (std.mem.startsWith(u8, announce_url, "udp://")) {
-        return scrapeUdp(allocator, announce_url, info_hash);
-    }
-    return scrapeHttpWithClient(allocator, http_client, announce_url, info_hash);
 }
 
 // ── Response parsing ─────────────────────────────────────
