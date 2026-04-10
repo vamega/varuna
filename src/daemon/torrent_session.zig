@@ -16,6 +16,8 @@ const ResumeDb = storage.resume_state.ResumeDb;
 const TrackerExecutor = @import("tracker_executor.zig").TrackerExecutor;
 const UdpTrackerExecutor = @import("udp_tracker_executor.zig").UdpTrackerExecutor;
 const TorrentId = @import("../io/event_loop.zig").TorrentId;
+const Bitfield = @import("../bitfield.zig").Bitfield;
+const AsyncRecheck = @import("../io/recheck.zig").AsyncRecheck;
 
 /// Mutable tracker URL storage. Tracks user-added, user-removed,
 /// and user-edited tracker URLs as overlays on top of the metainfo
@@ -194,6 +196,8 @@ pub const TorrentSession = struct {
     torrent_id_in_shared: ?TorrentId = null,
     pending_peers: ?[]std.net.Address = null, // peers waiting for main thread to add
     pending_seed_setup: bool = false, // signals main thread to set up seed mode
+    background_init_done: bool = false, // signals main thread that background init finished
+    resume_pieces: ?Bitfield = null, // known-complete pieces from resume DB, consumed by async recheck
     dht_registered: bool = false, // whether DHT requestPeers has been called
     thread: ?std.Thread = null,
     announcing: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
@@ -355,6 +359,7 @@ pub const TorrentSession = struct {
 
     pub fn deinit(self: *TorrentSession) void {
         self.stop();
+        if (self.resume_pieces) |*rp| rp.deinit(self.allocator);
         if (self.pending_peers) |pp| self.allocator.free(pp);
         if (self.torrent_bytes.len > 0) self.allocator.free(self.torrent_bytes);
         self.allocator.free(self.save_path);
@@ -433,10 +438,43 @@ pub const TorrentSession = struct {
         self.state = .stopped;
     }
 
-    /// Called by the main thread to integrate this session into the shared
-    /// event loop after the background recheck thread completes.
-    /// Returns true if peers were added.
+    /// Called by the main thread after the background init thread completes
+    /// and the session is in .checking state. Starts async piece recheck
+    /// on the event loop. Returns true if recheck was started.
     pub fn integrateIntoEventLoop(self: *TorrentSession) bool {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+
+        if (!self.background_init_done) return false;
+        if (self.session == null or self.shared_fds == null) return false;
+        const sel = self.shared_event_loop orelse return false;
+
+        if (self.state == .checking) {
+            // Start async recheck on the event loop
+            const known_ptr: ?*const Bitfield = if (self.resume_pieces) |*rp| rp else null;
+            sel.startRecheck(
+                &self.session.?,
+                self.shared_fds.?,
+                0, // torrent_id placeholder; real ID assigned after recheck
+                known_ptr,
+                onRecheckComplete,
+                @ptrCast(self), // caller_ctx: TorrentSession pointer for callback
+            ) catch {
+                self.state = .@"error";
+                self.error_message = std.fmt.allocPrint(self.allocator, "failed to start async recheck", .{}) catch null;
+                return false;
+            };
+            self.background_init_done = false; // consumed; don't re-enter
+            return true;
+        }
+
+        return false;
+    }
+
+    /// Called by the main thread to add peers to the event loop after
+    /// recheck completes and the session transitions to downloading/seeding.
+    /// Returns true if peers were added.
+    pub fn addPeersToEventLoop(self: *TorrentSession) bool {
         self.mutex.lock();
         defer self.mutex.unlock();
         const sel = self.shared_event_loop orelse return false;
@@ -488,6 +526,124 @@ pub const TorrentSession = struct {
         }
 
         return added > 0;
+    }
+
+    /// AsyncRecheck completion callback. Runs on the event loop thread.
+    /// Creates PieceTracker from results, persists to resume DB, transitions
+    /// state, and schedules announce via timerfd.
+    fn onRecheckComplete(recheck: *AsyncRecheck) void {
+        const self: *TorrentSession = if (recheck.caller_ctx) |ctx|
+            @ptrCast(@alignCast(ctx))
+        else
+            return;
+
+        const log = std.log.scoped(.torrent_session);
+        self.mutex.lock();
+        defer self.mutex.unlock();
+
+        const session = &(self.session orelse return);
+
+        // Persist recheck results to resume DB for next startup
+        if (self.resume_writer) |*rw| {
+            var completed_pieces = std.ArrayList(u32).empty;
+            defer completed_pieces.deinit(self.allocator);
+            var idx: u32 = 0;
+            while (idx < session.pieceCount()) : (idx += 1) {
+                if (recheck.complete_pieces.has(idx)) {
+                    completed_pieces.append(self.allocator, idx) catch {};
+                }
+            }
+            if (completed_pieces.items.len > 0) {
+                rw.db.markCompleteBatch(session.metainfo.info_hash, completed_pieces.items) catch {};
+            }
+        }
+        self.resume_last_count = recheck.complete_pieces.count;
+
+        // Create PieceTracker from recheck results
+        const piece_tracker = PieceTracker.init(
+            self.allocator,
+            session.pieceCount(),
+            session.layout.piece_length,
+            session.totalSize(),
+            &recheck.complete_pieces,
+            recheck.bytes_complete,
+        ) catch {
+            self.state = .@"error";
+            self.error_message = std.fmt.allocPrint(self.allocator, "failed to create piece tracker", .{}) catch null;
+            return;
+        };
+        self.piece_tracker = piece_tracker;
+
+        // Free resume_pieces now that recheck is done
+        if (self.resume_pieces) |*rp| {
+            rp.deinit(self.allocator);
+            self.resume_pieces = null;
+        }
+
+        if (recheck.bytes_complete == session.totalSize()) {
+            // All pieces complete -- seed mode
+            self.state = .seeding;
+            if (self.completion_on == 0) {
+                self.completion_on = std.time.timestamp();
+            }
+            self.pending_seed_setup = true;
+            self.scheduleCompletedAnnounce() catch {};
+
+            log.info("recheck complete: all pieces valid, entering seed mode", .{});
+        } else {
+            // Incomplete -- download mode with jittered announce delay
+            self.state = .downloading;
+
+            // Schedule announce with jitter via timerfd to avoid thundering herd
+            const delay_ms = self.computeAnnounceJitterMs();
+            if (delay_ms > 0) {
+                if (self.shared_event_loop) |sel| {
+                    sel.scheduleTimer(delay_ms, @ptrCast(self), onJitteredAnnounce) catch {
+                        // If timer fails, announce immediately
+                        self.scheduleReannounce() catch {};
+                    };
+                } else {
+                    self.scheduleReannounce() catch {};
+                }
+            } else {
+                self.scheduleReannounce() catch {};
+            }
+
+            // Set pending_peers to empty slice so main loop calls addPeersToEventLoop
+            // to register the torrent in the event loop for DHT/PEX peer discovery.
+            if (self.pending_peers == null) {
+                self.pending_peers = self.allocator.alloc(std.net.Address, 0) catch null;
+            }
+
+            log.info("recheck complete: {d}/{d} pieces, entering download mode", .{
+                recheck.complete_pieces.count,
+                session.pieceCount(),
+            });
+        }
+    }
+
+    /// timerfd callback for jittered initial announce after recheck completes.
+    fn onJitteredAnnounce(ctx: *anyopaque) void {
+        const self: *TorrentSession = @ptrCast(@alignCast(ctx));
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        if (self.state == .downloading or self.state == .seeding) {
+            self.scheduleReannounce() catch {};
+        }
+    }
+
+    /// Compute a deterministic jitter delay in milliseconds for the initial announce.
+    /// Uses info_hash bytes for deterministic spread, capped at 5 seconds.
+    fn computeAnnounceJitterMs(self: *const TorrentSession) u64 {
+        const base_interval: u64 = 1800; // default tracker interval in seconds
+        const max_delay_ms = (base_interval / 4) * std.time.ms_per_s;
+        if (max_delay_ms == 0) return 0;
+        const seed = @as(u64, self.info_hash[0]) |
+            (@as(u64, self.info_hash[1]) << 8) |
+            (@as(u64, self.info_hash[2]) << 16) |
+            (@as(u64, self.info_hash[3]) << 24);
+        const delay_ms = seed % max_delay_ms;
+        return @min(delay_ms, 5 * std.time.ms_per_s);
     }
 
     /// Convert raw API priority (0=skip, 1=normal, 6=high, 7=max) to FilePriority enum.
@@ -762,13 +918,16 @@ pub const TorrentSession = struct {
     fn startWorker(self: *TorrentSession) void {
         self.mutex.lock();
         defer self.mutex.unlock();
-        self.doStart() catch |err| {
+        self.doStartBackground() catch |err| {
             self.state = .@"error";
             self.error_message = std.fmt.allocPrint(self.allocator, "{s}", .{@errorName(err)}) catch null;
         };
     }
 
-    fn doStart(self: *TorrentSession) !void {
+    /// Background thread phase: parse torrent, create PieceStore, load resume DB.
+    /// Does NOT do piece verification (that moves to the event loop via AsyncRecheck)
+    /// and does NOT do blocking tracker announces (those use the ring-based executors).
+    fn doStartBackground(self: *TorrentSession) !void {
         // Magnet link: first fetch metadata from peers before normal download
         if (self.is_magnet and self.torrent_bytes.len == 0) {
             try self.fetchMetadata();
@@ -783,18 +942,15 @@ pub const TorrentSession = struct {
         self.store = store;
 
         // Open resume DB and load known-complete pieces (fast path: skip rehash)
-        var resume_pieces: ?storage.verify.PieceSet = null;
-        defer if (resume_pieces) |*rp| rp.deinit(self.allocator);
-
         if (self.resume_db_path) |db_path| {
             if (ResumeWriter.init(self.allocator, db_path, session.metainfo.info_hash)) |rw| {
                 self.resume_writer = rw;
                 // Load known-complete pieces from DB
-                var bf = storage.verify.PieceSet.init(self.allocator, session.pieceCount()) catch null;
+                var bf = Bitfield.init(self.allocator, session.pieceCount()) catch null;
                 if (bf) |*loaded_bf| {
                     const loaded_count = self.resume_writer.?.db.loadCompletePieces(session.metainfo.info_hash, loaded_bf) catch 0;
                     if (loaded_count > 0) {
-                        resume_pieces = loaded_bf.*;
+                        self.resume_pieces = loaded_bf.*;
                     } else {
                         loaded_bf.deinit(self.allocator);
                     }
@@ -860,122 +1016,14 @@ pub const TorrentSession = struct {
             } else |_| {}
         }
 
-        // Recheck with resume fast path (skips hashing known-complete pieces)
-        self.state = .checking;
-        const known_ptr: ?*const storage.verify.PieceSet = if (resume_pieces) |*rp| rp else null;
-        var recheck = try storage.verify.recheckExistingData(self.allocator, &self.session.?, &self.store.?, known_ptr);
-        defer recheck.deinit(self.allocator);
-
-        // Persist recheck results to resume DB for next startup
-        if (self.resume_writer) |*rw| {
-            var completed_pieces = std.ArrayList(u32).empty;
-            defer completed_pieces.deinit(self.allocator);
-            var idx: u32 = 0;
-            while (idx < session.pieceCount()) : (idx += 1) {
-                if (recheck.complete_pieces.has(idx)) {
-                    completed_pieces.append(self.allocator, idx) catch {};
-                }
-            }
-            if (completed_pieces.items.len > 0) {
-                rw.db.markCompleteBatch(session.metainfo.info_hash, completed_pieces.items) catch {};
-            }
-        }
-        self.resume_last_count = recheck.complete_pieces.count;
-
-        const piece_tracker = try PieceTracker.init(
-            self.allocator,
-            session.pieceCount(),
-            session.layout.piece_length,
-            session.totalSize(),
-            &recheck.complete_pieces,
-            recheck.bytes_complete,
-        );
-        self.piece_tracker = piece_tracker;
-
-        if (recheck.bytes_complete == session.totalSize()) {
-            // Get shared file handles for serving pieces
-            const shared_fds = try self.store.?.fileHandles(self.allocator);
-            self.shared_fds = shared_fds;
-
-            self.state = .seeding;
-            if (self.completion_on == 0) {
-                self.completion_on = std.time.timestamp();
-            }
-            self.pending_seed_setup = true;
-            self.scheduleCompletedAnnounce() catch {};
-            return;
-        }
-
-        // Download: announce to tracker, get peers, run event loop
-        self.state = .downloading;
-
-        // Initial announce delay: random 0 to interval/4 to stagger multiple torrents
-        // and avoid thundering herd on the tracker when many torrents start at once.
-        {
-            const base_interval: u64 = 1800; // default tracker interval
-            const max_delay_ns = (base_interval / 4) * std.time.ns_per_s;
-            if (max_delay_ns > 0) {
-                // Simple hash-based jitter using info_hash bytes for deterministic spread
-                const seed = @as(u64, self.info_hash[0]) |
-                    (@as(u64, self.info_hash[1]) << 8) |
-                    (@as(u64, self.info_hash[2]) << 16) |
-                    (@as(u64, self.info_hash[3]) << 24);
-                const delay_ns = seed % max_delay_ns;
-                // Cap at 5 seconds to avoid excessive startup delay
-                const capped_delay = @min(delay_ns, 5 * std.time.ns_per_s);
-                if (capped_delay > 0) {
-                    std.Thread.sleep(capped_delay);
-                }
-            }
-        }
-
-        // Get shared file handles (needed regardless of whether we use tracker)
+        // Get shared file handles (needed for both recheck and serving pieces)
         const shared_fds = try self.store.?.fileHandles(self.allocator);
         self.shared_fds = shared_fds;
 
-        // Peer collection from tracker (skipped when disable_trackers is set or
-        // when there are no tracker URLs -- DHT/PEX will provide peers instead).
-        var peer_list = std.ArrayList(std.net.Address).empty;
-        defer peer_list.deinit(self.allocator);
-
-        const skip_tracker = self.disable_trackers and !self.is_private;
-        if (!skip_tracker) {
-            const tracker_urls = self.buildTrackerUrls(&session) catch &.{};
-            defer self.allocator.free(tracker_urls);
-
-            if (tracker_urls.len > 0) {
-                // BEP 12: announce to all tiers simultaneously. First successful
-                // response with peers wins; the rest are discarded.
-                if (tracker.multi_announce.announceParallel(
-                    self.allocator,
-                    tracker_urls,
-                    .{
-                        .announce_url = "", // overridden per-URL inside announceParallel
-                        .info_hash = session.metainfo.info_hash,
-                        .peer_id = self.peer_id,
-                        .port = self.port,
-                        .left = session.totalSize() - recheck.bytes_complete,
-                        .key = self.tracker_key,
-                        .info_hash_v2 = self.info_hash_v2,
-                    },
-                )) |multi_result| {
-                    const announce_resp = multi_result.response;
-                    defer tracker.announce.freeResponse(self.allocator, announce_resp);
-                    for (announce_resp.peers) |peer| {
-                        if (peer_list.items.len >= self.max_peers) break;
-                        peer_list.append(self.allocator, peer.address) catch continue;
-                    }
-                } else |_| {
-                    // Tracker failed -- log warning but continue; DHT will find peers.
-                    std.log.warn("tracker announce failed for {x}, relying on DHT", .{session.metainfo.info_hash[0..4].*});
-                }
-            }
-        }
-
-        // DHT provides peers asynchronously after integrateIntoEventLoop is called.
-        // Even if the tracker returned zero peers, proceed -- DHT will fill in.
-        self.pending_peers = peer_list.toOwnedSlice(self.allocator) catch null;
-        self.state = .downloading;
+        // Stay in .checking state -- the event loop will run async recheck
+        // via integrateIntoEventLoop -> startRecheck.
+        self.state = .checking;
+        self.background_init_done = true;
     }
 
     fn stopInternal(self: *TorrentSession) void {
@@ -988,6 +1036,10 @@ pub const TorrentSession = struct {
             self.resume_writer = null;
         }
 
+        if (self.resume_pieces) |*rp| {
+            rp.deinit(self.allocator);
+            self.resume_pieces = null;
+        }
         if (self.shared_fds) |fds| {
             self.allocator.free(fds);
             self.shared_fds = null;
@@ -1006,6 +1058,7 @@ pub const TorrentSession = struct {
         }
         self.torrent_id_in_shared = null;
         self.pending_seed_setup = false;
+        self.background_init_done = false;
     }
 
     /// Called by the main thread to set up seed mode for this session
@@ -1798,8 +1851,6 @@ fn deinitTestEventLoop(_: std.mem.Allocator, el: *EventLoop) void {
 }
 
 test "getStats does not mutate completion state" {
-    const Bitfield = @import("../bitfield.zig").Bitfield;
-
     var initial_complete = try Bitfield.init(std.testing.allocator, 1);
     defer initial_complete.deinit(std.testing.allocator);
     try initial_complete.set(0);
@@ -1838,8 +1889,6 @@ test "getStats does not mutate completion state" {
 }
 
 test "checkSeedTransition is the seeding state mutation point" {
-    const Bitfield = @import("../bitfield.zig").Bitfield;
-
     var initial_complete = try Bitfield.init(std.testing.allocator, 1);
     defer initial_complete.deinit(std.testing.allocator);
     try initial_complete.set(0);

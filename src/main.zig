@@ -357,20 +357,25 @@ pub fn main() !void {
     var resume_tick_counter: u32 = 0;
     while (!varuna.io.signal.isShutdownRequested()) {
 
-        // Check if any sessions need to be integrated into the event loop
-        // (background recheck thread completed, peers ready)
-        // Skip if already at global connection limit
+        // Check if any sessions need event loop integration:
+        // 1. Sessions in .checking with background_init_done -> start async recheck
+        // 2. Sessions with pending_peers -> register torrent and add peers
         {
             session_manager.mutex.lock();
             var iter = session_manager.sessions.iterator();
             while (iter.next()) |entry| {
                 const sess = entry.value_ptr.*;
+                // Phase 1: background init done, start async recheck on event loop
+                if (sess.background_init_done and sess.state == .checking) {
+                    _ = sess.integrateIntoEventLoop();
+                }
+                // Phase 2: recheck done, register torrent and add peers
                 if (sess.pending_peers != null) {
                     if (shared_el.peer_count < shared_el.max_connections) {
-                        _ = sess.integrateIntoEventLoop();
+                        _ = sess.addPeersToEventLoop();
                     }
                 }
-                // Start DHT search immediately — don't wait for tracker to finish.
+                // Start DHT search immediately -- don't wait for tracker to finish.
                 // The tracker may take minutes (UDP timeouts), but DHT can find
                 // peers in parallel once bootstrapped.
                 if (!sess.is_private and !sess.dht_registered) {

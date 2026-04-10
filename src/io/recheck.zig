@@ -53,6 +53,9 @@ pub const AsyncRecheck = struct {
     // Completion
     done: bool = false,
     on_complete: ?*const fn (*AsyncRecheck) void = null,
+    /// Opaque context pointer passed to the caller (e.g. TorrentSession).
+    /// The on_complete callback can use this to find its parent object.
+    caller_ctx: ?*anyopaque = null,
 
     pub const max_in_flight: u32 = 4;
 
@@ -78,6 +81,7 @@ pub const AsyncRecheck = struct {
         torrent_id: u32,
         known_complete: ?*const Bitfield,
         on_complete: ?*const fn (*AsyncRecheck) void,
+        caller_ctx: ?*anyopaque,
     ) !*AsyncRecheck {
         const piece_count = session.pieceCount();
         var complete_pieces = try Bitfield.init(allocator, piece_count);
@@ -95,6 +99,7 @@ pub const AsyncRecheck = struct {
             .known_complete = known_complete,
             .piece_count = piece_count,
             .on_complete = on_complete,
+            .caller_ctx = caller_ctx,
         };
         return self;
     }

@@ -1223,6 +1223,8 @@ pub const EventLoop = struct {
     /// The recheck runs concurrently with normal event loop operation,
     /// using io_uring reads and the background hasher thread pool.
     /// Only one recheck may be active at a time.
+    /// `caller_ctx` is an opaque pointer stored on the AsyncRecheck for
+    /// the on_complete callback to retrieve its parent object.
     pub fn startRecheck(
         self: *EventLoop,
         session: *const @import("../torrent/session.zig").Session,
@@ -1230,6 +1232,7 @@ pub const EventLoop = struct {
         torrent_id: TorrentId,
         known_complete: ?*const Bitfield,
         on_complete: ?*const fn (*@import("recheck.zig").AsyncRecheck) void,
+        caller_ctx: ?*anyopaque,
     ) !void {
         const h = self.hasher orelse return error.NoHasher;
         if (self.recheck != null) return error.RecheckAlreadyActive;
@@ -1243,6 +1246,7 @@ pub const EventLoop = struct {
             torrent_id,
             known_complete,
             on_complete,
+            caller_ctx,
         );
         self.recheck.?.start();
     }
