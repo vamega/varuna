@@ -27,6 +27,7 @@ const seed_handler = @import("seed_handler.zig");
 const peer_policy = @import("peer_policy.zig");
 const utp_handler = @import("utp_handler.zig");
 const dht_handler = @import("dht_handler.zig");
+const metadata_handler = @import("metadata_handler.zig");
 
 // ── Re-exported type definitions (moved to types.zig) ────
 
@@ -273,6 +274,9 @@ pub const EventLoop = struct {
     // Async piece recheck state machine (null when no recheck is active)
     recheck: ?*@import("recheck.zig").AsyncRecheck = null,
 
+    // Async BEP 9 metadata fetch state machine (null when no fetch is active)
+    metadata_fetch: ?*metadata_handler.AsyncMetadataFetch = null,
+
     // Compact list of peer slots that are idle (active, unchoked, have
     // availability, and need a piece assignment).  Avoids scanning all
     // max_peers slots every tick in tryAssignPieces.
@@ -396,6 +400,10 @@ pub const EventLoop = struct {
         // touching our buffer memory before we free it. This prevents
         // use-after-free under GPA (debug poison 0xAA fill on free).
         self.drainRemainingCqes();
+
+        // Clean up active async state machines (metadata fetch, recheck)
+        self.cancelMetadataFetch();
+        self.cancelRecheck();
 
         // ── Phase 3: Free all buffers ────────────────────────────
         // Now that the kernel has completed all pending operations,
@@ -1259,6 +1267,44 @@ pub const EventLoop = struct {
         }
     }
 
+    // ── Async metadata fetch ─────────────────────────────
+
+    /// Start an async BEP 9 metadata fetch for a magnet link.
+    /// The on_complete callback fires when metadata is available or all peers fail.
+    pub fn startMetadataFetch(
+        self: *EventLoop,
+        info_hash: [20]u8,
+        peer_id: [20]u8,
+        port: u16,
+        is_private: bool,
+        peers: []const std.net.Address,
+        on_complete: ?*const fn (*metadata_handler.AsyncMetadataFetch) void,
+        caller_ctx: ?*anyopaque,
+    ) !void {
+        if (self.metadata_fetch != null) return error.MetadataFetchAlreadyActive;
+
+        self.metadata_fetch = try metadata_handler.AsyncMetadataFetch.create(
+            self.allocator,
+            &self.ring,
+            info_hash,
+            peer_id,
+            port,
+            is_private,
+            peers,
+            on_complete,
+            caller_ctx,
+        );
+        self.metadata_fetch.?.start();
+    }
+
+    /// Cancel and destroy an active metadata fetch. Safe to call if none is active.
+    pub fn cancelMetadataFetch(self: *EventLoop) void {
+        if (self.metadata_fetch) |mf| {
+            mf.destroy();
+            self.metadata_fetch = null;
+        }
+    }
+
     // ── Peer banning ────────────────────────────────────
 
     /// Scan all connected peers and disconnect any that are banned.
@@ -1467,6 +1513,9 @@ pub const EventLoop = struct {
             },
             .recheck_read => {
                 if (self.recheck) |rc| rc.handleReadCqe(op.slot, cqe.res);
+            },
+            .metadata_connect, .metadata_send, .metadata_recv => {
+                if (self.metadata_fetch) |mf| mf.handleCqe(op.op_type, op.slot, cqe.res);
             },
         }
     }

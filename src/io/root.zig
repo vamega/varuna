@@ -11,6 +11,7 @@ pub const peer_policy = @import("peer_policy.zig");
 pub const utp_handler = @import("utp_handler.zig");
 pub const hasher = @import("hasher.zig");
 pub const http = @import("http.zig");
+pub const metadata_handler = @import("metadata_handler.zig");
 pub const rate_limiter = @import("rate_limiter.zig");
 pub const recheck = @import("recheck.zig");
 pub const ring = @import("ring.zig");

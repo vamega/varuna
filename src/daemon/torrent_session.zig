@@ -18,6 +18,7 @@ const UdpTrackerExecutor = @import("udp_tracker_executor.zig").UdpTrackerExecuto
 const TorrentId = @import("../io/event_loop.zig").TorrentId;
 const Bitfield = @import("../bitfield.zig").Bitfield;
 const AsyncRecheck = @import("../io/recheck.zig").AsyncRecheck;
+const AsyncMetadataFetch = @import("../io/metadata_handler.zig").AsyncMetadataFetch;
 
 /// Mutable tracker URL storage. Tracks user-added, user-removed,
 /// and user-edited tracker URLs as overlays on top of the metainfo
@@ -446,8 +447,29 @@ pub const TorrentSession = struct {
         defer self.mutex.unlock();
 
         if (!self.background_init_done) return false;
-        if (self.session == null or self.shared_fds == null) return false;
         const sel = self.shared_event_loop orelse return false;
+
+        if (self.state == .metadata_fetching) {
+            // Start async BEP 9 metadata fetch on the event loop
+            const peers = self.pending_peers orelse &[_]std.net.Address{};
+            sel.startMetadataFetch(
+                self.info_hash,
+                self.peer_id,
+                self.port,
+                self.is_private,
+                peers,
+                onMetadataFetchComplete,
+                @ptrCast(self),
+            ) catch {
+                self.state = .@"error";
+                self.error_message = std.fmt.allocPrint(self.allocator, "failed to start async metadata fetch", .{}) catch null;
+                return false;
+            };
+            self.background_init_done = false; // consumed; don't re-enter
+            return true;
+        }
+
+        if (self.session == null or self.shared_fds == null) return false;
 
         if (self.state == .checking) {
             // Start async recheck on the event loop
@@ -928,11 +950,11 @@ pub const TorrentSession = struct {
     /// Does NOT do piece verification (that moves to the event loop via AsyncRecheck)
     /// and does NOT do blocking tracker announces (those use the ring-based executors).
     fn doStartBackground(self: *TorrentSession) !void {
-        // Magnet link: first fetch metadata from peers before normal download
+        // Magnet link: collect peers via tracker announce, then hand off
+        // to the event loop for async BEP 9 metadata fetch.
         if (self.is_magnet and self.torrent_bytes.len == 0) {
-            try self.fetchMetadata();
-            // After metadata fetch, torrent_bytes is populated and is_magnet
-            // state transitions. Fall through to normal download path.
+            try self.collectMagnetPeers();
+            return; // event loop will start async metadata fetch
         }
 
         const session = try session_mod.Session.load(self.allocator, self.torrent_bytes, self.save_path);
@@ -1421,7 +1443,175 @@ pub const TorrentSession = struct {
 
     // ── Magnet metadata fetching (BEP 9) ────────────────────
 
-    /// Fetch metadata from peers for a magnet link.
+    /// Collect peers for a magnet link via tracker announces.
+    /// Runs on the background thread. Stores peers for the event loop
+    /// to use with the async BEP 9 metadata fetch.
+    fn collectMagnetPeers(self: *TorrentSession) !void {
+        const tlog = std.log.scoped(.metadata_fetch);
+
+        self.state = .metadata_fetching;
+        self.metadata_fetch_progress = .{ .state = .announcing };
+
+        const tracker_urls = self.magnet_trackers orelse {
+            self.error_message = std.fmt.allocPrint(self.allocator, "no tracker URLs in magnet link", .{}) catch null;
+            return error.NoTrackers;
+        };
+
+        var peer_list = std.ArrayList(std.net.Address).empty;
+        defer peer_list.deinit(self.allocator);
+
+        for (tracker_urls) |url| {
+            const resp = tracker.announce.fetchAuto(self.allocator, .{
+                .announce_url = url,
+                .info_hash = self.info_hash,
+                .peer_id = self.peer_id,
+                .port = self.port,
+                .left = 1, // we need metadata
+                .key = self.tracker_key,
+            }) catch |err| {
+                tlog.debug("tracker announce failed for {s}: {s}", .{ url, @errorName(err) });
+                continue;
+            };
+            defer tracker.announce.freeResponse(self.allocator, resp);
+
+            for (resp.peers) |peer| {
+                peer_list.append(self.allocator, peer.address) catch {};
+            }
+        }
+
+        tlog.info("magnet: collected {d} peers from {d} trackers", .{ peer_list.items.len, tracker_urls.len });
+
+        // Store peers for event loop integration
+        self.pending_peers = peer_list.toOwnedSlice(self.allocator) catch null;
+        self.metadata_fetch_progress = .{ .state = .connecting };
+        self.background_init_done = true;
+    }
+
+    /// Callback from async metadata fetch completion. Runs on the event loop thread.
+    /// If metadata was successfully downloaded, continues with Session.load + recheck.
+    fn onMetadataFetchComplete(mf: *AsyncMetadataFetch) void {
+        const self: *TorrentSession = if (mf.caller_ctx) |ctx|
+            @ptrCast(@alignCast(ctx))
+        else
+            return;
+
+        const mlog = std.log.scoped(.metadata_fetch);
+        self.mutex.lock();
+        defer self.mutex.unlock();
+
+        const sel = self.shared_event_loop orelse {
+            self.state = .@"error";
+            self.error_message = std.fmt.allocPrint(self.allocator, "event loop gone during metadata fetch", .{}) catch null;
+            return;
+        };
+
+        // Clean up the pending_peers (already consumed by AsyncMetadataFetch)
+        if (self.pending_peers) |pp| {
+            self.allocator.free(pp);
+            self.pending_peers = null;
+        }
+
+        const info_bytes = mf.result_bytes orelse {
+            mlog.warn("metadata fetch failed: no result", .{});
+            self.state = .@"error";
+            self.metadata_fetch_progress = .{ .state = .failed };
+            self.error_message = std.fmt.allocPrint(self.allocator, "metadata fetch failed: all peers exhausted", .{}) catch null;
+            // Clean up the fetch state
+            sel.metadata_fetch = null;
+            mf.destroy();
+            return;
+        };
+
+        self.metadata_fetch_progress = .{
+            .state = .completed,
+            .pieces_received = mf.assembler.piece_count,
+            .pieces_total = mf.assembler.piece_count,
+            .metadata_size = mf.assembler.total_size,
+            .peers_attempted = mf.peers_attempted,
+        };
+
+        // Build a minimal .torrent file wrapping the raw info dictionary
+        const torrent_bytes = self.buildTorrentBytes(info_bytes) catch |err| {
+            self.state = .@"error";
+            self.error_message = std.fmt.allocPrint(self.allocator, "failed to build torrent: {s}", .{@errorName(err)}) catch null;
+            sel.metadata_fetch = null;
+            mf.destroy();
+            return;
+        };
+
+        // Clean up metadata fetch before continuing (frees assembler and info_bytes)
+        sel.metadata_fetch = null;
+        mf.destroy();
+
+        self.torrent_bytes = torrent_bytes;
+
+        // Parse the torrent to update metadata fields
+        const metainfo = @import("../torrent/metainfo.zig");
+        const meta = metainfo.parse(self.allocator, torrent_bytes) catch |err| {
+            self.state = .@"error";
+            self.error_message = std.fmt.allocPrint(self.allocator, "metadata parse failed: {s}", .{@errorName(err)}) catch null;
+            return;
+        };
+        defer metainfo.freeMetainfo(self.allocator, meta);
+
+        self.total_size = meta.totalSize();
+        self.piece_count = meta.pieceCount() catch 0;
+
+        if (self.is_magnet) {
+            const new_name = self.allocator.dupe(u8, meta.name) catch null;
+            if (new_name) |nn| {
+                self.allocator.free(self.name);
+                self.name = nn;
+            }
+        }
+
+        mlog.info("metadata downloaded: {s} ({d} bytes)", .{ self.name, self.total_size });
+
+        // Now do the normal Session.load + PieceStore.init + start recheck path.
+        // This is similar to doStartBackground but runs on the event loop thread.
+        // The one-time file creation in PieceStore.init is an acceptable exception
+        // per the io_uring policy.
+        const session = session_mod.Session.load(self.allocator, torrent_bytes, self.save_path) catch |err| {
+            self.state = .@"error";
+            self.error_message = std.fmt.allocPrint(self.allocator, "session load failed: {s}", .{@errorName(err)}) catch null;
+            return;
+        };
+        self.session = session;
+
+        const store_result = storage.writer.PieceStore.init(self.allocator, &self.session.?);
+        if (store_result) |pstore| {
+            self.store = pstore;
+        } else |err| {
+            self.state = .@"error";
+            self.error_message = std.fmt.allocPrint(self.allocator, "piece store init failed: {s}", .{@errorName(err)}) catch null;
+            return;
+        }
+
+        // Get shared file handles
+        const shared_fds = self.store.?.fileHandles(self.allocator) catch |err| {
+            self.state = .@"error";
+            self.error_message = std.fmt.allocPrint(self.allocator, "file handles failed: {s}", .{@errorName(err)}) catch null;
+            return;
+        };
+        self.shared_fds = shared_fds;
+
+        // Start async recheck
+        self.state = .checking;
+        sel.startRecheck(
+            &self.session.?,
+            shared_fds,
+            0,
+            null, // no resume pieces for fresh magnet
+            onRecheckComplete,
+            @ptrCast(self),
+        ) catch {
+            self.state = .@"error";
+            self.error_message = std.fmt.allocPrint(self.allocator, "failed to start recheck after metadata fetch", .{}) catch null;
+            return;
+        };
+    }
+
+    /// Fetch metadata from peers for a magnet link (blocking, legacy path).
     /// This runs on the background thread before the normal download path.
     /// Uses the resilient MetadataFetcher which handles multi-peer retry,
     /// per-peer timeouts, and progress reporting.
@@ -1828,6 +2018,15 @@ pub const TorrentSession = struct {
         self.mutex.lock();
         defer self.mutex.unlock();
         const sel = self.shared_event_loop orelse return;
+        // Cancel any active metadata fetch for this session
+        if (sel.metadata_fetch) |mf| {
+            if (mf.caller_ctx) |ctx| {
+                const mf_session: *TorrentSession = @ptrCast(@alignCast(ctx));
+                if (mf_session == self) {
+                    sel.cancelMetadataFetch();
+                }
+            }
+        }
         if (self.torrent_id_in_shared) |tid| {
             sel.removeTorrent(tid);
             self.torrent_id_in_shared = null;
