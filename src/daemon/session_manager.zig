@@ -493,18 +493,15 @@ pub const SessionManager = struct {
         if (session.state == .queued) {
             // The torrent was queued -- attempt to make it active
             if (self.queue_manager.config.enabled) {
-                // Temporarily set to paused so shouldBeActive can evaluate it as "wants to start"
-                // Actually, just run enforcement which will pick this one up
-                // if there is a slot available
-                session.state = .paused; // mark as "wants to run"
-                session.unpause();
-                // If enforcement says it can't be active, queue it again
-                if (!self.queue_manager.shouldBeActive(session.info_hash_hex, &self.sessions)) {
-                    session.pause();
-                    session.state = .queued;
+                // Check eligibility BEFORE starting anything to avoid spawning
+                // a thread that gets immediately killed.
+                if (self.queue_manager.shouldBeActive(session.info_hash_hex, &self.sessions)) {
+                    session.state = .paused;
+                    session.unpause();
                 }
+                // else: leave it queued, do not start anything
             } else {
-                session.state = .paused; // so unpause sees .paused
+                session.state = .paused;
                 session.unpause();
             }
         } else {
