@@ -1321,12 +1321,8 @@ pub const TorrentSession = struct {
         const self: *TorrentSession = @ptrCast(@alignCast(context));
         defer self.finishAnnounceJob();
         const body = result.body orelse return;
-        const resp = tracker.announce.parseResponse(self.allocator, body) catch |err| {
-            std.log.warn("announceComplete: parse failed: {s}", .{@errorName(err)});
-            return;
-        };
+        const resp = tracker.announce.parseResponse(self.allocator, body) catch return;
         defer tracker.announce.freeResponse(self.allocator, resp);
-        std.log.info("announceComplete: peers={d} interval={d}", .{ resp.peers.len, resp.interval });
 
         const el = self.shared_event_loop orelse return;
 

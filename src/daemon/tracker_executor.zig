@@ -765,16 +765,14 @@ pub const TrackerExecutor = struct {
         else
             null;
 
-        // Check if connection is reusable.
+        // Check if connection is reusable BEFORE completing (which frees the slot).
         const reusable = if (body_start) |bs|
             !http.parseConnectionClose(data[0..bs]) and
                 http.parseContentLength(data[0..bs]) != null
         else
             false;
 
-        self.completeSlot(slot_idx, .{ .status = status, .body = body });
-
-        // Return connection to pool if reusable (plain HTTP only).
+        // Return connection to pool before completing the slot.
         if (reusable and !slot.parsed.is_https and slot.fd >= 0) {
             self.pool.put(
                 slot.job.hostSlice(),
@@ -782,8 +780,10 @@ pub const TrackerExecutor = struct {
                 slot.fd,
                 std.time.timestamp(),
             );
-            slot.fd = -1; // Prevent close in reset.
+            slot.fd = -1; // Prevent close in completeSlot.
         }
+
+        self.completeSlot(slot_idx, .{ .status = status, .body = body });
     }
 
     // ── Timeout checking ─────────────────────────────────────
@@ -820,6 +820,16 @@ pub const TrackerExecutor = struct {
         const host = slot.job.hostSlice();
         const job = slot.job;
 
+        // Copy the body before reset, because result.body references
+        // slot.recv_buf which reset() frees.
+        var owned_body: ?[]u8 = null;
+        defer if (owned_body) |b| self.allocator.free(b);
+        var result_copy = result;
+        if (result.body) |body| {
+            owned_body = self.allocator.dupe(u8, body) catch null;
+            result_copy.body = owned_body;
+        }
+
         // Close fd if not returned to pool.
         if (slot.fd >= 0) {
             posix.close(slot.fd);
@@ -829,8 +839,8 @@ pub const TrackerExecutor = struct {
         self.active_count -= 1;
         self.decrementHostActive(host);
 
-        // Invoke callback.
-        job.on_complete(job.context, result);
+        // Invoke callback with the owned copy.
+        job.on_complete(job.context, result_copy);
     }
 
     fn incrementHostActive(self: *TrackerExecutor, host: []const u8) void {
