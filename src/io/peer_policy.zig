@@ -381,6 +381,16 @@ pub fn processHashResults(self: *EventLoop) void {
     const h = self.hasher orelse return;
     const results = h.drainResultsInto(&self.hash_result_swap);
     for (results) |result| {
+        // Route recheck results to the async recheck state machine
+        if (result.is_recheck) {
+            if (self.recheck) |rc| {
+                rc.handleHashResult(result.piece_index, result.valid, result.piece_buf);
+            } else {
+                self.allocator.free(result.piece_buf);
+            }
+            continue;
+        }
+
         // Use torrent_id stored in the hash result (not from the slot,
         // which may have been freed and reassigned since submission).
         const torrent_id = result.torrent_id;

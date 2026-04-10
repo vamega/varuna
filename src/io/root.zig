@@ -12,6 +12,7 @@ pub const utp_handler = @import("utp_handler.zig");
 pub const hasher = @import("hasher.zig");
 pub const http = @import("http.zig");
 pub const rate_limiter = @import("rate_limiter.zig");
+pub const recheck = @import("recheck.zig");
 pub const ring = @import("ring.zig");
 pub const signal = @import("signal.zig");
 pub const tls = @import("tls.zig");

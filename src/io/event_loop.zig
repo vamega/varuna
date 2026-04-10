@@ -270,6 +270,9 @@ pub const EventLoop = struct {
     hash_result_swap: std.ArrayList(Hasher.Result) = std.ArrayList(Hasher.Result).empty,
     merkle_result_swap: std.ArrayList(Hasher.MerkleResult) = std.ArrayList(Hasher.MerkleResult).empty,
 
+    // Async piece recheck state machine (null when no recheck is active)
+    recheck: ?*@import("recheck.zig").AsyncRecheck = null,
+
     // Compact list of peer slots that are idle (active, unchoked, have
     // availability, and need a piece assignment).  Avoids scanning all
     // max_peers slots every tick in tryAssignPieces.
@@ -1214,6 +1217,44 @@ pub const EventLoop = struct {
         peer_policy.processHashResults(self);
     }
 
+    // ── Async piece recheck ────────────────────────────
+
+    /// Start an asynchronous piece recheck for a torrent.
+    /// The recheck runs concurrently with normal event loop operation,
+    /// using io_uring reads and the background hasher thread pool.
+    /// Only one recheck may be active at a time.
+    pub fn startRecheck(
+        self: *EventLoop,
+        session: *const @import("../torrent/session.zig").Session,
+        fds: []const posix.fd_t,
+        torrent_id: TorrentId,
+        known_complete: ?*const Bitfield,
+        on_complete: ?*const fn (*@import("recheck.zig").AsyncRecheck) void,
+    ) !void {
+        const h = self.hasher orelse return error.NoHasher;
+        if (self.recheck != null) return error.RecheckAlreadyActive;
+
+        self.recheck = try @import("recheck.zig").AsyncRecheck.create(
+            self.allocator,
+            session,
+            fds,
+            &self.ring,
+            h,
+            torrent_id,
+            known_complete,
+            on_complete,
+        );
+        self.recheck.?.start();
+    }
+
+    /// Cancel and destroy an active recheck. Safe to call if no recheck is active.
+    pub fn cancelRecheck(self: *EventLoop) void {
+        if (self.recheck) |rc| {
+            rc.destroy();
+            self.recheck = null;
+        }
+    }
+
     // ── Peer banning ────────────────────────────────────
 
     /// Scan all connected peers and disconnect any that are banned.
@@ -1419,6 +1460,9 @@ pub const EventLoop = struct {
             .timerfd => {
                 self.timer_pending = false;
                 self.fireExpiredTimers();
+            },
+            .recheck_read => {
+                if (self.recheck) |rc| rc.handleReadCqe(op.slot, cqe.res);
             },
         }
     }

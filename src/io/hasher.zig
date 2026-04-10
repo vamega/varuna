@@ -51,6 +51,7 @@ pub const Hasher = struct {
         expected_hash_v2: [32]u8 = [_]u8{0} ** 32,
         hash_type: HashType = .sha1,
         torrent_id: u32,
+        is_recheck: bool = false,
     };
 
     pub const Result = struct {
@@ -59,6 +60,7 @@ pub const Hasher = struct {
         piece_buf: []u8,
         valid: bool,
         torrent_id: u32,
+        is_recheck: bool = false,
     };
 
     /// A job to build SHA-256 piece hashes for an entire file (BEP 52 Merkle tree).
@@ -317,6 +319,7 @@ pub const Hasher = struct {
                 .piece_buf = job.piece_buf,
                 .valid = valid,
                 .torrent_id = job.torrent_id,
+                .is_recheck = job.is_recheck,
             }) catch {
                 // OOM: free the piece buffer to avoid leaking it. The piece
                 // will appear stuck in-progress; the peer timeout mechanism

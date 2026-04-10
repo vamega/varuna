@@ -37,6 +37,7 @@ pub const OpType = enum(u8) {
     udp_tracker_send = 16,
     udp_tracker_recv = 17,
     timerfd = 18,
+    recheck_read = 19,
 };
 
 pub const OpData = struct {
