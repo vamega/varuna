@@ -196,75 +196,68 @@ pub const QueueManager = struct {
         return true;
     }
 
-    /// Run queue enforcement: check all queued torrents in priority order and
-    /// start those that fit within limits. Returns the list of info-hash hex
-    /// strings of torrents that should be started.
+    /// Run queue enforcement: walk the queue in priority order, decide which
+    /// torrents fit within active-slot limits, and return two lists:
+    ///   - `to_start`: queued torrents that should become active
+    ///   - `to_queue`: active torrents that exceed limits and should be demoted
     ///
     /// The caller must actually start/queue the sessions.
-    pub fn enforceQueue(
+    pub fn enforce(
         self: *const QueueManager,
         sessions: *const std.StringHashMap(*TorrentSession),
-    ) EnforcementResult {
-        if (!self.config.enabled) return .{};
+    ) EnforceResult {
+        var result = EnforceResult{};
+        if (!self.config.enabled) return result;
 
         var active_downloads: u32 = 0;
         var active_uploads: u32 = 0;
         var active_total: u32 = 0;
 
-        // First pass: count active torrents
         for (self.queue.items) |hash| {
             const session = sessions.get(&hash) orelse continue;
             const state = session.state;
+            if (!(state == .downloading or state == .seeding or state == .queued)) continue;
 
-            if (state == .downloading or state == .seeding) {
-                if (isDownloading(session)) {
+            const is_download = state != .seeding;
+            const within_total = self.config.max_active_torrents < 0 or
+                active_total < @as(u32, @intCast(self.config.max_active_torrents));
+            const within_type = if (is_download)
+                (self.config.max_active_downloads < 0 or
+                    active_downloads < @as(u32, @intCast(self.config.max_active_downloads)))
+            else
+                (self.config.max_active_uploads < 0 or
+                    active_uploads < @as(u32, @intCast(self.config.max_active_uploads)));
+
+            if (within_total and within_type) {
+                active_total += 1;
+                if (is_download) {
                     active_downloads += 1;
                 } else {
                     active_uploads += 1;
                 }
-                active_total += 1;
-            }
-        }
 
-        var result = EnforcementResult{};
-
-        // Second pass: find queued torrents that can be started (in priority order)
-        for (self.queue.items) |hash| {
-            if (result.start_count >= EnforcementResult.MAX_START) break;
-
-            const session = sessions.get(&hash) orelse continue;
-            if (session.state != .queued) continue;
-
-            // Check overall limit
-            if (self.config.max_active_torrents >= 0) {
-                if (active_total >= @as(u32, @intCast(self.config.max_active_torrents))) break;
-            }
-
-            const is_dl = isDownloading(session);
-
-            if (is_dl) {
-                if (self.config.max_active_downloads >= 0) {
-                    if (active_downloads >= @as(u32, @intCast(self.config.max_active_downloads))) continue;
+                if (state == .queued and result.start_count < result.to_start.len) {
+                    result.to_start[result.start_count] = hash;
+                    result.start_count += 1;
                 }
-                active_downloads += 1;
-            } else {
-                if (self.config.max_active_uploads >= 0) {
-                    if (active_uploads >= @as(u32, @intCast(self.config.max_active_uploads))) continue;
-                }
-                active_uploads += 1;
+                continue;
             }
-            active_total += 1;
-            result.to_start[result.start_count] = hash;
-            result.start_count += 1;
+
+            if ((state == .downloading or state == .seeding) and result.queue_count < result.to_queue.len) {
+                result.to_queue[result.queue_count] = hash;
+                result.queue_count += 1;
+            }
         }
 
         return result;
     }
 
-    pub const EnforcementResult = struct {
-        const MAX_START = 32;
-        to_start: [MAX_START][40]u8 = undefined,
+    pub const EnforceResult = struct {
+        const MAX_BATCH = 32;
+        to_start: [MAX_BATCH][40]u8 = undefined,
         start_count: usize = 0,
+        to_queue: [MAX_BATCH][40]u8 = undefined,
+        queue_count: usize = 0,
     };
 
     /// Persist queue positions to SQLite.
@@ -484,11 +477,12 @@ test "queue enforcement with limits" {
 
     // We cannot easily create TorrentSessions in tests without full
     // torrent bytes, so we test the enforcement logic structurally.
-    // The enforceQueue method with an empty sessions map should return
-    // no torrents to start.
+    // The enforce method with an empty sessions map should return
+    // nothing to start or queue.
     var sessions = std.StringHashMap(*TorrentSession).init(allocator);
     defer sessions.deinit();
 
-    const result = qm.enforceQueue(&sessions);
+    const result = qm.enforce(&sessions);
     try std.testing.expectEqual(@as(usize, 0), result.start_count);
+    try std.testing.expectEqual(@as(usize, 0), result.queue_count);
 }

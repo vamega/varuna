@@ -759,54 +759,9 @@ pub const SessionManager = struct {
 
     /// Run queue enforcement while the mutex is already held.
     fn runQueueEnforcementLocked(self: *SessionManager) void {
-        if (!self.queue_manager.config.enabled) return;
+        const result = self.queue_manager.enforce(&self.sessions);
 
-        var to_queue: [32][40]u8 = undefined;
-        var to_queue_count: usize = 0;
-        var to_start: [32][40]u8 = undefined;
-        var to_start_count: usize = 0;
-        var active_downloads: u32 = 0;
-        var active_uploads: u32 = 0;
-        var active_total: u32 = 0;
-
-        for (self.queue_manager.queue.items) |hash| {
-            if (self.sessions.get(&hash)) |session| {
-                const state = session.state;
-                if (!(state == .downloading or state == .seeding or state == .queued)) continue;
-
-                const is_download = state != .seeding;
-                const within_total = self.queue_manager.config.max_active_torrents < 0 or
-                    active_total < @as(u32, @intCast(self.queue_manager.config.max_active_torrents));
-                const within_type = if (is_download)
-                    (self.queue_manager.config.max_active_downloads < 0 or
-                        active_downloads < @as(u32, @intCast(self.queue_manager.config.max_active_downloads)))
-                else
-                    (self.queue_manager.config.max_active_uploads < 0 or
-                        active_uploads < @as(u32, @intCast(self.queue_manager.config.max_active_uploads)));
-
-                if (within_total and within_type) {
-                    active_total += 1;
-                    if (is_download) {
-                        active_downloads += 1;
-                    } else {
-                        active_uploads += 1;
-                    }
-
-                    if (state == .queued and to_start_count < to_start.len) {
-                        to_start[to_start_count] = hash;
-                        to_start_count += 1;
-                    }
-                    continue;
-                }
-
-                if ((state == .downloading or state == .seeding) and to_queue_count < to_queue.len) {
-                    to_queue[to_queue_count] = hash;
-                    to_queue_count += 1;
-                }
-            }
-        }
-
-        for (to_queue[0..to_queue_count]) |hash| {
+        for (result.to_queue[0..result.queue_count]) |hash| {
             if (self.sessions.get(&hash)) |session| {
                 if (session.state == .downloading or session.state == .seeding) {
                     session.pause();
@@ -815,7 +770,7 @@ pub const SessionManager = struct {
             }
         }
 
-        for (to_start[0..to_start_count]) |hash| {
+        for (result.to_start[0..result.start_count]) |hash| {
             if (self.sessions.get(&hash)) |session| {
                 if (session.state == .queued) {
                     session.state = .paused; // so unpause sees .paused
