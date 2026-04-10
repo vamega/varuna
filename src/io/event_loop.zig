@@ -87,6 +87,14 @@ pub const EventLoop = struct {
         remote: std.net.Address,
     };
 
+    /// A one-shot timer callback scheduled via scheduleTimer().
+    /// Fired when the monotonic clock passes fire_at_ms.
+    pub const TimerCallback = struct {
+        fire_at_ms: i64, // monotonic clock target in milliseconds
+        context: *anyopaque,
+        callback: *const fn (*anyopaque) void,
+    };
+
     /// Queued piece block response for batched sending.
     /// Multiple blocks queued in the same tick are combined into one send.
     pub const QueuedBlockResponse = struct {
@@ -198,6 +206,12 @@ pub const EventLoop = struct {
     timeout_ts: linux.kernel_timespec = .{ .sec = 2, .nsec = 0 },
     timeout_pending: bool = false,
 
+    // timerfd: one-shot timer callbacks driven by timerfd + io_uring read
+    timer_fd: posix.fd_t = -1,
+    timer_read_buf: [8]u8 = undefined,
+    timer_pending: bool = false,
+    timer_callbacks: std.ArrayList(TimerCallback) = std.ArrayList(TimerCallback).empty,
+
     // Pending disk writes: track buffers that io_uring is writing to disk.
     pending_writes: std.AutoHashMapUnmanaged(u32, PendingWrite),
     pending_write_lookup: std.AutoHashMapUnmanaged(PendingWriteKey, u32),
@@ -274,6 +288,11 @@ pub const EventLoop = struct {
         else
             null;
 
+        // Create a timerfd for one-shot timer callbacks (e.g. delayed announces).
+        // Non-fatal: if the syscall fails we fall back to no timer support.
+        const tfd_rc = linux.timerfd_create(.MONOTONIC, .{ .CLOEXEC = true, .NONBLOCK = true });
+        const timer_fd: posix.fd_t = if (@as(isize, @bitCast(tfd_rc)) < 0) -1 else @intCast(tfd_rc);
+
         return .{
             .ring = try ring_mod.initIoUring(256, linux.IORING_SETUP_COOP_TASKRUN | linux.IORING_SETUP_SINGLE_ISSUER),
             .allocator = allocator,
@@ -295,6 +314,7 @@ pub const EventLoop = struct {
             .idle_peers = std.ArrayList(u16).empty,
             .active_peer_slots = std.ArrayList(u16).empty,
             .hasher = hasher,
+            .timer_fd = timer_fd,
         };
     }
 
@@ -361,6 +381,10 @@ pub const EventLoop = struct {
         if (self.udp_fd >= 0) {
             posix.close(self.udp_fd);
             self.udp_fd = -1;
+        }
+        if (self.timer_fd >= 0) {
+            posix.close(self.timer_fd);
+            self.timer_fd = -1;
         }
 
         // ── Phase 2: Drain the ring ──────────────────────────────
@@ -450,6 +474,7 @@ pub const EventLoop = struct {
         // Clean up uTP resources
         if (self.utp_manager) |mgr| self.allocator.destroy(mgr);
         self.utp_send_queue.deinit(self.allocator);
+        self.timer_callbacks.deinit(self.allocator);
 
         // ── Phase 4: Tear down the ring ──────────────────────────
         self.ring.deinit();
@@ -1098,6 +1123,87 @@ pub const EventLoop = struct {
         self.timeout_pending = true;
     }
 
+    // ── timerfd-based one-shot timers ──────────────────────
+
+    /// Schedule a one-shot timer that fires `delay_ms` milliseconds from now.
+    /// When the timer fires, `callback(context)` is invoked from the event
+    /// loop thread during CQE dispatch.
+    pub fn scheduleTimer(self: *EventLoop, delay_ms: u64, context: *anyopaque, callback: *const fn (*anyopaque) void) !void {
+        const now_ms = nowMonotonicMs();
+        const fire_at_ms: i64 = now_ms +| @as(i64, @intCast(@min(delay_ms, std.math.maxInt(i63))));
+
+        try self.timer_callbacks.append(self.allocator, .{
+            .fire_at_ms = fire_at_ms,
+            .context = context,
+            .callback = callback,
+        });
+
+        self.armNextTimer();
+    }
+
+    /// Arm the timerfd for the earliest pending callback and submit
+    /// an io_uring read if one is not already in flight.
+    fn armNextTimer(self: *EventLoop) void {
+        if (self.timer_fd < 0) return;
+        if (self.timer_callbacks.items.len == 0) return;
+
+        // Find earliest deadline
+        var earliest_ms: i64 = std.math.maxInt(i64);
+        for (self.timer_callbacks.items) |cb| {
+            if (cb.fire_at_ms < earliest_ms) earliest_ms = cb.fire_at_ms;
+        }
+
+        const now_ms = nowMonotonicMs();
+        const delta_ms: i64 = @max(earliest_ms - now_ms, 1); // at least 1ms
+
+        const secs = @divTrunc(delta_ms, 1000);
+        const nsecs = @mod(delta_ms, 1000) * std.time.ns_per_ms;
+
+        const spec = linux.itimerspec{
+            .it_interval = .{ .sec = 0, .nsec = 0 },
+            .it_value = .{ .sec = @intCast(secs), .nsec = @intCast(nsecs) },
+        };
+        _ = linux.timerfd_settime(self.timer_fd, .{}, &spec, null);
+
+        if (!self.timer_pending) {
+            const ud = encodeUserData(.{ .slot = 0, .op_type = .timerfd, .context = 0 });
+            _ = self.ring.read(ud, self.timer_fd, .{ .buffer = &self.timer_read_buf }, 0) catch |err| {
+                log.warn("timerfd read submit: {s}", .{@errorName(err)});
+                return;
+            };
+            self.timer_pending = true;
+        }
+    }
+
+    /// Fire all timer callbacks whose deadline has passed, then re-arm
+    /// for the next pending timer (if any).
+    fn fireExpiredTimers(self: *EventLoop) void {
+        const now_ms = nowMonotonicMs();
+
+        var i: usize = 0;
+        while (i < self.timer_callbacks.items.len) {
+            if (self.timer_callbacks.items[i].fire_at_ms <= now_ms) {
+                const cb = self.timer_callbacks.swapRemove(i);
+                cb.callback(cb.context);
+                // don't increment i -- swapRemove moved the last element here
+            } else {
+                i += 1;
+            }
+        }
+
+        // Re-arm for next pending timer
+        if (self.timer_callbacks.items.len > 0) {
+            self.armNextTimer();
+        }
+    }
+
+    /// Return the current monotonic clock in milliseconds.
+    /// Uses CLOCK_MONOTONIC to match the timerfd clock source.
+    fn nowMonotonicMs() i64 {
+        const ts = posix.clock_gettime(.MONOTONIC) catch return 0;
+        return @as(i64, @intCast(ts.sec)) * std.time.ms_per_s + @divFloor(@as(i64, @intCast(ts.nsec)), std.time.ns_per_ms);
+    }
+
     pub fn stop(self: *EventLoop) void {
         self.running = false;
     }
@@ -1309,6 +1415,10 @@ pub const EventLoop = struct {
             .api_send => if (self.api_server) |srv| srv.handleSendCqe(op.slot, op.context, cqe),
             .udp_tracker_send, .udp_tracker_recv => {
                 if (self.udp_tracker_executor) |ute| ute.dispatchCqe(cqe);
+            },
+            .timerfd => {
+                self.timer_pending = false;
+                self.fireExpiredTimers();
             },
         }
     }
