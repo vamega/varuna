@@ -98,6 +98,7 @@ api_password = "adminadmin"
 
 [storage]
 data_dir = "$WORK_DIR/seed-root"
+resume_db = "$WORK_DIR/seed-daemon/resume.db"
 
 [network]
 port_min = ${SEED_PORT}
@@ -115,6 +116,7 @@ api_password = "adminadmin"
 
 [storage]
 data_dir = "$WORK_DIR/download-root"
+resume_db = "$WORK_DIR/download-daemon/resume.db"
 
 [network]
 port_min = ${DOWNLOAD_PORT}

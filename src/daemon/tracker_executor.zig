@@ -349,16 +349,22 @@ pub const TrackerExecutor = struct {
     fn tryStartJob(self: *TrackerExecutor, job: Job) bool {
         if (self.active_count >= self.max_concurrent) return false;
 
-        const host = job.hostSlice();
-        const current = self.host_active.get(host) orelse 0;
-        if (current >= self.max_per_host) return false;
-
         const slot_idx = self.claimSlot() orelse return false;
         const slot = &self.slots[slot_idx];
 
+        // Copy job into slot FIRST so slices reference stable memory.
         slot.job = job;
         slot.deadline = std.time.timestamp() + request_timeout_s;
-        slot.parsed = http.parseUrl(job.urlSlice()) catch {
+
+        const host = slot.job.hostSlice();
+        const current = self.host_active.get(host) orelse 0;
+        if (current >= self.max_per_host) {
+            slot.state = .free;
+            self.free_slot_count += 1;
+            return false;
+        }
+
+        slot.parsed = http.parseUrl(slot.job.urlSlice()) catch {
             self.completeSlot(slot_idx, .{ .err = error.InvalidUrl });
             return true;
         };
@@ -509,7 +515,6 @@ pub const TrackerExecutor = struct {
 
         switch (result) {
             .complete => {
-                // Handshake done — build and send the HTTP request through TLS.
                 self.buildRequest(slot);
                 // Encrypt the request.
                 _ = tls.writePlaintext(slot.send_buf.items) catch {
@@ -551,7 +556,6 @@ pub const TrackerExecutor = struct {
         };
     }
 
-    // ── HTTP request building and sending ────────────────────
 
     fn buildRequest(self: *TrackerExecutor, slot: *RequestSlot) void {
         const parsed = slot.parsed;

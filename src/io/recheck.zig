@@ -166,29 +166,23 @@ pub const AsyncRecheck = struct {
         slot.state = .hashing;
         self.in_flight_hashes += 1;
 
-        self.hasher.submitVerify(
+        self.hasher.submitVerifyEx(
             slot_idx,
             slot.piece_index,
             buf,
             plan.expected_hash,
             self.torrent_id,
+            .{
+                .hash_type = plan.hash_type,
+                .expected_hash_v2 = plan.expected_hash_v2,
+                .is_recheck = true,
+            },
         ) catch {
             log.warn("recheck: failed to submit piece {d} to hasher", .{slot.piece_index});
             self.in_flight_hashes -= 1;
             self.finishSlot(slot_idx, false);
             return;
         };
-
-        // Configure hash type on the most recently appended job
-        self.hasher.queue_mutex.lock();
-        if (self.hasher.pending_jobs.items.len > 0) {
-            const last = &self.hasher.pending_jobs.items[self.hasher.pending_jobs.items.len - 1];
-            last.hash_type = plan.hash_type;
-            last.expected_hash_v2 = plan.expected_hash_v2;
-            last.is_recheck = true;
-            last.piece_length = plan.piece_length;
-        }
-        self.hasher.queue_mutex.unlock();
     }
 
     /// Called when a hasher result arrives for a recheck piece.
@@ -207,17 +201,19 @@ pub const AsyncRecheck = struct {
             self.in_flight_hashes -= 1;
         }
 
+        // The hasher returns the piece_buf pointer but does not free it.
+        // We must free it here after checking the result.
+        defer self.allocator.free(piece_buf);
+
         if (slot_idx) |idx| {
-            // The hasher took ownership of the buf; clear our reference
-            // so finishSlot does not double-free.
+            // Clear the slot's buf reference so finishSlot does not double-free.
             self.slots[idx].buf = null;
             self.finishSlot(idx, valid);
         } else {
-            // Orphan result -- free the buffer
+            // Orphan result
             if (valid) {
                 self.markPieceComplete(piece_index);
             }
-            self.allocator.free(piece_buf);
             self.pieces_done += 1;
             self.checkComplete();
         }

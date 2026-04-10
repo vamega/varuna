@@ -114,7 +114,6 @@ const sources = [_][]const u8{
 ///   ares_sysconfig_win.c — Windows-only
 ///   windows_port.c      — Windows-only
 ///   event/ares_event_win32.c — Windows IOCP
-
 pub fn create(
     b: *std.Build,
     target: std.Build.ResolvedTarget,

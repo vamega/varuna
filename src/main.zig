@@ -366,7 +366,7 @@ pub fn main() !void {
             while (iter.next()) |entry| {
                 const sess = entry.value_ptr.*;
                 // Phase 1: background init done, start async recheck on event loop
-                if (sess.background_init_done and sess.state == .checking) {
+                if (sess.background_init_done.load(.acquire) and sess.state == .checking) {
                     _ = sess.integrateIntoEventLoop();
                 }
                 // Phase 2: recheck done, register torrent and add peers
@@ -457,12 +457,11 @@ pub fn main() !void {
         // Tick shared event loop (non-blocking poll).
         // Also tick when the DHT/uTP UDP socket is open so DHT bootstrap
         // messages and incoming datagrams are processed even without TCP peers.
-        if (shared_el.peer_count > 0 or shared_el.listen_fd >= 0 or shared_el.udp_fd >= 0) {
-            // Has active I/O -- use tick which calls submit_and_wait
+        const has_io = shared_el.peer_count > 0 or shared_el.listen_fd >= 0 or shared_el.udp_fd >= 0 or shared_el.recheck != null or shared_el.metadata_fetch != null or shared_el.timer_pending;
+        if (has_io) {
             shared_el.submitTimeout(100 * std.time.ns_per_ms) catch {};
             shared_el.tick() catch {};
         } else {
-            // No active I/O -- just sleep to avoid busy-spinning
             std.Thread.sleep(10 * std.time.ns_per_ms);
         }
     }

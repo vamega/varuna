@@ -197,7 +197,7 @@ pub const TorrentSession = struct {
     torrent_id_in_shared: ?TorrentId = null,
     pending_peers: ?[]std.net.Address = null, // peers waiting for main thread to add
     pending_seed_setup: bool = false, // signals main thread to set up seed mode
-    background_init_done: bool = false, // signals main thread that background init finished
+    background_init_done: std.atomic.Value(bool) = std.atomic.Value(bool).init(false), // signals main thread that background init finished
     resume_pieces: ?Bitfield = null, // known-complete pieces from resume DB, consumed by async recheck
     dht_registered: bool = false, // whether DHT requestPeers has been called
     thread: ?std.Thread = null,
@@ -443,54 +443,73 @@ pub const TorrentSession = struct {
     /// and the session is in .checking state. Starts async piece recheck
     /// on the event loop. Returns true if recheck was started.
     pub fn integrateIntoEventLoop(self: *TorrentSession) bool {
-        self.mutex.lock();
-        defer self.mutex.unlock();
+        // Snapshot state under lock, then release before starting async
+        // operations whose completion callbacks will re-acquire the mutex.
+        const Action = enum { none, metadata_fetch, recheck };
+        var action: Action = .none;
+        var sel_ptr: ?*EventLoop = null;
+        var peers_snapshot: ?[]const std.net.Address = null;
+        var known_ptr: ?*const Bitfield = null;
 
-        if (!self.background_init_done) return false;
-        const sel = self.shared_event_loop orelse return false;
+        {
+            self.mutex.lock();
+            defer self.mutex.unlock();
 
-        if (self.state == .metadata_fetching) {
-            // Start async BEP 9 metadata fetch on the event loop
-            const peers = self.pending_peers orelse &[_]std.net.Address{};
-            sel.startMetadataFetch(
-                self.info_hash,
-                self.peer_id,
-                self.port,
-                self.is_private,
-                peers,
-                onMetadataFetchComplete,
-                @ptrCast(self),
-            ) catch {
-                self.state = .@"error";
-                self.error_message = std.fmt.allocPrint(self.allocator, "failed to start async metadata fetch", .{}) catch null;
-                return false;
-            };
-            self.background_init_done = false; // consumed; don't re-enter
-            return true;
+            if (!self.background_init_done.load(.acquire)) return false;
+            sel_ptr = self.shared_event_loop;
+            if (sel_ptr == null) return false;
+
+            if (self.state == .metadata_fetching) {
+                action = .metadata_fetch;
+                peers_snapshot = self.pending_peers orelse &[_]std.net.Address{};
+                self.background_init_done.store(false, .release);
+            } else if (self.state == .checking and self.session != null and self.shared_fds != null) {
+                action = .recheck;
+                known_ptr = if (self.resume_pieces) |*rp| rp else null;
+                self.background_init_done.store(false, .release);
+            }
         }
 
-        if (self.session == null or self.shared_fds == null) return false;
+        const sel = sel_ptr orelse return false;
 
-        if (self.state == .checking) {
-            // Start async recheck on the event loop
-            const known_ptr: ?*const Bitfield = if (self.resume_pieces) |*rp| rp else null;
-            sel.startRecheck(
-                &self.session.?,
-                self.shared_fds.?,
-                0, // torrent_id placeholder; real ID assigned after recheck
-                known_ptr,
-                onRecheckComplete,
-                @ptrCast(self), // caller_ctx: TorrentSession pointer for callback
-            ) catch {
-                self.state = .@"error";
-                self.error_message = std.fmt.allocPrint(self.allocator, "failed to start async recheck", .{}) catch null;
-                return false;
-            };
-            self.background_init_done = false; // consumed; don't re-enter
-            return true;
+        switch (action) {
+            .metadata_fetch => {
+                sel.startMetadataFetch(
+                    self.info_hash,
+                    self.peer_id,
+                    self.port,
+                    self.is_private,
+                    peers_snapshot.?,
+                    onMetadataFetchComplete,
+                    @ptrCast(self),
+                ) catch {
+                    self.mutex.lock();
+                    defer self.mutex.unlock();
+                    self.state = .@"error";
+                    self.error_message = std.fmt.allocPrint(self.allocator, "failed to start async metadata fetch", .{}) catch null;
+                    return false;
+                };
+                return true;
+            },
+            .recheck => {
+                sel.startRecheck(
+                    &self.session.?,
+                    self.shared_fds.?,
+                    0,
+                    known_ptr,
+                    onRecheckComplete,
+                    @ptrCast(self),
+                ) catch {
+                    self.mutex.lock();
+                    defer self.mutex.unlock();
+                    self.state = .@"error";
+                    self.error_message = std.fmt.allocPrint(self.allocator, "failed to start async recheck", .{}) catch null;
+                    return false;
+                };
+                return true;
+            },
+            .none => return false,
         }
-
-        return false;
     }
 
     /// Called by the main thread to add peers to the event loop after
@@ -499,14 +518,25 @@ pub const TorrentSession = struct {
     pub fn addPeersToEventLoop(self: *TorrentSession) bool {
         self.mutex.lock();
         defer self.mutex.unlock();
-        const sel = self.shared_event_loop orelse return false;
-        const peers = self.pending_peers orelse return false;
+        const sel = self.shared_event_loop orelse {
+            std.log.warn("addPeersToEventLoop: no shared_event_loop", .{});
+            return false;
+        };
+        const peers = self.pending_peers orelse {
+            std.log.warn("addPeersToEventLoop: no pending_peers", .{});
+            return false;
+        };
         defer {
             self.allocator.free(peers);
             self.pending_peers = null;
         }
 
-        if (self.session == null or self.piece_tracker == null or self.shared_fds == null) return false;
+        if (self.session == null or self.piece_tracker == null or self.shared_fds == null) {
+            std.log.warn("addPeersToEventLoop: missing state: session={} pt={} fds={}", .{
+                self.session != null, self.piece_tracker != null, self.shared_fds != null,
+            });
+            return false;
+        }
 
         const tid = sel.addTorrentWithKey(
             &self.session.?,
@@ -539,15 +569,24 @@ pub const TorrentSession = struct {
 
         // DHT peer discovery: force an immediate requery now that the torrent
         // is registered in the event loop (findTorrentIdByInfoHash will work).
-        // Earlier requestPeers calls may have found peers that were silently
-        // dropped because the torrent wasn't integrated yet.
         if (!self.is_private) {
             if (sel.dht_engine) |engine| {
                 engine.forceRequery(self.info_hash);
             }
         }
 
-        return added > 0;
+        // Schedule initial announce now that the torrent is registered.
+        if (self.state == .seeding) {
+            self.scheduleCompletedAnnounce() catch |err| {
+                std.log.warn("scheduleCompletedAnnounce failed: {s}", .{@errorName(err)});
+            };
+        } else if (self.state == .downloading) {
+            self.scheduleReannounce() catch |err| {
+                std.log.warn("scheduleReannounce failed: {s}", .{@errorName(err)});
+            };
+        }
+
+        return added > 0 or self.state == .downloading or self.state == .seeding;
     }
 
     /// AsyncRecheck completion callback. Runs on the event loop thread.
@@ -603,44 +642,24 @@ pub const TorrentSession = struct {
         }
 
         if (recheck.bytes_complete == session.totalSize()) {
-            // All pieces complete -- seed mode
             self.state = .seeding;
             if (self.completion_on == 0) {
                 self.completion_on = std.time.timestamp();
             }
             self.pending_seed_setup = true;
-            self.scheduleCompletedAnnounce() catch {};
-
             log.info("recheck complete: all pieces valid, entering seed mode", .{});
         } else {
-            // Incomplete -- download mode with jittered announce delay
             self.state = .downloading;
-
-            // Schedule announce with jitter via timerfd to avoid thundering herd
-            const delay_ms = self.computeAnnounceJitterMs();
-            if (delay_ms > 0) {
-                if (self.shared_event_loop) |sel| {
-                    sel.scheduleTimer(delay_ms, @ptrCast(self), onJitteredAnnounce) catch {
-                        // If timer fails, announce immediately
-                        self.scheduleReannounce() catch {};
-                    };
-                } else {
-                    self.scheduleReannounce() catch {};
-                }
-            } else {
-                self.scheduleReannounce() catch {};
-            }
-
-            // Set pending_peers to empty slice so main loop calls addPeersToEventLoop
-            // to register the torrent in the event loop for DHT/PEX peer discovery.
-            if (self.pending_peers == null) {
-                self.pending_peers = self.allocator.alloc(std.net.Address, 0) catch null;
-            }
-
             log.info("recheck complete: {d}/{d} pieces, entering download mode", .{
                 recheck.complete_pieces.count,
                 session.pieceCount(),
             });
+        }
+
+        // Set pending_peers so main loop calls addPeersToEventLoop, which
+        // registers the torrent context and schedules the initial announce.
+        if (self.pending_peers == null) {
+            self.pending_peers = self.allocator.alloc(std.net.Address, 0) catch null;
         }
     }
 
@@ -1045,7 +1064,7 @@ pub const TorrentSession = struct {
         // Stay in .checking state -- the event loop will run async recheck
         // via integrateIntoEventLoop -> startRecheck.
         self.state = .checking;
-        self.background_init_done = true;
+        self.background_init_done.store(true, .release);
     }
 
     fn stopInternal(self: *TorrentSession) void {
@@ -1080,7 +1099,7 @@ pub const TorrentSession = struct {
         }
         self.torrent_id_in_shared = null;
         self.pending_seed_setup = false;
-        self.background_init_done = false;
+        self.background_init_done.store(false, .release);
     }
 
     /// Called by the main thread to set up seed mode for this session
@@ -1302,8 +1321,12 @@ pub const TorrentSession = struct {
         const self: *TorrentSession = @ptrCast(@alignCast(context));
         defer self.finishAnnounceJob();
         const body = result.body orelse return;
-        const resp = tracker.announce.parseResponse(self.allocator, body) catch return;
+        const resp = tracker.announce.parseResponse(self.allocator, body) catch |err| {
+            std.log.warn("announceComplete: parse failed: {s}", .{@errorName(err)});
+            return;
+        };
         defer tracker.announce.freeResponse(self.allocator, resp);
+        std.log.info("announceComplete: peers={d} interval={d}", .{ resp.peers.len, resp.interval });
 
         const el = self.shared_event_loop orelse return;
 
@@ -1484,7 +1507,7 @@ pub const TorrentSession = struct {
         // Store peers for event loop integration
         self.pending_peers = peer_list.toOwnedSlice(self.allocator) catch null;
         self.metadata_fetch_progress = .{ .state = .connecting };
-        self.background_init_done = true;
+        self.background_init_done.store(true, .release);
     }
 
     /// Callback from async metadata fetch completion. Runs on the event loop thread.

@@ -148,7 +148,13 @@ pub const Hasher = struct {
         if (self.event_fd >= 0) posix.close(self.event_fd);
     }
 
-    /// Submit a piece for background SHA-1 verification.
+    pub const VerifyOptions = struct {
+        hash_type: HashType = .sha1,
+        expected_hash_v2: [32]u8 = [_]u8{0} ** 32,
+        is_recheck: bool = false,
+    };
+
+    /// Submit a piece for background SHA verification.
     /// Called from the event loop thread. Does not block.
     pub fn submitVerify(
         self: *Hasher,
@@ -157,6 +163,19 @@ pub const Hasher = struct {
         piece_buf: []u8,
         expected_hash: [20]u8,
         torrent_id: u32,
+    ) !void {
+        return self.submitVerifyEx(slot, piece_index, piece_buf, expected_hash, torrent_id, .{});
+    }
+
+    /// Submit a piece for verification with extended options (hash type, recheck flag).
+    pub fn submitVerifyEx(
+        self: *Hasher,
+        slot: u16,
+        piece_index: u32,
+        piece_buf: []u8,
+        expected_hash: [20]u8,
+        torrent_id: u32,
+        opts: VerifyOptions,
     ) !void {
         self.queue_mutex.lock();
         defer self.queue_mutex.unlock();
@@ -167,7 +186,10 @@ pub const Hasher = struct {
             .piece_buf = piece_buf,
             .piece_length = @intCast(piece_buf.len),
             .expected_hash = expected_hash,
+            .expected_hash_v2 = opts.expected_hash_v2,
+            .hash_type = opts.hash_type,
             .torrent_id = torrent_id,
+            .is_recheck = opts.is_recheck,
         });
         self.queue_cond.signal();
     }
