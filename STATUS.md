@@ -26,13 +26,16 @@ Update it whenever a milestone lands, the near-term backlog changes, or a new op
 - Partial seeds (BEP 21): `upload_only` extension in BEP 10 handshake. Parse and store `upload_only` flag from peers. Advertise `upload_only: 1` when we are a partial seed (selective download complete but torrent incomplete). Automatic partial seed detection from piece tracker. Skip piece assignment when upload_only. Re-send extension handshake to all peers on state transition. Exposed in API (torrentPeers, properties, maindata).
 
 ### Architecture
-- **Single-threaded io_uring event loop**: all peer I/O, disk I/O, HTTP API, tracker HTTP through io_uring. Split into focused sub-modules: event_loop.zig (core), peer_handler.zig, protocol.zig, seed_handler.zig, peer_policy.zig, utp_handler.zig.
+- **Single-threaded io_uring event loop**: all peer I/O, disk I/O, HTTP API, tracker HTTP, piece verification reads, and metadata fetch through io_uring. Split into focused sub-modules: event_loop.zig (core), peer_handler.zig, protocol.zig, seed_handler.zig, peer_policy.zig, utp_handler.zig, recheck.zig, metadata_handler.zig.
 - **3-binary architecture**: `varuna` (daemon), `varuna-ctl` (CLI client), `varuna-tools` (standalone utilities).
 - **Fail-closed startup/config policy**: malformed config files now abort startup instead of silently falling back to defaults; invalid encryption modes are rejected; daemon startup now blocks on unsupported kernels or missing `io_uring`; removed dead config knobs `connect_timeout_secs`, `performance.pipeline_depth`, and `performance.ring_entries`.
 - **Shared multi-torrent event loop**: all torrents on one EventLoop thread with TorrentContext per torrent.
 - **Dynamic shared-torrent registry**: the shared EventLoop now uses dynamic slot storage, free-list reuse, `u32` torrent IDs, and hashed info-hash lookup instead of the old fixed 64-slot table.
-- **Shared announce ring**: tracker announces reuse a single ring instead of spawning per-announce threads.
+- **Shared announce ring**: tracker announces reuse a single ring instead of spawning per-announce threads. The blocking `multi_announce.zig` thread pool has been removed; all tracker I/O goes through the ring-based `TrackerExecutor` and `UdpTrackerExecutor`.
 - **Per-torrent announce handoff**: background tracker callbacks now queue discovered peers against the correct `torrent_id` instead of using one global mailbox, and background reannounce/scrape fan out across the full effective tracker set (metainfo plus overrides).
+- **Async torrent startup**: `doStart()` split into background-thread phase (SQLite+parse only) and event-loop phase. Piece verification uses io_uring reads pipelined through `AsyncRecheck` (4 concurrent pieces) with hasher pool for SHA. Announce scheduling uses timerfd for jittered delay. Background thread exits in milliseconds.
+- **Async metadata fetch (BEP 9)**: magnet link metadata download runs as an `AsyncMetadataFetch` state machine on the event loop with up to 3 concurrent peer connections via io_uring connect/send/recv. Replaces the blocking TCP socket path.
+- **Timerfd-based scheduling**: event loop supports one-shot timer callbacks via `timerfd_create`/`timerfd_settime`, used for jittered announce delays (replacing `Thread.sleep`).
 - **Tracked peer-wire control sends and shutdown drain**: `submitMessage` now routes all peer-wire messages through tracked send ownership instead of borrowing `handshake_buf`, seed reads validate per-span completion lengths, and EventLoop shutdown now dispatches late CQEs until tracked read/write/send state is retired before freeing buffers.
 - **Resume/state integrity hardening**: `ResumeWriter.flush()` now swaps and re-queues batches instead of clearing a shared pending slice after unlock, `clearTorrent()` now removes all torrent-scoped resume tables in one transaction, and v2 multi-piece piece checks now fail closed with `DeferredMerkleVerificationRequired` instead of accepting arbitrary payloads.
 - **Torrent-core v2/hybrid consistency**: pure-v2 layouts now reject flat v1 `pieceHash()` access, hybrids keep v1 piece-grid mapping semantics instead of being treated like file-aligned v2 layouts, and metainfo parsing now rejects `piece length = 0`.
@@ -51,7 +54,7 @@ Update it whenever a milestone lands, the near-term backlog changes, or a new op
 ### Storage & Resume
 - SQLite resume state: WAL mode, prepared statements, background thread. Daemon persists completions every ~5s.
 - Bundled SQLite option: `-Dsqlite=bundled` or `-Dsqlite=system`.
-- Resume fast path: loads known-complete pieces from SQLite, skips SHA-1 rehashing.
+- Resume fast path: loads known-complete pieces from SQLite, skips SHA-1 rehashing. Now integrated with `AsyncRecheck` — known-complete pieces are skipped without io_uring reads.
 - Session-owned metadata arena: `Session.load` now allocates torrent bytes, metainfo, layout, and manifest from one arena and frees them as a unit on session teardown.
 - Lifetime transfer stats: total_uploaded/total_downloaded persisted to SQLite, loaded as baseline on startup so share ratio survives daemon restarts.
 - Categories and tags persisted to SQLite (write-through on change, load at startup).
@@ -209,7 +212,8 @@ Update it whenever a milestone lands, the near-term backlog changes, or a new op
 - ~~**Seed plaintext scatter/gather**~~: (DONE) plaintext seed sends now use tracked vectored `sendmsg` with explicit piece-buffer ownership; encrypted peers still use the contiguous copy path.
 - **uTP outbound queueing**: the UDP path still has room for a ring queue and multiple in-flight sends if uTP becomes hot in real swarms.
 - **uTP multishot receive**: `recvmsg_multishot` plus a provided-buffer strategy still needs a workload and a measured implementation before it should land.
-- **Tracker work on the shared peer ring**: the daemon now shares tracker I/O through one executor, but the executor still owns its own ring. Moving tracker work onto the shared peer `EventLoop` ring requires an async tracker state machine rather than the current synchronous HTTP helper.
+- ~~**Tracker work on the shared peer ring**~~: (DONE) blocking tracker HTTP/UDP functions removed; all daemon tracker I/O goes through the ring-based `TrackerExecutor`/`UdpTrackerExecutor`. `multi_announce.zig` deleted.
+- **Magnet initial peer collection**: `collectMagnetPeers()` still calls blocking `announce.fetchAuto` from the background thread. Should be moved to use `TrackerExecutor` once the event loop is active for the session.
 - **Wave 5 BEP 52 creation**: `src/torrent/create.zig` still only emits v1 torrents. Pure-v2 / hybrid torrent creation remains the largest unfinished item from the review plan.
 
 ## Known Issues
@@ -232,6 +236,11 @@ Update it whenever a milestone lands, the near-term backlog changes, or a new op
 
 ## Last Verified Milestone
 
+- Async torrent startup: background thread does SQLite+parse only; event loop does io_uring piece verification + ring-based announce scheduling
+- Async BEP 9 metadata fetch on event loop (replaces blocking TCP sockets)
+- Blocking tracker code removed (multi_announce.zig deleted, blocking fetch/scrape functions removed)
+- Timerfd-based timer callbacks for announce jitter (replaces Thread.sleep)
+- Full codebase clarity pass: 82 fixes across 62 files (naming, abstractions, dead code, type safety)
 - HTTPS tracker support via vendored BoringSSL (BIO pair + io_uring transport)
 - DHT (BEP 5) Phases 1-3
 - BEP 52 (BitTorrent v2 / Hybrid) Phases 1-6 (including runtime Merkle tree cache)

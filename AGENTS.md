@@ -3,9 +3,9 @@
 ## Current Layout
 Keep implementation under `src/`. The current major subsystems are:
 - `src/daemon/` - session orchestration, torrent lifecycle, queueing, relocation
-- `src/io/` - io_uring event loop, peer handlers, protocol I/O, HTTP client, sockets
+- `src/io/` - io_uring event loop, peer handlers, protocol I/O, HTTP client, sockets, async recheck, async metadata fetch
 - `src/torrent/` - metainfo parsing, piece tracking, layouts, torrent state, creation
-- `src/storage/` - piece storage, verification, resume persistence, disk integrity
+- `src/storage/` - piece storage, verification, state persistence (state_db.zig), disk integrity
 - `src/net/` - peer helpers, web seeds, metadata fetch, PEX, uTP
 - `src/tracker/` - HTTP/UDP tracker announce and scrape behavior
 - `src/dht/` - DHT engine, lookups, KRPC, routing, persistence

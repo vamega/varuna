@@ -29,6 +29,11 @@ This document tracks which syscalls the `varuna` **daemon** uses, which are rout
 | fixed buffers | `IORING_OP_READ_FIXED` / `WRITE_FIXED` | `Ring.pread_fixed` / `Ring.pwrite_fixed` with registered buffer pool | Done |
 | `sendmsg()` | `IORING_OP_SENDMSG` | uTP handler, DHT handler, UDP tracker executor, API server | Done |
 | `recvmsg()` | `IORING_OP_RECVMSG` | uTP handler, DHT handler, UDP tracker executor | Done |
+| `read()` (timerfd) | `IORING_OP_READ` | Event loop timerfd for scheduled callbacks | Done |
+| `pread()` (recheck) | `IORING_OP_READ` | `AsyncRecheck` piece verification reads | Done |
+| `connect()` (metadata) | `IORING_OP_CONNECT` | `AsyncMetadataFetch` BEP 9 peer connections | Done |
+| `send()` (metadata) | `IORING_OP_SEND` | `AsyncMetadataFetch` handshake/request sends | Done |
+| `recv()` (metadata) | `IORING_OP_RECV` | `AsyncMetadataFetch` handshake/piece receives | Done |
 
 ### Remaining conventional I/O (not hot path)
 
@@ -41,13 +46,16 @@ This document tracks which syscalls the `varuna` **daemon** uses, which are rout
 | `openat+read+close` | `app.zig` -- reading `.torrent` file | Once at startup | Low value |
 | ~~`socket()`~~ | ~~`transport.tcpConnect`~~ | ~~Moved to io_uring~~ | Done via `Ring.socket` |
 | `socket+bind+listen` | `client.zig` seed mode -- listen socket | Once at startup | Low value |
-| HTTP stack | `std.http.Client` in `announce.zig` | Tracker announce | See notes below |
+| ~~HTTP stack~~ | ~~`std.http.Client` in `announce.zig`~~ | ~~Tracker announce~~ | **Resolved**: blocking tracker functions removed; all tracker I/O through ring-based executors |
 | `pwritev` | stdout logging via `std.Io.Writer` | Infrequent status messages | Low value -- not hot path |
 | `openat+read+close` | `app.zig` -- `.torrent` file read | Once at startup | Low value |
 | `openat+write+close` | `app.zig` -- `.torrent` file creation | Once per `varuna create` | Low value |
 | `uname` | `probe.zig` -- kernel detection | Once at startup | No equivalent |
 | HTTP stack (multiple) | `announce.zig` via `io/http.zig` | Initial + re-announce | **Resolved**: HTTP I/O goes through io_uring. DNS resolution runs on background threads with TTL-based caching (`io/dns.zig`). |
-| `std.Thread.sleep` | ~~`client.zig` progress loop~~ | ~~2s polling~~ | **Resolved**: replaced with condvar + timedWait |
+| ~~`std.Thread.sleep`~~ | ~~`client.zig` progress loop~~ | ~~2s polling~~ | **Resolved**: replaced with condvar + timedWait |
+| ~~`std.Thread.sleep`~~ | ~~`torrent_session.zig` announce jitter~~ | ~~Startup delay~~ | **Resolved**: replaced with timerfd on event loop |
+| ~~blocking pread~~ | ~~`recheckExistingData` in verify.zig~~ | ~~Piece verification~~ | **Resolved**: `AsyncRecheck` uses io_uring reads + hasher pool |
+| ~~blocking TCP~~ | ~~`metadata_fetch.zig` BEP 9~~ | ~~Magnet metadata~~ | **Resolved**: `AsyncMetadataFetch` state machine on event loop |
 
 ### Not yet implemented
 
