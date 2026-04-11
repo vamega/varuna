@@ -5,15 +5,17 @@ const UtpSocket = utp.UtpSocket;
 const State = utp.State;
 
 /// Maximum number of concurrent uTP connections.
-pub const max_connections: u16 = 4096;
+pub const max_connections: u16 = 512;
 
 /// UtpManager multiplexes many uTP connections over a single UDP socket.
 /// It routes incoming packets by connection_id to the correct UtpSocket,
 /// handles SYN packets for new inbound connections, and provides a
 /// connect/accept API.
 pub const UtpManager = struct {
-    /// Connection table indexed by slot.
-    connections: [max_connections]UtpSocket = [_]UtpSocket{.{}} ** max_connections,
+    /// Connection table indexed by slot. Sockets are heap-allocated on
+    /// demand so that zero-connection baseline is near zero (512 pointers
+    /// = 4 KiB instead of 24 MiB for 4096 inline UtpSocket structs).
+    connections: [max_connections]?*UtpSocket = [_]?*UtpSocket{null} ** max_connections,
 
     /// Whether each slot is in use.
     slot_active: [max_connections]bool = [_]bool{false} ** max_connections,
@@ -37,12 +39,23 @@ pub const UtpManager = struct {
         };
     }
 
+    /// Free all heap-allocated sockets. Call before destroying the manager.
+    pub fn deinit(self: *UtpManager) void {
+        for (0..max_connections) |i| {
+            if (self.connections[i]) |sock| {
+                sock.deinit();
+                self.allocator.destroy(sock);
+                self.connections[i] = null;
+            }
+        }
+        self.active_count = 0;
+    }
+
     /// Initiate an outbound uTP connection. Returns the slot index and
     /// the SYN packet to send.
     pub fn connect(self: *UtpManager, remote: std.net.Address, now_us: u32) !ConnectResult {
         const slot = self.allocSlot() orelse return error.TooManyConnections;
-        var sock = &self.connections[slot];
-        sock.* = .{};
+        const sock = self.connections[slot].?;
         sock.remote_addr = remote;
         sock.allocator = self.allocator;
 
@@ -82,7 +95,7 @@ pub const UtpManager = struct {
             return self.makeResetResponse(hdr, remote, now_us);
         };
 
-        var sock = &self.connections[slot];
+        const sock = self.connections[slot].?;
         const result = sock.processPacket(hdr, payload, now_us);
 
         // Check for connection close.
@@ -103,7 +116,7 @@ pub const UtpManager = struct {
     /// Close a connection gracefully by sending FIN.
     pub fn close(self: *UtpManager, slot: u16, now_us: u32) ?[Header.size]u8 {
         if (slot >= max_connections or !self.slot_active[slot]) return null;
-        var sock = &self.connections[slot];
+        const sock = self.connections[slot].?;
         const fin = sock.createFinPacket(now_us);
         return fin;
     }
@@ -111,7 +124,7 @@ pub const UtpManager = struct {
     /// Force-close a connection with RESET.
     pub fn reset(self: *UtpManager, slot: u16, now_us: u32) ?[Header.size]u8 {
         if (slot >= max_connections or !self.slot_active[slot]) return null;
-        var sock = &self.connections[slot];
+        const sock = self.connections[slot].?;
         const rst = sock.createResetPacket(now_us);
         self.freeSlot(slot);
         return rst;
@@ -121,19 +134,19 @@ pub const UtpManager = struct {
     /// null if the window is full.
     pub fn createDataPacket(self: *UtpManager, slot: u16, payload_len: u16, now_us: u32) ?[Header.size]u8 {
         if (slot >= max_connections or !self.slot_active[slot]) return null;
-        return self.connections[slot].createDataPacket(payload_len, now_us);
+        return self.connections[slot].?.createDataPacket(payload_len, now_us);
     }
 
     /// Get a reference to a socket by slot.
     pub fn getSocket(self: *UtpManager, slot: u16) ?*UtpSocket {
         if (slot >= max_connections or !self.slot_active[slot]) return null;
-        return &self.connections[slot];
+        return self.connections[slot];
     }
 
     /// Get the remote address for a connection.
     pub fn getRemoteAddress(self: *const UtpManager, slot: u16) ?std.net.Address {
         if (slot >= max_connections or !self.slot_active[slot]) return null;
-        return self.connections[slot].remote_addr;
+        return self.connections[slot].?.remote_addr;
     }
 
     /// Check all connections for timeouts. Returns a list of slots that
@@ -143,8 +156,9 @@ pub const UtpManager = struct {
         for (0..max_connections) |i| {
             if (!self.slot_active[i]) continue;
             const slot: u16 = @intCast(i);
-            if (self.connections[slot].isTimedOut(now_us)) {
-                self.connections[slot].handleTimeout();
+            const sock = self.connections[slot].?;
+            if (sock.isTimedOut(now_us)) {
+                sock.handleTimeout();
                 if (count < out_buf.len) {
                     out_buf[count] = slot;
                     count += 1;
@@ -161,7 +175,7 @@ pub const UtpManager = struct {
         for (0..max_connections) |i| {
             if (!self.slot_active[i]) continue;
             const slot: u16 = @intCast(i);
-            var sock = &self.connections[slot];
+            const sock = self.connections[slot].?;
 
             var entries: [8]utp.RetransmitEntry = undefined;
             const n = sock.collectRetransmits(&entries, now_us);
@@ -190,7 +204,7 @@ pub const UtpManager = struct {
         const existing = self.findByRecvIdRemote(hdr.connection_id +% 1, remote);
         if (existing) |slot| {
             // Resend SYN-ACK.
-            const response = self.connections[slot].makeAck(now_us);
+            const response = self.connections[slot].?.makeAck(now_us);
             return .{
                 .slot = slot,
                 .response = response,
@@ -202,8 +216,7 @@ pub const UtpManager = struct {
         }
 
         const slot = self.allocSlot() orelse return null;
-        var sock = &self.connections[slot];
-        sock.* = .{};
+        const sock = self.connections[slot].?;
         sock.remote_addr = remote;
         sock.allocator = self.allocator;
 
@@ -225,11 +238,9 @@ pub const UtpManager = struct {
     }
 
     fn findByRecvIdRemote(self: *const UtpManager, conn_id: u16, remote: std.net.Address) ?u16 {
-        // Use pointer to avoid Zig debug mode materializing the full
-        // UtpSocket (~6KB) as a stack temporary per iteration. Without
-        // this, the compiler allocates 6KB * 4096 = 23MB on the stack.
-        for (self.slot_active, self.connections[0..max_connections], 0..) |active, *conn, i| {
+        for (self.slot_active, self.connections, 0..) |active, maybe_conn, i| {
             if (!active) continue;
+            const conn = maybe_conn orelse continue;
             if (conn.recv_id != conn_id) continue;
             if (@import("address.zig").addressEql(&conn.remote_addr, &remote)) {
                 return @intCast(i);
@@ -264,6 +275,9 @@ pub const UtpManager = struct {
         if (self.active_count >= max_connections) return null;
         for (0..max_connections) |i| {
             if (!self.slot_active[i]) {
+                const sock = self.allocator.create(UtpSocket) catch return null;
+                sock.* = .{};
+                self.connections[i] = sock;
                 self.slot_active[i] = true;
                 self.active_count += 1;
                 return @intCast(i);
@@ -274,7 +288,11 @@ pub const UtpManager = struct {
 
     fn freeSlot(self: *UtpManager, slot: u16) void {
         if (slot >= max_connections or !self.slot_active[slot]) return;
-        self.connections[slot].deinit();
+        if (self.connections[slot]) |sock| {
+            sock.deinit();
+            self.allocator.destroy(sock);
+            self.connections[slot] = null;
+        }
         self.slot_active[slot] = false;
         self.active_count -= 1;
     }
@@ -308,6 +326,7 @@ pub const PacketResult = struct {
 
 test "manager connect allocates slot and produces SYN" {
     var mgr = UtpManager.init(std.testing.allocator);
+    defer mgr.deinit();
     const remote = std.net.Address.initIp4(.{ 127, 0, 0, 1 }, 6881);
 
     const result = try mgr.connect(remote, 1_000_000);
@@ -320,6 +339,7 @@ test "manager connect allocates slot and produces SYN" {
 
 test "manager processes SYN and queues for accept" {
     var mgr = UtpManager.init(std.testing.allocator);
+    defer mgr.deinit();
     const remote = std.net.Address.initIp4(.{ 10, 0, 0, 1 }, 6881);
 
     // Build a SYN packet.
@@ -352,6 +372,7 @@ test "manager processes SYN and queues for accept" {
 
 test "manager resets unknown connection_id" {
     var mgr = UtpManager.init(std.testing.allocator);
+    defer mgr.deinit();
     const remote = std.net.Address.initIp4(.{ 10, 0, 0, 1 }, 6881);
 
     // Send a DATA packet to an unknown connection.
@@ -376,7 +397,9 @@ test "manager resets unknown connection_id" {
 
 test "manager full handshake between two managers" {
     var client_mgr = UtpManager.init(std.testing.allocator);
+    defer client_mgr.deinit();
     var server_mgr = UtpManager.init(std.testing.allocator);
+    defer server_mgr.deinit();
     const client_addr = std.net.Address.initIp4(.{ 127, 0, 0, 1 }, 5000);
     const server_addr = std.net.Address.initIp4(.{ 127, 0, 0, 1 }, 6000);
 
@@ -400,11 +423,12 @@ test "manager full handshake between two managers" {
 
 test "manager close sends FIN" {
     var mgr = UtpManager.init(std.testing.allocator);
+    defer mgr.deinit();
     const remote = std.net.Address.initIp4(.{ 127, 0, 0, 1 }, 6881);
 
     const conn = try mgr.connect(remote, 1_000_000);
     // Manually transition to connected for testing.
-    mgr.connections[conn.slot].state = .connected;
+    mgr.connections[conn.slot].?.state = .connected;
 
     const fin = mgr.close(conn.slot, 2_000_000);
     try std.testing.expect(fin != null);
@@ -415,6 +439,7 @@ test "manager close sends FIN" {
 
 test "manager connection count tracks correctly" {
     var mgr = UtpManager.init(std.testing.allocator);
+    defer mgr.deinit();
     const remote = std.net.Address.initIp4(.{ 127, 0, 0, 1 }, 6881);
 
     try std.testing.expectEqual(@as(u16, 0), mgr.connectionCount());

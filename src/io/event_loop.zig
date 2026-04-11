@@ -483,7 +483,10 @@ pub const EventLoop = struct {
         for (self.announce_results.items) |result| self.allocator.free(result.peers);
         self.announce_results.deinit(self.allocator);
         // Clean up uTP resources
-        if (self.utp_manager) |mgr| self.allocator.destroy(mgr);
+        if (self.utp_manager) |mgr| {
+            mgr.deinit();
+            self.allocator.destroy(mgr);
+        }
         self.utp_send_queue.deinit(self.allocator);
         self.timer_callbacks.deinit(self.allocator);
 
