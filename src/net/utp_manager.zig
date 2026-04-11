@@ -460,6 +460,7 @@ test "manager connection count tracks correctly" {
 
 test "manager connect sets allocator on socket" {
     var mgr = UtpManager.init(std.testing.allocator);
+    defer mgr.deinit();
     const remote = std.net.Address.initIp4(.{ 127, 0, 0, 1 }, 6881);
 
     const conn = try mgr.connect(remote, 1_000_000);
@@ -472,7 +473,9 @@ test "manager connect sets allocator on socket" {
 
 test "manager handshake with retransmission and data exchange" {
     var client_mgr = UtpManager.init(std.testing.allocator);
+    defer client_mgr.deinit();
     var server_mgr = UtpManager.init(std.testing.allocator);
+    defer server_mgr.deinit();
     const client_addr = std.net.Address.initIp4(.{ 127, 0, 0, 1 }, 5000);
     const server_addr = std.net.Address.initIp4(.{ 127, 0, 0, 1 }, 6000);
 
@@ -511,6 +514,7 @@ test "manager handshake with retransmission and data exchange" {
 
 test "manager collectRetransmits returns timed-out packets" {
     var mgr = UtpManager.init(std.testing.allocator);
+    defer mgr.deinit();
     const remote = std.net.Address.initIp4(.{ 127, 0, 0, 1 }, 6881);
 
     const conn = try mgr.connect(remote, 1_000_000);
@@ -544,6 +548,7 @@ test "manager collectRetransmits returns timed-out packets" {
 
 test "manager freeSlot cleans up outbound buffers" {
     var mgr = UtpManager.init(std.testing.allocator);
+    defer mgr.deinit();
     const remote = std.net.Address.initIp4(.{ 127, 0, 0, 1 }, 6881);
 
     const conn = try mgr.connect(remote, 1_000_000);
