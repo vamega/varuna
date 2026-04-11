@@ -225,10 +225,13 @@ pub const UtpManager = struct {
     }
 
     fn findByRecvIdRemote(self: *const UtpManager, conn_id: u16, remote: std.net.Address) ?u16 {
-        for (0..max_connections) |i| {
-            if (!self.slot_active[i]) continue;
-            if (self.connections[i].recv_id != conn_id) continue;
-            if (@import("address.zig").addressEql(&self.connections[i].remote_addr, &remote)) {
+        // Use pointer to avoid Zig debug mode materializing the full
+        // UtpSocket (~6KB) as a stack temporary per iteration. Without
+        // this, the compiler allocates 6KB * 4096 = 23MB on the stack.
+        for (self.slot_active, self.connections[0..max_connections], 0..) |active, *conn, i| {
+            if (!active) continue;
+            if (conn.recv_id != conn_id) continue;
+            if (@import("address.zig").addressEql(&conn.remote_addr, &remote)) {
                 return @intCast(i);
             }
         }
