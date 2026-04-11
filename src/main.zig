@@ -189,8 +189,8 @@ pub fn main() !void {
     // Submit timeout for shared event loop
     shared_el.submitTimeout(100 * std.time.ns_per_ms) catch {};
 
-    // Listen socket for accepting inbound peer connections (created once, shared across torrents)
-    // If systemd provided multiple fds, try to use a second one as the peer listen socket.
+    // Listen socket for accepting inbound peer connections (created once, shared across torrents).
+    // Created at startup so both downloading and seeding torrents can receive inbound connections.
     var listen_fd: std.posix.fd_t = -1;
     var peer_socket_activated = false;
     if (systemd_fds) |fds| {
@@ -202,6 +202,13 @@ pub fn main() !void {
                 break;
             }
         }
+    }
+    if (listen_fd < 0) {
+        if (createListenSocket(cfg.network)) |result| {
+            listen_fd = result.fd;
+            session_manager.port = result.port;
+            shared_el.ensureAccepting(listen_fd) catch {};
+        } else |_| {}
     }
     defer if (listen_fd >= 0 and !peer_socket_activated) std.posix.close(listen_fd);
 
