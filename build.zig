@@ -265,6 +265,19 @@ pub fn build(b: *std.Build) void {
     const test_el_health_step = b.step("test-event-loop", "Run event loop health tests (fd leaks, thread counts)");
     test_el_health_step.dependOn(&run_el_health.step);
 
+    // ── Transfer integration test (single-process piece transfer) ──
+    const transfer_tests = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("tests/transfer_integration_test.zig"),
+            .target = target,
+            .optimize = optimize,
+            .imports = &varuna_import,
+        }),
+    });
+    const run_transfer_tests = b.addRunArtifact(transfer_tests);
+    const test_transfer_step = b.step("test-transfer", "Run single-process piece transfer integration test");
+    test_transfer_step.dependOn(&run_transfer_tests.step);
+
     // ── Soak test (long-running resource leak detection) ──
     const soak_exe = b.addExecutable(.{
         .name = "varuna-soak-test",
