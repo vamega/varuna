@@ -226,6 +226,32 @@ pub fn build(b: *std.Build) void {
     const test_torrent_session_step = b.step("test-torrent-session", "Run the focused TorrentSession test binary");
     test_torrent_session_step.dependOn(&run_torrent_session_tests.step);
 
+    // ── SO_BINDTODEVICE tests ────────────────────────────────
+    const bind_device_tests = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("tests/bind_device_test.zig"),
+            .target = target,
+            .optimize = optimize,
+            .imports = &varuna_import,
+        }),
+    });
+    const run_bind_device_tests = b.addRunArtifact(bind_device_tests);
+    const test_bind_device_step = b.step("test-bind-device", "Run SO_BINDTODEVICE socket option tests");
+    test_bind_device_step.dependOn(&run_bind_device_tests.step);
+
+    // ── Safety tests (compile-time + runtime regression guards) ─
+    const safety_tests = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("tests/safety_test.zig"),
+            .target = target,
+            .optimize = optimize,
+            .imports = &varuna_import,
+        }),
+    });
+    const run_safety_tests = b.addRunArtifact(safety_tests);
+    const test_safety_step = b.step("test-safety", "Run compile-time and runtime safety regression tests");
+    test_safety_step.dependOn(&run_safety_tests.step);
+
     // ── Soak test (long-running resource leak detection) ──
     const soak_exe = b.addExecutable(.{
         .name = "varuna-soak-test",
@@ -238,6 +264,14 @@ pub fn build(b: *std.Build) void {
     });
     const soak_step = b.step("soak-test", "Run long-running soak test for resource leak detection");
     soak_step.dependOn(&b.addRunArtifact(soak_exe).step);
+
+    // ── Swarm integration test ─────────────────────────────
+    // Runs the demo_swarm.sh script which starts a tracker, seeder, and
+    // downloader, transfers a file, and verifies data integrity.
+    const swarm_step = b.step("test-swarm", "Run end-to-end swarm transfer test (requires opentracker)");
+    const swarm_cmd = b.addSystemCommand(&.{"./scripts/demo_swarm.sh"});
+    swarm_cmd.step.dependOn(b.getInstallStep());
+    swarm_step.dependOn(&swarm_cmd.step);
 
     // ── Benchmarks ────────────────────────────────────────
     const bench_exe = b.addExecutable(.{
