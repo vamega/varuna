@@ -1,0 +1,15 @@
+FROM ubuntu:24.04
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        libsqlite3-dev \
+        curl \
+    && rm -rf /var/lib/apt/lists/*
+
+COPY zig-out/bin/varuna      /usr/local/bin/varuna
+COPY zig-out/bin/varuna-tools /usr/local/bin/varuna-tools
+COPY zig-out/bin/varuna-ctl   /usr/local/bin/varuna-ctl
+
+# Default data and config directories
+RUN mkdir -p /data /config
+WORKDIR /config
+
+ENTRYPOINT ["varuna"]

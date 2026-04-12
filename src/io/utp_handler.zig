@@ -474,7 +474,7 @@ fn processUtpInboundHandshake(self: *EventLoop, peer_slot: u16) void {
 
 /// Send data over a uTP connection (wraps it in uTP DATA packets).
 /// Stores the packet in the outbound buffer for retransmission.
-fn utpSendData(self: *EventLoop, peer_slot: u16, data: []const u8) !void {
+pub fn utpSendData(self: *EventLoop, peer_slot: u16, data: []const u8) !void {
     const peer = &self.peers[peer_slot];
     const utp_slot = peer.utp_slot orelse return error.NotUtpPeer;
     const mgr = self.utp_manager orelse return error.NoUtpManager;
@@ -599,7 +599,7 @@ fn sendUtpInboundBitfieldOrUnchoke(self: *EventLoop, peer_slot: u16) void {
 }
 
 /// Send a framed peer wire message over uTP.
-fn utpSendMessage(self: *EventLoop, peer_slot: u16, id: u8, payload: []const u8) !void {
+pub fn utpSendMessage(self: *EventLoop, peer_slot: u16, id: u8, payload: []const u8) !void {
     const msg_len = @as(u32, @intCast(1 + payload.len));
     var header: [5]u8 = undefined;
     std.mem.writeInt(u32, header[0..4], msg_len, .big);

@@ -18,6 +18,7 @@ const TorrentId = @import("event_loop.zig").TorrentId;
 const address = @import("../net/address.zig");
 const policy = @import("peer_policy.zig");
 const seed_handler = @import("seed_handler.zig");
+const utp_handler = @import("utp_handler.zig");
 
 // ── Peer wire protocol message processing ─────────────────
 

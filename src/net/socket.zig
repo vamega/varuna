@@ -43,6 +43,28 @@ pub fn applyBindConfig(fd: posix.fd_t, bind_device: ?[]const u8, bind_address: ?
     }
 }
 
+/// Create a TCP socket with bind_device and bind_address applied.
+/// All daemon socket creation should go through this function (or
+/// createUdpSocket) to ensure SO_BINDTODEVICE is consistently enforced.
+/// The io_uring IORING_OP_SOCKET path creates the fd in the kernel;
+/// call applyBindConfig on the resulting fd after the CQE arrives.
+pub fn createTcpSocket(family: u32, bind_device: ?[]const u8, bind_address: ?[]const u8) !posix.fd_t {
+    const fd = try posix.socket(family, posix.SOCK.STREAM | posix.SOCK.CLOEXEC | posix.SOCK.NONBLOCK, posix.IPPROTO.TCP);
+    errdefer posix.close(fd);
+    try applyBindConfig(fd, bind_device, bind_address, 0);
+    return fd;
+}
+
+/// Create a UDP socket with bind_device applied.
+pub fn createUdpSocket(family: u32, bind_device: ?[]const u8) !posix.fd_t {
+    const fd = try posix.socket(family, posix.SOCK.DGRAM | posix.SOCK.CLOEXEC | posix.SOCK.NONBLOCK, posix.IPPROTO.UDP);
+    errdefer posix.close(fd);
+    if (bind_device) |device| {
+        try applyBindDevice(fd, device);
+    }
+    return fd;
+}
+
 /// Configure a peer socket for BitTorrent wire protocol transfers.
 /// Disables Nagle's algorithm (TCP_NODELAY) and increases socket
 /// buffer sizes to match libtorrent/qBittorrent defaults:
