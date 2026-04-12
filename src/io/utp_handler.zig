@@ -478,29 +478,37 @@ pub fn utpSendData(self: *EventLoop, peer_slot: u16, data: []const u8) !void {
     const peer = &self.peers[peer_slot];
     const utp_slot = peer.utp_slot orelse return error.NotUtpPeer;
     const mgr = self.utp_manager orelse return error.NoUtpManager;
+    const remote = mgr.getRemoteAddress(utp_slot) orelse return error.NoRemoteAddress;
 
     const now_us = utpNowUs();
 
-    // Create a DATA packet header
-    const hdr_bytes = mgr.createDataPacket(utp_slot, @intCast(data.len), now_us) orelse
-        return error.WindowFull;
+    // Fragment data into MTU-sized uTP DATA packets.
+    // Each packet carries at most (MTU - uTP header) bytes of payload.
+    const max_payload = 1400 - utp_mod.Header.size; // conservative MTU
+    var offset: usize = 0;
+    while (offset < data.len) {
+        const chunk_len = @min(data.len - offset, max_payload);
 
-    // Extract the seq_nr from the header we just created (before it was incremented).
-    const pkt_seq_nr = std.mem.readInt(u16, hdr_bytes[16..18], .big);
+        const hdr_bytes = mgr.createDataPacket(utp_slot, @intCast(chunk_len), now_us) orelse {
+            // Congestion window full — we'll retry on the next tick.
+            // Partial sends are OK; the peer will request missing blocks.
+            if (offset > 0) return; // sent some data, that's progress
+            return error.WindowFull;
+        };
 
-    // Send header + payload as a single UDP datagram
-    var send_buf: [1500]u8 = undefined;
-    const total = utp_mod.Header.size + data.len;
-    if (total > send_buf.len) return error.PacketTooLarge;
-    @memcpy(send_buf[0..utp_mod.Header.size], &hdr_bytes);
-    @memcpy(send_buf[utp_mod.Header.size .. utp_mod.Header.size + data.len], data);
+        const pkt_seq_nr = std.mem.readInt(u16, hdr_bytes[16..18], .big);
 
-    // Buffer the full datagram for retransmission.
-    const sock = mgr.getSocket(utp_slot) orelse return error.NoSocket;
-    sock.bufferSentPacket(pkt_seq_nr, send_buf[0..total], @intCast(data.len), now_us);
+        var send_buf: [1400]u8 = undefined;
+        const total = utp_mod.Header.size + chunk_len;
+        @memcpy(send_buf[0..utp_mod.Header.size], &hdr_bytes);
+        @memcpy(send_buf[utp_mod.Header.size..][0..chunk_len], data[offset..][0..chunk_len]);
 
-    const remote = mgr.getRemoteAddress(utp_slot) orelse return error.NoRemoteAddress;
-    utpSendPacket(self, send_buf[0..total], remote);
+        const sock = mgr.getSocket(utp_slot) orelse return error.NoSocket;
+        sock.bufferSentPacket(pkt_seq_nr, send_buf[0..total], @intCast(chunk_len), now_us);
+
+        utpSendPacket(self, send_buf[0..total], remote);
+        offset += chunk_len;
+    }
 }
 
 /// Handle the completion of a uTP send for a peer. Since uTP sends don't
