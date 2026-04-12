@@ -271,6 +271,15 @@ main() {
     done
 
     case "$mode" in
+        quick)
+            # Quick smoke test: download the smallest torrent (LibreELEC, 275MB)
+            local quick_torrent="$PROJECT_DIR/testdata/torrents/LibreELEC-Generic.x86_64-12.2.1.img.gz.torrent"
+            if [ ! -f "$quick_torrent" ]; then
+                log "quick torrent not found: $quick_torrent"
+                exit 1
+            fi
+            test_single_download "$quick_torrent"
+            ;;
         single)
             if [ -z "${2:-}" ]; then
                 echo "usage: $0 single <torrent-file>"
@@ -285,30 +294,41 @@ main() {
         all)
             log "=== Running full E2E test suite ==="
 
-            # Check for test torrent files
+            # Torrent files committed in testdata/torrents/ (by size):
+            #   LibreELEC  275 MB  UDP tracker (fosstorrents), multiple trackers
+            #   Kali       695 MB  HTTP tracker (kali.org)
+            #   Debian     753 MB  HTTP tracker (debian.org)
+            #   Ubuntu     5.3 GB  HTTPS tracker (ubuntu.com), returns few peers
+            local torrent_dir="$PROJECT_DIR/testdata/torrents"
             local torrents=()
-            for f in /tmp/debian.torrent /tmp/linuxmint.torrent /tmp/zorin.torrent /tmp/ubuntu-25.10-desktop-amd64.iso.torrent; do
+
+            # Prefer smaller torrents first for faster feedback
+            for f in \
+                "$torrent_dir/LibreELEC-Generic.x86_64-12.2.1.img.gz.torrent" \
+                "$torrent_dir/kali-linux-installer.torrent" \
+                "$torrent_dir/debian-13.4.0-amd64-netinst.iso.torrent" \
+                "$torrent_dir/ubuntu-25.10-desktop-amd64.iso.torrent"; do
                 if [ -f "$f" ]; then
                     torrents+=("$f")
                 fi
             done
 
             if [ ${#torrents[@]} -eq 0 ]; then
-                log "no torrent files found in /tmp/. Download some first:"
-                log "  curl -o /tmp/debian.torrent https://cdimage.debian.org/debian-cd/current/amd64/bt-cd/debian-13.4.0-amd64-netinst.iso.torrent"
+                log "no torrent files found in testdata/torrents/"
+                log "expected: LibreELEC, kali, debian, ubuntu torrents"
                 exit 1
             fi
 
-            # Test 1: Single torrent (pick the smallest)
-            if [ -f /tmp/debian.torrent ]; then
-                test_single_download /tmp/debian.torrent
-                cleanup
-                DAEMON_PID=""
-                WORK_DIR=""
-                sleep 2
-            fi
+            log "found ${#torrents[@]} torrent files"
 
-            # Test 2: Multi-torrent simultaneous
+            # Test 1: Single torrent (smallest — LibreELEC at 275MB)
+            test_single_download "${torrents[0]}"
+            cleanup
+            DAEMON_PID=""
+            WORK_DIR=""
+            sleep 1
+
+            # Test 2: Multi-torrent simultaneous (all available)
             if [ ${#torrents[@]} -ge 2 ]; then
                 test_multi_download "${torrents[@]}"
             else
