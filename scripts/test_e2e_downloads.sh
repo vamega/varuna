@@ -302,12 +302,14 @@ main() {
             local torrent_dir="$PROJECT_DIR/testdata/torrents"
             local torrents=()
 
-            # Prefer smaller torrents first for faster feedback
+            # Prefer smaller torrents first for faster feedback.
+            # Ubuntu excluded from default 'all' — its HTTPS tracker returns
+            # very few peers and 5.3 GB at <1 MB/s exceeds the 15-min timeout.
+            # Use 'full' mode to include Ubuntu.
             for f in \
                 "$torrent_dir/LibreELEC-Generic.x86_64-12.2.1.img.gz.torrent" \
                 "$torrent_dir/kali-linux-installer.torrent" \
-                "$torrent_dir/debian-13.4.0-amd64-netinst.iso.torrent" \
-                "$torrent_dir/ubuntu-25.10-desktop-amd64.iso.torrent"; do
+                "$torrent_dir/debian-13.4.0-amd64-netinst.iso.torrent"; do
                 if [ -f "$f" ]; then
                     torrents+=("$f")
                 fi
@@ -337,8 +339,29 @@ main() {
 
             log "=== E2E test suite complete ==="
             ;;
+        full)
+            # Like 'all' but includes Ubuntu (5.3 GB, slow tracker).
+            # Expect this to take 1-2 hours depending on swarm availability.
+            log "=== Running FULL E2E test suite (including Ubuntu 5.3 GB) ==="
+            local torrent_dir="$PROJECT_DIR/testdata/torrents"
+            local all_torrents=()
+            for f in \
+                "$torrent_dir/LibreELEC-Generic.x86_64-12.2.1.img.gz.torrent" \
+                "$torrent_dir/kali-linux-installer.torrent" \
+                "$torrent_dir/debian-13.4.0-amd64-netinst.iso.torrent" \
+                "$torrent_dir/ubuntu-25.10-desktop-amd64.iso.torrent"; do
+                if [ -f "$f" ]; then
+                    all_torrents+=("$f")
+                fi
+            done
+            if [ ${#all_torrents[@]} -eq 0 ]; then
+                log "no torrent files found"; exit 1
+            fi
+            test_multi_download "${all_torrents[@]}"
+            log "=== FULL E2E test suite complete ==="
+            ;;
         *)
-            echo "usage: $0 [all|single <torrent>|multi <torrent1> <torrent2> ...]"
+            echo "usage: $0 [quick|all|full|single <torrent>|multi <torrent1> <torrent2> ...]"
             exit 1
             ;;
     esac
