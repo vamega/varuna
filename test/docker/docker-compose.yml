@@ -36,14 +36,15 @@ services:
       - -c
       - |
         set -e
+        mkdir -p /shared/seed-data /shared/torrents /shared/varuna-seed-data
         # Create a 1 MiB random test payload
         dd if=/dev/urandom of=/shared/seed-data/testfile.bin bs=1024 count=1024 2>/dev/null
         # Create the torrent file using varuna-tools
+        # Usage: varuna-tools create <file> <announce-url> [output-path]
         varuna-tools create \
-          --piece-length 65536 \
-          --tracker "http://172.28.0.10:6969/announce" \
-          --output /shared/torrents/testfile.torrent \
-          /shared/seed-data/testfile.bin
+          /shared/seed-data/testfile.bin \
+          "http://172.28.0.10:6969/announce" \
+          /shared/torrents/testfile.torrent
         # Copy test data for varuna-seed
         cp /shared/seed-data/testfile.bin /shared/varuna-seed-data/testfile.bin
         echo "SETUP COMPLETE"
@@ -159,8 +160,7 @@ services:
       - -c
       - |
         set -e
-        # Write daemon config
-        cat > /config/varuna.toml <<'TOML'
+        cat > /config/varuna.toml <<'EOF'
         [daemon]
         api_port = 8082
         api_bind = "0.0.0.0"
@@ -178,7 +178,7 @@ services:
         pex = false
         encryption = "disabled"
         enable_utp = false
-        TOML
+        EOF
         exec varuna
     ports:
       - "8082:8082"

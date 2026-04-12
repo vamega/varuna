@@ -320,21 +320,28 @@ pub fn handleUtMetadata(self: *EventLoop, slot: u16, ext_payload: []const u8) vo
 
             // Allocate the frame for tracked send (io_uring is async, buffer must persist)
             const frame = ext.serializeExtensionMessage(self.allocator, peer_ut_id, combined) catch return;
-            // MSE/PE: encrypt in-place before sending
-            peer.crypto.encryptBuf(frame);
 
-            const ts = self.nextTrackedSendUserData(slot);
-            const tracked = self.trackPendingSendOwned(slot, ts.send_id, frame) catch {
-                self.allocator.free(frame);
-                return;
-            };
+            // uTP peers: route through the uTP byte stream.
+            if (peer.transport == .utp) {
+                defer self.allocator.free(frame);
+                utp_handler.utpSendData(self, slot, frame) catch return;
+            } else {
+                // MSE/PE: encrypt in-place before sending
+                peer.crypto.encryptBuf(frame);
 
-            _ = self.ring.send(ts.ud, peer.fd, tracked, 0) catch {
-                // Send failed; the buffer will be freed when pending_sends is cleaned up
-                self.freeOnePendingSend(slot, ts.send_id);
-                return;
-            };
-            peer.send_pending = true;
+                const ts = self.nextTrackedSendUserData(slot);
+                const tracked = self.trackPendingSendOwned(slot, ts.send_id, frame) catch {
+                    self.allocator.free(frame);
+                    return;
+                };
+
+                _ = self.ring.send(ts.ud, peer.fd, tracked, 0) catch {
+                    // Send failed; the buffer will be freed when pending_sends is cleaned up
+                    self.freeOnePendingSend(slot, ts.send_id);
+                    return;
+                };
+                peer.send_pending = true;
+            }
         },
         .data, .reject => {
             // These are only relevant during metadata fetch (background thread).
@@ -356,20 +363,27 @@ fn sendUtMetadataReject(self: *EventLoop, slot: u16, peer: *Peer, piece: u32) vo
 
     // Allocate frame for tracked send
     const frame = ext.serializeExtensionMessage(self.allocator, peer_ut_id, reject_payload) catch return;
-    // MSE/PE: encrypt in-place before sending
-    peer.crypto.encryptBuf(frame);
 
-    const ts = self.nextTrackedSendUserData(slot);
-    const tracked = self.trackPendingSendOwned(slot, ts.send_id, frame) catch {
-        self.allocator.free(frame);
-        return;
-    };
+    // uTP peers: route through the uTP byte stream.
+    if (peer.transport == .utp) {
+        defer self.allocator.free(frame);
+        utp_handler.utpSendData(self, slot, frame) catch return;
+    } else {
+        // MSE/PE: encrypt in-place before sending
+        peer.crypto.encryptBuf(frame);
 
-    _ = self.ring.send(ts.ud, peer.fd, tracked, 0) catch {
-        self.freeOnePendingSend(slot, ts.send_id);
-        return;
-    };
-    peer.send_pending = true;
+        const ts = self.nextTrackedSendUserData(slot);
+        const tracked = self.trackPendingSendOwned(slot, ts.send_id, frame) catch {
+            self.allocator.free(frame);
+            return;
+        };
+
+        _ = self.ring.send(ts.ud, peer.fd, tracked, 0) catch {
+            self.freeOnePendingSend(slot, ts.send_id);
+            return;
+        };
+        peer.send_pending = true;
+    }
 }
 
 // ── SQE helpers ───────────────────────────────────────
@@ -457,6 +471,14 @@ pub fn submitExtensionHandshake(self: *EventLoop, slot: u16) !void {
     // Build the full framed message: 4-byte len | msg_id=20 | sub_id=0 | payload
     const frame = try ext.serializeExtensionMessage(self.allocator, ext.handshake_sub_id, ext_payload);
     errdefer self.allocator.free(frame);
+
+    // uTP peers: route through the uTP byte stream.
+    if (peer.transport == .utp) {
+        defer self.allocator.free(frame);
+        try utp_handler.utpSendData(self, slot, frame);
+        return;
+    }
+
     // MSE/PE: encrypt in-place before sending
     peer.crypto.encryptBuf(frame);
 
@@ -548,6 +570,16 @@ pub fn submitPexMessage(self: *EventLoop, slot: u16) !void {
     // Frame as BEP 10 extension message and send
     const frame = try ext.serializeExtensionMessage(self.allocator, peer_pex_id, payload);
     errdefer self.allocator.free(frame);
+
+    // uTP peers: route through the uTP byte stream.
+    if (peer.transport == .utp) {
+        defer self.allocator.free(frame);
+        try utp_handler.utpSendData(self, slot, frame);
+        peer_pex.last_pex_time = std.time.timestamp();
+        log.debug("slot {d}: sent PEX message", .{slot});
+        return;
+    }
+
     // MSE/PE: encrypt in-place before sending
     peer.crypto.encryptBuf(frame);
 

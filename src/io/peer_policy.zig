@@ -595,15 +595,20 @@ pub fn sendKeepAlives(self: *EventLoop) void {
 
         if (now - peer.last_activity > keepalive_interval_secs) {
             // BEP 3 keep-alive: 4 zero bytes (length-prefix only, no message ID)
-            var keepalive = [_]u8{ 0, 0, 0, 0 };
-            peer.crypto.encryptBuf(&keepalive);
-            const ts = self.nextTrackedSendUserData(slot);
-            const tracked = self.trackPendingSendCopy(slot, ts.send_id, &keepalive) catch continue;
-            _ = self.ring.send(ts.ud, peer.fd, tracked, 0) catch {
-                self.freeOnePendingSend(slot, ts.send_id);
-                continue;
-            };
-            peer.send_pending = true;
+            if (peer.transport == .utp) {
+                var keepalive = [_]u8{ 0, 0, 0, 0 };
+                utp_handler.utpSendData(self, slot, &keepalive) catch continue;
+            } else {
+                var keepalive = [_]u8{ 0, 0, 0, 0 };
+                peer.crypto.encryptBuf(&keepalive);
+                const ts = self.nextTrackedSendUserData(slot);
+                const tracked = self.trackPendingSendCopy(slot, ts.send_id, &keepalive) catch continue;
+                _ = self.ring.send(ts.ud, peer.fd, tracked, 0) catch {
+                    self.freeOnePendingSend(slot, ts.send_id);
+                    continue;
+                };
+                peer.send_pending = true;
+            }
             peer.last_activity = now;
         }
     }
