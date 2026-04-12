@@ -225,6 +225,8 @@ Update it whenever a milestone lands, the near-term backlog changes, or a new op
 - **uTP multishot receive**: `recvmsg_multishot` plus a provided-buffer strategy still needs a workload and a measured implementation before it should land.
 - ~~**Tracker work on the shared peer ring**~~: (DONE) blocking tracker HTTP/UDP functions removed; all daemon tracker I/O goes through the ring-based `TrackerExecutor`/`UdpTrackerExecutor`. `multi_announce.zig` deleted.
 - **Magnet initial peer collection**: `collectMagnetPeers()` still calls blocking `announce.fetchAuto` from the background thread. Should be moved to use `TrackerExecutor` once the event loop is active for the session.
+- **uTP BT send bridge**: piece data sends to uTP peers fail because the ring send path requires a real TCP fd. The uTP data delivery bridge works for receiving (inbound data from uTP -> peer handler) but the reverse path (outbound piece data from seed handler -> uTP socket) needs explicit wiring through the uTP manager's UDP sendmsg path instead of the TCP ring send path.
+- **MSE simultaneous handshake robustness**: timing-dependent crash in `checkPeerTimeouts -> removePeer -> cleanupPeer` when both inbound and outbound MSE handshakes are in flight. Disappears under GDB. Needs generation counters or explicit handshake-in-progress guards.
 - **Wave 5 BEP 52 creation**: `src/torrent/create.zig` still only emits v1 torrents. Pure-v2 / hybrid torrent creation remains the largest unfinished item from the review plan.
 
 ## Known Issues
