@@ -466,7 +466,7 @@ pub const TorrentSession = struct {
             } else if (self.state == .checking and self.session != null and self.shared_fds != null) {
                 // If there's no resume data, skip the expensive piece-by-piece
                 // recheck — all pieces are known incomplete (fresh download).
-                if (self.resume_pieces == null and self.resume_writer == null) {
+                if (self.resume_pieces == null) {
                     action = .skip_recheck;
                 } else {
                     action = .recheck;
