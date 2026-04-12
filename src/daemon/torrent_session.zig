@@ -445,7 +445,7 @@ pub const TorrentSession = struct {
     pub fn integrateIntoEventLoop(self: *TorrentSession) bool {
         // Snapshot state under lock, then release before starting async
         // operations whose completion callbacks will re-acquire the mutex.
-        const Action = enum { none, metadata_fetch, recheck };
+        const Action = enum { none, metadata_fetch, recheck, skip_recheck };
         var action: Action = .none;
         var sel_ptr: ?*EventLoop = null;
         var peers_snapshot: ?[]const std.net.Address = null;
@@ -464,8 +464,14 @@ pub const TorrentSession = struct {
                 peers_snapshot = self.pending_peers orelse &[_]std.net.Address{};
                 self.background_init_done.store(false, .release);
             } else if (self.state == .checking and self.session != null and self.shared_fds != null) {
-                action = .recheck;
-                known_ptr = if (self.resume_pieces) |*rp| rp else null;
+                // If there's no resume data, skip the expensive piece-by-piece
+                // recheck — all pieces are known incomplete (fresh download).
+                if (self.resume_pieces == null and self.resume_writer == null) {
+                    action = .skip_recheck;
+                } else {
+                    action = .recheck;
+                    known_ptr = if (self.resume_pieces) |*rp| rp else null;
+                }
                 self.background_init_done.store(false, .release);
             }
         }
@@ -515,6 +521,33 @@ pub const TorrentSession = struct {
                     self.error_message = std.fmt.allocPrint(self.allocator, "failed to start async recheck", .{}) catch null;
                     return false;
                 };
+                return true;
+            },
+            .skip_recheck => {
+                // Fresh download with no resume data — skip piece-by-piece
+                // recheck and create an empty PieceTracker immediately.
+                self.mutex.lock();
+                defer self.mutex.unlock();
+
+                const session = &(self.session orelse return false);
+                var empty_bf = Bitfield.init(self.allocator, session.pieceCount()) catch return false;
+                const pt = PieceTracker.init(
+                    self.allocator,
+                    session.pieceCount(),
+                    session.layout.piece_length,
+                    session.totalSize(),
+                    &empty_bf,
+                    0,
+                ) catch {
+                    empty_bf.deinit(self.allocator);
+                    return false;
+                };
+                empty_bf.deinit(self.allocator);
+                self.piece_tracker = pt;
+                self.state = .downloading;
+                if (self.pending_peers == null) {
+                    self.pending_peers = self.allocator.alloc(std.net.Address, 0) catch null;
+                }
                 return true;
             },
             .none => return false,
