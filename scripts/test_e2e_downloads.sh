@@ -237,7 +237,7 @@ test_multi_download() {
     done
     log "added ${#torrents[@]} torrents"
 
-    local timeout=900  # 15 minutes
+    local timeout=1800  # 30 minutes (Debian swarm can be slow)
     local start=$(date +%s)
     log "waiting up to ${timeout}s for all downloads..."
 
