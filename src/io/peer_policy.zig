@@ -15,6 +15,7 @@ const protocol = @import("protocol.zig");
 const MerkleCache = @import("../torrent/merkle_cache.zig").MerkleCache;
 const Hasher = @import("hasher.zig").Hasher;
 const LayoutSpan = @import("../torrent/layout.zig").Layout.Span;
+const utp_handler = @import("utp_handler.zig");
 
 const pipeline_depth: u32 = 64;
 const peer_timeout_secs: i64 = 60;
@@ -203,6 +204,15 @@ fn submitPipelineRequests(
     const peer = &self.peers[slot];
     const total = p1 + p2;
     if (total == 0) return;
+
+    // uTP peers: route through the uTP byte stream instead of io_uring send.
+    if (peer.transport == .utp) {
+        utp_handler.utpSendData(self, slot, buf) catch return;
+        peer.pipeline_sent += p1;
+        peer.next_pipeline_sent += p2;
+        peer.inflight_requests += total;
+        return;
+    }
 
     // MSE/PE: encrypt in-place before copying into tracked buffer
     peer.crypto.encryptBuf(buf);

@@ -1,0 +1,239 @@
+# Cross-client conformance test infrastructure.
+#
+# Topology:
+#   tracker (opentracker)        -- announce/scrape on port 6969
+#   qbittorrent-seed             -- seeds a test file via qBittorrent
+#   varuna-download              -- downloads from qBittorrent using varuna
+#   varuna-seed                  -- seeds a test file using varuna
+#   qbittorrent-download         -- downloads from varuna using qBittorrent
+#
+# Shared volumes carry the test torrent and payload between containers.
+# The setup container creates the torrent file and test payload before
+# clients start.
+
+services:
+  # ── OpenTracker ────────────────────────────────────────────
+  tracker:
+    image: lednerb/opentracker-docker:latest
+    ports:
+      - "6969:6969"
+    networks:
+      bt-net:
+        ipv4_address: 172.28.0.10
+    healthcheck:
+      test: ["CMD-SHELL", "echo -n | nc -w1 127.0.0.1 6969 || exit 0"]
+      interval: 2s
+      timeout: 3s
+      retries: 10
+
+  # ── Setup: create test payload and torrent file ────────────
+  setup:
+    build:
+      context: ../..
+      dockerfile: test/docker/Dockerfile.varuna
+    entrypoint: /bin/bash
+    command:
+      - -c
+      - |
+        set -e
+        # Create a 1 MiB random test payload
+        dd if=/dev/urandom of=/shared/seed-data/testfile.bin bs=1024 count=1024 2>/dev/null
+        # Create the torrent file using varuna-tools
+        varuna-tools create \
+          --piece-length 65536 \
+          --tracker "http://172.28.0.10:6969/announce" \
+          --output /shared/torrents/testfile.torrent \
+          /shared/seed-data/testfile.bin
+        # Copy test data for varuna-seed
+        cp /shared/seed-data/testfile.bin /shared/varuna-seed-data/testfile.bin
+        echo "SETUP COMPLETE"
+    volumes:
+      - shared-torrents:/shared/torrents
+      - qbt-seed-data:/shared/seed-data
+      - varuna-seed-data:/shared/varuna-seed-data
+    networks:
+      bt-net:
+        ipv4_address: 172.28.0.11
+
+  # ── qBittorrent Seeder ─────────────────────────────────────
+  qbittorrent-seed:
+    image: lscr.io/linuxserver/qbittorrent:latest
+    environment:
+      - PUID=1000
+      - PGID=1000
+      - TZ=UTC
+      - WEBUI_PORT=8080
+      - TORRENTING_PORT=6881
+    ports:
+      - "8080:8080"
+      - "6881:6881"
+      - "6881:6881/udp"
+    volumes:
+      - qbt-seed-data:/downloads
+      - qbt-seed-config:/config
+      - shared-torrents:/torrents
+    networks:
+      bt-net:
+        ipv4_address: 172.28.0.20
+    depends_on:
+      tracker:
+        condition: service_healthy
+      setup:
+        condition: service_completed_successfully
+    healthcheck:
+      test: ["CMD-SHELL", "curl -sf http://127.0.0.1:8080/api/v2/app/version || exit 1"]
+      interval: 3s
+      timeout: 5s
+      retries: 20
+
+  # ── Varuna Downloader (downloads from qBittorrent) ─────────
+  varuna-download:
+    build:
+      context: ../..
+      dockerfile: test/docker/Dockerfile.varuna
+    volumes:
+      - varuna-dl-data:/data
+      - varuna-dl-config:/config
+      - shared-torrents:/torrents:ro
+    networks:
+      bt-net:
+        ipv4_address: 172.28.0.30
+    depends_on:
+      tracker:
+        condition: service_healthy
+      qbittorrent-seed:
+        condition: service_healthy
+    entrypoint: /bin/bash
+    command:
+      - -c
+      - |
+        set -e
+        cat > /config/varuna.toml <<'EOF'
+        [daemon]
+        api_port = 8081
+        api_bind = "0.0.0.0"
+        api_username = "admin"
+        api_password = "adminadmin"
+
+        [storage]
+        data_dir = "/data"
+        resume_db = "/config/resume.db"
+
+        [network]
+        port_min = 6882
+        port_max = 6882
+        dht = false
+        pex = false
+        encryption = "disabled"
+        enable_utp = false
+        EOF
+        exec varuna
+    ports:
+      - "8081:8081"
+      - "6882:6882"
+    healthcheck:
+      test: ["CMD-SHELL", "curl -sf http://127.0.0.1:8081/api/v2/app/version || exit 1"]
+      interval: 3s
+      timeout: 5s
+      retries: 20
+
+  # ── Varuna Seeder ──────────────────────────────────────────
+  varuna-seed:
+    build:
+      context: ../..
+      dockerfile: test/docker/Dockerfile.varuna
+    volumes:
+      - varuna-seed-data:/data
+      - varuna-seed-config:/config
+      - shared-torrents:/torrents:ro
+    networks:
+      bt-net:
+        ipv4_address: 172.28.0.40
+    depends_on:
+      tracker:
+        condition: service_healthy
+      setup:
+        condition: service_completed_successfully
+    entrypoint: /bin/bash
+    command:
+      - -c
+      - |
+        set -e
+        # Write daemon config
+        cat > /config/varuna.toml <<'TOML'
+        [daemon]
+        api_port = 8082
+        api_bind = "0.0.0.0"
+        api_username = "admin"
+        api_password = "adminadmin"
+
+        [storage]
+        data_dir = "/data"
+        resume_db = "/config/resume.db"
+
+        [network]
+        port_min = 6883
+        port_max = 6883
+        dht = false
+        pex = false
+        encryption = "disabled"
+        enable_utp = false
+        TOML
+        exec varuna
+    ports:
+      - "8082:8082"
+      - "6883:6883"
+    healthcheck:
+      test: ["CMD-SHELL", "curl -sf http://127.0.0.1:8082/api/v2/app/version || exit 1"]
+      interval: 3s
+      timeout: 5s
+      retries: 20
+
+  # ── qBittorrent Downloader (downloads from varuna) ─────────
+  qbittorrent-download:
+    image: lscr.io/linuxserver/qbittorrent:latest
+    environment:
+      - PUID=1000
+      - PGID=1000
+      - TZ=UTC
+      - WEBUI_PORT=8083
+      - TORRENTING_PORT=6884
+    ports:
+      - "8083:8083"
+      - "6884:6884"
+      - "6884:6884/udp"
+    volumes:
+      - qbt-dl-data:/downloads
+      - qbt-dl-config:/config
+      - shared-torrents:/torrents:ro
+    networks:
+      bt-net:
+        ipv4_address: 172.28.0.50
+    depends_on:
+      tracker:
+        condition: service_healthy
+      varuna-seed:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "curl -sf http://127.0.0.1:8083/api/v2/app/version || exit 1"]
+      interval: 3s
+      timeout: 5s
+      retries: 20
+
+volumes:
+  shared-torrents:
+  qbt-seed-data:
+  qbt-seed-config:
+  qbt-dl-data:
+  qbt-dl-config:
+  varuna-dl-data:
+  varuna-dl-config:
+  varuna-seed-data:
+  varuna-seed-config:
+
+networks:
+  bt-net:
+    driver: bridge
+    ipam:
+      config:
+        - subnet: 172.28.0.0/16

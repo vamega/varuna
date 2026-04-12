@@ -397,6 +397,12 @@ pub fn submitBodyRecv(self: *EventLoop, slot: u16) !void {
 
 pub fn submitMessage(self: *EventLoop, slot: u16, id: u8, payload: []const u8) !void {
     const peer = &self.peers[slot];
+
+    // uTP peers: route through the uTP byte stream instead of io_uring send.
+    if (peer.transport == .utp) {
+        return utp_handler.utpSendMessage(self, slot, id, payload);
+    }
+
     // Build framed message: 4-byte length + id + payload
     const msg_len = @as(u32, @intCast(1 + payload.len));
     const total_len = 5 + payload.len;

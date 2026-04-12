@@ -6,6 +6,7 @@ const EventLoop = @import("event_loop.zig").EventLoop;
 const encodeUserData = @import("event_loop.zig").encodeUserData;
 const decodeUserData = @import("event_loop.zig").decodeUserData;
 const LayoutSpan = @import("../torrent/layout.zig").Layout.Span;
+const utp_handler = @import("utp_handler.zig");
 
 // ── Piece upload (seed mode) ─────────────────────────
 
@@ -185,6 +186,29 @@ fn submitCopiedPieceBatch(self: *EventLoop, slot: u16, batch: []const EventLoop.
         return false;
     };
     peer.send_pending = true;
+    return true;
+}
+
+/// Send piece block responses over uTP. Serializes each block as a framed
+/// PIECE message and routes it through the uTP byte stream.
+fn submitUtpPieceBatch(self: *EventLoop, slot: u16, batch: []const EventLoop.QueuedBlockResponse) bool {
+    for (batch) |resp| {
+        const block_len: usize = @intCast(resp.block_length);
+        const start: usize = @intCast(resp.block_offset);
+        const block_data = resp.piece_buffer.buf[start .. start + block_len];
+
+        // Build PIECE message payload: index(4) + begin(4) + block data
+        const payload_len = 8 + block_len;
+        const send_buf = self.allocator.alloc(u8, payload_len) catch return false;
+        defer self.allocator.free(send_buf);
+
+        std.mem.writeInt(u32, send_buf[0..4], resp.piece_index, .big);
+        std.mem.writeInt(u32, send_buf[4..8], resp.block_offset, .big);
+        @memcpy(send_buf[8..][0..block_len], block_data);
+
+        // Message ID 7 = piece
+        utp_handler.utpSendMessage(self, slot, 7, send_buf) catch return false;
+    }
     return true;
 }
 
@@ -398,11 +422,17 @@ pub fn flushQueuedResponses(self: *EventLoop) void {
         }
 
         var submitted = false;
-        if (!peer.crypto.isEncrypted()) {
-            submitted = submitPlaintextPieceBatch(self, current_slot, batch);
-        }
-        if (!submitted) {
-            submitted = submitCopiedPieceBatch(self, current_slot, batch);
+
+        // uTP peers: route through the uTP byte stream instead of io_uring send.
+        if (peer.transport == .utp) {
+            submitted = submitUtpPieceBatch(self, current_slot, batch);
+        } else {
+            if (!peer.crypto.isEncrypted()) {
+                submitted = submitPlaintextPieceBatch(self, current_slot, batch);
+            }
+            if (!submitted) {
+                submitted = submitCopiedPieceBatch(self, current_slot, batch);
+            }
         }
 
         if (submitted) {
@@ -443,11 +473,17 @@ pub fn sendPieceBlock(self: *EventLoop, slot: u16, piece_index: u32, block_offse
     }};
 
     var submitted = false;
-    if (!peer.crypto.isEncrypted()) {
-        submitted = submitPlaintextPieceBatch(self, slot, batch[0..]);
-    }
-    if (!submitted) {
-        submitted = submitCopiedPieceBatch(self, slot, batch[0..]);
+
+    // uTP peers: route through the uTP byte stream instead of io_uring send.
+    if (peer.transport == .utp) {
+        submitted = submitUtpPieceBatch(self, slot, batch[0..]);
+    } else {
+        if (!peer.crypto.isEncrypted()) {
+            submitted = submitPlaintextPieceBatch(self, slot, batch[0..]);
+        }
+        if (!submitted) {
+            submitted = submitCopiedPieceBatch(self, slot, batch[0..]);
+        }
     }
     if (!submitted) return;
 
