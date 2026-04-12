@@ -499,7 +499,16 @@ pub const TorrentSession = struct {
                     known_ptr,
                     onRecheckComplete,
                     @ptrCast(self),
-                ) catch {
+                ) catch |err| {
+                    if (err == error.RecheckAlreadyActive) {
+                        // Another torrent's recheck is in progress. Stay in .checking
+                        // state with background_init_done=true so the main loop retries
+                        // on the next tick.
+                        self.mutex.lock();
+                        defer self.mutex.unlock();
+                        self.background_init_done.store(true, .release);
+                        return false;
+                    }
                     self.mutex.lock();
                     defer self.mutex.unlock();
                     self.state = .@"error";
