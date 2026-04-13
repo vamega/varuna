@@ -278,6 +278,19 @@ pub fn build(b: *std.Build) void {
     const test_transfer_step = b.step("test-transfer", "Run single-process piece transfer integration test");
     test_transfer_step.dependOn(&run_transfer_tests.step);
 
+    // ── Recheck tests (parallel recheck, fast resume) ─────
+    const recheck_tests = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("tests/recheck_test.zig"),
+            .target = target,
+            .optimize = optimize,
+            .imports = &varuna_import,
+        }),
+    });
+    const run_recheck_tests = b.addRunArtifact(recheck_tests);
+    const test_recheck_step = b.step("test-recheck", "Run recheck tests (parallel, fast resume)");
+    test_recheck_step.dependOn(&run_recheck_tests.step);
+
     // ── Soak test (long-running resource leak detection) ──
     const soak_exe = b.addExecutable(.{
         .name = "varuna-soak-test",
