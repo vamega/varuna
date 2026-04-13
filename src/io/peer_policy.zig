@@ -391,11 +391,17 @@ pub fn processHashResults(self: *EventLoop) void {
     const h = self.hasher orelse return;
     const results = h.drainResultsInto(&self.hash_result_swap);
     for (results) |result| {
-        // Route recheck results to the async recheck state machine
+        // Route recheck results to the correct async recheck state machine
         if (result.is_recheck) {
-            if (self.recheck) |rc| {
-                rc.handleHashResult(result.piece_index, result.valid, result.piece_buf);
-            } else {
+            var found = false;
+            for (self.rechecks.items) |rc| {
+                if (rc.torrent_id == result.torrent_id) {
+                    rc.handleHashResult(result.piece_index, result.valid, result.piece_buf);
+                    found = true;
+                    break;
+                }
+            }
+            if (!found) {
                 self.allocator.free(result.piece_buf);
             }
             continue;

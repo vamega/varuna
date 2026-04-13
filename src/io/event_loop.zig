@@ -271,8 +271,8 @@ pub const EventLoop = struct {
     hash_result_swap: std.ArrayList(Hasher.Result) = std.ArrayList(Hasher.Result).empty,
     merkle_result_swap: std.ArrayList(Hasher.MerkleResult) = std.ArrayList(Hasher.MerkleResult).empty,
 
-    // Async piece recheck state machine (null when no recheck is active)
-    recheck: ?*@import("recheck.zig").AsyncRecheck = null,
+    // Async piece recheck state machines (multiple rechecks can run in parallel)
+    rechecks: std.ArrayList(*@import("recheck.zig").AsyncRecheck) = std.ArrayList(*@import("recheck.zig").AsyncRecheck).empty,
 
     // Async BEP 9 metadata fetch state machine (null when no fetch is active)
     metadata_fetch: ?*metadata_handler.AsyncMetadataFetch = null,
@@ -403,7 +403,7 @@ pub const EventLoop = struct {
 
         // Clean up active async state machines (metadata fetch, recheck)
         self.cancelMetadataFetch();
-        self.cancelRecheck();
+        self.cancelAllRechecks();
 
         // ── Phase 3: Free all buffers ────────────────────────────
         // Now that the kernel has completed all pending operations,
@@ -1233,7 +1233,7 @@ pub const EventLoop = struct {
     /// Start an asynchronous piece recheck for a torrent.
     /// The recheck runs concurrently with normal event loop operation,
     /// using io_uring reads and the background hasher thread pool.
-    /// Only one recheck may be active at a time.
+    /// Multiple rechecks may run in parallel for different torrents.
     /// `caller_ctx` is an opaque pointer stored on the AsyncRecheck for
     /// the on_complete callback to retrieve its parent object.
     pub fn startRecheck(
@@ -1246,9 +1246,8 @@ pub const EventLoop = struct {
         caller_ctx: ?*anyopaque,
     ) !void {
         const h = self.hasher orelse return error.NoHasher;
-        if (self.recheck != null) return error.RecheckAlreadyActive;
 
-        self.recheck = try @import("recheck.zig").AsyncRecheck.create(
+        const rc = try @import("recheck.zig").AsyncRecheck.create(
             self.allocator,
             session,
             fds,
@@ -1259,15 +1258,32 @@ pub const EventLoop = struct {
             on_complete,
             caller_ctx,
         );
-        self.recheck.?.start();
+        try self.rechecks.append(self.allocator, rc);
+        rc.start();
     }
 
-    /// Cancel and destroy an active recheck. Safe to call if no recheck is active.
-    pub fn cancelRecheck(self: *EventLoop) void {
-        if (self.recheck) |rc| {
-            rc.destroy();
-            self.recheck = null;
+    /// Cancel and destroy the recheck for a specific torrent. Safe to call
+    /// if no recheck is active for that torrent.
+    pub fn cancelRecheckForTorrent(self: *EventLoop, torrent_id: TorrentId) void {
+        var i: usize = 0;
+        while (i < self.rechecks.items.len) {
+            if (self.rechecks.items[i].torrent_id == torrent_id) {
+                const rc = self.rechecks.swapRemove(i);
+                rc.destroy();
+                // Don't increment i — swapRemove moved the last element here
+            } else {
+                i += 1;
+            }
         }
+    }
+
+    /// Cancel and destroy all active rechecks. Used during shutdown.
+    pub fn cancelAllRechecks(self: *EventLoop) void {
+        for (self.rechecks.items) |rc| {
+            rc.destroy();
+        }
+        self.rechecks.deinit(self.allocator);
+        self.rechecks = std.ArrayList(*@import("recheck.zig").AsyncRecheck).empty;
     }
 
     // ── Async metadata fetch ─────────────────────────────
@@ -1515,7 +1531,13 @@ pub const EventLoop = struct {
                 self.fireExpiredTimers();
             },
             .recheck_read => {
-                if (self.recheck) |rc| rc.handleReadCqe(op.slot, cqe.res);
+                const tid: u32 = @truncate(op.context);
+                for (self.rechecks.items) |rc| {
+                    if (rc.torrent_id == tid) {
+                        rc.handleReadCqe(op.slot, cqe.res);
+                        break;
+                    }
+                }
             },
             .metadata_connect, .metadata_send, .metadata_recv => {
                 if (self.metadata_fetch) |mf| mf.handleCqe(op.op_type, op.slot, cqe.res);

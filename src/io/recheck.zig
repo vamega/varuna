@@ -203,7 +203,7 @@ pub const AsyncRecheck = struct {
 
         // The hasher returns the piece_buf pointer but does not free it.
         // Save allocator locally because the completion callback may destroy
-        // self (via cancelRecheck) before this defer runs.
+        // self (via cancelRecheckForTorrent) before this defer runs.
         const alloc = self.allocator;
         defer alloc.free(piece_buf);
 
@@ -304,7 +304,7 @@ pub const AsyncRecheck = struct {
             const ud = encodeUserData(.{
                 .slot = @intCast(slot_idx),
                 .op_type = .recheck_read,
-                .context = 0,
+                .context = @as(u40, self.torrent_id),
             });
             _ = self.ring.read(ud, fd, .{ .buffer = target }, span.file_offset) catch |err| {
                 log.warn("recheck: io_uring read submit for piece {d}: {s}", .{ piece_index, @errorName(err) });

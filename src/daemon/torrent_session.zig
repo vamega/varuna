@@ -505,16 +505,7 @@ pub const TorrentSession = struct {
                     known_ptr,
                     onRecheckComplete,
                     @ptrCast(self),
-                ) catch |err| {
-                    if (err == error.RecheckAlreadyActive) {
-                        // Another torrent's recheck is in progress. Stay in .checking
-                        // state with background_init_done=true so the main loop retries
-                        // on the next tick.
-                        self.mutex.lock();
-                        defer self.mutex.unlock();
-                        self.background_init_done.store(true, .release);
-                        return false;
-                    }
+                ) catch {
                     self.mutex.lock();
                     defer self.mutex.unlock();
                     self.state = .@"error";
@@ -684,14 +675,14 @@ pub const TorrentSession = struct {
             self.state = .@"error";
             self.error_message = std.fmt.allocPrint(self.allocator, "failed to create piece tracker", .{}) catch null;
             // Still clean up the recheck
-            if (self.shared_event_loop) |sel| sel.cancelRecheck();
+            if (self.shared_event_loop) |sel| sel.cancelRecheckForTorrent(recheck.torrent_id);
             return;
         };
         self.piece_tracker = piece_tracker;
 
         // Clean up the async recheck on the event loop (frees recheck struct)
         if (self.shared_event_loop) |sel| {
-            sel.cancelRecheck();
+            sel.cancelRecheckForTorrent(recheck.torrent_id);
         }
 
         // Free resume_pieces now that recheck is done

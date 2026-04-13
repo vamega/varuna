@@ -193,7 +193,7 @@ test "fast resume with complete pieces skips recheck entirely" {
     try std.testing.expectEqual(@as(u32, 1), pt.completedCount());
 
     // Verify: no recheck was started on the event loop
-    try std.testing.expect(el.recheck == null);
+    try std.testing.expectEqual(@as(usize, 0), el.rechecks.items.len);
 
     // The point: creating a PieceTracker from resume data is instant.
     // No io_uring reads, no hashing, no async state machine needed.
@@ -264,5 +264,5 @@ test "explicit recheck after fast resume works" {
     try std.testing.expect(recheck_completed);
 
     // Clean up the recheck
-    el.cancelRecheck();
+    el.cancelAllRechecks();
 }
