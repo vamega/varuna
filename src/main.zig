@@ -341,6 +341,9 @@ fn resolveDbPath(buf: *[1024]u8, config_path: ?[]const u8, filename: []const u8)
     if (config_path) |p| {
         const z = std.fmt.bufPrintZ(buf, "{s}", .{p}) catch return null;
         _ = z;
+        // SQLite supports ":memory:" as a special path for in-memory databases.
+        // Skip directory creation for it.
+        if (std.mem.eql(u8, p, ":memory:")) return @ptrCast(buf);
         return @ptrCast(buf);
     }
     // Default: ~/.local/share/varuna/<filename>
