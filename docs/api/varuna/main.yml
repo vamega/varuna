@@ -1,0 +1,1610 @@
+openapi: '3.1.0'
+info:
+  description: >
+    Varuna BitTorrent daemon WebAPI. Implements a subset of the qBittorrent WebAPI v2
+    for compatibility with WebUI clients (qui, Flood, VueTorrent).
+    Includes Varuna-specific extensions marked with [Varuna extension].
+  title: Varuna WebAPI
+  version: '2.9.3'
+  contact:
+    name: Varuna
+servers:
+  - url: 'http://localhost:{port}/api/v2'
+    variables:
+      port:
+        default: "8080"
+components:
+  securitySchemes:
+    sessionCookie:
+      description: SID cookie set on successful login.
+      type: apiKey
+      name: SID
+      in: cookie
+  responses:
+    200ok:
+      description: OK
+    200text:
+      description: OK
+      content:
+        text/plain:
+          schema:
+            type: string
+    200json:
+      description: OK
+      content:
+        application/json:
+          schema:
+            type: object
+    400badRequest:
+      description: Bad Request
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ErrorResponse'
+    403forbidden:
+      description: Forbidden (not authenticated)
+      content:
+        text/plain:
+          schema:
+            type: string
+            const: 'Forbidden'
+    404notFound:
+      description: Not Found
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ErrorResponse'
+    500internalError:
+      description: Internal Server Error
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ErrorResponse'
+  schemas:
+    ErrorResponse:
+      type: object
+      properties:
+        error:
+          type: string
+      required: [error]
+
+    StatusResponse:
+      type: object
+      properties:
+        status:
+          type: string
+          const: 'ok'
+
+    TransferInfo:
+      type: object
+      properties:
+        connection_status:
+          type: string
+          enum: [connected]
+          description: Always "connected" (firewall detection not implemented)
+        dht_nodes:
+          type: integer
+          description: Number of DHT nodes
+        dl_info_speed:
+          type: integer
+          description: Global download speed in bytes/sec
+        up_info_speed:
+          type: integer
+          description: Global upload speed in bytes/sec
+        dl_info_data:
+          type: integer
+          description: Total bytes downloaded this session
+        up_info_data:
+          type: integer
+          description: Total bytes uploaded this session
+        dl_rate_limit:
+          type: integer
+          description: Global download rate limit (0 = unlimited)
+        up_rate_limit:
+          type: integer
+          description: Global upload rate limit (0 = unlimited)
+
+    TorrentInfo:
+      type: object
+      description: Torrent info object returned by /torrents/info and /sync/maindata
+      properties:
+        name:
+          type: string
+        hash:
+          type: string
+          description: 40-char lowercase hex info-hash (v1)
+        infohash_v1:
+          type: string
+          description: Same as hash
+        infohash_v2:
+          type: string
+          description: 64-char hex SHA-256 info-hash (v2), empty for v1-only
+        state:
+          type: string
+          enum: [downloading, uploading, pausedDL, pausedUP, stoppedDL, stoppedUP,
+                 queuedDL, queuedUP, checkingDL, checkingUP, metaDL, error]
+        size:
+          type: integer
+        total_size:
+          type: integer
+        progress:
+          type: number
+          format: float
+        dlspeed:
+          type: integer
+        upspeed:
+          type: integer
+        num_seeds:
+          type: integer
+          description: Seeds from tracker scrape
+        num_leechs:
+          type: integer
+          description: Connected peers
+        num_complete:
+          type: integer
+        num_incomplete:
+          type: integer
+        added_on:
+          type: integer
+          description: Unix timestamp
+        completion_on:
+          type: integer
+          description: Unix timestamp (-1 if not complete)
+        save_path:
+          type: string
+        content_path:
+          type: string
+        download_path:
+          type: string
+          const: ''
+        pieces_have:
+          type: integer
+        pieces_num:
+          type: integer
+        dl_limit:
+          type: integer
+          description: Per-torrent download limit (0 = unlimited)
+        up_limit:
+          type: integer
+          description: Per-torrent upload limit (0 = unlimited)
+        eta:
+          type: integer
+          description: ETA in seconds (-1 = unknown)
+        ratio:
+          type: number
+          format: float
+        seq_dl:
+          type: boolean
+        private:
+          type: boolean
+          description: "[Varuna extension] Whether torrent is private"
+        f_l_piece_prio:
+          type: boolean
+          const: false
+        force_start:
+          type: boolean
+          const: false
+        super_seeding:
+          type: boolean
+        auto_tmm:
+          type: boolean
+          const: false
+        category:
+          type: string
+        tags:
+          type: string
+          description: Comma-separated tag list
+        tracker:
+          type: string
+          description: Primary tracker URL
+        trackers_count:
+          type: integer
+        amount_left:
+          type: integer
+        completed:
+          type: integer
+        downloaded:
+          type: integer
+        downloaded_session:
+          type: integer
+          description: Same as downloaded (no session tracking)
+        uploaded:
+          type: integer
+        uploaded_session:
+          type: integer
+          description: Same as uploaded (no session tracking)
+        time_active:
+          type: integer
+        seeding_time:
+          type: integer
+        last_activity:
+          type: integer
+          description: Always current timestamp
+        seen_complete:
+          type: integer
+          const: -1
+        priority:
+          type: integer
+          description: Queue position (0 = not queued)
+        availability:
+          type: number
+          const: -1
+          description: Not implemented
+        max_ratio:
+          type: number
+          const: -1
+        max_seeding_time:
+          type: integer
+          const: -1
+        ratio_limit:
+          type: number
+          format: float
+        seeding_time_limit:
+          type: integer
+        popularity:
+          type: integer
+          const: 0
+        magnet_uri:
+          type: string
+        reannounce:
+          type: integer
+          const: 0
+        partial_seed:
+          type: boolean
+          description: Only present in /torrents/info, not in /sync/maindata
+
+    TorrentProperties:
+      type: object
+      properties:
+        save_path:
+          type: string
+        download_path:
+          type: string
+          const: ''
+        creation_date:
+          type: integer
+        piece_size:
+          type: integer
+        comment:
+          type: string
+        created_by:
+          type: string
+        total_size:
+          type: integer
+        pieces_have:
+          type: integer
+        pieces_num:
+          type: integer
+        dl_speed:
+          type: integer
+        dl_speed_avg:
+          type: integer
+          const: 0
+        up_speed:
+          type: integer
+        up_speed_avg:
+          type: integer
+          const: 0
+        dl_limit:
+          type: integer
+        up_limit:
+          type: integer
+        eta:
+          type: integer
+        hash:
+          type: string
+        infohash_v1:
+          type: string
+        infohash_v2:
+          type: string
+        name:
+          type: string
+        ratio:
+          type: number
+        share_ratio:
+          type: number
+        time_elapsed:
+          type: integer
+        time_active:
+          type: integer
+        seeding_time:
+          type: integer
+        nb_connections:
+          type: integer
+        nb_connections_limit:
+          type: integer
+          const: 500
+        peers:
+          type: integer
+        peers_total:
+          type: integer
+        seeds:
+          type: integer
+        seeds_total:
+          type: integer
+        last_seen:
+          type: integer
+          const: -1
+        reannounce:
+          type: integer
+          const: 0
+        addition_date:
+          type: integer
+        completion_date:
+          type: integer
+        total_downloaded:
+          type: integer
+        total_downloaded_session:
+          type: integer
+        total_uploaded:
+          type: integer
+        total_uploaded_session:
+          type: integer
+        total_wasted:
+          type: integer
+          const: 0
+        is_private:
+          type: boolean
+        seq_dl:
+          type: boolean
+        super_seeding:
+          type: boolean
+        web_seeds_count:
+          type: integer
+        partial_seed:
+          type: boolean
+        ratio_limit:
+          type: number
+        seeding_time_limit:
+          type: integer
+
+    FileInfo:
+      type: object
+      properties:
+        index:
+          type: integer
+        name:
+          type: string
+        size:
+          type: integer
+        progress:
+          type: number
+        priority:
+          type: integer
+          enum: [0, 1, 6, 7]
+        availability:
+          type: number
+          description: Approximated by progress
+        is_seed:
+          type: boolean
+          const: false
+        piece_range:
+          type: array
+          items:
+            type: integer
+          minItems: 2
+          maxItems: 2
+
+    TrackerInfo:
+      type: object
+      properties:
+        url:
+          type: string
+        status:
+          type: integer
+          description: "0=disabled, 1=not contacted, 2=working, 3=updating, 4=error"
+        tier:
+          type: integer
+        num_peers:
+          type: integer
+        num_seeds:
+          type: integer
+        num_leeches:
+          type: integer
+        num_downloaded:
+          type: integer
+        msg:
+          type: string
+          const: ''
+
+    WebSeed:
+      type: object
+      properties:
+        url:
+          type: string
+
+    ConnDiagnostics:
+      type: object
+      description: "[Varuna extension] Connection diagnostics for a torrent"
+      properties:
+        connection_attempts:
+          type: integer
+        connection_failures:
+          type: integer
+        timeout_failures:
+          type: integer
+        refused_failures:
+          type: integer
+        peers_connected:
+          type: integer
+        peers_half_open:
+          type: integer
+
+    SyncMaindata:
+      type: object
+      properties:
+        rid:
+          type: integer
+        full_update:
+          type: boolean
+        torrents:
+          type: object
+          additionalProperties:
+            $ref: '#/components/schemas/TorrentInfo'
+        torrents_removed:
+          type: array
+          items:
+            type: string
+        categories:
+          type: object
+        tags:
+          type: array
+          items:
+            type: string
+        server_state:
+          $ref: '#/components/schemas/ServerState'
+
+    ServerState:
+      type: object
+      properties:
+        connection_status:
+          type: string
+          const: connected
+        dht_nodes:
+          type: integer
+        dl_info_speed:
+          type: integer
+        up_info_speed:
+          type: integer
+        dl_info_data:
+          type: integer
+        up_info_data:
+          type: integer
+        dl_rate_limit:
+          type: integer
+        up_rate_limit:
+          type: integer
+        alltime_dl:
+          type: integer
+          description: Same as dl_info_data (no persistent tracking)
+        alltime_ul:
+          type: integer
+          description: Same as up_info_data (no persistent tracking)
+        queueing:
+          type: boolean
+          const: false
+          description: Always false (known bug, should reflect actual state)
+        use_alt_speed_limits:
+          type: boolean
+          const: false
+        refresh_interval:
+          type: integer
+          const: 1500
+        free_space_on_disk:
+          type: integer
+          const: 0
+          description: Not implemented
+        total_peer_connections:
+          type: integer
+          const: 0
+          description: Not implemented
+
+    PeerInfo:
+      type: object
+      properties:
+        client:
+          type: string
+        connection:
+          type: string
+          const: ''
+        country:
+          type: string
+          const: ''
+        country_code:
+          type: string
+          const: ''
+        dl_speed:
+          type: integer
+        downloaded:
+          type: integer
+        files:
+          type: string
+          const: ''
+        flags:
+          type: string
+        flags_desc:
+          type: string
+          const: ''
+        ip:
+          type: string
+        port:
+          type: integer
+        progress:
+          type: number
+        relevance:
+          type: integer
+          const: 1
+        up_speed:
+          type: integer
+        uploaded:
+          type: integer
+        upload_only:
+          type: boolean
+          description: "[Varuna extension] BEP 21 upload-only flag"
+
+    BanInfo:
+      type: object
+      description: "[Varuna extension]"
+      properties:
+        individual:
+          type: array
+          items:
+            type: object
+            properties:
+              ip:
+                type: string
+              source:
+                type: string
+                enum: [manual, ipfilter]
+              reason:
+                type: string
+                nullable: true
+              created_at:
+                type: integer
+        ranges:
+          type: array
+          items:
+            type: object
+            properties:
+              start:
+                type: string
+              end:
+                type: string
+              source:
+                type: string
+                enum: [manual, ipfilter]
+              created_at:
+                type: integer
+        total_rules:
+          type: integer
+
+security:
+  - sessionCookie: []
+
+paths:
+  # ── Auth ────────────────────────────────────────
+  /auth/login:
+    post:
+      summary: Login
+      security: []
+      requestBody:
+        required: true
+        content:
+          application/x-www-form-urlencoded:
+            schema:
+              type: object
+              properties:
+                username:
+                  type: string
+                password:
+                  type: string
+              required: [username, password]
+      responses:
+        '200':
+          description: Login result
+          content:
+            text/plain:
+              schema:
+                type: string
+                enum: ['Ok.', 'Fails.']
+
+  /auth/logout:
+    get:
+      summary: Logout
+      responses:
+        '200':
+          description: OK
+          content:
+            text/plain:
+              schema:
+                type: string
+                const: 'Ok.'
+
+  # ── Application ─────────────────────────────────
+  /app/webapiVersion:
+    get:
+      summary: Get WebAPI version
+      responses:
+        '200':
+          description: Returns "2.9.3"
+          content:
+            text/plain:
+              schema:
+                type: string
+
+  /app/version:
+    get:
+      summary: Get application version
+      responses:
+        '200':
+          description: Returns "v5.0.0"
+          content:
+            text/plain:
+              schema:
+                type: string
+
+  /app/buildInfo:
+    get:
+      summary: Get build info
+      responses:
+        '200':
+          description: Build information (all versions N/A for Varuna)
+          content:
+            application/json:
+              schema:
+                type: object
+
+  /app/preferences:
+    get:
+      summary: Get application preferences
+      responses:
+        '200':
+          description: Preferences JSON (40+ fields)
+          content:
+            application/json:
+              schema:
+                type: object
+
+  /app/setPreferences:
+    post:
+      summary: Set application preferences
+      description: Accepts form-encoded or JSON body
+      requestBody:
+        content:
+          application/x-www-form-urlencoded:
+            schema:
+              type: object
+          application/json:
+            schema:
+              type: object
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/StatusResponse'
+
+  # ── Transfer ────────────────────────────────────
+  /transfer/info:
+    get:
+      summary: Get global transfer info
+      responses:
+        '200':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/TransferInfo'
+
+  /transfer/speedLimitsMode:
+    get:
+      summary: Get speed limits mode
+      description: Always returns 0 (no alternative speed mode)
+      responses:
+        '200':
+          content:
+            text/plain:
+              schema:
+                type: integer
+                const: 0
+
+  /transfer/banPeers:
+    post:
+      summary: Ban peers
+      requestBody:
+        content:
+          application/x-www-form-urlencoded:
+            schema:
+              type: object
+              properties:
+                peers:
+                  type: string
+                  description: Pipe-separated ip:port list
+              required: [peers]
+      responses:
+        '200':
+          $ref: '#/components/responses/200ok'
+
+  /transfer/unbanPeers:
+    post:
+      summary: "[Varuna extension] Unban peers"
+      requestBody:
+        content:
+          application/x-www-form-urlencoded:
+            schema:
+              type: object
+              properties:
+                ips:
+                  type: string
+                  description: Pipe-separated IP list
+              required: [ips]
+      responses:
+        '200':
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  removed:
+                    type: integer
+
+  /transfer/bannedPeers:
+    get:
+      summary: "[Varuna extension] List all bans"
+      responses:
+        '200':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/BanInfo'
+
+  /transfer/importBanList:
+    post:
+      summary: "[Varuna extension] Import ipfilter ban list"
+      requestBody:
+        content:
+          application/x-www-form-urlencoded:
+            schema:
+              type: object
+              properties:
+                file:
+                  type: string
+                  description: Raw ipfilter file content
+                format:
+                  type: string
+                  enum: [auto, dat, p2p, cidr]
+      responses:
+        '200':
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  imported:
+                    type: integer
+                  errors:
+                    type: integer
+
+  # ── Torrents ────────────────────────────────────
+  /torrents/info:
+    get:
+      summary: Get torrent list
+      responses:
+        '200':
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: '#/components/schemas/TorrentInfo'
+
+  /torrents/add:
+    post:
+      summary: Add torrent
+      description: Supports multipart/form-data (file upload), raw body, and magnet URIs
+      requestBody:
+        content:
+          multipart/form-data:
+            schema:
+              type: object
+              properties:
+                torrents:
+                  type: string
+                  format: binary
+                urls:
+                  type: string
+                  description: Magnet URI
+                savepath:
+                  type: string
+                category:
+                  type: string
+          application/x-www-form-urlencoded:
+            schema:
+              type: object
+              properties:
+                urls:
+                  type: string
+      responses:
+        '200':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/StatusResponse'
+
+  /torrents/delete:
+    post:
+      summary: Delete torrents
+      requestBody:
+        content:
+          application/x-www-form-urlencoded:
+            schema:
+              type: object
+              properties:
+                hashes:
+                  type: string
+                deleteFiles:
+                  type: string
+                  enum: ['true', 'false']
+              required: [hashes]
+      responses:
+        '200':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/StatusResponse'
+
+  /torrents/pause:
+    post:
+      summary: Pause torrents
+      requestBody:
+        content:
+          application/x-www-form-urlencoded:
+            schema:
+              type: object
+              properties:
+                hashes:
+                  type: string
+              required: [hashes]
+      responses:
+        '200':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/StatusResponse'
+
+  /torrents/resume:
+    post:
+      summary: Resume torrents
+      requestBody:
+        content:
+          application/x-www-form-urlencoded:
+            schema:
+              type: object
+              properties:
+                hashes:
+                  type: string
+              required: [hashes]
+      responses:
+        '200':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/StatusResponse'
+
+  /torrents/properties:
+    get:
+      summary: Get torrent properties
+      parameters:
+        - name: hash
+          in: query
+          required: true
+          schema:
+            type: string
+      responses:
+        '200':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/TorrentProperties'
+
+  /torrents/files:
+    get:
+      summary: Get torrent files
+      parameters:
+        - name: hash
+          in: query
+          required: true
+          schema:
+            type: string
+      responses:
+        '200':
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: '#/components/schemas/FileInfo'
+
+  /torrents/trackers:
+    get:
+      summary: Get torrent trackers
+      parameters:
+        - name: hash
+          in: query
+          required: true
+          schema:
+            type: string
+      responses:
+        '200':
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: '#/components/schemas/TrackerInfo'
+
+  /torrents/webSeeds:
+    get:
+      summary: Get torrent web seeds
+      parameters:
+        - name: hash
+          in: query
+          required: true
+          schema:
+            type: string
+      responses:
+        '200':
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: '#/components/schemas/WebSeed'
+
+  /torrents/filePrio:
+    post:
+      summary: Set file priority
+      requestBody:
+        content:
+          application/x-www-form-urlencoded:
+            schema:
+              type: object
+              properties:
+                hash:
+                  type: string
+                id:
+                  type: string
+                  description: Pipe-separated file indices
+                priority:
+                  type: integer
+                  enum: [0, 1, 6, 7]
+              required: [hash, id, priority]
+      responses:
+        '200':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/StatusResponse'
+
+  /torrents/setSequentialDownload:
+    post:
+      summary: Set sequential download mode
+      requestBody:
+        content:
+          application/x-www-form-urlencoded:
+            schema:
+              type: object
+              properties:
+                hash:
+                  type: string
+                value:
+                  type: string
+                  enum: ['true', 'false']
+              required: [hash, value]
+      responses:
+        '200':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/StatusResponse'
+
+  /torrents/setDownloadLimit:
+    post:
+      summary: Set per-torrent download limit
+      requestBody:
+        content:
+          application/x-www-form-urlencoded:
+            schema:
+              type: object
+              properties:
+                hashes:
+                  type: string
+                limit:
+                  type: integer
+              required: [hashes, limit]
+      responses:
+        '200':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/StatusResponse'
+
+  /torrents/setUploadLimit:
+    post:
+      summary: Set per-torrent upload limit
+      requestBody:
+        content:
+          application/x-www-form-urlencoded:
+            schema:
+              type: object
+              properties:
+                hashes:
+                  type: string
+                limit:
+                  type: integer
+              required: [hashes, limit]
+      responses:
+        '200':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/StatusResponse'
+
+  /torrents/downloadLimit:
+    post:
+      summary: Get per-torrent download limit
+      requestBody:
+        content:
+          application/x-www-form-urlencoded:
+            schema:
+              type: object
+              properties:
+                hashes:
+                  type: string
+              required: [hashes]
+      responses:
+        '200':
+          content:
+            text/plain:
+              schema:
+                type: integer
+
+  /torrents/uploadLimit:
+    post:
+      summary: Get per-torrent upload limit
+      requestBody:
+        content:
+          application/x-www-form-urlencoded:
+            schema:
+              type: object
+              properties:
+                hashes:
+                  type: string
+              required: [hashes]
+      responses:
+        '200':
+          content:
+            text/plain:
+              schema:
+                type: integer
+
+  /torrents/forceReannounce:
+    post:
+      summary: Force tracker reannounce
+      requestBody:
+        content:
+          application/x-www-form-urlencoded:
+            schema:
+              type: object
+              properties:
+                hashes:
+                  type: string
+              required: [hashes]
+      responses:
+        '200':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/StatusResponse'
+
+  /torrents/recheck:
+    post:
+      summary: Recheck torrent data
+      requestBody:
+        content:
+          application/x-www-form-urlencoded:
+            schema:
+              type: object
+              properties:
+                hashes:
+                  type: string
+              required: [hashes]
+      responses:
+        '200':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/StatusResponse'
+
+  /torrents/setLocation:
+    post:
+      summary: Set torrent location
+      requestBody:
+        content:
+          application/x-www-form-urlencoded:
+            schema:
+              type: object
+              properties:
+                hashes:
+                  type: string
+                location:
+                  type: string
+              required: [hashes, location]
+      responses:
+        '200':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/StatusResponse'
+
+  /torrents/setSuperSeeding:
+    post:
+      summary: Set super seeding mode
+      requestBody:
+        content:
+          application/x-www-form-urlencoded:
+            schema:
+              type: object
+              properties:
+                hashes:
+                  type: string
+                value:
+                  type: string
+                  enum: ['true', 'false']
+              required: [hashes, value]
+      responses:
+        '200':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/StatusResponse'
+
+  /torrents/setShareLimits:
+    post:
+      summary: Set per-torrent share limits
+      requestBody:
+        content:
+          application/x-www-form-urlencoded:
+            schema:
+              type: object
+              properties:
+                hashes:
+                  type: string
+                ratioLimit:
+                  type: number
+                  description: "-2=use global, -1=no limit, >=0 specific"
+                seedingTimeLimit:
+                  type: integer
+                  description: "-2=use global, -1=no limit, >=0 minutes"
+              required: [hashes]
+      responses:
+        '200':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/StatusResponse'
+
+  /torrents/addTrackers:
+    post:
+      summary: Add trackers to torrent
+      requestBody:
+        content:
+          application/x-www-form-urlencoded:
+            schema:
+              type: object
+              properties:
+                hash:
+                  type: string
+                urls:
+                  type: string
+                  description: Newline-separated tracker URLs
+              required: [hash, urls]
+      responses:
+        '200':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/StatusResponse'
+
+  /torrents/removeTrackers:
+    post:
+      summary: Remove trackers from torrent
+      requestBody:
+        content:
+          application/x-www-form-urlencoded:
+            schema:
+              type: object
+              properties:
+                hash:
+                  type: string
+                urls:
+                  type: string
+                  description: Pipe-separated tracker URLs
+              required: [hash, urls]
+      responses:
+        '200':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/StatusResponse'
+
+  /torrents/editTracker:
+    post:
+      summary: Edit tracker URL
+      requestBody:
+        content:
+          application/x-www-form-urlencoded:
+            schema:
+              type: object
+              properties:
+                hash:
+                  type: string
+                origUrl:
+                  type: string
+                newUrl:
+                  type: string
+              required: [hash, origUrl, newUrl]
+      responses:
+        '200':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/StatusResponse'
+
+  /torrents/connDiagnostics:
+    get:
+      summary: "[Varuna extension] Get connection diagnostics"
+      parameters:
+        - name: hash
+          in: query
+          required: true
+          schema:
+            type: string
+      responses:
+        '200':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ConnDiagnostics'
+
+  # ── Queue Management ────────────────────────────
+  /torrents/increasePrio:
+    post:
+      summary: Increase torrent queue priority
+      requestBody:
+        content:
+          application/x-www-form-urlencoded:
+            schema:
+              type: object
+              properties:
+                hashes:
+                  type: string
+              required: [hashes]
+      responses:
+        '200':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/StatusResponse'
+
+  /torrents/decreasePrio:
+    post:
+      summary: Decrease torrent queue priority
+      requestBody:
+        content:
+          application/x-www-form-urlencoded:
+            schema:
+              type: object
+              properties:
+                hashes:
+                  type: string
+              required: [hashes]
+      responses:
+        '200':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/StatusResponse'
+
+  /torrents/topPrio:
+    post:
+      summary: Set torrent to top of queue
+      requestBody:
+        content:
+          application/x-www-form-urlencoded:
+            schema:
+              type: object
+              properties:
+                hashes:
+                  type: string
+              required: [hashes]
+      responses:
+        '200':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/StatusResponse'
+
+  /torrents/bottomPrio:
+    post:
+      summary: Set torrent to bottom of queue
+      requestBody:
+        content:
+          application/x-www-form-urlencoded:
+            schema:
+              type: object
+              properties:
+                hashes:
+                  type: string
+              required: [hashes]
+      responses:
+        '200':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/StatusResponse'
+
+  # ── Categories ──────────────────────────────────
+  /torrents/categories:
+    get:
+      summary: Get all categories
+      responses:
+        '200':
+          content:
+            application/json:
+              schema:
+                type: object
+                additionalProperties:
+                  type: object
+                  properties:
+                    name:
+                      type: string
+                    savePath:
+                      type: string
+
+  /torrents/createCategory:
+    post:
+      summary: Create category
+      requestBody:
+        content:
+          application/x-www-form-urlencoded:
+            schema:
+              type: object
+              properties:
+                category:
+                  type: string
+                savePath:
+                  type: string
+              required: [category]
+      responses:
+        '200':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/StatusResponse'
+
+  /torrents/editCategory:
+    post:
+      summary: Edit category
+      requestBody:
+        content:
+          application/x-www-form-urlencoded:
+            schema:
+              type: object
+              properties:
+                category:
+                  type: string
+                savePath:
+                  type: string
+              required: [category]
+      responses:
+        '200':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/StatusResponse'
+
+  /torrents/removeCategories:
+    post:
+      summary: Remove categories
+      requestBody:
+        content:
+          application/x-www-form-urlencoded:
+            schema:
+              type: object
+              properties:
+                categories:
+                  type: string
+                  description: Newline-separated category names
+              required: [categories]
+      responses:
+        '200':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/StatusResponse'
+
+  /torrents/setCategory:
+    post:
+      summary: Set torrent category
+      requestBody:
+        content:
+          application/x-www-form-urlencoded:
+            schema:
+              type: object
+              properties:
+                hashes:
+                  type: string
+                category:
+                  type: string
+              required: [hashes]
+      responses:
+        '200':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/StatusResponse'
+
+  # ── Tags ────────────────────────────────────────
+  /torrents/tags:
+    get:
+      summary: Get all tags
+      responses:
+        '200':
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  type: string
+
+  /torrents/createTags:
+    post:
+      summary: Create tags
+      requestBody:
+        content:
+          application/x-www-form-urlencoded:
+            schema:
+              type: object
+              properties:
+                tags:
+                  type: string
+                  description: Comma-separated tag names
+              required: [tags]
+      responses:
+        '200':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/StatusResponse'
+
+  /torrents/deleteTags:
+    post:
+      summary: Delete tags
+      requestBody:
+        content:
+          application/x-www-form-urlencoded:
+            schema:
+              type: object
+              properties:
+                tags:
+                  type: string
+                  description: Comma-separated tag names
+              required: [tags]
+      responses:
+        '200':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/StatusResponse'
+
+  /torrents/addTags:
+    post:
+      summary: Add tags to torrents
+      requestBody:
+        content:
+          application/x-www-form-urlencoded:
+            schema:
+              type: object
+              properties:
+                hashes:
+                  type: string
+                tags:
+                  type: string
+                  description: Comma-separated tag names
+              required: [hashes, tags]
+      responses:
+        '200':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/StatusResponse'
+
+  /torrents/removeTags:
+    post:
+      summary: Remove tags from torrents
+      requestBody:
+        content:
+          application/x-www-form-urlencoded:
+            schema:
+              type: object
+              properties:
+                hashes:
+                  type: string
+                tags:
+                  type: string
+                  description: Comma-separated tag names
+              required: [hashes, tags]
+      responses:
+        '200':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/StatusResponse'
+
+  # ── Sync ────────────────────────────────────────
+  /sync/maindata:
+    get:
+      summary: Get sync maindata
+      parameters:
+        - name: rid
+          in: query
+          required: false
+          schema:
+            type: integer
+            default: 0
+          description: Response ID for delta updates (0 = full update)
+      responses:
+        '200':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SyncMaindata'
+
+  /sync/torrentPeers:
+    get:
+      summary: Get torrent peers (delta sync)
+      parameters:
+        - name: hash
+          in: query
+          required: true
+          schema:
+            type: string
+        - name: rid
+          in: query
+          required: false
+          schema:
+            type: integer
+            default: 0
+      responses:
+        '200':
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  rid:
+                    type: integer
+                  full_update:
+                    type: boolean
+                  peers:
+                    type: object
+                    additionalProperties:
+                      $ref: '#/components/schemas/PeerInfo'
+                  peers_removed:
+                    type: array
+                    items:
+                      type: string
+                  show_flags:
+                    type: boolean
+                    const: true
