@@ -20,12 +20,18 @@ This document tracks which endpoints are implemented, which return placeholder d
 | `GET /api/v2/app/buildInfo` | Full |
 | `GET /api/v2/app/preferences` | Full (40+ fields) |
 | `POST /api/v2/app/setPreferences` | Full (form + JSON) |
+| `GET /api/v2/app/defaultSavePath` | Full |
 
 ### Transfer
 | Endpoint | Status |
 |---|---|
 | `GET /api/v2/transfer/info` | Full (real DHT node count, speeds, limits) |
 | `GET /api/v2/transfer/speedLimitsMode` | Full |
+| `POST /api/v2/transfer/toggleSpeedLimitsMode` | Stub (no-op, alt-speed not implemented) |
+| `GET /api/v2/transfer/downloadLimit` | Full |
+| `GET /api/v2/transfer/uploadLimit` | Full |
+| `POST /api/v2/transfer/setDownloadLimit` | Full |
+| `POST /api/v2/transfer/setUploadLimit` | Full |
 | `POST /api/v2/transfer/banPeers` | Full |
 | `POST /api/v2/transfer/unbanPeers` | Full |
 | `GET /api/v2/transfer/bannedPeers` | Full |
@@ -56,6 +62,16 @@ This document tracks which endpoints are implemented, which return placeholder d
 | `POST /api/v2/torrents/removeTrackers` | Full |
 | `POST /api/v2/torrents/editTracker` | Full |
 | `GET /api/v2/torrents/connDiagnostics` | Full (Varuna extension) |
+| `POST /api/v2/torrents/rename` | Full |
+| `POST /api/v2/torrents/toggleSequentialDownload` | Full |
+| `POST /api/v2/torrents/setAutoManagement` | Stub (no-op, auto-management not implemented) |
+| `POST /api/v2/torrents/setForceStart` | Full (bypasses queue limits) |
+| `GET /api/v2/torrents/pieceStates` | Full |
+| `GET /api/v2/torrents/pieceHashes` | Full (v1 only) |
+| `POST /api/v2/torrents/renameFile` | Stub (accepts request, returns OK) |
+| `POST /api/v2/torrents/renameFolder` | Stub (accepts request, returns OK) |
+| `GET /api/v2/torrents/export` | Full |
+| `POST /api/v2/torrents/addPeers` | Full |
 
 ### Categories & Tags
 | Endpoint | Status |
@@ -102,19 +118,9 @@ These endpoints are not implemented but could be added if there is demand.
 
 | Endpoint | Notes |
 |---|---|
-| `POST /api/v2/torrents/rename` | Rename torrent display name. |
-| `POST /api/v2/torrents/renameFile` | Rename individual file within torrent. |
-| `POST /api/v2/torrents/renameFolder` | Rename folder within torrent. |
-| `GET /api/v2/torrents/pieceStates` | Per-piece download state (not downloaded / downloading / downloaded). |
-| `GET /api/v2/torrents/pieceHashes` | Per-piece SHA-1 hash list. |
-| `GET /api/v2/torrents/export` | Export .torrent file for an added torrent. |
 | `POST /api/v2/torrents/toggleFirstLastPiecePrio` | First/last piece priority for streaming. Sequential mode covers the main use case. |
-| `POST /api/v2/torrents/setShareLimits` | Per-torrent share ratio and seeding time limits. |
-| Queue management (`topPrio`, `bottomPrio`, `increasePrio`, `decreasePrio`) | Torrent queue ordering. Varuna currently processes all active torrents equally. |
 | `/api/v2/rss/*` | RSS feed management and auto-downloading rules. |
 | `/api/v2/search/*` | Search plugin management (search engines, results). |
-| `/api/v2/transfer/setDownloadLimit` | Global rate limits are set via `setPreferences`. |
-| `/api/v2/transfer/setUploadLimit` | Same as above. |
 | `/api/v2/log/*` | Log retrieval endpoints. |
 
 ## Error Handling for Unknown Paths

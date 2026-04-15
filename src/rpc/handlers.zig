@@ -80,12 +80,36 @@ pub const ApiHandler = struct {
             return withCors(self.handleSetPreferences(allocator, request.body));
         }
 
+        if (std.mem.eql(u8, request.path, "/api/v2/app/defaultSavePath")) {
+            return withCors(self.handleDefaultSavePath());
+        }
+
         if (std.mem.eql(u8, request.path, "/api/v2/transfer/info")) {
             return withCors(self.handleTransferInfo(allocator));
         }
 
         if (std.mem.eql(u8, request.path, "/api/v2/transfer/speedLimitsMode")) {
             return withCors(self.handleSpeedLimitsMode(allocator));
+        }
+
+        if (std.mem.eql(u8, request.path, "/api/v2/transfer/toggleSpeedLimitsMode") and std.mem.eql(u8, request.method, "POST")) {
+            return withCors(self.handleToggleSpeedLimitsMode());
+        }
+
+        if (std.mem.eql(u8, request.path, "/api/v2/transfer/downloadLimit")) {
+            return withCors(self.handleGlobalDlLimit(allocator));
+        }
+
+        if (std.mem.eql(u8, request.path, "/api/v2/transfer/uploadLimit")) {
+            return withCors(self.handleGlobalUlLimit(allocator));
+        }
+
+        if (std.mem.eql(u8, request.path, "/api/v2/transfer/setDownloadLimit") and std.mem.eql(u8, request.method, "POST")) {
+            return withCors(self.handleSetGlobalDlLimit(request.body));
+        }
+
+        if (std.mem.eql(u8, request.path, "/api/v2/transfer/setUploadLimit") and std.mem.eql(u8, request.method, "POST")) {
+            return withCors(self.handleSetGlobalUlLimit(request.body));
         }
 
         // ── Ban management endpoints ──────────────────────────
@@ -322,6 +346,46 @@ pub const ApiHandler = struct {
 
         if (std.mem.eql(u8, action_name, "bottomPrio") and std.mem.eql(u8, method, "POST")) {
             return self.handleQueueBottomPrio(allocator, body);
+        }
+
+        if (std.mem.eql(u8, action_name, "rename") and std.mem.eql(u8, method, "POST")) {
+            return self.handleTorrentsRename(allocator, body);
+        }
+
+        if (std.mem.eql(u8, action_name, "toggleSequentialDownload") and std.mem.eql(u8, method, "POST")) {
+            return self.handleTorrentsToggleSequentialDownload(allocator, body);
+        }
+
+        if (std.mem.eql(u8, action_name, "setAutoManagement") and std.mem.eql(u8, method, "POST")) {
+            return self.handleTorrentsSetAutoManagement();
+        }
+
+        if (std.mem.eql(u8, action_name, "setForceStart") and std.mem.eql(u8, method, "POST")) {
+            return self.handleTorrentsSetForceStart(allocator, body);
+        }
+
+        if (std.mem.eql(u8, action_name, "pieceStates")) {
+            return self.handleTorrentsPieceStates(allocator, params);
+        }
+
+        if (std.mem.eql(u8, action_name, "pieceHashes")) {
+            return self.handleTorrentsPieceHashes(allocator, params);
+        }
+
+        if (std.mem.eql(u8, action_name, "renameFile") and std.mem.eql(u8, method, "POST")) {
+            return self.handleTorrentsRenameFile();
+        }
+
+        if (std.mem.eql(u8, action_name, "renameFolder") and std.mem.eql(u8, method, "POST")) {
+            return self.handleTorrentsRenameFolder();
+        }
+
+        if (std.mem.eql(u8, action_name, "export")) {
+            return self.handleTorrentsExport(params);
+        }
+
+        if (std.mem.eql(u8, action_name, "addPeers") and std.mem.eql(u8, method, "POST")) {
+            return self.handleTorrentsAddPeers(allocator, body);
         }
 
         return .{ .status = 404, .body = "{\"error\":\"unknown action\"}" };
@@ -1560,6 +1624,212 @@ pub const ApiHandler = struct {
         }
 
         return .{ .body = "{\"status\":\"ok\"}" };
+    }
+
+    // ── New API endpoints ───────────────────────────────────
+
+    /// GET /api/v2/app/defaultSavePath -- return the default save path as plain text.
+    fn handleDefaultSavePath(self: *const ApiHandler) server.Response {
+        return .{ .body = self.session_manager.default_save_path, .content_type = "text/plain" };
+    }
+
+    /// POST /api/v2/transfer/toggleSpeedLimitsMode -- toggle alt speed limits (no-op stub).
+    fn handleToggleSpeedLimitsMode(_: *const ApiHandler) server.Response {
+        // Alternative speed limits are not implemented; accept and return OK.
+        return .{ .body = "Ok.", .content_type = "text/plain" };
+    }
+
+    /// GET /api/v2/transfer/downloadLimit -- return global download limit as plain text number.
+    fn handleGlobalDlLimit(self: *const ApiHandler, allocator: std.mem.Allocator) server.Response {
+        const limit: u64 = if (self.session_manager.shared_event_loop) |el| el.getGlobalDlLimit() else 0;
+        const body = std.fmt.allocPrint(allocator, "{}", .{limit}) catch
+            return .{ .status = 500, .body = "0", .content_type = "text/plain" };
+        return .{ .body = body, .owned_body = body, .content_type = "text/plain" };
+    }
+
+    /// GET /api/v2/transfer/uploadLimit -- return global upload limit as plain text number.
+    fn handleGlobalUlLimit(self: *const ApiHandler, allocator: std.mem.Allocator) server.Response {
+        const limit: u64 = if (self.session_manager.shared_event_loop) |el| el.getGlobalUlLimit() else 0;
+        const body = std.fmt.allocPrint(allocator, "{}", .{limit}) catch
+            return .{ .status = 500, .body = "0", .content_type = "text/plain" };
+        return .{ .body = body, .owned_body = body, .content_type = "text/plain" };
+    }
+
+    /// POST /api/v2/transfer/setDownloadLimit -- set global download speed limit.
+    fn handleSetGlobalDlLimit(self: *const ApiHandler, body: []const u8) server.Response {
+        const limit_str = extractParamMut(body, "limit") orelse
+            return .{ .status = 400, .body = "{\"error\":\"missing limit\"}" };
+        const limit = std.fmt.parseInt(u64, limit_str, 10) catch
+            return .{ .status = 400, .body = "{\"error\":\"invalid limit\"}" };
+        self.session_manager.setGlobalDlLimit(limit);
+        return .{ .body = "Ok.", .content_type = "text/plain" };
+    }
+
+    /// POST /api/v2/transfer/setUploadLimit -- set global upload speed limit.
+    fn handleSetGlobalUlLimit(self: *const ApiHandler, body: []const u8) server.Response {
+        const limit_str = extractParamMut(body, "limit") orelse
+            return .{ .status = 400, .body = "{\"error\":\"missing limit\"}" };
+        const limit = std.fmt.parseInt(u64, limit_str, 10) catch
+            return .{ .status = 400, .body = "{\"error\":\"invalid limit\"}" };
+        self.session_manager.setGlobalUlLimit(limit);
+        return .{ .body = "Ok.", .content_type = "text/plain" };
+    }
+
+    /// POST /api/v2/torrents/rename -- rename a torrent.
+    fn handleTorrentsRename(self: *const ApiHandler, allocator: std.mem.Allocator, body: []const u8) server.Response {
+        const hash = extractParamMut(body, "hash") orelse
+            return .{ .status = 400, .body = "{\"error\":\"missing hash\"}" };
+        const name = extractParamMut(body, "name") orelse
+            return .{ .status = 400, .body = "{\"error\":\"missing name\"}" };
+        if (name.len == 0) {
+            return .{ .status = 400, .body = "{\"error\":\"name cannot be empty\"}" };
+        }
+
+        self.session_manager.renameTorrent(hash, name) catch |err| {
+            return errorResponse(allocator, 404, err);
+        };
+
+        return .{ .body = "Ok.", .content_type = "text/plain" };
+    }
+
+    /// POST /api/v2/torrents/toggleSequentialDownload -- toggle sequential download mode.
+    fn handleTorrentsToggleSequentialDownload(self: *const ApiHandler, allocator: std.mem.Allocator, body: []const u8) server.Response {
+        const hashes_str = requireHashes(body) orelse
+            return .{ .status = 400, .body = "{\"error\":\"missing hashes\"}" };
+
+        var iter = std.mem.splitScalar(u8, hashes_str, '|');
+        while (iter.next()) |hash| {
+            if (hash.len == 0) continue;
+            self.session_manager.toggleSequentialDownload(hash) catch |err| {
+                return errorResponse(allocator, 404, err);
+            };
+        }
+
+        return .{ .body = "Ok.", .content_type = "text/plain" };
+    }
+
+    /// POST /api/v2/torrents/setAutoManagement -- stub (accept and return OK).
+    fn handleTorrentsSetAutoManagement(_: *const ApiHandler) server.Response {
+        return .{ .body = "Ok.", .content_type = "text/plain" };
+    }
+
+    /// POST /api/v2/torrents/setForceStart -- force-start torrents bypassing queue limits.
+    fn handleTorrentsSetForceStart(self: *const ApiHandler, allocator: std.mem.Allocator, body: []const u8) server.Response {
+        const hashes_str = requireHashes(body) orelse
+            return .{ .status = 400, .body = "{\"error\":\"missing hashes\"}" };
+
+        var iter = std.mem.splitScalar(u8, hashes_str, '|');
+        while (iter.next()) |hash| {
+            if (hash.len == 0) continue;
+            self.session_manager.forceStartTorrent(hash) catch |err| {
+                return errorResponse(allocator, 404, err);
+            };
+        }
+
+        return .{ .body = "Ok.", .content_type = "text/plain" };
+    }
+
+    /// GET /api/v2/torrents/pieceStates -- return piece states as JSON array.
+    fn handleTorrentsPieceStates(self: *const ApiHandler, allocator: std.mem.Allocator, params: []const u8) server.Response {
+        const hash = extractParamMut(params, "hash") orelse
+            return .{ .status = 400, .body = "{\"error\":\"missing hash\"}" };
+
+        const states = self.session_manager.getPieceStates(allocator, hash) catch |err| switch (err) {
+            error.TorrentNotFound => return .{ .status = 404, .body = "{\"error\":\"torrent not found\"}" },
+            error.TorrentNotReady => return .{ .status = 409, .body = "{\"error\":\"torrent metadata not ready\"}" },
+            else => return .{ .status = 500, .body = "{\"error\":\"internal\"}" },
+        };
+        defer allocator.free(states);
+
+        var json = std.ArrayList(u8).empty;
+        defer json.deinit(allocator);
+
+        json.append(allocator, '[') catch return .{ .status = 500, .body = "[]" };
+        for (states, 0..) |state, i| {
+            if (i > 0) json.append(allocator, ',') catch {};
+            json.print(allocator, "{}", .{state}) catch {};
+        }
+        json.append(allocator, ']') catch {};
+
+        const body = json.toOwnedSlice(allocator) catch return .{ .status = 500, .body = "[]" };
+        return .{ .body = body, .owned_body = body };
+    }
+
+    /// GET /api/v2/torrents/pieceHashes -- return piece hashes as JSON array of hex strings.
+    fn handleTorrentsPieceHashes(self: *const ApiHandler, allocator: std.mem.Allocator, params: []const u8) server.Response {
+        const hash = extractParamMut(params, "hash") orelse
+            return .{ .status = 400, .body = "{\"error\":\"missing hash\"}" };
+
+        const hashes = self.session_manager.getPieceHashes(allocator, hash) catch |err| switch (err) {
+            error.TorrentNotFound => return .{ .status = 404, .body = "{\"error\":\"torrent not found\"}" },
+            error.TorrentNotReady => return .{ .status = 409, .body = "{\"error\":\"torrent metadata not ready\"}" },
+            else => return .{ .status = 500, .body = "{\"error\":\"internal\"}" },
+        };
+        defer {
+            for (hashes) |h| allocator.free(h);
+            allocator.free(hashes);
+        }
+
+        var json = std.ArrayList(u8).empty;
+        defer json.deinit(allocator);
+
+        json.append(allocator, '[') catch return .{ .status = 500, .body = "[]" };
+        for (hashes, 0..) |hex, i| {
+            if (i > 0) json.append(allocator, ',') catch {};
+            json.append(allocator, '"') catch {};
+            json.appendSlice(allocator, hex) catch {};
+            json.append(allocator, '"') catch {};
+        }
+        json.append(allocator, ']') catch {};
+
+        const body = json.toOwnedSlice(allocator) catch return .{ .status = 500, .body = "[]" };
+        return .{ .body = body, .owned_body = body };
+    }
+
+    /// POST /api/v2/torrents/renameFile -- stub (accept and return OK).
+    fn handleTorrentsRenameFile(_: *const ApiHandler) server.Response {
+        return .{ .body = "Ok.", .content_type = "text/plain" };
+    }
+
+    /// POST /api/v2/torrents/renameFolder -- stub (accept and return OK).
+    fn handleTorrentsRenameFolder(_: *const ApiHandler) server.Response {
+        return .{ .body = "Ok.", .content_type = "text/plain" };
+    }
+
+    /// GET /api/v2/torrents/export -- export .torrent file bytes.
+    fn handleTorrentsExport(self: *const ApiHandler, params: []const u8) server.Response {
+        const hash = extractParamMut(params, "hash") orelse
+            return .{ .status = 400, .body = "{\"error\":\"missing hash\"}" };
+
+        self.session_manager.mutex.lock();
+        defer self.session_manager.mutex.unlock();
+
+        const session = self.session_manager.sessions.get(hash) orelse
+            return .{ .status = 404, .body = "{\"error\":\"torrent not found\"}" };
+
+        if (session.torrent_bytes.len == 0) {
+            return .{ .status = 409, .body = "{\"error\":\"no torrent file available (magnet link)\"}" };
+        }
+
+        return .{ .body = session.torrent_bytes, .content_type = "application/x-bittorrent" };
+    }
+
+    /// POST /api/v2/torrents/addPeers -- manually add peers to a torrent.
+    fn handleTorrentsAddPeers(self: *const ApiHandler, allocator: std.mem.Allocator, body: []const u8) server.Response {
+        const hashes_str = requireHashes(body) orelse
+            return .{ .status = 400, .body = "{\"error\":\"missing hashes\"}" };
+        const peers_str = extractParamMut(body, "peers") orelse
+            return .{ .status = 400, .body = "{\"error\":\"missing peers\"}" };
+
+        var iter = std.mem.splitScalar(u8, hashes_str, '|');
+        while (iter.next()) |hash| {
+            if (hash.len == 0) continue;
+            self.session_manager.addManualPeers(hash, peers_str) catch |err| {
+                return errorResponse(allocator, 404, err);
+            };
+        }
+
+        return .{ .body = "Ok.", .content_type = "text/plain" };
     }
 };
 

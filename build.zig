@@ -304,6 +304,20 @@ pub fn build(b: *std.Build) void {
     const test_recheck_step = b.step("test-recheck", "Run recheck tests (parallel, fast resume)");
     test_recheck_step.dependOn(&run_recheck_tests.step);
 
+    // ── API endpoint tests ─────────────────────────────────
+    const api_tests = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("tests/api_endpoints_test.zig"),
+            .target = target,
+            .optimize = optimize,
+            .imports = &varuna_import,
+        }),
+    });
+    const run_api_tests = b.addRunArtifact(api_tests);
+    const test_api_step = b.step("test-api", "Run API endpoint tests");
+    test_api_step.dependOn(&run_api_tests.step);
+    test_step.dependOn(&run_api_tests.step);
+
     // ── Soak test (long-running resource leak detection) ──
     const soak_exe = b.addExecutable(.{
         .name = "varuna-soak-test",

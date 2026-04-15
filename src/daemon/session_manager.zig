@@ -1559,6 +1559,137 @@ pub const SessionManager = struct {
         }
     }
 
+    /// Rename a torrent (update its display name).
+    pub fn renameTorrent(self: *SessionManager, hash: []const u8, new_name: []const u8) !void {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+
+        const session = self.sessions.get(hash) orelse return error.TorrentNotFound;
+        const owned_name = try self.allocator.dupe(u8, new_name);
+        self.allocator.free(session.name);
+        session.name = owned_name;
+    }
+
+    /// Toggle sequential download mode for a torrent (flip current value).
+    pub fn toggleSequentialDownload(self: *SessionManager, hash: []const u8) !void {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+
+        const session = self.sessions.get(hash) orelse return error.TorrentNotFound;
+        session.sequential_download = !session.sequential_download;
+        session.applySequentialMode();
+    }
+
+    /// Force-start a torrent, bypassing queue limits.
+    pub fn forceStartTorrent(self: *SessionManager, hash: []const u8) !void {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+
+        const session = self.sessions.get(hash) orelse return error.TorrentNotFound;
+
+        if (session.state == .queued) {
+            session.state = .paused;
+            session.unpause();
+        } else if (session.state == .paused or session.state == .stopped) {
+            session.unpause();
+        }
+        // If already downloading/seeding, no-op.
+    }
+
+    /// Get piece states for a torrent: 0=not downloaded, 1=downloading, 2=downloaded.
+    pub fn getPieceStates(self: *SessionManager, allocator: std.mem.Allocator, hash: []const u8) ![]u8 {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+
+        const session = self.sessions.get(hash) orelse return error.TorrentNotFound;
+        if (session.session == null) return error.TorrentNotReady;
+
+        const piece_count = session.piece_count;
+        if (piece_count == 0) return try allocator.alloc(u8, 0);
+
+        var states = try allocator.alloc(u8, piece_count);
+        @memset(states, 0);
+
+        if (session.piece_tracker) |*pt| {
+            var i: u32 = 0;
+            while (i < piece_count) : (i += 1) {
+                if (pt.complete.has(i)) {
+                    states[i] = 2;
+                } else if (pt.in_progress.has(i)) {
+                    states[i] = 1;
+                }
+            }
+        }
+
+        return states;
+    }
+
+    /// Get piece hashes as hex-encoded strings for a torrent.
+    pub fn getPieceHashes(self: *SessionManager, allocator: std.mem.Allocator, hash: []const u8) ![][]const u8 {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+
+        const session = self.sessions.get(hash) orelse return error.TorrentNotFound;
+        const sess = session.session orelse return error.TorrentNotReady;
+        const meta = sess.metainfo;
+
+        if (meta.pieces.len == 0) return try allocator.alloc([]const u8, 0);
+
+        const piece_count = meta.pieces.len / 20;
+        var hashes = try allocator.alloc([]const u8, piece_count);
+        var built: usize = 0;
+        errdefer {
+            for (hashes[0..built]) |h| allocator.free(h);
+            allocator.free(hashes);
+        }
+
+        var i: usize = 0;
+        while (i < piece_count) : (i += 1) {
+            const piece_hash = meta.pieces[i * 20 ..][0..20];
+            const hex_arr = std.fmt.bytesToHex(piece_hash, .lower);
+            const hex = try allocator.dupe(u8, &hex_arr);
+            hashes[built] = hex;
+            built += 1;
+        }
+
+        return hashes;
+    }
+
+    /// Add manually-specified peers to a torrent.
+    /// peers_str is comma-separated "IP:port" entries.
+    pub fn addManualPeers(self: *SessionManager, hash: []const u8, peers_str: []const u8) !void {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+
+        const session = self.sessions.get(hash) orelse return error.TorrentNotFound;
+        const el = self.shared_event_loop orelse return;
+        const tid = session.torrent_id_in_shared orelse return;
+
+        var iter = std.mem.splitScalar(u8, peers_str, ',');
+        while (iter.next()) |peer_str| {
+            const trimmed = std.mem.trim(u8, peer_str, " \t\r\n");
+            if (trimmed.len == 0) continue;
+
+            // Parse IP:port
+            const addr = parseIpPort(trimmed) orelse continue;
+            _ = el.addPeerAutoTransport(addr, tid) catch continue;
+        }
+    }
+
+    /// Parse an "IP:port" string into a std.net.Address.
+    pub fn parseIpPort(str: []const u8) ?std.net.Address {
+        // Find the last ':' for port separator
+        const colon = std.mem.lastIndexOfScalar(u8, str, ':') orelse return null;
+        if (colon == 0 or colon + 1 >= str.len) return null;
+
+        const ip_str = str[0..colon];
+        const port_str = str[colon + 1 ..];
+        const port = std.fmt.parseInt(u16, port_str, 10) catch return null;
+
+        return std.net.Address.parseIp4(ip_str, port) catch
+            std.net.Address.parseIp6(ip_str, port) catch return null;
+    }
+
     /// Peer information returned by getTorrentPeers().
     pub const PeerInfo = struct {
         /// IP:port string, owned by caller.
