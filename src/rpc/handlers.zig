@@ -1633,10 +1633,18 @@ pub const ApiHandler = struct {
         return .{ .body = self.session_manager.default_save_path, .content_type = "text/plain" };
     }
 
-    /// POST /api/v2/transfer/toggleSpeedLimitsMode -- toggle alt speed limits (no-op stub).
+    /// POST /api/v2/transfer/toggleSpeedLimitsMode — 501 Not Implemented.
+    ///
+    /// qBittorrent has an "alternative speed limits" feature: a second set of
+    /// upload/download rate caps that can be toggled manually or on a schedule
+    /// (e.g. lower limits during business hours). Implementing this requires:
+    ///   - A second pair of rate-limit values stored in config and persisted
+    ///   - A toggle flag (normal vs alternative) with persistence
+    ///   - Optional time-based scheduling (cron-style)
+    /// Varuna does not have an alt-speed subsystem. Use `setDownloadLimit` /
+    /// `setUploadLimit` directly, or automate via `cron` + `varuna-ctl`.
     fn handleToggleSpeedLimitsMode(_: *const ApiHandler) server.Response {
-        // Alternative speed limits are not implemented; accept and return OK.
-        return .{ .body = "Ok.", .content_type = "text/plain" };
+        return .{ .status = 501, .body = "{\"error\":\"not implemented: alternative speed limits are not supported. Use setDownloadLimit/setUploadLimit directly.\"}" };
     }
 
     /// GET /api/v2/transfer/downloadLimit -- return global download limit as plain text number.
@@ -1708,9 +1716,18 @@ pub const ApiHandler = struct {
         return .{ .body = "Ok.", .content_type = "text/plain" };
     }
 
-    /// POST /api/v2/torrents/setAutoManagement -- stub (accept and return OK).
+    /// POST /api/v2/torrents/setAutoManagement — 501 Not Implemented.
+    ///
+    /// qBittorrent's "automatic torrent management" moves completed downloads
+    /// to category-specific directories and applies category-level save paths
+    /// automatically. Implementing this requires:
+    ///   - Per-category save path configuration with persistence
+    ///   - A post-completion hook that renames/moves files (io_uring)
+    ///   - Updating PieceStore file mappings after the move
+    /// Varuna does not have an auto-management layer. Use `setLocation` to
+    /// move torrents manually, or automate via `varuna-ctl` scripts.
     fn handleTorrentsSetAutoManagement(_: *const ApiHandler) server.Response {
-        return .{ .body = "Ok.", .content_type = "text/plain" };
+        return .{ .status = 501, .body = "{\"error\":\"not implemented: automatic torrent management is not supported. Use setLocation to move torrents manually.\"}" };
     }
 
     /// POST /api/v2/torrents/setForceStart -- force-start torrents bypassing queue limits.
@@ -1786,14 +1803,28 @@ pub const ApiHandler = struct {
         return .{ .body = body, .owned_body = body };
     }
 
-    /// POST /api/v2/torrents/renameFile -- stub (accept and return OK).
+    /// POST /api/v2/torrents/renameFile — 501 Not Implemented.
+    ///
+    /// Renaming a file within a torrent's download requires:
+    ///   - Filesystem rename via io_uring (daemon I/O policy)
+    ///   - Updating PieceStore's file-to-piece mappings so reads/writes
+    ///     target the new path
+    ///   - Persisting the rename to SQLite so it survives daemon restart
+    ///   - Handling active downloads: the file may be open for writing
+    ///     by the event loop, requiring coordinated close/rename/reopen
+    /// None of this plumbing exists yet.
     fn handleTorrentsRenameFile(_: *const ApiHandler) server.Response {
-        return .{ .body = "Ok.", .content_type = "text/plain" };
+        return .{ .status = 501, .body = "{\"error\":\"not implemented: file rename requires io_uring filesystem ops, PieceStore mapping updates, and SQLite persistence.\"}" };
     }
 
-    /// POST /api/v2/torrents/renameFolder -- stub (accept and return OK).
+    /// POST /api/v2/torrents/renameFolder — 501 Not Implemented.
+    ///
+    /// Same requirements as renameFile, plus:
+    ///   - Recursive directory rename affecting multiple file mappings
+    ///   - Must update all PieceStore entries whose paths are children
+    ///     of the renamed directory
     fn handleTorrentsRenameFolder(_: *const ApiHandler) server.Response {
-        return .{ .body = "Ok.", .content_type = "text/plain" };
+        return .{ .status = 501, .body = "{\"error\":\"not implemented: folder rename requires recursive io_uring filesystem ops, PieceStore mapping updates, and SQLite persistence.\"}" };
     }
 
     /// GET /api/v2/torrents/export -- export .torrent file bytes.

@@ -27,7 +27,7 @@ This document tracks which endpoints are implemented, which return placeholder d
 |---|---|
 | `GET /api/v2/transfer/info` | Full (real DHT node count, speeds, limits) |
 | `GET /api/v2/transfer/speedLimitsMode` | Full |
-| `POST /api/v2/transfer/toggleSpeedLimitsMode` | Stub (no-op, alt-speed not implemented) |
+| `POST /api/v2/transfer/toggleSpeedLimitsMode` | 501 — alt-speed requires a second set of rate limits, toggle flag, and optional scheduling. Use `setDownloadLimit`/`setUploadLimit` directly or automate via `cron` + `varuna-ctl`. |
 | `GET /api/v2/transfer/downloadLimit` | Full |
 | `GET /api/v2/transfer/uploadLimit` | Full |
 | `POST /api/v2/transfer/setDownloadLimit` | Full |
@@ -64,12 +64,12 @@ This document tracks which endpoints are implemented, which return placeholder d
 | `GET /api/v2/torrents/connDiagnostics` | Full (Varuna extension) |
 | `POST /api/v2/torrents/rename` | Full |
 | `POST /api/v2/torrents/toggleSequentialDownload` | Full |
-| `POST /api/v2/torrents/setAutoManagement` | Stub (no-op, auto-management not implemented) |
+| `POST /api/v2/torrents/setAutoManagement` | 501 — auto-management requires per-category save paths, post-completion move hooks (io_uring), and PieceStore mapping updates. Use `setLocation` manually or automate via `varuna-ctl`. |
 | `POST /api/v2/torrents/setForceStart` | Full (bypasses queue limits) |
 | `GET /api/v2/torrents/pieceStates` | Full |
 | `GET /api/v2/torrents/pieceHashes` | Full (v1 only) |
-| `POST /api/v2/torrents/renameFile` | Stub (accepts request, returns OK) |
-| `POST /api/v2/torrents/renameFolder` | Stub (accepts request, returns OK) |
+| `POST /api/v2/torrents/renameFile` | 501 — requires io_uring filesystem rename, PieceStore mapping updates, SQLite persistence, and coordination with active downloads. |
+| `POST /api/v2/torrents/renameFolder` | 501 — same as renameFile plus recursive directory handling across multiple file mappings. |
 | `GET /api/v2/torrents/export` | Full |
 | `POST /api/v2/torrents/addPeers` | Full |
 

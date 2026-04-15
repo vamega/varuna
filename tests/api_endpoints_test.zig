@@ -54,12 +54,11 @@ test "defaultSavePath returns plain text" {
     try std.testing.expectEqualStrings("/tmp/test-downloads", resp.body);
 }
 
-test "toggleSpeedLimitsMode returns Ok" {
+test "toggleSpeedLimitsMode returns 501 Not Implemented" {
     var ctx = TestCtx.init();
     defer ctx.deinit();
     const resp = ctx.handle("POST", "/api/v2/transfer/toggleSpeedLimitsMode", "");
-    try std.testing.expectEqual(@as(u16, 200), resp.status);
-    try std.testing.expectEqualStrings("Ok.", resp.body);
+    try std.testing.expectEqual(@as(u16, 501), resp.status);
 }
 
 test "transfer/downloadLimit returns 0 without event loop" {
@@ -117,12 +116,11 @@ test "torrents/toggleSequentialDownload requires hashes" {
     try std.testing.expectEqual(@as(u16, 400), resp.status);
 }
 
-test "torrents/setAutoManagement returns Ok stub" {
+test "torrents/setAutoManagement returns 501 Not Implemented" {
     var ctx = TestCtx.init();
     defer ctx.deinit();
     const resp = ctx.handle("POST", "/api/v2/torrents/setAutoManagement", "hashes=abc&enable=true");
-    try std.testing.expectEqual(@as(u16, 200), resp.status);
-    try std.testing.expectEqualStrings("Ok.", resp.body);
+    try std.testing.expectEqual(@as(u16, 501), resp.status);
 }
 
 test "torrents/setForceStart requires hashes" {
@@ -160,20 +158,18 @@ test "torrents/pieceHashes with unknown hash returns 404" {
     try std.testing.expectEqual(@as(u16, 404), resp.status);
 }
 
-test "torrents/renameFile returns Ok stub" {
+test "torrents/renameFile returns 501 Not Implemented" {
     var ctx = TestCtx.init();
     defer ctx.deinit();
     const resp = ctx.handle("POST", "/api/v2/torrents/renameFile", "hash=abc&oldPath=a&newPath=b");
-    try std.testing.expectEqual(@as(u16, 200), resp.status);
-    try std.testing.expectEqualStrings("Ok.", resp.body);
+    try std.testing.expectEqual(@as(u16, 501), resp.status);
 }
 
-test "torrents/renameFolder returns Ok stub" {
+test "torrents/renameFolder returns 501 Not Implemented" {
     var ctx = TestCtx.init();
     defer ctx.deinit();
     const resp = ctx.handle("POST", "/api/v2/torrents/renameFolder", "hash=abc&oldPath=a&newPath=b");
-    try std.testing.expectEqual(@as(u16, 200), resp.status);
-    try std.testing.expectEqualStrings("Ok.", resp.body);
+    try std.testing.expectEqual(@as(u16, 501), resp.status);
 }
 
 test "torrents/export with unknown hash returns 404" {
