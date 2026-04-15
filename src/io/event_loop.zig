@@ -397,8 +397,14 @@ pub const EventLoop = struct {
         // ── Phase 2: Drain the ring ──────────────────────────────
         // After closing fds, any in-flight SQEs will complete with
         // errors. Drain all remaining CQEs so the kernel is finished
-        // touching our buffer memory before we free it. This prevents
-        // use-after-free under GPA (debug poison 0xAA fill on free).
+        // touching our buffer memory before we free it.
+        //
+        // Null out external references first — stale CQEs from closed
+        // fds may route to handlers for already-freed objects (e.g. DHT
+        // engine freed by main() before this deinit runs).
+        self.dht_engine = null;
+        self.tracker_executor = null;
+        self.udp_tracker_executor = null;
         self.drainRemainingCqes();
 
         // Clean up active async state machines (metadata fetch, recheck)
