@@ -106,7 +106,7 @@ port_max = ${SEED_PORT}
 dht = false
 pex = false
 encryption = "disabled"
-enable_utp = false
+enable_utp = true
 EOF
 
 cat >"$WORK_DIR/download-daemon/varuna.toml" <<EOF
@@ -126,7 +126,7 @@ port_max = ${DOWNLOAD_PORT}
 dht = false
 pex = false
 encryption = "disabled"
-enable_utp = false
+enable_utp = true
 EOF
 
 # ── Start seeder daemon ─────────────────────────────────

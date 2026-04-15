@@ -528,7 +528,12 @@ fn handleUtpSendComplete(self: *EventLoop, peer_slot: u16) void {
                 peer.state = .inbound_extension_handshake_send;
                 submitUtpExtensionHandshake(self, peer_slot) catch {
                     sendUtpInboundBitfieldOrUnchoke(self, peer_slot);
+                    return;
                 };
+                // Drive the state machine forward — without this, the peer
+                // stays in .inbound_extension_handshake_send and deliverUtpData
+                // drops all incoming data in the `else => {}` branch.
+                handleUtpSendComplete(self, peer_slot);
             } else {
                 sendUtpInboundBitfieldOrUnchoke(self, peer_slot);
             }
