@@ -313,7 +313,7 @@ pub const UtpSocket = struct {
         self.recv_id = syn.connection_id +% 1;
         self.send_id = syn.connection_id;
         self.ack_nr = syn.seq_nr;
-        self.seq_nr = 1;
+        self.seq_nr = 1; // SYN-ACK uses seq_nr=1, then incremented to 2
         self.state = .connected;
         self.last_recv_timestamp = syn.timestamp_us;
         self.last_recv_time = now_us;
@@ -330,6 +330,9 @@ pub const UtpSocket = struct {
         };
 
         self.last_send_time_us = now_us;
+        // Increment seq_nr after SYN-ACK so the first DATA uses seq_nr=2.
+        // The remote expects ack_nr+1 for the next data after our SYN-ACK.
+        self.seq_nr +%= 1;
         return hdr.encode();
     }
 

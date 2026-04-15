@@ -278,6 +278,19 @@ pub fn build(b: *std.Build) void {
     const test_transfer_step = b.step("test-transfer", "Run single-process piece transfer integration test");
     test_transfer_step.dependOn(&run_transfer_tests.step);
 
+    // ── uTP byte stream tests ─────────────────────────────
+    const utp_bs_tests = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("tests/utp_bytestream_test.zig"),
+            .target = target,
+            .optimize = optimize,
+            .imports = &varuna_import,
+        }),
+    });
+    const run_utp_bs = b.addRunArtifact(utp_bs_tests);
+    const test_utp_bs_step = b.step("test-utp", "Run uTP byte stream tests (handshake, messages, fragmentation)");
+    test_utp_bs_step.dependOn(&run_utp_bs.step);
+
     // ── Recheck tests (parallel recheck, fast resume) ─────
     const recheck_tests = b.addTest(.{
         .root_module = b.createModule(.{
