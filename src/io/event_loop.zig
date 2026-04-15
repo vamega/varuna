@@ -867,22 +867,11 @@ pub const EventLoop = struct {
             .address = address,
         };
 
-        const fd = try posix.socket(
-            family,
-            posix.SOCK.STREAM | posix.SOCK.CLOEXEC | posix.SOCK.NONBLOCK,
-            posix.IPPROTO.TCP,
-        );
-        errdefer posix.close(fd);
-        peer.fd = fd;
-
-        socket_util.configurePeerSocket(fd);
-
-        // Apply bind configuration (SO_BINDTODEVICE and/or local address) to outbound socket
-        try socket_util.applyBindConfig(fd, self.bind_device, self.bind_address, 0);
-
-        const ud = encodeUserData(.{ .slot = slot, .op_type = .peer_connect, .context = 0 });
-        // Use peer.address (stored in slot) not the parameter (stack-local, dangling after return)
-        _ = try self.ring.connect(ud, fd, &peer.address.any, peer.address.getOsSockLen());
+        // Submit async socket creation via io_uring (IORING_OP_SOCKET, kernel 5.19+).
+        // The CQE handler (peer_handler.handleSocketCreated) will configure the fd
+        // and chain the CONNECT SQE.
+        const ud = encodeUserData(.{ .slot = slot, .op_type = .peer_socket, .context = 0 });
+        _ = try self.ring.socket(ud, family, posix.SOCK.STREAM | posix.SOCK.CLOEXEC | posix.SOCK.NONBLOCK, posix.IPPROTO.TCP, 0);
 
         self.peer_count += 1;
         self.half_open_count += 1;
@@ -1511,6 +1500,7 @@ pub const EventLoop = struct {
     fn dispatch(self: *EventLoop, cqe: linux.io_uring_cqe) void {
         const op = decodeUserData(cqe.user_data);
         switch (op.op_type) {
+            .peer_socket => peer_handler.handleSocketCreated(self, op.slot, cqe),
             .peer_connect => peer_handler.handleConnect(self, op.slot, cqe),
             .peer_recv => peer_handler.handleRecv(self, op.slot, cqe),
             .peer_send => peer_handler.handleSend(self, op.slot, cqe),
@@ -1522,14 +1512,14 @@ pub const EventLoop = struct {
             },
             .utp_recv => utp_handler.handleUtpRecv(self, cqe),
             .utp_send => utp_handler.handleUtpSend(self, cqe),
-            .http_connect, .http_send, .http_recv => {
+            .http_socket, .http_connect, .http_send, .http_recv => {
                 if (self.tracker_executor) |te| te.dispatchCqe(cqe);
             },
             .cancel => {},
             .api_accept => if (self.api_server) |srv| srv.handleAcceptCqe(cqe),
             .api_recv => if (self.api_server) |srv| srv.handleRecvCqe(op.slot, op.context, cqe),
             .api_send => if (self.api_server) |srv| srv.handleSendCqe(op.slot, op.context, cqe),
-            .udp_tracker_send, .udp_tracker_recv => {
+            .udp_socket, .udp_tracker_send, .udp_tracker_recv => {
                 if (self.udp_tracker_executor) |ute| ute.dispatchCqe(cqe);
             },
             .timerfd => {

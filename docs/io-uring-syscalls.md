@@ -15,7 +15,7 @@ This document tracks which syscalls the `varuna` **daemon** uses, which are rout
 | `recv()` | `IORING_OP_RECV` | `peer_wire` via `Ring.recv_exact` | Done |
 | `connect()` | `IORING_OP_CONNECT` | `transport.tcpConnect` via `Ring.connect` | Done |
 | `accept()` | `IORING_OP_ACCEPT` | `transport.tcpAccept` via `Ring.accept` | Done |
-| `socket()` | `IORING_OP_SOCKET` | `transport.tcpConnect` via `Ring.socket` | Done |
+| `socket()` | `IORING_OP_SOCKET` | Peer connections (`addPeerForTorrent`, `reconnectPeer`), HTTP tracker (`TrackerExecutor.startConnect`), UDP tracker (`UdpTrackerExecutor.startUdpRequest`) | Done |
 | `fdatasync()` | `IORING_OP_FSYNC` + `DATASYNC` | `PieceStore.sync` via `Ring.fdatasync` | Done |
 | `fallocate()` | `IORING_OP_FALLOCATE` | `PieceStore.init` via `Ring.fallocate` | Done |
 | `shutdown()` | `IORING_OP_SHUTDOWN` | `Ring.shutdown` -- clean peer disconnects | Done |
@@ -44,8 +44,7 @@ This document tracks which syscalls the `varuna` **daemon** uses, which are rout
 | `ftruncate()` | `PieceStore.init` -- pre-allocate file size | One-time setup | Yes (`IORING_OP_FTRUNCATE`, kernel 6.2) |
 | `close()` | `PieceStore.deinit`, peer socket cleanup | Cleanup path | Yes (`IORING_OP_CLOSE`, kernel 5.6) |
 | `openat+read+close` | `app.zig` -- reading `.torrent` file | Once at startup | Low value |
-| ~~`socket()`~~ | ~~`transport.tcpConnect`~~ | ~~Moved to io_uring~~ | Done via `Ring.socket` |
-| `socket+bind+listen` | `client.zig` seed mode -- listen socket | Once at startup | Low value |
+| `socket+bind+listen` | `main.zig` listen socket, `rpc/server.zig` API server, `event_loop.zig` UDP listener | Once at startup, `bind`/`listen` need kernel 6.11+ (`IORING_OP_BIND`/`LISTEN`) | `socket` done; `bind`/`listen` blocked on kernel 6.11 |
 | ~~HTTP stack~~ | ~~`std.http.Client` in `announce.zig`~~ | ~~Tracker announce~~ | **Resolved**: blocking tracker functions removed; all tracker I/O through ring-based executors |
 | `pwritev` | stdout logging via `std.Io.Writer` | Infrequent status messages | Low value -- not hot path |
 | `openat+read+close` | `app.zig` -- `.torrent` file read | Once at startup | Low value |
@@ -66,6 +65,8 @@ This document tracks which syscalls the `varuna` **daemon** uses, which are rout
 | ~~`recvmsg()`~~ | ~~`IORING_OP_RECVMSG`~~ | ~~5.3~~ | ~~Scatter/gather for DHT UDP~~ Done: uTP, DHT, UDP tracker |
 | `setsockopt()` | `IORING_OP_SETSOCKOPT` | 6.7 | Socket buffer sizes, TCP options |
 | `getsockopt()` | `IORING_OP_GETSOCKOPT` | 6.7 | Reading socket state |
+| `bind()` | `IORING_OP_BIND` | 6.11 | Async listen socket bind (startup only) |
+| `listen()` | `IORING_OP_LISTEN` | 6.11 | Async listen socket setup (startup only) |
 | `epoll_ctl()` | `IORING_OP_EPOLL_CTL` | 5.6 | Managing fd watch sets (unlikely needed if io_uring is primary) |
 | `madvise()` | `IORING_OP_MADVISE` | 5.6 | Hinting huge page usage on piece cache |
 
@@ -126,8 +127,8 @@ This document tracks which syscalls the `varuna` **daemon** uses, which are rout
 | Syscall | Used For | Workaround |
 |---------|----------|------------|
 | `getaddrinfo()` | Resolving tracker hostnames | Threadpool, or c-ares async resolver (see DNS notes below) |
-| `bind()` | Binding listen socket, DHT UDP port | Call once at startup, not on hot path |
-| `listen()` | Listening for incoming peers | Call once at startup |
+| `bind()` | Binding listen socket, DHT UDP port | `IORING_OP_BIND` available in kernel 6.11+; call once at startup, not on hot path |
+| `listen()` | Listening for incoming peers | `IORING_OP_LISTEN` available in kernel 6.11+; call once at startup |
 | `getpeername()`/`getsockname()` | Getting peer address after accept | Call inline after `IORING_OP_ACCEPT`, not on hot path |
 | `mmap()` | Allocating huge-page piece cache | Call at startup during pool setup, not on hot path |
 | `mlock()` | Pinning piece cache in RAM | Call once after mmap() |

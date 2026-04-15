@@ -41,6 +41,9 @@ pub const OpType = enum(u8) {
     metadata_connect = 20,
     metadata_send = 21,
     metadata_recv = 22,
+    peer_socket = 23,
+    http_socket = 24,
+    udp_socket = 25,
 };
 
 pub const OpData = struct {

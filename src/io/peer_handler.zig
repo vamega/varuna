@@ -90,6 +90,39 @@ pub fn handleAccept(self: *EventLoop, cqe: linux.io_uring_cqe) void {
     };
 }
 
+/// Handle completion of async socket creation (IORING_OP_SOCKET).
+/// Configures the new fd (TCP options, bind config) and chains the
+/// CONNECT SQE to initiate the peer connection.
+pub fn handleSocketCreated(self: *EventLoop, slot: u16, cqe: linux.io_uring_cqe) void {
+    const peer = &self.peers[slot];
+    if (peer.state == .free) {
+        // Slot was freed while socket creation was pending — close the fd.
+        if (cqe.res >= 0) posix.close(@intCast(cqe.res));
+        return;
+    }
+
+    if (cqe.res < 0) {
+        log.warn("async socket creation failed for slot {d}: errno={d}", .{ slot, -cqe.res });
+        self.removePeer(slot);
+        return;
+    }
+
+    const fd: posix.fd_t = @intCast(cqe.res);
+    peer.fd = fd;
+
+    socket_util.configurePeerSocket(fd);
+    socket_util.applyBindConfig(fd, self.bind_device, self.bind_address, 0) catch {
+        self.removePeer(slot);
+        return;
+    };
+
+    const ud = encodeUserData(.{ .slot = slot, .op_type = .peer_connect, .context = 0 });
+    _ = self.ring.connect(ud, fd, &peer.address.any, peer.address.getOsSockLen()) catch {
+        self.removePeer(slot);
+        return;
+    };
+}
+
 pub fn handleConnect(self: *EventLoop, slot: u16, cqe: linux.io_uring_cqe) void {
     // Connection attempt completed (success or failure) -- no longer half-open
     if (self.half_open_count > 0) self.half_open_count -= 1;
@@ -760,26 +793,11 @@ fn attemptMseFallback(self: *EventLoop, slot: u16) void {
     peer.crypto = mse.PeerCrypto.plaintext;
     peer.handshake_offset = 0;
 
-    // Create new socket and reconnect
+    // Submit async socket creation — handleSocketCreated will configure
+    // the fd and chain the CONNECT SQE.
     const family = address.any.family;
-    const fd = posix.socket(
-        family,
-        posix.SOCK.STREAM | posix.SOCK.CLOEXEC | posix.SOCK.NONBLOCK,
-        posix.IPPROTO.TCP,
-    ) catch {
-        self.removePeer(slot);
-        return;
-    };
-    peer.fd = fd;
-
-    // Apply bind configuration
-    socket_util.applyBindConfig(fd, self.bind_device, self.bind_address, 0) catch {
-        self.removePeer(slot);
-        return;
-    };
-
-    const ud = encodeUserData(.{ .slot = slot, .op_type = .peer_connect, .context = 0 });
-    _ = self.ring.connect(ud, fd, &peer.address.any, peer.address.getOsSockLen()) catch {
+    const ud = encodeUserData(.{ .slot = slot, .op_type = .peer_socket, .context = 0 });
+    _ = self.ring.socket(ud, family, posix.SOCK.STREAM | posix.SOCK.CLOEXEC | posix.SOCK.NONBLOCK, posix.IPPROTO.TCP, 0) catch {
         self.removePeer(slot);
         return;
     };

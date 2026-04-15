@@ -229,6 +229,7 @@ pub const UdpTrackerExecutor = struct {
         const slot = &self.slots[op.slot];
 
         switch (op.op_type) {
+            .udp_socket => self.handleSocketCreated(slot, op.slot, cqe),
             .udp_tracker_send => self.handleSend(slot, op.slot, cqe),
             .udp_tracker_recv => self.handleRecv(slot, op.slot, cqe),
             else => {},
@@ -317,15 +318,29 @@ pub const UdpTrackerExecutor = struct {
     // ── UDP request flow ─────────────────────────────────────
 
     fn startUdpRequest(self: *UdpTrackerExecutor, slot: *RequestSlot, slot_idx: u16) void {
-        // Create a UDP socket
+        // Submit async socket creation via io_uring — handleSocketCreated
+        // will set the destination and start the BEP 15 flow.
         const family: u32 = slot.address.any.family;
-        const fd = posix.socket(family, posix.SOCK.DGRAM | posix.SOCK.CLOEXEC | posix.SOCK.NONBLOCK, posix.IPPROTO.UDP) catch {
+        const ud = encodeUserData(.{ .slot = slot_idx, .op_type = .udp_socket, .context = 0 });
+        _ = self.ring.socket(ud, family, posix.SOCK.DGRAM | posix.SOCK.CLOEXEC | posix.SOCK.NONBLOCK, posix.IPPROTO.UDP, 0) catch {
             self.completeSlot(slot_idx, .{ .err = error.SocketCreateFailed });
             return;
         };
+        slot.state = .connecting;
+    }
+
+    /// Handle async UDP socket creation CQE — set destination and start BEP 15 flow.
+    fn handleSocketCreated(self: *UdpTrackerExecutor, slot: *RequestSlot, slot_idx: u16, cqe: linux.io_uring_cqe) void {
+        if (cqe.res < 0) {
+            self.completeSlot(slot_idx, .{ .err = error.SocketCreateFailed });
+            return;
+        }
+
+        const fd: posix.fd_t = @intCast(cqe.res);
         slot.fd = fd;
 
-        // Connect the UDP socket so we can use send/recv instead of sendto/recvfrom
+        // Connect the UDP socket so we can use send/recv instead of sendto/recvfrom.
+        // UDP connect just sets the destination address — no network I/O, always instant.
         posix.connect(fd, &slot.address.any, slot.address.getOsSockLen()) catch {
             self.completeSlot(slot_idx, .{ .err = error.ConnectionRefused });
             return;
@@ -334,13 +349,11 @@ pub const UdpTrackerExecutor = struct {
         // Check connection ID cache
         if (self.conn_cache.get(slot.job.hostSlice(), slot.job.port)) |conn_id| {
             slot.connection_id = conn_id;
-            // Skip connect, go directly to announce/scrape
             switch (slot.job.kind) {
                 .announce => self.startAnnounce(slot, slot_idx),
                 .scrape => self.startScrape(slot, slot_idx),
             }
         } else {
-            // Need to do BEP 15 connect first
             self.startConnect(slot, slot_idx);
         }
     }

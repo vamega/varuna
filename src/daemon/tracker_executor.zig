@@ -311,6 +311,7 @@ pub const TrackerExecutor = struct {
         const slot = &self.slots[op.slot];
 
         switch (op.op_type) {
+            .http_socket => self.handleSocketCreated(slot, op.slot, cqe),
             .http_connect => self.handleConnect(slot, op.slot, cqe),
             .http_send => self.handleSend(slot, op.slot, cqe),
             .http_recv => self.handleRecv(slot, op.slot, cqe),
@@ -443,10 +444,25 @@ pub const TrackerExecutor = struct {
 
     fn startConnect(self: *TrackerExecutor, slot: *RequestSlot, slot_idx: u16) void {
         const family: u32 = slot.address.any.family;
-        const fd = posix.socket(family, posix.SOCK.STREAM | posix.SOCK.CLOEXEC | posix.SOCK.NONBLOCK, posix.IPPROTO.TCP) catch {
+        // Submit async socket creation — handleSocketCreated will chain the connect.
+        const ud = encodeUserData(.{ .slot = slot_idx, .op_type = .http_socket, .context = 0 });
+        _ = self.ring.socket(ud, family, posix.SOCK.STREAM | posix.SOCK.CLOEXEC | posix.SOCK.NONBLOCK, posix.IPPROTO.TCP, 0) catch {
             self.completeSlot(slot_idx, .{ .err = error.SocketCreateFailed });
             return;
         };
+        slot.state = .connecting;
+    }
+
+    /// Handle async socket creation CQE — store the fd and chain the connect.
+    fn handleSocketCreated(self: *TrackerExecutor, slot: *RequestSlot, slot_idx: u16, cqe: linux.io_uring_cqe) void {
+        if (slot.state != .connecting) return;
+
+        if (cqe.res < 0) {
+            self.completeSlot(slot_idx, .{ .err = error.SocketCreateFailed });
+            return;
+        }
+
+        const fd: posix.fd_t = @intCast(cqe.res);
         slot.fd = fd;
 
         const ud = encodeUserData(.{ .slot = slot_idx, .op_type = .http_connect, .context = 0 });
@@ -460,8 +476,6 @@ pub const TrackerExecutor = struct {
         sqe.flags |= linux.IOSQE_IO_LINK;
         const ts = linux.kernel_timespec{ .sec = 10, .nsec = 0 };
         _ = self.ring.link_timeout(ud + 1, &ts, 0) catch {};
-
-        slot.state = .connecting;
     }
 
     fn handleConnect(self: *TrackerExecutor, slot: *RequestSlot, slot_idx: u16, cqe: linux.io_uring_cqe) void {
