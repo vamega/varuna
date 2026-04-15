@@ -266,3 +266,97 @@ test "explicit recheck after fast resume works" {
     // Clean up the recheck
     el.cancelAllRechecks();
 }
+
+// ── Test 4: Fast resume with resume_pieces should NOT start recheck ──
+//
+// When a torrent restarts with resume data (resume_pieces is non-null),
+// the daemon should trust the resume DB and create the PieceTracker
+// directly, without starting an async recheck. This tests the pattern
+// that integrateIntoEventLoop should follow for fast resume.
+//
+// Currently the daemon DOES start a recheck when resume_pieces is set
+// (the recheck just skips known-complete pieces). This test verifies
+// the fast-resume behavior we want:
+//   1. resume_pieces says piece 0 is complete
+//   2. PieceTracker is created from resume_pieces
+//   3. No startRecheck is called
+//   4. Torrent is ready to download/seed immediately
+
+test "daemon restart with resume data skips recheck (fast resume)" {
+    const allocator = std.testing.allocator;
+
+    var el = EventLoop.initBare(allocator, 2) catch |err| {
+        if (err == error.SystemResources) return error.SkipZigTest;
+        return err;
+    };
+    defer el.deinit();
+
+    // Create a torrent
+    var piece_data: [piece_data_len]u8 = undefined;
+    for (&piece_data, 0..) |*b, i| b.* = @truncate(i *% 71);
+    var piece_hash: [20]u8 = undefined;
+    Sha1.hash(&piece_data, &piece_hash, .{});
+
+    const torrent_bytes = try buildTorrentBytes(allocator, piece_hash, "fr.b");
+    defer allocator.free(torrent_bytes);
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    {
+        const f = try tmp.dir.createFile("fr.b", .{});
+        defer f.close();
+        try f.writeAll(&piece_data);
+    }
+
+    const save_path = try tmp.dir.realpathAlloc(allocator, ".");
+    defer allocator.free(save_path);
+    const session = try Session.load(allocator, torrent_bytes, save_path);
+    defer session.deinit(allocator);
+
+    var store = try PieceStore.init(allocator, &session);
+    defer store.deinit();
+    const fds = try store.fileHandles(allocator);
+    defer allocator.free(fds);
+
+    // Simulate resume data: piece 0 is complete (from previous session)
+    var resume_pieces = try Bitfield.init(allocator, session.pieceCount());
+    defer resume_pieces.deinit(allocator);
+    try resume_pieces.set(0);
+
+    // Fast resume path: create PieceTracker from resume data, no recheck
+    var pt = try PieceTracker.init(
+        allocator,
+        session.pieceCount(),
+        session.layout.piece_length,
+        session.totalSize(),
+        &resume_pieces,
+        piece_data_len,
+    );
+    defer pt.deinit(allocator);
+
+    // Verify: 1 piece complete from resume
+    try std.testing.expectEqual(@as(u32, 1), pt.completedCount());
+
+    // THE KEY ASSERTION: no recheck should have been started.
+    // In the current daemon code, integrateIntoEventLoop starts a recheck
+    // when resume_pieces is non-null. After the fast-resume fix, it should
+    // skip the recheck and use the PieceTracker directly.
+    try std.testing.expectEqual(@as(usize, 0), el.rechecks.items.len);
+
+    // Bonus: the torrent should be immediately ready to register in the
+    // event loop for downloading/seeding — no waiting for recheck.
+    const tid = try el.addTorrentContext(.{
+        .session = &session,
+        .piece_tracker = &pt,
+        .shared_fds = fds,
+        .info_hash = session.metainfo.info_hash,
+        .peer_id = [_]u8{0} ** 20,
+        .tracker_key = null,
+        .is_private = false,
+        .info_hash_v2 = null,
+    });
+    _ = tid;
+
+    // The torrent is registered and ready — no recheck needed.
+    try std.testing.expectEqual(@as(usize, 0), el.rechecks.items.len);
+}

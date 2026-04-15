@@ -449,7 +449,6 @@ pub const TorrentSession = struct {
         var action: Action = .none;
         var sel_ptr: ?*EventLoop = null;
         var peers_snapshot: ?[]const std.net.Address = null;
-        var known_ptr: ?*const Bitfield = null;
 
         {
             self.mutex.lock();
@@ -464,13 +463,18 @@ pub const TorrentSession = struct {
                 peers_snapshot = self.pending_peers orelse &[_]std.net.Address{};
                 self.background_init_done.store(false, .release);
             } else if (self.state == .checking and self.session != null and self.shared_fds != null) {
-                // If there's no resume data, skip the expensive piece-by-piece
-                // recheck — all pieces are known incomplete (fresh download).
-                if (self.resume_pieces == null) {
+                if (self.resume_pieces != null) {
+                    // Fast resume: resume DB has saved state. Trust it and
+                    // create PieceTracker directly without rechecking.
                     action = .skip_recheck;
-                } else {
+                } else if (self.resume_writer != null) {
+                    // Resume DB exists but no saved pieces for this torrent.
+                    // This could be a fresh download OR imported data without
+                    // prior resume state. Recheck to discover existing data.
                     action = .recheck;
-                    known_ptr = if (self.resume_pieces) |*rp| rp else null;
+                } else {
+                    // No resume DB at all — fresh download, no data on disk.
+                    action = .skip_recheck;
                 }
                 self.background_init_done.store(false, .release);
             }
@@ -502,7 +506,7 @@ pub const TorrentSession = struct {
                     &self.session.?,
                     self.shared_fds.?,
                     0,
-                    known_ptr,
+                    null, // no known_complete — recheck everything
                     onRecheckComplete,
                     @ptrCast(self),
                 ) catch {
@@ -515,27 +519,60 @@ pub const TorrentSession = struct {
                 return true;
             },
             .skip_recheck => {
-                // Fresh download with no resume data — skip piece-by-piece
-                // recheck and create an empty PieceTracker immediately.
+                // Fast resume: trust resume DB or start fresh (no data).
+                // Create PieceTracker from resume_pieces if available,
+                // otherwise create an empty one.
                 self.mutex.lock();
                 defer self.mutex.unlock();
 
                 const session = &(self.session orelse return false);
-                var empty_bf = Bitfield.init(self.allocator, session.pieceCount()) catch return false;
+
+                // Use resume_pieces if available (restart), or create empty (fresh)
+                var bytes_complete: u64 = 0;
+                const initial_bf: *const Bitfield = if (self.resume_pieces) |*rp| blk: {
+                    // Calculate bytes from resume piece count
+                    var idx: u32 = 0;
+                    while (idx < session.pieceCount()) : (idx += 1) {
+                        if (rp.has(idx)) {
+                            bytes_complete += session.layout.pieceSize(idx) catch 0;
+                        }
+                    }
+                    break :blk rp;
+                } else blk: {
+                    // No resume data — all pieces incomplete
+                    const empty = Bitfield.init(self.allocator, session.pieceCount()) catch return false;
+                    // Store it temporarily so we can take a pointer
+                    self.resume_pieces = empty;
+                    break :blk &self.resume_pieces.?;
+                };
+
                 const pt = PieceTracker.init(
                     self.allocator,
                     session.pieceCount(),
                     session.layout.piece_length,
                     session.totalSize(),
-                    &empty_bf,
-                    0,
-                ) catch {
-                    empty_bf.deinit(self.allocator);
-                    return false;
-                };
-                empty_bf.deinit(self.allocator);
+                    initial_bf,
+                    bytes_complete,
+                ) catch return false;
                 self.piece_tracker = pt;
-                self.state = .downloading;
+
+                // Free resume_pieces — PieceTracker made its own copy
+                if (self.resume_pieces) |*rp| {
+                    rp.deinit(self.allocator);
+                    self.resume_pieces = null;
+                }
+
+                // Determine state based on completion
+                if (bytes_complete == session.totalSize()) {
+                    self.state = .seeding;
+                    if (self.completion_on == 0) {
+                        self.completion_on = std.time.timestamp();
+                    }
+                    self.pending_seed_setup = true;
+                } else {
+                    self.state = .downloading;
+                }
+
                 if (self.pending_peers == null) {
                     self.pending_peers = self.allocator.alloc(std.net.Address, 0) catch null;
                 }
