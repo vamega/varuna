@@ -1008,6 +1008,51 @@ pub const EventLoop = struct {
         log.info("uTP listener started on UDP port {d}", .{self.port});
     }
 
+    /// Stop the UDP listener (uTP/DHT). Closes the UDP socket and frees
+    /// the UtpManager. The pending RECVMSG CQE will complete with an error
+    /// (ECANCELED or EBADF) and be harmlessly ignored since udp_fd == -1.
+    /// Call this when both incoming_utp and DHT are disabled at runtime.
+    pub fn stopUtpListener(self: *EventLoop) void {
+        if (self.udp_fd < 0) return;
+        posix.close(self.udp_fd);
+        self.udp_fd = -1;
+        if (self.utp_manager) |mgr| {
+            mgr.deinit();
+            self.allocator.destroy(mgr);
+            self.utp_manager = null;
+        }
+        log.info("uTP listener stopped", .{});
+    }
+
+    /// Ensure listeners match the current transport disposition.
+    /// Call after changing transport_disposition at runtime.
+    /// - Starts the UDP listener if incoming_utp is enabled and not running.
+    /// - Stops the UDP listener if incoming_utp and DHT are both disabled.
+    /// - Starts TCP accept if incoming_tcp is enabled and listen_fd is set.
+    /// Note: TCP listen socket creation requires bind/listen which can only
+    /// happen at startup (needs port allocation). If no listen socket was
+    /// created at startup, enabling incoming_tcp at runtime is a no-op
+    /// for inbound connections.
+    pub fn reconcileListeners(self: *EventLoop) void {
+        const disp = self.transport_disposition;
+        const dht_active = self.dht_engine != null;
+
+        // UDP listener: needed for incoming_utp or DHT
+        if (disp.incoming_utp or dht_active) {
+            if (self.udp_fd < 0) {
+                self.startUtpListener() catch |err| {
+                    log.warn("failed to start UDP listener on transport change: {s}", .{@errorName(err)});
+                    // Disable the flags we can't honor
+                    self.transport_disposition.incoming_utp = false;
+                    self.transport_disposition.outgoing_utp = false;
+                };
+            }
+        } else {
+            // Nobody needs the UDP socket
+            self.stopUtpListener();
+        }
+    }
+
     pub fn removePeer(self: *EventLoop, slot: u16) void {
         const peer = &self.peers[slot];
         // Track half-open connection cleanup

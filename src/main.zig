@@ -111,7 +111,7 @@ pub fn main() !void {
     // Initialize DHT engine (BEP 5), persistence DB, and bootstrap nodes.
     shared_el.port = cfg.network.port_min;
     shared_el.pex_enabled = cfg.network.pex;
-    const transport_disp = try cfg.network.resolveTransportDisposition();
+    const transport_disp = cfg.network.resolveTransportDisposition();
     shared_el.transport_disposition = transport_disp;
 
     var dht_state = try initDht(allocator, shared_el, cfg, stdout);
@@ -207,7 +207,7 @@ pub fn main() !void {
             }
         }
     }
-    if (listen_fd < 0) {
+    if (listen_fd < 0 and transport_disp.incoming_tcp) {
         if (createListenSocket(cfg.network)) |result| {
             listen_fd = result.fd;
             session_manager.port = result.port;

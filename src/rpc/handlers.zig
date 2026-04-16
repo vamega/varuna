@@ -686,6 +686,9 @@ pub const ApiHandler = struct {
                     el.transport_disposition = config_mod.TransportDisposition.fromEnableUtp(v);
                 }
             }
+
+            // Reconcile listeners: start/stop UDP listener as needed
+            el.reconcileListeners();
         } else {
             if (extractParamMut(body, "dl_limit")) |dl_str| {
                 const dl = std.fmt.parseInt(u64, dl_str, 10) catch
@@ -780,6 +783,9 @@ pub const ApiHandler = struct {
                     el.transport_disposition = config_mod.TransportDisposition.fromEnableUtp(enable);
                 }
             }
+
+            // Reconcile listeners: start/stop UDP listener as needed
+            el.reconcileListeners();
         }
 
         // Handle banned_IPs: newline-separated list of IPs and CIDRs (form-encoded only)
