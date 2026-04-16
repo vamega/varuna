@@ -141,9 +141,6 @@ pub fn tryAssignWebSeedPieces(el: *EventLoop) void {
             log.debug("web seed: assigned piece {d} to seed {d} ({d} ranges)", .{
                 piece_index, seed_index, ranges.len,
             });
-
-            // Only assign one piece per tick per torrent to spread load
-            break;
         }
     }
 }
@@ -264,15 +261,16 @@ fn webSeedRangeComplete(context: *anyopaque, result: HttpExecutor.RequestResult)
         });
         slot.ranges_failed = true;
 
-        // Disable seed on 404 (file not found)
+        // Classify the failure for backoff decisions
         if (result.status == 404) {
-            const tc = el.getTorrentContext(slot.torrent_id) orelse {
-                failSlot(el, slot);
-                return;
-            };
-            if (tc.web_seed_manager) |wsm| {
-                wsm.disable(slot.seed_index);
+            // Disable seed permanently on 404 (file not found)
+            if (el.getTorrentContext(slot.torrent_id)) |tc| {
+                if (tc.web_seed_manager) |wsm| wsm.disable(slot.seed_index);
             }
+        } else if (result.status == 0 and result.err == null) {
+            // status=0 with no error = stale pooled connection dropped.
+            // Not the seed's fault — mark idle for immediate retry, no backoff.
+            slot.ranges_failed = false; // treat as retryable, not a real failure
         }
     }
 
@@ -285,6 +283,14 @@ fn webSeedRangeComplete(context: *anyopaque, result: HttpExecutor.RequestResult)
     if (slot.ranges_failed) {
         failSlot(el, slot);
         return;
+    }
+
+    // Mark the seed as idle immediately so the next piece can start
+    // downloading while this one is being hash-verified and written.
+    if (el.getTorrentContext(slot.torrent_id)) |tc| {
+        if (tc.web_seed_manager) |wsm| {
+            wsm.markSuccess(slot.seed_index, slot.piece_size);
+        }
     }
 
     // Submit to hasher for verification
@@ -338,11 +344,6 @@ fn submitToHasher(el: *EventLoop, slot: *WebSeedSlot, slot_idx: u8) void {
     // Hasher owns the buffer now
     slot.piece_buf = null;
     slot.state = .hashing;
-
-    // Mark success on the web seed (download completed, hash pending)
-    if (tc.web_seed_manager) |wsm| {
-        wsm.markSuccess(slot.seed_index, slot.piece_size);
-    }
 
     log.debug("web seed: piece {d} submitted to hasher", .{slot.piece_index});
 

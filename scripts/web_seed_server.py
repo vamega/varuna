@@ -19,6 +19,8 @@ from http.server import HTTPServer, BaseHTTPRequestHandler
 class RangeHTTPHandler(BaseHTTPRequestHandler):
     """HTTP handler that supports Range requests for web seed compatibility."""
 
+    # Use HTTP/1.1 for keep-alive support (HTTP/1.0 closes after each response)
+    protocol_version = "HTTP/1.1"
     serve_dir = "."
 
     def do_GET(self):
