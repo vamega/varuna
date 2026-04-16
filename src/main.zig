@@ -208,11 +208,14 @@ pub fn main() !void {
         }
     }
     if (listen_fd < 0 and transport_disp.incoming_tcp) {
-        if (createListenSocket(cfg.network)) |result| {
-            listen_fd = result.fd;
-            session_manager.port = result.port;
-            shared_el.ensureAccepting(listen_fd) catch {};
-        } else |_| {}
+        shared_el.startTcpListener() catch |err| {
+            try stdout.print("warning: failed to start TCP listener: {s}\n", .{@errorName(err)});
+            try stdout.flush();
+            shared_el.transport_disposition.incoming_tcp = false;
+        };
+        if (shared_el.listen_fd >= 0) {
+            listen_fd = shared_el.listen_fd;
+        }
     }
     defer if (listen_fd >= 0 and !peer_socket_activated) std.posix.close(listen_fd);
 
@@ -266,13 +269,11 @@ pub fn main() !void {
                 if (sess.pending_seed_setup) {
                     if (sess.integrateSeedIntoEventLoop()) {
                         // Create listen socket once for the first seeding torrent
-                        if (listen_fd < 0) {
-                            if (createListenSocket(cfg.network)) |result| {
-                                listen_fd = result.fd;
-                                // Update the port used for tracker announces to the actual bound port
-                                session_manager.port = result.port;
-                                shared_el.ensureAccepting(listen_fd) catch {};
-                            } else |_| {}
+                        if (listen_fd < 0 and shared_el.transport_disposition.incoming_tcp) {
+                            shared_el.startTcpListener() catch {};
+                            if (shared_el.listen_fd >= 0) {
+                                listen_fd = shared_el.listen_fd;
+                            }
                         }
                     }
                 }

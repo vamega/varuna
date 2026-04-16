@@ -1024,31 +1024,78 @@ pub const EventLoop = struct {
         log.info("uTP listener stopped", .{});
     }
 
+    /// Create and bind a TCP listen socket on the configured port.
+    /// Tries each port in [port, port] (single port for now).
+    /// Submits the first ACCEPT to the ring.
+    pub fn startTcpListener(self: *EventLoop) !void {
+        if (self.listen_fd >= 0) return; // already listening
+
+        const bind_addr_str = self.bind_address orelse "0.0.0.0";
+        const addr = std.net.Address.parseIp4(bind_addr_str, self.port) catch
+            std.net.Address.parseIp6(bind_addr_str, self.port) catch
+            return error.InvalidBindAddress;
+
+        const fd = try posix.socket(
+            addr.any.family,
+            posix.SOCK.STREAM | posix.SOCK.CLOEXEC | posix.SOCK.NONBLOCK,
+            posix.IPPROTO.TCP,
+        );
+        errdefer posix.close(fd);
+
+        const one: u32 = 1;
+        posix.setsockopt(fd, posix.SOL.SOCKET, posix.SO.REUSEADDR, std.mem.asBytes(&one)) catch {};
+
+        if (self.bind_device) |device| {
+            try socket_util.applyBindDevice(fd, device);
+        }
+
+        try posix.bind(fd, &addr.any, addr.getOsSockLen());
+        try posix.listen(fd, 128);
+
+        self.listen_fd = fd;
+        try self.submitAccept();
+        log.info("TCP listener started on port {d}", .{self.port});
+    }
+
+    /// Stop the TCP listener. Closes the listen socket; the pending
+    /// multishot ACCEPT CQE will complete with an error and be ignored
+    /// since listen_fd == -1.
+    pub fn stopTcpListener(self: *EventLoop) void {
+        if (self.listen_fd < 0) return;
+        posix.close(self.listen_fd);
+        self.listen_fd = -1;
+        log.info("TCP listener stopped", .{});
+    }
+
     /// Ensure listeners match the current transport disposition.
     /// Call after changing transport_disposition at runtime.
-    /// - Starts the UDP listener if incoming_utp is enabled and not running.
-    /// - Stops the UDP listener if incoming_utp and DHT are both disabled.
-    /// - Starts TCP accept if incoming_tcp is enabled and listen_fd is set.
-    /// Note: TCP listen socket creation requires bind/listen which can only
-    /// happen at startup (needs port allocation). If no listen socket was
-    /// created at startup, enabling incoming_tcp at runtime is a no-op
-    /// for inbound connections.
+    /// Starts or stops TCP and UDP listeners as needed.
     pub fn reconcileListeners(self: *EventLoop) void {
         const disp = self.transport_disposition;
         const dht_active = self.dht_engine != null;
+
+        // TCP listener
+        if (disp.incoming_tcp) {
+            if (self.listen_fd < 0) {
+                self.startTcpListener() catch |err| {
+                    log.warn("failed to start TCP listener on transport change: {s}", .{@errorName(err)});
+                    self.transport_disposition.incoming_tcp = false;
+                };
+            }
+        } else {
+            self.stopTcpListener();
+        }
 
         // UDP listener: needed for incoming_utp or DHT
         if (disp.incoming_utp or dht_active) {
             if (self.udp_fd < 0) {
                 self.startUtpListener() catch |err| {
                     log.warn("failed to start UDP listener on transport change: {s}", .{@errorName(err)});
-                    // Disable the flags we can't honor
                     self.transport_disposition.incoming_utp = false;
                     self.transport_disposition.outgoing_utp = false;
                 };
             }
         } else {
-            // Nobody needs the UDP socket
             self.stopUtpListener();
         }
     }
