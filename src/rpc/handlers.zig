@@ -5,6 +5,7 @@ const multipart = @import("multipart.zig");
 const sync_mod = @import("sync.zig");
 const json_mod = @import("json.zig");
 const compat = @import("compat.zig");
+const config_mod = @import("../config.zig");
 const mse = @import("../crypto/mse.zig");
 const SessionManager = @import("../daemon/session_manager.zig").SessionManager;
 const TorrentSession = @import("../daemon/torrent_session.zig");
@@ -582,6 +583,8 @@ pub const ApiHandler = struct {
             \\"start_paused_enabled":false,
             \\"dht":{s},"pex":{s},"lsd":false,"encryption":{},"anonymous_mode":false,
             \\"enable_utp":{s},
+            \\"outgoing_tcp":{s},"outgoing_utp":{s},"incoming_tcp":{s},"incoming_utp":{s},
+            \\"transport_disposition":{},
             \\"piece_cache_enabled":{},
             \\"ip_filter_enabled":false,"ip_filter_path":"","ip_filter_trackers":false,
             \\"banned_IPs":"{f}"}}
@@ -601,7 +604,12 @@ pub const ApiHandler = struct {
             @as([]const u8, if (el) |e| (if (e.dht_engine != null) "true" else "false") else "false"),
             @as([]const u8, if (el) |e| (if (e.pex_enabled) "true" else "false") else "false"),
             enc_mode,
-            @as([]const u8, if (el) |e| (if (e.utp_enabled) "true" else "false") else "false"),
+            @as([]const u8, if (el) |e| (if (e.transport_disposition.toEnableUtp()) "true" else "false") else "false"),
+            @as([]const u8, if (el) |e| (if (e.transport_disposition.outgoing_tcp) "true" else "false") else "true"),
+            @as([]const u8, if (el) |e| (if (e.transport_disposition.outgoing_utp) "true" else "false") else "false"),
+            @as([]const u8, if (el) |e| (if (e.transport_disposition.incoming_tcp) "true" else "false") else "true"),
+            @as([]const u8, if (el) |e| (if (e.transport_disposition.incoming_utp) "true" else "false") else "false"),
+            if (el) |e| e.transport_disposition.toBitfield() else @as(u8, 15),
             @as(u8, if (piece_cache_enabled) 1 else 0),
             esc(banned_ips_str),
         }) catch
@@ -661,7 +669,23 @@ pub const ApiHandler = struct {
             // DHT / PEX / uTP toggles
             if (prefs.dht) |v| self.session_manager.setDhtEnabled(v);
             if (prefs.pex) |v| el.pex_enabled = v;
-            if (prefs.enable_utp) |v| el.utp_enabled = v;
+
+            // Granular transport disposition fields take precedence
+            if (prefs.outgoing_tcp) |v| el.transport_disposition.outgoing_tcp = v;
+            if (prefs.outgoing_utp) |v| el.transport_disposition.outgoing_utp = v;
+            if (prefs.incoming_tcp) |v| el.transport_disposition.incoming_tcp = v;
+            if (prefs.incoming_utp) |v| el.transport_disposition.incoming_utp = v;
+            if (prefs.transport_disposition) |v| el.transport_disposition = config_mod.TransportDisposition.fromBitfield(v);
+
+            // Legacy enable_utp: only apply if no granular fields were set
+            if (prefs.enable_utp) |v| {
+                if (prefs.outgoing_tcp == null and prefs.outgoing_utp == null and
+                    prefs.incoming_tcp == null and prefs.incoming_utp == null and
+                    prefs.transport_disposition == null)
+                {
+                    el.transport_disposition = config_mod.TransportDisposition.fromEnableUtp(v);
+                }
+            }
         } else {
             if (extractParamMut(body, "dl_limit")) |dl_str| {
                 const dl = std.fmt.parseInt(u64, dl_str, 10) catch
@@ -718,8 +742,44 @@ pub const ApiHandler = struct {
                 return .{ .status = 400, .body = "{\"error\":\"invalid dht\"}" });
             if (extractParamMut(body, "pex")) |v| el.pex_enabled = parseBoolPreference(v) catch
                 return .{ .status = 400, .body = "{\"error\":\"invalid pex\"}" };
-            if (extractParamMut(body, "enable_utp")) |v| el.utp_enabled = parseBoolPreference(v) catch
-                return .{ .status = 400, .body = "{\"error\":\"invalid enable_utp\"}" };
+
+            // Granular transport disposition fields
+            var has_granular_transport = false;
+            if (extractParamMut(body, "outgoing_tcp")) |v| {
+                el.transport_disposition.outgoing_tcp = parseBoolPreference(v) catch
+                    return .{ .status = 400, .body = "{\"error\":\"invalid outgoing_tcp\"}" };
+                has_granular_transport = true;
+            }
+            if (extractParamMut(body, "outgoing_utp")) |v| {
+                el.transport_disposition.outgoing_utp = parseBoolPreference(v) catch
+                    return .{ .status = 400, .body = "{\"error\":\"invalid outgoing_utp\"}" };
+                has_granular_transport = true;
+            }
+            if (extractParamMut(body, "incoming_tcp")) |v| {
+                el.transport_disposition.incoming_tcp = parseBoolPreference(v) catch
+                    return .{ .status = 400, .body = "{\"error\":\"invalid incoming_tcp\"}" };
+                has_granular_transport = true;
+            }
+            if (extractParamMut(body, "incoming_utp")) |v| {
+                el.transport_disposition.incoming_utp = parseBoolPreference(v) catch
+                    return .{ .status = 400, .body = "{\"error\":\"invalid incoming_utp\"}" };
+                has_granular_transport = true;
+            }
+            if (extractParamMut(body, "transport_disposition")) |v| {
+                const bitfield = std.fmt.parseInt(u8, v, 10) catch
+                    return .{ .status = 400, .body = "{\"error\":\"invalid transport_disposition\"}" };
+                el.transport_disposition = config_mod.TransportDisposition.fromBitfield(bitfield);
+                has_granular_transport = true;
+            }
+
+            // Legacy enable_utp: only apply if no granular fields were set
+            if (!has_granular_transport) {
+                if (extractParamMut(body, "enable_utp")) |v| {
+                    const enable = parseBoolPreference(v) catch
+                        return .{ .status = 400, .body = "{\"error\":\"invalid enable_utp\"}" };
+                    el.transport_disposition = config_mod.TransportDisposition.fromEnableUtp(enable);
+                }
+            }
         }
 
         // Handle banned_IPs: newline-separated list of IPs and CIDRs (form-encoded only)
@@ -1886,6 +1946,11 @@ const PreferencesUpdate = struct {
     dht: ?bool = null,
     pex: ?bool = null,
     enable_utp: ?bool = null,
+    outgoing_tcp: ?bool = null,
+    outgoing_utp: ?bool = null,
+    incoming_tcp: ?bool = null,
+    incoming_utp: ?bool = null,
+    transport_disposition: ?u8 = null,
 };
 
 /// Build a `server.Response` carrying a JSON error body.
@@ -2445,4 +2510,35 @@ test "enable_utp json parsing via PreferencesUpdate" {
     const parsed2 = try std.json.parseFromSlice(PreferencesUpdate, std.testing.allocator, "{\"dht\":false,\"enable_utp\":false,\"pex\":true}", .{ .ignore_unknown_fields = true });
     defer parsed2.deinit();
     try std.testing.expectEqual(@as(?bool, false), parsed2.value.enable_utp);
+}
+
+test "transport disposition json parsing via PreferencesUpdate" {
+    const parsed = try std.json.parseFromSlice(
+        PreferencesUpdate,
+        std.testing.allocator,
+        "{\"outgoing_tcp\":true,\"outgoing_utp\":false,\"incoming_tcp\":true,\"incoming_utp\":false}",
+        .{ .ignore_unknown_fields = true },
+    );
+    defer parsed.deinit();
+    try std.testing.expectEqual(@as(?bool, true), parsed.value.outgoing_tcp);
+    try std.testing.expectEqual(@as(?bool, false), parsed.value.outgoing_utp);
+    try std.testing.expectEqual(@as(?bool, true), parsed.value.incoming_tcp);
+    try std.testing.expectEqual(@as(?bool, false), parsed.value.incoming_utp);
+}
+
+test "transport disposition bitfield json parsing via PreferencesUpdate" {
+    const parsed = try std.json.parseFromSlice(
+        PreferencesUpdate,
+        std.testing.allocator,
+        "{\"transport_disposition\":5}",
+        .{ .ignore_unknown_fields = true },
+    );
+    defer parsed.deinit();
+    try std.testing.expectEqual(@as(?u8, 5), parsed.value.transport_disposition);
+}
+
+test "transport disposition form param parsing" {
+    try std.testing.expectEqualStrings("true", extractParamMut("outgoing_tcp=true", "outgoing_tcp").?);
+    try std.testing.expectEqualStrings("false", extractParamMut("outgoing_utp=false", "outgoing_utp").?);
+    try std.testing.expectEqualStrings("5", extractParamMut("transport_disposition=5", "transport_disposition").?);
 }

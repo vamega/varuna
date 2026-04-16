@@ -60,17 +60,31 @@ enable_utp = true  # default: true
 
 Runtime toggle via API: `POST /api/v2/app/setPreferences` with `enable_utp=true|false`.
 
-### Advanced Transport Disposition (Future)
+### ~~Advanced Transport Disposition~~ (DONE)
 
-uTorrent exposes a `bt.transp_disposition` bitfield for fine-grained transport control:
+Implemented in `src/config.zig` as `TransportDisposition` packed struct. Inspired by uTorrent's `bt.transp_disposition` bitfield:
 
   1 allows outgoing TCP connections
   2 allows outgoing uTP connections
   4 allows incoming TCP connections
   8 allows incoming uTP connections
-  16 use new uTP header (not backwards compatible)
 
-Values are additive (255 = all enabled). We may consider this level of granularity in the future. For now, varuna exposes a simpler `enable_utp` boolean toggle that controls both inbound and outbound uTP.
+Config (TOML):
+```toml
+[network]
+transport = "tcp_and_utp"  # or "tcp_only", "utp_only"
+# Legacy enable_utp = true/false still works for backwards compatibility
+```
+
+Runtime toggle via API: `POST /api/v2/app/setPreferences` with granular fields (`outgoing_tcp`, `outgoing_utp`, `incoming_tcp`, `incoming_utp`), integer bitfield (`transport_disposition`), or legacy `enable_utp` (all three forms supported, granular fields take precedence).
+
+GET `/api/v2/app/preferences` returns both the legacy `enable_utp` boolean and the new granular fields plus `transport_disposition` integer.
+
+Enforcement:
+- `selectTransport()` in `event_loop.zig` respects outgoing TCP/uTP flags
+- `peer_handler.zig:handleAccept` rejects inbound TCP when `incoming_tcp` is disabled
+- `utp_handler.zig:acceptUtpConnection` rejects inbound uTP when `incoming_utp` is disabled
+- UDP listener startup gated on whether any uTP direction is enabled (or DHT is on)
 
 ## 4. ~~SO_BINDTODEVICE support~~ (DONE)
 

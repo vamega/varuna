@@ -232,6 +232,17 @@ fn checkOutboundUtpConnect(self: *EventLoop, utp_slot: u16, mgr: *utp_mgr.UtpMan
 /// Accept pending inbound uTP connections and create Peer entries.
 fn acceptUtpConnection(self: *EventLoop, mgr: *utp_mgr.UtpManager) void {
     while (mgr.accept()) |utp_slot| {
+        // Reject inbound uTP if transport disposition disables it
+        if (!self.transport_disposition.incoming_utp) {
+            log.debug("rejected inbound uTP connection: incoming_utp disabled", .{});
+            const now_us = utpNowUs();
+            if (mgr.reset(utp_slot, now_us)) |rst| {
+                const remote = mgr.getRemoteAddress(utp_slot) orelse continue;
+                utpSendPacket(self, &rst, remote);
+            }
+            continue;
+        }
+
         // Enforce global connection limit
         if (self.peer_count >= self.max_connections) {
             log.warn("rejecting inbound uTP connection: global limit reached", .{});

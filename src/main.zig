@@ -111,21 +111,25 @@ pub fn main() !void {
     // Initialize DHT engine (BEP 5), persistence DB, and bootstrap nodes.
     shared_el.port = cfg.network.port_min;
     shared_el.pex_enabled = cfg.network.pex;
-    shared_el.utp_enabled = cfg.network.enable_utp;
+    const transport_disp = try cfg.network.resolveTransportDisposition();
+    shared_el.transport_disposition = transport_disp;
 
     var dht_state = try initDht(allocator, shared_el, cfg, stdout);
     defer dht_state.deinit(allocator);
 
     // Start the shared UDP socket (used by both DHT and uTP). This must happen
     // before the event loop so that DHT bootstrap pings can be submitted and
-    // inbound uTP connections can be accepted immediately when enable_utp is true.
-    if (cfg.network.dht or cfg.network.enable_utp) {
+    // inbound uTP connections can be accepted immediately when uTP is enabled.
+    const utp_needed = transport_disp.toEnableUtp();
+    if (cfg.network.dht or utp_needed) {
         shared_el.startUtpListener() catch |err| {
             try stdout.print("warning: failed to start UDP listener: {s}\n", .{@errorName(err)});
             try stdout.flush();
             shared_el.dht_engine = null; // Disable DHT if UDP socket failed
-            if (cfg.network.enable_utp) {
-                shared_el.utp_enabled = false; // Disable uTP if UDP socket failed
+            if (utp_needed) {
+                // Disable uTP directions if UDP socket failed
+                shared_el.transport_disposition.outgoing_utp = false;
+                shared_el.transport_disposition.incoming_utp = false;
             }
         };
     }

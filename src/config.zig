@@ -2,6 +2,81 @@ const std = @import("std");
 const toml = @import("toml");
 const mse = @import("crypto/mse.zig");
 
+/// Fine-grained transport control inspired by uTorrent's `bt.transp_disposition`.
+/// Each bit controls a specific transport direction:
+///   bit 0 (1): allow outgoing TCP connections
+///   bit 1 (2): allow outgoing uTP connections
+///   bit 2 (4): allow incoming TCP connections
+///   bit 3 (8): allow incoming uTP connections
+pub const TransportDisposition = packed struct(u8) {
+    outgoing_tcp: bool = true,
+    outgoing_utp: bool = true,
+    incoming_tcp: bool = true,
+    incoming_utp: bool = true,
+    _padding: u4 = 0,
+
+    /// All transports enabled (default). Equivalent to bitfield value 15.
+    pub const tcp_and_utp: TransportDisposition = .{};
+
+    /// TCP only: no uTP in any direction. Equivalent to bitfield value 5.
+    pub const tcp_only: TransportDisposition = .{
+        .outgoing_tcp = true,
+        .outgoing_utp = false,
+        .incoming_tcp = true,
+        .incoming_utp = false,
+    };
+
+    /// uTP only: no TCP in any direction. Equivalent to bitfield value 10.
+    pub const utp_only: TransportDisposition = .{
+        .outgoing_tcp = false,
+        .outgoing_utp = true,
+        .incoming_tcp = false,
+        .incoming_utp = true,
+    };
+
+    /// True when at least one outbound transport is enabled.
+    pub fn canConnectOutbound(self: TransportDisposition) bool {
+        return self.outgoing_tcp or self.outgoing_utp;
+    }
+
+    /// True when at least one inbound transport is enabled.
+    pub fn canAcceptInbound(self: TransportDisposition) bool {
+        return self.incoming_tcp or self.incoming_utp;
+    }
+
+    /// Convert to the uTorrent-compatible integer representation.
+    pub fn toBitfield(self: TransportDisposition) u8 {
+        return @bitCast(self);
+    }
+
+    /// Parse from a uTorrent-compatible integer representation.
+    pub fn fromBitfield(value: u8) TransportDisposition {
+        var disp: TransportDisposition = @bitCast(value);
+        disp._padding = 0;
+        return disp;
+    }
+
+    /// Construct from the legacy `enable_utp` boolean.
+    /// true  -> tcp_and_utp (all enabled)
+    /// false -> tcp_only (TCP only)
+    pub fn fromEnableUtp(enable_utp: bool) TransportDisposition {
+        return if (enable_utp) tcp_and_utp else tcp_only;
+    }
+
+    /// Return the legacy `enable_utp` equivalent: true if any uTP direction is enabled.
+    pub fn toEnableUtp(self: TransportDisposition) bool {
+        return self.outgoing_utp or self.incoming_utp;
+    }
+
+    /// Parse a human-readable transport preset name from TOML config.
+    pub fn parsePreset(value: []const u8) !TransportDisposition {
+        if (std.mem.eql(u8, value, "tcp_and_utp")) return tcp_and_utp;
+        if (std.mem.eql(u8, value, "tcp_only")) return tcp_only;
+        if (std.mem.eql(u8, value, "utp_only")) return utp_only;
+        return error.InvalidTransportPreset;
+    }
+};
+
 pub const Config = struct {
     daemon: Daemon = .{},
     storage: Storage = .{},
@@ -75,10 +150,25 @@ pub const Config = struct {
         dht: bool = true,
         /// Enable PEX (BEP 11) for peer exchange between connected peers.
         pex: bool = true,
-        /// Enable uTP (BEP 29) transport for peer connections.
-        /// When true, new outbound connections alternate between TCP and uTP,
-        /// and the UDP listener starts at daemon startup for inbound uTP.
+        /// Legacy toggle for uTP (BEP 29) transport for peer connections.
+        /// Kept for backwards compatibility with existing config files.
+        /// When `transport` is also set, `transport` takes precedence.
+        /// true  -> "tcp_and_utp" (both TCP and uTP enabled in all directions)
+        /// false -> "tcp_only"    (TCP only, no uTP)
         enable_utp: bool = true,
+        /// Fine-grained transport control: "tcp_and_utp", "tcp_only", "utp_only".
+        /// Takes precedence over `enable_utp` when set.
+        /// Default null means fall through to `enable_utp`.
+        transport: ?[]const u8 = null,
+
+        /// Resolve the effective TransportDisposition from config fields.
+        /// `transport` takes precedence when set; otherwise falls back to `enable_utp`.
+        pub fn resolveTransportDisposition(self: Network) !TransportDisposition {
+            if (self.transport) |preset| {
+                return TransportDisposition.parsePreset(preset);
+            }
+            return TransportDisposition.fromEnableUtp(self.enable_utp);
+        }
     };
 
     pub const Performance = struct {
@@ -172,6 +262,7 @@ pub fn loadDefault(allocator: std.mem.Allocator) !LoadedConfig {
 
 pub fn validateConfig(config: Config) !void {
     _ = try parseEncryptionMode(config.network.encryption);
+    _ = try config.network.resolveTransportDisposition();
 }
 
 /// Parse the encryption config string into an EncryptionMode enum.
@@ -275,4 +366,120 @@ test "default share ratio limits are disabled" {
 test "default enable_utp is true" {
     const config = Config{};
     try std.testing.expect(config.network.enable_utp);
+}
+
+test "default transport disposition is tcp_and_utp" {
+    const config = Config{};
+    const disp = try config.network.resolveTransportDisposition();
+    try std.testing.expect(disp.outgoing_tcp);
+    try std.testing.expect(disp.outgoing_utp);
+    try std.testing.expect(disp.incoming_tcp);
+    try std.testing.expect(disp.incoming_utp);
+}
+
+test "enable_utp false resolves to tcp_only disposition" {
+    var net = Config.Network{};
+    net.enable_utp = false;
+    const disp = try net.resolveTransportDisposition();
+    try std.testing.expect(disp.outgoing_tcp);
+    try std.testing.expect(!disp.outgoing_utp);
+    try std.testing.expect(disp.incoming_tcp);
+    try std.testing.expect(!disp.incoming_utp);
+}
+
+test "transport preset overrides enable_utp" {
+    var net = Config.Network{};
+    net.enable_utp = false; // would normally mean tcp_only
+    net.transport = "utp_only"; // but transport takes precedence
+    const disp = try net.resolveTransportDisposition();
+    try std.testing.expect(!disp.outgoing_tcp);
+    try std.testing.expect(disp.outgoing_utp);
+    try std.testing.expect(!disp.incoming_tcp);
+    try std.testing.expect(disp.incoming_utp);
+}
+
+test "invalid transport preset rejected" {
+    var net = Config.Network{};
+    net.transport = "bogus";
+    try std.testing.expectError(error.InvalidTransportPreset, net.resolveTransportDisposition());
+}
+
+test "TransportDisposition parsePreset recognizes all presets" {
+    const tcp_and_utp = try TransportDisposition.parsePreset("tcp_and_utp");
+    try std.testing.expect(tcp_and_utp.outgoing_tcp and tcp_and_utp.outgoing_utp);
+    try std.testing.expect(tcp_and_utp.incoming_tcp and tcp_and_utp.incoming_utp);
+
+    const tcp_only = try TransportDisposition.parsePreset("tcp_only");
+    try std.testing.expect(tcp_only.outgoing_tcp and !tcp_only.outgoing_utp);
+    try std.testing.expect(tcp_only.incoming_tcp and !tcp_only.incoming_utp);
+
+    const utp_only = try TransportDisposition.parsePreset("utp_only");
+    try std.testing.expect(!utp_only.outgoing_tcp and utp_only.outgoing_utp);
+    try std.testing.expect(!utp_only.incoming_tcp and utp_only.incoming_utp);
+
+    try std.testing.expectError(error.InvalidTransportPreset, TransportDisposition.parsePreset("invalid"));
+}
+
+test "TransportDisposition bitfield round-trip" {
+    const disp = TransportDisposition.tcp_and_utp;
+    try std.testing.expectEqual(@as(u8, 15), disp.toBitfield());
+    const rt = TransportDisposition.fromBitfield(15);
+    try std.testing.expect(rt.outgoing_tcp and rt.outgoing_utp);
+    try std.testing.expect(rt.incoming_tcp and rt.incoming_utp);
+
+    try std.testing.expectEqual(@as(u8, 5), TransportDisposition.tcp_only.toBitfield());
+    try std.testing.expectEqual(@as(u8, 10), TransportDisposition.utp_only.toBitfield());
+}
+
+test "TransportDisposition fromEnableUtp mapping" {
+    const enabled = TransportDisposition.fromEnableUtp(true);
+    try std.testing.expect(enabled.outgoing_tcp and enabled.outgoing_utp);
+    try std.testing.expect(enabled.incoming_tcp and enabled.incoming_utp);
+
+    const disabled = TransportDisposition.fromEnableUtp(false);
+    try std.testing.expect(disabled.outgoing_tcp and !disabled.outgoing_utp);
+    try std.testing.expect(disabled.incoming_tcp and !disabled.incoming_utp);
+}
+
+test "TransportDisposition toEnableUtp" {
+    try std.testing.expect(TransportDisposition.tcp_and_utp.toEnableUtp());
+    try std.testing.expect(!TransportDisposition.tcp_only.toEnableUtp());
+    try std.testing.expect(TransportDisposition.utp_only.toEnableUtp());
+}
+
+test "TransportDisposition canConnectOutbound and canAcceptInbound" {
+    try std.testing.expect(TransportDisposition.tcp_and_utp.canConnectOutbound());
+    try std.testing.expect(TransportDisposition.tcp_and_utp.canAcceptInbound());
+    try std.testing.expect(TransportDisposition.tcp_only.canConnectOutbound());
+    try std.testing.expect(TransportDisposition.tcp_only.canAcceptInbound());
+
+    // No transports at all
+    const none: TransportDisposition = .{
+        .outgoing_tcp = false,
+        .outgoing_utp = false,
+        .incoming_tcp = false,
+        .incoming_utp = false,
+    };
+    try std.testing.expect(!none.canConnectOutbound());
+    try std.testing.expect(!none.canAcceptInbound());
+}
+
+test "load rejects invalid transport preset" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const cwd = try std.fs.cwd().openDir(".", .{});
+    defer cwd.close();
+
+    try tmp.dir.writeFile(.{
+        .sub_path = "bad-transport.toml",
+        .data = "[network]\ntransport = \"bad-mode\"\n",
+    });
+    try tmp.dir.setAsCwd();
+    defer cwd.setAsCwd() catch unreachable;
+
+    try std.testing.expectError(
+        error.InvalidTransportPreset,
+        load(std.testing.allocator, "bad-transport.toml"),
+    );
 }

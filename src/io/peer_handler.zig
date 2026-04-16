@@ -44,6 +44,14 @@ pub fn handleAccept(self: *EventLoop, cqe: linux.io_uring_cqe) void {
         }
     }
 
+    // Reject inbound TCP if transport disposition disables it
+    if (!self.transport_disposition.incoming_tcp) {
+        log.debug("rejected inbound TCP connection: incoming_tcp disabled", .{});
+        posix.close(new_fd);
+        if (!more) self.submitAccept() catch {};
+        return;
+    }
+
     // Enforce global connection limit on inbound connections
     if (self.peer_count >= self.max_connections) {
         log.warn("rejecting inbound connection: global limit reached ({d}/{d})", .{
