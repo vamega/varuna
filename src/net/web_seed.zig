@@ -2,7 +2,6 @@ const std = @import("std");
 const log = std.log.scoped(.web_seed);
 const layout_mod = @import("../torrent/layout.zig");
 const metainfo_mod = @import("../torrent/metainfo.zig");
-const http = @import("../io/http.zig");
 
 /// State of a single web seed source.
 pub const WebSeedState = enum {
@@ -258,56 +257,6 @@ pub const FileRange = struct {
     /// Number of bytes in this range.
     length: u32,
 };
-
-/// Download a single piece from a BEP 19 web seed.
-/// Returns the piece data buffer (caller owns).
-/// Uses io_uring-based HTTP client for all network I/O.
-pub fn downloadPiece(
-    allocator: std.mem.Allocator,
-    client: *http.HttpClient,
-    manager: *const WebSeedManager,
-    seed_index: usize,
-    piece_index: u32,
-    piece_count: u32,
-    piece_size: u32,
-) ![]u8 {
-    var ranges_buf: [64]FileRange = undefined;
-    const ranges = try manager.computePieceRanges(piece_index, piece_count, &ranges_buf);
-
-    // Allocate piece buffer
-    const piece_buf = try allocator.alloc(u8, piece_size);
-    errdefer allocator.free(piece_buf);
-
-    // Fetch each file range
-    for (ranges) |range| {
-        const url = try manager.buildFileUrl(allocator, seed_index, range.file_index);
-        defer allocator.free(url);
-
-        var response = try client.getRange(url, range.range_start, range.range_end);
-        defer response.deinit();
-
-        // Accept both 200 (full content) and 206 (partial content)
-        if (response.status != 200 and response.status != 206) {
-            if (response.status == 404) return error.WebSeedNotFound;
-            if (response.status == 416) return error.WebSeedRangeNotSatisfiable;
-            if (response.status >= 500) return error.WebSeedServerError;
-            return error.WebSeedHttpError;
-        }
-
-        // Copy response body into piece buffer at the correct offset
-        const copy_len = @min(response.body.len, range.length);
-        if (copy_len > 0) {
-            @memcpy(piece_buf[range.piece_offset .. range.piece_offset + copy_len], response.body[0..copy_len]);
-        }
-
-        // If we got less data than expected, zero-fill the remainder
-        if (copy_len < range.length) {
-            @memset(piece_buf[range.piece_offset + copy_len .. range.piece_offset + range.length], 0);
-        }
-    }
-
-    return piece_buf;
-}
 
 /// URL-encode a path component (percent-encode non-unreserved characters).
 fn appendUrlEncoded(buf: *std.ArrayList(u8), allocator: std.mem.Allocator, input: []const u8) !void {

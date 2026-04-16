@@ -17,3 +17,4 @@ pub const recheck = @import("recheck.zig");
 pub const ring = @import("ring.zig");
 pub const signal = @import("signal.zig");
 pub const tls = @import("tls.zig");
+pub const url = @import("url.zig");
