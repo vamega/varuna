@@ -118,7 +118,10 @@ pub fn handleUtpRecv(self: *EventLoop, cqe: linux.io_uring_cqe) void {
     };
 
     if (cqe.res < 0) {
-        log.warn("uTP recvmsg failed: errno={d}", .{-cqe.res});
+        // ECANCELED is expected when stopUtpListener cancels the pending recvmsg.
+        if (cqe.err() != .CANCELED) {
+            log.warn("uTP recvmsg failed: errno={d}", .{-cqe.res});
+        }
         return;
     }
 

@@ -19,8 +19,11 @@ const BanList = @import("../net/ban_list.zig").BanList;
 pub fn handleAccept(self: *EventLoop, cqe: linux.io_uring_cqe) void {
     const more = (cqe.flags & linux.IORING_CQE_F_MORE) != 0;
     if (cqe.res < 0) {
-        // Accept failed, try again
-        log.warn("accept failed: errno={d}", .{-cqe.res});
+        const e = cqe.err();
+        // ECANCELED is expected when stopTcpListener cancels the pending accept.
+        if (e != .CANCELED) {
+            log.warn("accept failed: errno={d}", .{-cqe.res});
+        }
         if (!more) self.submitAccept() catch |err| {
             log.err("re-submit accept after failure: {s}", .{@errorName(err)});
         };

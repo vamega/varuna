@@ -1008,14 +1008,26 @@ pub const EventLoop = struct {
         log.info("uTP listener started on UDP port {d}", .{self.port});
     }
 
-    /// Stop the UDP listener (uTP/DHT). Closes the UDP socket and frees
-    /// the UtpManager. The pending RECVMSG CQE will complete with an error
-    /// (ECANCELED or EBADF) and be harmlessly ignored since udp_fd == -1.
-    /// Call this when both incoming_utp and DHT are disabled at runtime.
+    /// Stop the UDP listener (uTP/DHT). Cancels the pending RECVMSG,
+    /// closes the UDP socket via io_uring, and frees the UtpManager.
+    /// The cancel and close CQEs will be processed on the next tick;
+    /// setting udp_fd = -1 immediately ensures the dispatch loop ignores them.
     pub fn stopUtpListener(self: *EventLoop) void {
         if (self.udp_fd < 0) return;
-        posix.close(self.udp_fd);
+        const fd = self.udp_fd;
         self.udp_fd = -1;
+
+        // Cancel the pending RECVMSG SQE
+        const recv_ud = encodeUserData(.{ .slot = 0, .op_type = .utp_recv, .context = 0 });
+        const cancel_ud = encodeUserData(.{ .slot = 0, .op_type = .cancel, .context = 0 });
+        _ = self.ring.cancel(cancel_ud, recv_ud, 0) catch {};
+
+        // Close the fd via io_uring (avoids racing with the pending CQE)
+        _ = self.ring.close(cancel_ud, fd) catch {
+            // Fallback to synchronous close if we can't get an SQE
+            posix.close(fd);
+        };
+
         if (self.utp_manager) |mgr| {
             mgr.deinit();
             self.allocator.destroy(mgr);
@@ -1057,13 +1069,24 @@ pub const EventLoop = struct {
         log.info("TCP listener started on port {d}", .{self.port});
     }
 
-    /// Stop the TCP listener. Closes the listen socket; the pending
-    /// multishot ACCEPT CQE will complete with an error and be ignored
-    /// since listen_fd == -1.
+    /// Stop the TCP listener. Cancels the pending multishot ACCEPT,
+    /// then closes the listen socket via io_uring. Setting listen_fd = -1
+    /// immediately ensures the dispatch loop ignores stale CQEs.
     pub fn stopTcpListener(self: *EventLoop) void {
         if (self.listen_fd < 0) return;
-        posix.close(self.listen_fd);
+        const fd = self.listen_fd;
         self.listen_fd = -1;
+
+        // Cancel the pending multishot ACCEPT SQE
+        const accept_ud = encodeUserData(.{ .slot = 0, .op_type = .accept, .context = 0 });
+        const cancel_ud = encodeUserData(.{ .slot = 0, .op_type = .cancel, .context = 0 });
+        _ = self.ring.cancel(cancel_ud, accept_ud, 0) catch {};
+
+        // Close via io_uring
+        _ = self.ring.close(cancel_ud, fd) catch {
+            posix.close(fd);
+        };
+
         log.info("TCP listener stopped", .{});
     }
 
