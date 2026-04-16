@@ -445,7 +445,7 @@ pub const TorrentSession = struct {
     pub fn integrateIntoEventLoop(self: *TorrentSession) bool {
         // Snapshot state under lock, then release before starting async
         // operations whose completion callbacks will re-acquire the mutex.
-        const Action = enum { none, metadata_fetch, recheck, skip_recheck };
+        const Action = enum { none, magnet_announce, metadata_fetch, recheck, skip_recheck };
         var action: Action = .none;
         var sel_ptr: ?*EventLoop = null;
         var peers_snapshot: ?[]const std.net.Address = null;
@@ -459,8 +459,14 @@ pub const TorrentSession = struct {
             if (sel_ptr == null) return false;
 
             if (self.state == .metadata_fetching) {
-                action = .metadata_fetch;
-                peers_snapshot = self.pending_peers orelse &[_]std.net.Address{};
+                if (self.pending_peers != null) {
+                    // Peers already collected (from async announces) — start metadata fetch
+                    action = .metadata_fetch;
+                    peers_snapshot = self.pending_peers orelse &[_]std.net.Address{};
+                } else {
+                    // No peers yet — submit async tracker announces
+                    action = .magnet_announce;
+                }
                 self.background_init_done.store(false, .release);
             } else if (self.state == .checking and self.session != null and self.shared_fds != null) {
                 if (self.resume_pieces != null) {
@@ -483,6 +489,10 @@ pub const TorrentSession = struct {
         const sel = sel_ptr orelse return false;
 
         switch (action) {
+            .magnet_announce => {
+                self.submitMagnetAnnounces();
+                return true;
+            },
             .metadata_fetch => {
                 sel.startMetadataFetch(
                     self.info_hash,
@@ -1056,11 +1066,12 @@ pub const TorrentSession = struct {
     /// Does NOT do piece verification (that moves to the event loop via AsyncRecheck)
     /// and does NOT do blocking tracker announces (those use the ring-based executors).
     fn doStartBackground(self: *TorrentSession) !void {
-        // Magnet link: collect peers via tracker announce, then hand off
-        // to the event loop for async BEP 9 metadata fetch.
+        // Magnet link: signal the main thread to submit async tracker
+        // announces via the ring-based executors. No blocking I/O here.
         if (self.is_magnet and self.torrent_bytes.len == 0) {
-            try self.collectMagnetPeers();
-            return; // event loop will start async metadata fetch
+            self.state = .metadata_fetching;
+            self.background_init_done.store(true, .release);
+            return; // integrateIntoEventLoop will submit tracker jobs
         }
 
         const session = try session_mod.Session.load(self.allocator, self.torrent_bytes, self.save_path);
@@ -1342,6 +1353,10 @@ pub const TorrentSession = struct {
     /// Try to submit an announce via the UDP tracker executor.
     /// Returns true if the URL was a UDP URL and the job was submitted.
     fn trySubmitUdpAnnounce(self: *TorrentSession, request: tracker.announce.Request) bool {
+        return self.trySubmitUdpAnnounceWithCallback(request, udpAnnounceComplete);
+    }
+
+    fn trySubmitUdpAnnounceWithCallback(self: *TorrentSession, request: tracker.announce.Request, on_complete: UdpTrackerExecutor.CompletionFn) bool {
         const udp_mod = @import("../tracker/udp.zig");
 
         const parsed = udp_mod.parseUdpUrl(request.announce_url) orelse return false;
@@ -1350,7 +1365,7 @@ pub const TorrentSession = struct {
         const key_value: u32 = if (request.key) |k| std.mem.readInt(u32, k[0..4], .big) else udp_mod.generateTransactionId();
         var job = UdpTrackerExecutor.Job{
             .context = @ptrCast(self),
-            .on_complete = udpAnnounceComplete,
+            .on_complete = on_complete,
             .kind = .announce,
             .port = parsed.port,
             .info_hash = request.info_hash,
@@ -1549,48 +1564,146 @@ pub const TorrentSession = struct {
 
     // ── Magnet metadata fetching (BEP 9) ────────────────────
 
-    /// Collect peers for a magnet link via tracker announces.
-    /// Runs on the background thread. Stores peers for the event loop
-    /// to use with the async BEP 9 metadata fetch.
-    fn collectMagnetPeers(self: *TorrentSession) !void {
+    /// Submit async tracker announces for a magnet link via the ring-based
+    /// executors. Called from integrateIntoEventLoop on the main thread.
+    /// Callbacks accumulate peers; the last callback to finish triggers
+    /// metadata fetch.
+    fn submitMagnetAnnounces(self: *TorrentSession) void {
         const tlog = std.log.scoped(.metadata_fetch);
 
-        self.state = .metadata_fetching;
         self.metadata_fetch_progress = .{ .state = .announcing };
 
         const tracker_urls = self.magnet_trackers orelse {
+            tlog.warn("magnet: no tracker URLs", .{});
+            self.mutex.lock();
+            defer self.mutex.unlock();
+            self.state = .@"error";
             self.error_message = std.fmt.allocPrint(self.allocator, "no tracker URLs in magnet link", .{}) catch null;
-            return error.NoTrackers;
+            return;
         };
 
-        var peer_list = std.ArrayList(std.net.Address).empty;
-        defer peer_list.deinit(self.allocator);
+        self.announce_jobs_in_flight.store(0, .release);
+        var submitted: u32 = 0;
 
         for (tracker_urls) |url| {
-            const resp = tracker.announce.fetchAuto(self.allocator, .{
+            const request = tracker.announce.Request{
                 .announce_url = url,
                 .info_hash = self.info_hash,
                 .peer_id = self.peer_id,
                 .port = self.port,
                 .left = 1, // we need metadata
                 .key = self.tracker_key,
-            }) catch |err| {
-                tlog.debug("tracker announce failed for {s}: {s}", .{ url, @errorName(err) });
-                continue;
             };
-            defer tracker.announce.freeResponse(self.allocator, resp);
 
-            for (resp.peers) |peer| {
-                peer_list.append(self.allocator, peer.address) catch {};
+            // Try UDP first
+            if (self.trySubmitUdpAnnounceWithCallback(request, magnetUdpAnnounceComplete)) {
+                _ = self.announce_jobs_in_flight.fetchAdd(1, .acq_rel);
+                submitted += 1;
+                continue;
             }
+
+            // Fall back to HTTP
+            const host = getTrackerHostForUrl(url) orelse continue;
+            const built_url = tracker.announce.buildUrl(self.allocator, request) catch continue;
+            defer self.allocator.free(built_url);
+            self.submitTrackerJob(built_url, host, magnetHttpAnnounceComplete) catch continue;
+            _ = self.announce_jobs_in_flight.fetchAdd(1, .acq_rel);
+            submitted += 1;
         }
 
-        tlog.info("magnet: collected {d} peers from {d} trackers", .{ peer_list.items.len, tracker_urls.len });
+        if (submitted == 0) {
+            tlog.warn("magnet: failed to submit any tracker announces", .{});
+            self.mutex.lock();
+            defer self.mutex.unlock();
+            self.state = .@"error";
+            self.error_message = std.fmt.allocPrint(self.allocator, "failed to submit magnet tracker announces", .{}) catch null;
+            return;
+        }
 
-        // Store peers for event loop integration
-        self.pending_peers = peer_list.toOwnedSlice(self.allocator) catch null;
-        self.metadata_fetch_progress = .{ .state = .connecting };
-        self.background_init_done.store(true, .release);
+        tlog.info("magnet: submitted {d} async tracker announces", .{submitted});
+    }
+
+    /// HTTP tracker announce callback for magnet links.
+    /// Accumulates peers and triggers metadata fetch when all jobs complete.
+    fn magnetHttpAnnounceComplete(context: *anyopaque, result: TrackerExecutor.RequestResult) void {
+        const self: *TorrentSession = @ptrCast(@alignCast(context));
+        const body = result.body orelse {
+            self.finishMagnetAnnounceJob();
+            return;
+        };
+        const resp = tracker.announce.parseResponse(self.allocator, body) catch {
+            self.finishMagnetAnnounceJob();
+            return;
+        };
+        defer tracker.announce.freeResponse(self.allocator, resp);
+
+        self.accumulateMagnetPeers(resp.peers);
+        self.finishMagnetAnnounceJob();
+    }
+
+    /// UDP tracker announce callback for magnet links.
+    fn magnetUdpAnnounceComplete(context: *anyopaque, result: UdpTrackerExecutor.RequestResult) void {
+        const self: *TorrentSession = @ptrCast(@alignCast(context));
+        const body = result.body orelse {
+            self.finishMagnetAnnounceJob();
+            return;
+        };
+        if (body.len < 20) {
+            self.finishMagnetAnnounceJob();
+            return;
+        }
+
+        const udp_mod = @import("../tracker/udp.zig");
+        const ann_resp = udp_mod.AnnounceResponse.decode(body) catch {
+            self.finishMagnetAnnounceJob();
+            return;
+        };
+        const peers = ann_resp.parsePeers(self.allocator) catch {
+            self.finishMagnetAnnounceJob();
+            return;
+        };
+        defer self.allocator.free(peers);
+
+        self.accumulateMagnetPeers(peers);
+        self.finishMagnetAnnounceJob();
+    }
+
+    /// Accumulate peer addresses from a tracker response into pending_peers.
+    fn accumulateMagnetPeers(self: *TorrentSession, peers: []const tracker.announce.Peer) void {
+        if (peers.len == 0) return;
+
+        self.mutex.lock();
+        defer self.mutex.unlock();
+
+        // Append to existing pending_peers or create a new allocation
+        if (self.pending_peers) |existing| {
+            const new_len = existing.len + peers.len;
+            const expanded = self.allocator.realloc(existing, new_len) catch return;
+            for (peers, 0..) |peer, i| {
+                expanded[existing.len + i] = peer.address;
+            }
+            self.pending_peers = expanded;
+        } else {
+            const addrs = self.allocator.alloc(std.net.Address, peers.len) catch return;
+            for (peers, 0..) |peer, i| {
+                addrs[i] = peer.address;
+            }
+            self.pending_peers = addrs;
+        }
+    }
+
+    /// Decrement the magnet announce job counter. When all jobs complete,
+    /// signal the main loop to start the async metadata fetch.
+    fn finishMagnetAnnounceJob(self: *TorrentSession) void {
+        const remaining = self.announce_jobs_in_flight.fetchSub(1, .acq_rel) - 1;
+        if (remaining == 0) {
+            const tlog = std.log.scoped(.metadata_fetch);
+            const peer_count = if (self.pending_peers) |pp| pp.len else 0;
+            tlog.info("magnet: collected {d} peers from async announces", .{peer_count});
+            self.metadata_fetch_progress = .{ .state = .connecting };
+            // Signal the main loop to pick up peers and start metadata fetch
+            self.background_init_done.store(true, .release);
+        }
     }
 
     /// Callback from async metadata fetch completion. Runs on the event loop thread.
