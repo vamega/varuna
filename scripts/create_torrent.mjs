@@ -10,19 +10,21 @@ const outputPath = args.output
 const announce = args.announce
 
 if (inputPath == null || outputPath == null || announce == null) {
-  console.error('usage: node scripts/create_torrent.mjs --input <path> --output <file.torrent> --announce <tracker-url> [--piece-length <bytes>] [--name <torrent-name>] [--private true|false]')
+  console.error('usage: node scripts/create_torrent.mjs --input <path> --output <file.torrent> --announce <tracker-url> [--piece-length <bytes>] [--name <torrent-name>] [--private true|false] [--url-list <web-seed-url>]')
   process.exit(1)
 }
 
 const pieceLength = args['piece-length'] != null ? parsePositiveInt(args['piece-length'], 'piece-length') : undefined
 const privateFlag = args.private != null ? parseBoolean(args.private, 'private') : undefined
+const urlList = args['url-list'] != null ? [args['url-list']] : undefined
 
 const options = {
   announceList: [[announce]],
   createdBy: 'varuna dev tooling',
   name: args.name ?? path.basename(inputPath),
   pieceLength,
-  private: privateFlag
+  private: privateFlag,
+  urlList
 }
 
 const torrentBuffer = await new Promise((resolve, reject) => {
