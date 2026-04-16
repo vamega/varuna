@@ -19,6 +19,7 @@ const TorrentId = @import("../io/event_loop.zig").TorrentId;
 const Bitfield = @import("../bitfield.zig").Bitfield;
 const AsyncRecheck = @import("../io/recheck.zig").AsyncRecheck;
 const AsyncMetadataFetch = @import("../io/metadata_handler.zig").AsyncMetadataFetch;
+const WebSeedManager = @import("../net/web_seed.zig").WebSeedManager;
 
 /// Mutable tracker URL storage. Tracks user-added, user-removed,
 /// and user-edited tracker URLs as overlays on top of the metainfo
@@ -634,6 +635,13 @@ pub const TorrentSession = struct {
             sel.setTorrentCompletePieces(tid, &pt.complete);
         }
 
+        // BEP 19: create WebSeedManager if the metainfo has url-list
+        if (self.session) |*sess| {
+            if (sess.metainfo.url_list.len > 0) {
+                self.initWebSeedManager(sel, tid, sess);
+            }
+        }
+
         // Apply per-torrent speed limits to the event loop context
         if (self.dl_limit > 0) sel.setTorrentDlLimit(tid, self.dl_limit);
         if (self.ul_limit > 0) sel.setTorrentUlLimit(tid, self.ul_limit);
@@ -797,6 +805,42 @@ pub const TorrentSession = struct {
     /// to the piece_tracker via setWanted(). If no files are marked
     /// do_not_download the mask is cleared (want everything).
     /// Returns true if a mask was applied, false if all files are wanted.
+    /// Create and attach a WebSeedManager to the event loop torrent context.
+    /// Non-fatal: logs a warning if creation fails.
+    fn initWebSeedManager(
+        self: *TorrentSession,
+        sel: *EventLoop,
+        tid: TorrentId,
+        sess: *session_mod.Session,
+    ) void {
+        const wsm = self.allocator.create(WebSeedManager) catch {
+            std.log.warn("web seed: failed to allocate WebSeedManager", .{});
+            return;
+        };
+        wsm.* = WebSeedManager.init(
+            self.allocator,
+            sess.metainfo.url_list,
+            sess.metainfo.name,
+            sess.metainfo.isMultiFile(),
+            sess.metainfo.files,
+            sess.layout.piece_length,
+            sess.layout.total_size,
+        ) catch {
+            self.allocator.destroy(wsm);
+            std.log.warn("web seed: failed to init WebSeedManager", .{});
+            return;
+        };
+        if (sel.getTorrentContext(tid)) |tc| {
+            tc.web_seed_manager = wsm;
+            std.log.info("web seed: initialized {d} seed(s) for torrent {s}", .{
+                wsm.seedCount(), sess.metainfo.name,
+            });
+        } else {
+            wsm.deinit();
+            self.allocator.destroy(wsm);
+        }
+    }
+
     pub fn applyFilePriorities(self: *TorrentSession) bool {
         const pt = &(self.piece_tracker orelse return false);
         const sess = &(self.session orelse return false);

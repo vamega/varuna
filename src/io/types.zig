@@ -9,6 +9,7 @@ const mse = @import("../crypto/mse.zig");
 const RateLimiter = @import("rate_limiter.zig").RateLimiter;
 const SuperSeedState = @import("super_seed.zig").SuperSeedState;
 const MerkleCache = @import("../torrent/merkle_cache.zig").MerkleCache;
+const WebSeedManager = @import("../net/web_seed.zig").WebSeedManager;
 
 // ── Constants ────────────────────────────────────────────
 
@@ -237,6 +238,10 @@ pub const TorrentContext = struct {
 
     // BEP 52: per-file Merkle tree cache for hash serving
     merkle_cache: ?*MerkleCache = null,
+
+    // BEP 19: web seed manager (GetRight-style HTTP seeding)
+    web_seed_manager: ?*WebSeedManager = null,
+
     // Slots of peers currently attached to this torrent.
     peer_slots: std.ArrayList(u16) = std.ArrayList(u16).empty,
     torrent_peer_list_index: ?u32 = null,

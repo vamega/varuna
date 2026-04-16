@@ -9,6 +9,7 @@ pub const QueueManager = @import("queue_manager.zig").QueueManager;
 pub const QueueConfig = @import("queue_manager.zig").QueueConfig;
 const ResumeDb = @import("../storage/state_db.zig").ResumeDb;
 const BanList = @import("../net/ban_list.zig").BanList;
+const HttpExecutor = @import("../io/http_executor.zig").HttpExecutor;
 const TrackerExecutor = @import("tracker_executor.zig").TrackerExecutor;
 const UdpTrackerExecutor = @import("udp_tracker_executor.zig").UdpTrackerExecutor;
 
@@ -137,6 +138,11 @@ pub const SessionManager = struct {
             self.allocator.destroy(bl);
         }
         if (self.tracker_executor) |executor| {
+            // Null out event loop references before destroying.
+            if (self.shared_event_loop) |el| {
+                el.http_executor = null;
+                el.tracker_executor = null;
+            }
             executor.destroy();
             self.tracker_executor = null;
         }
@@ -675,7 +681,8 @@ pub const SessionManager = struct {
         if (self.tracker_executor == null) {
             const el = self.shared_event_loop orelse return error.SharedEventLoopNotConfigured;
             self.tracker_executor = try TrackerExecutor.create(self.allocator, &el.ring, .{});
-            // Wire into event loop for CQE dispatch
+            // Wire the underlying HttpExecutor into event loop for CQE dispatch
+            el.http_executor = self.tracker_executor.?.http;
             el.tracker_executor = self.tracker_executor;
         }
         return self.tracker_executor.?;

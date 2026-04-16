@@ -30,6 +30,7 @@ const peer_policy = @import("peer_policy.zig");
 const utp_handler = @import("utp_handler.zig");
 const dht_handler = @import("dht_handler.zig");
 const metadata_handler = @import("metadata_handler.zig");
+const web_seed_handler = @import("web_seed_handler.zig");
 
 // ── Re-exported type definitions (moved to types.zig) ────
 
@@ -197,7 +198,11 @@ pub const EventLoop = struct {
     // API server (shares the event loop's ring)
     api_server: ?*@import("../rpc/server.zig").ApiServer = null,
 
-    // Tracker executor (shares the event loop's ring)
+    // Generic HTTP executor (shares the event loop's ring).
+    // CQEs for http_socket/http_connect/http_send/http_recv route here.
+    http_executor: ?*@import("http_executor.zig").HttpExecutor = null,
+
+    // Tracker executor (thin wrapper around http_executor, shares the event loop's ring)
     tracker_executor: ?*@import("../daemon/tracker_executor.zig").TrackerExecutor = null,
 
     // UDP tracker executor (shares the event loop's ring, BEP 15)
@@ -279,6 +284,10 @@ pub const EventLoop = struct {
 
     // Async BEP 9 metadata fetch state machine (null when no fetch is active)
     metadata_fetch: ?*metadata_handler.AsyncMetadataFetch = null,
+
+    // BEP 19: web seed download slots
+    web_seed_slots: [web_seed_handler.max_web_seed_slots]web_seed_handler.WebSeedSlot =
+        [_]web_seed_handler.WebSeedSlot{.{}} ** web_seed_handler.max_web_seed_slots,
 
     // Compact list of peer slots that are idle (active, unchoked, have
     // availability, and need a piece assignment).  Avoids scanning all
@@ -406,6 +415,7 @@ pub const EventLoop = struct {
         // fds may route to handlers for already-freed objects (e.g. DHT
         // engine freed by main() before this deinit runs).
         self.dht_engine = null;
+        self.http_executor = null;
         self.tracker_executor = null;
         self.udp_tracker_executor = null;
         self.drainRemainingCqes();
@@ -413,6 +423,12 @@ pub const EventLoop = struct {
         // Clean up active async state machines (metadata fetch, recheck)
         self.cancelMetadataFetch();
         self.cancelAllRechecks();
+
+        // Free web seed slot buffers (in-flight downloads that didn't complete)
+        for (&self.web_seed_slots) |*ws| {
+            if (ws.piece_buf) |buf| self.allocator.free(buf);
+            ws.* = .{};
+        }
 
         // ── Phase 3: Free all buffers ────────────────────────────
         // Now that the kernel has completed all pending operations,
@@ -474,12 +490,16 @@ pub const EventLoop = struct {
             if (peer.mse_responder) |mr| self.allocator.destroy(mr);
         }
         self.allocator.free(self.peers);
-        // Clean up torrent PEX state
+        // Clean up torrent PEX state and web seed managers
         for (self.active_torrent_ids.items) |torrent_id| {
             if (self.getTorrentContext(torrent_id)) |tc| {
                 if (tc.pex_state) |tps| {
                     tps.deinit(self.allocator);
                     self.allocator.destroy(tps);
+                }
+                if (tc.web_seed_manager) |wsm| {
+                    wsm.deinit();
+                    self.allocator.destroy(wsm);
                 }
                 tc.peer_slots.deinit(self.allocator);
             }
@@ -1214,13 +1234,14 @@ pub const EventLoop = struct {
         peer_policy.checkReannounce(self);
         peer_policy.recalculateUnchokes(self);
         peer_policy.tryAssignPieces(self);
+        web_seed_handler.tryAssignWebSeedPieces(self);
         peer_policy.updateSpeedCounters(self);
         peer_policy.sendKeepAlives(self);
         peer_policy.checkPex(self);
         peer_policy.checkPartialSeed(self);
         utp_handler.utpTick(self);
         dht_handler.dhtTick(self);
-        if (self.tracker_executor) |te| te.tick();
+        if (self.http_executor) |he| he.tick();
         if (self.udp_tracker_executor) |ute| ute.tick();
 
         // Flush any queued SQEs before waiting
@@ -1639,7 +1660,7 @@ pub const EventLoop = struct {
             .utp_recv => utp_handler.handleUtpRecv(self, cqe),
             .utp_send => utp_handler.handleUtpSend(self, cqe),
             .http_socket, .http_connect, .http_send, .http_recv => {
-                if (self.tracker_executor) |te| te.dispatchCqe(cqe);
+                if (self.http_executor) |he| he.dispatchCqe(cqe);
             },
             .cancel => {},
             .api_accept => if (self.api_server) |srv| srv.handleAcceptCqe(cqe),
