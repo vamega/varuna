@@ -3,21 +3,31 @@
 Varuna is a headless BitTorrent client in Zig for Linux, currently at an early minimal-client stage. The project is named after the Hindu god of water and also ties back to the author’s name. The design target is still a high-performance daemon that leans heavily on `io_uring`, keeps allocations tightly controlled, and scales to thousands or tens of thousands of torrents.
 
 ## Current Status
-The repository now includes a minimal end-to-end download path:
 
-- Load a `.torrent` file and derive its file layout.
-- Announce to an HTTP tracker with compact peer support.
-- Recheck existing on-disk data and reuse pieces that already verify.
-- Connect to a peer over the BitTorrent wire protocol.
-- Download pieces sequentially, verify SHA-1 hashes, and write data to disk.
-- Seed verified on-disk data back to one inbound peer.
+Varuna is a functional headless BitTorrent daemon with:
 
-Current CLI:
+- **Full download/seed pipeline**: multi-peer rarest-first piece selection, endgame mode, tit-for-tat choking, block pipelining, selective file download, sequential mode.
+- **All I/O through io_uring**: peer connections, disk reads/writes, tracker HTTP/UDP, uTP, DHT, API server, timers. Verified via bpftrace — zero daemon networking syscalls bypass io_uring.
+- **Tracker support**: HTTP, HTTPS (BoringSSL), UDP (BEP 15), multi-tracker (BEP 12), scrape. All async via ring-based executors.
+- **Protocol extensions**: uTP (BEP 29), DHT (BEP 5), PEX (BEP 11), magnet links (BEP 9), MSE/PE encryption (BEP 6), super-seeding (BEP 16), partial seeds (BEP 21), BEP 52 v2/hybrid support.
+- **Web seeds (BEP 19)**: HTTP Range-based piece downloads with multi-piece batching, connection pooling, configurable request size.
+- **qBittorrent-compatible API**: 71 endpoints for WebUI clients (Flood, VueTorrent, qui).
+- **Tooling**: `varuna-tools create` for torrent creation (mktorrent-compatible, parallel hashing at 3+ GB/s), `varuna-tools inspect` for torrent inspection. `varuna-ctl` for daemon control.
 
 ```bash
-zig build run -- download /path/to/file.torrent /path/to/download-root --port 6882
-zig build run -- seed /path/to/file.torrent /path/to/data-root --port 6881
-zig build run -- inspect /path/to/file.torrent
+# Daemon
+varuna                                    # starts daemon (reads varuna.toml)
+
+# CLI control
+varuna-ctl add /path/to/file.torrent
+varuna-ctl add --magnet "magnet:?xt=..."
+varuna-ctl list
+varuna-ctl info <hash>
+
+# Tooling
+varuna-tools create -a http://tracker/announce -o out.torrent /path/to/file
+varuna-tools create --hybrid -w http://webseed/file -t 8 /path/to/file
+varuna-tools inspect file.torrent
 ```
 
 ### Known Limitations
@@ -29,21 +39,15 @@ zig build run -- inspect /path/to/file.torrent
 The living scope and architecture record lives in [DECISIONS.md](DECISIONS.md). Keep that file updated as constraints and design choices change.
 Use [STATUS.md](STATUS.md) as the current ledger for what is already implemented, what is next, and which issues are still open.
 
-## Local Swarm Demo
-The repository includes a reproducible local smoke test that uses an off-the-shelf tracker:
+## Testing
 
 ```bash
-./scripts/demo_swarm.sh
+zig build test                    # all unit tests
+./scripts/demo_swarm.sh           # e2e: seeder → downloader via tracker (TCP + uTP)
+./scripts/test_web_seed.sh        # e2e: web seed download (3 scenarios, BEP 19)
 ```
 
-That script:
-
-- Creates a small `.torrent` file with the Node helper in `scripts/create_torrent.mjs`.
-- Uses `varuna inspect` to derive the torrent info hash.
-- Starts `scripts/tracker.sh`, which wraps the Ubuntu `opentracker` package.
-- Whitelists the torrent info hash because the packaged `opentracker` build rejects unlisted torrents.
-- Runs one `varuna seed` instance and one `varuna download` instance against the tracker.
-- Verifies the downloaded payload with `cmp`.
+The demo swarm creates a torrent with `varuna-tools create`, starts opentracker with the info hash whitelisted, runs a seeder and downloader daemon, and verifies the downloaded payload.
 
 ## Project Direction
 Varuna is intended for local Linux storage only. SSDs, HDDs, mergerfs, ext4, xfs, btrfs, bcachefs, and zfs matter; network filesystems such as NFS and CIFS do not. The initial focus is private-tracker functionality and operational reliability, not broad feature coverage or plugin systems.

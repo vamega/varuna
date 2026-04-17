@@ -211,71 +211,53 @@ Update it whenever a milestone lands, the near-term backlog changes, or a new op
 - ~~**BEP 52 Phase 6**~~: (DONE) runtime Merkle tree caching for hash serving. Per-file trees built lazily from disk, LRU eviction, `handleHashRequest` serves real hashes.
 
 ### Operational
-- ~~**Flood/qui WebUI validation**~~: (DONE) populated remaining stub fields (tracker URL, trackers_count, piece_range, content_path, magnet_uri, super_seeding, properties hash/name/created_by), added real peer data to torrentPeers endpoint.
-- ~~**API placeholder cleanup**~~: (DONE) wired real DHT node count into transfer/info and sync/maindata, wired real infohash_v2 (BEP 52) into torrent info/properties/sync, wired scrape data into properties peers_total/seeds_total, parsed creation_date from .torrent files. Documented unsupported endpoints in `docs/api-compatibility.md`.
-- ~~**API keep-alive for polling**~~: (DONE) HTTP/1.1 clients now stay connected across sequential requests, and the server keeps buffered leftovers instead of forcing one request per socket.
-- ~~**Shared MSE responder lookup**~~: (DONE) inbound encrypted handshakes now consult a shared `req2 -> info_hash` table instead of copying and scanning all torrent hashes per peer.
-- ~~**Shared tracker executor / connection reuse**~~: (DONE) daemon-side reannounce, completion announce, and scrape jobs now run through one shared tracker executor with a persistent HTTP client instead of detached per-session tracker threads.
+- ~~**Flood/qui WebUI validation**~~: (DONE)
+- ~~**API placeholder cleanup**~~: (DONE)
+- ~~**API keep-alive for polling**~~: (DONE)
+- ~~**Shared MSE responder lookup**~~: (DONE)
+- ~~**Shared tracker executor / connection reuse**~~: (DONE)
+- ~~**Seed plaintext scatter/gather**~~: (DONE)
+- ~~**Tracker work on the shared peer ring**~~: (DONE)
+- ~~**Magnet initial peer collection**~~: (DONE) `collectMagnetPeers` replaced with `submitMagnetAnnounces` — magnet tracker announces now go through ring-based `TrackerExecutor`/`UdpTrackerExecutor`. Zero blocking I/O on the background thread.
+- ~~**uTP BT send bridge**~~: (DONE) uTP data transfer works end-to-end. Fixed seq_nr off-by-one in `acceptSyn` and inbound state machine stall after extension handshake. `demo_swarm.sh` runs with `enable_utp = true`.
+- ~~**Wave 5 BEP 52 creation**~~: (DONE) `varuna-tools create --hybrid` produces BEP 52 hybrid v1+v2 torrents with SHA-256 Merkle trees, file tree structure, and pieces root.
+- ~~**Generic HttpExecutor**~~: (DONE) extracted from TrackerExecutor (~1011 lines). Supports custom headers (Range), target buffer for zero-copy body writes, HTTPS via BoringSSL. TrackerExecutor is now a thin 92-line wrapper.
+- ~~**BEP 19 web seed downloads**~~: (DONE) piece downloads via HTTP Range requests through HttpExecutor. Multi-piece batched requests (configurable `web_seed_max_request_bytes`, default 4MB). WebSeedManager handles URL management, piece-to-file mapping, backoff. E2e verified: 3 scenarios (1-request, multi-request, many-small-requests) all pass.
+- ~~**Blocking HttpClient retired**~~: (DONE) no daemon code path imports the blocking `io/http.zig` HttpClient. URL parsing extracted to `io/url.zig`. Only CLI tools and tests use the blocking client.
+- ~~**Transport disposition**~~: (DONE) fine-grained TCP/uTP control via `TransportDisposition` packed struct. TOML config accepts presets or flag lists. Runtime start/stop of TCP and UDP listeners via `reconcileListeners()`. Cancel-before-close with IORING_OP_ASYNC_CANCEL. 25 integration tests.
+- ~~**IORING_OP_SOCKET for hot-path socket creation**~~: (DONE) peer connections, tracker requests, and UDP tracker all use async socket creation. Startup socket() count: 13 → 3.
+- ~~**varuna-tools create**~~: (DONE) native Zig torrent creator with mktorrent feature parity. Parallel hashing (11x speedup at 16 threads). All test scripts use `varuna-tools create` — Node.js dependency eliminated.
+- **Smart ban**: no hash-failure-based peer penalization. Implementation plan in `docs/future-features.md` (3 phases: trust points → per-block SHA-1 tracking → event loop integration).
+- **MSE simultaneous handshake robustness**: timing-dependent crash in `checkPeerTimeouts -> removePeer -> cleanupPeer` when both inbound and outbound MSE handshakes are in flight. Disappears under GDB. Needs generation counters or explicit handshake-in-progress guards.
+- **Multi-source piece assembly**: each piece is downloaded from a single peer. Requesting different blocks from different peers would improve download performance and is a prerequisite for full smart ban value.
 - **Peer hot/cold split / partial SoA**: the active-slot pass removes a lot of wasted scans, but the `Peer` struct is still wide. The next performance step is separating hot scheduling/state fields from cold crypto/buffering state.
 - **Torrent hot-summary registry**: cached cumulative byte totals now remove the hottest `/sync` stats scan, but a denser registry is still the next step if queue position, state derivation, or other per-torrent fields dominate at `10k+` torrents.
 - **Broader RPC arena coverage**: `/sync/maindata` now uses an arena for transient work; the other list-heavy endpoints still allocate temporary object graphs and strings.
-- **API request-body reuse above the retained cap**: upload-sized request buffers are now retained per slot up to `256 KiB`, but larger bodies still allocate on demand. Revisit this only if real API traces show sustained uploads above that threshold.
-- ~~**Seed plaintext scatter/gather**~~: (DONE) plaintext seed sends now use tracked vectored `sendmsg` with explicit piece-buffer ownership; encrypted peers still use the contiguous copy path.
 - **uTP outbound queueing**: the UDP path still has room for a ring queue and multiple in-flight sends if uTP becomes hot in real swarms.
 - **uTP multishot receive**: `recvmsg_multishot` plus a provided-buffer strategy still needs a workload and a measured implementation before it should land.
-- ~~**Tracker work on the shared peer ring**~~: (DONE) blocking tracker HTTP/UDP functions removed; all daemon tracker I/O goes through the ring-based `TrackerExecutor`/`UdpTrackerExecutor`. `multi_announce.zig` deleted.
-- **Magnet initial peer collection**: `collectMagnetPeers()` still calls blocking `announce.fetchAuto` from the background thread. Should be moved to use `TrackerExecutor` once the event loop is active for the session.
-- **uTP BT send bridge**: piece data sends to uTP peers fail because the ring send path requires a real TCP fd. The uTP data delivery bridge works for receiving (inbound data from uTP -> peer handler) but the reverse path (outbound piece data from seed handler -> uTP socket) needs explicit wiring through the uTP manager's UDP sendmsg path instead of the TCP ring send path.
-- **MSE simultaneous handshake robustness**: timing-dependent crash in `checkPeerTimeouts -> removePeer -> cleanupPeer` when both inbound and outbound MSE handshakes are in flight. Disappears under GDB. Needs generation counters or explicit handshake-in-progress guards.
-- **Wave 5 BEP 52 creation**: `src/torrent/create.zig` still only emits v1 torrents. Pure-v2 / hybrid torrent creation remains the largest unfinished item from the review plan.
+- **Dynamic outbound buffer for UtpSocket**: fixed `[128]OutPacket` should become ArrayList for high-throughput uTP connections.
+- **c-ares io_uring integration**: proof-of-concept in `~/projects/c-ares` — native io_uring event engine with SENDMSG/RECVMSG for DNS queries (zero direct syscalls). Could replace varuna's DNS threadpool to eliminate background-thread DNS.
 
 ## Known Issues
 
 - The packaged Ubuntu `opentracker` build requires explicit info-hash whitelisting (`--whitelist-hash`).
-- On WSL2, the real `perf` backend works for `perf stat` and `perf record`, but many hardware counters still report `<not supported>`.
-- uTP send queue previously truncated data packets to header-only size (fixed).
-- On this WSL2 host, `perf stat` and `perf record` still require the kernel-matched `linux-tools-6.6.87.2-microsoft-standard-WSL2` package. `cachegrind` is the current cache-miss fallback.
-- The `peer_scan` harness is now parameterized by active density (`--scale`), but the production peer table is still a wide AoS. Sparse synthetic scans are measurable; a full hot/cold split is still pending.
-- The shared EventLoop no longer has a 64-torrent cap, and the sparse peer/torrent registry pass removed the main cross-product scans. Cached live byte totals further reduced `/sync` stats cost, but a broader hot-summary registry may still be needed for `10k+` torrents.
-- The first outbound uTP queue cleanup experiment removed allocator churn but did not show a convincing wall-clock improvement on the loopback workload, so it was not kept in production.
-- `splice` / sendfile-style upload is currently a poor fit for BitTorrent framing and multi-file spans. The benchmark prototype was slower than both contiguous copy and `sendmsg`.
-- `zig build test-torrent-session` now uses the correct project-module wrapper, but this host still intermittently hits Zig cache/toolchain failures (`manifest_create Unexpected`) before the focused step finishes compiling.
-- **uTP BT send bridge incomplete**: piece download sends via `ring.send(fd=-1)` fail for uTP peers because the ring send path requires a real TCP file descriptor. uTP data delivery (`deliverUtpData`) works for receiving but the reverse path (sending piece data to uTP peers) is not yet wired. This blocks download-via-uTP.
-- **MSE handshake failures in mixed encryption mode**: `vc_not_found` and `req1_not_found` errors occur during simultaneous inbound+outbound MSE handshakes. The timing-dependent crash in `checkPeerTimeouts -> removePeer -> cleanupPeer` disappears under GDB (slower execution avoids the timeout race). Pre-existing issue unrelated to the io_uring migration.
-- `demo_swarm.sh` runs TCP-only (uTP and encryption disabled) as a workaround until the uTP send bridge is implemented.
+- On WSL2, `perf stat`/`perf record` require kernel-matched `linux-tools` package; many hardware counters report `<not supported>`.
+- `zig build test-torrent-session` intermittently hits Zig cache/toolchain failures (`manifest_create Unexpected`).
+- **No smart ban**: peers sending corrupt data are not penalized. Pieces are re-downloaded indefinitely. See `docs/future-features.md` for the 3-phase implementation plan.
+- **MSE handshake failures in mixed encryption mode**: `vc_not_found` and `req1_not_found` errors occur during simultaneous inbound+outbound MSE handshakes. Timing-dependent, disappears under GDB. `demo_swarm.sh` runs with `encryption = "disabled"` as workaround.
+- **Daemon graceful shutdown**: SIGTERM doesn't always result in clean exit when web seed downloads or active connections are in progress. Scripts use `kill -9` + `pkill` fallback.
+- `IORING_OP_SETSOCKOPT` (kernel 6.7+), `IORING_OP_BIND`/`LISTEN` (kernel 6.11+) not available on current kernel 6.6. Per-peer setsockopt (TCP_NODELAY, buffer sizes) remains synchronous.
 
-## Documentation Notes
+## Last Verified Milestone (2026-04-16)
 
-- `AGENTS.md` now reflects the current subsystem layout and build-driven testing workflow instead of the earlier mostly-forward-looking repository template.
-- `docs/future-features.md` is now explicitly documented as deferred/follow-up work only, not a source-of-truth list of missing features.
-- `docs/dht-bep52-plan.md` is now explicitly documented as a planning/follow-up document. DHT and most BEP 52 runtime support are implemented; the main remaining BEP 52 gap is torrent creation.
-
-## Last Verified Milestone
-
-- Demo swarm end-to-end: TCP-only transfer verified (`demo_swarm.sh` with encryption/uTP disabled), async recheck, tracker announce, peer discovery, piece transfer all working
-- strace verified: all daemon network I/O routes through `io_uring_enter` (290 calls); no direct `connect`/`send`/`recv`/`sendto`/`recvfrom`/`sendmsg`/`recvmsg`; only exceptions are SQLite pread/pwrite (background thread), stdout pwritev (logging), socket/bind (one-time setup)
-- 9 integration bugs found and fixed during demo_swarm testing (deadlocks, UAFs, dangling pointers, race conditions)
-- UtpSocket heap allocation: 24 MB inline to 4 KB baseline (10,790x stack frame reduction in debug mode)
-- Stack overflow fix: `addressEql` by-pointer signature eliminates 46 MB debug-mode stack frame
-- TCP listen socket created at startup for both download and seed modes
-- Socket creation wrappers (`createTcpSocket`/`createUdpSocket`) with enforced `bind_device`
-- Compile-time safety tests, SO_BINDTODEVICE tests, strace validator script, `zig build test-swarm`
-- Async torrent startup: background thread does SQLite+parse only; event loop does io_uring piece verification + ring-based announce scheduling
-- Async BEP 9 metadata fetch on event loop (replaces blocking TCP sockets)
-- Blocking tracker code removed (multi_announce.zig deleted, blocking fetch/scrape functions removed)
-- Timerfd-based timer callbacks for announce jitter (replaces Thread.sleep)
-- Full codebase clarity pass: 82 fixes across 62 files (naming, abstractions, dead code, type safety)
-- Queue enforcement consolidated into `QueueManager.enforce()`, BencodeScanner shared, main.zig decomposed
-- HTTPS tracker support via vendored BoringSSL (BIO pair + io_uring transport)
-- DHT (BEP 5) Phases 1-3
-- BEP 52 (BitTorrent v2 / Hybrid) Phases 1-6 (including runtime Merkle tree cache)
-- MSE/PE (BEP 6) async handshake + auto-fallback
-- All protocol features merged, API placeholder values replaced with real data where available
+- Demo swarm end-to-end with uTP enabled: `demo_swarm.sh` runs TCP+uTP, seeder-to-downloader transfer verified
+- bpftrace audit: zero daemon networking syscalls bypass io_uring. All 75 "violations" were DNS threadpool `getaddrinfo` calls (allowed exception). Hot-path socket creation via IORING_OP_SOCKET (startup socket() count: 13 → 3).
+- Web seed (BEP 19) e2e: 3 scenarios pass — 1MB/1-request (1s), 4MB/5-requests (1s), 8MB/17-requests (1s). Multi-piece batched Range requests with configurable `web_seed_max_request_bytes`.
+- `varuna-tools create`: info hashes byte-identical to mktorrent. Parallel hashing: 100MB in 30ms (3.3 GB/s, 16 threads). Hybrid v1+v2 torrent creation (BEP 52). Node.js dependency eliminated.
+- Transport disposition: runtime start/stop of TCP/UDP listeners via API, 25 integration tests.
+- 71 qBittorrent API endpoints implemented (16 added this session).
 - `zig build test`: all tests pass
-- Shared EventLoop registry validated with `20,000` active torrent contexts and hashed inbound lookup
-- `zig build`: clean build (with `-Dtls=boringssl` default and `-Dtls=none`)
-- `zig build -Doptimize=ReleaseFast perf-workload -- session_load --iterations=1000`: `2,004` allocs, `1.33e7 ns`
-- `zig build -Doptimize=ReleaseFast perf-workload -- piece_buffer_cycle --iterations=5000`: `11` allocs, `5.59 MB` retained bytes, `2.40e5 ns`, repeat `2.07e5 ns`
+- `zig build`: clean build
 - `zig build -Doptimize=ReleaseFast perf-workload -- http_response --iterations=5000`: `1` alloc, `8 KB` transient bytes, `1.77e6 ns`
 - `zig build -Doptimize=ReleaseFast perf-workload -- api_get_burst --iterations=4000 --clients=8`: `0` allocs, `0` transient bytes, `2.13e8 ns` to `2.31e8 ns`
 - `zig build -Doptimize=ReleaseFast perf-workload -- api_upload_burst --iterations=1000 --clients=8 --body-bytes=65536`: `8` allocs, `525 KB` retained bytes, `1.24e8 ns`
