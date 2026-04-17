@@ -105,7 +105,7 @@ port_min = ${SEED_PORT}
 port_max = ${SEED_PORT}
 dht = false
 pex = false
-encryption = "disabled"
+encryption = "preferred"
 enable_utp = true
 EOF
 
@@ -125,7 +125,7 @@ port_min = ${DOWNLOAD_PORT}
 port_max = ${DOWNLOAD_PORT}
 dht = false
 pex = false
-encryption = "disabled"
+encryption = "preferred"
 enable_utp = true
 EOF
 
