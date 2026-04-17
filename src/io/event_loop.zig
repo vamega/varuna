@@ -168,6 +168,10 @@ pub const EventLoop = struct {
     /// When both outgoing TCP and uTP are enabled, even values use TCP and odd values use uTP.
     utp_transport_counter: u32 = 0,
 
+    // signalfd for SIGINT/SIGTERM — produces a CQE via POLL_ADD when
+    // a shutdown signal arrives, breaking submit_and_wait immediately.
+    signal_fd: posix.fd_t = -1,
+
     // Accept socket for seeding (-1 if not seeding)
     listen_fd: posix.fd_t = -1,
 
@@ -339,6 +343,20 @@ pub const EventLoop = struct {
         };
     }
 
+    /// Sentinel user_data for signalfd POLL_ADD CQEs.
+    const signal_sentinel: u64 = 0xDEAD_51C0A1_DEAD;
+
+    /// Create a signalfd for SIGINT/SIGTERM and register it with the ring
+    /// via POLL_ADD. When a signal arrives, the CQE fires and dispatch()
+    /// sets self.running = false, breaking the submit_and_wait loop.
+    pub fn installSignalFd(self: *EventLoop) !void {
+        const signal = @import("signal.zig");
+        const fd = try signal.createSignalFd();
+        self.signal_fd = fd;
+        // Register a oneshot POLL_ADD — we only need one signal to shut down.
+        _ = try self.ring.poll_add(signal_sentinel, fd, linux.POLL.IN);
+    }
+
     pub fn init(
         allocator: std.mem.Allocator,
         session: *const session_mod.Session,
@@ -406,6 +424,10 @@ pub const EventLoop = struct {
         if (self.timer_fd >= 0) {
             posix.close(self.timer_fd);
             self.timer_fd = -1;
+        }
+        if (self.signal_fd >= 0) {
+            posix.close(self.signal_fd);
+            self.signal_fd = -1;
         }
 
         // ── Phase 2: Drain the ring ──────────────────────────────
@@ -1647,6 +1669,15 @@ pub const EventLoop = struct {
     // ── CQE dispatch ──────────────────────────────────────
 
     fn dispatch(self: *EventLoop, cqe: linux.io_uring_cqe) void {
+        // signalfd CQE — SIGINT or SIGTERM received
+        if (cqe.user_data == signal_sentinel) {
+            log.info("shutdown signal received via signalfd", .{});
+            self.running = false;
+            const signal = @import("signal.zig");
+            signal.requestShutdown();
+            return;
+        }
+
         const op = decodeUserData(cqe.user_data);
         switch (op.op_type) {
             .peer_socket => peer_handler.handleSocketCreated(self, op.slot, cqe),

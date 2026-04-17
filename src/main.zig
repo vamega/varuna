@@ -31,6 +31,8 @@ pub fn main() !void {
         }
     }
 
+    // Install fallback signal handler (for pre-event-loop startup errors).
+    // The signalfd installed below replaces this for the main event loop.
     varuna.io.signal.installHandlers();
     var loaded_cfg = try varuna.config.loadDefault(allocator);
     defer loaded_cfg.deinit();
@@ -84,6 +86,13 @@ pub fn main() !void {
         shared_el.deinit();
         allocator.destroy(shared_el_heap);
     }
+
+    // Install signalfd for graceful shutdown via io_uring. SIGINT/SIGTERM
+    // produce a POLL_ADD CQE that breaks submit_and_wait immediately.
+    shared_el.installSignalFd() catch |err| {
+        try stdout.print("warning: signalfd setup failed ({s}), falling back to signal handler\n", .{@errorName(err)});
+        try stdout.flush();
+    };
 
     // Resolve resume DB path (config override or default XDG location)
     var resume_db_buf: [1024]u8 = undefined;

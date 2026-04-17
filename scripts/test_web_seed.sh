@@ -255,16 +255,14 @@ fi
 
 # Clean up for next scenario
 # Restart daemon and tracker between scenarios for clean state
-kill -9 "$DAEMON_PID" 2>/dev/null || true
-kill -9 "$TRACKER_PID" 2>/dev/null || true
-# Also pkill in case kill didn't reach the process (WSL2 subprocess issue)
-pkill -9 -f "varuna.*${API_PORT}" 2>/dev/null || true
-pkill -9 -f "opentracker.*${TRACKER_PORT}" 2>/dev/null || true
+# Graceful shutdown via SIGTERM (signalfd makes this reliable)
+kill "$DAEMON_PID" 2>/dev/null || true
+kill "$TRACKER_PID" 2>/dev/null || true
 wait "$DAEMON_PID" 2>/dev/null || true
 wait "$TRACKER_PID" 2>/dev/null || true
 DAEMON_PID=""
 TRACKER_PID=""
-sleep 1
+sleep 0.5
 rm -rf "$WORK_DIR/download-root"/*
 (cd "$WORK_DIR/daemon" && exec "$VARUNA") >"$WORK_DIR/daemon.log" 2>&1 &
 DAEMON_PID=$!
@@ -325,16 +323,14 @@ else
 fi
 
 # Restart daemon and tracker between scenarios for clean state
-kill -9 "$DAEMON_PID" 2>/dev/null || true
-kill -9 "$TRACKER_PID" 2>/dev/null || true
-# Also pkill in case kill didn't reach the process (WSL2 subprocess issue)
-pkill -9 -f "varuna.*${API_PORT}" 2>/dev/null || true
-pkill -9 -f "opentracker.*${TRACKER_PORT}" 2>/dev/null || true
+# Graceful shutdown via SIGTERM (signalfd makes this reliable)
+kill "$DAEMON_PID" 2>/dev/null || true
+kill "$TRACKER_PID" 2>/dev/null || true
 wait "$DAEMON_PID" 2>/dev/null || true
 wait "$TRACKER_PID" 2>/dev/null || true
 DAEMON_PID=""
 TRACKER_PID=""
-sleep 1
+sleep 0.5
 rm -rf "$WORK_DIR/download-root"/*
 (cd "$WORK_DIR/daemon" && exec "$VARUNA") >"$WORK_DIR/daemon.log" 2>&1 &
 DAEMON_PID=$!
