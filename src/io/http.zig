@@ -1,3 +1,22 @@
+// ── BLOCKING HTTP CLIENT ──────────────────────────────────────────
+//
+// This module contains a blocking HTTP client (HttpClient) that uses
+// direct posix syscalls (socket/connect/read/write). It is NOT used by
+// the varuna daemon — all daemon HTTP I/O goes through the non-blocking
+// io_uring-based HttpExecutor in http_executor.zig.
+//
+// The blocking HttpClient is only used by:
+//   - varuna-ctl (CLI tool, blocking I/O is acceptable)
+//   - tracker/announce.zig:fetchViaHttp (library function for CLI tools)
+//   - perf/workloads.zig (benchmarking)
+//   - tests in this file
+//
+// The pure parsing utilities at the bottom of this file (ParsedUrl,
+// parseUrl, findBodyStart, parseContentLength, parseStatusCode,
+// parseConnectionClose) ARE used by the daemon's HttpExecutor and
+// must not be removed.
+// ──────────────────────────────────────────────────────────────────
+
 const std = @import("std");
 const posix = std.posix;
 const linux = std.os.linux;
@@ -5,10 +24,9 @@ const DnsResolver = @import("dns.zig").DnsResolver;
 const build_options = @import("build_options");
 const TlsStream = @import("tls.zig").TlsStream;
 
-/// Minimal HTTP/1.1 GET client using blocking posix I/O.
-/// Designed for tracker announces: simple GET requests with small responses.
-/// Supports both HTTP and HTTPS (when built with -Dtls=boringssl).
-/// Runs on background threads -- no io_uring dependency.
+/// Blocking HTTP/1.1 GET client using direct posix I/O.
+/// Only for varuna-ctl and CLI tools — the daemon uses HttpExecutor instead.
+/// Supports HTTP and HTTPS (when built with -Dtls=boringssl).
 pub const HttpClient = struct {
     allocator: std.mem.Allocator,
     dns_resolver: ?*DnsResolver = null,
