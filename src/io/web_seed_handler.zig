@@ -319,11 +319,10 @@ fn webSeedRangeComplete(context: *anyopaque, result: HttpExecutor.RequestResult)
             if (el.getTorrentContext(slot.torrent_id)) |tc| {
                 if (tc.web_seed_manager) |wsm| wsm.disable(slot.seed_index);
             }
-        } else if (result.status == 0 and result.err == null) {
-            // status=0 with no error = stale pooled connection dropped.
-            // Not the seed's fault -- mark idle for immediate retry, no backoff.
-            slot.ranges_failed = false; // treat as retryable, not a real failure
         }
+        // Note: status=0 with no error (stale pooled connection) is still
+        // a failure -- ranges_failed stays true. The seed will be retried
+        // without backoff penalty below.
     }
 
     slot.ranges_completed += 1;
@@ -333,7 +332,28 @@ fn webSeedRangeComplete(context: *anyopaque, result: HttpExecutor.RequestResult)
 
     // All ranges are done
     if (slot.ranges_failed) {
-        failSlot(el, slot);
+        // For stale pooled connections (status=0, no error), release pieces
+        // without penalizing the seed -- the connection was just stale.
+        const stale_conn = result.status == 0 and result.err == null;
+        if (stale_conn) {
+            // Release pieces back to pool without backoff penalty
+            if (el.getTorrentContext(slot.torrent_id)) |tc| {
+                if (tc.piece_tracker) |pt| {
+                    var i: u32 = 0;
+                    while (i < slot.piece_count) : (i += 1) {
+                        pt.releasePiece(slot.first_piece + i);
+                    }
+                }
+                // Mark seed idle (no backoff) so it can retry immediately
+                if (tc.web_seed_manager) |wsm| {
+                    wsm.markSuccess(slot.seed_index, 0);
+                }
+            }
+            if (slot.buf) |buf| el.allocator.free(buf);
+            slot.reset();
+        } else {
+            failSlot(el, slot);
+        }
         return;
     }
 

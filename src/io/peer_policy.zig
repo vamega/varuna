@@ -483,8 +483,23 @@ pub fn processHashResults(self: *EventLoop) void {
 
             if (self.getPendingWrite(pending_key)) |pending_w| {
                 if (pending_w.spans_remaining == 0) {
+                    // No disk writes were submitted. This happens when all
+                    // file spans have fd == -1 (do_not_download) or all
+                    // io_uring write submissions failed.
                     _ = self.removePendingWrite(pending_key);
-                    if (tc.piece_tracker) |pt| pt.releasePiece(result.piece_index);
+                    if (pending_w.write_failed) {
+                        // Actual write submission failures -- release piece
+                        // so it can be retried.
+                        log.warn("piece {d} torrent {d}: all write submissions failed, releasing", .{
+                            result.piece_index, torrent_id,
+                        });
+                        if (tc.piece_tracker) |pt| pt.releasePiece(result.piece_index);
+                    } else {
+                        // All spans skipped (do_not_download) -- the piece
+                        // data is verified correct, mark complete.
+                        const piece_length = sess.layout.pieceSize(result.piece_index) catch 0;
+                        if (tc.piece_tracker) |pt| _ = pt.completePiece(result.piece_index, piece_length);
+                    }
                     self.allocator.free(result.piece_buf);
                     continue;
                 }

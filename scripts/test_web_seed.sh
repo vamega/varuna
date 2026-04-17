@@ -189,7 +189,7 @@ web_seed_max_request_bytes = 4194304
 EOF
 
 # ── Start downloader daemon ──────────────────────────────
-(cd "$WORK_DIR/daemon" && "$VARUNA") >"$WORK_DIR/daemon.log" 2>&1 &
+(cd "$WORK_DIR/daemon" && exec "$VARUNA") >"$WORK_DIR/daemon.log" 2>&1 &
 DAEMON_PID=$!
 wait_for_tcp 127.0.0.1 "$API_PORT"
 echo "Daemon started (PID $DAEMON_PID)"
@@ -257,13 +257,16 @@ fi
 # Restart daemon and tracker between scenarios for clean state
 kill -9 "$DAEMON_PID" 2>/dev/null || true
 kill -9 "$TRACKER_PID" 2>/dev/null || true
+# Also pkill in case kill didn't reach the process (WSL2 subprocess issue)
+pkill -9 -f "varuna.*${API_PORT}" 2>/dev/null || true
+pkill -9 -f "opentracker.*${TRACKER_PORT}" 2>/dev/null || true
 wait "$DAEMON_PID" 2>/dev/null || true
 wait "$TRACKER_PID" 2>/dev/null || true
 DAEMON_PID=""
 TRACKER_PID=""
 sleep 1
 rm -rf "$WORK_DIR/download-root"/*
-(cd "$WORK_DIR/daemon" && "$VARUNA") >"$WORK_DIR/daemon.log" 2>&1 &
+(cd "$WORK_DIR/daemon" && exec "$VARUNA") >"$WORK_DIR/daemon.log" 2>&1 &
 DAEMON_PID=$!
 wait_for_tcp 127.0.0.1 "$API_PORT"
 SID=$(get_sid "$API_PORT")
@@ -324,13 +327,16 @@ fi
 # Restart daemon and tracker between scenarios for clean state
 kill -9 "$DAEMON_PID" 2>/dev/null || true
 kill -9 "$TRACKER_PID" 2>/dev/null || true
+# Also pkill in case kill didn't reach the process (WSL2 subprocess issue)
+pkill -9 -f "varuna.*${API_PORT}" 2>/dev/null || true
+pkill -9 -f "opentracker.*${TRACKER_PORT}" 2>/dev/null || true
 wait "$DAEMON_PID" 2>/dev/null || true
 wait "$TRACKER_PID" 2>/dev/null || true
 DAEMON_PID=""
 TRACKER_PID=""
 sleep 1
 rm -rf "$WORK_DIR/download-root"/*
-(cd "$WORK_DIR/daemon" && "$VARUNA") >"$WORK_DIR/daemon.log" 2>&1 &
+(cd "$WORK_DIR/daemon" && exec "$VARUNA") >"$WORK_DIR/daemon.log" 2>&1 &
 DAEMON_PID=$!
 wait_for_tcp 127.0.0.1 "$API_PORT"
 SID=$(get_sid "$API_PORT")
