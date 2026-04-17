@@ -94,6 +94,11 @@ fn runInspect(
     const info_hash_hex = std.fmt.bytesToHex(metainfo.info_hash, .lower);
     try writer.print("name={s}\n", .{metainfo.name});
     try writer.print("info_hash={s}\n", .{info_hash_hex[0..]});
+    if (metainfo.info_hash_v2) |v2_hash| {
+        const v2_hex = std.fmt.bytesToHex(v2_hash, .lower);
+        try writer.print("info_hash_v2={s}\n", .{v2_hex[0..]});
+    }
+    try writer.print("version={s}\n", .{@tagName(metainfo.version)});
     try writer.print("announce={s}\n", .{metainfo.announce orelse ""});
     if (metainfo.announce_list.len > 0) {
         for (metainfo.announce_list) |url| {
@@ -128,6 +133,7 @@ fn runCreate(
     var source: ?[]const u8 = null;
     var input_path: ?[]const u8 = null;
     var threads: u32 = 0;
+    var hybrid = false;
 
     var i: usize = 0;
     while (i < sub_args.len) : (i += 1) {
@@ -168,6 +174,8 @@ fn runCreate(
             if (i >= sub_args.len) return error.InvalidArguments;
             threads = std.fmt.parseInt(u32, sub_args[i], 10) catch return error.InvalidArguments;
             if (threads == 0) return error.InvalidArguments;
+        } else if (std.mem.eql(u8, arg, "--hybrid")) {
+            hybrid = true;
         } else if (!std.mem.startsWith(u8, arg, "-")) {
             input_path = arg;
         } else {
@@ -187,6 +195,7 @@ fn runCreate(
         .source = source,
         .web_seed = web_seed,
         .threads = threads,
+        .hybrid = hybrid,
     };
 
     const is_dir = blk: {
@@ -218,6 +227,12 @@ fn runCreate(
     const info_hash_val = try torrent.info_hash.compute(torrent_bytes);
     const hex = std.fmt.bytesToHex(info_hash_val, .lower);
     try writer.print("created {s} ({} bytes), info_hash={s}\n", .{ dest, torrent_bytes.len, hex[0..] });
+
+    if (hybrid) {
+        const v2_hash = try torrent.info_hash.computeV2(torrent_bytes);
+        const v2_hex = std.fmt.bytesToHex(v2_hash, .lower);
+        try writer.print("info_hash_v2={s}\n", .{v2_hex[0..]});
+    }
 
     // Print hashing speed
     if (hash_stats.elapsed_ns > 0) {
@@ -307,6 +322,7 @@ fn writeUsage(writer: *std.Io.Writer) !void {
             "    -w, --web-seed <url>      BEP 19 web seed URL\n" ++
             "    -c, --comment <text>      Comment field\n" ++
             "    -s, --source <text>       Source field (private tracker identification)\n" ++
+            "    --hybrid                  Create a hybrid v1+v2 torrent (BEP 52)\n" ++
             "\n" ++
             "  varuna-tools inspect <torrent-file>\n" ++
             "  varuna-tools verify <torrent-file> <target-root>\n" ++

@@ -1008,4 +1008,159 @@ pub const HttpExecutor = struct {
             }
         }
     }
+
+    // ── Tests ────────────────────────────────────────────────
+
+    test "target_buf receives correct body data for multi-piece range" {
+        // Simulate an HTTP 206 response being received in chunks and
+        // verify that the body bytes end up at the correct position in
+        // target_buf (the multi-piece web seed download path).
+        const Sha1 = @import("../crypto/root.zig").Sha1;
+        const allocator = std.testing.allocator;
+
+        // Simulate a 4-piece file (256KB pieces = 1MB total)
+        const piece_length: u32 = 262144;
+        const piece_count: u32 = 4;
+        const total_bytes: u32 = piece_length * piece_count;
+
+        // Create known file content (deterministic pattern)
+        const file_data = try allocator.alloc(u8, total_bytes);
+        defer allocator.free(file_data);
+        for (file_data, 0..) |*b, i| {
+            b.* = @truncate(i *% 251 +% 71);
+        }
+
+        // Compute expected SHA-1 for each piece
+        var expected_hashes: [piece_count][20]u8 = undefined;
+        for (0..piece_count) |i| {
+            const start = i * piece_length;
+            const end = start + piece_length;
+            Sha1.hash(file_data[start..end], &expected_hashes[i], .{});
+        }
+
+        // Allocate the target buffer (like run_buf in the web seed handler)
+        const target_buf = try allocator.alloc(u8, total_bytes);
+        defer allocator.free(target_buf);
+        @memset(target_buf, 0);
+
+        // Build a fake HTTP 206 response
+        const headers = "HTTP/1.1 206 Partial Content\r\n" ++
+            "Content-Type: application/octet-stream\r\n" ++
+            "Content-Length: 1048576\r\n" ++
+            "Content-Range: bytes 0-1048575/1048576\r\n" ++
+            "\r\n";
+
+        // Create a minimal HttpExecutor (only allocator field is used)
+        var he: HttpExecutor = undefined;
+        he.allocator = allocator;
+
+        // Create a request slot with target_buf configured
+        var slot = RequestSlot{};
+        slot.job = Job{
+            .context = undefined,
+            .on_complete = undefined,
+            .target_buf = target_buf,
+            .target_offset = 0,
+        };
+
+        // Simulate receiving data in chunks, like io_uring recv would deliver.
+        // First chunk: all headers + first part of body.
+        const first_chunk_size = 8192;
+        var full_response = try allocator.alloc(u8, headers.len + total_bytes);
+        defer allocator.free(full_response);
+        @memcpy(full_response[0..headers.len], headers);
+        @memcpy(full_response[headers.len..], file_data);
+
+        // Feed the response in 8KB chunks (simulating recv_tmp[0..n])
+        var offset: usize = 0;
+        while (offset < full_response.len) {
+            const chunk_end = @min(offset + first_chunk_size, full_response.len);
+            const chunk = full_response[offset..chunk_end];
+            try he.appendRecvData(&slot, chunk);
+            offset = chunk_end;
+        }
+
+        // Verify headers_done was set
+        try std.testing.expect(slot.headers_done);
+
+        // Verify all body bytes were written
+        try std.testing.expectEqual(total_bytes, slot.target_written);
+
+        // Split the buffer at piece boundaries and verify SHA-1 hashes
+        var mismatches: u32 = 0;
+        for (0..piece_count) |i| {
+            const start = i * piece_length;
+            const end = start + piece_length;
+            const piece_data = target_buf[start..end];
+
+            var actual_hash: [20]u8 = undefined;
+            Sha1.hash(piece_data, &actual_hash, .{});
+
+            if (!std.mem.eql(u8, &actual_hash, &expected_hashes[i])) {
+                mismatches += 1;
+            }
+        }
+
+        // This is the key assertion: all pieces should hash correctly.
+        // The bug causes ALL pieces to fail hash verification.
+        try std.testing.expectEqual(@as(u32, 0), mismatches);
+
+        // Clean up recv_buf
+        slot.recv_buf.deinit(allocator);
+    }
+
+    test "target_buf with non-zero offset writes at correct position" {
+        // Tests the multi-file scenario where buf_offset > 0 for subsequent ranges.
+        const allocator = std.testing.allocator;
+
+        const target_buf = try allocator.alloc(u8, 4096);
+        defer allocator.free(target_buf);
+        @memset(target_buf, 0);
+
+        // Second range writes to offset 1024 within the target buffer.
+        const headers = "HTTP/1.1 206 Partial Content\r\n" ++
+            "Content-Length: 1024\r\n" ++
+            "\r\n";
+
+        var body: [1024]u8 = undefined;
+        for (&body, 0..) |*b, i| {
+            b.* = @truncate(i ^ 0xAB);
+        }
+
+        var he: HttpExecutor = undefined;
+        he.allocator = allocator;
+
+        var slot = RequestSlot{};
+        slot.job = Job{
+            .context = undefined,
+            .on_complete = undefined,
+            .target_buf = target_buf,
+            .target_offset = 1024,
+        };
+
+        // Feed response in one chunk
+        var full_response = try allocator.alloc(u8, headers.len + body.len);
+        defer allocator.free(full_response);
+        @memcpy(full_response[0..headers.len], headers);
+        @memcpy(full_response[headers.len..], &body);
+
+        try he.appendRecvData(&slot, full_response);
+
+        try std.testing.expect(slot.headers_done);
+        try std.testing.expectEqual(@as(u32, 1024), slot.target_written);
+
+        // Verify data was written at the correct offset
+        // Bytes 0-1023 should be untouched (still 0)
+        for (target_buf[0..1024]) |b| {
+            try std.testing.expectEqual(@as(u8, 0), b);
+        }
+        // Bytes 1024-2047 should have the body data
+        try std.testing.expect(std.mem.eql(u8, target_buf[1024..2048], &body));
+        // Bytes 2048-4095 should be untouched
+        for (target_buf[2048..4096]) |b| {
+            try std.testing.expectEqual(@as(u8, 0), b);
+        }
+
+        slot.recv_buf.deinit(allocator);
+    }
 };
