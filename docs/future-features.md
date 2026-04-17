@@ -182,6 +182,49 @@ Remaining work for full production readiness:
 
 See [api-compatibility.md](api-compatibility.md) for the full qBittorrent WebAPI compatibility matrix, including which endpoints are implemented, which return placeholder data, and which are explicitly unsupported or deferred.
 
+## Smart Ban (Planned)
+
+Varuna currently has no hash-failure-based peer penalization. A peer sending corrupt data causes the piece to be re-downloaded indefinitely without consequence. This section describes the planned implementation, based on [libtorrent's smart ban algorithm](https://blog.libtorrent.org/2011/11/smart-ban/).
+
+### Phase 0: Basic trust-point banning
+
+Add `hashfails: u8` and `trust_points: i8` fields to the `Peer` struct in `src/io/types.zig`. On piece hash failure in `processHashResults` (`src/io/peer_policy.zig`), identify the peer that downloaded the failed piece, decrement `trust_points` by 2, and ban the peer (via `ban_list.banIp()`) if trust_points reach -7.
+
+This gives immediate protection against persistently corrupt peers without the full smart ban complexity.
+
+### Phase 1: Smart ban data structures
+
+New file `src/net/smart_ban.zig` with a `SmartBan` struct:
+
+```
+block_hashes: HashMap((torrent_id, piece_index, block_index) -> {peer_address, sha1_digest})
+```
+
+- `recordFailedPiece(torrent_id, piece_index, piece_data, block_size, peer_address)` — compute per-block SHA-1 digests and store them. Called when a piece fails hash verification.
+- `checkPassedPiece(torrent_id, piece_index, piece_data, block_size) -> []Address` — compare stored digests from the failed download against the now-verified data. Return addresses of peers whose blocks changed (sent corrupt data).
+- `clearTorrent(torrent_id)` — free entries when a torrent is removed or becomes a seed.
+
+Memory: ~42 bytes per block entry. A 1MB piece with 16KB blocks = 64 entries = ~2.7KB per failed piece. Even 1000 concurrent failures = ~2.7MB.
+
+### Phase 2: Integration
+
+Wire `SmartBan` into `processHashResults` in `src/io/peer_policy.zig`:
+- On hash failure: call `recordFailedPiece` with the piece buffer (still in memory, no disk read needed)
+- On hash success: call `checkPassedPiece`, ban any returned addresses via `ban_list`
+- On torrent removal/seed: call `clearTorrent`
+
+Add `smart_ban: ?*SmartBan` field to `EventLoop`. Event-loop-thread-only, no mutex needed.
+
+### Simplifications vs libtorrent
+
+- **No async disk reads**: libtorrent's smart_ban reads blocks back from disk because the cache may evict them. Varuna hashes directly from the in-memory piece buffer at the point of hash-result processing.
+- **Single peer per piece**: libtorrent uses `get_downloaders()` for multi-source piece attribution. Varuna currently downloads each piece from one peer, so all blocks are attributed to the same peer. The data structure is block-level for future-proofing.
+- **No `force_copy` issue**: no disk cache eviction race.
+
+### Multi-source piece assembly (prerequisite for full smart ban)
+
+Currently each piece is downloaded entirely from one peer. Multi-source assembly — requesting different blocks of the same piece from different peers simultaneously — is needed for the smart ban algorithm to show its full value. Without it, a failed piece always implicates exactly one peer (making basic trust-point banning sufficient). Multi-source assembly is planned as a follow-up after smart ban Phase 0-2.
+
 ## Will Not Implement
 
 ### Time-based alternative speed scheduling

@@ -20,14 +20,11 @@ zig build run -- seed /path/to/file.torrent /path/to/data-root --port 6881
 zig build run -- inspect /path/to/file.torrent
 ```
 
-Current scope limits:
+### Known Limitations
 
-- HTTP trackers only.
-- Compact peer lists only.
-- One active peer at a time.
-- Sequential piece download and a single inbound seed connection.
-- `.torrent` files only; no magnet support yet.
-- Resume is currently based on full piece recheck at startup, not persisted resume metadata.
+- **No smart ban**: When a peer sends corrupt data that fails piece hash verification, the piece is re-downloaded but the peer is not penalized or banned. A smart ban implementation (per-block SHA-1 tracking with cross-reference on piece pass, matching libtorrent's approach) is planned. See `docs/future-features.md` for the implementation plan.
+- **No multi-source piece assembly**: Each piece is downloaded from a single peer. Requesting different blocks of the same piece from multiple peers simultaneously is not yet supported. This is a prerequisite for the full smart ban algorithm to be effective in mixed-peer scenarios.
+- MSE/PE encryption handshake has known issues in mixed mode (`vc_not_found` / `req1_not_found`).
 
 The living scope and architecture record lives in [DECISIONS.md](DECISIONS.md). Keep that file updated as constraints and design choices change.
 Use [STATUS.md](STATUS.md) as the current ledger for what is already implemented, what is next, and which issues are still open.
