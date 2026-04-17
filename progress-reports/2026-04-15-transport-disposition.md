@@ -16,7 +16,7 @@ Three named presets: `tcp_and_utp` (default, bitfield 15), `tcp_only` (bitfield 
 
 ### Config (src/config.zig Network struct)
 
-New `transport` field accepts preset names: `"tcp_and_utp"`, `"tcp_only"`, `"utp_only"`. Takes precedence over the legacy `enable_utp` boolean when both are set. The `resolveTransportDisposition()` method handles the precedence logic.
+The `transport` field accepts either preset names (`"all"`, `"tcp_and_utp"`, `"tcp_only"`, `"utp_only"`) or a list of individual direction flags (`["tcp_inbound", "tcp_outbound", "utp_inbound", "utp_outbound"]`). Both forms are parsed at TOML load time into a `TransportDisposition` value. Takes precedence over the legacy `enable_utp` boolean when set. The `resolveTransportDisposition()` method handles the precedence logic. Custom TOML deserialization via `Network.tomlIntoStruct` handles both string and array TOML value types for the `transport` key.
 
 ### Event loop (src/io/event_loop.zig)
 
@@ -51,8 +51,10 @@ The packed struct approach maps cleanly to a bitfield integer while keeping the 
 
 ## Key code references
 
-- `src/config.zig:11-80` - TransportDisposition type
-- `src/config.zig:161-172` - Network.transport field and resolveTransportDisposition()
+- `src/config.zig:11-130` - TransportDisposition type (parsePreset, parseFlag, parseFlags)
+- `src/config.zig:220-226` - Network.transport field and resolveTransportDisposition()
+- `src/config.zig:230-280` - Network.tomlIntoStruct() custom TOML deserialization
+- `src/config.zig:285-340` - setField() helper for type-directed TOML value extraction
 - `src/io/event_loop.zig:163` - transport_disposition field
 - `src/io/event_loop.zig:797-810` - selectTransport() updated logic
 - `src/io/peer_handler.zig:47-53` - incoming TCP rejection

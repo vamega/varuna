@@ -288,6 +288,8 @@ pub const EventLoop = struct {
     // BEP 19: web seed download slots
     web_seed_slots: [web_seed_handler.max_web_seed_slots]web_seed_handler.WebSeedSlot =
         [_]web_seed_handler.WebSeedSlot{.{}} ** web_seed_handler.max_web_seed_slots,
+    /// Maximum bytes per web seed HTTP Range request (batches multiple pieces).
+    web_seed_max_request_bytes: u32 = 4 * 1024 * 1024,
 
     // Compact list of peer slots that are idle (active, unchoked, have
     // availability, and need a piece assignment).  Avoids scanning all
@@ -426,7 +428,7 @@ pub const EventLoop = struct {
 
         // Free web seed slot buffers (in-flight downloads that didn't complete)
         for (&self.web_seed_slots) |*ws| {
-            if (ws.piece_buf) |buf| self.allocator.free(buf);
+            if (ws.buf) |buf| self.allocator.free(buf);
             ws.* = .{};
         }
 

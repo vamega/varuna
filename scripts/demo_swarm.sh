@@ -68,12 +68,12 @@ DOWNLOAD_LOG="$WORK_DIR/download.log"
 
 printf 'hello from varuna swarm demo\n' >"$PAYLOAD_PATH"
 
-mise exec -- node "$ROOT_DIR/scripts/create_torrent.mjs" \
-  --input "$PAYLOAD_PATH" \
-  --output "$TORRENT_PATH" \
-  --announce "http://127.0.0.1:$TRACKER_PORT/announce"
-
 mise exec -- zig build >/dev/null
+
+"$VARUNA_TOOLS" create \
+  -a "http://127.0.0.1:$TRACKER_PORT/announce" \
+  -o "$TORRENT_PATH" \
+  "$PAYLOAD_PATH"
 
 INFO_HASH="$("$VARUNA_TOOLS" inspect "$TORRENT_PATH" | awk -F= '/^info_hash=/{print $2}')"
 if [[ -z "$INFO_HASH" ]]; then

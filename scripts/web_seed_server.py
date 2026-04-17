@@ -6,13 +6,17 @@ Serves files from a directory with proper Range header handling:
 - 206 with Content-Range for Range requests
 - 416 for invalid ranges
 
+Tracks request count in a JSON stats endpoint for test verification.
+
 Usage:
     python3 scripts/web_seed_server.py --port 8888 --dir /path/to/files
 """
 
 import argparse
+import json
 import os
 import sys
+import threading
 from http.server import HTTPServer, BaseHTTPRequestHandler
 
 
@@ -23,10 +27,26 @@ class RangeHTTPHandler(BaseHTTPRequestHandler):
     protocol_version = "HTTP/1.1"
     serve_dir = "."
 
+    # Shared request counter (thread-safe via lock)
+    _stats_lock = threading.Lock()
+    _request_count = 0
+    _range_request_count = 0
+
     def do_GET(self):
         # URL-decode the path and resolve relative to serve_dir
         from urllib.parse import unquote
         rel_path = unquote(self.path.lstrip("/"))
+
+        # Stats endpoint for test verification
+        if rel_path == "_stats":
+            self._serve_stats()
+            return
+
+        # Reset endpoint for between test scenarios
+        if rel_path == "_reset":
+            self._reset_stats()
+            return
+
         file_path = os.path.join(self.serve_dir, rel_path)
 
         if not os.path.isfile(file_path):
@@ -35,6 +55,11 @@ class RangeHTTPHandler(BaseHTTPRequestHandler):
 
         file_size = os.path.getsize(file_path)
         range_header = self.headers.get("Range")
+
+        with RangeHTTPHandler._stats_lock:
+            RangeHTTPHandler._request_count += 1
+            if range_header:
+                RangeHTTPHandler._range_request_count += 1
 
         if range_header:
             self._serve_range(file_path, file_size, range_header)
@@ -87,6 +112,32 @@ class RangeHTTPHandler(BaseHTTPRequestHandler):
             f.seek(start)
             self.wfile.write(f.read(content_length))
 
+    def _serve_stats(self):
+        """Return request statistics as JSON."""
+        with RangeHTTPHandler._stats_lock:
+            stats = {
+                "request_count": RangeHTTPHandler._request_count,
+                "range_request_count": RangeHTTPHandler._range_request_count,
+            }
+        body = json.dumps(stats).encode()
+        self.send_response(200)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def _reset_stats(self):
+        """Reset request counters (called between test scenarios)."""
+        with RangeHTTPHandler._stats_lock:
+            RangeHTTPHandler._request_count = 0
+            RangeHTTPHandler._range_request_count = 0
+        body = b'{"status":"reset"}'
+        self.send_response(200)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
     def log_message(self, format, *args):
         # Suppress request logging unless DEBUG is set
         if os.environ.get("DEBUG"):
@@ -101,6 +152,7 @@ def main():
     args = parser.parse_args()
 
     RangeHTTPHandler.serve_dir = os.path.abspath(args.dir)
+    HTTPServer.allow_reuse_address = True
     server = HTTPServer((args.bind, args.port), RangeHTTPHandler)
     print(f"web seed server: http://{args.bind}:{args.port}/ serving {args.dir}", flush=True)
     try:

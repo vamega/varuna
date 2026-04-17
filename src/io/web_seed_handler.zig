@@ -8,25 +8,36 @@ const TorrentId = @import("types.zig").TorrentId;
 const encodeUserData = @import("types.zig").encodeUserData;
 const HttpExecutor = @import("http_executor.zig").HttpExecutor;
 const WebSeedManager = @import("../net/web_seed.zig").WebSeedManager;
-const FileRange = @import("../net/web_seed.zig").FileRange;
+const MultiPieceRange = @import("../net/web_seed.zig").MultiPieceRange;
 const Hasher = @import("hasher.zig").Hasher;
 const storage = @import("../storage/root.zig");
 const LayoutSpan = @import("../torrent/layout.zig").Layout.Span;
 
 pub const max_web_seed_slots: usize = 16;
 
-/// Tracks one in-flight web seed piece download.
-/// A piece may require multiple HTTP range requests (one per file range).
+/// Tracks one in-flight web seed download that may span multiple pieces.
+/// A multi-piece request uses a single HTTP Range request and a single
+/// buffer. On completion, the buffer is split at piece boundaries and
+/// each piece is submitted to the hasher individually.
 pub const WebSeedSlot = struct {
     state: State = .free,
     seed_index: usize = 0,
     torrent_id: TorrentId = 0,
-    piece_index: u32 = 0,
-    piece_buf: ?[]u8 = null,
-    piece_size: u32 = 0,
+    /// First piece index in the contiguous run.
+    first_piece: u32 = 0,
+    /// Number of pieces in this request (>= 1).
+    piece_count: u32 = 0,
+    /// Total bytes across all pieces in this request.
+    total_bytes: u32 = 0,
+    /// Large buffer covering the entire byte range.
+    buf: ?[]u8 = null,
+    /// Number of file-range HTTP requests for this slot (multi-file torrents
+    /// may need one request per file that the run overlaps).
     ranges_total: u8 = 0,
     ranges_completed: u8 = 0,
     ranges_failed: bool = false,
+    /// Number of individual pieces submitted to the hasher.
+    pieces_hashed: u32 = 0,
 
     pub const State = enum { free, downloading, hashing };
 
@@ -43,7 +54,8 @@ const RangeContext = struct {
 };
 
 /// Called each tick from the event loop. Scans torrents for available
-/// web seeds and unclaimed pieces, then submits HTTP range requests.
+/// web seeds and unclaimed pieces, then submits batched HTTP range requests
+/// covering contiguous runs of pieces (up to web_seed_max_request_bytes).
 pub fn tryAssignWebSeedPieces(el: *EventLoop) void {
     const he = el.http_executor orelse return;
 
@@ -62,47 +74,71 @@ pub fn tryAssignWebSeedPieces(el: *EventLoop) void {
         const now = std.time.timestamp();
         if (wsm.availableCount(now) == 0) continue;
 
+        const max_bytes = el.web_seed_max_request_bytes;
+        const piece_count_total = sess.pieceCount();
+
         // Try to fill free web seed slots
         for (&el.web_seed_slots) |*slot| {
             if (slot.state != .free) continue;
 
-            // Claim a piece from the piece tracker (no peer bitfield filter --
-            // web seeds have all pieces by definition).
-            const piece_index = pt.claimPiece(null) orelse break;
+            // Claim a contiguous run of pieces up to max_bytes
+            const first_piece = pt.claimPiece(null) orelse break;
 
-            const seed_index = wsm.assignPiece(piece_index, now) orelse {
-                pt.releasePiece(piece_index);
+            // Extend the run: claim adjacent pieces
+            var run_count: u32 = 1;
+            var run_bytes: u64 = sess.layout.pieceSize(first_piece) catch {
+                pt.releasePiece(first_piece);
+                continue;
+            };
+
+            while (run_bytes < max_bytes) {
+                const next_piece = first_piece + run_count;
+                if (next_piece >= piece_count_total) break;
+
+                // Try to claim the next adjacent piece
+                if (pt.isPieceComplete(next_piece)) break;
+                // Use claimSpecificPiece to claim a specific piece index
+                if (!pt.claimSpecificPiece(next_piece)) break;
+
+                const next_size = sess.layout.pieceSize(next_piece) catch {
+                    pt.releasePiece(next_piece);
+                    break;
+                };
+                run_bytes += next_size;
+                run_count += 1;
+            }
+
+            const total_bytes: u32 = @intCast(run_bytes);
+
+            const seed_index = wsm.assignPiece(first_piece, now) orelse {
+                // No available seed -- release all claimed pieces
+                releaseRunPieces(pt, first_piece, run_count);
                 break; // no more available seeds
             };
 
-            const piece_size = sess.layout.pieceSize(piece_index) catch {
-                pt.releasePiece(piece_index);
+            const run_buf = el.allocator.alloc(u8, total_bytes) catch {
+                releaseRunPieces(pt, first_piece, run_count);
                 wsm.markFailure(seed_index, now);
                 continue;
             };
 
-            const piece_buf = el.allocator.alloc(u8, piece_size) catch {
-                pt.releasePiece(piece_index);
-                wsm.markFailure(seed_index, now);
-                continue;
-            };
-
-            // Compute the file ranges this piece spans
-            var ranges_buf: [8]FileRange = undefined;
-            const ranges = wsm.computePieceRanges(
-                piece_index,
-                sess.pieceCount(),
+            // Compute the multi-piece file ranges
+            var ranges_buf: [16]MultiPieceRange = undefined;
+            const ranges = wsm.computeMultiPieceRanges(
+                first_piece,
+                run_count,
+                piece_count_total,
                 &ranges_buf,
             ) catch {
-                el.allocator.free(piece_buf);
-                pt.releasePiece(piece_index);
+                el.allocator.free(run_buf);
+                releaseRunPieces(pt, first_piece, run_count);
                 wsm.markFailure(seed_index, now);
                 continue;
             };
 
             if (ranges.len == 0) {
-                el.allocator.free(piece_buf);
-                pt.releasePiece(piece_index);
+                el.allocator.free(run_buf);
+                releaseRunPieces(pt, first_piece, run_count);
                 wsm.markFailure(seed_index, now);
                 continue;
             }
@@ -112,17 +148,19 @@ pub fn tryAssignWebSeedPieces(el: *EventLoop) void {
             slot.state = .downloading;
             slot.seed_index = seed_index;
             slot.torrent_id = torrent_id;
-            slot.piece_index = piece_index;
-            slot.piece_buf = piece_buf;
-            slot.piece_size = piece_size;
+            slot.first_piece = first_piece;
+            slot.piece_count = run_count;
+            slot.total_bytes = total_bytes;
+            slot.buf = run_buf;
             slot.ranges_total = @intCast(ranges.len);
             slot.ranges_completed = 0;
             slot.ranges_failed = false;
+            slot.pieces_hashed = 0;
 
             // Submit one HTTP request per file range
             var submitted: u8 = 0;
             for (ranges) |range| {
-                submitRangeRequest(el, he, wsm, slot_idx, seed_index, range) catch {
+                submitMultiPieceRangeRequest(el, he, wsm, slot_idx, seed_index, range, run_buf) catch {
                     slot.ranges_failed = true;
                     continue;
                 };
@@ -131,17 +169,30 @@ pub fn tryAssignWebSeedPieces(el: *EventLoop) void {
 
             if (submitted == 0) {
                 // All range submissions failed
-                el.allocator.free(piece_buf);
-                pt.releasePiece(piece_index);
+                el.allocator.free(run_buf);
+                releaseRunPieces(pt, first_piece, run_count);
                 wsm.markFailure(seed_index, now);
                 slot.reset();
                 continue;
             }
 
-            log.debug("web seed: assigned piece {d} to seed {d} ({d} ranges)", .{
-                piece_index, seed_index, ranges.len,
+            log.debug("web seed: assigned pieces {d}..{d} ({d} pieces, {d} bytes) to seed {d} ({d} ranges)", .{
+                first_piece,
+                first_piece + run_count - 1,
+                run_count,
+                total_bytes,
+                seed_index,
+                ranges.len,
             });
         }
+    }
+}
+
+/// Release a contiguous run of claimed pieces back to the piece tracker.
+fn releaseRunPieces(pt: anytype, first_piece: u32, count: u32) void {
+    var i: u32 = 0;
+    while (i < count) : (i += 1) {
+        pt.releasePiece(first_piece + i);
     }
 }
 
@@ -151,13 +202,14 @@ fn slotIndex(el: *EventLoop, slot: *WebSeedSlot) u8 {
     return @intCast((ptr - base) / @sizeOf(WebSeedSlot));
 }
 
-fn submitRangeRequest(
+fn submitMultiPieceRangeRequest(
     el: *EventLoop,
     he: *HttpExecutor,
     wsm: *WebSeedManager,
     slot_idx: u8,
     seed_index: usize,
-    range: FileRange,
+    range: MultiPieceRange,
+    run_buf: []u8,
 ) !void {
     const url = wsm.buildFileUrl(el.allocator, seed_index, range.file_index) catch |err| {
         log.warn("web seed: buildFileUrl failed: {s}", .{@errorName(err)});
@@ -205,10 +257,9 @@ fn submitRangeRequest(
     };
     job.extra_headers[0] = HttpExecutor.ExtraHeader.set(range_hdr);
 
-    // Set target buffer so the body is written directly into piece_buf
-    const slot = &el.web_seed_slots[slot_idx];
-    job.target_buf = slot.piece_buf;
-    job.target_offset = range.piece_offset;
+    // Set target buffer so the body is written directly into the run buffer
+    job.target_buf = run_buf;
+    job.target_offset = range.buf_offset;
 
     he.submit(job) catch |err| {
         el.allocator.destroy(ctx);
@@ -254,8 +305,9 @@ fn webSeedRangeComplete(context: *anyopaque, result: HttpExecutor.RequestResult)
 
     // Check HTTP status
     if (result.err != null or (result.status != 200 and result.status != 206)) {
-        log.debug("web seed: range failed for piece {d} (status={d}, err={?})", .{
-            slot.piece_index,
+        log.debug("web seed: range failed for pieces {d}..{d} (status={d}, err={?})", .{
+            slot.first_piece,
+            slot.first_piece + slot.piece_count - 1,
             result.status,
             result.err,
         });
@@ -269,7 +321,7 @@ fn webSeedRangeComplete(context: *anyopaque, result: HttpExecutor.RequestResult)
             }
         } else if (result.status == 0 and result.err == null) {
             // status=0 with no error = stale pooled connection dropped.
-            // Not the seed's fault — mark idle for immediate retry, no backoff.
+            // Not the seed's fault -- mark idle for immediate retry, no backoff.
             slot.ranges_failed = false; // treat as retryable, not a real failure
         }
     }
@@ -286,19 +338,20 @@ fn webSeedRangeComplete(context: *anyopaque, result: HttpExecutor.RequestResult)
     }
 
     // Mark the seed as idle immediately so the next piece can start
-    // downloading while this one is being hash-verified and written.
+    // downloading while these are being hash-verified and written.
     if (el.getTorrentContext(slot.torrent_id)) |tc| {
         if (tc.web_seed_manager) |wsm| {
-            wsm.markSuccess(slot.seed_index, slot.piece_size);
+            wsm.markSuccess(slot.seed_index, slot.total_bytes);
         }
     }
 
-    // Submit to hasher for verification
-    submitToHasher(el, slot, slot_idx);
+    // Submit each piece in the run to the hasher individually
+    submitPiecesToHasher(el, slot, slotIndex(el, slot));
 }
 
-/// Submit a completed piece buffer to the background hasher for SHA verification.
-fn submitToHasher(el: *EventLoop, slot: *WebSeedSlot, slot_idx: u8) void {
+/// Split the completed multi-piece buffer at piece boundaries and submit
+/// each piece to the background hasher for SHA verification.
+fn submitPiecesToHasher(el: *EventLoop, slot: *WebSeedSlot, slot_idx: u8) void {
     const tc = el.getTorrentContext(slot.torrent_id) orelse {
         failSlot(el, slot);
         return;
@@ -308,52 +361,83 @@ fn submitToHasher(el: *EventLoop, slot: *WebSeedSlot, slot_idx: u8) void {
         return;
     };
     const h = el.hasher orelse {
-        // No hasher available -- try inline verification
-        inlineVerifyAndWrite(el, slot);
+        // No hasher available -- try inline verification for each piece
+        inlineVerifyMultiPiece(el, slot);
         return;
     };
 
-    const expected_hash = sess.layout.pieceHash(slot.piece_index) catch {
-        failSlot(el, slot);
-        return;
-    };
-    var hash: [20]u8 = undefined;
-    @memcpy(&hash, expected_hash);
-
-    // The hasher takes ownership of piece_buf.
-    // We use a sentinel slot value (max_peers + slot_idx) to distinguish
-    // web seed results from peer results in processHashResults.
-    // Actually, the hasher Result includes torrent_id and the processHashResults
-    // path doesn't use slot for anything critical -- it just stores it.
-    // We use the standard path: the hash result goes to processHashResults
-    // which handles the disk write. We just need to set the slot to an unused
-    // peer slot value. We use 0xFFFF - slot_idx as a distinctive sentinel.
-    const sentinel_slot: u16 = @as(u16, 0xFFFF) - @as(u16, slot_idx);
-
-    h.submitVerify(
-        sentinel_slot,
-        slot.piece_index,
-        slot.piece_buf.?,
-        hash,
-        slot.torrent_id,
-    ) catch {
+    const run_buf = slot.buf orelse {
         failSlot(el, slot);
         return;
     };
 
-    // Hasher owns the buffer now
-    slot.piece_buf = null;
+    var buf_offset: u32 = 0;
+    var submitted: u32 = 0;
+
+    var i: u32 = 0;
+    while (i < slot.piece_count) : (i += 1) {
+        const piece_index = slot.first_piece + i;
+        const piece_size = sess.layout.pieceSize(piece_index) catch {
+            // Should not happen -- we validated during claim
+            continue;
+        };
+
+        const expected_hash = sess.layout.pieceHash(piece_index) catch {
+            continue;
+        };
+        var hash: [20]u8 = undefined;
+        @memcpy(&hash, expected_hash);
+
+        // Allocate a per-piece buffer and copy from the run buffer
+        const piece_buf = el.allocator.alloc(u8, piece_size) catch {
+            continue;
+        };
+        @memcpy(piece_buf, run_buf[buf_offset .. buf_offset + piece_size]);
+
+        const sentinel_slot: u16 = @as(u16, 0xFFFF) - @as(u16, slot_idx);
+
+        h.submitVerify(
+            sentinel_slot,
+            piece_index,
+            piece_buf,
+            hash,
+            slot.torrent_id,
+        ) catch {
+            el.allocator.free(piece_buf);
+            continue;
+        };
+
+        submitted += 1;
+        buf_offset += piece_size;
+    }
+
+    slot.pieces_hashed = submitted;
+
+    if (submitted == 0) {
+        failSlot(el, slot);
+        return;
+    }
+
+    log.debug("web seed: pieces {d}..{d} ({d} pieces) submitted to hasher", .{
+        slot.first_piece,
+        slot.first_piece + slot.piece_count - 1,
+        submitted,
+    });
+
+    // Free the run buffer -- each piece was copied to its own buffer.
+    // The hasher owns each per-piece buffer from here.
+    el.allocator.free(run_buf);
+    slot.buf = null;
     slot.state = .hashing;
-
-    log.debug("web seed: piece {d} submitted to hasher", .{slot.piece_index});
 
     // Free the slot -- the hasher/processHashResults owns the rest of the
     // lifecycle (hash verify -> disk write -> completePiece).
     slot.reset();
 }
 
-/// Inline SHA-1 verification and disk write (fallback when hasher is unavailable).
-fn inlineVerifyAndWrite(el: *EventLoop, slot: *WebSeedSlot) void {
+/// Inline SHA-1 verification and disk write for multi-piece runs
+/// (fallback when hasher is unavailable).
+fn inlineVerifyMultiPiece(el: *EventLoop, slot: *WebSeedSlot) void {
     const Sha1 = @import("../crypto/root.zig").Sha1;
 
     const tc = el.getTorrentContext(slot.torrent_id) orelse {
@@ -368,107 +452,142 @@ fn inlineVerifyAndWrite(el: *EventLoop, slot: *WebSeedSlot) void {
         failSlot(el, slot);
         return;
     };
-    const piece_buf = slot.piece_buf orelse {
+    const run_buf = slot.buf orelse {
         failSlot(el, slot);
         return;
     };
 
-    const expected_hash = sess.layout.pieceHash(slot.piece_index) catch {
-        failSlot(el, slot);
-        return;
-    };
+    var buf_offset: u32 = 0;
+    var any_success = false;
 
-    var actual: [20]u8 = undefined;
-    Sha1.hash(piece_buf, &actual, .{});
+    var i: u32 = 0;
+    while (i < slot.piece_count) : (i += 1) {
+        const piece_index = slot.first_piece + i;
+        const piece_size = sess.layout.pieceSize(piece_index) catch continue;
 
-    if (!std.mem.eql(u8, &actual, expected_hash)) {
-        log.warn("web seed: piece {d} hash mismatch", .{slot.piece_index});
-        failSlot(el, slot);
-        return;
-    }
-
-    // Write piece to disk via io_uring (same pattern as peer_policy.zig)
-    var span_scratch: [8]LayoutSpan = undefined;
-    const plan = storage.verify.planPieceVerificationWithScratch(
-        el.allocator,
-        sess,
-        slot.piece_index,
-        span_scratch[0..],
-    ) catch {
-        failSlot(el, slot);
-        return;
-    };
-    defer plan.deinit(el.allocator);
-
-    if (plan.spans.len == 0) {
-        failSlot(el, slot);
-        return;
-    }
-
-    const pending_key = EventLoop.PendingWriteKey{
-        .piece_index = slot.piece_index,
-        .torrent_id = slot.torrent_id,
-    };
-    const write_id = el.createPendingWrite(pending_key, .{
-        .write_id = 0,
-        .piece_index = slot.piece_index,
-        .torrent_id = slot.torrent_id,
-        .slot = 0, // no peer slot
-        .buf = piece_buf,
-        .spans_remaining = 0,
-    }) catch {
-        failSlot(el, slot);
-        return;
-    };
-
-    for (plan.spans) |span| {
-        if (tc.shared_fds[span.file_index] < 0) continue;
-        const block = piece_buf[span.piece_offset .. span.piece_offset + span.length];
-        const ud = encodeUserData(.{ .slot = 0, .op_type = .disk_write, .context = write_id });
-        _ = el.ring.write(ud, tc.shared_fds[span.file_index], block, span.file_offset) catch |err| {
-            log.warn("web seed: disk write for piece {d}: {s}", .{ slot.piece_index, @errorName(err) });
-            if (el.getPendingWrite(pending_key)) |pending_w| {
-                pending_w.write_failed = true;
-            }
+        const expected_hash = sess.layout.pieceHash(piece_index) catch {
+            buf_offset += piece_size;
             continue;
         };
-        if (el.getPendingWrite(pending_key)) |pending_w| {
-            pending_w.spans_remaining += 1;
-        }
-    }
 
-    if (el.getPendingWrite(pending_key)) |pending_w| {
-        if (pending_w.spans_remaining == 0) {
-            _ = el.removePendingWrite(pending_key);
-            pt.releasePiece(slot.piece_index);
+        const piece_data = run_buf[buf_offset .. buf_offset + piece_size];
+
+        var actual: [20]u8 = undefined;
+        Sha1.hash(piece_data, &actual, .{});
+
+        if (!std.mem.eql(u8, &actual, expected_hash)) {
+            log.warn("web seed: piece {d} hash mismatch", .{piece_index});
+            pt.releasePiece(piece_index);
+            buf_offset += piece_size;
+            continue;
+        }
+
+        // Write piece to disk via io_uring
+        var span_scratch: [8]LayoutSpan = undefined;
+        const plan = storage.verify.planPieceVerificationWithScratch(
+            el.allocator,
+            sess,
+            piece_index,
+            span_scratch[0..],
+        ) catch {
+            pt.releasePiece(piece_index);
+            buf_offset += piece_size;
+            continue;
+        };
+        defer plan.deinit(el.allocator);
+
+        if (plan.spans.len == 0) {
+            pt.releasePiece(piece_index);
+            buf_offset += piece_size;
+            continue;
+        }
+
+        // Allocate a per-piece buffer for the pending write
+        const piece_buf = el.allocator.alloc(u8, piece_size) catch {
+            pt.releasePiece(piece_index);
+            buf_offset += piece_size;
+            continue;
+        };
+        @memcpy(piece_buf, piece_data);
+
+        const pending_key = EventLoop.PendingWriteKey{
+            .piece_index = piece_index,
+            .torrent_id = slot.torrent_id,
+        };
+        const write_id = el.createPendingWrite(pending_key, .{
+            .write_id = 0,
+            .piece_index = piece_index,
+            .torrent_id = slot.torrent_id,
+            .slot = 0,
+            .buf = piece_buf,
+            .spans_remaining = 0,
+        }) catch {
             el.allocator.free(piece_buf);
-            slot.reset();
-            return;
+            pt.releasePiece(piece_index);
+            buf_offset += piece_size;
+            continue;
+        };
+
+        for (plan.spans) |span| {
+            if (tc.shared_fds[span.file_index] < 0) continue;
+            const block = piece_buf[span.piece_offset .. span.piece_offset + span.length];
+            const ud = encodeUserData(.{ .slot = 0, .op_type = .disk_write, .context = write_id });
+            _ = el.ring.write(ud, tc.shared_fds[span.file_index], block, span.file_offset) catch |err| {
+                log.warn("web seed: disk write for piece {d}: {s}", .{ piece_index, @errorName(err) });
+                if (el.getPendingWrite(pending_key)) |pending_w| {
+                    pending_w.write_failed = true;
+                }
+                continue;
+            };
+            if (el.getPendingWrite(pending_key)) |pending_w| {
+                pending_w.spans_remaining += 1;
+            }
+        }
+
+        if (el.getPendingWrite(pending_key)) |pending_w| {
+            if (pending_w.spans_remaining == 0) {
+                _ = el.removePendingWrite(pending_key);
+                pt.releasePiece(piece_index);
+                el.allocator.free(piece_buf);
+                buf_offset += piece_size;
+                continue;
+            }
+        }
+
+        any_success = true;
+        buf_offset += piece_size;
+    }
+
+    // Free the run buffer
+    el.allocator.free(run_buf);
+    slot.buf = null;
+
+    if (any_success) {
+        if (tc.web_seed_manager) |wsm| {
+            wsm.markSuccess(slot.seed_index, slot.total_bytes);
         }
     }
 
-    // Buffer ownership transferred to pending_writes
-    slot.piece_buf = null;
-    if (tc.web_seed_manager) |wsm| {
-        wsm.markSuccess(slot.seed_index, slot.piece_size);
-    }
     slot.reset();
 }
 
-/// Release a piece on failure and free the slot.
+/// Release all pieces in a multi-piece slot on failure and free the slot.
 fn failSlot(el: *EventLoop, slot: *WebSeedSlot) void {
     const now = std.time.timestamp();
 
     if (el.getTorrentContext(slot.torrent_id)) |tc| {
         if (tc.piece_tracker) |pt| {
-            pt.releasePiece(slot.piece_index);
+            var i: u32 = 0;
+            while (i < slot.piece_count) : (i += 1) {
+                pt.releasePiece(slot.first_piece + i);
+            }
         }
         if (tc.web_seed_manager) |wsm| {
             wsm.markFailure(slot.seed_index, now);
         }
     }
 
-    if (slot.piece_buf) |buf| {
+    if (slot.buf) |buf| {
         el.allocator.free(buf);
     }
 
@@ -493,14 +612,19 @@ test "WebSeedSlot reset" {
         .state = .downloading,
         .seed_index = 3,
         .torrent_id = 1,
-        .piece_index = 42,
-        .piece_size = 16384,
+        .first_piece = 10,
+        .piece_count = 4,
+        .total_bytes = 65536,
         .ranges_total = 2,
         .ranges_completed = 1,
         .ranges_failed = true,
+        .pieces_hashed = 2,
     };
     slot.reset();
     try std.testing.expectEqual(WebSeedSlot.State.free, slot.state);
-    try std.testing.expectEqual(@as(u32, 0), slot.piece_index);
-    try std.testing.expectEqual(@as(?[]u8, null), slot.piece_buf);
+    try std.testing.expectEqual(@as(u32, 0), slot.first_piece);
+    try std.testing.expectEqual(@as(u32, 0), slot.piece_count);
+    try std.testing.expectEqual(@as(u32, 0), slot.total_bytes);
+    try std.testing.expectEqual(@as(?[]u8, null), slot.buf);
+    try std.testing.expectEqual(@as(u32, 0), slot.pieces_hashed);
 }

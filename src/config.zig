@@ -69,11 +69,63 @@ pub const TransportDisposition = packed struct(u8) {
     }
 
     /// Parse a human-readable transport preset name from TOML config.
+    /// Accepts: "all", "tcp_and_utp", "tcp_only", "utp_only".
     pub fn parsePreset(value: []const u8) !TransportDisposition {
+        if (std.mem.eql(u8, value, "all")) return tcp_and_utp;
         if (std.mem.eql(u8, value, "tcp_and_utp")) return tcp_and_utp;
         if (std.mem.eql(u8, value, "tcp_only")) return tcp_only;
         if (std.mem.eql(u8, value, "utp_only")) return utp_only;
         return error.InvalidTransportPreset;
+    }
+
+    /// Parse a single transport flag name. Returns the corresponding
+    /// disposition with only that flag enabled (all others false).
+    pub fn parseFlag(value: []const u8) !TransportDisposition {
+        if (std.mem.eql(u8, value, "tcp_inbound")) return .{
+            .outgoing_tcp = false,
+            .outgoing_utp = false,
+            .incoming_tcp = true,
+            .incoming_utp = false,
+        };
+        if (std.mem.eql(u8, value, "tcp_outbound")) return .{
+            .outgoing_tcp = true,
+            .outgoing_utp = false,
+            .incoming_tcp = false,
+            .incoming_utp = false,
+        };
+        if (std.mem.eql(u8, value, "utp_inbound")) return .{
+            .outgoing_tcp = false,
+            .outgoing_utp = false,
+            .incoming_tcp = false,
+            .incoming_utp = true,
+        };
+        if (std.mem.eql(u8, value, "utp_outbound")) return .{
+            .outgoing_tcp = false,
+            .outgoing_utp = true,
+            .incoming_tcp = false,
+            .incoming_utp = false,
+        };
+        return error.InvalidTransportFlag;
+    }
+
+    /// Build a TransportDisposition from a list of individual flag names.
+    /// Starts with all flags disabled, enables each named flag.
+    /// Valid flag names: "tcp_inbound", "tcp_outbound", "utp_inbound", "utp_outbound".
+    pub fn parseFlags(values: []const []const u8) !TransportDisposition {
+        var result: TransportDisposition = .{
+            .outgoing_tcp = false,
+            .outgoing_utp = false,
+            .incoming_tcp = false,
+            .incoming_utp = false,
+        };
+        for (values) |flag| {
+            const single = try parseFlag(flag);
+            result.outgoing_tcp = result.outgoing_tcp or single.outgoing_tcp;
+            result.outgoing_utp = result.outgoing_utp or single.outgoing_utp;
+            result.incoming_tcp = result.incoming_tcp or single.incoming_tcp;
+            result.incoming_utp = result.incoming_utp or single.incoming_utp;
+        }
+        return result;
     }
 };
 
@@ -146,6 +198,10 @@ pub const Config = struct {
         /// Useful for testing DHT peer discovery or for privacy-conscious operation.
         /// Private torrents (private=1 flag) always use the tracker regardless of this setting.
         disable_trackers: bool = false,
+        /// Maximum bytes to request in a single web seed HTTP Range request.
+        /// Larger values batch more pieces per request, reducing HTTP overhead.
+        /// Default: 4 MB.
+        web_seed_max_request_bytes: u32 = 4 * 1024 * 1024,
         /// Enable DHT (BEP 5) for distributed peer discovery.
         dht: bool = true,
         /// Enable PEX (BEP 11) for peer exchange between connected peers.
@@ -156,20 +212,130 @@ pub const Config = struct {
         /// true  -> "tcp_and_utp" (both TCP and uTP enabled in all directions)
         /// false -> "tcp_only"    (TCP only, no uTP)
         enable_utp: bool = true,
-        /// Fine-grained transport control: "tcp_and_utp", "tcp_only", "utp_only".
-        /// Takes precedence over `enable_utp` when set.
+        /// Fine-grained transport control. Accepts either a preset string
+        /// ("all", "tcp_and_utp", "tcp_only", "utp_only") or a list of
+        /// individual flags (["tcp_inbound", "tcp_outbound", "utp_inbound",
+        /// "utp_outbound"]). Takes precedence over `enable_utp` when set.
         /// Default null means fall through to `enable_utp`.
-        transport: ?[]const u8 = null,
+        transport: ?TransportDisposition = null,
 
         /// Resolve the effective TransportDisposition from config fields.
         /// `transport` takes precedence when set; otherwise falls back to `enable_utp`.
-        pub fn resolveTransportDisposition(self: Network) !TransportDisposition {
-            if (self.transport) |preset| {
-                return TransportDisposition.parsePreset(preset);
+        pub fn resolveTransportDisposition(self: Network) TransportDisposition {
+            if (self.transport) |disp| {
+                return disp;
             }
             return TransportDisposition.fromEnableUtp(self.enable_utp);
         }
+
+        /// Custom TOML deserialization for Network. Handles the `transport`
+        /// field specially (accepts both string presets and arrays of flag
+        /// names), then maps all other fields via standard value extraction.
+        pub fn tomlIntoStruct(ctx: anytype, table: *toml.Table) !Network {
+            var result = Network{};
+            const alloc = ctx.alloc;
+
+            // Handle `transport` specially: string preset or array of flags.
+            if (table.fetchRemove("transport")) |entry| {
+                alloc.free(entry.key);
+                switch (entry.value) {
+                    .string => |s| {
+                        result.transport = TransportDisposition.parsePreset(s) catch
+                            return error.InvalidTransportPreset;
+                    },
+                    .array => |ar| {
+                        // Collect string values from the array.
+                        var flags: [4][]const u8 = undefined;
+                        if (ar.items.len == 0 or ar.items.len > 4) return error.InvalidTransportFlag;
+                        for (ar.items, 0..) |item, i| {
+                            switch (item) {
+                                .string => |s| flags[i] = s,
+                                else => return error.InvalidTransportFlag,
+                            }
+                        }
+                        result.transport = TransportDisposition.parseFlags(flags[0..ar.items.len]) catch
+                            return error.InvalidTransportFlag;
+                    },
+                    else => return error.InvalidTransportPreset,
+                }
+            }
+
+            // Map remaining fields using type-directed extraction.
+            inline for (@typeInfo(Network).@"struct".fields) |field| {
+                if (comptime std.mem.eql(u8, field.name, "transport")) continue;
+                // Skip methods/decls, only process actual fields.
+                if (table.fetchRemove(field.name)) |entry| {
+                    alloc.free(entry.key);
+                    setField(Network, &result, field.name, entry.value) catch
+                        return error.InvalidValueType;
+                }
+                // Fields not present in TOML keep their default values.
+            }
+
+            // Clean up any unknown keys remaining in the table.
+            var it = table.iterator();
+            while (it.next()) |entry| {
+                alloc.free(entry.key_ptr.*);
+                entry.value_ptr.deinit(alloc);
+            }
+            table.deinit();
+
+            return result;
+        }
     };
+
+    /// Set a named field on a struct from a TOML Value, using type-directed
+    /// dispatch. Handles the subset of types used by Network fields.
+    fn setField(comptime T: type, dest: *T, comptime name: []const u8, value: toml.Value) !void {
+        const FieldType = @TypeOf(@field(dest.*, name));
+        switch (@typeInfo(FieldType)) {
+            .int => {
+                switch (value) {
+                    .integer => |x| @field(dest.*, name) = @intCast(x),
+                    else => return error.InvalidValueType,
+                }
+            },
+            .float => {
+                switch (value) {
+                    .float => |x| @field(dest.*, name) = @floatCast(x),
+                    .integer => |x| @field(dest.*, name) = @floatFromInt(x),
+                    else => return error.InvalidValueType,
+                }
+            },
+            .bool => {
+                switch (value) {
+                    .boolean => |b| @field(dest.*, name) = b,
+                    else => return error.InvalidValueType,
+                }
+            },
+            .pointer => |ptr_info| {
+                if (ptr_info.size == .slice and ptr_info.child == u8) {
+                    switch (value) {
+                        .string => |s| @field(dest.*, name) = s,
+                        else => return error.InvalidValueType,
+                    }
+                } else {
+                    return error.InvalidValueType;
+                }
+            },
+            .optional => |opt_info| {
+                switch (@typeInfo(opt_info.child)) {
+                    .pointer => |ptr_info| {
+                        if (ptr_info.size == .slice and ptr_info.child == u8) {
+                            switch (value) {
+                                .string => |s| @field(dest.*, name) = s,
+                                else => return error.InvalidValueType,
+                            }
+                        } else {
+                            return error.InvalidValueType;
+                        }
+                    },
+                    else => return error.InvalidValueType,
+                }
+            },
+            else => return error.InvalidValueType,
+        }
+    }
 
     pub const Performance = struct {
         hasher_threads: u32 = 4,
@@ -262,7 +428,7 @@ pub fn loadDefault(allocator: std.mem.Allocator) !LoadedConfig {
 
 pub fn validateConfig(config: Config) !void {
     _ = try parseEncryptionMode(config.network.encryption);
-    _ = try config.network.resolveTransportDisposition();
+    _ = config.network.resolveTransportDisposition();
 }
 
 /// Parse the encryption config string into an EncryptionMode enum.
@@ -370,7 +536,7 @@ test "default enable_utp is true" {
 
 test "default transport disposition is tcp_and_utp" {
     const config = Config{};
-    const disp = try config.network.resolveTransportDisposition();
+    const disp = config.network.resolveTransportDisposition();
     try std.testing.expect(disp.outgoing_tcp);
     try std.testing.expect(disp.outgoing_utp);
     try std.testing.expect(disp.incoming_tcp);
@@ -380,31 +546,29 @@ test "default transport disposition is tcp_and_utp" {
 test "enable_utp false resolves to tcp_only disposition" {
     var net = Config.Network{};
     net.enable_utp = false;
-    const disp = try net.resolveTransportDisposition();
+    const disp = net.resolveTransportDisposition();
     try std.testing.expect(disp.outgoing_tcp);
     try std.testing.expect(!disp.outgoing_utp);
     try std.testing.expect(disp.incoming_tcp);
     try std.testing.expect(!disp.incoming_utp);
 }
 
-test "transport preset overrides enable_utp" {
+test "transport disposition overrides enable_utp" {
     var net = Config.Network{};
     net.enable_utp = false; // would normally mean tcp_only
-    net.transport = "utp_only"; // but transport takes precedence
-    const disp = try net.resolveTransportDisposition();
+    net.transport = TransportDisposition.utp_only; // but transport takes precedence
+    const disp = net.resolveTransportDisposition();
     try std.testing.expect(!disp.outgoing_tcp);
     try std.testing.expect(disp.outgoing_utp);
     try std.testing.expect(!disp.incoming_tcp);
     try std.testing.expect(disp.incoming_utp);
 }
 
-test "invalid transport preset rejected" {
-    var net = Config.Network{};
-    net.transport = "bogus";
-    try std.testing.expectError(error.InvalidTransportPreset, net.resolveTransportDisposition());
-}
-
 test "TransportDisposition parsePreset recognizes all presets" {
+    const all = try TransportDisposition.parsePreset("all");
+    try std.testing.expect(all.outgoing_tcp and all.outgoing_utp);
+    try std.testing.expect(all.incoming_tcp and all.incoming_utp);
+
     const tcp_and_utp = try TransportDisposition.parsePreset("tcp_and_utp");
     try std.testing.expect(tcp_and_utp.outgoing_tcp and tcp_and_utp.outgoing_utp);
     try std.testing.expect(tcp_and_utp.incoming_tcp and tcp_and_utp.incoming_utp);
@@ -418,6 +582,51 @@ test "TransportDisposition parsePreset recognizes all presets" {
     try std.testing.expect(!utp_only.incoming_tcp and utp_only.incoming_utp);
 
     try std.testing.expectError(error.InvalidTransportPreset, TransportDisposition.parsePreset("invalid"));
+}
+
+test "TransportDisposition parseFlag recognizes individual flags" {
+    const tcp_in = try TransportDisposition.parseFlag("tcp_inbound");
+    try std.testing.expect(!tcp_in.outgoing_tcp and !tcp_in.outgoing_utp);
+    try std.testing.expect(tcp_in.incoming_tcp and !tcp_in.incoming_utp);
+
+    const tcp_out = try TransportDisposition.parseFlag("tcp_outbound");
+    try std.testing.expect(tcp_out.outgoing_tcp and !tcp_out.outgoing_utp);
+    try std.testing.expect(!tcp_out.incoming_tcp and !tcp_out.incoming_utp);
+
+    const utp_in = try TransportDisposition.parseFlag("utp_inbound");
+    try std.testing.expect(!utp_in.outgoing_tcp and !utp_in.outgoing_utp);
+    try std.testing.expect(!utp_in.incoming_tcp and utp_in.incoming_utp);
+
+    const utp_out = try TransportDisposition.parseFlag("utp_outbound");
+    try std.testing.expect(!utp_out.outgoing_tcp and utp_out.outgoing_utp);
+    try std.testing.expect(!utp_out.incoming_tcp and !utp_out.incoming_utp);
+
+    try std.testing.expectError(error.InvalidTransportFlag, TransportDisposition.parseFlag("bogus"));
+}
+
+test "TransportDisposition parseFlags combines multiple flags" {
+    // All four flags = same as tcp_and_utp
+    const all = try TransportDisposition.parseFlags(&.{ "tcp_inbound", "tcp_outbound", "utp_inbound", "utp_outbound" });
+    try std.testing.expect(all.outgoing_tcp and all.outgoing_utp);
+    try std.testing.expect(all.incoming_tcp and all.incoming_utp);
+
+    // TCP only via flags
+    const tcp = try TransportDisposition.parseFlags(&.{ "tcp_inbound", "tcp_outbound" });
+    try std.testing.expect(tcp.outgoing_tcp and !tcp.outgoing_utp);
+    try std.testing.expect(tcp.incoming_tcp and !tcp.incoming_utp);
+
+    // Asymmetric: TCP inbound + uTP outbound
+    const asym = try TransportDisposition.parseFlags(&.{ "tcp_inbound", "utp_outbound" });
+    try std.testing.expect(!asym.outgoing_tcp and asym.outgoing_utp);
+    try std.testing.expect(asym.incoming_tcp and !asym.incoming_utp);
+
+    // Single flag
+    const single = try TransportDisposition.parseFlags(&.{"tcp_outbound"});
+    try std.testing.expect(single.outgoing_tcp and !single.outgoing_utp);
+    try std.testing.expect(!single.incoming_tcp and !single.incoming_utp);
+
+    // Invalid flag in list
+    try std.testing.expectError(error.InvalidTransportFlag, TransportDisposition.parseFlags(&.{ "tcp_inbound", "bad" }));
 }
 
 test "TransportDisposition bitfield round-trip" {
@@ -482,4 +691,152 @@ test "load rejects invalid transport preset" {
         error.InvalidTransportPreset,
         load(std.testing.allocator, "bad-transport.toml"),
     );
+}
+
+test "load accepts transport as string preset" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const cwd = try std.fs.cwd().openDir(".", .{});
+    defer cwd.close();
+
+    try tmp.dir.writeFile(.{
+        .sub_path = "tcp-only.toml",
+        .data = "[network]\ntransport = \"tcp_only\"\n",
+    });
+    try tmp.dir.setAsCwd();
+    defer cwd.setAsCwd() catch unreachable;
+
+    var loaded = try load(std.testing.allocator, "tcp-only.toml");
+    defer loaded.deinit();
+    const disp = loaded.value.network.resolveTransportDisposition();
+    try std.testing.expect(disp.outgoing_tcp);
+    try std.testing.expect(!disp.outgoing_utp);
+    try std.testing.expect(disp.incoming_tcp);
+    try std.testing.expect(!disp.incoming_utp);
+}
+
+test "load accepts transport as all preset" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const cwd = try std.fs.cwd().openDir(".", .{});
+    defer cwd.close();
+
+    try tmp.dir.writeFile(.{
+        .sub_path = "all-transport.toml",
+        .data = "[network]\ntransport = \"all\"\n",
+    });
+    try tmp.dir.setAsCwd();
+    defer cwd.setAsCwd() catch unreachable;
+
+    var loaded = try load(std.testing.allocator, "all-transport.toml");
+    defer loaded.deinit();
+    const disp = loaded.value.network.resolveTransportDisposition();
+    try std.testing.expect(disp.outgoing_tcp);
+    try std.testing.expect(disp.outgoing_utp);
+    try std.testing.expect(disp.incoming_tcp);
+    try std.testing.expect(disp.incoming_utp);
+}
+
+test "load accepts transport as array of flags" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const cwd = try std.fs.cwd().openDir(".", .{});
+    defer cwd.close();
+
+    try tmp.dir.writeFile(.{
+        .sub_path = "transport-array.toml",
+        .data = "[network]\ntransport = [\"tcp_inbound\", \"tcp_outbound\", \"utp_inbound\", \"utp_outbound\"]\n",
+    });
+    try tmp.dir.setAsCwd();
+    defer cwd.setAsCwd() catch unreachable;
+
+    var loaded = try load(std.testing.allocator, "transport-array.toml");
+    defer loaded.deinit();
+    const disp = loaded.value.network.resolveTransportDisposition();
+    try std.testing.expect(disp.outgoing_tcp);
+    try std.testing.expect(disp.outgoing_utp);
+    try std.testing.expect(disp.incoming_tcp);
+    try std.testing.expect(disp.incoming_utp);
+}
+
+test "load accepts asymmetric transport array" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const cwd = try std.fs.cwd().openDir(".", .{});
+    defer cwd.close();
+
+    try tmp.dir.writeFile(.{
+        .sub_path = "asym-transport.toml",
+        .data = "[network]\ntransport = [\"tcp_inbound\", \"utp_outbound\"]\n",
+    });
+    try tmp.dir.setAsCwd();
+    defer cwd.setAsCwd() catch unreachable;
+
+    var loaded = try load(std.testing.allocator, "asym-transport.toml");
+    defer loaded.deinit();
+    const disp = loaded.value.network.resolveTransportDisposition();
+    try std.testing.expect(!disp.outgoing_tcp);
+    try std.testing.expect(disp.outgoing_utp);
+    try std.testing.expect(disp.incoming_tcp);
+    try std.testing.expect(!disp.incoming_utp);
+}
+
+test "load rejects invalid transport flag in array" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const cwd = try std.fs.cwd().openDir(".", .{});
+    defer cwd.close();
+
+    try tmp.dir.writeFile(.{
+        .sub_path = "bad-flag.toml",
+        .data = "[network]\ntransport = [\"tcp_inbound\", \"bad_flag\"]\n",
+    });
+    try tmp.dir.setAsCwd();
+    defer cwd.setAsCwd() catch unreachable;
+
+    try std.testing.expectError(
+        error.InvalidTransportFlag,
+        load(std.testing.allocator, "bad-flag.toml"),
+    );
+}
+
+test "load transport array with other network fields" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const cwd = try std.fs.cwd().openDir(".", .{});
+    defer cwd.close();
+
+    try tmp.dir.writeFile(.{
+        .sub_path = "full-network.toml",
+        .data =
+        \\[network]
+        \\transport = ["tcp_inbound", "tcp_outbound"]
+        \\port_min = 7000
+        \\port_max = 7100
+        \\max_peers = 200
+        \\encryption = "forced"
+        \\dht = false
+        \\
+        ,
+    });
+    try tmp.dir.setAsCwd();
+    defer cwd.setAsCwd() catch unreachable;
+
+    var loaded = try load(std.testing.allocator, "full-network.toml");
+    defer loaded.deinit();
+    const net = loaded.value.network;
+    const disp = net.resolveTransportDisposition();
+    try std.testing.expect(disp.outgoing_tcp and !disp.outgoing_utp);
+    try std.testing.expect(disp.incoming_tcp and !disp.incoming_utp);
+    try std.testing.expectEqual(@as(u16, 7000), net.port_min);
+    try std.testing.expectEqual(@as(u16, 7100), net.port_max);
+    try std.testing.expectEqual(@as(u32, 200), net.max_peers);
+    try std.testing.expectEqualSlices(u8, "forced", net.encryption);
+    try std.testing.expect(!net.dht);
 }

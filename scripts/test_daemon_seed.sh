@@ -82,15 +82,15 @@ DL2_LOG="$WORK_DIR/dl2.log"
 dd if=/dev/urandom of="$PAYLOAD" bs=1024 count=50 2>/dev/null
 echo "created 50KB payload"
 
-mise exec -- node "$ROOT_DIR/scripts/create_torrent.mjs" \
-  --input "$PAYLOAD" \
-  --output "$TORRENT" \
-  --announce "http://127.0.0.1:$TRACKER_PORT/announce"
-echo "created .torrent file"
-
 # --- Build ---
 mise exec -- zig build >/dev/null
 echo "build complete"
+
+"$ROOT_DIR/zig-out/bin/varuna-tools" create \
+  -a "http://127.0.0.1:$TRACKER_PORT/announce" \
+  -o "$TORRENT" \
+  "$PAYLOAD"
+echo "created .torrent file"
 
 INFO_HASH="$("$ROOT_DIR/zig-out/bin/varuna-tools" inspect "$TORRENT" | awk -F= '/^info_hash=/{print $2}')"
 if [[ -z "$INFO_HASH" ]]; then

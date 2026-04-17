@@ -73,10 +73,7 @@ pub fn run(
     }
 
     if (std.mem.eql(u8, args[1], "create")) {
-        if (args.len < 4) {
-            return error.InvalidArguments;
-        }
-        try runCreate(allocator, args[2], args[3], if (args.len > 4) args[4] else null, writer);
+        try runCreate(allocator, args[2..], writer);
         return;
     }
 
@@ -118,25 +115,91 @@ fn runInspect(
 
 fn runCreate(
     allocator: std.mem.Allocator,
-    file_path: []const u8,
-    announce_url: []const u8,
-    output_path: ?[]const u8,
+    sub_args: []const []const u8,
     writer: *std.Io.Writer,
 ) !void {
+    var announce_url: ?[]const u8 = null;
+    var output_path: ?[]const u8 = null;
+    var piece_length: u32 = 0;
+    var name: ?[]const u8 = null;
+    var private = false;
+    var web_seed: ?[]const u8 = null;
+    var comment: ?[]const u8 = null;
+    var source: ?[]const u8 = null;
+    var input_path: ?[]const u8 = null;
+    var threads: u32 = 0;
+
+    var i: usize = 0;
+    while (i < sub_args.len) : (i += 1) {
+        const arg = sub_args[i];
+
+        if (std.mem.eql(u8, arg, "-a") or std.mem.eql(u8, arg, "--announce")) {
+            i += 1;
+            if (i >= sub_args.len) return error.InvalidArguments;
+            announce_url = sub_args[i];
+        } else if (std.mem.eql(u8, arg, "-o") or std.mem.eql(u8, arg, "--output")) {
+            i += 1;
+            if (i >= sub_args.len) return error.InvalidArguments;
+            output_path = sub_args[i];
+        } else if (std.mem.eql(u8, arg, "-l") or std.mem.eql(u8, arg, "--piece-length")) {
+            i += 1;
+            if (i >= sub_args.len) return error.InvalidArguments;
+            piece_length = parsePieceLength(sub_args[i]) orelse return error.InvalidArguments;
+        } else if (std.mem.eql(u8, arg, "-n") or std.mem.eql(u8, arg, "--name")) {
+            i += 1;
+            if (i >= sub_args.len) return error.InvalidArguments;
+            name = sub_args[i];
+        } else if (std.mem.eql(u8, arg, "-p") or std.mem.eql(u8, arg, "--private")) {
+            private = true;
+        } else if (std.mem.eql(u8, arg, "-w") or std.mem.eql(u8, arg, "--web-seed")) {
+            i += 1;
+            if (i >= sub_args.len) return error.InvalidArguments;
+            web_seed = sub_args[i];
+        } else if (std.mem.eql(u8, arg, "-c") or std.mem.eql(u8, arg, "--comment")) {
+            i += 1;
+            if (i >= sub_args.len) return error.InvalidArguments;
+            comment = sub_args[i];
+        } else if (std.mem.eql(u8, arg, "-s") or std.mem.eql(u8, arg, "--source")) {
+            i += 1;
+            if (i >= sub_args.len) return error.InvalidArguments;
+            source = sub_args[i];
+        } else if (std.mem.eql(u8, arg, "-t") or std.mem.eql(u8, arg, "--threads")) {
+            i += 1;
+            if (i >= sub_args.len) return error.InvalidArguments;
+            threads = std.fmt.parseInt(u32, sub_args[i], 10) catch return error.InvalidArguments;
+            if (threads == 0) return error.InvalidArguments;
+        } else if (!std.mem.startsWith(u8, arg, "-")) {
+            input_path = arg;
+        } else {
+            return error.InvalidArguments;
+        }
+    }
+
+    const file_path = input_path orelse return error.InvalidArguments;
+    const announce = announce_url orelse return error.InvalidArguments;
+
+    const options = torrent.create.CreateOptions{
+        .announce_url = announce,
+        .piece_length = piece_length,
+        .name = name,
+        .private = private,
+        .comment = comment,
+        .source = source,
+        .web_seed = web_seed,
+        .threads = threads,
+    };
+
     const is_dir = blk: {
         var dir = std.fs.cwd().openDir(file_path, .{}) catch break :blk false;
         dir.close();
         break :blk true;
     };
 
+    var hash_stats: torrent.create.HashStats = undefined;
     const torrent_bytes = if (is_dir)
-        try torrent.create.createDirectory(allocator, file_path, .{
-            .announce_url = announce_url,
-        })
+        try torrent.create.createDirectory(allocator, file_path, options, &hash_stats)
     else
-        try torrent.create.createSingleFile(allocator, file_path, .{
-            .announce_url = announce_url,
-        });
+        try torrent.create.createSingleFile(allocator, file_path, options, &hash_stats);
     defer allocator.free(torrent_bytes);
 
     const dest = output_path orelse blk: {
@@ -152,10 +215,51 @@ fn runCreate(
 
     try std.fs.cwd().writeFile(.{ .sub_path = dest, .data = torrent_bytes });
 
-    const info_hash = try torrent.info_hash.compute(torrent_bytes);
-    const hex = std.fmt.bytesToHex(info_hash, .lower);
+    const info_hash_val = try torrent.info_hash.compute(torrent_bytes);
+    const hex = std.fmt.bytesToHex(info_hash_val, .lower);
     try writer.print("created {s} ({} bytes), info_hash={s}\n", .{ dest, torrent_bytes.len, hex[0..] });
+
+    // Print hashing speed
+    if (hash_stats.elapsed_ns > 0) {
+        const elapsed_ms = hash_stats.elapsed_ns / std.time.ns_per_ms;
+        const elapsed_s_f: f64 = @as(f64, @floatFromInt(hash_stats.elapsed_ns)) / @as(f64, @floatFromInt(std.time.ns_per_s));
+        const mb_f: f64 = @as(f64, @floatFromInt(hash_stats.total_bytes)) / (1024.0 * 1024.0);
+        const speed_mb_s: f64 = if (elapsed_s_f > 0) mb_f / elapsed_s_f else 0;
+
+        if (elapsed_ms >= 1000) {
+            try writer.print("hashed {} pieces ({d:.0} MB) in {d:.2}s ({d:.0} MB/s, {} threads)\n", .{
+                hash_stats.piece_count,
+                mb_f,
+                elapsed_s_f,
+                speed_mb_s,
+                hash_stats.thread_count,
+            });
+        } else {
+            try writer.print("hashed {} pieces ({d:.0} MB) in {}ms ({d:.0} MB/s, {} threads)\n", .{
+                hash_stats.piece_count,
+                mb_f,
+                elapsed_ms,
+                speed_mb_s,
+                hash_stats.thread_count,
+            });
+        }
+    }
+
     try writer.flush();
+}
+
+/// Parse a piece length argument. Accepts either raw byte values (e.g. "262144")
+/// or power-of-2 exponents (e.g. "18" for 2^18 = 262144). Values <= 24 are
+/// treated as exponents; larger values as raw byte counts.
+fn parsePieceLength(s: []const u8) ?u32 {
+    const val = std.fmt.parseInt(u64, s, 10) catch return null;
+    if (val == 0) return null;
+    if (val <= 24) {
+        // Treat as power of 2
+        const shift: u5 = @intCast(val);
+        return @as(u32, 1) << shift;
+    }
+    return std.math.cast(u32, val);
 }
 
 fn runVerify(
@@ -194,7 +298,16 @@ fn runVerify(
 fn writeUsage(writer: *std.Io.Writer) !void {
     try writer.writeAll(
         "usage:\n" ++
-            "  varuna-tools create <file> <announce-url> [output.torrent]\n" ++
+            "  varuna-tools create [options] <input-path>\n" ++
+            "    -a, --announce <url>      Tracker announce URL (required)\n" ++
+            "    -o, --output <file>       Output .torrent file (default: <name>.torrent)\n" ++
+            "    -l, --piece-length <n>    Piece length in bytes or power of 2 (default: auto)\n" ++
+            "    -n, --name <name>         Torrent name (default: basename of input)\n" ++
+            "    -p, --private             Mark as private torrent\n" ++
+            "    -w, --web-seed <url>      BEP 19 web seed URL\n" ++
+            "    -c, --comment <text>      Comment field\n" ++
+            "    -s, --source <text>       Source field (private tracker identification)\n" ++
+            "\n" ++
             "  varuna-tools inspect <torrent-file>\n" ++
             "  varuna-tools verify <torrent-file> <target-root>\n" ++
             "\n" ++

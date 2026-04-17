@@ -109,15 +109,15 @@ TRACKER_LOG="$WORK_DIR/tracker.log"
 SEED_LOG="$WORK_DIR/seed.log"
 DAEMON_LOG="$WORK_DIR/daemon.log"
 
-# 16 KB pieces so the torrent has enough pieces for meaningful testing
-mise exec -- node "$ROOT_DIR/scripts/create_torrent.mjs" \
-  --input "$PAYLOAD_DIR" \
-  --output "$TORRENT_PATH" \
-  --announce "http://127.0.0.1:$TRACKER_PORT/announce" \
-  --piece-length 16384
-
 # ── 2. Build binaries ──────────────────────────────────────────
 mise exec -- zig build >/dev/null
+
+# 16 KB pieces so the torrent has enough pieces for meaningful testing
+"$ROOT_DIR/zig-out/bin/varuna-tools" create \
+  -a "http://127.0.0.1:$TRACKER_PORT/announce" \
+  -l 16384 \
+  -o "$TORRENT_PATH" \
+  "$PAYLOAD_DIR"
 
 # ── 3. Extract info hash ───────────────────────────────────────
 INFO_HASH="$("$ROOT_DIR/zig-out/bin/varuna-tools" inspect "$TORRENT_PATH" | awk -F= '/^info_hash=/{print $2}')"

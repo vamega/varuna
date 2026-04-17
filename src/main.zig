@@ -105,6 +105,9 @@ pub fn main() !void {
     if (cfg.network.dl_limit > 0) shared_el.setGlobalDlLimit(cfg.network.dl_limit);
     if (cfg.network.ul_limit > 0) shared_el.setGlobalUlLimit(cfg.network.ul_limit);
 
+    // Apply web seed batching limit from config
+    shared_el.web_seed_max_request_bytes = cfg.network.web_seed_max_request_bytes;
+
     // Initialize the reusable piece cache. A zero size means the default 64 MB.
     shared_el.initHugePageCache(cfg.performance.piece_cache_size);
 

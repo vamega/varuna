@@ -52,12 +52,12 @@ mkdir -p "$WORK_DIR/seed-root" "$WORK_DIR/download-root"
 # Create 100KB random payload
 dd if=/dev/urandom of="$WORK_DIR/seed-root/payload.bin" bs=1024 count=100 2>/dev/null
 
-mise exec -- node "$ROOT_DIR/scripts/create_torrent.mjs" \
-  --input "$WORK_DIR/seed-root/payload.bin" \
-  --output "$WORK_DIR/test.torrent" \
-  --announce "http://127.0.0.1:$TRACKER_PORT/announce"
-
 mise exec -- zig build >/dev/null
+
+"$ROOT_DIR/zig-out/bin/varuna-tools" create \
+  -a "http://127.0.0.1:$TRACKER_PORT/announce" \
+  -o "$WORK_DIR/test.torrent" \
+  "$WORK_DIR/seed-root/payload.bin"
 
 INFO_HASH="$("$ROOT_DIR/zig-out/bin/varuna-tools" inspect "$WORK_DIR/test.torrent" | awk -F= '/^info_hash=/{print $2}')"
 if [[ -z "$INFO_HASH" ]]; then

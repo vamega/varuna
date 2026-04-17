@@ -279,6 +279,21 @@ pub const PieceTracker = struct {
         return null;
     }
 
+    /// Try to claim a specific piece index (for building contiguous runs).
+    /// Returns true if the piece was successfully claimed, false if it is
+    /// already complete, already in-progress, or not wanted.
+    pub fn claimSpecificPiece(self: *PieceTracker, piece_index: u32) bool {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+
+        if (piece_index >= self.piece_count) return false;
+        if (!self.isEligible(piece_index)) return false;
+        if (self.in_progress.has(piece_index)) return false;
+
+        self.in_progress.set(piece_index) catch return false;
+        return true;
+    }
+
     /// Mark a piece as fully downloaded and verified.
     /// Returns true if this was the first completion (not a duplicate from endgame).
     pub fn completePiece(self: *PieceTracker, piece_index: u32, piece_length: u32) bool {
@@ -844,4 +859,39 @@ test "completePiece in_progress count decrements correctly" {
     // Complete piece 1 -- count should drop to 0
     _ = tracker.completePiece(1, 4);
     try std.testing.expectEqual(@as(u32, 0), tracker.in_progress.count);
+}
+
+test "claimSpecificPiece claims adjacent pieces for contiguous runs" {
+    var bf = try Bitfield.init(std.testing.allocator, 8);
+    defer bf.deinit(std.testing.allocator);
+
+    var tracker = try PieceTracker.init(std.testing.allocator, 8, 256, 2048, &bf, 0);
+    defer tracker.deinit(std.testing.allocator);
+
+    // Claim piece 0 normally
+    const p0 = tracker.claimPiece(null);
+    try std.testing.expectEqual(@as(?u32, 0), p0);
+
+    // Claim adjacent pieces specifically for a contiguous run
+    try std.testing.expect(tracker.claimSpecificPiece(1));
+    try std.testing.expect(tracker.claimSpecificPiece(2));
+    try std.testing.expect(tracker.claimSpecificPiece(3));
+
+    // All four should be in-progress
+    try std.testing.expectEqual(@as(u32, 4), tracker.in_progress.count);
+
+    // Can't claim already in-progress pieces
+    try std.testing.expect(!tracker.claimSpecificPiece(0));
+    try std.testing.expect(!tracker.claimSpecificPiece(1));
+
+    // Can't claim out-of-bounds
+    try std.testing.expect(!tracker.claimSpecificPiece(8));
+
+    // Complete piece 2 and verify it can't be claimed again
+    _ = tracker.completePiece(2, 256);
+    try std.testing.expect(!tracker.claimSpecificPiece(2));
+
+    // Release piece 3 and verify it can be claimed again
+    tracker.releasePiece(3);
+    try std.testing.expect(tracker.claimSpecificPiece(3));
 }

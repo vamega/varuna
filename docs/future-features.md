@@ -72,7 +72,15 @@ Implemented in `src/config.zig` as `TransportDisposition` packed struct. Inspire
 Config (TOML):
 ```toml
 [network]
-transport = "tcp_and_utp"  # or "tcp_only", "utp_only"
+# Preset string: "all", "tcp_and_utp", "tcp_only", "utp_only"
+transport = "all"
+
+# Or fine-grained list of individual flags:
+transport = ["tcp_inbound", "tcp_outbound", "utp_inbound", "utp_outbound"]
+
+# Asymmetric example (TCP receive, uTP send):
+transport = ["tcp_inbound", "utp_outbound"]
+
 # Legacy enable_utp = true/false still works for backwards compatibility
 ```
 

@@ -158,11 +158,11 @@ for entry in "${TESTS[@]}"; do
   echo "  payload: $actual_size bytes, piece size: $piece_bytes"
 
   # Create torrent
-  mise exec -- node "$ROOT_DIR/scripts/create_torrent.mjs" \
-    --input "$PAYLOAD_PATH" \
-    --output "$TORRENT_PATH" \
-    --announce "http://127.0.0.1:$tracker_port/announce" \
-    --piece-length "$piece_bytes" >/dev/null
+  "$TOOLS_BIN" create \
+    -a "http://127.0.0.1:$tracker_port/announce" \
+    -l "$piece_bytes" \
+    -o "$TORRENT_PATH" \
+    "$PAYLOAD_PATH" >/dev/null
 
   # Extract info hash
   INFO_HASH="$("$TOOLS_BIN" inspect "$TORRENT_PATH" | awk -F= '/^info_hash=/{print $2}')"

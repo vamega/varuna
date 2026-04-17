@@ -318,6 +318,20 @@ pub fn build(b: *std.Build) void {
     test_api_step.dependOn(&run_api_tests.step);
     test_step.dependOn(&run_api_tests.step);
 
+    // ── Transport disposition tests ──────────────────────────
+    const transport_tests = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("tests/transport_disposition_test.zig"),
+            .target = target,
+            .optimize = optimize,
+            .imports = &varuna_import,
+        }),
+    });
+    const run_transport_tests = b.addRunArtifact(transport_tests);
+    const test_transport_step = b.step("test-transport", "Run transport disposition integration tests");
+    test_transport_step.dependOn(&run_transport_tests.step);
+    test_step.dependOn(&run_transport_tests.step);
+
     // ── Soak test (long-running resource leak detection) ──
     const soak_exe = b.addExecutable(.{
         .name = "varuna-soak-test",

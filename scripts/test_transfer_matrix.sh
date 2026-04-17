@@ -151,11 +151,11 @@ run_single_file_test() {
   mkdir -p "$W/seed" "$W/dl"
   dd if=/dev/urandom of="$W/seed/payload.bin" bs=1024 count="$size_kb" 2>/dev/null
 
-  mise exec -- node "$ROOT_DIR/scripts/create_torrent.mjs" \
-    --input "$W/seed/payload.bin" \
-    --output "$W/test.torrent" \
-    --announce "http://127.0.0.1:$tp/announce" \
-    --piece-length "$piece_len" >/dev/null 2>&1
+  "$VARUNA_TOOLS" create \
+    -a "http://127.0.0.1:$tp/announce" \
+    -l "$piece_len" \
+    -o "$W/test.torrent" \
+    "$W/seed/payload.bin" >/dev/null 2>&1
 
   local H
   H=$("$VARUNA_TOOLS" inspect "$W/test.torrent" 2>/dev/null | awk -F= '/^info_hash=/{print $2}')
@@ -290,11 +290,11 @@ run_multi_file_test() {
     total_kb=$((total_kb + sz_kb))
   done
 
-  mise exec -- node "$ROOT_DIR/scripts/create_torrent.mjs" \
-    --input "$W/seed/content" \
-    --output "$W/test.torrent" \
-    --announce "http://127.0.0.1:$tp/announce" \
-    --piece-length "$piece_len" >/dev/null 2>&1
+  "$VARUNA_TOOLS" create \
+    -a "http://127.0.0.1:$tp/announce" \
+    -l "$piece_len" \
+    -o "$W/test.torrent" \
+    "$W/seed/content" >/dev/null 2>&1
 
   local H
   H=$("$VARUNA_TOOLS" inspect "$W/test.torrent" 2>/dev/null | awk -F= '/^info_hash=/{print $2}')

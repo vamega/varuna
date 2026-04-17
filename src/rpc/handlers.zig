@@ -586,6 +586,7 @@ pub const ApiHandler = struct {
             \\"outgoing_tcp":{s},"outgoing_utp":{s},"incoming_tcp":{s},"incoming_utp":{s},
             \\"transport_disposition":{},
             \\"piece_cache_enabled":{},
+            \\"web_seed_max_request_bytes":{},
             \\"ip_filter_enabled":false,"ip_filter_path":"","ip_filter_trackers":false,
             \\"banned_IPs":"{f}"}}
         , .{
@@ -611,6 +612,7 @@ pub const ApiHandler = struct {
             @as([]const u8, if (el) |e| (if (e.transport_disposition.incoming_utp) "true" else "false") else "false"),
             if (el) |e| e.transport_disposition.toBitfield() else @as(u8, 15),
             @as(u8, if (piece_cache_enabled) 1 else 0),
+            if (el) |e| e.web_seed_max_request_bytes else @as(u32, 4 * 1024 * 1024),
             esc(banned_ips_str),
         }) catch
             return .{ .status = 500, .body = "{\"error\":\"internal\"}" };
@@ -686,6 +688,9 @@ pub const ApiHandler = struct {
                     el.transport_disposition = config_mod.TransportDisposition.fromEnableUtp(v);
                 }
             }
+
+            // Web seed batching limit
+            if (prefs.web_seed_max_request_bytes) |v| el.web_seed_max_request_bytes = v;
 
             // Reconcile listeners: start/stop UDP listener as needed
             el.reconcileListeners();
@@ -782,6 +787,12 @@ pub const ApiHandler = struct {
                         return .{ .status = 400, .body = "{\"error\":\"invalid enable_utp\"}" };
                     el.transport_disposition = config_mod.TransportDisposition.fromEnableUtp(enable);
                 }
+            }
+
+            // Web seed batching limit
+            if (extractParamMut(body, "web_seed_max_request_bytes")) |v| {
+                el.web_seed_max_request_bytes = std.fmt.parseInt(u32, v, 10) catch
+                    return .{ .status = 400, .body = "{\"error\":\"invalid web_seed_max_request_bytes\"}" };
             }
 
             // Reconcile listeners: start/stop UDP listener as needed
@@ -1957,6 +1968,7 @@ const PreferencesUpdate = struct {
     incoming_tcp: ?bool = null,
     incoming_utp: ?bool = null,
     transport_disposition: ?u8 = null,
+    web_seed_max_request_bytes: ?u32 = null,
 };
 
 /// Build a `server.Response` carrying a JSON error body.
