@@ -1,5 +1,6 @@
 pub const address = @import("address.zig");
 pub const ban_list = @import("ban_list.zig");
+pub const smart_ban = @import("smart_ban.zig");
 pub const bencode_scanner = @import("bencode_scanner.zig");
 pub const extensions = @import("extensions.zig");
 pub const hash_exchange = @import("hash_exchange.zig");

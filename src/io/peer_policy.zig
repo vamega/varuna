@@ -18,6 +18,7 @@ const LayoutSpan = @import("../torrent/layout.zig").Layout.Span;
 const utp_handler = @import("utp_handler.zig");
 const web_seed_handler = @import("web_seed_handler.zig");
 const BanList = @import("../net/ban_list.zig").BanList;
+const SmartBan = @import("../net/smart_ban.zig").SmartBan;
 const dp_mod = @import("downloading_piece.zig");
 const DownloadingPiece = dp_mod.DownloadingPiece;
 const DownloadingPieceKey = dp_mod.DownloadingPieceKey;
@@ -488,6 +489,15 @@ pub fn completePieceDownload(self: *EventLoop, slot: u16) void {
     @memcpy(&hash, expected_hash);
 
     if (self.hasher) |h| {
+        // Smart Ban Phase 1: snapshot per-block peer attribution before
+        // destroying the DownloadingPiece.  The attribution is consumed in
+        // processHashResults (on both pass and fail paths).
+        if (dp) |d| {
+            if (self.smart_ban) |sb| {
+                snapshotAttributionForSmartBan(self, sb, peer.torrent_id, piece_index, d);
+            }
+        }
+
         // Submit to background hasher thread (non-blocking)
         h.submitVerify(slot, piece_index, piece_buf, hash, peer.torrent_id) catch {
             cleanupCompletionFailure(self, peer, dp, pt, piece_index);
@@ -694,6 +704,18 @@ pub fn processHashResults(self: *EventLoop) void {
                 }
             }
 
+            // Smart Ban Phase 2: if this piece previously failed, compare
+            // per-block digests from the now-verified buffer against stored
+            // records.  Peers whose blocks changed between the failed and
+            // passing downloads get banned.
+            if (self.smart_ban) |sb| {
+                const block_size: u32 = 16 * 1024;
+                if (sb.onPiecePassed(torrent_id, result.piece_index, result.piece_buf, block_size)) |bad| {
+                    defer self.allocator.free(bad);
+                    smartBanCorruptPeers(self, bad);
+                } else |_| {}
+            }
+
             const sess = tc.session orelse {
                 self.allocator.free(result.piece_buf);
                 continue;
@@ -783,6 +805,15 @@ pub fn processHashResults(self: *EventLoop) void {
                 }
             }
         } else {
+            // Smart Ban Phase 1: record per-block hashes + peer attribution
+            // from the failed piece BEFORE freeing the buffer.  When the
+            // piece is re-downloaded and passes, we'll compare block hashes
+            // to identify which peer(s) sent corrupt data.
+            if (self.smart_ban) |sb| {
+                const block_size: u32 = 16 * 1024;
+                sb.onPieceFailed(torrent_id, result.piece_index, result.piece_buf, block_size) catch {};
+            }
+
             // Hash mismatch -- release piece back to pool
             if (tc.piece_tracker) |pt| pt.releasePiece(result.piece_index);
             self.allocator.free(result.piece_buf);
@@ -1238,6 +1269,72 @@ fn rewardPeerTrust(peer: *Peer) void {
 /// Web seed sentinel slots are >= max_peers and handled separately by WebSeedManager.
 fn isWebSeedSentinelSlot(slot: u16) bool {
     return slot >= max_peers;
+}
+
+/// Smart Ban Phase 1: snapshot per-block peer attribution before a
+/// DownloadingPiece is destroyed.  Builds a `[]?std.net.Address` indexed by
+/// block_index, translating `peer_slot` to the peer's network address.
+/// Slots that are free or web seed sentinels produce null entries (those
+/// blocks are skipped during smart ban bookkeeping).
+fn snapshotAttributionForSmartBan(
+    self: *EventLoop,
+    sb: *SmartBan,
+    torrent_id: u32,
+    piece_index: u32,
+    d: *const DownloadingPiece,
+) void {
+    const block_count = d.block_infos.len;
+    const block_peers = self.allocator.alloc(?std.net.Address, block_count) catch return;
+
+    for (d.block_infos, 0..) |bi, i| {
+        if (bi.state != .received) {
+            block_peers[i] = null;
+            continue;
+        }
+        if (isWebSeedSentinelSlot(bi.peer_slot)) {
+            block_peers[i] = null;
+            continue;
+        }
+        if (bi.peer_slot >= self.peers.len) {
+            block_peers[i] = null;
+            continue;
+        }
+        const p = &self.peers[bi.peer_slot];
+        if (p.state == .free) {
+            // Slot was freed mid-piece; skip attribution for this block.
+            block_peers[i] = null;
+            continue;
+        }
+        block_peers[i] = p.address;
+    }
+
+    sb.snapshotAttribution(torrent_id, piece_index, block_peers) catch {
+        // On failure, free the slice we just allocated.
+        self.allocator.free(block_peers);
+    };
+}
+
+/// Smart Ban Phase 2: given the peer addresses identified as having sent
+/// corrupt blocks, ban them via the BanList and disconnect matching peer
+/// slots.  Called from the hash-pass path in processHashResults.
+pub fn smartBanCorruptPeers(self: *EventLoop, bad_peers: []const std.net.Address) void {
+    if (bad_peers.len == 0) return;
+    const bl = self.ban_list orelse return;
+
+    for (bad_peers) |addr| {
+        _ = bl.banIp(addr, "smart ban: sent corrupt block in failed piece", .manual) catch {};
+        log.warn("smart ban: banned {any} for sending corrupt blocks", .{addr});
+
+        // Disconnect any currently-connected peer with this address.
+        for (self.peers, 0..) |*p, i| {
+            if (p.state == .free) continue;
+            if (p.address.eql(addr)) {
+                self.removePeer(@intCast(i));
+            }
+        }
+    }
+
+    self.ban_list_dirty.store(true, .release);
 }
 
 // ── Tests ─────────────────────────────────────────────────

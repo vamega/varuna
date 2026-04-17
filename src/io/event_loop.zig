@@ -21,6 +21,7 @@ const SuperSeedState = @import("super_seed.zig").SuperSeedState;
 const HugePageCache = @import("../storage/huge_page_cache.zig").HugePageCache;
 const MerkleCache = @import("../torrent/merkle_cache.zig").MerkleCache;
 const BanList = @import("../net/ban_list.zig").BanList;
+const SmartBan = @import("../net/smart_ban.zig").SmartBan;
 const dp_mod = @import("downloading_piece.zig");
 pub const DownloadingPiece = dp_mod.DownloadingPiece;
 pub const DownloadingPieceKey = dp_mod.DownloadingPieceKey;
@@ -288,6 +289,11 @@ pub const EventLoop = struct {
     ban_list: ?*BanList = null,
     // Atomic flag set by API handlers when bans change; checked in tick()
     ban_list_dirty: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
+
+    // Smart Ban: per-block SHA-1 attribution for detecting peers that send
+    // corrupt data without false-positive-banning other peers on the same piece.
+    // Populated at piece completion, consumed at hash result processing.
+    smart_ban: ?*SmartBan = null,
 
     // Background hasher for SHA verification (off event loop thread)
     last_unchoke_recalc: i64 = 0,
@@ -773,6 +779,10 @@ pub const EventLoop = struct {
 
     /// Remove a torrent context and disconnect all its peers.
     pub fn removeTorrent(self: *EventLoop, torrent_id: TorrentId) void {
+        // Smart Ban: free any per-block records / pending attribution for
+        // this torrent (otherwise they'd leak).
+        if (self.smart_ban) |sb| sb.clearTorrent(torrent_id);
+
         // Disconnect all peers for this torrent
         var to_remove = std.ArrayList(u16).empty;
         defer to_remove.deinit(self.allocator);

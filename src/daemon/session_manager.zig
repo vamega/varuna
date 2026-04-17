@@ -9,6 +9,7 @@ pub const QueueManager = @import("queue_manager.zig").QueueManager;
 pub const QueueConfig = @import("queue_manager.zig").QueueConfig;
 const ResumeDb = @import("../storage/state_db.zig").ResumeDb;
 const BanList = @import("../net/ban_list.zig").BanList;
+const SmartBan = @import("../net/smart_ban.zig").SmartBan;
 const HttpExecutor = @import("../io/http_executor.zig").HttpExecutor;
 const TrackerExecutor = @import("tracker_executor.zig").TrackerExecutor;
 const UdpTrackerExecutor = @import("udp_tracker_executor.zig").UdpTrackerExecutor;
@@ -60,6 +61,7 @@ pub const SessionManager = struct {
     /// Shared ban list for peer IP filtering. Owned by SessionManager,
     /// shared with EventLoop (read-only ban checks) and API handlers (mutations).
     ban_list: ?*BanList = null,
+    smart_ban: ?*SmartBan = null,
 
     /// Shared tracker executor for daemon-side announces and scrapes.
     tracker_executor: ?*TrackerExecutor = null,
@@ -112,6 +114,16 @@ pub const SessionManager = struct {
 
         // Load ban list from SQLite
         self.loadBanList();
+
+        // Initialize smart ban (per-block peer attribution for hash failures)
+        self.initSmartBan();
+    }
+
+    fn initSmartBan(self: *SessionManager) void {
+        const sb = self.allocator.create(SmartBan) catch return;
+        sb.* = SmartBan.init(self.allocator);
+        self.smart_ban = sb;
+        if (self.shared_event_loop) |el| el.smart_ban = sb;
     }
 
     /// Enable or disable DHT at runtime. If no engine was created at startup,
@@ -136,6 +148,12 @@ pub const SessionManager = struct {
         if (self.ban_list) |bl| {
             bl.deinit();
             self.allocator.destroy(bl);
+        }
+        if (self.smart_ban) |sb| {
+            // Null out event loop reference before destroying.
+            if (self.shared_event_loop) |el| el.smart_ban = null;
+            sb.deinit();
+            self.allocator.destroy(sb);
         }
         if (self.tracker_executor) |executor| {
             // Null out event loop references before destroying.
