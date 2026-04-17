@@ -85,6 +85,10 @@ pub const ApiHandler = struct {
             return withCors(self.handleDefaultSavePath());
         }
 
+        if (std.mem.startsWith(u8, request.path, "/api/v2/app/shutdown") and std.mem.eql(u8, request.method, "POST")) {
+            return withCors(self.handleShutdown(request.path, request.body));
+        }
+
         if (std.mem.eql(u8, request.path, "/api/v2/transfer/info")) {
             return withCors(self.handleTransferInfo(allocator));
         }
@@ -1708,6 +1712,52 @@ pub const ApiHandler = struct {
     /// GET /api/v2/app/defaultSavePath -- return the default save path as plain text.
     fn handleDefaultSavePath(self: *const ApiHandler) server.Response {
         return .{ .body = self.session_manager.default_save_path, .content_type = "text/plain" };
+    }
+
+    /// POST /api/v2/app/shutdown -- initiate graceful daemon shutdown.
+    ///
+    /// Accepts an optional `timeout` parameter (seconds) from either the
+    /// request body (form-encoded) or the query string. When omitted, the
+    /// daemon's configured `shutdown_timeout` is used. A timeout of 0 means
+    /// immediate shutdown with no drain period.
+    ///
+    /// Sets the event loop into draining mode and requests shutdown so the
+    /// main loop exits after in-flight transfers complete (or the deadline
+    /// passes). Returns 200 immediately; the actual exit happens
+    /// asynchronously.
+    fn handleShutdown(self: *const ApiHandler, path: []const u8, body: []const u8) server.Response {
+        const signal = @import("../io/signal.zig");
+        const el = self.session_manager.shared_event_loop orelse {
+            // No event loop -- just request shutdown directly
+            signal.requestShutdown();
+            return .{ .body = "Ok.", .content_type = "text/plain" };
+        };
+
+        // Parse optional timeout from body or query string
+        const timeout_str = extractParamMut(body, "timeout") orelse blk: {
+            if (std.mem.indexOf(u8, path, "?")) |q| {
+                break :blk extractParamMut(path[q + 1 ..], "timeout");
+            }
+            break :blk null;
+        };
+
+        const timeout: u32 = if (timeout_str) |s|
+            std.fmt.parseInt(u32, s, 10) catch
+                return .{ .status = 400, .body = "{\"error\":\"invalid timeout\"}" }
+        else
+            el.shutdown_timeout;
+
+        if (timeout == 0) {
+            // Immediate shutdown, no drain
+            el.running = false;
+            signal.requestShutdown();
+        } else {
+            el.draining = true;
+            el.drain_deadline = std.time.timestamp() + @as(i64, @intCast(timeout));
+            signal.requestShutdown();
+        }
+
+        return .{ .body = "Ok.", .content_type = "text/plain" };
     }
 
     /// POST /api/v2/transfer/toggleSpeedLimitsMode — 501 Not Implemented.

@@ -18,8 +18,15 @@ const LayoutSpan = @import("../torrent/layout.zig").Layout.Span;
 const utp_handler = @import("utp_handler.zig");
 const web_seed_handler = @import("web_seed_handler.zig");
 const BanList = @import("../net/ban_list.zig").BanList;
+const dp_mod = @import("downloading_piece.zig");
+const DownloadingPiece = dp_mod.DownloadingPiece;
+const DownloadingPieceKey = dp_mod.DownloadingPieceKey;
+const PieceTracker = @import("../torrent/piece_tracker.zig").PieceTracker;
 
 const pipeline_depth: u32 = 64;
+
+/// Maximum number of peers that can work on the same piece simultaneously.
+const max_peers_per_piece: u8 = 3;
 
 /// Threshold at which a peer is banned for sending too many corrupt pieces.
 const trust_ban_threshold: i8 = -7;
@@ -68,6 +75,14 @@ pub fn tryAssignPieces(self: *EventLoop) void {
             continue;
         };
 
+        // Phase 2: try to join an existing DownloadingPiece before claiming a new one.
+        // This enables multi-source piece assembly -- multiple peers contribute
+        // blocks to the same piece simultaneously.
+        if (tryJoinExistingPiece(self, slot, peer)) {
+            self.unmarkIdle(slot);
+            continue;
+        }
+
         const peer_bf: ?*const Bitfield = if (peer.availability) |*bf| bf else null;
         const piece_index = pt.claimPiece(peer_bf) orelse {
             // No piece available for this peer right now; keep it in the
@@ -87,6 +102,41 @@ pub fn tryAssignPieces(self: *EventLoop) void {
     }
 }
 
+/// Try to join an existing DownloadingPiece that has unrequested blocks and
+/// fewer than max_peers_per_piece peers.  Returns true if the peer was
+/// successfully joined to an existing download.
+pub fn tryJoinExistingPiece(self: *EventLoop, slot: u16, peer: *Peer) bool {
+    const peer_bf = if (peer.availability) |*bf| bf else return false;
+
+    var best_dp: ?*DownloadingPiece = null;
+    var best_unrequested: u16 = 0;
+
+    var it = self.downloading_pieces.valueIterator();
+    while (it.next()) |dp_ptr| {
+        const dp = dp_ptr.*;
+        // Must be same torrent
+        if (dp.torrent_id != peer.torrent_id) continue;
+        // Must have room for another peer
+        if (dp.peer_count >= max_peers_per_piece) continue;
+        // Must have unrequested blocks
+        const unreq = dp.unrequestedCount();
+        if (unreq == 0) continue;
+        // Peer must have this piece
+        if (!peer_bf.has(dp.piece_index)) continue;
+        // Pick the piece with the most unrequested blocks
+        if (unreq > best_unrequested) {
+            best_unrequested = unreq;
+            best_dp = dp;
+        }
+    }
+
+    if (best_dp) |dp| {
+        joinPieceDownload(self, slot, dp) catch return false;
+        return true;
+    }
+    return false;
+}
+
 pub fn startPieceDownload(self: *EventLoop, slot: u16, piece_index: u32) !void {
     const peer = &self.peers[slot];
     const tc = self.getTorrentContext(peer.torrent_id) orelse return error.TorrentNotFound;
@@ -95,20 +145,110 @@ pub fn startPieceDownload(self: *EventLoop, slot: u16, piece_index: u32) !void {
     const geometry = sess.geometry();
     const block_count = try geometry.blockCount(piece_index);
 
+    // Look up or create the shared DownloadingPiece
+    const dp_key = DownloadingPieceKey{ .torrent_id = peer.torrent_id, .piece_index = piece_index };
+    const dp = if (self.downloading_pieces.get(dp_key)) |existing| existing else blk: {
+        const new_dp = dp_mod.createDownloadingPiece(
+            self.allocator,
+            piece_index,
+            peer.torrent_id,
+            piece_size,
+            @intCast(block_count),
+        ) catch return error.OutOfMemory;
+        self.downloading_pieces.put(self.allocator, dp_key, new_dp) catch {
+            dp_mod.destroyDownloadingPieceFull(self.allocator, new_dp);
+            return error.OutOfMemory;
+        };
+        break :blk new_dp;
+    };
+
     peer.current_piece = piece_index;
-    peer.piece_buf = try self.allocator.alloc(u8, piece_size);
-    errdefer {
-        // On failure, clean up so the peer doesn't stall with a dangling current_piece.
-        if (peer.piece_buf) |buf| self.allocator.free(buf);
-        peer.piece_buf = null;
-        peer.current_piece = null;
-    }
+    peer.piece_buf = dp.buf;
+    peer.downloading_piece = dp;
+    dp.peer_count += 1;
+
     peer.blocks_received = 0;
     peer.blocks_expected = block_count;
     peer.pipeline_sent = 0;
     peer.inflight_requests = 0;
 
-    try tryFillPipeline(self, slot);
+    tryFillPipeline(self, slot) catch {
+        // On failure, detach this peer from the DownloadingPiece
+        detachPeerFromDownloadingPiece(self, peer);
+        peer.current_piece = null;
+        peer.piece_buf = null;
+        return error.PipelineFillFailed;
+    };
+}
+
+/// Join an existing DownloadingPiece that other peers are already working on.
+pub fn joinPieceDownload(self: *EventLoop, slot: u16, dp: *DownloadingPiece) !void {
+    const peer = &self.peers[slot];
+
+    peer.current_piece = dp.piece_index;
+    peer.piece_buf = dp.buf;
+    peer.downloading_piece = dp;
+    dp.peer_count += 1;
+
+    peer.blocks_received = 0;
+    peer.blocks_expected = dp.blocks_total;
+    peer.pipeline_sent = 0;
+    peer.inflight_requests = 0;
+
+    tryFillPipeline(self, slot) catch {
+        detachPeerFromDownloadingPiece(self, peer);
+        peer.current_piece = null;
+        peer.piece_buf = null;
+        return error.PipelineFillFailed;
+    };
+}
+
+/// Detach a peer from its current DownloadingPiece.  Releases requested blocks
+/// and decrements peer_count.  If no peers remain and the piece is incomplete,
+/// the DownloadingPiece is kept in the registry for future peers to resume.
+pub fn detachPeerFromDownloadingPiece(self: *EventLoop, peer: *Peer) void {
+    const dp = peer.downloading_piece orelse return;
+    const slot = peerSlot(self, peer);
+    dp.releaseBlocksForPeer(slot);
+    if (dp.peer_count > 0) dp.peer_count -= 1;
+    peer.downloading_piece = null;
+    peer.piece_buf = null;
+
+    // If no peers remain and no blocks received, remove from registry and free
+    if (dp.peer_count == 0 and dp.blocks_received == 0) {
+        const dp_key = DownloadingPieceKey{ .torrent_id = dp.torrent_id, .piece_index = dp.piece_index };
+        _ = self.downloading_pieces.remove(dp_key);
+        if (self.getTorrentContext(dp.torrent_id)) |tc| {
+            if (tc.piece_tracker) |pt| pt.releasePiece(dp.piece_index);
+        }
+        dp_mod.destroyDownloadingPieceFull(self.allocator, dp);
+    }
+}
+
+/// Detach a peer from its next_downloading_piece.
+pub fn detachPeerFromNextDownloadingPiece(self: *EventLoop, peer: *Peer) void {
+    const dp = peer.next_downloading_piece orelse return;
+    const slot = peerSlot(self, peer);
+    dp.releaseBlocksForPeer(slot);
+    if (dp.peer_count > 0) dp.peer_count -= 1;
+    peer.next_downloading_piece = null;
+    peer.next_piece_buf = null;
+
+    if (dp.peer_count == 0 and dp.blocks_received == 0) {
+        const dp_key = DownloadingPieceKey{ .torrent_id = dp.torrent_id, .piece_index = dp.piece_index };
+        _ = self.downloading_pieces.remove(dp_key);
+        if (self.getTorrentContext(dp.torrent_id)) |tc| {
+            if (tc.piece_tracker) |pt| pt.releasePiece(dp.piece_index);
+        }
+        dp_mod.destroyDownloadingPieceFull(self.allocator, dp);
+    }
+}
+
+/// Get the slot index of a peer within the peers array.
+fn peerSlot(self: *EventLoop, peer: *const Peer) u16 {
+    const base = @intFromPtr(self.peers.ptr);
+    const addr = @intFromPtr(peer);
+    return @intCast((addr - base) / @sizeOf(Peer));
 }
 
 pub fn tryFillPipeline(self: *EventLoop, slot: u16) !void {
@@ -132,21 +272,35 @@ pub fn tryFillPipeline(self: *EventLoop, slot: u16) !void {
     // Buffer covers current + next piece (at most pipeline_depth * 2 total requests)
     var send_buf: [request_size * pipeline_depth * 2]u8 = undefined;
 
-    // --- Phase 1: fill requests for current piece ---
+    // --- Phase 1: fill requests for current piece using DownloadingPiece ---
     var p1: u32 = 0; // requests to send for current piece this call
     if (peer.current_piece) |piece_index| {
-        while (peer.inflight_requests + p1 < pipeline_depth and
-            peer.pipeline_sent + p1 < peer.blocks_expected)
-        {
-            const req = geometry.requestForBlock(piece_index, peer.pipeline_sent + p1) catch break;
-            writeRequestMsg(send_buf[p1 * request_size ..], req);
-            p1 += 1;
+        if (peer.downloading_piece) |dp| {
+            // Use block-level tracking: request the next unrequested block
+            while (peer.inflight_requests + p1 < pipeline_depth) {
+                const block_idx = dp.nextUnrequestedBlock() orelse break;
+                const req = geometry.requestForBlock(piece_index, block_idx) catch break;
+                if (!dp.markBlockRequested(block_idx, slot)) break;
+                writeRequestMsg(send_buf[p1 * request_size ..], req);
+                p1 += 1;
+            }
+        } else {
+            // Legacy path (no DownloadingPiece -- should not happen after migration)
+            while (peer.inflight_requests + p1 < pipeline_depth and
+                peer.pipeline_sent + p1 < peer.blocks_expected)
+            {
+                const req = geometry.requestForBlock(piece_index, peer.pipeline_sent + p1) catch break;
+                writeRequestMsg(send_buf[p1 * request_size ..], req);
+                p1 += 1;
+            }
         }
     }
 
     // --- Phase 2: prefetch next piece if current is fully requested and pipeline has headroom ---
     var p2: u32 = 0; // requests to send for next piece this call
-    const cur_fully_requested = if (peer.current_piece) |_|
+    const cur_fully_requested = if (peer.downloading_piece) |dp|
+        dp.nextUnrequestedBlock() == null
+    else if (peer.current_piece) |_|
         (peer.pipeline_sent + p1 >= peer.blocks_expected)
     else
         false;
@@ -165,12 +319,31 @@ pub fn tryFillPipeline(self: *EventLoop, slot: u16) !void {
                         pt.releasePiece(next_idx);
                         return try submitPipelineRequests(self, slot, send_buf[0 .. p1 * request_size], p1, 0);
                     };
-                    const next_buf = self.allocator.alloc(u8, next_size) catch {
-                        pt.releasePiece(next_idx);
-                        return try submitPipelineRequests(self, slot, send_buf[0 .. p1 * request_size], p1, 0);
+                    // Create DownloadingPiece for next piece
+                    const next_dp_key = DownloadingPieceKey{ .torrent_id = peer.torrent_id, .piece_index = next_idx };
+                    const next_dp = if (self.downloading_pieces.get(next_dp_key)) |existing| existing else blk: {
+                        const new_dp = dp_mod.createDownloadingPiece(
+                            self.allocator,
+                            next_idx,
+                            peer.torrent_id,
+                            next_size,
+                            @intCast(next_block_count),
+                        ) catch {
+                            pt.releasePiece(next_idx);
+                            return try submitPipelineRequests(self, slot, send_buf[0 .. p1 * request_size], p1, 0);
+                        };
+                        self.downloading_pieces.put(self.allocator, next_dp_key, new_dp) catch {
+                            dp_mod.destroyDownloadingPieceFull(self.allocator, new_dp);
+                            pt.releasePiece(next_idx);
+                            return try submitPipelineRequests(self, slot, send_buf[0 .. p1 * request_size], p1, 0);
+                        };
+                        break :blk new_dp;
                     };
+
                     peer.next_piece = next_idx;
-                    peer.next_piece_buf = next_buf;
+                    peer.next_piece_buf = next_dp.buf;
+                    peer.next_downloading_piece = next_dp;
+                    next_dp.peer_count += 1;
                     peer.next_blocks_expected = next_block_count;
                     peer.next_blocks_received = 0;
                     peer.next_pipeline_sent = 0;
@@ -178,14 +351,25 @@ pub fn tryFillPipeline(self: *EventLoop, slot: u16) !void {
             }
         }
 
-        // Fill requests for next piece
+        // Fill requests for next piece using DownloadingPiece
         if (peer.next_piece) |next_idx| {
-            while (peer.inflight_requests + p1 + p2 < pipeline_depth and
-                peer.next_pipeline_sent + p2 < peer.next_blocks_expected)
-            {
-                const req = geometry.requestForBlock(next_idx, peer.next_pipeline_sent + p2) catch break;
-                writeRequestMsg(send_buf[(p1 + p2) * request_size ..], req);
-                p2 += 1;
+            if (peer.next_downloading_piece) |next_dp| {
+                while (peer.inflight_requests + p1 + p2 < pipeline_depth) {
+                    const block_idx = next_dp.nextUnrequestedBlock() orelse break;
+                    const req = geometry.requestForBlock(next_idx, block_idx) catch break;
+                    if (!next_dp.markBlockRequested(block_idx, slot)) break;
+                    writeRequestMsg(send_buf[(p1 + p2) * request_size ..], req);
+                    p2 += 1;
+                }
+            } else {
+                // Legacy path
+                while (peer.inflight_requests + p1 + p2 < pipeline_depth and
+                    peer.next_pipeline_sent + p2 < peer.next_blocks_expected)
+                {
+                    const req = geometry.requestForBlock(next_idx, peer.next_pipeline_sent + p2) catch break;
+                    writeRequestMsg(send_buf[(p1 + p2) * request_size ..], req);
+                    p2 += 1;
+                }
             }
         }
     }
@@ -245,18 +429,26 @@ fn promoteNextPieceOrMarkIdle(self: *EventLoop, slot: u16) void {
     if (peer.next_piece != null) {
         peer.current_piece = peer.next_piece;
         peer.piece_buf = peer.next_piece_buf;
+        peer.downloading_piece = peer.next_downloading_piece;
         peer.blocks_expected = peer.next_blocks_expected;
         peer.blocks_received = peer.next_blocks_received;
         peer.pipeline_sent = peer.next_pipeline_sent;
         // inflight_requests covers pending requests for the promoted piece -- do not reset.
         peer.next_piece = null;
         peer.next_piece_buf = null;
+        peer.next_downloading_piece = null;
         peer.next_blocks_expected = 0;
         peer.next_blocks_received = 0;
         peer.next_pipeline_sent = 0;
 
         // Check if the promoted piece is already complete (all blocks received)
-        if (peer.blocks_received >= peer.blocks_expected) {
+        if (peer.downloading_piece) |dp| {
+            if (dp.isComplete()) {
+                completePieceDownload(self, slot);
+            } else {
+                tryFillPipeline(self, slot) catch {};
+            }
+        } else if (peer.blocks_received >= peer.blocks_expected) {
             completePieceDownload(self, slot);
         } else {
             // Refill pipeline: claim another next_piece and send remaining requests
@@ -271,6 +463,7 @@ pub fn completePieceDownload(self: *EventLoop, slot: u16) void {
     const peer = &self.peers[slot];
     const piece_index = peer.current_piece orelse return;
     const piece_buf = peer.piece_buf orelse return;
+    const dp = peer.downloading_piece;
 
     const tc = self.getTorrentContext(peer.torrent_id) orelse return;
     const sess = tc.session orelse return;
@@ -278,9 +471,7 @@ pub fn completePieceDownload(self: *EventLoop, slot: u16) void {
 
     // Get the expected hash for this piece
     const expected_hash = sess.layout.pieceHash(piece_index) catch {
-        pt.releasePiece(piece_index);
-        peer.current_piece = null;
-        self.markIdle(slot);
+        cleanupCompletionFailure(self, peer, dp, pt, piece_index);
         return;
     };
     var hash: [20]u8 = undefined;
@@ -289,14 +480,23 @@ pub fn completePieceDownload(self: *EventLoop, slot: u16) void {
     if (self.hasher) |h| {
         // Submit to background hasher thread (non-blocking)
         h.submitVerify(slot, piece_index, piece_buf, hash, peer.torrent_id) catch {
-            pt.releasePiece(piece_index);
-            peer.current_piece = null;
-            self.markIdle(slot);
+            cleanupCompletionFailure(self, peer, dp, pt, piece_index);
             return;
         };
         // Don't free piece_buf -- the hasher owns it now.
+        // Clean up the DownloadingPiece metadata (block_infos) but keep the buffer.
+        if (dp) |d| {
+            // Remove from registry
+            const dp_key = DownloadingPieceKey{ .torrent_id = d.torrent_id, .piece_index = d.piece_index };
+            _ = self.downloading_pieces.remove(dp_key);
+            // Detach all peers still referencing this DP (they will get markIdle)
+            detachAllPeersExcept(self, d, slot);
+            // Free metadata only (not the buffer -- hasher owns it)
+            dp_mod.destroyDownloadingPiece(self.allocator, d);
+        }
         // The peer can start downloading another piece immediately.
         peer.piece_buf = null;
+        peer.downloading_piece = null;
         peer.current_piece = null;
         peer.blocks_received = 0;
         peer.blocks_expected = 0;
@@ -312,22 +512,14 @@ pub fn completePieceDownload(self: *EventLoop, slot: u16) void {
             // Write piece to disk via io_uring
             var span_scratch: [8]LayoutSpan = undefined;
             const plan = storage.verify.planPieceVerificationWithScratch(self.allocator, sess, piece_index, span_scratch[0..]) catch {
-                pt.releasePiece(piece_index);
-                self.allocator.free(piece_buf);
-                peer.piece_buf = null;
-                peer.current_piece = null;
-                self.markIdle(slot);
+                cleanupCompletionFailure(self, peer, dp, pt, piece_index);
                 return;
             };
             defer plan.deinit(self.allocator);
 
             const span_count: u32 = @intCast(plan.spans.len);
             if (span_count == 0) {
-                pt.releasePiece(piece_index);
-                self.allocator.free(piece_buf);
-                peer.piece_buf = null;
-                peer.current_piece = null;
-                self.markIdle(slot);
+                cleanupCompletionFailure(self, peer, dp, pt, piece_index);
                 return;
             }
 
@@ -344,11 +536,7 @@ pub fn completePieceDownload(self: *EventLoop, slot: u16) void {
                 .buf = piece_buf,
                 .spans_remaining = 0,
             }) catch {
-                pt.releasePiece(piece_index);
-                self.allocator.free(piece_buf);
-                peer.piece_buf = null;
-                peer.current_piece = null;
-                self.markIdle(slot);
+                cleanupCompletionFailure(self, peer, dp, pt, piece_index);
                 return;
             };
 
@@ -372,24 +560,87 @@ pub fn completePieceDownload(self: *EventLoop, slot: u16) void {
             if (self.getPendingWrite(pending_key)) |pending_w| {
                 if (pending_w.spans_remaining == 0) {
                     _ = self.removePendingWrite(pending_key);
-                    pt.releasePiece(piece_index);
-                    self.allocator.free(piece_buf);
-                    peer.piece_buf = null;
-                    peer.current_piece = null;
-                    self.markIdle(slot);
+                    cleanupCompletionFailure(self, peer, dp, pt, piece_index);
                     return;
                 }
             }
             // Buffer ownership transferred to pending_writes; will be freed on completion
+            if (dp) |d| {
+                const dp_key = DownloadingPieceKey{ .torrent_id = d.torrent_id, .piece_index = d.piece_index };
+                _ = self.downloading_pieces.remove(dp_key);
+                detachAllPeersExcept(self, d, slot);
+                dp_mod.destroyDownloadingPiece(self.allocator, d);
+            }
             peer.piece_buf = null;
+            peer.downloading_piece = null;
         } else {
             // Hash mismatch -- release piece and free buffer
+            if (dp) |d| {
+                const dp_key = DownloadingPieceKey{ .torrent_id = d.torrent_id, .piece_index = d.piece_index };
+                _ = self.downloading_pieces.remove(dp_key);
+                detachAllPeersExcept(self, d, slot);
+                dp_mod.destroyDownloadingPieceFull(self.allocator, d);
+            } else {
+                self.allocator.free(piece_buf);
+            }
             pt.releasePiece(piece_index);
-            self.allocator.free(piece_buf);
             peer.piece_buf = null;
+            peer.downloading_piece = null;
         }
         peer.current_piece = null;
         self.markIdle(slot);
+    }
+}
+
+/// Clean up after a failed piece completion (hash lookup failure, hasher submit failure, etc.).
+/// Releases the piece back to the tracker and marks the peer idle.
+fn cleanupCompletionFailure(
+    self: *EventLoop,
+    peer: *Peer,
+    dp: ?*DownloadingPiece,
+    pt: *PieceTracker,
+    piece_index: u32,
+) void {
+    if (dp) |d| {
+        const dp_key = DownloadingPieceKey{ .torrent_id = d.torrent_id, .piece_index = d.piece_index };
+        _ = self.downloading_pieces.remove(dp_key);
+        const slot = peerSlot(self, peer);
+        detachAllPeersExcept(self, d, slot);
+        dp_mod.destroyDownloadingPieceFull(self.allocator, d);
+    } else {
+        if (peer.piece_buf) |buf| self.allocator.free(buf);
+    }
+    pt.releasePiece(piece_index);
+    peer.piece_buf = null;
+    peer.downloading_piece = null;
+    peer.current_piece = null;
+    self.markIdle(peerSlot(self, peer));
+}
+
+/// Detach all peers from a DownloadingPiece except the specified slot.
+/// Used when a piece completes -- the completing peer handles its own cleanup,
+/// but other peers referencing the same DP need to be detached and re-queued.
+fn detachAllPeersExcept(self: *EventLoop, dp: *DownloadingPiece, except_slot: u16) void {
+    for (self.peers, 0..) |*p, i| {
+        const s: u16 = @intCast(i);
+        if (s == except_slot) continue;
+        if (p.downloading_piece == dp) {
+            p.downloading_piece = null;
+            p.piece_buf = null;
+            p.current_piece = null;
+            p.blocks_received = 0;
+            p.blocks_expected = 0;
+            p.pipeline_sent = 0;
+            self.markIdle(s);
+        }
+        if (p.next_downloading_piece == dp) {
+            p.next_downloading_piece = null;
+            p.next_piece_buf = null;
+            p.next_piece = null;
+            p.next_blocks_expected = 0;
+            p.next_blocks_received = 0;
+            p.next_pipeline_sent = 0;
+        }
     }
 }
 

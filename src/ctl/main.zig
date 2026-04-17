@@ -412,6 +412,23 @@ pub fn main() !void {
             try body_buf.print(allocator, "hashes={s}", .{args[cmd_start + 1]});
             try doPost(allocator, stdout, api_host, api_port, "/api/v2/torrents/decreasePrio", body_buf.items, sid);
         }
+    } else if (std.mem.eql(u8, command, "shutdown")) {
+        // Parse optional --timeout flag
+        var timeout: ?[]const u8 = null;
+        var i: usize = cmd_start + 1;
+        while (i < args.len) : (i += 1) {
+            if (std.mem.eql(u8, args[i], "--timeout") and i + 1 < args.len) {
+                timeout = args[i + 1];
+                i += 1;
+            }
+        }
+        var body_buf = std.ArrayList(u8).empty;
+        defer body_buf.deinit(allocator);
+        if (timeout) |t| {
+            try body_buf.print(allocator, "timeout={s}", .{t});
+        }
+        try doPost(allocator, stdout, api_host, api_port, "/api/v2/app/shutdown", body_buf.items, sid);
+        try stdout.print("Shutdown initiated\n", .{});
     } else {
         try stdout.print("unknown command: {s}\n\n", .{command});
         try printUsage(stdout, api_host, api_port);
@@ -648,6 +665,7 @@ fn printUsage(stdout: *std.Io.Writer, host: []const u8, port: u16) !void {
     try stdout.print("  queue-down <hash>              decrease torrent queue priority\n", .{});
     try stdout.print("  set-pref <key> <value>         set a daemon preference (dht, pex, ...)\n", .{});
     try stdout.print("  get-pref                       show all daemon preferences\n", .{});
+    try stdout.print("  shutdown [--timeout <secs>]     graceful daemon shutdown\n", .{});
     try stdout.print("  version                        daemon API version\n", .{});
     try stdout.print("  stats                          global transfer stats\n", .{});
     try stdout.print("\ndaemon: http://{s}:{}\n", .{ host, port });

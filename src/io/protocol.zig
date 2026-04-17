@@ -36,11 +36,21 @@ pub fn processMessage(self: *EventLoop, slot: u16) void {
     switch (id) {
         0 => { // choke
             peer.peer_choking = true;
+            // Release requested blocks back to the DownloadingPiece
+            if (peer.downloading_piece) |dp| {
+                dp.releaseBlocksForPeer(slot);
+            }
             // Clear pipeline state
             peer.inflight_requests = 0;
             peer.pipeline_sent = peer.blocks_received;
             // Release pre-fetched next piece back to the tracker
-            if (peer.next_piece) |next_idx| {
+            if (peer.next_downloading_piece != null) {
+                policy.detachPeerFromNextDownloadingPiece(self, peer);
+                peer.next_piece = null;
+                peer.next_blocks_expected = 0;
+                peer.next_blocks_received = 0;
+                peer.next_pipeline_sent = 0;
+            } else if (peer.next_piece) |next_idx| {
                 if (self.getTorrentContext(peer.torrent_id)) |tc| {
                     if (tc.piece_tracker) |pt| pt.releasePiece(next_idx);
                 }
@@ -149,6 +159,8 @@ pub fn processMessage(self: *EventLoop, slot: u16) void {
                 const piece_index = std.mem.readInt(u32, payload[0..4], .big);
                 const block_offset = std.mem.readInt(u32, payload[4..8], .big);
                 const block_data = payload[8..];
+                const block_size: u32 = 16 * 1024;
+                const block_index: u16 = @intCast(block_offset / block_size);
 
                 // Consume download tokens for rate limiting accounting
                 _ = self.consumeDownloadTokens(peer.torrent_id, block_data.len);
@@ -157,7 +169,23 @@ pub fn processMessage(self: *EventLoop, slot: u16) void {
                 if (peer.inflight_requests > 0) peer.inflight_requests -= 1;
 
                 if (peer.current_piece != null and peer.current_piece.? == piece_index) {
-                    if (peer.piece_buf) |pbuf| {
+                    if (peer.downloading_piece) |dp| {
+                        // Multi-source path: write through DownloadingPiece
+                        if (dp.markBlockReceived(block_index, slot, block_offset, block_data)) {
+                            peer.blocks_received += 1;
+                            peer.bytes_downloaded_from += block_data.len;
+                            self.accountTorrentBytes(peer.torrent_id, block_data.len, 0);
+
+                            if (dp.isComplete()) {
+                                policy.completePieceDownload(self, slot);
+                            } else {
+                                policy.tryFillPipeline(self, slot) catch |err| {
+                                    log.debug("pipeline refill failed for slot {d}: {s}", .{ slot, @errorName(err) });
+                                };
+                            }
+                        }
+                    } else if (peer.piece_buf) |pbuf| {
+                        // Legacy path (no DownloadingPiece)
                         const start: usize = @intCast(block_offset);
                         const end = start + block_data.len;
                         if (end <= pbuf.len) {
@@ -177,7 +205,14 @@ pub fn processMessage(self: *EventLoop, slot: u16) void {
                     }
                 } else if (peer.next_piece != null and peer.next_piece.? == piece_index) {
                     // Block arrived early for the pre-fetched next piece
-                    if (peer.next_piece_buf) |nbuf| {
+                    if (peer.next_downloading_piece) |next_dp| {
+                        if (next_dp.markBlockReceived(block_index, slot, block_offset, block_data)) {
+                            peer.next_blocks_received += 1;
+                            peer.bytes_downloaded_from += block_data.len;
+                            self.accountTorrentBytes(peer.torrent_id, block_data.len, 0);
+                            policy.tryFillPipeline(self, slot) catch {};
+                        }
+                    } else if (peer.next_piece_buf) |nbuf| {
                         const start: usize = @intCast(block_offset);
                         const end = start + block_data.len;
                         if (end <= nbuf.len) {

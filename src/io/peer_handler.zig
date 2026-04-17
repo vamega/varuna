@@ -120,6 +120,17 @@ pub fn handleSocketCreated(self: *EventLoop, slot: u16, cqe: linux.io_uring_cqe)
         return;
     }
 
+    // Guard: if the peer is not in connecting state, this is a stale socket
+    // CQE from a slot that was reused while a previous socket creation was
+    // in-flight. Close the new fd and ignore the CQE.
+    if (peer.state != .connecting) {
+        log.debug("slot {d}: ignoring stale socket CQE (state={s})", .{
+            slot, @tagName(peer.state),
+        });
+        if (cqe.res >= 0) posix.close(@intCast(cqe.res));
+        return;
+    }
+
     if (cqe.res < 0) {
         log.warn("async socket creation failed for slot {d}: errno={d}", .{ slot, -cqe.res });
         self.removePeer(slot);
@@ -155,6 +166,18 @@ pub fn handleConnect(self: *EventLoop, slot: u16, cqe: linux.io_uring_cqe) void 
         return;
     }
     peer.last_activity = std.time.timestamp();
+
+    // Guard: if the peer is not in connecting state, this is a stale connect CQE
+    // from a slot that was reused while a previous connect was still in-flight.
+    // On localhost, TCP connects complete near-instantly and the CQE may arrive
+    // after the slot has been freed and reallocated for a new connection. Ignoring
+    // the stale CQE prevents corrupting the new connection's MSE handshake state.
+    if (peer.state != .connecting) {
+        log.debug("slot {d}: ignoring stale connect CQE (state={s})", .{
+            slot, @tagName(peer.state),
+        });
+        return;
+    }
 
     // Determine if we should initiate MSE handshake
     const should_mse = shouldInitiateMse(self, peer);
@@ -258,6 +281,12 @@ pub fn handleSend(self: *EventLoop, slot: u16, cqe: linux.io_uring_cqe) void {
         // Check if this was a tracked send buffer -- free it on error.
         // Only free ONE buffer: removePeer will clean up the rest.
         if (op.context != 0) self.freeOnePendingSend(slot, send_id);
+        // Guard: if the peer is reconnecting (connecting state), this is a stale
+        // send CQE from the previous connection's fd. Ignore it.
+        if (peer.state == .connecting) {
+            log.debug("slot {d}: ignoring stale send error during reconnect", .{slot});
+            return;
+        }
         // MSE fallback: if send failed during MSE handshake and mode is "preferred",
         // try reconnecting without MSE
         if (peer.state == .mse_handshake_send and self.encryption_mode == .preferred and !peer.mse_fallback) {
@@ -390,6 +419,12 @@ pub fn handleRecv(self: *EventLoop, slot: u16, cqe: linux.io_uring_cqe) void {
     if (peer.state == .free) return;
 
     if (cqe.res <= 0) {
+        // Guard: if the peer is reconnecting (connecting state), this is a stale
+        // recv CQE from the previous connection's fd. Ignore it.
+        if (peer.state == .connecting) {
+            log.debug("slot {d}: ignoring stale recv error during reconnect", .{slot});
+            return;
+        }
         // MSE fallback: if MSE handshake recv failed and mode is "preferred",
         // reconnect without MSE
         if (peer.state == .mse_handshake_recv or peer.state == .mse_resp_recv) {

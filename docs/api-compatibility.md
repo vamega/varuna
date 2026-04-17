@@ -21,6 +21,7 @@ This document tracks which endpoints are implemented, which return placeholder d
 | `GET /api/v2/app/preferences` | Full (40+ fields) |
 | `POST /api/v2/app/setPreferences` | Full (form + JSON) |
 | `GET /api/v2/app/defaultSavePath` | Full |
+| `POST /api/v2/app/shutdown` | Full (optional `timeout` param) |
 
 ### Transfer
 | Endpoint | Status |

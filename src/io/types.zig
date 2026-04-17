@@ -155,6 +155,10 @@ pub const Peer = struct {
     pipeline_sent: u32 = 0,
     inflight_requests: u32 = 0,
 
+    // Multi-source piece assembly: shared DownloadingPiece for current and next piece.
+    downloading_piece: ?*@import("downloading_piece.zig").DownloadingPiece = null,
+    next_downloading_piece: ?*@import("downloading_piece.zig").DownloadingPiece = null,
+
     // Pre-claimed next piece (pipeline overlap: requests sent before current piece completes)
     next_piece: ?u32 = null,
     next_piece_buf: ?[]u8 = null,

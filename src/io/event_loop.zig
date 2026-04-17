@@ -21,6 +21,10 @@ const SuperSeedState = @import("super_seed.zig").SuperSeedState;
 const HugePageCache = @import("../storage/huge_page_cache.zig").HugePageCache;
 const MerkleCache = @import("../torrent/merkle_cache.zig").MerkleCache;
 const BanList = @import("../net/ban_list.zig").BanList;
+const dp_mod = @import("downloading_piece.zig");
+pub const DownloadingPiece = dp_mod.DownloadingPiece;
+pub const DownloadingPieceKey = dp_mod.DownloadingPieceKey;
+pub const DownloadingPieceMap = dp_mod.DownloadingPieceMap;
 
 // Sub-modules: focused implementations that operate on *EventLoop
 const peer_handler = @import("peer_handler.zig");
@@ -310,6 +314,10 @@ pub const EventLoop = struct {
     idle_peers: std.ArrayList(u16),
     active_peer_slots: std.ArrayList(u16),
 
+    // Multi-source piece assembly: shared per-piece download state.
+    // Key = (torrent_id, piece_index), Value = heap-allocated DownloadingPiece.
+    downloading_pieces: DownloadingPieceMap = .empty,
+
     // ── Lifecycle ──────────────────────────────────────────
 
     /// Create a bare event loop with no initial torrent (for daemon mode).
@@ -498,6 +506,14 @@ pub const EventLoop = struct {
         self.queued_responses.deinit(self.allocator);
         self.idle_peers.deinit(self.allocator);
         self.active_peer_slots.deinit(self.allocator);
+        // Free any abandoned DownloadingPieces (partial downloads that never completed)
+        {
+            var dp_it = self.downloading_pieces.valueIterator();
+            while (dp_it.next()) |dp_ptr| {
+                dp_mod.destroyDownloadingPieceFull(self.allocator, dp_ptr.*);
+            }
+            self.downloading_pieces.deinit(self.allocator);
+        }
         self.torrents_with_peers.deinit(self.allocator);
         self.hash_result_swap.deinit(self.allocator);
         // Free any unclaimed Merkle results (piece_hashes ownership)
@@ -510,8 +526,14 @@ pub const EventLoop = struct {
             if (peer.body_is_heap) {
                 if (peer.body_buf) |buf| self.allocator.free(buf);
             }
-            if (peer.piece_buf) |buf| self.allocator.free(buf);
-            if (peer.next_piece_buf) |buf| self.allocator.free(buf);
+            // piece_buf/next_piece_buf: only free if NOT owned by a DownloadingPiece
+            // (DownloadingPiece buffers are freed in the downloading_pieces cleanup above)
+            if (peer.downloading_piece == null) {
+                if (peer.piece_buf) |buf| self.allocator.free(buf);
+            }
+            if (peer.next_downloading_piece == null) {
+                if (peer.next_piece_buf) |buf| self.allocator.free(buf);
+            }
             if (peer.availability) |*bf| bf.deinit(self.allocator);
             if (peer.pex_state) |ps| {
                 ps.deinit(self.allocator);
@@ -1188,12 +1210,18 @@ pub const EventLoop = struct {
         if (peer.state == .connecting and self.half_open_count > 0) {
             self.half_open_count -= 1;
         }
-        if (peer.current_piece) |piece_index| {
+        // Detach from DownloadingPiece (releases requested blocks, manages lifecycle)
+        if (peer.downloading_piece != null) {
+            peer_policy.detachPeerFromDownloadingPiece(self, peer);
+        } else if (peer.current_piece) |piece_index| {
+            // Legacy path: no DownloadingPiece
             if (self.getTorrentContext(peer.torrent_id)) |tc| {
                 if (tc.piece_tracker) |pt| pt.releasePiece(piece_index);
             }
         }
-        if (peer.next_piece) |next_index| {
+        if (peer.next_downloading_piece != null) {
+            peer_policy.detachPeerFromNextDownloadingPiece(self, peer);
+        } else if (peer.next_piece) |next_index| {
             if (self.getTorrentContext(peer.torrent_id)) |tc| {
                 if (tc.piece_tracker) |pt| pt.releasePiece(next_index);
             }
@@ -1811,17 +1839,20 @@ pub const EventLoop = struct {
         // waiting for the next tick's processIdlePeers pass.
         const policy = @import("peer_policy.zig");
         if (self.getTorrentContext(peer.torrent_id)) |tc| {
-            if (!tc.upload_only) {
+            if (!tc.upload_only and !self.isDownloadThrottled(peer.torrent_id)) {
+                // First try joining an existing DownloadingPiece (multi-source)
+                if (policy.tryJoinExistingPiece(self, slot, peer)) {
+                    return; // joined existing download; don't add to idle queue
+                }
+                // Then try claiming a new piece
                 if (tc.piece_tracker) |pt| {
-                    if (!self.isDownloadThrottled(peer.torrent_id)) {
-                        const peer_bf: ?*const Bitfield = if (peer.availability) |*bf| bf else null;
-                        if (pt.claimPiece(peer_bf)) |piece_index| {
-                            if (policy.startPieceDownload(self, slot, piece_index)) {
-                                return; // piece claimed and started; don't add to idle queue
-                            } else |_| {
-                                pt.releasePiece(piece_index);
-                                // startPieceDownload failed; fall through to add to idle queue
-                            }
+                    const peer_bf: ?*const Bitfield = if (peer.availability) |*bf| bf else null;
+                    if (pt.claimPiece(peer_bf)) |piece_index| {
+                        if (policy.startPieceDownload(self, slot, piece_index)) {
+                            return; // piece claimed and started; don't add to idle queue
+                        } else |_| {
+                            pt.releasePiece(piece_index);
+                            // startPieceDownload failed; fall through to add to idle queue
                         }
                     }
                 }
@@ -2210,8 +2241,13 @@ pub const EventLoop = struct {
         if (peer.body_is_heap) {
             if (peer.body_buf) |buf| self.allocator.free(buf);
         }
-        if (peer.piece_buf) |buf| self.allocator.free(buf);
-        if (peer.next_piece_buf) |buf| self.allocator.free(buf);
+        // piece_buf/next_piece_buf: only free if NOT owned by a DownloadingPiece
+        if (peer.downloading_piece == null) {
+            if (peer.piece_buf) |buf| self.allocator.free(buf);
+        }
+        if (peer.next_downloading_piece == null) {
+            if (peer.next_piece_buf) |buf| self.allocator.free(buf);
+        }
         if (peer.availability) |*bf| bf.deinit(self.allocator);
         if (peer.pex_state) |ps| {
             ps.deinit(self.allocator);
