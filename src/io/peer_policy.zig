@@ -285,6 +285,27 @@ pub fn tryFillPipeline(self: *EventLoop, slot: u16) !void {
                 writeRequestMsg(send_buf[p1 * request_size ..], req);
                 p1 += 1;
             }
+
+            // Phase 1b: block-level endgame. If this peer's pipeline is empty
+            // but the piece still has in-flight blocks from slower peers,
+            // shadow-request them so a faster peer can finish the piece.
+            //  - p1 == 0 means we didn't fill any regular requests (no .none blocks for us).
+            //  - peer.inflight_requests == 0 means our pipeline is fully drained.
+            //  - dp not complete means some block is still in .requested state.
+            // Block state is NOT modified by shadow requests -- attribution
+            // stays with the original requester until the block is received.
+            // The first peer to deliver wins (markBlockReceived returns false
+            // for duplicates, and protocol.zig refills pipeline either way).
+            if (p1 == 0 and peer.inflight_requests == 0 and !dp.isComplete()) {
+                var scan_from: u16 = 0;
+                while (peer.inflight_requests + p1 < pipeline_depth) {
+                    const block_idx = dp.nextEndgameBlockExcluding(slot, scan_from) orelse break;
+                    const req = geometry.requestForBlock(piece_index, block_idx) catch break;
+                    writeRequestMsg(send_buf[p1 * request_size ..], req);
+                    p1 += 1;
+                    scan_from = block_idx + 1;
+                }
+            }
         } else {
             // Legacy path (no DownloadingPiece -- should not happen after migration)
             while (peer.inflight_requests + p1 < pipeline_depth and

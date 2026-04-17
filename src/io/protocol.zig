@@ -171,7 +171,8 @@ pub fn processMessage(self: *EventLoop, slot: u16) void {
                 if (peer.current_piece != null and peer.current_piece.? == piece_index) {
                     if (peer.downloading_piece) |dp| {
                         // Multi-source path: write through DownloadingPiece
-                        if (dp.markBlockReceived(block_index, slot, block_offset, block_data)) {
+                        const delivered_now = dp.markBlockReceived(block_index, slot, block_offset, block_data);
+                        if (delivered_now) {
                             peer.blocks_received += 1;
                             peer.bytes_downloaded_from += block_data.len;
                             self.accountTorrentBytes(peer.torrent_id, block_data.len, 0);
@@ -183,6 +184,13 @@ pub fn processMessage(self: *EventLoop, slot: u16) void {
                                     log.debug("pipeline refill failed for slot {d}: {s}", .{ slot, @errorName(err) });
                                 };
                             }
+                        } else {
+                            // Duplicate block (block-level endgame): inflight
+                            // was already decremented above. Refill pipeline
+                            // so this peer doesn't stall waiting for another CQE.
+                            policy.tryFillPipeline(self, slot) catch |err| {
+                                log.debug("pipeline refill failed after dup for slot {d}: {s}", .{ slot, @errorName(err) });
+                            };
                         }
                     } else if (peer.piece_buf) |pbuf| {
                         // Legacy path (no DownloadingPiece)

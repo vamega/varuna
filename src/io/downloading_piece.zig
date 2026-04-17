@@ -117,6 +117,27 @@ pub const DownloadingPiece = struct {
         }
         return count;
     }
+
+    /// Block-level endgame: return the next block that is .requested by a
+    /// peer OTHER than exclude_slot, starting the scan at start_index.
+    /// Used when a peer has drained its pipeline but the piece still has
+    /// blocks in flight from slower peers. The caller shadow-requests the
+    /// block without updating block state; the first peer to deliver wins
+    /// (markBlockReceived returns false for the duplicate).
+    pub fn nextEndgameBlockExcluding(
+        self: *const DownloadingPiece,
+        exclude_slot: u16,
+        start_index: u16,
+    ) ?u16 {
+        var i: u16 = start_index;
+        while (i < self.blocks_total) : (i += 1) {
+            const bi = self.block_infos[i];
+            if (bi.state == .requested and bi.peer_slot != exclude_slot) {
+                return i;
+            }
+        }
+        return null;
+    }
 };
 
 /// Composite key for the downloading_pieces registry.
@@ -294,6 +315,43 @@ test "markBlockReceived on unsolicited block counts as requested" {
     try testing.expect(ok);
     try testing.expectEqual(@as(u16, 1), dp.blocks_requested);
     try testing.expectEqual(@as(u16, 1), dp.blocks_received);
+}
+
+test "nextEndgameBlockExcluding returns requested blocks from other peers" {
+    const allocator = testing.allocator;
+    const dp = try createDownloadingPiece(allocator, 0, 0, 64 * 1024, 4);
+    defer destroyDownloadingPieceFull(allocator, dp);
+
+    // No requested blocks -- returns null
+    try testing.expectEqual(@as(?u16, null), dp.nextEndgameBlockExcluding(1, 0));
+
+    // Peers 1 and 2 each request a block
+    _ = dp.markBlockRequested(0, 1);
+    _ = dp.markBlockRequested(1, 2);
+    _ = dp.markBlockRequested(2, 1);
+
+    // From peer 1's perspective, endgame candidates are block 1 (peer 2)
+    try testing.expectEqual(@as(?u16, 1), dp.nextEndgameBlockExcluding(1, 0));
+    // With start_index past block 1, no more candidates from peer 1's view
+    try testing.expectEqual(@as(?u16, null), dp.nextEndgameBlockExcluding(1, 2));
+
+    // From peer 2's perspective, candidates are blocks 0 and 2 (both peer 1)
+    try testing.expectEqual(@as(?u16, 0), dp.nextEndgameBlockExcluding(2, 0));
+    try testing.expectEqual(@as(?u16, 2), dp.nextEndgameBlockExcluding(2, 1));
+    try testing.expectEqual(@as(?u16, null), dp.nextEndgameBlockExcluding(2, 3));
+}
+
+test "nextEndgameBlockExcluding skips received blocks" {
+    const allocator = testing.allocator;
+    const dp = try createDownloadingPiece(allocator, 0, 0, 64 * 1024, 4);
+    defer destroyDownloadingPieceFull(allocator, dp);
+
+    _ = dp.markBlockRequested(0, 1);
+    _ = dp.markBlockRequested(1, 2);
+    _ = dp.markBlockReceived(1, 2, 16384, &.{0});
+
+    // Block 1 now .received -- should be skipped in endgame scan
+    try testing.expectEqual(@as(?u16, null), dp.nextEndgameBlockExcluding(1, 0));
 }
 
 test "peer_count tracks references" {
