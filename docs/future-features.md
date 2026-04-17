@@ -182,6 +182,27 @@ Remaining work for full production readiness:
 
 See [api-compatibility.md](api-compatibility.md) for the full qBittorrent WebAPI compatibility matrix, including which endpoints are implemented, which return placeholder data, and which are explicitly unsupported or deferred.
 
+## Graceful Shutdown (Planned)
+
+The daemon currently exits as soon as the signalfd CQE fires (~200ms). This means in-flight piece transfers (both downloads and uploads) are aborted mid-stream, and peers see a connection reset.
+
+### Desired behavior
+
+On SIGTERM/SIGINT:
+1. **Stop accepting new work**: stop claiming new pieces, stop accepting new peer connections, stop initiating new outbound connections, stop starting new web seed requests.
+2. **Drain in-flight transfers**: allow currently in-progress piece downloads to complete (receive remaining blocks, verify hash, write to disk). Allow in-progress piece uploads (block sends) to complete.
+3. **Timeout**: if draining takes longer than a configurable limit (e.g., 10 seconds), force-close all connections and exit. This prevents hanging on a stalled peer.
+4. **Persist state**: flush any pending resume DB writes before exit.
+5. **Send tracker stopped event**: announce `event=stopped` to all trackers so they remove us from the swarm promptly.
+
+### Implementation sketch
+
+- On signal: set a `draining` flag on the event loop (distinct from `running = false`)
+- In `draining` mode: `tryAssignPieces` and `tryAssignWebSeedPieces` become no-ops, `handleAccept` rejects new connections, `addPeerForTorrent` returns error
+- Track `pieces_in_flight` count (already partially tracked via pending writes)
+- When `pieces_in_flight == 0` or drain timeout expires, set `running = false`
+- Submit stopped announces to TrackerExecutor/UdpTrackerExecutor before final exit
+
 ## Smart Ban (Planned)
 
 Varuna currently has no hash-failure-based peer penalization. A peer sending corrupt data causes the piece to be re-downloaded indefinitely without consequence. This section describes the planned implementation, based on [libtorrent's smart ban algorithm](https://blog.libtorrent.org/2011/11/smart-ban/).
