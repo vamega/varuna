@@ -36,7 +36,7 @@ pub fn fetchViaHttp(
     const url = try buildUrl(allocator, request);
     defer allocator.free(url);
 
-    const http_mod = @import("../io/http.zig");
+    const http_mod = @import("../io/http_blocking.zig");
     var http_client = if (dns_resolver) |r|
         http_mod.HttpClient.initWithDns(allocator, r)
     else

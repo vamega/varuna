@@ -518,43 +518,15 @@ pub const HttpResponse = struct {
     }
 };
 
-// ── URL parsing (re-exported from url.zig) ────────────────
+// ── Re-exports from http_parse.zig ──────────────────────────
 
-const url_mod = @import("url.zig");
-pub const ParsedUrl = url_mod.ParsedUrl;
-pub const parseUrl = url_mod.parseUrl;
-
-// ── HTTP response parsing ─────────────────────────────────
-
-pub fn findBodyStart(data: []const u8) ?usize {
-    const sep = "\r\n\r\n";
-    if (std.mem.indexOf(u8, data, sep)) |pos| {
-        return pos + sep.len;
-    }
-    return null;
-}
-
-pub fn parseContentLength(headers: []const u8) ?usize {
-    var iter = std.mem.splitSequence(u8, headers, "\r\n");
-    while (iter.next()) |line| {
-        if (std.ascii.startsWithIgnoreCase(line, "content-length:")) {
-            const value = std.mem.trim(u8, line["content-length:".len..], " ");
-            return std.fmt.parseInt(usize, value, 10) catch null;
-        }
-    }
-    return null;
-}
-
-pub fn parseConnectionClose(headers: []const u8) bool {
-    var iter = std.mem.splitSequence(u8, headers, "\r\n");
-    while (iter.next()) |line| {
-        if (std.ascii.startsWithIgnoreCase(line, "connection:")) {
-            const value = std.mem.trim(u8, line["connection:".len..], " ");
-            return std.ascii.eqlIgnoreCase(value, "close");
-        }
-    }
-    return false;
-}
+const http_parse = @import("http_parse.zig");
+pub const ParsedUrl = http_parse.ParsedUrl;
+pub const parseUrl = http_parse.parseUrl;
+pub const findBodyStart = http_parse.findBodyStart;
+pub const parseContentLength = http_parse.parseContentLength;
+pub const parseConnectionClose = http_parse.parseConnectionClose;
+pub const parseStatusCode = http_parse.parseStatusCode;
 
 fn isRetryableKeepAliveError(err: anyerror) bool {
     return err == error.BrokenPipe or
@@ -562,15 +534,6 @@ fn isRetryableKeepAliveError(err: anyerror) bool {
         err == error.ConnectionAborted or
         err == error.NotOpenForWriting or
         err == error.UnexpectedEndOfStream;
-}
-
-pub fn parseStatusCode(data: []const u8) ?u16 {
-    // "HTTP/1.1 200 OK\r\n"
-    if (data.len < 12) return null;
-    if (!std.mem.startsWith(u8, data, "HTTP/")) return null;
-    const space1 = std.mem.indexOfScalar(u8, data, ' ') orelse return null;
-    if (space1 + 4 > data.len) return null;
-    return std.fmt.parseInt(u16, data[space1 + 1 .. space1 + 4], 10) catch null;
 }
 
 // ── Tests ─────────────────────────────────────────────────

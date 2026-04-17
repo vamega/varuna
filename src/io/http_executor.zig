@@ -4,7 +4,7 @@ const linux = std.os.linux;
 const ring_mod = @import("ring.zig");
 const DnsResolver = @import("dns.zig").DnsResolver;
 const DnsJob = @import("../io/dns_threadpool.zig").DnsJob;
-const http = @import("http.zig");
+const http = @import("http_parse.zig");
 const TlsStream = @import("tls.zig").TlsStream;
 const build_options = @import("build_options");
 

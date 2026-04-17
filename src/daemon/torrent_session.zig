@@ -1328,7 +1328,7 @@ pub const TorrentSession = struct {
     }
 
     fn getTrackerHostForUrl(url: []const u8) ?[]const u8 {
-        return (@import("../io/url.zig").parseUrl(url) catch return null).host;
+        return (@import("../io/http_parse.zig").parseUrl(url) catch return null).host;
     }
 
     fn submitTrackerJob(self: *TorrentSession, url: []const u8, host: []const u8, on_complete: TrackerExecutor.CompletionFn) !void {
