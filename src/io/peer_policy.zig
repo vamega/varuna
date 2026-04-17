@@ -311,42 +311,52 @@ pub fn tryFillPipeline(self: *EventLoop, slot: u16) !void {
             if (tc.piece_tracker) |pt| {
                 const peer_bf: ?*const Bitfield = if (peer.availability) |*bf| bf else null;
                 if (pt.claimPiece(peer_bf)) |next_idx| {
-                    const next_size = sess.layout.pieceSize(next_idx) catch {
-                        pt.releasePiece(next_idx);
-                        return try submitPipelineRequests(self, slot, send_buf[0 .. p1 * request_size], p1, 0);
-                    };
-                    const next_block_count = geometry.blockCount(next_idx) catch {
-                        pt.releasePiece(next_idx);
-                        return try submitPipelineRequests(self, slot, send_buf[0 .. p1 * request_size], p1, 0);
-                    };
-                    // Create DownloadingPiece for next piece
-                    const next_dp_key = DownloadingPieceKey{ .torrent_id = peer.torrent_id, .piece_index = next_idx };
-                    const next_dp = if (self.downloading_pieces.get(next_dp_key)) |existing| existing else blk: {
-                        const new_dp = dp_mod.createDownloadingPiece(
-                            self.allocator,
-                            next_idx,
-                            peer.torrent_id,
-                            next_size,
-                            @intCast(next_block_count),
-                        ) catch {
+                    // Endgame mode can return the same piece we're already
+                    // downloading.  Skip prefetch in that case -- otherwise
+                    // next_downloading_piece aliases downloading_piece and
+                    // completePieceDownload double-frees the DP.
+                    // Don't releasePiece -- endgame doesn't set in_progress,
+                    // and the original claim still needs it.
+                    if (peer.current_piece != null and next_idx == peer.current_piece.?) {
+                        // no-op: skip duplicate piece prefetch
+                    } else {
+                        const next_size = sess.layout.pieceSize(next_idx) catch {
                             pt.releasePiece(next_idx);
                             return try submitPipelineRequests(self, slot, send_buf[0 .. p1 * request_size], p1, 0);
                         };
-                        self.downloading_pieces.put(self.allocator, next_dp_key, new_dp) catch {
-                            dp_mod.destroyDownloadingPieceFull(self.allocator, new_dp);
+                        const next_block_count = geometry.blockCount(next_idx) catch {
                             pt.releasePiece(next_idx);
                             return try submitPipelineRequests(self, slot, send_buf[0 .. p1 * request_size], p1, 0);
                         };
-                        break :blk new_dp;
-                    };
+                        // Create DownloadingPiece for next piece
+                        const next_dp_key = DownloadingPieceKey{ .torrent_id = peer.torrent_id, .piece_index = next_idx };
+                        const next_dp = if (self.downloading_pieces.get(next_dp_key)) |existing| existing else blk: {
+                            const new_dp = dp_mod.createDownloadingPiece(
+                                self.allocator,
+                                next_idx,
+                                peer.torrent_id,
+                                next_size,
+                                @intCast(next_block_count),
+                            ) catch {
+                                pt.releasePiece(next_idx);
+                                return try submitPipelineRequests(self, slot, send_buf[0 .. p1 * request_size], p1, 0);
+                            };
+                            self.downloading_pieces.put(self.allocator, next_dp_key, new_dp) catch {
+                                dp_mod.destroyDownloadingPieceFull(self.allocator, new_dp);
+                                pt.releasePiece(next_idx);
+                                return try submitPipelineRequests(self, slot, send_buf[0 .. p1 * request_size], p1, 0);
+                            };
+                            break :blk new_dp;
+                        };
 
-                    peer.next_piece = next_idx;
-                    peer.next_piece_buf = next_dp.buf;
-                    peer.next_downloading_piece = next_dp;
-                    next_dp.peer_count += 1;
-                    peer.next_blocks_expected = next_block_count;
-                    peer.next_blocks_received = 0;
-                    peer.next_pipeline_sent = 0;
+                        peer.next_piece = next_idx;
+                        peer.next_piece_buf = next_dp.buf;
+                        peer.next_downloading_piece = next_dp;
+                        next_dp.peer_count += 1;
+                        peer.next_blocks_expected = next_block_count;
+                        peer.next_blocks_received = 0;
+                        peer.next_pipeline_sent = 0;
+                    }
                 }
             }
         }
