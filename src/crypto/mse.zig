@@ -2139,3 +2139,222 @@ test "MseInitiator and MseResponder shared_secret agree after DH exchange" {
     // Now verify the shared secrets agree
     try std.testing.expectEqualSlices(u8, &ini.shared_secret, &resp.shared_secret);
 }
+
+test "MseInitiator and MseResponder full async handshake completes" {
+    // Simulate the full async MSE handshake, piping data between both sides.
+    // This is the async equivalent of a blocking handshakeInitiator/handshakeResponder pair.
+    const info_hash = [_]u8{0x42} ** 20;
+    const known = [_][20]u8{info_hash};
+
+    var ini = MseInitiatorHandshake.init(info_hash, .preferred);
+    var resp = MseResponderHandshake.init(&known, .preferred);
+
+    // Step 1: Initiator sends Ya + PadA
+    const ini_start = ini.start();
+    const ya_data = switch (ini_start) {
+        .send => |d| d,
+        else => return error.ExpectedSend,
+    };
+    // The send buffer holds Ya(96) + PadA(0-512). Copy to temp buffer.
+    var ini_to_resp_buf: [dh_key_size + max_pad_len]u8 = undefined;
+    @memcpy(ini_to_resp_buf[0..ya_data.len], ya_data);
+    const ya_len = ya_data.len;
+
+    // After send completes, initiator transitions to recv_dh_key
+    const ini_after_ya_send = ini.feedSend();
+    const ini_recv_yb_buf = switch (ini_after_ya_send) {
+        .recv => |buf| buf,
+        else => return error.ExpectedRecv,
+    };
+
+    // Step 2: Responder receives Ya (possibly in chunks, just like io_uring)
+    const resp_start = resp.start();
+    const resp_recv_ya_buf = switch (resp_start) {
+        .recv => |buf| buf,
+        else => return error.ExpectedRecv,
+    };
+
+    // Feed Ya to the responder. The recv target is peer_public_key[0..96].
+    // In reality, the responder might receive partial data (via handshake_buf).
+    // Simulate receiving 68 bytes first, then 28 bytes (like the real code).
+    const first_chunk: usize = 68;
+    @memcpy(resp_recv_ya_buf[0..first_chunk], ini_to_resp_buf[0..first_chunk]);
+    const resp_after_ya_partial = resp.feedRecv(first_chunk);
+
+    // Should want more bytes
+    const resp_recv_ya_rest = switch (resp_after_ya_partial) {
+        .recv => |buf| buf,
+        else => return error.ExpectedRecv,
+    };
+
+    const remaining_ya = dh_key_size - first_chunk;
+    @memcpy(resp_recv_ya_rest[0..remaining_ya], ini_to_resp_buf[first_chunk..dh_key_size]);
+    const resp_after_ya_complete = resp.feedRecv(remaining_ya);
+
+    // Responder should now send Yb + PadB
+    const yb_data = switch (resp_after_ya_complete) {
+        .send => |d| d,
+        else => return error.ExpectedSend,
+    };
+    var resp_to_ini_buf: [dh_key_size + max_pad_len]u8 = undefined;
+    @memcpy(resp_to_ini_buf[0..yb_data.len], yb_data);
+    const yb_len = yb_data.len;
+
+    // Step 3: Initiator receives Yb
+    @memcpy(ini_recv_yb_buf[0..dh_key_size], resp_to_ini_buf[0..dh_key_size]);
+    const ini_after_yb = ini.feedRecv(dh_key_size);
+
+    // Verify shared secrets agree
+    try std.testing.expectEqualSlices(u8, &ini.shared_secret, &resp.shared_secret);
+
+    // Initiator should now send crypto request
+    const crypto_req_data = switch (ini_after_yb) {
+        .send => |d| d,
+        else => return error.ExpectedSend,
+    };
+    var ini_crypto_buf: [mse_send_buf_size]u8 = undefined;
+    @memcpy(ini_crypto_buf[0..crypto_req_data.len], crypto_req_data);
+    const crypto_req_len = crypto_req_data.len;
+
+    // After send, initiator transitions to recv_vc_scan
+    const ini_after_crypto_send = ini.feedSend();
+    _ = switch (ini_after_crypto_send) {
+        .recv => |buf| buf, // recv scan_buf[0..1]
+        else => return error.ExpectedRecv,
+    };
+
+    // Step 4: Responder send completes (Yb+PadB sent), transitions to recv_req1_scan
+    const resp_after_yb_send = resp.feedSend();
+    const resp_recv_scan_buf = switch (resp_after_yb_send) {
+        .recv => |buf| buf,
+        else => return error.ExpectedRecv,
+    };
+
+    // Now the responder needs to receive: PadA (if any) + crypto_request from initiator.
+    // PadA is ini_to_resp_buf[dh_key_size..ya_len], followed by crypto_req data.
+    const pad_a_len = ya_len - dh_key_size;
+    var full_resp_input: [max_pad_len + mse_send_buf_size]u8 = undefined;
+    if (pad_a_len > 0) {
+        @memcpy(full_resp_input[0..pad_a_len], ini_to_resp_buf[dh_key_size..ya_len]);
+    }
+    @memcpy(full_resp_input[pad_a_len .. pad_a_len + crypto_req_len], ini_crypto_buf[0..crypto_req_len]);
+    const total_resp_input_len = pad_a_len + crypto_req_len;
+
+    // Feed data to responder in chunks (simulating io_uring recv behavior)
+    var resp_input_pos: usize = 0;
+    var resp_action: MseAction = .{ .recv = resp_recv_scan_buf };
+    while (resp_input_pos < total_resp_input_len) {
+        const recv_buf = switch (resp_action) {
+            .recv => |buf| buf,
+            .send => break, // Responder wants to send its response
+            .complete => break,
+            .failed => |err| {
+                log.err("responder failed at input pos {d}/{d}: {s}", .{
+                    resp_input_pos, total_resp_input_len, @tagName(err),
+                });
+                return error.ResponderFailed;
+            },
+        };
+
+        const chunk_size = @min(recv_buf.len, total_resp_input_len - resp_input_pos);
+        if (chunk_size == 0) break;
+        @memcpy(recv_buf[0..chunk_size], full_resp_input[resp_input_pos .. resp_input_pos + chunk_size]);
+        resp_input_pos += chunk_size;
+        resp_action = resp.feedRecv(chunk_size);
+    }
+
+    // Responder should now want to send its response
+    const resp_response = switch (resp_action) {
+        .send => |d| d,
+        else => {
+            log.err("expected responder to send, got {s}", .{@tagName(resp_action)});
+            return error.ExpectedSend;
+        },
+    };
+    var resp_response_buf: [mse_send_buf_size]u8 = undefined;
+    @memcpy(resp_response_buf[0..resp_response.len], resp_response);
+    const resp_response_len = resp_response.len;
+
+    // Step 5: Feed responder's response to initiator.
+    // The initiator already received Yb (96 bytes). Remaining data from the
+    // responder is: PadB + encrypted(VC + crypto_select + PadD).
+    const pad_b_len = yb_len - dh_key_size;
+    var full_ini_input: [max_pad_len + mse_send_buf_size]u8 = undefined;
+    if (pad_b_len > 0) {
+        @memcpy(full_ini_input[0..pad_b_len], resp_to_ini_buf[dh_key_size..yb_len]);
+    }
+    @memcpy(full_ini_input[pad_b_len .. pad_b_len + resp_response_len], resp_response_buf[0..resp_response_len]);
+    const total_ini_input_len = pad_b_len + resp_response_len;
+
+    // Feed data to initiator one byte at a time (matching the scan_buf[0..1] pattern)
+    var ini_input_pos: usize = 0;
+    var ini_action: MseAction = ini_after_crypto_send;
+    while (ini_input_pos < total_ini_input_len) {
+        const recv_buf = switch (ini_action) {
+            .recv => |buf| buf,
+            .complete => break,
+            .failed => |err| {
+                log.err("initiator failed at input pos {d}/{d}: {s}", .{
+                    ini_input_pos, total_ini_input_len, @tagName(err),
+                });
+                return error.InitiatorFailed;
+            },
+            .send => return error.UnexpectedSend,
+        };
+
+        const chunk_size = @min(recv_buf.len, total_ini_input_len - ini_input_pos);
+        if (chunk_size == 0) break;
+        @memcpy(recv_buf[0..chunk_size], full_ini_input[ini_input_pos .. ini_input_pos + chunk_size]);
+        ini_input_pos += chunk_size;
+        ini_action = ini.feedRecv(chunk_size);
+    }
+
+    // Both sides should complete successfully
+    switch (ini_action) {
+        .complete => {},
+        .failed => |err| {
+            log.err("initiator failed: {s}", .{@tagName(err)});
+            return error.InitiatorFailed;
+        },
+        else => {
+            log.err("initiator not complete: {s}", .{@tagName(ini_action)});
+            return error.InitiatorNotComplete;
+        },
+    }
+
+    // Responder completes after its send
+    const resp_final = resp.feedSend();
+    switch (resp_final) {
+        .complete => {},
+        .failed => |err| {
+            log.err("responder failed: {s}", .{@tagName(err)});
+            return error.ResponderFailed;
+        },
+        else => {
+            log.err("responder not complete: {s}", .{@tagName(resp_final)});
+            return error.ResponderNotComplete;
+        },
+    }
+
+    // Verify both sides agree on crypto method
+    const ini_result = ini.result();
+    const resp_result = resp.result();
+    try std.testing.expectEqual(ini_result.crypto_method, resp_result.crypto_method);
+    try std.testing.expect(ini_result.crypto_method == crypto_rc4 or ini_result.crypto_method == crypto_plaintext);
+
+    // Verify encryption/decryption roundtrip works if RC4 was selected
+    if (ini_result.crypto_method == crypto_rc4) {
+        var test_data = [_]u8{ 'H', 'e', 'l', 'l', 'o' };
+        var encrypted: [5]u8 = undefined;
+        var decrypted: [5]u8 = undefined;
+
+        // Initiator encrypts with keyA, responder decrypts with keyA
+        var ini_crypto = ini_result;
+        var resp_crypto = resp_result;
+        @memcpy(&encrypted, &test_data);
+        ini_crypto.encryptBuf(&encrypted);
+        @memcpy(&decrypted, &encrypted);
+        resp_crypto.decryptBuf(&decrypted);
+        try std.testing.expectEqualSlices(u8, &test_data, &decrypted);
+    }
+}

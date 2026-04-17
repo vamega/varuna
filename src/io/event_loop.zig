@@ -141,6 +141,15 @@ pub const EventLoop = struct {
     peer_count: u16 = 0,
     running: bool = true,
 
+    /// Graceful shutdown: when true, the event loop stops accepting new work
+    /// and waits for in-flight transfers to complete before setting running=false.
+    draining: bool = false,
+    /// Monotonic timestamp (seconds) when the drain timeout expires and
+    /// shutdown is forced regardless of pending work.
+    drain_deadline: i64 = 0,
+    /// Configurable drain timeout in seconds (0 = immediate shutdown).
+    shutdown_timeout: u32 = 10,
+
     // Multi-torrent contexts
     torrents: std.ArrayList(?TorrentContext),
     free_torrent_ids: std.ArrayList(TorrentId),
@@ -872,6 +881,9 @@ pub const EventLoop = struct {
     }
 
     pub fn addPeerForTorrent(self: *EventLoop, address: std.net.Address, torrent_id: TorrentId) !u16 {
+        // Reject new outbound connections during graceful shutdown drain
+        if (self.draining) return error.ShuttingDown;
+
         // Validate address family
         const family = address.any.family;
         if (family != posix.AF.INET and family != posix.AF.INET6) {
@@ -939,6 +951,9 @@ pub const EventLoop = struct {
     /// socket via the UtpManager, sends the SYN packet, and allocates a
     /// peer slot in the event loop.
     pub fn addUtpPeer(self: *EventLoop, address: std.net.Address, torrent_id: TorrentId) !u16 {
+        // Reject new outbound connections during graceful shutdown drain
+        if (self.draining) return error.ShuttingDown;
+
         // Check ban list before allocating uTP socket
         if (self.ban_list) |bl| {
             if (bl.isBanned(address)) {
@@ -1288,6 +1303,42 @@ pub const EventLoop = struct {
         _ = self.ring.submit() catch |err| {
             log.warn("ring submit (post-dispatch): {s}", .{@errorName(err)});
         };
+
+        // Graceful shutdown drain check
+        if (self.draining) {
+            if (!self.hasPendingTransferWork()) {
+                log.info("drain complete, all in-flight transfers finished", .{});
+                const signal = @import("signal.zig");
+                signal.requestShutdown();
+                self.running = false;
+            } else if (std.time.timestamp() >= self.drain_deadline) {
+                log.info("drain timeout expired, forcing shutdown", .{});
+                const signal = @import("signal.zig");
+                signal.requestShutdown();
+                self.running = false;
+            }
+        }
+    }
+
+    /// Returns true if there is in-flight transfer work that should complete
+    /// before a graceful shutdown. Checks pending disk writes, hasher work,
+    /// and peers with active piece downloads.
+    pub fn hasPendingTransferWork(self: *EventLoop) bool {
+        // Pending disk writes
+        if (self.pending_writes.count() > 0) return true;
+
+        // Hasher has pending jobs or results
+        if (self.hasher) |h| {
+            if (h.hasPendingWork()) return true;
+        }
+
+        // Peers with in-flight piece downloads
+        for (self.active_peer_slots.items) |slot| {
+            const peer = &self.peers[slot];
+            if (peer.current_piece != null) return true;
+        }
+
+        return false;
     }
 
     /// Submit a timeout SQE so that submit_and_wait returns even if
@@ -1671,10 +1722,26 @@ pub const EventLoop = struct {
     fn dispatch(self: *EventLoop, cqe: linux.io_uring_cqe) void {
         // signalfd CQE — SIGINT or SIGTERM received
         if (cqe.user_data == signal_sentinel) {
-            log.info("shutdown signal received via signalfd", .{});
-            self.running = false;
             const signal = @import("signal.zig");
-            signal.requestShutdown();
+            if (self.draining) {
+                // Second signal while draining: force immediate shutdown
+                log.info("second shutdown signal received, forcing immediate exit", .{});
+                self.running = false;
+                signal.requestShutdown();
+                return;
+            }
+            if (self.shutdown_timeout == 0) {
+                // Immediate shutdown (no drain)
+                log.info("shutdown signal received via signalfd", .{});
+                self.running = false;
+                signal.requestShutdown();
+                return;
+            }
+            log.info("shutting down gracefully, draining in-flight transfers (timeout={d}s)...", .{self.shutdown_timeout});
+            self.draining = true;
+            self.drain_deadline = std.time.timestamp() + @as(i64, @intCast(self.shutdown_timeout));
+            // Re-arm the signalfd poll so a second signal is caught
+            _ = self.ring.poll_add(signal_sentinel, self.signal_fd, linux.POLL.IN) catch {};
             return;
         }
 

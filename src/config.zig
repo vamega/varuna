@@ -158,6 +158,10 @@ pub const Config = struct {
         max_seeding_time_enabled: bool = false,
         /// Maximum minutes to seed after completion. -1 = disabled.
         max_seeding_time: i64 = -1,
+        /// Graceful shutdown drain timeout in seconds. On SIGTERM/SIGINT, the
+        /// daemon drains in-flight transfers for up to this many seconds before
+        /// forcing shutdown. 0 = immediate shutdown (no drain).
+        shutdown_timeout: u32 = 10,
     };
 
     pub const Storage = struct {

@@ -235,6 +235,17 @@ fn checkOutboundUtpConnect(self: *EventLoop, utp_slot: u16, mgr: *utp_mgr.UtpMan
 /// Accept pending inbound uTP connections and create Peer entries.
 fn acceptUtpConnection(self: *EventLoop, mgr: *utp_mgr.UtpManager) void {
     while (mgr.accept()) |utp_slot| {
+        // Reject inbound uTP connections during graceful shutdown drain
+        if (self.draining) {
+            log.debug("rejected inbound uTP connection: shutting down", .{});
+            const now_us = utpNowUs();
+            if (mgr.reset(utp_slot, now_us)) |rst| {
+                const remote = mgr.getRemoteAddress(utp_slot) orelse continue;
+                utpSendPacket(self, &rst, remote);
+            }
+            continue;
+        }
+
         // Reject inbound uTP if transport disposition disables it
         if (!self.transport_disposition.incoming_utp) {
             log.debug("rejected inbound uTP connection: incoming_utp disabled", .{});

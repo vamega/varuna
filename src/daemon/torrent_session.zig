@@ -1361,6 +1361,17 @@ pub const TorrentSession = struct {
         try self.scheduleAnnounceJobs(request);
     }
 
+    /// Send event=stopped to all trackers (fire-and-forget for graceful shutdown).
+    /// Does not block on responses — just submits the jobs and returns.
+    pub fn scheduleStoppedAnnounce(self: *TorrentSession) void {
+        const request = self.makeAnnounceRequest(.stopped) orelse return;
+        // Don't guard on announcing — we want to send stopped even if a
+        // regular announce is in flight. The tracker will accept it.
+        self.scheduleAnnounceJobs(request) catch |err| {
+            std.log.warn("failed to schedule stopped announce: {s}", .{@errorName(err)});
+        };
+    }
+
     fn scheduleAnnounceJobs(self: *TorrentSession, base_request: tracker.announce.Request) !void {
         const session = &(self.session orelse return error.MissingSession);
         const tracker_urls = try self.buildTrackerUrls(session);

@@ -57,6 +57,9 @@ const RangeContext = struct {
 /// web seeds and unclaimed pieces, then submits batched HTTP range requests
 /// covering contiguous runs of pieces (up to web_seed_max_request_bytes).
 pub fn tryAssignWebSeedPieces(el: *EventLoop) void {
+    // During graceful shutdown drain, don't start new web seed requests
+    if (el.draining) return;
+
     const he = el.http_executor orelse return;
 
     for (el.active_torrent_ids.items) |torrent_id| {

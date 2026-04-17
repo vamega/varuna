@@ -381,6 +381,7 @@ fn peerHash(peer: SessionManager.PeerInfo) u64 {
     hasher.update(std.mem.asBytes(&peer.uploaded));
     hasher.update(std.mem.asBytes(&peer.progress));
     hasher.update(std.mem.asBytes(&peer.upload_only));
+    hasher.update(std.mem.asBytes(&peer.hashfails));
     return hasher.final();
 }
 
@@ -390,12 +391,13 @@ fn serializePeerObject(
     peer: SessionManager.PeerInfo,
 ) !void {
     const esc = json_esc.jsonSafe;
-    try json_buf.writer(allocator).print("\"{f}\":{{\"client\":\"{f}\",\"connection\":\"\",\"country\":\"\",\"country_code\":\"\",\"dl_speed\":{},\"downloaded\":{},\"files\":\"\",\"flags\":\"{f}\",\"flags_desc\":\"\",\"ip\":\"{f}\",\"port\":{},\"progress\":{d:.4},\"relevance\":1,\"up_speed\":{},\"uploaded\":{},\"upload_only\":{}}}", .{
+    try json_buf.writer(allocator).print("\"{f}\":{{\"client\":\"{f}\",\"connection\":\"\",\"country\":\"\",\"country_code\":\"\",\"dl_speed\":{},\"downloaded\":{},\"files\":\"\",\"flags\":\"{f}\",\"flags_desc\":\"\",\"hashfails\":{},\"ip\":\"{f}\",\"port\":{},\"progress\":{d:.4},\"relevance\":1,\"up_speed\":{},\"uploaded\":{},\"upload_only\":{}}}", .{
         esc(peer.ip),
         esc(peer.client),
         peer.dl_speed,
         peer.downloaded,
         esc(peer.flags),
+        peer.hashfails,
         esc(peer.ip),
         peer.port,
         peer.progress,

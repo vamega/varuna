@@ -173,6 +173,10 @@ pub const Peer = struct {
     // BEP 11 PEX state (per-peer, tracks what we have sent to this peer)
     pex_state: ?*pex_mod.PexState = null,
 
+    // Trust tracking (Smart Ban Phase 0)
+    hashfails: u8 = 0, // pieces that failed hash verification from this peer
+    trust_points: i8 = 0, // reputation: decremented on failure, incremented on success
+
     // MSE/PE (BEP 6) encryption state
     crypto: mse.PeerCrypto = mse.PeerCrypto.plaintext,
     // Async MSE handshake state (heap-allocated, freed on completion/disconnect)

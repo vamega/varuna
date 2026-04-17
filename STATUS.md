@@ -90,7 +90,7 @@ Update it whenever a milestone lands, the near-term backlog changes, or a new op
 - **varuna-ctl**: list, add (--save-path), pause, resume, delete (--delete-files), move, conn-diag, add-tracker, remove-tracker, edit-tracker, version, stats, speed limits (set/get), --username/--password auth.
 
 ### Daemon Features
-- Graceful SIGINT/SIGTERM shutdown: flush resume DB, send tracker stopped, close connections.
+- Graceful SIGINT/SIGTERM shutdown with in-flight transfer draining: on signal, stops new work, drains pending disk writes/hashes/downloads, sends tracker stopped announces, flushes resume DB, configurable timeout (default 10s), double-signal escape hatch for forced exit.
 - systemd-notify: READY=1 / STOPPING=1 via AF_UNIX.
 - systemd socket activation: inherits listen fds from systemd via $LISTEN_FDS/$LISTEN_PID (sd_listen_fds protocol). Supports API server and peer listener sockets.
 - Daemon seeding after download: announces completed, creates listen socket, multi-torrent handshake matching.
@@ -227,7 +227,7 @@ Update it whenever a milestone lands, the near-term backlog changes, or a new op
 - ~~**Transport disposition**~~: (DONE) fine-grained TCP/uTP control via `TransportDisposition` packed struct. TOML config accepts presets or flag lists. Runtime start/stop of TCP and UDP listeners via `reconcileListeners()`. Cancel-before-close with IORING_OP_ASYNC_CANCEL. 25 integration tests.
 - ~~**IORING_OP_SOCKET for hot-path socket creation**~~: (DONE) peer connections, tracker requests, and UDP tracker all use async socket creation. Startup socket() count: 13 → 3.
 - ~~**varuna-tools create**~~: (DONE) native Zig torrent creator with mktorrent feature parity. Parallel hashing (11x speedup at 16 threads). All test scripts use `varuna-tools create` — Node.js dependency eliminated.
-- **Smart ban**: no hash-failure-based peer penalization. Implementation plan in `docs/future-features.md` (3 phases: trust points → per-block SHA-1 tracking → event loop integration).
+- ~~**Smart ban Phase 0**~~: (DONE) trust-point banning on hash failure. `hashfails`/`trust_points` fields on `Peer`, penalization in `processHashResults`, ban at threshold -7, slow recovery on success. Web seed slots excluded. `hashfails` exposed in torrentPeers API. Phases 1-2 (per-block SHA-1 tracking) remain in `docs/future-features.md`.
 - **MSE simultaneous handshake robustness**: timing-dependent crash in `checkPeerTimeouts -> removePeer -> cleanupPeer` when both inbound and outbound MSE handshakes are in flight. Disappears under GDB. Needs generation counters or explicit handshake-in-progress guards.
 - **Multi-source piece assembly**: each piece is downloaded from a single peer. Requesting different blocks from different peers would improve download performance and is a prerequisite for full smart ban value.
 - **Peer hot/cold split / partial SoA**: the active-slot pass removes a lot of wasted scans, but the `Peer` struct is still wide. The next performance step is separating hot scheduling/state fields from cold crypto/buffering state.
@@ -243,9 +243,9 @@ Update it whenever a milestone lands, the near-term backlog changes, or a new op
 - The packaged Ubuntu `opentracker` build requires explicit info-hash whitelisting (`--whitelist-hash`).
 - On WSL2, `perf stat`/`perf record` require kernel-matched `linux-tools` package; many hardware counters report `<not supported>`.
 - `zig build test-torrent-session` intermittently hits Zig cache/toolchain failures (`manifest_create Unexpected`).
-- **No smart ban**: peers sending corrupt data are not penalized. Pieces are re-downloaded indefinitely. See `docs/future-features.md` for the 3-phase implementation plan.
+- **Smart ban Phases 1-2 not yet implemented**: Phase 0 (trust-point banning) is done, but per-block SHA-1 tracking for definitive identification in multi-source scenarios is not. See `docs/future-features.md`.
 - **MSE handshake failures in mixed encryption mode**: `vc_not_found` and `req1_not_found` errors occur during simultaneous inbound+outbound MSE handshakes. Timing-dependent, disappears under GDB. `demo_swarm.sh` runs with `encryption = "disabled"` as workaround.
-- **Daemon graceful shutdown**: SIGTERM doesn't always result in clean exit when web seed downloads or active connections are in progress. Scripts use `kill -9` + `pkill` fallback.
+- ~~**Daemon graceful shutdown**~~: Fixed. In-flight transfer draining with configurable timeout now ensures clean exit on SIGTERM/SIGINT.
 - `IORING_OP_SETSOCKOPT` (kernel 6.7+), `IORING_OP_BIND`/`LISTEN` (kernel 6.11+) not available on current kernel 6.6. Per-peer setsockopt (TCP_NODELAY, buffer sizes) remains synchronous.
 
 ## Last Verified Milestone (2026-04-16)

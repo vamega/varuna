@@ -16,8 +16,13 @@ const MerkleCache = @import("../torrent/merkle_cache.zig").MerkleCache;
 const Hasher = @import("hasher.zig").Hasher;
 const LayoutSpan = @import("../torrent/layout.zig").Layout.Span;
 const utp_handler = @import("utp_handler.zig");
+const web_seed_handler = @import("web_seed_handler.zig");
+const BanList = @import("../net/ban_list.zig").BanList;
 
 const pipeline_depth: u32 = 64;
+
+/// Threshold at which a peer is banned for sending too many corrupt pieces.
+const trust_ban_threshold: i8 = -7;
 const peer_timeout_secs: i64 = 60;
 const unchoke_interval_secs: i64 = 10; // BEP 3: recalculate every 10 seconds
 const optimistic_unchoke_interval_secs: i64 = 30; // rotate optimistic unchoke every 30s
@@ -27,6 +32,9 @@ const optimistic_unchoke_slots: u32 = 1;
 // ── Piece download coordination ───────────────────────
 
 pub fn tryAssignPieces(self: *EventLoop) void {
+    // During graceful shutdown drain, don't claim new pieces
+    if (self.draining) return;
+
     var i: usize = 0;
     while (i < self.idle_peers.items.len) {
         const slot = self.idle_peers.items[i];
@@ -416,6 +424,15 @@ pub fn processHashResults(self: *EventLoop) void {
         };
 
         if (result.valid) {
+            // Smart Ban Phase 0: reward peer on successful hash verification.
+            // Skip web seed sentinel slots -- those use WebSeedManager.
+            if (!isWebSeedSentinelSlot(result.slot)) {
+                const contributor = &self.peers[result.slot];
+                if (contributor.state != .free and contributor.torrent_id == torrent_id) {
+                    rewardPeerTrust(contributor);
+                }
+            }
+
             const sess = tc.session orelse {
                 self.allocator.free(result.piece_buf);
                 continue;
@@ -508,6 +525,25 @@ pub fn processHashResults(self: *EventLoop) void {
             // Hash mismatch -- release piece back to pool
             if (tc.piece_tracker) |pt| pt.releasePiece(result.piece_index);
             self.allocator.free(result.piece_buf);
+
+            // Smart Ban Phase 0: penalize peer on hash failure.
+            // Skip web seed sentinel slots -- those are handled by
+            // WebSeedManager.markFailure with its own backoff.
+            if (!isWebSeedSentinelSlot(result.slot)) {
+                const contributor = &self.peers[result.slot];
+                if (contributor.state != .free and contributor.torrent_id == torrent_id) {
+                    const should_ban = penalizePeerTrust(contributor);
+                    if (should_ban) {
+                        log.warn("banning peer {any} (slot {d}): trust_points={d}, hashfails={d}", .{
+                            contributor.address, result.slot, contributor.trust_points, contributor.hashfails,
+                        });
+                        if (self.ban_list) |bl| {
+                            _ = bl.banIp(contributor.address, "smart ban: too many hash failures", .manual) catch {};
+                        }
+                        self.removePeer(result.slot);
+                    }
+                }
+            }
         }
     }
     // Results are already swapped out of the hasher -- no clearResults needed.
@@ -919,6 +955,30 @@ pub fn checkPartialSeed(self: *EventLoop) void {
     }
 }
 
+// ── Smart Ban Phase 0: trust point helpers ────────────────
+
+/// Penalize a peer for a hash failure. Returns true if the peer should be banned.
+/// Increments hashfails (saturating), decrements trust_points by 2 (saturating).
+fn penalizePeerTrust(peer: *Peer) bool {
+    peer.hashfails +|= 1;
+    peer.trust_points -|= 2;
+    return peer.trust_points <= trust_ban_threshold;
+}
+
+/// Reward a peer for a successful hash verification (slow recovery).
+/// Only increments trust_points if currently negative.
+fn rewardPeerTrust(peer: *Peer) void {
+    if (peer.trust_points < 0) {
+        peer.trust_points += 1;
+    }
+}
+
+/// Returns true if the given slot is a web seed sentinel (not a real peer slot).
+/// Web seed sentinel slots are >= max_peers and handled separately by WebSeedManager.
+fn isWebSeedSentinelSlot(slot: u16) bool {
+    return slot >= max_peers;
+}
+
 // ── Tests ─────────────────────────────────────────────────
 
 test "writeRequestMsg formats 17-byte request message correctly" {
@@ -1317,4 +1377,129 @@ test "sendKeepAlives skips non-active peers" {
 
     try std.testing.expectEqual(original_activity, peer.last_activity);
     try std.testing.expectEqual(false, peer.send_pending);
+}
+
+// ── Smart Ban Phase 0 tests ──────────────────────────────
+
+test "penalizePeerTrust decrements trust_points by 2 and increments hashfails" {
+    var peer = Peer{};
+    try std.testing.expectEqual(@as(i8, 0), peer.trust_points);
+    try std.testing.expectEqual(@as(u8, 0), peer.hashfails);
+
+    const should_ban = penalizePeerTrust(&peer);
+    try std.testing.expectEqual(false, should_ban);
+    try std.testing.expectEqual(@as(i8, -2), peer.trust_points);
+    try std.testing.expectEqual(@as(u8, 1), peer.hashfails);
+}
+
+test "four consecutive hash failures result in ban" {
+    var peer = Peer{};
+
+    // 4 failures: trust_points goes 0 -> -2 -> -4 -> -6 -> -8
+    var ban = penalizePeerTrust(&peer);
+    try std.testing.expectEqual(false, ban);
+    try std.testing.expectEqual(@as(i8, -2), peer.trust_points);
+
+    ban = penalizePeerTrust(&peer);
+    try std.testing.expectEqual(false, ban);
+    try std.testing.expectEqual(@as(i8, -4), peer.trust_points);
+
+    ban = penalizePeerTrust(&peer);
+    try std.testing.expectEqual(false, ban);
+    try std.testing.expectEqual(@as(i8, -6), peer.trust_points);
+
+    ban = penalizePeerTrust(&peer);
+    try std.testing.expectEqual(true, ban); // -8 <= -7, should ban
+    try std.testing.expectEqual(@as(i8, -8), peer.trust_points);
+    try std.testing.expectEqual(@as(u8, 4), peer.hashfails);
+}
+
+test "successful pieces increment trust_points with slow recovery" {
+    var peer = Peer{};
+    peer.trust_points = -4; // simulating 2 prior hash failures
+
+    // Each success recovers 1 point
+    rewardPeerTrust(&peer);
+    try std.testing.expectEqual(@as(i8, -3), peer.trust_points);
+
+    rewardPeerTrust(&peer);
+    try std.testing.expectEqual(@as(i8, -2), peer.trust_points);
+
+    rewardPeerTrust(&peer);
+    try std.testing.expectEqual(@as(i8, -1), peer.trust_points);
+
+    rewardPeerTrust(&peer);
+    try std.testing.expectEqual(@as(i8, 0), peer.trust_points);
+
+    // Once at 0, trust_points should not increase further
+    rewardPeerTrust(&peer);
+    try std.testing.expectEqual(@as(i8, 0), peer.trust_points);
+}
+
+test "web seed sentinel slots are correctly identified" {
+    // Web seed sentinels: 0xFFFF - slot_idx (for slot_idx 0..15)
+    try std.testing.expectEqual(true, isWebSeedSentinelSlot(0xFFFF));
+    try std.testing.expectEqual(true, isWebSeedSentinelSlot(0xFFFF - 15));
+    try std.testing.expectEqual(true, isWebSeedSentinelSlot(max_peers)); // boundary
+
+    // Regular peer slots
+    try std.testing.expectEqual(false, isWebSeedSentinelSlot(0));
+    try std.testing.expectEqual(false, isWebSeedSentinelSlot(1));
+    try std.testing.expectEqual(false, isWebSeedSentinelSlot(max_peers - 1));
+}
+
+test "trust_points saturate and do not wrap around" {
+    var peer = Peer{};
+    peer.trust_points = -126; // near minimum for i8 (-128)
+
+    const ban = penalizePeerTrust(&peer);
+    try std.testing.expectEqual(true, ban);
+    // Should saturate at -128, not wrap to positive
+    try std.testing.expectEqual(@as(i8, -128), peer.trust_points);
+}
+
+test "hashfails saturate at 255" {
+    var peer = Peer{};
+    peer.hashfails = 254;
+
+    _ = penalizePeerTrust(&peer);
+    try std.testing.expectEqual(@as(u8, 255), peer.hashfails);
+
+    // Should stay at 255 (saturating)
+    _ = penalizePeerTrust(&peer);
+    try std.testing.expectEqual(@as(u8, 255), peer.hashfails);
+}
+
+test "hash failure penalization with ban uses ban_list" {
+    var el = try EventLoop.initBare(std.testing.allocator, 0);
+    defer el.deinit();
+
+    // Set up a ban list
+    var bl = BanList.init(std.testing.allocator);
+    defer bl.deinit();
+    el.ban_list = &bl;
+
+    const slot: u16 = 0;
+    const peer = &el.peers[slot];
+    peer.state = .active_recv_header;
+    peer.mode = .outbound;
+    peer.torrent_id = 0;
+    peer.address = std.net.Address.initIp4(.{ 192, 168, 1, 100 }, 6881);
+    peer.fd = -1;
+    el.markActivePeer(slot);
+
+    // Penalize until ban threshold
+    peer.trust_points = -6; // one more failure should trigger ban at -8
+    const should_ban = penalizePeerTrust(peer);
+    try std.testing.expectEqual(true, should_ban);
+
+    // Simulate what processHashResults does on ban
+    if (should_ban) {
+        if (el.ban_list) |ban_list| {
+            _ = try ban_list.banIp(peer.address, "smart ban: too many hash failures", .manual);
+        }
+    }
+
+    // Verify the IP was banned
+    try std.testing.expectEqual(true, bl.isBanned(std.net.Address.initIp4(.{ 192, 168, 1, 100 }, 6881)));
 }

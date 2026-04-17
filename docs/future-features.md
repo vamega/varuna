@@ -182,36 +182,31 @@ Remaining work for full production readiness:
 
 See [api-compatibility.md](api-compatibility.md) for the full qBittorrent WebAPI compatibility matrix, including which endpoints are implemented, which return placeholder data, and which are explicitly unsupported or deferred.
 
-## Graceful Shutdown (Planned)
+## ~~Graceful Shutdown~~ (DONE)
 
-The daemon currently exits as soon as the signalfd CQE fires (~200ms). This means in-flight piece transfers (both downloads and uploads) are aborted mid-stream, and peers see a connection reset.
-
-### Desired behavior
+Implemented in `src/io/event_loop.zig` (draining state, drain deadline, `hasPendingTransferWork`), `src/io/peer_policy.zig` (skip piece assignment during drain), `src/io/web_seed_handler.zig` (skip web seed assignment during drain), `src/io/peer_handler.zig` (reject inbound connections during drain), `src/daemon/torrent_session.zig` (`scheduleStoppedAnnounce`), `src/main.zig` (drain orchestration, final state persistence).
 
 On SIGTERM/SIGINT:
-1. **Stop accepting new work**: stop claiming new pieces, stop accepting new peer connections, stop initiating new outbound connections, stop starting new web seed requests.
-2. **Drain in-flight transfers**: allow currently in-progress piece downloads to complete (receive remaining blocks, verify hash, write to disk). Allow in-progress piece uploads (block sends) to complete.
-3. **Timeout**: if draining takes longer than a configurable limit (e.g., 10 seconds), force-close all connections and exit. This prevents hanging on a stalled peer.
-4. **Persist state**: flush any pending resume DB writes before exit.
-5. **Send tracker stopped event**: announce `event=stopped` to all trackers so they remove us from the swarm promptly.
+1. **Stop accepting new work**: `tryAssignPieces` and `tryAssignWebSeedPieces` return immediately, `handleAccept` rejects inbound connections, `addPeerForTorrent` and `addUtpPeer` return `error.ShuttingDown`.
+2. **Drain in-flight transfers**: pending disk writes, hasher jobs, and active piece downloads are allowed to complete.
+3. **Timeout**: configurable `shutdown_timeout` (default 10s). When expired, forces shutdown regardless of pending work.
+4. **Persist state**: resume DB writes flushed at drain start and again before final exit.
+5. **Send tracker stopped event**: `event=stopped` announces submitted to all trackers (fire-and-forget) at drain start.
+6. **Double-signal escape hatch**: a second SIGTERM/SIGINT during drain forces immediate shutdown.
 
-### Implementation sketch
+Config:
+```toml
+[daemon]
+shutdown_timeout = 10  # seconds, 0 = immediate shutdown
+```
 
-- On signal: set a `draining` flag on the event loop (distinct from `running = false`)
-- In `draining` mode: `tryAssignPieces` and `tryAssignWebSeedPieces` become no-ops, `handleAccept` rejects new connections, `addPeerForTorrent` returns error
-- Track `pieces_in_flight` count (already partially tracked via pending writes)
-- When `pieces_in_flight == 0` or drain timeout expires, set `running = false`
-- Submit stopped announces to TrackerExecutor/UdpTrackerExecutor before final exit
+## Smart Ban
 
-## Smart Ban (Planned)
+Peer penalization based on hash failures. Phase 0 is implemented; Phases 1-2 are planned. Based on [libtorrent's smart ban algorithm](https://blog.libtorrent.org/2011/11/smart-ban/).
 
-Varuna currently has no hash-failure-based peer penalization. A peer sending corrupt data causes the piece to be re-downloaded indefinitely without consequence. This section describes the planned implementation, based on [libtorrent's smart ban algorithm](https://blog.libtorrent.org/2011/11/smart-ban/).
+### Phase 0: Basic trust-point banning (implemented)
 
-### Phase 0: Basic trust-point banning
-
-Add `hashfails: u8` and `trust_points: i8` fields to the `Peer` struct in `src/io/types.zig`. On piece hash failure in `processHashResults` (`src/io/peer_policy.zig`), identify the peer that downloaded the failed piece, decrement `trust_points` by 2, and ban the peer (via `ban_list.banIp()`) if trust_points reach -7.
-
-This gives immediate protection against persistently corrupt peers without the full smart ban complexity.
+`hashfails: u8` and `trust_points: i8` fields on the `Peer` struct (`src/io/types.zig`). On piece hash failure in `processHashResults` (`src/io/peer_policy.zig`), the peer that downloaded the failed piece is penalized: `trust_points` decremented by 2, `hashfails` incremented. At `trust_points <= -7` the peer's IP is banned via `ban_list.banIp()` and disconnected. On hash success, negative `trust_points` recover by 1 (slow recovery). Web seed sentinel slots are excluded (handled by `WebSeedManager`). `hashfails` is exposed in the `/api/v2/sync/torrentPeers` response.
 
 ### Phase 1: Smart ban data structures
 

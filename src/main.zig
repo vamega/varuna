@@ -110,6 +110,9 @@ pub fn main() !void {
     shared_el.max_peers_per_torrent = cfg.network.max_peers_per_torrent;
     shared_el.max_half_open = cfg.network.max_half_open;
 
+    // Apply graceful shutdown timeout from config
+    shared_el.shutdown_timeout = cfg.daemon.shutdown_timeout;
+
     // Apply global speed limits from config
     if (cfg.network.dl_limit > 0) shared_el.setGlobalDlLimit(cfg.network.dl_limit);
     if (cfg.network.ul_limit > 0) shared_el.setGlobalUlLimit(cfg.network.ul_limit);
@@ -233,107 +236,134 @@ pub fn main() !void {
 
     // Main loop: tick shared event loop (API CQEs dispatched via shared ring)
     var resume_tick_counter: u32 = 0;
+    var drain_announced = false; // track whether we've sent stopped announces
     while (!varuna.io.signal.isShutdownRequested()) {
+        const is_draining = shared_el.draining;
 
-        // Check if any sessions need event loop integration:
-        // 1. Sessions in .checking with background_init_done -> start async recheck
-        // 2. Sessions with pending_peers -> register torrent and add peers
-        {
+        // On first drain tick, send stopped announces to all trackers and
+        // persist state so we leave the swarm promptly.
+        if (is_draining and !drain_announced) {
+            drain_announced = true;
+            varuna.daemon.systemd.notifyStopping();
+            try stdout.print("\ndraining in-flight transfers...\n", .{});
+            try stdout.flush();
             session_manager.mutex.lock();
-            var iter = session_manager.sessions.iterator();
-            while (iter.next()) |entry| {
+            var drain_iter = session_manager.sessions.iterator();
+            while (drain_iter.next()) |entry| {
                 const sess = entry.value_ptr.*;
-                // Phase 1: background init done, start async recheck on event loop
-                if (sess.background_init_done.load(.acquire) and sess.state == .checking) {
-                    _ = sess.integrateIntoEventLoop();
-                }
-                // Phase 2: recheck done, register torrent and add peers
-                if (sess.pending_peers != null) {
-                    if (shared_el.peer_count < shared_el.max_connections) {
-                        _ = sess.addPeersToEventLoop();
-                    }
-                }
-                // Start DHT search immediately -- don't wait for tracker to finish.
-                // The tracker may take minutes (UDP timeouts), but DHT can find
-                // peers in parallel once bootstrapped.
-                if (!sess.is_private and !sess.dht_registered) {
-                    if (shared_el.dht_engine) |engine| {
-                        engine.requestPeers(sess.info_hash);
-                        sess.dht_registered = true;
-                        std.log.info("DHT: registered {x} for peer search", .{sess.info_hash[0..4].*});
-                    }
+                if (sess.state == .downloading or sess.state == .seeding) {
+                    sess.scheduleStoppedAnnounce();
+                    sess.persistNewCompletions();
+                    sess.flushResume();
                 }
             }
             session_manager.mutex.unlock();
         }
 
-        // Check if any sessions need seed mode setup (completed download or 100% recheck)
-        {
-            session_manager.mutex.lock();
-            var iter = session_manager.sessions.iterator();
-            while (iter.next()) |entry| {
-                const sess = entry.value_ptr.*;
+        // Skip new work when draining — only keep ticking the event loop
+        // to let in-flight transfers complete.
+        if (!is_draining) {
+            // Check if any sessions need event loop integration:
+            // 1. Sessions in .checking with background_init_done -> start async recheck
+            // 2. Sessions with pending_peers -> register torrent and add peers
+            {
+                session_manager.mutex.lock();
+                var iter = session_manager.sessions.iterator();
+                while (iter.next()) |entry| {
+                    const sess = entry.value_ptr.*;
+                    // Phase 1: background init done, start async recheck on event loop
+                    if (sess.background_init_done.load(.acquire) and sess.state == .checking) {
+                        _ = sess.integrateIntoEventLoop();
+                    }
+                    // Phase 2: recheck done, register torrent and add peers
+                    if (sess.pending_peers != null) {
+                        if (shared_el.peer_count < shared_el.max_connections) {
+                            _ = sess.addPeersToEventLoop();
+                        }
+                    }
+                    // Start DHT search immediately -- don't wait for tracker to finish.
+                    // The tracker may take minutes (UDP timeouts), but DHT can find
+                    // peers in parallel once bootstrapped.
+                    if (!sess.is_private and !sess.dht_registered) {
+                        if (shared_el.dht_engine) |engine| {
+                            engine.requestPeers(sess.info_hash);
+                            sess.dht_registered = true;
+                            std.log.info("DHT: registered {x} for peer search", .{sess.info_hash[0..4].*});
+                        }
+                    }
+                }
+                session_manager.mutex.unlock();
+            }
 
-                // Check for download-to-seed transition
-                _ = sess.checkSeedTransition();
+            // Check if any sessions need seed mode setup (completed download or 100% recheck)
+            {
+                session_manager.mutex.lock();
+                var iter = session_manager.sessions.iterator();
+                while (iter.next()) |entry| {
+                    const sess = entry.value_ptr.*;
 
-                // Set up seed mode if flagged by background thread or transition
-                if (sess.pending_seed_setup) {
-                    if (sess.integrateSeedIntoEventLoop()) {
-                        // Create listen socket once for the first seeding torrent
-                        if (listen_fd < 0 and shared_el.transport_disposition.incoming_tcp) {
-                            shared_el.startTcpListener() catch {};
-                            if (shared_el.listen_fd >= 0) {
-                                listen_fd = shared_el.listen_fd;
+                    // Check for download-to-seed transition
+                    _ = sess.checkSeedTransition();
+
+                    // Set up seed mode if flagged by background thread or transition
+                    if (sess.pending_seed_setup) {
+                        if (sess.integrateSeedIntoEventLoop()) {
+                            // Create listen socket once for the first seeding torrent
+                            if (listen_fd < 0 and shared_el.transport_disposition.incoming_tcp) {
+                                shared_el.startTcpListener() catch {};
+                                if (shared_el.listen_fd >= 0) {
+                                    listen_fd = shared_el.listen_fd;
+                                }
                             }
                         }
                     }
                 }
+                session_manager.mutex.unlock();
             }
-            session_manager.mutex.unlock();
-        }
 
-        // Periodically run queue enforcement (~every 5s at 100ms tick).
-        // This catches state transitions (download->seed) that free up slots.
-        resume_tick_counter +%= 1;
-        if (resume_tick_counter % 50 == 0) {
-            session_manager.runQueueEnforcement();
-        }
+            // Periodically run queue enforcement (~every 5s at 100ms tick).
+            // This catches state transitions (download->seed) that free up slots.
+            resume_tick_counter +%= 1;
+            if (resume_tick_counter % 50 == 0) {
+                session_manager.runQueueEnforcement();
+            }
 
-        // Periodically persist completed pieces to resume DB (~every 5s at 100ms tick)
-        // and trigger tracker scrapes for swarm health stats.
-        if (resume_tick_counter % 50 == 0) {
-            session_manager.mutex.lock();
-            var iter = session_manager.sessions.iterator();
-            while (iter.next()) |entry| {
-                const sess = entry.value_ptr.*;
-                if (sess.state == .downloading or sess.state == .seeding) {
-                    sess.persistNewCompletions();
-                    sess.flushResume();
-                    sess.maybeScrape();
-                    // Persist completion_on if it was set but not yet saved
-                    if (sess.completion_on > 0) {
-                        session_manager.persistCompletionOn(
-                            sess.info_hash,
-                            sess.ratio_limit,
-                            sess.seeding_time_limit,
-                            sess.completion_on,
-                        );
+            // Periodically persist completed pieces to resume DB (~every 5s at 100ms tick)
+            // and trigger tracker scrapes for swarm health stats.
+            if (resume_tick_counter % 50 == 0) {
+                session_manager.mutex.lock();
+                var iter = session_manager.sessions.iterator();
+                while (iter.next()) |entry| {
+                    const sess = entry.value_ptr.*;
+                    if (sess.state == .downloading or sess.state == .seeding) {
+                        sess.persistNewCompletions();
+                        sess.flushResume();
+                        sess.maybeScrape();
+                        // Persist completion_on if it was set but not yet saved
+                        if (sess.completion_on > 0) {
+                            session_manager.persistCompletionOn(
+                                sess.info_hash,
+                                sess.ratio_limit,
+                                sess.seeding_time_limit,
+                                sess.completion_on,
+                            );
+                        }
                     }
                 }
+                session_manager.mutex.unlock();
             }
-            session_manager.mutex.unlock();
-        }
 
-        // Check share ratio / seeding time limits (~every 30s at 100ms tick)
-        if (resume_tick_counter % 300 == 150) {
-            _ = session_manager.checkShareLimits();
+            // Check share ratio / seeding time limits (~every 30s at 100ms tick)
+            if (resume_tick_counter % 300 == 150) {
+                _ = session_manager.checkShareLimits();
+            }
         }
 
         // Tick shared event loop (non-blocking poll).
         // Also tick when the DHT/uTP UDP socket is open so DHT bootstrap
         // messages and incoming datagrams are processed even without TCP peers.
-        const has_io = shared_el.peer_count > 0 or shared_el.listen_fd >= 0 or shared_el.udp_fd >= 0 or shared_el.rechecks.items.len > 0 or shared_el.metadata_fetch != null or shared_el.timer_pending;
+        // Always tick during drain so the drain timeout and completion checks run.
+        const has_io = is_draining or shared_el.peer_count > 0 or shared_el.listen_fd >= 0 or shared_el.udp_fd >= 0 or shared_el.rechecks.items.len > 0 or shared_el.metadata_fetch != null or shared_el.timer_pending;
         if (has_io) {
             shared_el.submitTimeout(100 * std.time.ns_per_ms) catch {};
             shared_el.tick() catch {};
@@ -342,7 +372,23 @@ pub fn main() !void {
         }
     }
 
-    varuna.daemon.systemd.notifyStopping();
+    // Final state persistence before exit
+    {
+        session_manager.mutex.lock();
+        var final_iter = session_manager.sessions.iterator();
+        while (final_iter.next()) |entry| {
+            const sess = entry.value_ptr.*;
+            if (sess.state == .downloading or sess.state == .seeding) {
+                sess.persistNewCompletions();
+                sess.flushResume();
+            }
+        }
+        session_manager.mutex.unlock();
+    }
+
+    if (!drain_announced) {
+        varuna.daemon.systemd.notifyStopping();
+    }
     try stdout.print("\nshutting down...\n", .{});
     try stdout.flush();
 }

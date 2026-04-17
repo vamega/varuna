@@ -47,6 +47,14 @@ pub fn handleAccept(self: *EventLoop, cqe: linux.io_uring_cqe) void {
         }
     }
 
+    // Reject inbound connections during graceful shutdown drain
+    if (self.draining) {
+        log.debug("rejected inbound connection: shutting down", .{});
+        posix.close(new_fd);
+        if (!more) self.submitAccept() catch {};
+        return;
+    }
+
     // Reject inbound TCP if transport disposition disables it
     if (!self.transport_disposition.incoming_tcp) {
         log.debug("rejected inbound TCP connection: incoming_tcp disabled", .{});

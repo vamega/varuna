@@ -1715,6 +1715,8 @@ pub const SessionManager = struct {
         progress: f64,
         /// BEP 21: peer is a partial seed (upload_only).
         upload_only: bool = false,
+        /// Smart Ban Phase 0: pieces that failed hash verification from this peer.
+        hashfails: u8 = 0,
     };
 
     pub fn freePeerInfos(allocator: std.mem.Allocator, infos: []const PeerInfo) void {
@@ -1815,6 +1817,7 @@ pub const SessionManager = struct {
                 .uploaded = peer.bytes_uploaded_to,
                 .progress = progress,
                 .upload_only = peer.upload_only,
+                .hashfails = peer.hashfails,
             });
         }
 
