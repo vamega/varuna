@@ -130,7 +130,7 @@ enable_utp = true
 EOF
 
 # ── Start seeder daemon ─────────────────────────────────
-(cd "$WORK_DIR/seed-daemon" && exec "$VARUNA") >"$SEED_LOG" 2>&1 &
+"$VARUNA" --config "$WORK_DIR/seed-daemon/varuna.toml" >"$SEED_LOG" 2>&1 &
 SEED_DAEMON_PID="$!"
 wait_for_tcp 127.0.0.1 "$SEED_API_PORT"
 
@@ -149,7 +149,7 @@ curl -s -b "SID=${SEED_SID}" \
 sleep 2
 
 # ── Start downloader daemon ─────────────────────────────
-(cd "$WORK_DIR/download-daemon" && exec "$VARUNA") >"$DOWNLOAD_LOG" 2>&1 &
+"$VARUNA" --config "$WORK_DIR/download-daemon/varuna.toml" >"$DOWNLOAD_LOG" 2>&1 &
 DOWNLOAD_DAEMON_PID="$!"
 wait_for_tcp 127.0.0.1 "$DOWNLOAD_API_PORT"
 

@@ -189,7 +189,7 @@ web_seed_max_request_bytes = 4194304
 EOF
 
 # ── Start downloader daemon ──────────────────────────────
-(cd "$WORK_DIR/daemon" && exec "$VARUNA") >"$WORK_DIR/daemon.log" 2>&1 &
+"$VARUNA" --config "$WORK_DIR/daemon/varuna.toml" >"$WORK_DIR/daemon.log" 2>&1 &
 DAEMON_PID=$!
 wait_for_tcp 127.0.0.1 "$API_PORT"
 echo "Daemon started (PID $DAEMON_PID)"
@@ -264,7 +264,7 @@ DAEMON_PID=""
 TRACKER_PID=""
 sleep 0.5
 rm -rf "$WORK_DIR/download-root"/*
-(cd "$WORK_DIR/daemon" && exec "$VARUNA") >"$WORK_DIR/daemon.log" 2>&1 &
+"$VARUNA" --config "$WORK_DIR/daemon/varuna.toml" >"$WORK_DIR/daemon.log" 2>&1 &
 DAEMON_PID=$!
 wait_for_tcp 127.0.0.1 "$API_PORT"
 SID=$(get_sid "$API_PORT")
@@ -332,7 +332,7 @@ DAEMON_PID=""
 TRACKER_PID=""
 sleep 0.5
 rm -rf "$WORK_DIR/download-root"/*
-(cd "$WORK_DIR/daemon" && exec "$VARUNA") >"$WORK_DIR/daemon.log" 2>&1 &
+"$VARUNA" --config "$WORK_DIR/daemon/varuna.toml" >"$WORK_DIR/daemon.log" 2>&1 &
 DAEMON_PID=$!
 wait_for_tcp 127.0.0.1 "$API_PORT"
 SID=$(get_sid "$API_PORT")

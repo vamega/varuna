@@ -16,25 +16,51 @@ pub fn main() !void {
     var stdout_writer = std.fs.File.stdout().writer(&stdout_buffer);
     const stdout = &stdout_writer.interface;
 
-    // Check for --help
-    for (args[1..]) |arg| {
-        if (std.mem.eql(u8, arg, "--help") or std.mem.eql(u8, arg, "-h")) {
-            const cfg = varuna.config.Config{};
-            try stdout.print("varuna: BitTorrent daemon with io_uring and qBittorrent-compatible API\n\n", .{});
-            try stdout.print("usage: varuna [--help]\n\n", .{});
-            try stdout.print("Config: varuna.toml or ~/.config/varuna/config.toml\n", .{});
-            try stdout.print("API: http://{s}:{}\n\n", .{ cfg.daemon.api_bind, cfg.daemon.api_port });
-            try stdout.print("Use varuna-ctl to control the daemon.\n", .{});
-            try stdout.print("Use varuna-tools for standalone operations.\n", .{});
-            try stdout.flush();
-            return;
+    // Parse CLI args: --help / -h and --config <path> / -c <path>.
+    var explicit_config_path: ?[]const u8 = null;
+    {
+        var i: usize = 1;
+        while (i < args.len) : (i += 1) {
+            const arg = args[i];
+            if (std.mem.eql(u8, arg, "--help") or std.mem.eql(u8, arg, "-h")) {
+                const cfg = varuna.config.Config{};
+                try stdout.print("varuna: BitTorrent daemon with io_uring and qBittorrent-compatible API\n\n", .{});
+                try stdout.print("usage: varuna [--help] [--config <path>]\n\n", .{});
+                try stdout.print("Options:\n", .{});
+                try stdout.print("  -h, --help             Show this help\n", .{});
+                try stdout.print("  -c, --config <path>    Load config from <path> (overrides default search)\n\n", .{});
+                try stdout.print("Default config search order: ./varuna.toml, /etc/varuna/config.toml,\n", .{});
+                try stdout.print("  $XDG_CONFIG_HOME/varuna/config.toml, ~/.config/varuna/config.toml\n\n", .{});
+                try stdout.print("API: http://{s}:{}\n\n", .{ cfg.daemon.api_bind, cfg.daemon.api_port });
+                try stdout.print("Use varuna-ctl to control the daemon.\n", .{});
+                try stdout.print("Use varuna-tools for standalone operations.\n", .{});
+                try stdout.flush();
+                return;
+            }
+            if (std.mem.eql(u8, arg, "--config") or std.mem.eql(u8, arg, "-c")) {
+                if (i + 1 >= args.len) {
+                    try stdout.print("error: {s} requires a path argument\n", .{arg});
+                    try stdout.flush();
+                    return error.MissingConfigPath;
+                }
+                explicit_config_path = args[i + 1];
+                i += 1;
+                continue;
+            }
+            if (std.mem.startsWith(u8, arg, "--config=")) {
+                explicit_config_path = arg["--config=".len..];
+                continue;
+            }
         }
     }
 
     // Install fallback signal handler (for pre-event-loop startup errors).
     // The signalfd installed below replaces this for the main event loop.
     varuna.io.signal.installHandlers();
-    var loaded_cfg = try varuna.config.loadDefault(allocator);
+    var loaded_cfg = if (explicit_config_path) |path|
+        try varuna.config.load(allocator, path)
+    else
+        try varuna.config.loadDefault(allocator);
     defer loaded_cfg.deinit();
     const cfg = loaded_cfg.value;
 

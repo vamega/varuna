@@ -128,11 +128,17 @@ EOF
 # Start a varuna daemon with a per-instance config in the given work directory.
 # Args: work_dir api_port peer_port data_dir log_file
 # Prints: the daemon PID
+#
+# Passes the config via --config <path> so the daemon loads a per-instance
+# file instead of the implicit CWD lookup. This makes test isolation
+# explicit and avoids accidental config sharing if tests run from the
+# same working directory.
 start_daemon() {
   local work_dir="$1" api_port="$2" peer_port="$3" data_dir="$4" log_file="$5"
   mkdir -p "$work_dir"
-  write_daemon_config "$work_dir/varuna.toml" "$api_port" "$peer_port" "$data_dir"
-  (cd "$work_dir" && exec "$VARUNA") >"$log_file" 2>&1 &
+  local config_path="$work_dir/varuna.toml"
+  write_daemon_config "$config_path" "$api_port" "$peer_port" "$data_dir"
+  "$VARUNA" --config "$config_path" >"$log_file" 2>&1 &
   echo "$!"
 }
 
@@ -201,8 +207,12 @@ run_single_file_test() {
   fi
   api_add_torrent "$sp_api" "$seed_sid" "$W/test.torrent" "$W/seed"
 
-  # Brief pause for the seeder to announce to tracker
-  sleep 1
+  # Wait for the seeder to complete its initial tracker announce.
+  # Varuna applies up to ~5s of jitter to the initial announce; if the
+  # downloader comes up before the seeder has announced, the downloader's
+  # first announce gets an empty peer list and has to wait for its
+  # reannounce interval, which can blow the per-test timeout.
+  sleep 6
 
   # Start downloader daemon
   local dl_pid
@@ -340,8 +350,12 @@ run_multi_file_test() {
   fi
   api_add_torrent "$sp_api" "$seed_sid" "$W/test.torrent" "$W/seed"
 
-  # Brief pause for the seeder to announce to tracker
-  sleep 1
+  # Wait for the seeder to complete its initial tracker announce.
+  # Varuna applies up to ~5s of jitter to the initial announce; if the
+  # downloader comes up before the seeder has announced, the downloader's
+  # first announce gets an empty peer list and has to wait for its
+  # reannounce interval, which can blow the per-test timeout.
+  sleep 6
 
   # Start downloader daemon
   local dl_pid
