@@ -4,20 +4,25 @@
 # Uses the varuna daemon + varuna-ctl API instead of varuna-tools seed/download.
 #
 # ── Isolation model ───────────────────────────────────────────────────────
-# Each test gets a fresh 100-port range starting at 30000 (+100 per test),
-# so no two concurrent listen sockets share an (ip, port). Cleanup uses
-# POST /api/v2/app/shutdown?timeout=0 to trigger a graceful exit on each
-# daemon; the main loop then sees el.running=false, closes sockets with
-# proper FIN handshakes, and exits. We only SIGKILL as a last resort
-# (tracker, or a daemon stuck past the drain window).
+# Each test gets a fresh loopback /24 inside 127.0.0.0/8:
+#   tracker    → 127.0.${TEST_INDEX}.1 : 6969
+#   seeder     → 127.0.${TEST_INDEX}.2 : 6881 (peer) / 8081 (api)
+#   downloader → 127.0.${TEST_INDEX}.3 : 6882 (peer) / 8082 (api)
 #
-# Attempted but reverted: unique 127.0.N.X /24 per test. The daemon's
-# HTTP tracker client doesn't honor bind_address, so announces originate
-# from the default source IP (127.0.0.1) and opentracker registers the
-# seeder at the wrong address, which makes the downloader unable to reach
-# it. Reintroducing this would require wiring bind_address into
-# http_executor.zig's socket creation; until then, unique-port isolation
-# plus graceful shutdown is sufficient.
+# Every (src_ip, src_port, dst_ip, dst_port) 4-tuple is therefore disjoint
+# across tests, so nothing the kernel keeps from test N (TIME_WAIT,
+# half-closed CLOSE_WAIT, syncache, etc.) can influence test N+1 even if
+# it lingers for the full TIME_WAIT window. Port re-use across tests is
+# fine because the IPs differ.
+#
+# Daemons bind to their per-test IP via [network] bind_address. Tracker
+# HTTP announces honor this bind (see src/io/http_executor.zig), so
+# opentracker registers the peer at the correct address and the other
+# side can connect.
+#
+# Teardown uses POST /api/v2/app/shutdown?timeout=0 on every registered
+# daemon, waits up to 2 s for a clean FIN-based exit, then SIGKILLs
+# anything still alive (tracker, or a stuck daemon past the drain).
 # ─────────────────────────────────────────────────────────────────────────
 set -o pipefail
 
@@ -30,11 +35,10 @@ RESULTS=()
 VARUNA="$ROOT_DIR/zig-out/bin/varuna"
 VARUNA_TOOLS="$ROOT_DIR/zig-out/bin/varuna-tools"
 
-# Each test gets a port range of 100 starting from 30000+
-# to avoid conflicts with standard services and other tests.
-# Within each range: +0 = tracker, +1 = seed peer, +2 = download peer,
-#                    +3 = seed API, +4 = download API.
-NEXT_PORT="${BASE_PORT:-30000}"
+# Per-test counter: used to pick a unique 127.0.${TEST_INDEX}.x /24 for
+# each test. Linux routes all of 127/8 to lo, so every value in [1, 255]
+# is a valid loopback subnet.
+TEST_INDEX=0
 
 # Per-test lists, reset at the start of every run_*_test invocation.
 # DAEMON_PIDS holds PIDs of every background process launched (daemons + tracker).
@@ -52,11 +56,11 @@ register_pid() {
   DAEMON_PIDS+=("$1")
 }
 
-# Register a (api_port, sid) tuple so cleanup_test can POST a graceful
-# shutdown to this daemon before resorting to SIGKILL.
+# Register a (host, api_port, sid) tuple so cleanup_test can POST a
+# graceful shutdown to this daemon before resorting to SIGKILL.
 register_shutdown() {
-  local port="$1" sid="$2"
-  DAEMON_SHUTDOWN_CMDS+=("curl -s -b 'SID=${sid}' -X POST 'http://127.0.0.1:${port}/api/v2/app/shutdown?timeout=0'")
+  local host="$1" port="$2" sid="$3"
+  DAEMON_SHUTDOWN_CMDS+=("curl -s -b 'SID=${sid}' -X POST 'http://${host}:${port}/api/v2/app/shutdown?timeout=0'")
 }
 
 # Shut down every registered daemon cleanly, then wait for every registered
@@ -92,67 +96,64 @@ cleanup_test() {
   done
 }
 
-wait_for_port_free() {
-  local port="$1"
-  for _ in $(seq 1 40); do
-    if ! bash -c "exec 3<>/dev/tcp/127.0.0.1/$port" 2>/dev/null; then
-      return 0
-    fi
-    sleep 0.1
-  done
-  echo "    warning: port $port still in use after 4s" >&2
-  return 1
-}
-
 wait_for_tcp() {
-  local port="$1"
+  local host="$1" port="$2"
   for _ in $(seq 1 100); do
-    bash -c "exec 3<>/dev/tcp/127.0.0.1/$port" 2>/dev/null && return 0
+    bash -c "exec 3<>/dev/tcp/${host}/${port}" 2>/dev/null && return 0
     sleep 0.05
   done
   return 1
 }
 
 # Login to a daemon API and return the SID cookie value.
+# Args: api_host api_port
 api_login() {
-  local port="$1"
+  local host="$1" port="$2"
   local sid
-  sid=$(curl -s -c - "http://127.0.0.1:${port}/api/v2/auth/login" \
+  sid=$(curl -s -c - "http://${host}:${port}/api/v2/auth/login" \
     -d "username=admin&password=adminadmin" 2>/dev/null \
     | grep SID | awk '{print $NF}')
   echo "$sid"
 }
 
 # Add a torrent to a daemon via the API.
-# Args: api_port sid torrent_file save_path
+# Args: api_host api_port sid torrent_file save_path
 api_add_torrent() {
-  local port="$1" sid="$2" torrent_file="$3" save_path="$4"
+  local host="$1" port="$2" sid="$3" torrent_file="$4" save_path="$5"
   curl -s -b "SID=${sid}" \
-    "http://127.0.0.1:${port}/api/v2/torrents/add?savepath=$(printf '%s' "$save_path" | sed 's/ /%20/g')" \
+    "http://${host}:${port}/api/v2/torrents/add?savepath=$(printf '%s' "$save_path" | sed 's/ /%20/g')" \
     --data-binary @"$torrent_file" >/dev/null 2>&1
 }
 
 # Query the torrent list from a daemon and extract the progress of the first torrent.
+# Args: api_host api_port sid
 api_get_progress() {
-  local port="$1" sid="$2"
-  curl -s -b "SID=${sid}" "http://127.0.0.1:${port}/api/v2/torrents/info" 2>/dev/null \
+  local host="$1" port="$2" sid="$3"
+  curl -s -b "SID=${sid}" "http://${host}:${port}/api/v2/torrents/info" 2>/dev/null \
     | sed 's/.*"progress":\([0-9.]*\).*/\1/'
 }
 
 # Write a varuna daemon TOML config file.
-# Args: config_path api_port peer_port data_dir
+# Args: config_path host api_port peer_port data_dir
 #
-# IMPORTANT: Each daemon MUST use its own resume_db. The default XDG path
+# api_bind and [network] bind_address both pin the daemon to the test's
+# loopback address so its API, peer listener, outbound peer connects,
+# and (via the HttpExecutor bind plumbing) tracker announces all go
+# through the same 127.0.N.x address. Without bind_address the tracker
+# announce would originate from 127.0.0.1 and opentracker would
+# register the peer at the wrong IP.
+#
+# Each daemon MUST use its own resume_db. The default XDG path
 # (~/.local/share/varuna/resume.db) is shared across daemon instances;
 # sharing it between the seeder and downloader causes the downloader to
 # load the seeder's completion records and skip downloading entirely
 # (see progress-reports/2026-04-21-test-matrix-resume-db-isolation.md).
 write_daemon_config() {
-  local config_path="$1" api_port="$2" peer_port="$3" data_dir="$4"
+  local config_path="$1" host="$2" api_port="$3" peer_port="$4" data_dir="$5"
   cat >"$config_path" <<EOF
 [daemon]
 api_port = ${api_port}
-api_bind = "127.0.0.1"
+api_bind = "${host}"
 api_username = "admin"
 api_password = "adminadmin"
 
@@ -161,6 +162,7 @@ data_dir = "${data_dir}"
 resume_db = "${data_dir}/resume.db"
 
 [network]
+bind_address = "${host}"
 port_min = ${peer_port}
 port_max = ${peer_port}
 dht = false
@@ -173,13 +175,13 @@ EOF
 }
 
 # Start a varuna daemon with a per-instance config in the given work directory.
-# Args: work_dir api_port peer_port data_dir log_file
+# Args: work_dir host api_port peer_port data_dir log_file
 # Prints: the daemon PID
 start_daemon() {
-  local work_dir="$1" api_port="$2" peer_port="$3" data_dir="$4" log_file="$5"
+  local work_dir="$1" host="$2" api_port="$3" peer_port="$4" data_dir="$5" log_file="$6"
   mkdir -p "$work_dir"
   local config_path="$work_dir/varuna.toml"
-  write_daemon_config "$config_path" "$api_port" "$peer_port" "$data_dir"
+  write_daemon_config "$config_path" "$host" "$api_port" "$peer_port" "$data_dir"
   "$VARUNA" --config "$config_path" >"$log_file" 2>&1 &
   echo "$!"
 }
@@ -188,31 +190,26 @@ start_daemon() {
 # Args: test_name payload_size_kb piece_length_bytes timeout_secs
 run_single_file_test() {
   local name="$1" size_kb="$2" piece_len="$3" timeout_s="${4:-60}"
-  reset_test_state
-  local port_base=$NEXT_PORT
-  NEXT_PORT=$((NEXT_PORT + 100))
 
-  local tp=$port_base sp=$((port_base+1)) dp=$((port_base+2))
-  local sp_api=$((port_base+3)) dp_api=$((port_base+4))
+  TEST_INDEX=$((TEST_INDEX + 1))
+  reset_test_state
+
+  # Unique loopback /24 per test: tracker .1, seeder .2, downloader .3.
+  local tracker_host="127.0.${TEST_INDEX}.1"
+  local seed_host="127.0.${TEST_INDEX}.2"
+  local dl_host="127.0.${TEST_INDEX}.3"
+  # Ports are identical across tests because IPs differ; no 4-tuple collision.
+  local tp=6969 sp=6881 dp=6882 sp_api=8081 dp_api=8082
   local W
   W=$(mktemp -d -t "vt-${name}-XXXXXX")
 
   echo -n "  $name (${size_kb}KB, piece=${piece_len})... "
 
-  # Verify tracker port is free before starting
-  if ! wait_for_port_free "$tp"; then
-    echo "SKIP (port $tp in use)"
-    SKIP_COUNT=$((SKIP_COUNT + 1))
-    RESULTS+=("SKIP $name (port conflict)")
-    rm -rf "$W"
-    return
-  fi
-
   mkdir -p "$W/seed" "$W/dl"
   dd if=/dev/urandom of="$W/seed/payload.bin" bs=1024 count="$size_kb" 2>/dev/null
 
   "$VARUNA_TOOLS" create \
-    -a "http://127.0.0.1:$tp/announce" \
+    -a "http://${tracker_host}:$tp/announce" \
     -l "$piece_len" \
     -o "$W/test.torrent" \
     "$W/seed/payload.bin" >/dev/null 2>&1
@@ -227,59 +224,59 @@ run_single_file_test() {
     return
   fi
 
-  # Start tracker
-  "$ROOT_DIR/scripts/tracker.sh" --host 127.0.0.1 --port "$tp" --whitelist-hash "$H" >"$W/tracker.log" 2>&1 &
+  # Start tracker on the test's tracker IP
+  "$ROOT_DIR/scripts/tracker.sh" --host "$tracker_host" --port "$tp" --whitelist-hash "$H" >"$W/tracker.log" 2>&1 &
   register_pid "$!"
-  wait_for_tcp "$tp" || { echo "SKIP (tracker)"; SKIP_COUNT=$((SKIP_COUNT+1)); RESULTS+=("SKIP $name"); cleanup_test; rm -rf "$W"; return; }
+  wait_for_tcp "$tracker_host" "$tp" || { echo "SKIP (tracker)"; SKIP_COUNT=$((SKIP_COUNT+1)); RESULTS+=("SKIP $name"); cleanup_test; rm -rf "$W"; return; }
 
-  # Start seeder daemon
+  # Start seeder daemon bound to its per-test IP
   local seed_pid
-  seed_pid=$(start_daemon "$W/seed-daemon" "$sp_api" "$sp" "$W/seed" "$W/seed.log")
+  seed_pid=$(start_daemon "$W/seed-daemon" "$seed_host" "$sp_api" "$sp" "$W/seed" "$W/seed.log")
   register_pid "$seed_pid"
-  if ! wait_for_tcp "$sp_api"; then
+  if ! wait_for_tcp "$seed_host" "$sp_api"; then
     echo "SKIP (seed daemon)"
     SKIP_COUNT=$((SKIP_COUNT+1)); RESULTS+=("SKIP $name"); cleanup_test; rm -rf "$W"; return
   fi
 
   # Add torrent to seeder
   local seed_sid
-  seed_sid=$(api_login "$sp_api")
+  seed_sid=$(api_login "$seed_host" "$sp_api")
   if [[ -z "$seed_sid" ]]; then
     echo "SKIP (seed login)"
     SKIP_COUNT=$((SKIP_COUNT+1)); RESULTS+=("SKIP $name"); cleanup_test; rm -rf "$W"; return
   fi
-  register_shutdown "$sp_api" "$seed_sid"
-  api_add_torrent "$sp_api" "$seed_sid" "$W/test.torrent" "$W/seed"
+  register_shutdown "$seed_host" "$sp_api" "$seed_sid"
+  api_add_torrent "$seed_host" "$sp_api" "$seed_sid" "$W/test.torrent" "$W/seed"
 
   # Wait for the seeder to finish its jittered initial tracker announce
   # (varuna applies up to ~5s of jitter to the first announce).
   sleep 6
 
-  # Start downloader daemon
+  # Start downloader daemon bound to its per-test IP
   local dl_pid
-  dl_pid=$(start_daemon "$W/dl-daemon" "$dp_api" "$dp" "$W/dl" "$W/dl.log")
+  dl_pid=$(start_daemon "$W/dl-daemon" "$dl_host" "$dp_api" "$dp" "$W/dl" "$W/dl.log")
   register_pid "$dl_pid"
-  if ! wait_for_tcp "$dp_api"; then
+  if ! wait_for_tcp "$dl_host" "$dp_api"; then
     echo "SKIP (dl daemon)"
     SKIP_COUNT=$((SKIP_COUNT+1)); RESULTS+=("SKIP $name"); cleanup_test; rm -rf "$W"; return
   fi
 
   # Add torrent to downloader
   local dl_sid
-  dl_sid=$(api_login "$dp_api")
+  dl_sid=$(api_login "$dl_host" "$dp_api")
   if [[ -z "$dl_sid" ]]; then
     echo "SKIP (dl login)"
     SKIP_COUNT=$((SKIP_COUNT+1)); RESULTS+=("SKIP $name"); cleanup_test; rm -rf "$W"; return
   fi
-  register_shutdown "$dp_api" "$dl_sid"
-  api_add_torrent "$dp_api" "$dl_sid" "$W/test.torrent" "$W/dl"
+  register_shutdown "$dl_host" "$dp_api" "$dl_sid"
+  api_add_torrent "$dl_host" "$dp_api" "$dl_sid" "$W/test.torrent" "$W/dl"
 
   # Poll until download completes or timeout
   local elapsed=0
   local progress=""
   local completed=false
   while [[ $elapsed -lt $timeout_s ]]; do
-    progress=$(api_get_progress "$dp_api" "$dl_sid")
+    progress=$(api_get_progress "$dl_host" "$dp_api" "$dl_sid")
     if [[ -n "$progress" ]] && awk "BEGIN{exit(!($progress >= 1.0))}" 2>/dev/null; then
       completed=true
       break
@@ -317,25 +314,18 @@ run_single_file_test() {
 # file_specs is "size1_kb:name1,size2_kb:name2,..."
 run_multi_file_test() {
   local name="$1" file_specs="$2" piece_len="$3" timeout_s="${4:-60}"
-  reset_test_state
-  local port_base=$NEXT_PORT
-  NEXT_PORT=$((NEXT_PORT + 100))
 
-  local tp=$port_base sp=$((port_base+1)) dp=$((port_base+2))
-  local sp_api=$((port_base+3)) dp_api=$((port_base+4))
+  TEST_INDEX=$((TEST_INDEX + 1))
+  reset_test_state
+
+  local tracker_host="127.0.${TEST_INDEX}.1"
+  local seed_host="127.0.${TEST_INDEX}.2"
+  local dl_host="127.0.${TEST_INDEX}.3"
+  local tp=6969 sp=6881 dp=6882 sp_api=8081 dp_api=8082
   local W
   W=$(mktemp -d -t "vt-${name}-XXXXXX")
 
   echo -n "  $name (multi-file, piece=${piece_len})... "
-
-  # Verify tracker port is free before starting
-  if ! wait_for_port_free "$tp"; then
-    echo "SKIP (port $tp in use)"
-    SKIP_COUNT=$((SKIP_COUNT + 1))
-    RESULTS+=("SKIP $name (port conflict)")
-    rm -rf "$W"
-    return
-  fi
 
   mkdir -p "$W/seed/content" "$W/dl"
 
@@ -353,7 +343,7 @@ run_multi_file_test() {
   done
 
   "$VARUNA_TOOLS" create \
-    -a "http://127.0.0.1:$tp/announce" \
+    -a "http://${tracker_host}:$tp/announce" \
     -l "$piece_len" \
     -o "$W/test.torrent" \
     "$W/seed/content" >/dev/null 2>&1
@@ -368,54 +358,51 @@ run_multi_file_test() {
     return
   fi
 
-  # Start tracker
-  "$ROOT_DIR/scripts/tracker.sh" --host 127.0.0.1 --port "$tp" --whitelist-hash "$H" >"$W/tracker.log" 2>&1 &
+  "$ROOT_DIR/scripts/tracker.sh" --host "$tracker_host" --port "$tp" --whitelist-hash "$H" >"$W/tracker.log" 2>&1 &
   register_pid "$!"
-  wait_for_tcp "$tp" || { echo "SKIP (tracker)"; SKIP_COUNT=$((SKIP_COUNT+1)); RESULTS+=("SKIP $name"); cleanup_test; rm -rf "$W"; return; }
+  wait_for_tcp "$tracker_host" "$tp" || { echo "SKIP (tracker)"; SKIP_COUNT=$((SKIP_COUNT+1)); RESULTS+=("SKIP $name"); cleanup_test; rm -rf "$W"; return; }
 
-  # Start seeder daemon
   local seed_pid
-  seed_pid=$(start_daemon "$W/seed-daemon" "$sp_api" "$sp" "$W/seed" "$W/seed.log")
+  seed_pid=$(start_daemon "$W/seed-daemon" "$seed_host" "$sp_api" "$sp" "$W/seed" "$W/seed.log")
   register_pid "$seed_pid"
-  if ! wait_for_tcp "$sp_api"; then
+  if ! wait_for_tcp "$seed_host" "$sp_api"; then
     echo "SKIP (seed daemon)"
     SKIP_COUNT=$((SKIP_COUNT+1)); RESULTS+=("SKIP $name"); cleanup_test; rm -rf "$W"; return
   fi
 
-  # Add torrent to seeder
   local seed_sid
-  seed_sid=$(api_login "$sp_api")
+  seed_sid=$(api_login "$seed_host" "$sp_api")
   if [[ -z "$seed_sid" ]]; then
     echo "SKIP (seed login)"
     SKIP_COUNT=$((SKIP_COUNT+1)); RESULTS+=("SKIP $name"); cleanup_test; rm -rf "$W"; return
   fi
-  register_shutdown "$sp_api" "$seed_sid"
-  api_add_torrent "$sp_api" "$seed_sid" "$W/test.torrent" "$W/seed"
+  register_shutdown "$seed_host" "$sp_api" "$seed_sid"
+  api_add_torrent "$seed_host" "$sp_api" "$seed_sid" "$W/test.torrent" "$W/seed"
 
   sleep 6
 
   local dl_pid
-  dl_pid=$(start_daemon "$W/dl-daemon" "$dp_api" "$dp" "$W/dl" "$W/dl.log")
+  dl_pid=$(start_daemon "$W/dl-daemon" "$dl_host" "$dp_api" "$dp" "$W/dl" "$W/dl.log")
   register_pid "$dl_pid"
-  if ! wait_for_tcp "$dp_api"; then
+  if ! wait_for_tcp "$dl_host" "$dp_api"; then
     echo "SKIP (dl daemon)"
     SKIP_COUNT=$((SKIP_COUNT+1)); RESULTS+=("SKIP $name"); cleanup_test; rm -rf "$W"; return
   fi
 
   local dl_sid
-  dl_sid=$(api_login "$dp_api")
+  dl_sid=$(api_login "$dl_host" "$dp_api")
   if [[ -z "$dl_sid" ]]; then
     echo "SKIP (dl login)"
     SKIP_COUNT=$((SKIP_COUNT+1)); RESULTS+=("SKIP $name"); cleanup_test; rm -rf "$W"; return
   fi
-  register_shutdown "$dp_api" "$dl_sid"
-  api_add_torrent "$dp_api" "$dl_sid" "$W/test.torrent" "$W/dl"
+  register_shutdown "$dl_host" "$dp_api" "$dl_sid"
+  api_add_torrent "$dl_host" "$dp_api" "$dl_sid" "$W/test.torrent" "$W/dl"
 
   local elapsed=0
   local progress=""
   local completed=false
   while [[ $elapsed -lt $timeout_s ]]; do
-    progress=$(api_get_progress "$dp_api" "$dl_sid")
+    progress=$(api_get_progress "$dl_host" "$dp_api" "$dl_sid")
     if [[ -n "$progress" ]] && awk "BEGIN{exit(!($progress >= 1.0))}" 2>/dev/null; then
       completed=true
       break
@@ -500,7 +487,7 @@ run_single_file_test "med-10m-256k" 10240   262144   60
 # ── Large files ──────────────────────────────────────────
 echo ""
 echo "Large files (> 10MB):"
-run_single_file_test "large-20m-64k"  20480    65536  240
+run_single_file_test "large-20m-64k"  20480    65536  120
 run_single_file_test "large-20m-256k" 20480   262144   90
 run_single_file_test "large-50m-256k" 51200   262144  180
 run_single_file_test "large-100m-256k" 102400 262144  300
