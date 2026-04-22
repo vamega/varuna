@@ -698,7 +698,13 @@ pub const SessionManager = struct {
     fn ensureTrackerExecutor(self: *SessionManager) !*TrackerExecutor {
         if (self.tracker_executor == null) {
             const el = self.shared_event_loop orelse return error.SharedEventLoopNotConfigured;
-            self.tracker_executor = try TrackerExecutor.create(self.allocator, &el.ring, .{});
+            // Forward the event loop's bind config so tracker announces
+            // originate from the daemon's configured source address/interface
+            // (matches what peer_handler.zig does for peer sockets).
+            self.tracker_executor = try TrackerExecutor.create(self.allocator, &el.ring, .{
+                .bind_device = el.bind_device,
+                .bind_address = el.bind_address,
+            });
             // Wire the underlying HttpExecutor into event loop for CQE dispatch
             el.http_executor = self.tracker_executor.?.http;
             el.tracker_executor = self.tracker_executor;

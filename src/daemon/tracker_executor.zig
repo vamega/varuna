@@ -41,6 +41,9 @@ pub const TrackerExecutor = struct {
     pub const Config = struct {
         max_concurrent: u16 = 8,
         max_per_host: u16 = 3,
+        /// Forwarded to HttpExecutor — see its docs.
+        bind_device: ?[]const u8 = null,
+        bind_address: ?[]const u8 = null,
     };
 
     // ── Public API ───────────────────────────────────────────
@@ -54,6 +57,8 @@ pub const TrackerExecutor = struct {
             .http = try HttpExecutor.create(allocator, ring, .{
                 .max_concurrent = config.max_concurrent,
                 .max_per_host = config.max_per_host,
+                .bind_device = config.bind_device,
+                .bind_address = config.bind_address,
             }),
         };
 

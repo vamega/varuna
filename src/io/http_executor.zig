@@ -6,6 +6,7 @@ const DnsResolver = @import("dns.zig").DnsResolver;
 const DnsJob = @import("../io/dns_threadpool.zig").DnsJob;
 const http = @import("http_parse.zig");
 const TlsStream = @import("tls.zig").TlsStream;
+const socket_util = @import("../net/socket.zig");
 const build_options = @import("build_options");
 
 // Reuse the event loop's user data encoding.
@@ -48,6 +49,13 @@ pub const HttpExecutor = struct {
     active_count: u16 = 0,
     max_concurrent: u16,
     max_per_host: u16,
+
+    // Bind configuration applied to every outbound socket before connect.
+    // Mirrors src/io/peer_handler.zig:144; needed for tests (and production
+    // multi-homed setups) where the HTTP tracker and web seed clients must
+    // go out of a specific interface or source address.
+    bind_device: ?[]const u8 = null,
+    bind_address: ?[]const u8 = null,
 
     dns_resolver: DnsResolver,
     pool: ConnectionPool = .{},
@@ -131,6 +139,12 @@ pub const HttpExecutor = struct {
     pub const Config = struct {
         max_concurrent: u16 = 8,
         max_per_host: u16 = 3,
+        /// Interface name for SO_BINDTODEVICE (optional). Strings must outlive
+        /// the executor; typically passed from cfg.network.bind_device.
+        bind_device: ?[]const u8 = null,
+        /// Source address for outbound sockets (optional). Strings must
+        /// outlive the executor; typically passed from cfg.network.bind_address.
+        bind_address: ?[]const u8 = null,
     };
 
     const RequestSlot = struct {
@@ -271,6 +285,8 @@ pub const HttpExecutor = struct {
             .deferred_jobs = std.ArrayList(Job).empty,
             .max_concurrent = config.max_concurrent,
             .max_per_host = config.max_per_host,
+            .bind_device = config.bind_device,
+            .bind_address = config.bind_address,
             .dns_resolver = try DnsResolver.init(allocator),
             .slots = undefined,
             .free_slot_count = config.max_concurrent,
@@ -510,6 +526,18 @@ pub const HttpExecutor = struct {
 
         const fd: posix.fd_t = @intCast(cqe.res);
         slot.fd = fd;
+
+        // Apply bind_device (SO_BINDTODEVICE) and bind_address (explicit
+        // source IP) before connect. Without this the outbound HTTP tracker
+        // and web seed requests always use the OS-default source, which
+        // for tests means opentracker registers peers at 127.0.0.1 even
+        // when the daemon's peer listener is bound to 127.0.N.x.
+        socket_util.applyBindConfig(fd, self.bind_device, self.bind_address, 0) catch {
+            posix.close(fd);
+            slot.fd = -1;
+            self.completeSlot(slot_idx, .{ .err = error.BindFailed });
+            return;
+        };
 
         const ud = encodeUserData(.{ .slot = slot_idx, .op_type = .http_connect, .context = 0 });
         const sqe = self.ring.connect(ud, fd, &slot.address.any, slot.address.getOsSockLen()) catch {
