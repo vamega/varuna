@@ -94,6 +94,12 @@ api_get_progress() {
 
 # Write a varuna daemon TOML config file.
 # Args: config_path api_port peer_port data_dir
+#
+# IMPORTANT: Each daemon MUST use its own resume_db. The default XDG path
+# (~/.local/share/varuna/resume.db) is shared across daemon instances;
+# sharing it between the seeder and downloader causes the downloader to
+# load the seeder's completion records and skip downloading entirely
+# (see progress-reports/2026-04-21-test-matrix-resume-db-isolation.md).
 write_daemon_config() {
   local config_path="$1" api_port="$2" peer_port="$3" data_dir="$4"
   cat >"$config_path" <<EOF
@@ -105,12 +111,17 @@ api_password = "adminadmin"
 
 [storage]
 data_dir = "${data_dir}"
+resume_db = "${data_dir}/resume.db"
 
 [network]
 port_min = ${peer_port}
 port_max = ${peer_port}
 dht = false
 pex = false
+# Disable uTP: varuna's uTP path currently fails on BT messages that span
+# multiple uTP packets (anything above ~2KB). Tracked as a separate bug in
+# STATUS.md under "Known Issues". TCP transfers work correctly.
+enable_utp = false
 EOF
 }
 
