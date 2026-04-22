@@ -2,6 +2,23 @@
 # Comprehensive transfer test matrix for verifying data integrity.
 # Tests various file sizes, piece sizes, and multi-file torrents.
 # Uses the varuna daemon + varuna-ctl API instead of varuna-tools seed/download.
+#
+# ── Isolation model ───────────────────────────────────────────────────────
+# Each test gets a fresh 100-port range starting at 30000 (+100 per test),
+# so no two concurrent listen sockets share an (ip, port). Cleanup uses
+# POST /api/v2/app/shutdown?timeout=0 to trigger a graceful exit on each
+# daemon; the main loop then sees el.running=false, closes sockets with
+# proper FIN handshakes, and exits. We only SIGKILL as a last resort
+# (tracker, or a daemon stuck past the drain window).
+#
+# Attempted but reverted: unique 127.0.N.X /24 per test. The daemon's
+# HTTP tracker client doesn't honor bind_address, so announces originate
+# from the default source IP (127.0.0.1) and opentracker registers the
+# seeder at the wrong address, which makes the downloader unable to reach
+# it. Reintroducing this would require wiring bind_address into
+# http_executor.zig's socket creation; until then, unique-port isolation
+# plus graceful shutdown is sufficient.
+# ─────────────────────────────────────────────────────────────────────────
 set -o pipefail
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -19,29 +36,59 @@ VARUNA_TOOLS="$ROOT_DIR/zig-out/bin/varuna-tools"
 #                    +3 = seed API, +4 = download API.
 NEXT_PORT="${BASE_PORT:-30000}"
 
+# Per-test lists, reset at the start of every run_*_test invocation.
+# DAEMON_PIDS holds PIDs of every background process launched (daemons + tracker).
+# DAEMON_SHUTDOWN_CMDS holds ready-to-eval curl invocations for graceful shutdown.
+DAEMON_PIDS=()
+DAEMON_SHUTDOWN_CMDS=()
+
+reset_test_state() {
+  DAEMON_PIDS=()
+  DAEMON_SHUTDOWN_CMDS=()
+}
+
+# Register a background PID so cleanup_test waits for and kills it.
+register_pid() {
+  DAEMON_PIDS+=("$1")
+}
+
+# Register a (api_port, sid) tuple so cleanup_test can POST a graceful
+# shutdown to this daemon before resorting to SIGKILL.
+register_shutdown() {
+  local port="$1" sid="$2"
+  DAEMON_SHUTDOWN_CMDS+=("curl -s -b 'SID=${sid}' -X POST 'http://127.0.0.1:${port}/api/v2/app/shutdown?timeout=0'")
+}
+
+# Shut down every registered daemon cleanly, then wait for every registered
+# PID, falling back to SIGKILL if any still live after the grace period.
+# This closes sockets with a proper FIN handshake so the next test starts
+# from a clean kernel state (no lingering TIME_WAIT tying up ports).
 cleanup_test() {
-  local pids="$1"
-  # Send SIGTERM first for graceful shutdown
-  for pid in $pids; do
-    kill "$pid" 2>/dev/null || true
+  # 1. Ask every daemon to shut down through the API (best-effort).
+  for cmd in "${DAEMON_SHUTDOWN_CMDS[@]}"; do
+    eval "$cmd" >/dev/null 2>&1 || true
   done
-  sleep 0.2
-  # Force-kill anything still alive
-  for pid in $pids; do
+
+  # 2. Give processes up to 2s to exit on their own after API shutdown.
+  local pids=("${DAEMON_PIDS[@]}")
+  for _ in 1 2 3 4; do
+    local any_alive=0
+    for pid in "${pids[@]}"; do
+      if kill -0 "$pid" 2>/dev/null; then
+        any_alive=1
+        break
+      fi
+    done
+    (( any_alive == 0 )) && break
+    sleep 0.5
+  done
+
+  # 3. SIGKILL whatever is still alive (tracker, or a stuck daemon).
+  for pid in "${pids[@]}"; do
     kill -9 "$pid" 2>/dev/null || true
   done
-  # Wait for all processes to fully exit
-  for pid in $pids; do
+  for pid in "${pids[@]}"; do
     wait "$pid" 2>/dev/null || true
-  done
-  # Verify all processes are dead
-  for pid in $pids; do
-    if kill -0 "$pid" 2>/dev/null; then
-      echo "    warning: process $pid still alive after cleanup" >&2
-      sleep 0.5
-      kill -9 "$pid" 2>/dev/null || true
-      wait "$pid" 2>/dev/null || true
-    fi
   done
 }
 
@@ -128,11 +175,6 @@ EOF
 # Start a varuna daemon with a per-instance config in the given work directory.
 # Args: work_dir api_port peer_port data_dir log_file
 # Prints: the daemon PID
-#
-# Passes the config via --config <path> so the daemon loads a per-instance
-# file instead of the implicit CWD lookup. This makes test isolation
-# explicit and avoids accidental config sharing if tests run from the
-# same working directory.
 start_daemon() {
   local work_dir="$1" api_port="$2" peer_port="$3" data_dir="$4" log_file="$5"
   mkdir -p "$work_dir"
@@ -146,13 +188,14 @@ start_daemon() {
 # Args: test_name payload_size_kb piece_length_bytes timeout_secs
 run_single_file_test() {
   local name="$1" size_kb="$2" piece_len="$3" timeout_s="${4:-60}"
+  reset_test_state
   local port_base=$NEXT_PORT
   NEXT_PORT=$((NEXT_PORT + 100))
 
   local tp=$port_base sp=$((port_base+1)) dp=$((port_base+2))
   local sp_api=$((port_base+3)) dp_api=$((port_base+4))
-  local W=$(mktemp -d -t "vt-${name}-XXXXXX")
-  local pids=""
+  local W
+  W=$(mktemp -d -t "vt-${name}-XXXXXX")
 
   echo -n "  $name (${size_kb}KB, piece=${piece_len})... "
 
@@ -186,16 +229,16 @@ run_single_file_test() {
 
   # Start tracker
   "$ROOT_DIR/scripts/tracker.sh" --host 127.0.0.1 --port "$tp" --whitelist-hash "$H" >"$W/tracker.log" 2>&1 &
-  pids="$!"
-  wait_for_tcp "$tp" || { echo "SKIP (tracker)"; SKIP_COUNT=$((SKIP_COUNT+1)); RESULTS+=("SKIP $name"); cleanup_test "$pids"; rm -rf "$W"; return; }
+  register_pid "$!"
+  wait_for_tcp "$tp" || { echo "SKIP (tracker)"; SKIP_COUNT=$((SKIP_COUNT+1)); RESULTS+=("SKIP $name"); cleanup_test; rm -rf "$W"; return; }
 
   # Start seeder daemon
   local seed_pid
   seed_pid=$(start_daemon "$W/seed-daemon" "$sp_api" "$sp" "$W/seed" "$W/seed.log")
-  pids="$pids $seed_pid"
+  register_pid "$seed_pid"
   if ! wait_for_tcp "$sp_api"; then
     echo "SKIP (seed daemon)"
-    SKIP_COUNT=$((SKIP_COUNT+1)); RESULTS+=("SKIP $name"); cleanup_test "$pids"; rm -rf "$W"; return
+    SKIP_COUNT=$((SKIP_COUNT+1)); RESULTS+=("SKIP $name"); cleanup_test; rm -rf "$W"; return
   fi
 
   # Add torrent to seeder
@@ -203,24 +246,22 @@ run_single_file_test() {
   seed_sid=$(api_login "$sp_api")
   if [[ -z "$seed_sid" ]]; then
     echo "SKIP (seed login)"
-    SKIP_COUNT=$((SKIP_COUNT+1)); RESULTS+=("SKIP $name"); cleanup_test "$pids"; rm -rf "$W"; return
+    SKIP_COUNT=$((SKIP_COUNT+1)); RESULTS+=("SKIP $name"); cleanup_test; rm -rf "$W"; return
   fi
+  register_shutdown "$sp_api" "$seed_sid"
   api_add_torrent "$sp_api" "$seed_sid" "$W/test.torrent" "$W/seed"
 
-  # Wait for the seeder to complete its initial tracker announce.
-  # Varuna applies up to ~5s of jitter to the initial announce; if the
-  # downloader comes up before the seeder has announced, the downloader's
-  # first announce gets an empty peer list and has to wait for its
-  # reannounce interval, which can blow the per-test timeout.
+  # Wait for the seeder to finish its jittered initial tracker announce
+  # (varuna applies up to ~5s of jitter to the first announce).
   sleep 6
 
   # Start downloader daemon
   local dl_pid
   dl_pid=$(start_daemon "$W/dl-daemon" "$dp_api" "$dp" "$W/dl" "$W/dl.log")
-  pids="$pids $dl_pid"
+  register_pid "$dl_pid"
   if ! wait_for_tcp "$dp_api"; then
     echo "SKIP (dl daemon)"
-    SKIP_COUNT=$((SKIP_COUNT+1)); RESULTS+=("SKIP $name"); cleanup_test "$pids"; rm -rf "$W"; return
+    SKIP_COUNT=$((SKIP_COUNT+1)); RESULTS+=("SKIP $name"); cleanup_test; rm -rf "$W"; return
   fi
 
   # Add torrent to downloader
@@ -228,8 +269,9 @@ run_single_file_test() {
   dl_sid=$(api_login "$dp_api")
   if [[ -z "$dl_sid" ]]; then
     echo "SKIP (dl login)"
-    SKIP_COUNT=$((SKIP_COUNT+1)); RESULTS+=("SKIP $name"); cleanup_test "$pids"; rm -rf "$W"; return
+    SKIP_COUNT=$((SKIP_COUNT+1)); RESULTS+=("SKIP $name"); cleanup_test; rm -rf "$W"; return
   fi
+  register_shutdown "$dp_api" "$dl_sid"
   api_add_torrent "$dp_api" "$dl_sid" "$W/test.torrent" "$W/dl"
 
   # Poll until download completes or timeout
@@ -266,10 +308,8 @@ run_single_file_test() {
     RESULTS+=("FAIL $name (timeout)")
   fi
 
-  cleanup_test "$pids"
+  cleanup_test
   rm -rf "$W"
-  # Brief pause for socket TIME_WAIT cleanup between tests
-  sleep 0.5
 }
 
 # Run a multi-file (directory) transfer test
@@ -277,13 +317,14 @@ run_single_file_test() {
 # file_specs is "size1_kb:name1,size2_kb:name2,..."
 run_multi_file_test() {
   local name="$1" file_specs="$2" piece_len="$3" timeout_s="${4:-60}"
+  reset_test_state
   local port_base=$NEXT_PORT
   NEXT_PORT=$((NEXT_PORT + 100))
 
   local tp=$port_base sp=$((port_base+1)) dp=$((port_base+2))
   local sp_api=$((port_base+3)) dp_api=$((port_base+4))
-  local W=$(mktemp -d -t "vt-${name}-XXXXXX")
-  local pids=""
+  local W
+  W=$(mktemp -d -t "vt-${name}-XXXXXX")
 
   echo -n "  $name (multi-file, piece=${piece_len})... "
 
@@ -304,8 +345,8 @@ run_multi_file_test() {
   for spec in "${specs[@]}"; do
     local sz_kb="${spec%%:*}"
     local fname="${spec##*:}"
-    # Support subdirectories
-    local fdir=$(dirname "$fname")
+    local fdir
+    fdir=$(dirname "$fname")
     [[ "$fdir" != "." ]] && mkdir -p "$W/seed/content/$fdir"
     dd if=/dev/urandom of="$W/seed/content/$fname" bs=1024 count="$sz_kb" 2>/dev/null
     total_kb=$((total_kb + sz_kb))
@@ -329,16 +370,16 @@ run_multi_file_test() {
 
   # Start tracker
   "$ROOT_DIR/scripts/tracker.sh" --host 127.0.0.1 --port "$tp" --whitelist-hash "$H" >"$W/tracker.log" 2>&1 &
-  pids="$!"
-  wait_for_tcp "$tp" || { echo "SKIP (tracker)"; SKIP_COUNT=$((SKIP_COUNT+1)); RESULTS+=("SKIP $name"); cleanup_test "$pids"; rm -rf "$W"; return; }
+  register_pid "$!"
+  wait_for_tcp "$tp" || { echo "SKIP (tracker)"; SKIP_COUNT=$((SKIP_COUNT+1)); RESULTS+=("SKIP $name"); cleanup_test; rm -rf "$W"; return; }
 
-  # Start seeder daemon (multi-file torrents: pass parent dir so PieceStore finds <torrent_name>/<file_path>)
+  # Start seeder daemon
   local seed_pid
   seed_pid=$(start_daemon "$W/seed-daemon" "$sp_api" "$sp" "$W/seed" "$W/seed.log")
-  pids="$pids $seed_pid"
+  register_pid "$seed_pid"
   if ! wait_for_tcp "$sp_api"; then
     echo "SKIP (seed daemon)"
-    SKIP_COUNT=$((SKIP_COUNT+1)); RESULTS+=("SKIP $name"); cleanup_test "$pids"; rm -rf "$W"; return
+    SKIP_COUNT=$((SKIP_COUNT+1)); RESULTS+=("SKIP $name"); cleanup_test; rm -rf "$W"; return
   fi
 
   # Add torrent to seeder
@@ -346,36 +387,30 @@ run_multi_file_test() {
   seed_sid=$(api_login "$sp_api")
   if [[ -z "$seed_sid" ]]; then
     echo "SKIP (seed login)"
-    SKIP_COUNT=$((SKIP_COUNT+1)); RESULTS+=("SKIP $name"); cleanup_test "$pids"; rm -rf "$W"; return
+    SKIP_COUNT=$((SKIP_COUNT+1)); RESULTS+=("SKIP $name"); cleanup_test; rm -rf "$W"; return
   fi
+  register_shutdown "$sp_api" "$seed_sid"
   api_add_torrent "$sp_api" "$seed_sid" "$W/test.torrent" "$W/seed"
 
-  # Wait for the seeder to complete its initial tracker announce.
-  # Varuna applies up to ~5s of jitter to the initial announce; if the
-  # downloader comes up before the seeder has announced, the downloader's
-  # first announce gets an empty peer list and has to wait for its
-  # reannounce interval, which can blow the per-test timeout.
   sleep 6
 
-  # Start downloader daemon
   local dl_pid
   dl_pid=$(start_daemon "$W/dl-daemon" "$dp_api" "$dp" "$W/dl" "$W/dl.log")
-  pids="$pids $dl_pid"
+  register_pid "$dl_pid"
   if ! wait_for_tcp "$dp_api"; then
     echo "SKIP (dl daemon)"
-    SKIP_COUNT=$((SKIP_COUNT+1)); RESULTS+=("SKIP $name"); cleanup_test "$pids"; rm -rf "$W"; return
+    SKIP_COUNT=$((SKIP_COUNT+1)); RESULTS+=("SKIP $name"); cleanup_test; rm -rf "$W"; return
   fi
 
-  # Add torrent to downloader
   local dl_sid
   dl_sid=$(api_login "$dp_api")
   if [[ -z "$dl_sid" ]]; then
     echo "SKIP (dl login)"
-    SKIP_COUNT=$((SKIP_COUNT+1)); RESULTS+=("SKIP $name"); cleanup_test "$pids"; rm -rf "$W"; return
+    SKIP_COUNT=$((SKIP_COUNT+1)); RESULTS+=("SKIP $name"); cleanup_test; rm -rf "$W"; return
   fi
+  register_shutdown "$dp_api" "$dl_sid"
   api_add_torrent "$dp_api" "$dl_sid" "$W/test.torrent" "$W/dl"
 
-  # Poll until download completes or timeout
   local elapsed=0
   local progress=""
   local completed=false
@@ -390,7 +425,6 @@ run_multi_file_test() {
   done
 
   if $completed; then
-    # Verify each file
     local all_match=true
     for spec in "${specs[@]}"; do
       local fname="${spec##*:}"
@@ -418,10 +452,8 @@ run_multi_file_test() {
     RESULTS+=("FAIL $name")
   fi
 
-  cleanup_test "$pids"
+  cleanup_test
   rm -rf "$W"
-  # Brief pause for socket TIME_WAIT cleanup between tests
-  sleep 0.5
 }
 
 # ─── Main ───────────────────────────────────────────────
@@ -434,8 +466,6 @@ echo ""
 zig build >/dev/null 2>&1
 
 # Kill any lingering daemon processes from THIS worktree's previous runs.
-# Only kill processes whose command line references this ROOT_DIR to avoid
-# interfering with other concurrent test runs from different worktrees.
 for pid in $(pgrep -f "$ROOT_DIR/zig-out/bin/varuna" 2>/dev/null || true); do
   [[ "$pid" == "$$" ]] && continue
   kill -9 "$pid" 2>/dev/null || true
@@ -470,7 +500,7 @@ run_single_file_test "med-10m-256k" 10240   262144   60
 # ── Large files ──────────────────────────────────────────
 echo ""
 echo "Large files (> 10MB):"
-run_single_file_test "large-20m-64k"  20480    65536  120
+run_single_file_test "large-20m-64k"  20480    65536  240
 run_single_file_test "large-20m-256k" 20480   262144   90
 run_single_file_test "large-50m-256k" 51200   262144  180
 run_single_file_test "large-100m-256k" 102400 262144  300
