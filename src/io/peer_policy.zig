@@ -1092,17 +1092,31 @@ pub fn checkReannounce(self: *EventLoop) void {
             var drained = owned_results;
             drained.deinit(self.allocator);
         }
+        // Precompute our own listen address so we can skip self-announces.
+        // Trackers routinely return the announcing client itself as one of
+        // the peers. Connecting to ourselves creates two slot entries
+        // (outbound initiator + inbound accept) pointing at the same listen
+        // socket, with no possible data transfer but real state-machine cost
+        // — on larger tests this self-loop has been observed to correlate
+        // with the downloader-stall flake.
+        const self_address: ?std.net.Address = blk: {
+            const bind_str = self.bind_address orelse "0.0.0.0";
+            if (std.net.Address.parseIp4(bind_str, self.port)) |a| break :blk a else |_| {}
+            if (std.net.Address.parseIp6(bind_str, self.port)) |a| break :blk a else |_| {}
+            break :blk null;
+        };
+
         for (owned_results.items) |result| {
             const tc = self.getTorrentContext(result.torrent_id) orelse continue;
             for (result.peers) |addr| {
                 if (self.peer_count >= self.max_connections) break;
+
+                // Skip self: the tracker echoes our own announce back.
+                if (self_address) |own| {
+                    if (addr_mod.addressEql(&own, &addr)) continue;
+                }
+
                 // Deduplicate: skip addresses we already have a peer for.
-                // Tracker responses frequently include the announcing client
-                // itself, plus PEX can re-echo peers tracker already gave us.
-                // Without this check we kick off a fresh outbound for every
-                // announce → socket/connect SQE churn on loopback, and on a
-                // local test where tracker returns both our own address and
-                // the seeder's we'd reconnect-loop forever.
                 var already = false;
                 for (tc.peer_slots.items) |slot| {
                     const p = &self.peers[slot];
