@@ -17,6 +17,7 @@ const Hasher = @import("hasher.zig").Hasher;
 const LayoutSpan = @import("../torrent/layout.zig").Layout.Span;
 const utp_handler = @import("utp_handler.zig");
 const web_seed_handler = @import("web_seed_handler.zig");
+const addr_mod = @import("../net/address.zig");
 const BanList = @import("../net/ban_list.zig").BanList;
 const SmartBan = @import("../net/smart_ban.zig").SmartBan;
 const dp_mod = @import("downloading_piece.zig");
@@ -1092,9 +1093,26 @@ pub fn checkReannounce(self: *EventLoop) void {
             drained.deinit(self.allocator);
         }
         for (owned_results.items) |result| {
-            if (self.getTorrentContext(result.torrent_id) == null) continue;
+            const tc = self.getTorrentContext(result.torrent_id) orelse continue;
             for (result.peers) |addr| {
                 if (self.peer_count >= self.max_connections) break;
+                // Deduplicate: skip addresses we already have a peer for.
+                // Tracker responses frequently include the announcing client
+                // itself, plus PEX can re-echo peers tracker already gave us.
+                // Without this check we kick off a fresh outbound for every
+                // announce → socket/connect SQE churn on loopback, and on a
+                // local test where tracker returns both our own address and
+                // the seeder's we'd reconnect-loop forever.
+                var already = false;
+                for (tc.peer_slots.items) |slot| {
+                    const p = &self.peers[slot];
+                    if (p.state == .free) continue;
+                    if (addr_mod.addressEql(&p.address, &addr)) {
+                        already = true;
+                        break;
+                    }
+                }
+                if (already) continue;
                 _ = self.addPeerAutoTransport(addr, result.torrent_id) catch continue;
             }
         }
