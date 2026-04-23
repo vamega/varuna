@@ -248,8 +248,12 @@ run_single_file_test() {
   register_shutdown "$seed_host" "$sp_api" "$seed_sid"
   api_add_torrent "$seed_host" "$sp_api" "$seed_sid" "$W/test.torrent" "$W/seed"
 
-  # Wait for the seeder to finish its jittered initial tracker announce
-  # (varuna applies up to ~5s of jitter to the first announce).
+  # Wait for the seeder's initial jittered announce. Varuna schedules
+  # this with up to ~5 s of jitter, so we sleep 6 s here to guarantee
+  # the tracker has registered the seeder before the downloader queries.
+  # (An earlier attempt to replace this with wait_for_seeding +
+  # forceReannounce produced intermittent mid-matrix failures; left as
+  # a follow-up to instrument announce timing more carefully.)
   sleep 6
 
   # Start downloader daemon bound to its per-test IP
@@ -285,6 +289,7 @@ run_single_file_test() {
     elapsed=$((elapsed + 1))
   done
 
+  local ok=pass
   if $completed; then
     if cmp -s "$W/seed/payload.bin" "$W/dl/payload.bin"; then
       echo "PASS"
@@ -292,6 +297,7 @@ run_single_file_test() {
       RESULTS+=("PASS $name")
     else
       echo "FAIL (data mismatch)"
+      ok=fail
       FAIL_COUNT=$((FAIL_COUNT + 1))
       RESULTS+=("FAIL $name (data mismatch)")
     fi
@@ -301,12 +307,17 @@ run_single_file_test() {
     else
       echo "FAIL (download error, progress=${progress:-unknown})"
     fi
+    ok=fail
     FAIL_COUNT=$((FAIL_COUNT + 1))
     RESULTS+=("FAIL $name (timeout)")
   fi
 
   cleanup_test
-  rm -rf "$W"
+  if [[ "$ok" == "pass" ]]; then
+    rm -rf "$W"
+  else
+    echo "    (preserved workdir for inspection: $W)"
+  fi
 }
 
 # Run a multi-file (directory) transfer test
