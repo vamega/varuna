@@ -19,32 +19,41 @@ pub const TorrentId = u32;
 // ── User data encoding ────────────────────────────────────
 
 pub const OpType = enum(u8) {
-    peer_connect = 0,
-    peer_recv = 1,
-    peer_send = 2,
-    accept = 3,
-    disk_read = 4,
-    disk_write = 5,
-    http_connect = 6,
-    http_send = 7,
-    http_recv = 8,
-    timeout = 9,
-    cancel = 10,
-    utp_recv = 11,
-    utp_send = 12,
-    api_accept = 13,
-    api_recv = 14,
-    api_send = 15,
-    udp_tracker_send = 16,
-    udp_tracker_recv = 17,
-    timerfd = 18,
-    recheck_read = 19,
-    metadata_connect = 20,
-    metadata_send = 21,
-    metadata_recv = 22,
-    peer_socket = 23,
-    http_socket = 24,
-    udp_socket = 25,
+    // Value 0 is reserved for "no op / spurious CQE". Any CQE whose user_data
+    // decodes to op_type=0 is filtered out in dispatch. This defends against
+    // the kernel occasionally emitting CQEs with user_data=0 — observed on
+    // failed large-20m-64k runs as a flood of 120+ peer_connect CQEs with
+    // res=0 flags=0, clearly not originated by any of our submit sites (see
+    // progress-reports/2026-04-22-inbound-peer-address-fix.md). Previously
+    // peer_connect = 0 collided with the sentinel, making the filter
+    // impossible.
+    invalid = 0,
+    peer_connect = 1,
+    peer_recv = 2,
+    peer_send = 3,
+    accept = 4,
+    disk_read = 5,
+    disk_write = 6,
+    http_connect = 7,
+    http_send = 8,
+    http_recv = 9,
+    timeout = 10,
+    cancel = 11,
+    utp_recv = 12,
+    utp_send = 13,
+    api_accept = 14,
+    api_recv = 15,
+    api_send = 16,
+    udp_tracker_send = 17,
+    udp_tracker_recv = 18,
+    timerfd = 19,
+    recheck_read = 20,
+    metadata_connect = 21,
+    metadata_send = 22,
+    metadata_recv = 23,
+    peer_socket = 24,
+    http_socket = 25,
+    udp_socket = 26,
 };
 
 pub const OpData = struct {

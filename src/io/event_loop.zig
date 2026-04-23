@@ -1785,6 +1785,15 @@ pub const EventLoop = struct {
 
         const op = decodeUserData(cqe.user_data);
         switch (op.op_type) {
+            .invalid => {
+                // Spurious CQE with user_data=0 — the kernel occasionally
+                // emits these (observed on heavier-load tests). No submit
+                // site in our code produces user_data=0 after the
+                // enum value shift; if one ever did, it'd be a bug.
+                log.debug("dispatch: ignoring user_data=0x{x} res={d} flags=0x{x}", .{
+                    cqe.user_data, cqe.res, cqe.flags,
+                });
+            },
             .peer_socket => peer_handler.handleSocketCreated(self, op.slot, cqe),
             .peer_connect => peer_handler.handleConnect(self, op.slot, cqe),
             .peer_recv => peer_handler.handleRecv(self, op.slot, cqe),
