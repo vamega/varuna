@@ -191,6 +191,20 @@ pub fn build(b: *std.Build) void {
     const run_adversarial_tests = b.addRunArtifact(adversarial_tests);
     test_step.dependOn(&run_adversarial_tests.step);
 
+    // Regression tests for commit 3af560a (large-20m-64k stall): protocol
+    // handlers misusing peer.mode as the swarm role. Deterministic — drives
+    // processMessage directly with constructed bodies, no network.
+    const peer_mode_tests = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("tests/peer_mode_regression_test.zig"),
+            .target = target,
+            .optimize = optimize,
+            .imports = &varuna_import,
+        }),
+    });
+    const run_peer_mode_tests = b.addRunArtifact(peer_mode_tests);
+    test_step.dependOn(&run_peer_mode_tests.step);
+
     const private_tracker_tests = b.addTest(.{
         .root_module = b.createModule(.{
             .root_source_file = b.path("tests/private_tracker_test.zig"),
