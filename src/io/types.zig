@@ -98,6 +98,7 @@ pub const PeerState = enum {
     handshake_send,
     handshake_recv,
     extension_handshake_send, // BEP 10: sending extension handshake after peer handshake
+    outbound_bitfield_send, // sending bitfield after outbound extension handshake (so peer learns what we have)
     inbound_handshake_recv,
     inbound_handshake_send, // sending our handshake back
     inbound_extension_handshake_send, // BEP 10: sending extension handshake (inbound)
