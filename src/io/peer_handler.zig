@@ -31,19 +31,31 @@ pub fn handleAccept(self: *EventLoop, cqe: linux.io_uring_cqe) void {
     }
     const new_fd: posix.fd_t = @intCast(cqe.res);
 
-    // Extract peer address and check ban list before allocating a slot
+    // Resolve the peer's remote address up-front. Every downstream code path
+    // that touches peer.address (ban checks, PEX duplicate-connection filter,
+    // smart ban, /sync/torrentPeers) assumes it's a valid std.net.Address —
+    // if we leave it `undefined` we get stack-garbage behaviour: silent
+    // false-match on addressEql (killing good connections as "duplicates")
+    // and panics in getPort on unexpected families. Bail on peers we can't
+    // identify rather than carry an unknown address forward.
+    var peer_addr_storage: posix.sockaddr.storage = undefined;
+    var addr_len: posix.socklen_t = @sizeOf(posix.sockaddr.storage);
+    const getpeername_rc = std.os.linux.getpeername(new_fd, @ptrCast(&peer_addr_storage), &addr_len);
+    if (@as(i32, @bitCast(@as(u32, @truncate(getpeername_rc)))) < 0) {
+        log.debug("rejected inbound: getpeername failed", .{});
+        posix.close(new_fd);
+        if (!more) self.submitAccept() catch {};
+        return;
+    }
+    const peer_address = std.net.Address{ .any = @as(*posix.sockaddr, @ptrCast(&peer_addr_storage)).* };
+
+    // Check ban list using the resolved address.
     if (self.ban_list) |bl| {
-        var peer_addr: posix.sockaddr.storage = undefined;
-        var addr_len: posix.socklen_t = @sizeOf(posix.sockaddr.storage);
-        const rc = std.os.linux.getpeername(new_fd, @ptrCast(&peer_addr), &addr_len);
-        if (@as(i32, @bitCast(@as(u32, @truncate(rc)))) >= 0) {
-            const net_addr = std.net.Address{ .any = @as(*posix.sockaddr, @ptrCast(&peer_addr)).* };
-            if (bl.isBanned(net_addr)) {
-                log.debug("rejected banned inbound peer", .{});
-                posix.close(new_fd);
-                if (!more) self.submitAccept() catch {};
-                return;
-            }
+        if (bl.isBanned(peer_address)) {
+            log.debug("rejected banned inbound peer", .{});
+            posix.close(new_fd);
+            if (!more) self.submitAccept() catch {};
+            return;
         }
     }
 
@@ -90,6 +102,7 @@ pub fn handleAccept(self: *EventLoop, cqe: linux.io_uring_cqe) void {
         .fd = new_fd,
         .state = .inbound_handshake_recv,
         .mode = .inbound,
+        .address = peer_address,
     };
     peer.handshake_offset = 0;
     self.peer_count += 1;
