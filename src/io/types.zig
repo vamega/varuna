@@ -28,9 +28,6 @@ pub const OpType = enum(u8) {
     utp_send = 12,
     udp_tracker_send = 16,
     udp_tracker_recv = 17,
-    metadata_connect = 20,
-    metadata_send = 21,
-    metadata_recv = 22,
     peer_socket = 23,
     udp_socket = 25,
 };

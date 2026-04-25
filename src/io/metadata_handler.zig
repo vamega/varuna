@@ -4,13 +4,15 @@ const linux = std.os.linux;
 const log = std.log.scoped(.metadata_handler);
 
 const types = @import("types.zig");
-const encodeUserData = types.encodeUserData;
-const OpType = types.OpType;
 
 const ut_metadata = @import("../net/ut_metadata.zig");
 const ext = @import("../net/extensions.zig");
 const pw = @import("../net/peer_wire.zig");
 const socket_util = @import("../net/socket.zig");
+
+const io_interface = @import("io_interface.zig");
+const real_io_mod = @import("real_io.zig");
+const RealIO = real_io_mod.RealIO;
 
 /// Async BEP 9 metadata fetch state machine for the io_uring event loop.
 ///
@@ -28,7 +30,7 @@ const socket_util = @import("../net/socket.zig");
 ///   5. Caller calls `destroy()` to free resources.
 pub const AsyncMetadataFetch = struct {
     allocator: std.mem.Allocator,
-    ring: *linux.IoUring,
+    io: *RealIO,
     info_hash: [20]u8,
     peer_id: [20]u8,
     port: u16,
@@ -96,12 +98,17 @@ pub const AsyncMetadataFetch = struct {
         // Count of non-extension messages skipped while waiting for
         // the extension handshake reply.
         msgs_skipped: u32 = 0,
+
+        /// Caller-owned completion for the slot's in-flight io op.
+        /// Only one op is in flight per slot at a time (the state
+        /// machine is fully serial), so a single completion suffices.
+        completion: io_interface.Completion = .{},
     };
 
     /// Create a heap-allocated AsyncMetadataFetch.
     pub fn create(
         allocator: std.mem.Allocator,
-        ring: *linux.IoUring,
+        io: *RealIO,
         info_hash: [20]u8,
         peer_id: [20]u8,
         port: u16,
@@ -116,7 +123,7 @@ pub const AsyncMetadataFetch = struct {
         const self = try allocator.create(AsyncMetadataFetch);
         self.* = .{
             .allocator = allocator,
-            .ring = ring,
+            .io = io,
             .info_hash = info_hash,
             .peer_id = peer_id,
             .port = port,
@@ -150,20 +157,67 @@ pub const AsyncMetadataFetch = struct {
         }
     }
 
-    /// Central CQE dispatcher. Called by the event loop for metadata_* ops.
-    pub fn handleCqe(self: *AsyncMetadataFetch, op_type: OpType, slot_idx: u16, res: i32) void {
-        if (self.done) return;
-        if (slot_idx >= max_slots) return;
+    /// Recover the slot index for a callback firing on `slot.completion`.
+    fn slotIdxFor(self: *const AsyncMetadataFetch, slot: *const Slot) u8 {
+        const offset = @intFromPtr(slot) - @intFromPtr(&self.slots[0]);
+        return @intCast(offset / @sizeOf(Slot));
+    }
 
-        const slot = &self.slots[slot_idx];
-        if (slot.state == .free) return;
+    fn metadataConnectComplete(
+        userdata: ?*anyopaque,
+        completion: *io_interface.Completion,
+        result: io_interface.Result,
+    ) io_interface.CallbackAction {
+        const self: *AsyncMetadataFetch = @ptrCast(@alignCast(userdata.?));
+        const slot: *Slot = @fieldParentPtr("completion", completion);
+        if (self.done or slot.state == .free) return .disarm;
+        const slot_idx = self.slotIdxFor(slot);
+        const ok = switch (result) {
+            .connect => |r| if (r) |_| true else |_| false,
+            else => false,
+        };
+        self.onConnectComplete(slot, slot_idx, if (ok) 0 else -1);
+        return .disarm;
+    }
 
-        switch (op_type) {
-            .metadata_connect => self.onConnectComplete(slot, @intCast(slot_idx), res),
-            .metadata_send => self.onSendComplete(slot, @intCast(slot_idx), res),
-            .metadata_recv => self.onRecvComplete(slot, @intCast(slot_idx), res),
-            else => {},
-        }
+    fn metadataSendComplete(
+        userdata: ?*anyopaque,
+        completion: *io_interface.Completion,
+        result: io_interface.Result,
+    ) io_interface.CallbackAction {
+        const self: *AsyncMetadataFetch = @ptrCast(@alignCast(userdata.?));
+        const slot: *Slot = @fieldParentPtr("completion", completion);
+        if (self.done or slot.state == .free) return .disarm;
+        const slot_idx = self.slotIdxFor(slot);
+        const res: i32 = switch (result) {
+            .send => |r| if (r) |n|
+                std.math.cast(i32, n) orelse std.math.maxInt(i32)
+            else |_|
+                -1,
+            else => -1,
+        };
+        self.onSendComplete(slot, slot_idx, res);
+        return .disarm;
+    }
+
+    fn metadataRecvComplete(
+        userdata: ?*anyopaque,
+        completion: *io_interface.Completion,
+        result: io_interface.Result,
+    ) io_interface.CallbackAction {
+        const self: *AsyncMetadataFetch = @ptrCast(@alignCast(userdata.?));
+        const slot: *Slot = @fieldParentPtr("completion", completion);
+        if (self.done or slot.state == .free) return .disarm;
+        const slot_idx = self.slotIdxFor(slot);
+        const res: i32 = switch (result) {
+            .recv => |r| if (r) |n|
+                std.math.cast(i32, n) orelse std.math.maxInt(i32)
+            else |_|
+                -1,
+            else => -1,
+        };
+        self.onRecvComplete(slot, slot_idx, res);
+        return .disarm;
     }
 
     // ── Connection ─────────────────────────────────────────
@@ -213,12 +267,12 @@ pub const AsyncMetadataFetch = struct {
 
         self.active_slots += 1;
 
-        const ud = encodeUserData(.{
-            .slot = slot_idx,
-            .op_type = .metadata_connect,
-            .context = 0,
-        });
-        _ = self.ring.connect(ud, fd, &self.peers[peer_idx].any, self.peers[peer_idx].getOsSockLen()) catch {
+        self.io.connect(
+            .{ .fd = fd, .addr = self.peers[peer_idx] },
+            &slot.completion,
+            self,
+            metadataConnectComplete,
+        ) catch {
             self.releaseSlot(slot_idx);
             self.tryNextPeer(slot_idx);
             return;
@@ -763,12 +817,12 @@ pub const AsyncMetadataFetch = struct {
             return;
         };
 
-        const ud = encodeUserData(.{
-            .slot = slot_idx,
-            .op_type = .metadata_send,
-            .context = 0,
-        });
-        _ = self.ring.send(ud, slot.fd, send_buf[0..slot.send_len], 0) catch {
+        self.io.send(
+            .{ .fd = slot.fd, .buf = send_buf[0..slot.send_len] },
+            &slot.completion,
+            self,
+            metadataSendComplete,
+        ) catch {
             self.releaseSlot(slot_idx);
             self.tryNextPeer(slot_idx);
             return;
@@ -782,14 +836,12 @@ pub const AsyncMetadataFetch = struct {
             return;
         };
 
-        const ud = encodeUserData(.{
-            .slot = slot_idx,
-            .op_type = .metadata_recv,
-            .context = 0,
-        });
-        _ = self.ring.recv(ud, slot.fd, .{
-            .buffer = recv_buf[slot.recv_len..slot.recv_expected],
-        }, 0) catch {
+        self.io.recv(
+            .{ .fd = slot.fd, .buf = recv_buf[slot.recv_len..slot.recv_expected] },
+            &slot.completion,
+            self,
+            metadataRecvComplete,
+        ) catch {
             self.releaseSlot(slot_idx);
             self.tryNextPeer(slot_idx);
             return;
@@ -824,13 +876,13 @@ test "AsyncMetadataFetch SlotState defaults" {
 
 test "AsyncMetadataFetch create and destroy with no peers" {
     // We need a real io_uring for the create call but won't submit anything
-    var ring = try linux.IoUring.init(4, 0);
-    defer ring.deinit();
+    var io = try RealIO.init(.{ .entries = 4 });
+    defer io.deinit();
 
     const peers = [_]std.net.Address{};
     const mf = try AsyncMetadataFetch.create(
         std.testing.allocator,
-        &ring,
+        &io,
         [_]u8{0xAA} ** 20,
         [_]u8{0xBB} ** 20,
         6881,
@@ -843,8 +895,8 @@ test "AsyncMetadataFetch create and destroy with no peers" {
 }
 
 test "AsyncMetadataFetch create and destroy with peers" {
-    var ring = try linux.IoUring.init(4, 0);
-    defer ring.deinit();
+    var io = try RealIO.init(.{ .entries = 4 });
+    defer io.deinit();
 
     const peers = [_]std.net.Address{
         std.net.Address.initIp4(.{ 127, 0, 0, 1 }, 6881),
@@ -852,7 +904,7 @@ test "AsyncMetadataFetch create and destroy with peers" {
     };
     const mf = try AsyncMetadataFetch.create(
         std.testing.allocator,
-        &ring,
+        &io,
         [_]u8{0xAA} ** 20,
         [_]u8{0xBB} ** 20,
         6881,
@@ -867,8 +919,8 @@ test "AsyncMetadataFetch create and destroy with peers" {
 }
 
 test "AsyncMetadataFetch start with no peers calls finish" {
-    var ring = try linux.IoUring.init(4, 0);
-    defer ring.deinit();
+    var io = try RealIO.init(.{ .entries = 4 });
+    defer io.deinit();
 
     const TestCtx = struct {
         var completed: bool = false;
@@ -881,7 +933,7 @@ test "AsyncMetadataFetch start with no peers calls finish" {
     const peers = [_]std.net.Address{};
     const mf = try AsyncMetadataFetch.create(
         std.testing.allocator,
-        &ring,
+        &io,
         [_]u8{0xAA} ** 20,
         [_]u8{0xBB} ** 20,
         6881,

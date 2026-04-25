@@ -1698,7 +1698,7 @@ pub const EventLoop = struct {
 
         self.metadata_fetch = try metadata_handler.AsyncMetadataFetch.create(
             self.allocator,
-            &self.ring,
+            &self.io,
             info_hash,
             peer_id,
             port,
@@ -1910,9 +1910,6 @@ pub const EventLoop = struct {
             .cancel => {},
             .udp_socket, .udp_tracker_send, .udp_tracker_recv => {
                 if (self.udp_tracker_executor) |ute| ute.dispatchCqe(cqe);
-            },
-            .metadata_connect, .metadata_send, .metadata_recv => {
-                if (self.metadata_fetch) |mf| mf.handleCqe(op.op_type, op.slot, cqe.res);
             },
         }
     }
