@@ -874,3 +874,240 @@ test "SimPeer slow throttles piece dispatch with delay_per_block_ns" {
 
     try testing.expectEqual(@as(u32, 2), seeder.blocks_sent);
 }
+
+test "SimPeer block_mask drops requests outside the served range" {
+    // Phase 2A scaffolding: a seeder advertising piece 0 but only
+    // serving block 0 should drop requests for block 1 silently.
+    // Used to stage multi-source-piece scenarios where one peer holds
+    // a strict subset of a piece's blocks.
+    var io = try SimIO.init(testing.allocator, .{ .socket_capacity = 4 });
+    defer io.deinit();
+
+    var rng = std.Random.DefaultPrng.init(101);
+
+    const fds = try io.createSocketpair();
+    const seeder_fd = fds[0];
+    const test_fd = fds[1];
+
+    const info_hash: [20]u8 = .{0xab} ** 20;
+    const peer_id: [20]u8 = .{0x53} ** 20;
+    const piece_count: u32 = 1;
+    // Piece is 32 KiB = 2 blocks of 16 KiB each.
+    const piece_size: u32 = 32 * 1024;
+    var bitfield: [1]u8 = .{0x80};
+    var piece_data: [piece_size]u8 = undefined;
+    @memset(&piece_data, 0x77);
+
+    // Mask: block 0 served, block 1 not served.
+    const block_mask = [_]bool{ true, false };
+
+    var seeder = SimPeer{
+        .io = undefined,
+        .fd = 0,
+        .role = .seeder,
+        .behavior = .{ .honest = {} },
+        .rng = &rng,
+        .info_hash = undefined,
+        .peer_id = undefined,
+        .piece_count = 0,
+        .piece_size = 0,
+        .bitfield = &.{},
+        .piece_data = &.{},
+    };
+    try seeder.init(.{
+        .io = &io,
+        .fd = seeder_fd,
+        .role = .seeder,
+        .behavior = .{ .honest = {} },
+        .info_hash = info_hash,
+        .peer_id = peer_id,
+        .piece_count = piece_count,
+        .piece_size = piece_size,
+        .bitfield = &bitfield,
+        .piece_data = &piece_data,
+        .rng = &rng,
+        .block_mask = &block_mask,
+    });
+
+    // Send handshake + interested + request for block 0 (offset 0)
+    // and block 1 (offset 16 KiB).
+    var combined: [68 + 5 + 17 * 2]u8 = undefined;
+    const hs = peer_wire.serializeHandshake(info_hash, .{0x44} ** 20);
+    @memcpy(combined[0..68], &hs);
+    const interested_header = peer_wire.serializeHeader(2, &.{});
+    @memcpy(combined[68..73], &interested_header);
+    const req0 = peer_wire.serializeRequest(.{ .piece_index = 0, .block_offset = 0, .length = 16 * 1024 });
+    @memcpy(combined[73..90], &req0);
+    const req1 = peer_wire.serializeRequest(.{ .piece_index = 0, .block_offset = 16 * 1024, .length = 16 * 1024 });
+    @memcpy(combined[90..107], &req1);
+
+    var tx_c = Completion{};
+    var tx_ctx = TxCtx{};
+    try io.send(.{ .fd = test_fd, .buf = &combined }, &tx_c, &tx_ctx, txCallback);
+
+    var rx_c = Completion{};
+    var rx_ctx = RxCtx{};
+    try primeRecv(&io, test_fd, &rx_c, &rx_ctx);
+
+    var i: u32 = 0;
+    while (i < 20) : (i += 1) try io.advance(0);
+
+    // Both requests are received by SimPeer (wire-level), but only
+    // block 0 is served. Block 1 is dropped silently.
+    try testing.expectEqual(@as(u32, 2), seeder.requests_received);
+    try testing.expectEqual(@as(u32, 1), seeder.blocks_sent);
+}
+
+test "SimPeer corrupt_blocks garbles only the listed block index" {
+    // Phase 2B scaffolding: deterministic per-block corruption. With
+    // `corrupt_blocks: { indices = [1] }` and a 2-block piece, block 0
+    // is sent cleanly and block 1 is sent garbled (canonical 0xcc
+    // pattern). The smart-ban Phase 1 SHA-1 recompute would identify
+    // the per-block hash mismatch and Phase 2 would attribute it to
+    // this peer.
+    var io = try SimIO.init(testing.allocator, .{ .socket_capacity = 4 });
+    defer io.deinit();
+
+    var rng = std.Random.DefaultPrng.init(102);
+
+    const fds = try io.createSocketpair();
+    const seeder_fd = fds[0];
+    const test_fd = fds[1];
+
+    const info_hash: [20]u8 = .{0xab} ** 20;
+    const peer_id: [20]u8 = .{0x53} ** 20;
+    const piece_count: u32 = 1;
+    const piece_size: u32 = 32 * 1024;
+    var bitfield: [1]u8 = .{0x80};
+    var piece_data: [piece_size]u8 = undefined;
+    // Distinct values per block so we can tell honest from garbled.
+    @memset(piece_data[0 .. 16 * 1024], 0x11);
+    @memset(piece_data[16 * 1024 ..], 0x22);
+
+    const corrupt_indices = [_]u32{1};
+
+    var seeder = SimPeer{
+        .io = undefined,
+        .fd = 0,
+        .role = .seeder,
+        .behavior = .{ .corrupt_blocks = .{ .indices = &corrupt_indices } },
+        .rng = &rng,
+        .info_hash = undefined,
+        .peer_id = undefined,
+        .piece_count = 0,
+        .piece_size = 0,
+        .bitfield = &.{},
+        .piece_data = &.{},
+    };
+    try seeder.init(.{
+        .io = &io,
+        .fd = seeder_fd,
+        .role = .seeder,
+        .behavior = .{ .corrupt_blocks = .{ .indices = &corrupt_indices } },
+        .info_hash = info_hash,
+        .peer_id = peer_id,
+        .piece_count = piece_count,
+        .piece_size = piece_size,
+        .bitfield = &bitfield,
+        .piece_data = &piece_data,
+        .rng = &rng,
+    });
+
+    // Request both blocks.
+    var combined: [68 + 5 + 17 * 2]u8 = undefined;
+    const hs = peer_wire.serializeHandshake(info_hash, .{0x44} ** 20);
+    @memcpy(combined[0..68], &hs);
+    const interested_header = peer_wire.serializeHeader(2, &.{});
+    @memcpy(combined[68..73], &interested_header);
+    const req0 = peer_wire.serializeRequest(.{ .piece_index = 0, .block_offset = 0, .length = 16 * 1024 });
+    @memcpy(combined[73..90], &req0);
+    const req1 = peer_wire.serializeRequest(.{ .piece_index = 0, .block_offset = 16 * 1024, .length = 16 * 1024 });
+    @memcpy(combined[90..107], &req1);
+
+    var tx_c = Completion{};
+    var tx_ctx = TxCtx{};
+    try io.send(.{ .fd = test_fd, .buf = &combined }, &tx_c, &tx_ctx, txCallback);
+
+    var rx_c = Completion{};
+    var rx_ctx = RxCtx{};
+    try primeRecv(&io, test_fd, &rx_c, &rx_ctx);
+
+    var i: u32 = 0;
+    while (i < 20) : (i += 1) try io.advance(0);
+
+    // Both blocks were sent.
+    try testing.expectEqual(@as(u32, 2), seeder.blocks_sent);
+
+    // Walk the received bytes: handshake + bitfield + unchoke + 2 piece
+    // messages. Each piece message header is 4 (length) + 1 (id) + 4
+    // (piece_idx) + 4 (block_offset) = 13 bytes. Block payload follows.
+    const piece_block_size: usize = 16 * 1024;
+    const piece_msg_size: usize = 4 + 1 + 4 + 4 + piece_block_size;
+    const first_piece_offset: usize = 68 + 6 + 5; // handshake + bitfield + unchoke
+    const block0_payload_start = first_piece_offset + 4 + 1 + 4 + 4;
+    const block0_payload_end = block0_payload_start + piece_block_size;
+    const block1_msg_start = first_piece_offset + piece_msg_size;
+    const block1_payload_start = block1_msg_start + 4 + 1 + 4 + 4;
+    const block1_payload_end = block1_payload_start + piece_block_size;
+
+    // Block 0: clean (canonical 0x11).
+    try testing.expectEqual(@as(u8, 0x11), rx_ctx.bytes[block0_payload_start]);
+    try testing.expectEqual(@as(u8, 0x11), rx_ctx.bytes[block0_payload_end - 1]);
+
+    // Block 1: garbled with canonical 0xcc pattern.
+    try testing.expectEqual(@as(u8, 0xcc), rx_ctx.bytes[block1_payload_start]);
+    try testing.expectEqual(@as(u8, 0xcc), rx_ctx.bytes[block1_payload_end - 1]);
+}
+
+test "SimPeer disconnect closes the socketpair fd cleanly" {
+    var io = try SimIO.init(testing.allocator, .{ .socket_capacity = 4 });
+    defer io.deinit();
+
+    var rng = std.Random.DefaultPrng.init(103);
+
+    const fds = try io.createSocketpair();
+    const seeder_fd = fds[0];
+    _ = fds[1]; // partner fd; closeSocket on either side is enough
+
+    const info_hash: [20]u8 = .{0xab} ** 20;
+    const peer_id: [20]u8 = .{0x53} ** 20;
+    var bitfield: [1]u8 = .{0xc0};
+    var piece_data: [32]u8 = undefined;
+    @memset(&piece_data, 0x42);
+
+    var seeder = SimPeer{
+        .io = undefined,
+        .fd = 0,
+        .role = .seeder,
+        .behavior = .{ .honest = {} },
+        .rng = &rng,
+        .info_hash = undefined,
+        .peer_id = undefined,
+        .piece_count = 0,
+        .piece_size = 0,
+        .bitfield = &.{},
+        .piece_data = &.{},
+    };
+    try seeder.init(.{
+        .io = &io,
+        .fd = seeder_fd,
+        .role = .seeder,
+        .behavior = .{ .honest = {} },
+        .info_hash = info_hash,
+        .peer_id = peer_id,
+        .piece_count = 2,
+        .piece_size = 16,
+        .bitfield = &bitfield,
+        .piece_data = &piece_data,
+        .rng = &rng,
+    });
+
+    try testing.expect(seeder.fd >= 0);
+    seeder.disconnect();
+    try testing.expectEqual(@as(posix.fd_t, -1), seeder.fd);
+    try testing.expectEqual(varuna.sim.sim_peer.ProtocolState.closed, seeder.state);
+
+    // Calling disconnect again is idempotent (no double-close).
+    seeder.disconnect();
+    try testing.expectEqual(@as(posix.fd_t, -1), seeder.fd);
+}

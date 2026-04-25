@@ -52,6 +52,14 @@ pub const Behavior = union(enum) {
     slow: struct { delay_per_block_ns: u64 },
     /// With each block, flip a single random bit with this probability.
     corrupt: struct { probability: f32 },
+    /// Deterministically corrupt specific block indices. The seeder serves
+    /// other blocks cleanly; only blocks whose index appears in `indices`
+    /// are sent garbled (overwritten with a canonical bad pattern).
+    /// Composes with `block_mask` (a peer can hold blocks 4-7 AND corrupt
+    /// block 5 specifically). Used for Phase 2B smart-ban scenarios that
+    /// need precise per-block control rather than the random `corrupt`
+    /// probability shape.
+    corrupt_blocks: struct { indices: []const u32 },
     /// Always send bytes that don't match the requested block.
     wrong_data: void,
     /// Stop responding after N successful block sends. The connection
@@ -93,7 +101,14 @@ pub const Role = enum { seeder, downloader };
 
 const recv_buf_size: usize = 32 * 1024;
 const send_buf_size: usize = 128 * 1024;
-const action_queue_capacity: usize = 32;
+// Sized to hold a full burst of `peer_policy.pipeline_depth=64` piece-
+// response actions (each REQUEST received from the downloader becomes
+// one queued piece_response action) plus headroom for the inline
+// control messages (handshake, bitfield, unchoke). 128 is conservative;
+// 64 + ~5 control would technically fit, but keeping the cap a clean
+// power-of-two-multiple-of-pipeline keeps the math obvious if
+// pipeline_depth ever changes.
+const action_queue_capacity: usize = 128;
 
 pub const SimPeer = struct {
     io: *SimIO,
@@ -112,6 +127,19 @@ pub const SimPeer = struct {
     piece_size: u32,
     bitfield: []const u8,
     piece_data: []const u8,
+
+    /// Optional per-block service mask for multi-source piece-assembly
+    /// tests. When set, REQUEST messages whose computed block index falls
+    /// outside the mask are dropped silently — the downloader's existing
+    /// request-timeout path reroutes the block to another peer. Modelling
+    /// "peer A holds blocks 0-3 of piece P only" — real BitTorrent
+    /// doesn't have per-block availability on the wire, so this is sim-
+    /// only sleight of hand for stressing the multi-source picker.
+    /// `null` means "serve any block whose piece is in `bitfield`".
+    /// The mask is indexed by global block number (not per-piece): for a
+    /// torrent with `block_count` blocks per piece, block `b` of piece
+    /// `p` lives at `block_mask[p * block_count + b]`.
+    block_mask: ?[]const bool = null,
 
     state: ProtocolState = .await_handshake,
 
@@ -160,6 +188,8 @@ pub const SimPeer = struct {
         bitfield: []const u8,
         piece_data: []const u8,
         rng: *std.Random.DefaultPrng,
+        /// Optional per-block service mask. See `SimPeer.block_mask`.
+        block_mask: ?[]const bool = null,
     };
 
     pub fn init(self: *SimPeer, opts: InitOpts) !void {
@@ -177,17 +207,32 @@ pub const SimPeer = struct {
             .piece_size = opts.piece_size,
             .bitfield = opts.bitfield,
             .piece_data = opts.piece_data,
+            .block_mask = opts.block_mask,
         };
         // Always arm a recv first so we capture the inbound handshake.
         try self.armRecv();
+    }
+
+    /// Cleanly close the seeder fd and put the peer in the closed state.
+    /// Used by Phase 2A's mid-piece-disconnect tests to model a peer
+    /// vanishing partway through a piece — the downloader's recv-error
+    /// path then runs `removePeer`, which calls `releaseBlocksForPeer`
+    /// to put the peer's outstanding requests back in the picker pool
+    /// for the remaining peers to claim.
+    pub fn disconnect(self: *SimPeer) void {
+        if (self.fd >= 0) {
+            self.io.closeSocket(self.fd);
+            self.fd = -1;
+        }
+        self.state = .closed;
     }
 
     /// Drive any timing-dependent state forward. Today `step` is the
     /// place where `slow`-behaviour throttle windows expire — when the
     /// simulator's clock crosses `dispatch_blocked_until_ns`, the next
     /// piece response that was queued but held back gets dispatched.
-    /// Behaviours that don't need timing (honest, corrupt, wrong_data,
-    /// lie_bitfield, greedy) leave step as a near-no-op.
+    /// Behaviours that don't need timing (honest, corrupt, corrupt_blocks,
+    /// wrong_data, lie_bitfield, greedy) leave step as a near-no-op.
     pub fn step(self: *SimPeer, now_ns: u64) !void {
         // Released throttle: try to drain any actions that were waiting
         // for the slow-window to elapse.
@@ -342,6 +387,18 @@ pub const SimPeer = struct {
         if (req.block_offset + req.length > self.piece_size) return;
         if (piece_offset + req.block_offset + req.length > self.piece_data.len) return;
 
+        // block_mask gate: if the block falls outside our serving mask,
+        // drop the request silently. The downloader's request-timeout
+        // path reroutes the block to another peer with the same piece
+        // in their bitfield. Modelling per-block availability that
+        // doesn't exist on the real BT wire — sim-only sleight of hand.
+        if (self.block_mask) |mask| {
+            if (req.length > 0) {
+                const block_index_global = self.globalBlockIndex(req.piece_index, req.block_offset);
+                if (block_index_global >= mask.len or !mask[block_index_global]) return;
+            }
+        }
+
         // Build the framed piece message into send_buf:
         //   [4-byte length][1 id=7][4 piece_idx][4 block_offset][block...].
         const header = try peer_wire.serializePieceHeader(req.piece_index, req.block_offset, req.length);
@@ -362,6 +419,24 @@ pub const SimPeer = struct {
                     block_dst[byte_index] ^= mask;
                 }
             },
+            .corrupt_blocks => |params| {
+                @memcpy(block_dst, block_src);
+                // Compute the per-piece block index (offset / 16 KiB) and
+                // garble if the index appears in `params.indices`. Block
+                // size is the BitTorrent canonical 16 KiB; for tests with
+                // smaller piece sizes (single-block pieces), the offset
+                // is always 0 → block_index 0.
+                const block_size: u32 = 16 * 1024;
+                const block_index_in_piece = req.block_offset / block_size;
+                for (params.indices) |idx| {
+                    if (idx == block_index_in_piece) {
+                        // Canonical bad pattern — distinguishable from
+                        // both honest data and `wrong_data` (0xaa).
+                        @memset(block_dst, 0xcc);
+                        break;
+                    }
+                }
+            },
             else => @memcpy(block_dst, block_src),
         }
         try self.submitSend(self.send_buf[0..total]);
@@ -372,6 +447,19 @@ pub const SimPeer = struct {
         assert(!self.send_in_flight);
         self.send_in_flight = true;
         try self.io.send(.{ .fd = self.fd, .buf = buf }, &self.send_completion, self, sendCallback);
+    }
+
+    /// Translate (piece_index, block_offset) into a global block index
+    /// for `block_mask` lookup. Block size is BitTorrent's canonical
+    /// 16 KiB. For piece sizes smaller than 16 KiB the request always
+    /// has block_offset = 0 → in-piece block index 0; the global index
+    /// then equals piece_index. For larger pieces the math expands
+    /// naturally.
+    fn globalBlockIndex(self: *const SimPeer, piece_index: u32, block_offset: u32) usize {
+        const block_size: u32 = 16 * 1024;
+        const blocks_per_piece: u32 = (self.piece_size + block_size - 1) / block_size;
+        const block_index_in_piece = block_offset / block_size;
+        return @as(usize, piece_index) * @as(usize, @max(blocks_per_piece, 1)) + @as(usize, block_index_in_piece);
     }
 
     fn armRecv(self: *SimPeer) !void {

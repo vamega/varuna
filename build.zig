@@ -369,6 +369,48 @@ pub fn build(b: *std.Build) void {
     test_sim_smart_ban_eventloop_step.dependOn(&run_sim_smart_ban_eventloop_tests.step);
     test_step.dependOn(&run_sim_smart_ban_eventloop_tests.step);
 
+    // ── Phase 2A multi-source piece assembly: protocol-only test ─
+    const sim_multi_source_protocol_tests = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("tests/sim_multi_source_protocol_test.zig"),
+            .target = target,
+            .optimize = optimize,
+            .imports = &varuna_import,
+        }),
+    });
+    const run_sim_multi_source_protocol_tests = b.addRunArtifact(sim_multi_source_protocol_tests);
+    const test_sim_multi_source_protocol_step = b.step("test-sim-multi-source-protocol", "Run multi-source piece assembly algorithm test (bare DownloadingPiece)");
+    test_sim_multi_source_protocol_step.dependOn(&run_sim_multi_source_protocol_tests.step);
+    test_step.dependOn(&run_sim_multi_source_protocol_tests.step);
+
+    // ── Phase 2A multi-source EventLoop integration scaffold ─────
+    const sim_multi_source_eventloop_tests = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("tests/sim_multi_source_eventloop_test.zig"),
+            .target = target,
+            .optimize = optimize,
+            .imports = &varuna_import,
+        }),
+    });
+    const run_sim_multi_source_eventloop_tests = b.addRunArtifact(sim_multi_source_eventloop_tests);
+    const test_sim_multi_source_eventloop_step = b.step("test-sim-multi-source-eventloop", "Run multi-source piece assembly EventLoop integration (scaffold; lights up with getBlockAttribution)");
+    test_sim_multi_source_eventloop_step.dependOn(&run_sim_multi_source_eventloop_tests.step);
+    test_step.dependOn(&run_sim_multi_source_eventloop_tests.step);
+
+    // ── Phase 2B smart-ban Phase 1-2 EventLoop integration scaffold ─
+    const sim_smart_ban_phase12_tests = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("tests/sim_smart_ban_phase12_eventloop_test.zig"),
+            .target = target,
+            .optimize = optimize,
+            .imports = &varuna_import,
+        }),
+    });
+    const run_sim_smart_ban_phase12_tests = b.addRunArtifact(sim_smart_ban_phase12_tests);
+    const test_sim_smart_ban_phase12_step = b.step("test-sim-smart-ban-phase12", "Run smart-ban Phase 1-2 per-block attribution EventLoop integration (scaffold)");
+    test_sim_smart_ban_phase12_step.dependOn(&run_sim_smart_ban_phase12_tests.step);
+    test_step.dependOn(&run_sim_smart_ban_phase12_tests.step);
+
     // ── Event loop health tests ────────────────────────────
     const el_health_tests = b.addTest(.{
         .root_module = b.createModule(.{
