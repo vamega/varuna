@@ -9,7 +9,7 @@ const io_interface = @import("io_interface.zig");
 
 // ── Piece upload (seed mode) ─────────────────────────
 
-fn nextSeedReadId(self: *EventLoop) u32 {
+fn nextSeedReadId(self: anytype) u32 {
     const read_id = self.next_seed_read_id;
     self.next_seed_read_id +%= 1;
     if (self.next_seed_read_id == 0) self.next_seed_read_id = 1;
@@ -57,7 +57,7 @@ fn seedReadComplete(
 }
 
 fn queuePieceBlockResponse(
-    self: *EventLoop,
+    self: anytype,
     slot: u16,
     piece_index: u32,
     block_offset: u32,
@@ -77,7 +77,7 @@ fn queuePieceBlockResponse(
     });
 }
 
-fn deferCachedPieceBuffer(self: *EventLoop, piece_buffer: *EventLoop.PieceBuffer) void {
+fn deferCachedPieceBuffer(self: anytype, piece_buffer: *EventLoop.PieceBuffer) void {
     self.deferred_piece_buffers.append(self.allocator, .{
         .piece_buffer = piece_buffer,
     }) catch {
@@ -86,7 +86,7 @@ fn deferCachedPieceBuffer(self: *EventLoop, piece_buffer: *EventLoop.PieceBuffer
     };
 }
 
-fn releaseDeferredPieceBuffers(self: *EventLoop) void {
+fn releaseDeferredPieceBuffers(self: anytype) void {
     for (self.deferred_piece_buffers.items) |piece_buf| {
         self.releasePieceBuffer(piece_buf.piece_buffer);
     }
@@ -94,8 +94,8 @@ fn releaseDeferredPieceBuffers(self: *EventLoop) void {
 }
 
 fn createPlaintextBatchSendState(
-    self: *EventLoop,
-    batch: []const EventLoop.QueuedBlockResponse,
+    self: anytype,
+    batch: anytype,
 ) !*EventLoop.VectoredSendState {
     const state = try self.acquireVectoredSendState(batch.len);
     const headers = state.headers;
@@ -156,7 +156,7 @@ fn createPlaintextBatchSendState(
     return state;
 }
 
-fn submitPlaintextPieceBatch(self: *EventLoop, slot: u16, batch: []const EventLoop.QueuedBlockResponse) bool {
+fn submitPlaintextPieceBatch(self: anytype, slot: u16, batch: anytype) bool {
     _ = &self.peers[slot]; // ensure slot is valid
     const state = createPlaintextBatchSendState(self, batch) catch return false;
 
@@ -170,7 +170,7 @@ fn submitPlaintextPieceBatch(self: *EventLoop, slot: u16, batch: []const EventLo
     return true;
 }
 
-fn submitCopiedPieceBatch(self: *EventLoop, slot: u16, batch: []const EventLoop.QueuedBlockResponse) bool {
+fn submitCopiedPieceBatch(self: anytype, slot: u16, batch: anytype) bool {
     const peer = &self.peers[slot];
 
     var total_len: usize = 0;
@@ -210,7 +210,7 @@ fn submitCopiedPieceBatch(self: *EventLoop, slot: u16, batch: []const EventLoop.
 
 /// Send piece block responses over uTP. Serializes each block as a framed
 /// PIECE message and routes it through the uTP byte stream.
-fn submitUtpPieceBatch(self: *EventLoop, slot: u16, batch: []const EventLoop.QueuedBlockResponse) bool {
+fn submitUtpPieceBatch(self: anytype, slot: u16, batch: anytype) bool {
     for (batch) |resp| {
         const block_len: usize = @intCast(resp.block_length);
         const start: usize = @intCast(resp.block_offset);
@@ -231,7 +231,7 @@ fn submitUtpPieceBatch(self: *EventLoop, slot: u16, batch: []const EventLoop.Que
     return true;
 }
 
-pub fn servePieceRequest(self: *EventLoop, slot: u16, payload: []const u8) void {
+pub fn servePieceRequest(self: anytype, slot: u16, payload: []const u8) void {
     const piece_index = std.mem.readInt(u32, payload[0..4], .big);
     const block_offset = std.mem.readInt(u32, payload[4..8], .big);
     const block_length = std.mem.readInt(u32, payload[8..12], .big);
@@ -301,7 +301,11 @@ pub fn servePieceRequest(self: *EventLoop, slot: u16, payload: []const u8) void 
             log.warn("seed read op alloc for piece {d}: {s}", .{ piece_index, @errorName(err) });
             continue;
         };
-        op.* = .{ .el = self, .read_id = read_id, .span_index = @intCast(span_index) };
+        // SeedReadOp.el is concrete `*EventLoop` (= RealIO instantiation)
+        // for legacy reasons. The seed-serving path doesn't fire under
+        // simulator_mode usage, so the runtime-type-correctness is moot;
+        // this cast keeps SimIO instantiations compiling.
+        op.* = .{ .el = @ptrCast(@alignCast(self)), .read_id = read_id, .span_index = @intCast(span_index) };
         self.io.read(
             .{ .fd = tc.shared_fds[span.file_index], .buf = target, .offset = span.file_offset },
             &op.completion,
@@ -326,7 +330,7 @@ pub fn servePieceRequest(self: *EventLoop, slot: u16, payload: []const u8) void 
     self.pending_reads.items[pending_index].submitted_span_count = @intCast(submitted_reads);
 }
 
-fn handleSeedReadResult(self: *EventLoop, read_id: u32, span_index: u8, res: i32) void {
+fn handleSeedReadResult(self: anytype, read_id: u32, span_index: u8, res: i32) void {
     const idx = findPendingSeedReadIndex(self.pending_reads.items, read_id) orelse return;
     var pending = self.pending_reads.items[idx];
     if (span_index >= pending.submitted_span_count) {
@@ -381,7 +385,7 @@ fn handleSeedReadResult(self: *EventLoop, read_id: u32, span_index: u8, res: i32
 
 /// Handle a CANCEL message: remove matching queued response so we don't
 /// waste bandwidth sending a block the peer no longer wants.
-pub fn cancelQueuedResponse(self: *EventLoop, slot: u16, payload: []const u8) void {
+pub fn cancelQueuedResponse(self: anytype, slot: u16, payload: []const u8) void {
     const piece_index = std.mem.readInt(u32, payload[0..4], .big);
     const block_offset = std.mem.readInt(u32, payload[4..8], .big);
     const block_length = std.mem.readInt(u32, payload[8..12], .big);
@@ -402,8 +406,8 @@ pub fn cancelQueuedResponse(self: *EventLoop, slot: u16, payload: []const u8) vo
 
 /// Flush all queued piece block responses, batching by peer slot.
 /// All blocks for a given peer are concatenated into one send buffer.
-pub fn flushQueuedResponses(self: *EventLoop) void {
-    const QueuedBlockResponse = EventLoop.QueuedBlockResponse;
+pub fn flushQueuedResponses(self: anytype) void {
+    const QueuedBlockResponse = @TypeOf(self.*).QueuedBlockResponse;
 
     if (self.queued_responses.items.len == 0) {
         releaseDeferredPieceBuffers(self);
@@ -478,7 +482,7 @@ pub fn flushQueuedResponses(self: *EventLoop) void {
     releaseDeferredPieceBuffers(self);
 }
 
-pub fn sendPieceBlock(self: *EventLoop, slot: u16, piece_index: u32, block_offset: u32, block_length: u32, piece_buffer: *EventLoop.PieceBuffer) void {
+pub fn sendPieceBlock(self: anytype, slot: u16, piece_index: u32, block_offset: u32, block_length: u32, piece_buffer: *EventLoop.PieceBuffer) void {
     const start: usize = @intCast(block_offset);
     const len: usize = @intCast(block_length);
     if (start + len > piece_buffer.buf.len) return;

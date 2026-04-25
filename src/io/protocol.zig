@@ -23,7 +23,7 @@ const peer_handler = @import("peer_handler.zig");
 
 // ── Peer wire protocol message processing ─────────────────
 
-pub fn processMessage(self: *EventLoop, slot: u16) void {
+pub fn processMessage(self: anytype, slot: u16) void {
     const peer = &self.peers[slot];
     const body = peer.body_buf orelse return;
     if (body.len == 0) return;
@@ -305,7 +305,7 @@ pub fn processMessage(self: *EventLoop, slot: u16) void {
 /// Only request messages are handled (we serve metadata to peers).
 /// Data and reject messages are only relevant during metadata fetch
 /// which runs on a background thread, not through the event loop.
-pub fn handleUtMetadata(self: *EventLoop, slot: u16, ext_payload: []const u8) void {
+pub fn handleUtMetadata(self: anytype, slot: u16, ext_payload: []const u8) void {
     const peer = &self.peers[slot];
 
     const msg = ut_metadata.decode(self.allocator, ext_payload) catch {
@@ -389,7 +389,7 @@ pub fn handleUtMetadata(self: *EventLoop, slot: u16, ext_payload: []const u8) vo
     }
 }
 
-fn sendUtMetadataReject(self: *EventLoop, slot: u16, peer: *Peer, piece: u32) void {
+fn sendUtMetadataReject(self: anytype, slot: u16, peer: *Peer, piece: u32) void {
     const peer_ut_id = if (peer.extension_ids) |ids| ids.ut_metadata else return;
     if (peer_ut_id == 0) return;
 
@@ -422,40 +422,40 @@ fn sendUtMetadataReject(self: *EventLoop, slot: u16, peer: *Peer, piece: u32) vo
 
 // ── SQE helpers ───────────────────────────────────────
 
-pub fn submitHandshakeRecv(self: *EventLoop, slot: u16) !void {
+pub fn submitHandshakeRecv(self: anytype, slot: u16) !void {
     const peer = &self.peers[slot];
     const buf = peer.handshake_buf[peer.handshake_offset..68];
     try self.io.recv(
         .{ .fd = peer.fd, .buf = buf },
         &peer.recv_completion,
         self,
-        peer_handler.peerRecvComplete,
+        peer_handler.peerRecvCompleteFor(@TypeOf(self.*)),
     );
 }
 
-pub fn submitHeaderRecv(self: *EventLoop, slot: u16) !void {
+pub fn submitHeaderRecv(self: anytype, slot: u16) !void {
     const peer = &self.peers[slot];
     const buf = peer.header_buf[peer.header_offset..4];
     try self.io.recv(
         .{ .fd = peer.fd, .buf = buf },
         &peer.recv_completion,
         self,
-        peer_handler.peerRecvComplete,
+        peer_handler.peerRecvCompleteFor(@TypeOf(self.*)),
     );
 }
 
-pub fn submitBodyRecv(self: *EventLoop, slot: u16) !void {
+pub fn submitBodyRecv(self: anytype, slot: u16) !void {
     const peer = &self.peers[slot];
     const buf = peer.body_buf orelse return error.NullBuffer;
     try self.io.recv(
         .{ .fd = peer.fd, .buf = buf[peer.body_offset..peer.body_expected] },
         &peer.recv_completion,
         self,
-        peer_handler.peerRecvComplete,
+        peer_handler.peerRecvCompleteFor(@TypeOf(self.*)),
     );
 }
 
-pub fn submitMessage(self: *EventLoop, slot: u16, id: u8, payload: []const u8) !void {
+pub fn submitMessage(self: anytype, slot: u16, id: u8, payload: []const u8) !void {
     const peer = &self.peers[slot];
 
     // uTP peers: route through the uTP byte stream instead of io_uring send.
@@ -468,8 +468,9 @@ pub fn submitMessage(self: *EventLoop, slot: u16, id: u8, payload: []const u8) !
     const total_len = 5 + payload.len;
     const send_id = self.nextSendId();
 
-    if (total_len <= EventLoop.small_send_capacity) {
-        var stack_buf: [EventLoop.small_send_capacity]u8 = undefined;
+    const EL = @TypeOf(self.*);
+    if (total_len <= EL.small_send_capacity) {
+        var stack_buf: [EL.small_send_capacity]u8 = undefined;
         std.mem.writeInt(u32, stack_buf[0..4], msg_len, .big);
         stack_buf[4] = id;
         @memcpy(stack_buf[5..total_len], payload);
@@ -493,7 +494,7 @@ pub fn submitMessage(self: *EventLoop, slot: u16, id: u8, payload: []const u8) !
 /// Send our BEP 10 extension handshake as a tracked (heap-allocated) send.
 /// Includes metadata_size (BEP 9) if we have the torrent's info dictionary.
 /// Includes upload_only (BEP 21) if we are a partial seed.
-pub fn submitExtensionHandshake(self: *EventLoop, slot: u16) !void {
+pub fn submitExtensionHandshake(self: anytype, slot: u16) !void {
     const peer = &self.peers[slot];
     // Check if the torrent is private (BEP 27: don't advertise ut_pex)
     const tc = self.getTorrentContext(peer.torrent_id);
@@ -537,7 +538,7 @@ pub fn submitExtensionHandshake(self: *EventLoop, slot: u16) !void {
 
 /// Handle an incoming ut_pex message from a peer.
 /// Parses the PEX message and attempts to connect to newly discovered peers.
-fn handlePexMessage(self: *EventLoop, slot: u16, payload: []const u8) void {
+fn handlePexMessage(self: anytype, slot: u16, payload: []const u8) void {
     const peer = &self.peers[slot];
 
     var msg = pex_mod.parsePexMessage(self.allocator, payload) catch {
@@ -570,7 +571,7 @@ fn handlePexMessage(self: *EventLoop, slot: u16, payload: []const u8) void {
 }
 
 /// Check if we already have a connection to the given address for this torrent.
-fn isPeerAlreadyConnected(self: *EventLoop, torrent_id: TorrentId, addr: std.net.Address) bool {
+fn isPeerAlreadyConnected(self: anytype, torrent_id: TorrentId, addr: std.net.Address) bool {
     const tc = self.getTorrentContext(torrent_id) orelse return false;
     for (tc.peer_slots.items) |slot| {
         const p = &self.peers[slot];
@@ -583,7 +584,7 @@ fn isPeerAlreadyConnected(self: *EventLoop, torrent_id: TorrentId, addr: std.net
 
 /// Build and send a PEX message to the given peer slot.
 /// Called periodically from peer_policy.checkPex.
-pub fn submitPexMessage(self: *EventLoop, slot: u16) !void {
+pub fn submitPexMessage(self: anytype, slot: u16) !void {
     const peer = &self.peers[slot];
     if (peer.state == .free or peer.state == .disconnecting) return;
 
@@ -635,7 +636,7 @@ pub fn submitPexMessage(self: *EventLoop, slot: u16) !void {
 }
 
 /// Helper: send interested and transition to active recv (outbound download peer).
-pub fn sendInterestedAndGoActive(self: *EventLoop, slot: u16) void {
+pub fn sendInterestedAndGoActive(self: anytype, slot: u16) void {
     const peer = &self.peers[slot];
     submitMessage(self, slot, 2, &.{}) catch {
         self.removePeer(slot);
@@ -652,7 +653,7 @@ pub fn sendInterestedAndGoActive(self: *EventLoop, slot: u16) void {
 /// Helper: send bitfield (if available) then unchoke for an inbound seed peer.
 /// In BEP 16 super-seed mode, sends individual HAVE messages instead of a
 /// full bitfield to control which pieces each peer sees.
-pub fn sendInboundBitfieldOrUnchoke(self: *EventLoop, slot: u16) void {
+pub fn sendInboundBitfieldOrUnchoke(self: anytype, slot: u16) void {
     const peer = &self.peers[slot];
     const tc_bp = self.getTorrentContext(peer.torrent_id);
 
@@ -702,7 +703,7 @@ pub fn sendInboundBitfieldOrUnchoke(self: *EventLoop, slot: u16) void {
 /// Handle an incoming hash request (msg_type 21).
 /// If we have the Merkle tree for the requested file, build and send a hashes
 /// response. Otherwise, send a hash reject.
-fn handleHashRequest(self: *EventLoop, slot: u16, payload: []const u8) void {
+fn handleHashRequest(self: anytype, slot: u16, payload: []const u8) void {
     const peer = &self.peers[slot];
 
     const req = hash_exchange.decodeHashRequest(payload) catch {
@@ -824,7 +825,7 @@ fn handleHashRequest(self: *EventLoop, slot: u16, payload: []const u8) void {
 
 /// Build and send a hashes response from a cached Merkle tree.
 pub fn sendHashesFromTree(
-    self: *EventLoop,
+    self: anytype,
     slot: u16,
     tree: *const merkle.MerkleTree,
     req: hash_exchange.HashRequest,
@@ -856,7 +857,7 @@ pub fn sendHashesFromTree(
 
 /// Handle an incoming hashes response (msg_type 22).
 /// Verify the received hashes against the known Merkle root for the file.
-fn handleHashesResponse(self: *EventLoop, slot: u16, payload: []const u8) void {
+fn handleHashesResponse(self: anytype, slot: u16, payload: []const u8) void {
     const peer = &self.peers[slot];
 
     const resp = hash_exchange.decodeHashesResponse(self.allocator, payload) catch {
@@ -897,7 +898,7 @@ fn handleHashesResponse(self: *EventLoop, slot: u16, payload: []const u8) void {
 }
 
 /// Handle an incoming hash reject (msg_type 23).
-fn handleHashReject(self: *EventLoop, slot: u16, payload: []const u8) void {
+fn handleHashReject(self: anytype, slot: u16, payload: []const u8) void {
     const req = hash_exchange.decodeHashRequest(payload) catch {
         log.debug("slot {d}: invalid hash reject message", .{slot});
         return;
@@ -910,7 +911,7 @@ fn handleHashReject(self: *EventLoop, slot: u16, payload: []const u8) void {
 }
 
 /// Send a hash reject message (echo back the request parameters).
-pub fn sendHashReject(self: *EventLoop, slot: u16, req: hash_exchange.HashRequest) void {
+pub fn sendHashReject(self: anytype, slot: u16, req: hash_exchange.HashRequest) void {
     const reject_payload = hash_exchange.encodeHashRequest(req);
     submitMessage(self, slot, hash_exchange.msg_hash_reject, &reject_payload) catch {};
 }

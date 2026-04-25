@@ -217,6 +217,20 @@ pub const Result = union(enum) {
 //
 // `result` is a tagged union whose active variant matches the operation
 // that was submitted.
+//
+// **In-flight clearing.** Backends clear `in_flight` on the completion
+// *before* invoking the callback for the final CQE / delivery (multishot
+// keeps it set until `IORING_CQE_F_MORE` clears). This means a callback
+// may submit a new op on the same completion freely — for example the
+// natural "header → body, then body → next header" recv pattern, where
+// each chunk's callback re-submits a recv with a different buffer slice.
+//
+// The one rule: a callback may **either** submit a new op **or** return
+// `.rearm` — not both. `.rearm` re-submits whatever is currently in
+// `c.op`; if you've overwritten that during the callback (by submitting a
+// new op), you must return `.disarm`. Returning `.rearm` after the
+// callback already pushed a new submission would double-arm the
+// completion and corrupt the backend's bookkeeping.
 
 pub const CallbackAction = enum { disarm, rearm };
 

@@ -266,6 +266,109 @@ pub fn build(b: *std.Build) void {
     test_io_parity_step.dependOn(&run_io_parity.step);
     test_step.dependOn(&run_io_parity.step);
 
+    // ── SimIO inline tests (socketpair, parking, fault injection) ─
+    //
+    // The inline `test` blocks in `src/io/sim_io.zig` aren't reachable
+    // from any of the other test roots (mod_tests/daemon_tests don't
+    // discover transitively imported tests in this codebase). This
+    // wrapper imports sim_io.zig directly so its unit tests run.
+    const sim_io_tests = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("tests/sim_socketpair_test.zig"),
+            .target = target,
+            .optimize = optimize,
+            .imports = &varuna_import,
+        }),
+    });
+    const run_sim_io_tests = b.addRunArtifact(sim_io_tests);
+    const test_sim_io_step = b.step("test-sim-io", "Run SimIO inline unit tests (socketpair, parking, fault injection)");
+    test_sim_io_step.dependOn(&run_sim_io_tests.step);
+    test_step.dependOn(&run_sim_io_tests.step);
+
+    // ── SimPeer protocol tests ─────────────────────────────
+    const sim_peer_tests = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("tests/sim_peer_test.zig"),
+            .target = target,
+            .optimize = optimize,
+            .imports = &varuna_import,
+        }),
+    });
+    const run_sim_peer_tests = b.addRunArtifact(sim_peer_tests);
+    const test_sim_peer_step = b.step("test-sim-peer", "Run SimPeer behavior / protocol tests");
+    test_sim_peer_step.dependOn(&run_sim_peer_tests.step);
+    test_step.dependOn(&run_sim_peer_tests.step);
+
+    // ── Minimal Simulator swarm test ───────────────────────
+    const sim_minimal_tests = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("tests/sim_minimal_swarm_test.zig"),
+            .target = target,
+            .optimize = optimize,
+            .imports = &varuna_import,
+        }),
+    });
+    const run_sim_minimal_tests = b.addRunArtifact(sim_minimal_tests);
+    const test_sim_minimal_step = b.step("test-sim-minimal", "Run minimal Simulator swarm test");
+    test_sim_minimal_step.dependOn(&run_sim_minimal_tests.step);
+    test_step.dependOn(&run_sim_minimal_tests.step);
+
+    // ── Simulator unit + BUGGIFY tests ─────────────────────
+    const sim_simulator_tests = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("tests/sim_simulator_test.zig"),
+            .target = target,
+            .optimize = optimize,
+            .imports = &varuna_import,
+        }),
+    });
+    const run_sim_simulator_tests = b.addRunArtifact(sim_simulator_tests);
+    const test_sim_simulator_step = b.step("test-sim-simulator", "Run Simulator init / step / BUGGIFY tests");
+    test_sim_simulator_step.dependOn(&run_sim_simulator_tests.step);
+    test_step.dependOn(&run_sim_simulator_tests.step);
+
+    // ── Sim-only smart-ban protocol regression ─────────────
+    const sim_smart_ban_tests = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("tests/sim_smart_ban_protocol_test.zig"),
+            .target = target,
+            .optimize = optimize,
+            .imports = &varuna_import,
+        }),
+    });
+    const run_sim_smart_ban_tests = b.addRunArtifact(sim_smart_ban_tests);
+    const test_sim_smart_ban_step = b.step("test-sim-smart-ban", "Run protocol-only smart-ban regression (8 seeds)");
+    test_sim_smart_ban_step.dependOn(&run_sim_smart_ban_tests.step);
+    test_step.dependOn(&run_sim_smart_ban_tests.step);
+
+    // ── Smart-ban swarm test (pre-scaffolded for EventLoop swap) ─
+    const sim_smart_ban_swarm_tests = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("tests/sim_smart_ban_swarm_test.zig"),
+            .target = target,
+            .optimize = optimize,
+            .imports = &varuna_import,
+        }),
+    });
+    const run_sim_smart_ban_swarm_tests = b.addRunArtifact(sim_smart_ban_swarm_tests);
+    const test_sim_smart_ban_swarm_step = b.step("test-sim-smart-ban-swarm", "Run smart-ban swarm test (8 seeds, EventLoop-shaped)");
+    test_sim_smart_ban_swarm_step.dependOn(&run_sim_smart_ban_swarm_tests.step);
+    test_step.dependOn(&run_sim_smart_ban_swarm_tests.step);
+
+    // ── Smart-ban EventLoop integration test (scaffold only today) ─
+    const sim_smart_ban_eventloop_tests = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("tests/sim_smart_ban_eventloop_test.zig"),
+            .target = target,
+            .optimize = optimize,
+            .imports = &varuna_import,
+        }),
+    });
+    const run_sim_smart_ban_eventloop_tests = b.addRunArtifact(sim_smart_ban_eventloop_tests);
+    const test_sim_smart_ban_eventloop_step = b.step("test-sim-smart-ban-eventloop", "Run smart-ban EventLoop integration (scaffold; lights up after Stage 2 #12)");
+    test_sim_smart_ban_eventloop_step.dependOn(&run_sim_smart_ban_eventloop_tests.step);
+    test_step.dependOn(&run_sim_smart_ban_eventloop_tests.step);
+
     // ── Event loop health tests ────────────────────────────
     const el_health_tests = b.addTest(.{
         .root_module = b.createModule(.{

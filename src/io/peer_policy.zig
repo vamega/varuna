@@ -40,7 +40,7 @@ const optimistic_unchoke_slots: u32 = 1;
 
 // ── Piece download coordination ───────────────────────
 
-pub fn tryAssignPieces(self: *EventLoop) void {
+pub fn tryAssignPieces(self: anytype) void {
     // During graceful shutdown drain, don't claim new pieces
     if (self.draining) return;
 
@@ -50,7 +50,7 @@ pub fn tryAssignPieces(self: *EventLoop) void {
         const peer = &self.peers[slot];
 
         // Re-check eligibility (state may have changed since enqueue).
-        if (!EventLoop.isIdleCandidate(peer)) {
+        if (!@TypeOf(self.*).isIdleCandidate(peer)) {
             self.unmarkIdle(slot);
             continue;
         }
@@ -107,7 +107,7 @@ pub fn tryAssignPieces(self: *EventLoop) void {
 /// Try to join an existing DownloadingPiece that has unrequested blocks and
 /// fewer than max_peers_per_piece peers.  Returns true if the peer was
 /// successfully joined to an existing download.
-pub fn tryJoinExistingPiece(self: *EventLoop, slot: u16, peer: *Peer) bool {
+pub fn tryJoinExistingPiece(self: anytype, slot: u16, peer: *Peer) bool {
     const peer_bf = if (peer.availability) |*bf| bf else return false;
 
     var best_dp: ?*DownloadingPiece = null;
@@ -139,7 +139,7 @@ pub fn tryJoinExistingPiece(self: *EventLoop, slot: u16, peer: *Peer) bool {
     return false;
 }
 
-pub fn startPieceDownload(self: *EventLoop, slot: u16, piece_index: u32) !void {
+pub fn startPieceDownload(self: anytype, slot: u16, piece_index: u32) !void {
     const peer = &self.peers[slot];
     const tc = self.getTorrentContext(peer.torrent_id) orelse return error.TorrentNotFound;
     const sess = tc.session orelse return error.TorrentNotFound;
@@ -184,7 +184,7 @@ pub fn startPieceDownload(self: *EventLoop, slot: u16, piece_index: u32) !void {
 }
 
 /// Join an existing DownloadingPiece that other peers are already working on.
-pub fn joinPieceDownload(self: *EventLoop, slot: u16, dp: *DownloadingPiece) !void {
+pub fn joinPieceDownload(self: anytype, slot: u16, dp: *DownloadingPiece) !void {
     const peer = &self.peers[slot];
 
     peer.current_piece = dp.piece_index;
@@ -208,7 +208,7 @@ pub fn joinPieceDownload(self: *EventLoop, slot: u16, dp: *DownloadingPiece) !vo
 /// Detach a peer from its current DownloadingPiece.  Releases requested blocks
 /// and decrements peer_count.  If no peers remain and the piece is incomplete,
 /// the DownloadingPiece is kept in the registry for future peers to resume.
-pub fn detachPeerFromDownloadingPiece(self: *EventLoop, peer: *Peer) void {
+pub fn detachPeerFromDownloadingPiece(self: anytype, peer: *Peer) void {
     const dp = peer.downloading_piece orelse return;
     const slot = peerSlot(self, peer);
     dp.releaseBlocksForPeer(slot);
@@ -228,7 +228,7 @@ pub fn detachPeerFromDownloadingPiece(self: *EventLoop, peer: *Peer) void {
 }
 
 /// Detach a peer from its next_downloading_piece.
-pub fn detachPeerFromNextDownloadingPiece(self: *EventLoop, peer: *Peer) void {
+pub fn detachPeerFromNextDownloadingPiece(self: anytype, peer: *Peer) void {
     const dp = peer.next_downloading_piece orelse return;
     const slot = peerSlot(self, peer);
     dp.releaseBlocksForPeer(slot);
@@ -247,13 +247,13 @@ pub fn detachPeerFromNextDownloadingPiece(self: *EventLoop, peer: *Peer) void {
 }
 
 /// Get the slot index of a peer within the peers array.
-fn peerSlot(self: *EventLoop, peer: *const Peer) u16 {
+fn peerSlot(self: anytype, peer: *const Peer) u16 {
     const base = @intFromPtr(self.peers.ptr);
     const addr = @intFromPtr(peer);
     return @intCast((addr - base) / @sizeOf(Peer));
 }
 
-pub fn tryFillPipeline(self: *EventLoop, slot: u16) !void {
+pub fn tryFillPipeline(self: anytype, slot: u16) !void {
     const peer = &self.peers[slot];
     if (peer.current_piece == null) return;
     if (peer.peer_choking) return;
@@ -399,7 +399,7 @@ fn writeRequestMsg(buf: []u8, req: anytype) void {
 
 /// Submit the request batch via io_uring and update peer pipeline state.
 fn submitPipelineRequests(
-    self: *EventLoop,
+    self: anytype,
     slot: u16,
     buf: []u8,
     p1: u32, // requests for current piece
@@ -435,7 +435,7 @@ fn submitPipelineRequests(
 
 /// After current piece completes: promote pre-fetched next_piece to current,
 /// or fall back to markIdle if no next piece is queued.
-fn promoteNextPieceOrMarkIdle(self: *EventLoop, slot: u16) void {
+fn promoteNextPieceOrMarkIdle(self: anytype, slot: u16) void {
     const peer = &self.peers[slot];
     if (peer.next_piece != null) {
         peer.current_piece = peer.next_piece;
@@ -470,7 +470,7 @@ fn promoteNextPieceOrMarkIdle(self: *EventLoop, slot: u16) void {
     }
 }
 
-pub fn completePieceDownload(self: *EventLoop, slot: u16) void {
+pub fn completePieceDownload(self: anytype, slot: u16) void {
     const peer = &self.peers[slot];
     const piece_index = peer.current_piece orelse return;
     const piece_buf = peer.piece_buf orelse return;
@@ -544,7 +544,7 @@ pub fn completePieceDownload(self: *EventLoop, slot: u16) void {
             }
 
             // Track pending writes for completion
-            const pending_key = EventLoop.PendingWriteKey{
+            const pending_key = @TypeOf(self.*).PendingWriteKey{
                 .piece_index = piece_index,
                 .torrent_id = peer.torrent_id,
             };
@@ -564,7 +564,8 @@ pub fn completePieceDownload(self: *EventLoop, slot: u16) void {
                 // Skip spans for do_not_download files (fd == -1)
                 if (tc.shared_fds[span.file_index] < 0) continue;
                 const block = piece_buf[span.piece_offset .. span.piece_offset + span.length];
-                const wop = self.allocator.create(peer_handler.DiskWriteOp) catch |err| {
+                const EL = @TypeOf(self.*);
+                const wop = self.allocator.create(peer_handler.DiskWriteOpOf(EL)) catch |err| {
                     log.warn("inline disk write op alloc for piece {d}: {s}", .{ piece_index, @errorName(err) });
                     if (self.getPendingWrite(pending_key)) |pending_w| {
                         pending_w.write_failed = true;
@@ -576,7 +577,7 @@ pub fn completePieceDownload(self: *EventLoop, slot: u16) void {
                     .{ .fd = tc.shared_fds[span.file_index], .buf = block, .offset = span.file_offset },
                     &wop.completion,
                     wop,
-                    peer_handler.diskWriteComplete,
+                    peer_handler.diskWriteCompleteFor(EL),
                 ) catch |err| {
                     log.warn("inline disk write for piece {d}: {s}", .{ piece_index, @errorName(err) });
                     self.allocator.destroy(wop);
@@ -628,7 +629,7 @@ pub fn completePieceDownload(self: *EventLoop, slot: u16) void {
 /// Clean up after a failed piece completion (hash lookup failure, hasher submit failure, etc.).
 /// Releases the piece back to the tracker and marks the peer idle.
 fn cleanupCompletionFailure(
-    self: *EventLoop,
+    self: anytype,
     peer: *Peer,
     dp: ?*DownloadingPiece,
     pt: *PieceTracker,
@@ -653,7 +654,7 @@ fn cleanupCompletionFailure(
 /// Detach all peers from a DownloadingPiece except the specified slot.
 /// Used when a piece completes -- the completing peer handles its own cleanup,
 /// but other peers referencing the same DP need to be detached and re-queued.
-fn detachAllPeersExcept(self: *EventLoop, dp: *DownloadingPiece, except_slot: u16) void {
+fn detachAllPeersExcept(self: anytype, dp: *DownloadingPiece, except_slot: u16) void {
     for (self.peers, 0..) |*p, i| {
         const s: u16 = @intCast(i);
         if (s == except_slot) continue;
@@ -679,7 +680,7 @@ fn detachAllPeersExcept(self: *EventLoop, dp: *DownloadingPiece, except_slot: u1
 
 /// Process completed hash results from the background hasher.
 /// Called each tick from the event loop.
-pub fn processHashResults(self: *EventLoop) void {
+pub fn processHashResults(self: anytype) void {
     const h = self.hasher orelse return;
     const results = h.drainResultsInto(&self.hash_result_swap);
     for (results) |result| {
@@ -738,7 +739,7 @@ pub fn processHashResults(self: *EventLoop) void {
             // and a write is in flight. Skip the duplicate -- just free
             // the buffer and mark the piece complete (the first write
             // will handle persistence).
-            const pending_key = EventLoop.PendingWriteKey{
+            const pending_key = @TypeOf(self.*).PendingWriteKey{
                 .piece_index = result.piece_index,
                 .torrent_id = torrent_id,
             };
@@ -781,7 +782,8 @@ pub fn processHashResults(self: *EventLoop) void {
                 // Skip spans for do_not_download files (fd == -1)
                 if (tc.shared_fds[span.file_index] < 0) continue;
                 const block = result.piece_buf[span.piece_offset .. span.piece_offset + span.length];
-                const wop = self.allocator.create(peer_handler.DiskWriteOp) catch |err| {
+                const EL = @TypeOf(self.*);
+                const wop = self.allocator.create(peer_handler.DiskWriteOpOf(EL)) catch |err| {
                     log.warn("disk write op alloc for piece {d}: {s}", .{ result.piece_index, @errorName(err) });
                     if (self.getPendingWrite(pending_key)) |pending_w| {
                         pending_w.write_failed = true;
@@ -793,7 +795,7 @@ pub fn processHashResults(self: *EventLoop) void {
                     .{ .fd = tc.shared_fds[span.file_index], .buf = block, .offset = span.file_offset },
                     &wop.completion,
                     wop,
-                    peer_handler.diskWriteComplete,
+                    peer_handler.diskWriteCompleteFor(EL),
                 ) catch |err| {
                     log.warn("disk write submit for piece {d}: {s}", .{ result.piece_index, @errorName(err) });
                     self.allocator.destroy(wop);
@@ -870,7 +872,7 @@ pub fn processHashResults(self: *EventLoop) void {
 
 /// Process completed Merkle tree building results from the background hasher.
 /// Called each tick from the event loop, after processHashResults.
-pub fn processMerkleResults(self: *EventLoop) void {
+pub fn processMerkleResults(self: anytype) void {
     const h = self.hasher orelse return;
     const merkle_results = h.drainMerkleResultsInto(&self.merkle_result_swap);
 
@@ -937,7 +939,7 @@ pub fn processMerkleResults(self: *EventLoop) void {
 
 // ── Peer timeout ───────────────────────────────────────
 
-pub fn checkPeerTimeouts(self: *EventLoop) void {
+pub fn checkPeerTimeouts(self: anytype) void {
     const now = self.clock.now();
     var to_remove = std.ArrayList(u16).empty;
     defer to_remove.deinit(self.allocator);
@@ -960,7 +962,7 @@ const keepalive_interval_secs: i64 = 90; // send keep-alive if we've been quiet 
 
 /// Send keep-alive messages to peers we haven't sent anything to recently.
 /// Prevents remote peers from disconnecting us for inactivity.
-pub fn sendKeepAlives(self: *EventLoop) void {
+pub fn sendKeepAlives(self: anytype) void {
     const now = self.clock.now();
     for (self.active_peer_slots.items) |slot| {
         const peer = &self.peers[slot];
@@ -990,7 +992,7 @@ pub fn sendKeepAlives(self: *EventLoop) void {
 
 // ── Choking algorithm (tit-for-tat) ─────────────────
 
-pub fn recalculateUnchokes(self: *EventLoop) void {
+pub fn recalculateUnchokes(self: anytype) void {
     const now = self.clock.now();
     if (now - self.last_unchoke_recalc < unchoke_interval_secs) return;
     self.last_unchoke_recalc = now;
@@ -1016,16 +1018,16 @@ pub fn recalculateUnchokes(self: *EventLoop) void {
     // Sort by download speed (tit-for-tat: unchoke peers that send us the most).
     // When seeding, sort by upload speed instead (prefer fast downloaders).
     const peers_slice = interested_peers[0..interested_count];
-    const context = self;
+    const Ctx = @TypeOf(self);
     if (is_seeding) {
-        std.mem.sort(u16, peers_slice, context, struct {
-            fn lessThan(ctx: *EventLoop, a: u16, b: u16) bool {
+        std.mem.sort(u16, peers_slice, self, struct {
+            fn lessThan(ctx: Ctx, a: u16, b: u16) bool {
                 return ctx.peers[a].current_ul_speed > ctx.peers[b].current_ul_speed;
             }
         }.lessThan);
     } else {
-        std.mem.sort(u16, peers_slice, context, struct {
-            fn lessThan(ctx: *EventLoop, a: u16, b: u16) bool {
+        std.mem.sort(u16, peers_slice, self, struct {
+            fn lessThan(ctx: Ctx, a: u16, b: u16) bool {
                 return ctx.peers[a].current_dl_speed > ctx.peers[b].current_dl_speed;
             }
         }.lessThan);
@@ -1080,13 +1082,13 @@ pub fn recalculateUnchokes(self: *EventLoop) void {
 
 /// Pick up peers discovered by daemon tracker sessions.
 /// The standalone announce thread was removed — all announces go through TrackerExecutor.
-pub fn checkReannounce(self: *EventLoop) void {
+pub fn checkReannounce(self: anytype) void {
     const results = blk: {
         self.announce_mutex.lock();
         defer self.announce_mutex.unlock();
         if (self.announce_results.items.len == 0) break :blk null;
         const drained = self.announce_results;
-        self.announce_results = std.ArrayList(EventLoop.AnnounceResult).empty;
+        self.announce_results = std.ArrayList(@TypeOf(self.*).AnnounceResult).empty;
         break :blk drained;
     };
     if (results) |owned_results| {
@@ -1109,7 +1111,7 @@ pub fn checkReannounce(self: *EventLoop) void {
 
 /// Send PEX messages to all eligible peers at the BEP 11 interval.
 /// Also ensures torrent PEX state is initialized for non-private torrents.
-pub fn checkPex(self: *EventLoop) void {
+pub fn checkPex(self: anytype) void {
     if (!self.pex_enabled) return;
     if (self.active_peer_slots.items.len == 0) return;
 
@@ -1171,7 +1173,7 @@ pub fn checkPex(self: *EventLoop) void {
 }
 
 /// Update speed counters for all active torrents and individual peers (called from tick).
-pub fn updateSpeedCounters(self: *EventLoop) void {
+pub fn updateSpeedCounters(self: anytype) void {
     if (self.active_peer_slots.items.len == 0) return;
 
     const now = self.clock.now();
@@ -1238,7 +1240,7 @@ pub fn updateSpeedCounters(self: *EventLoop) void {
 /// pieces complete but not all pieces in the torrent). When detected, set
 /// the torrent's `upload_only` flag and re-send extension handshakes to
 /// all connected peers so they know we are upload_only.
-pub fn checkPartialSeed(self: *EventLoop) void {
+pub fn checkPartialSeed(self: anytype) void {
     for (self.torrents_with_peers.items) |tid| {
         const tc = self.getTorrentContext(tid) orelse continue;
         const pt = tc.piece_tracker orelse continue;
@@ -1302,7 +1304,7 @@ fn isWebSeedSentinelSlot(slot: u16) bool {
 /// Slots that are free or web seed sentinels produce null entries (those
 /// blocks are skipped during smart ban bookkeeping).
 fn snapshotAttributionForSmartBan(
-    self: *EventLoop,
+    self: anytype,
     sb: *SmartBan,
     torrent_id: u32,
     piece_index: u32,
@@ -1342,7 +1344,7 @@ fn snapshotAttributionForSmartBan(
 /// Smart Ban Phase 2: given the peer addresses identified as having sent
 /// corrupt blocks, ban them via the BanList and disconnect matching peer
 /// slots.  Called from the hash-pass path in processHashResults.
-pub fn smartBanCorruptPeers(self: *EventLoop, bad_peers: []const std.net.Address) void {
+pub fn smartBanCorruptPeers(self: anytype, bad_peers: []const std.net.Address) void {
     if (bad_peers.len == 0) return;
     const bl = self.ban_list orelse return;
 

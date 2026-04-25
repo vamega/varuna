@@ -14,7 +14,7 @@ const io_interface = @import("io_interface.zig");
 // ── uTP transport ──────────────────────────────────────
 
 /// Submit a RECVMSG SQE for the UDP socket to receive the next datagram.
-pub fn submitUtpRecv(self: *EventLoop) !void {
+pub fn submitUtpRecv(self: anytype) !void {
     if (self.udp_fd < 0) return;
 
     // Set up iovec pointing to the recv buffer
@@ -64,7 +64,7 @@ fn utpRecvComplete(
 }
 
 /// Submit a SENDMSG SQE to send a uTP packet over UDP.
-pub fn submitUtpSend(self: *EventLoop, data: []const u8, remote: std.net.Address) !void {
+pub fn submitUtpSend(self: anytype, data: []const u8, remote: std.net.Address) !void {
     if (self.udp_fd < 0) return;
 
     // Copy data into send buffer
@@ -121,7 +121,7 @@ fn utpSendComplete(
 }
 
 /// Queue a uTP packet for sending. If no send is in flight, submit immediately.
-pub fn utpSendPacket(self: *EventLoop, data: []const u8, remote: std.net.Address) void {
+pub fn utpSendPacket(self: anytype, data: []const u8, remote: std.net.Address) void {
     const UtpQueuedPacket = EventLoop.UtpQueuedPacket;
     if (self.utp_send_pending) {
         // Queue for later
@@ -141,7 +141,7 @@ pub fn utpSendPacket(self: *EventLoop, data: []const u8, remote: std.net.Address
 }
 
 /// Drain the uTP send queue: submit the next queued packet.
-pub fn utpDrainSendQueue(self: *EventLoop) void {
+pub fn utpDrainSendQueue(self: anytype) void {
     if (self.utp_send_queue.items.len == 0) return;
     const pkt = self.utp_send_queue.orderedRemove(0);
     submitUtpSend(self, pkt.data[0..pkt.len], pkt.remote) catch |err| {
@@ -152,7 +152,7 @@ pub fn utpDrainSendQueue(self: *EventLoop) void {
     };
 }
 
-fn handleUtpRecvResult(self: *EventLoop, recv_res: i32) void {
+fn handleUtpRecvResult(self: anytype, recv_res: i32) void {
     // Always re-submit recv for the next datagram
     defer submitUtpRecv(self) catch |err| {
         log.err("failed to re-submit uTP recv: {s}", .{@errorName(err)});
@@ -215,7 +215,7 @@ fn handleUtpRecvResult(self: *EventLoop, recv_res: i32) void {
     }
 }
 
-fn handleUtpSendResult(self: *EventLoop, send_res: i32) void {
+fn handleUtpSendResult(self: anytype, send_res: i32) void {
     self.utp_send_pending = false;
 
     if (send_res < 0) {
@@ -229,7 +229,7 @@ fn handleUtpSendResult(self: *EventLoop, send_res: i32) void {
 /// Check if an outbound uTP connection just completed the three-way
 /// handshake (peer was in .connecting state, socket is now .connected).
 /// If so, begin the peer wire protocol handshake over uTP.
-fn checkOutboundUtpConnect(self: *EventLoop, utp_slot: u16, mgr: *utp_mgr.UtpManager) void {
+fn checkOutboundUtpConnect(self: anytype, utp_slot: u16, mgr: *utp_mgr.UtpManager) void {
     const peer_slot = findPeerByUtpSlot(self, utp_slot) orelse return;
     const peer = &self.peers[peer_slot];
 
@@ -273,7 +273,7 @@ fn checkOutboundUtpConnect(self: *EventLoop, utp_slot: u16, mgr: *utp_mgr.UtpMan
 }
 
 /// Accept pending inbound uTP connections and create Peer entries.
-fn acceptUtpConnection(self: *EventLoop, mgr: *utp_mgr.UtpManager) void {
+fn acceptUtpConnection(self: anytype, mgr: *utp_mgr.UtpManager) void {
     while (mgr.accept()) |utp_slot| {
         // Reject inbound uTP connections during graceful shutdown drain
         if (self.draining) {
@@ -343,7 +343,7 @@ fn acceptUtpConnection(self: *EventLoop, mgr: *utp_mgr.UtpManager) void {
 
 /// Deliver ordered byte-stream data from a uTP socket to the peer wire layer.
 /// This maps uTP slot -> peer slot and feeds data as if it came from a TCP recv.
-fn deliverUtpData(self: *EventLoop, utp_slot: u16, data: []const u8) void {
+fn deliverUtpData(self: anytype, utp_slot: u16, data: []const u8) void {
     // Find the peer associated with this uTP slot
     const peer_slot = findPeerByUtpSlot(self, utp_slot) orelse return;
     const peer = &self.peers[peer_slot];
@@ -452,7 +452,7 @@ fn deliverUtpData(self: *EventLoop, utp_slot: u16, data: []const u8) void {
 
 /// Process a completed outbound handshake response from a uTP peer.
 /// This is the uTP equivalent of the TCP handshake_recv path.
-fn processUtpOutboundHandshake(self: *EventLoop, peer_slot: u16) void {
+fn processUtpOutboundHandshake(self: anytype, peer_slot: u16) void {
     const peer = &self.peers[peer_slot];
     const tc = self.getTorrentContext(peer.torrent_id) orelse {
         self.removePeer(peer_slot);
@@ -490,7 +490,7 @@ fn processUtpOutboundHandshake(self: *EventLoop, peer_slot: u16) void {
 }
 
 /// Process a completed inbound handshake from a uTP peer.
-fn processUtpInboundHandshake(self: *EventLoop, peer_slot: u16) void {
+fn processUtpInboundHandshake(self: anytype, peer_slot: u16) void {
     const peer = &self.peers[peer_slot];
     const inbound_hash = peer.handshake_buf[28..48];
 
@@ -539,7 +539,7 @@ fn processUtpInboundHandshake(self: *EventLoop, peer_slot: u16) void {
 
 /// Send data over a uTP connection (wraps it in uTP DATA packets).
 /// Stores the packet in the outbound buffer for retransmission.
-pub fn utpSendData(self: *EventLoop, peer_slot: u16, data: []const u8) !void {
+pub fn utpSendData(self: anytype, peer_slot: u16, data: []const u8) !void {
     const peer = &self.peers[peer_slot];
     const utp_slot = peer.utp_slot orelse return error.NotUtpPeer;
     const mgr = self.utp_manager orelse return error.NoUtpManager;
@@ -578,7 +578,7 @@ pub fn utpSendData(self: *EventLoop, peer_slot: u16, data: []const u8) !void {
 
 /// Handle the completion of a uTP send for a peer. Since uTP sends don't
 /// have per-peer CQEs, this drives the peer state machine forward.
-fn handleUtpSendComplete(self: *EventLoop, peer_slot: u16) void {
+fn handleUtpSendComplete(self: anytype, peer_slot: u16) void {
     const peer = &self.peers[peer_slot];
 
     switch (peer.state) {
@@ -630,7 +630,7 @@ fn handleUtpSendComplete(self: *EventLoop, peer_slot: u16) void {
 
 /// Send interested message and transition an outbound uTP peer to active
 /// download mode. This is the uTP equivalent of protocol.sendInterestedAndGoActive.
-fn sendUtpInterestedAndGoActive(self: *EventLoop, peer_slot: u16) void {
+fn sendUtpInterestedAndGoActive(self: anytype, peer_slot: u16) void {
     const peer = &self.peers[peer_slot];
     peer.am_interested = true;
     // Message ID 2 = interested
@@ -644,7 +644,7 @@ fn sendUtpInterestedAndGoActive(self: *EventLoop, peer_slot: u16) void {
 }
 
 /// Send a BEP 10 extension handshake over uTP.
-fn submitUtpExtensionHandshake(self: *EventLoop, peer_slot: u16) !void {
+fn submitUtpExtensionHandshake(self: anytype, peer_slot: u16) !void {
     const peer = &self.peers[peer_slot];
     const is_private = if (self.getTorrentContext(peer.torrent_id)) |tc| tc.is_private else false;
     const ext_payload = try ext.encodeExtensionHandshake(self.allocator, self.port, is_private);
@@ -655,7 +655,7 @@ fn submitUtpExtensionHandshake(self: *EventLoop, peer_slot: u16) !void {
 }
 
 /// Send bitfield or unchoke for an inbound uTP peer.
-fn sendUtpInboundBitfieldOrUnchoke(self: *EventLoop, peer_slot: u16) void {
+fn sendUtpInboundBitfieldOrUnchoke(self: anytype, peer_slot: u16) void {
     const peer = &self.peers[peer_slot];
     const tc_bp = self.getTorrentContext(peer.torrent_id);
     if ((if (tc_bp) |t| t.complete_pieces else null) orelse self.complete_pieces) |cp| {
@@ -677,7 +677,7 @@ fn sendUtpInboundBitfieldOrUnchoke(self: *EventLoop, peer_slot: u16) void {
 }
 
 /// Send a framed peer wire message over uTP.
-pub fn utpSendMessage(self: *EventLoop, peer_slot: u16, id: u8, payload: []const u8) !void {
+pub fn utpSendMessage(self: anytype, peer_slot: u16, id: u8, payload: []const u8) !void {
     const msg_len = @as(u32, @intCast(1 + payload.len));
     var header: [5]u8 = undefined;
     std.mem.writeInt(u32, header[0..4], msg_len, .big);
@@ -699,7 +699,7 @@ pub fn utpSendMessage(self: *EventLoop, peer_slot: u16, id: u8, payload: []const
 }
 
 /// Find the peer slot associated with a uTP connection slot.
-pub fn findPeerByUtpSlot(self: *const EventLoop, utp_slot: u16) ?u16 {
+pub fn findPeerByUtpSlot(self: anytype, utp_slot: u16) ?u16 {
     for (self.peers, 0..) |*peer, i| {
         if (peer.state != .free and peer.transport == .utp and peer.utp_slot != null and peer.utp_slot.? == utp_slot) {
             return @intCast(i);
@@ -710,7 +710,7 @@ pub fn findPeerByUtpSlot(self: *const EventLoop, utp_slot: u16) ?u16 {
 
 /// Process uTP timeouts for all active connections. Retransmits packets
 /// that have timed out and closes connections that have backed off too much.
-pub fn utpTick(self: *EventLoop) void {
+pub fn utpTick(self: anytype) void {
     const mgr = self.utp_manager orelse return;
     const now_us = utpNowUs();
 
