@@ -381,6 +381,7 @@ pub fn build(b: *std.Build) void {
     const run_el_health = b.addRunArtifact(el_health_tests);
     const test_el_health_step = b.step("test-event-loop", "Run event loop health tests (fd leaks, thread counts)");
     test_el_health_step.dependOn(&run_el_health.step);
+    test_step.dependOn(&run_el_health.step);
 
     // ── Transfer integration test (single-process piece transfer) ──
     const transfer_tests = b.addTest(.{

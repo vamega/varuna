@@ -490,14 +490,35 @@ pub fn EventLoopOf(comptime IO: type) type {
         }
 
         pub fn deinit(self: *Self) void {
+            // ── Phase -1: Drain hasher → pending_writes ──────────────
+            // Before tearing down the hasher, give any verified piece
+            // results a chance to land on disk. The graceful-shutdown
+            // path drains via the daemon's main loop, but tests and
+            // crash paths call deinit directly with hasher.completed_results
+            // potentially holding valid bufs whose disk writes haven't
+            // been kicked off yet. Run a bounded drain loop:
+            //   tick → processHashResults pulls completed_results into
+            //   pending_writes → tick fires the writes → repeat.
+            // hasher.deinit defensively frees any leftover completed_results
+            // bufs (see hasher.deinit) so even if the drain is incomplete
+            // we don't leak; it just means some verified data may be lost.
             if (self.hasher) |h| {
+                var drain_rounds: u32 = 0;
+                while ((h.hasPendingWork() or self.pending_writes.count() > 0) and
+                    drain_rounds < 100) : (drain_rounds += 1)
+                {
+                    self.io.tick(0) catch break;
+                    peer_policy.processHashResults(self);
+                    self.io.tick(0) catch break;
+                }
                 h.deinit();
                 self.allocator.destroy(h);
             }
 
             // ── Phase 0: Flush pending disk writes ────────────────────
-            // Before closing fds, drain any in-flight piece writes so that
-            // hash-verified data is not lost on shutdown.
+            // Belt-and-braces: drain any pending_writes that the hasher
+            // drain above queued. The drain loop already ticks them, but
+            // this catches any still-in-flight on the legacy path.
             {
                 var flush_rounds: u32 = 0;
                 while (self.pending_writes.count() > 0 and flush_rounds < 100) : (flush_rounds += 1) {
