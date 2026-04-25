@@ -43,11 +43,14 @@ const SimIO = sim_io_mod.SimIO;
 pub const Behavior = union(enum) {
     /// Standard well-behaved seeder.
     honest: void,
-    /// Bytes-per-nanosecond throttle; the peer pauses after each block
-    /// for a window proportional to block size. (Stub for now — honest
-    /// behaviour applies until step() consumes time.)
-    slow: struct { bytes_per_ns: u64 },
-    /// With each block, flip random bits with this probability.
+    /// Drip-feed mode: after each piece response, hold off on the next
+    /// dispatch for `delay_per_block_ns` of simulated time. Implemented
+    /// in `step()` via a `dispatch_blocked_until_ns` checkpoint. This is
+    /// a simpler model than the original `bytes_per_ns` sketch — block
+    /// granularity is sufficient to stress request-pipelining and
+    /// timeouts without a per-byte schedule.
+    slow: struct { delay_per_block_ns: u64 },
+    /// With each block, flip a single random bit with this probability.
     corrupt: struct { probability: f32 },
     /// Always send bytes that don't match the requested block.
     wrong_data: void,
@@ -58,6 +61,19 @@ pub const Behavior = union(enum) {
     disconnect_after: struct { blocks: u32 },
     /// Advertise pieces it doesn't actually hold.
     lie_bitfield: void,
+    /// Greedy peer: accept incoming requests without ever dispatching a
+    /// piece response. Stresses the downloader's request-pipeline
+    /// backpressure / timeout logic. The peer still completes the
+    /// handshake / bitfield / unchoke flow normally so the downloader
+    /// will pipeline real requests at it.
+    greedy: void,
+    /// Advertise an extension handshake with a `metadata_size` value far
+    /// larger than the real metainfo length. Stresses BEP 9 metadata-fetch
+    /// validation. This is a placeholder — the wire-level extension
+    /// handshake send isn't implemented yet (the seeder doesn't initiate
+    /// BEP 10), but the `metadata_size_lie` value is plumbed through so
+    /// callers can stage the test.
+    lie_extensions: struct { metadata_size_lie: u64 = 1 << 30 },
 };
 
 // ── Protocol state ────────────────────────────────────────
@@ -118,6 +134,12 @@ pub const SimPeer = struct {
 
     blocks_sent: u32 = 0,
 
+    /// `slow.delay_per_block_ns` checkpoint — the simulated time before
+    /// which the next piece response must NOT dispatch. `step()` releases
+    /// any blocked piece-response actions when the clock crosses this.
+    /// Default 0 means "never throttled".
+    dispatch_blocked_until_ns: u64 = 0,
+
     recv_completion: Completion = .{},
     send_completion: Completion = .{},
 
@@ -160,14 +182,19 @@ pub const SimPeer = struct {
         try self.armRecv();
     }
 
-    /// Submit any pending actions that don't depend on the partner. For
-    /// the seeder role this is a no-op — the seeder responds to traffic.
-    /// `step` is called by the simulator once per tick; it exists so
-    /// timing-sensitive behaviours (slow, silent_after's idle timer) can
-    /// hook in later without changing the SimPeer/Simulator contract.
+    /// Drive any timing-dependent state forward. Today `step` is the
+    /// place where `slow`-behaviour throttle windows expire — when the
+    /// simulator's clock crosses `dispatch_blocked_until_ns`, the next
+    /// piece response that was queued but held back gets dispatched.
+    /// Behaviours that don't need timing (honest, corrupt, wrong_data,
+    /// lie_bitfield, greedy) leave step as a near-no-op.
     pub fn step(self: *SimPeer, now_ns: u64) !void {
-        _ = self;
-        _ = now_ns;
+        // Released throttle: try to drain any actions that were waiting
+        // for the slow-window to elapse.
+        if (self.dispatch_blocked_until_ns > 0 and now_ns >= self.dispatch_blocked_until_ns) {
+            self.dispatch_blocked_until_ns = 0;
+            try self.pumpActions();
+        }
     }
 
     // ── Action queue ──────────────────────────────────────
@@ -196,12 +223,34 @@ pub const SimPeer = struct {
     }
 
     /// Drain the action queue: while no send is in flight, pop the next
-    /// action and dispatch it. Returns when the queue is empty or a send
-    /// is in flight.
+    /// action and dispatch it. Returns when the queue is empty, a send
+    /// is in flight, or a `slow`-throttle window is open and the head of
+    /// the queue is a piece response (we hold piece responses; control
+    /// messages like handshake/bitfield/unchoke flow through unthrottled).
     fn pumpActions(self: *SimPeer) !void {
         while (!self.send_in_flight) {
+            // Slow throttle: peek at the head — if it's a piece_response
+            // and the window hasn't expired, hold. step() retries when
+            // the clock crosses the deadline.
+            if (self.dispatch_blocked_until_ns > 0 and self.io.now() < self.dispatch_blocked_until_ns) {
+                if (self.action_count > 0 and std.meta.activeTag(self.actions[self.action_head]) == .piece_response) {
+                    return;
+                }
+            }
             const action = self.dequeueAction() orelse return;
             try self.dispatch(action);
+            // Slow: arm the throttle window for the NEXT piece response.
+            switch (action) {
+                .piece_response => switch (self.behavior) {
+                    .slow => |params| {
+                        if (self.send_in_flight) {
+                            self.dispatch_blocked_until_ns = self.io.now() +| params.delay_per_block_ns;
+                        }
+                    },
+                    else => {},
+                },
+                else => {},
+            }
         }
     }
 
@@ -264,8 +313,8 @@ pub const SimPeer = struct {
     }
 
     fn dispatchPieceResponse(self: *SimPeer, req: peer_wire.Request) !void {
-        // disconnect_after and silent_after both gate piece responses on
-        // blocks_sent; handle them centrally here.
+        // disconnect_after, silent_after, and greedy all gate piece
+        // responses; handle them centrally before any work is done.
         switch (self.behavior) {
             .disconnect_after => |params| if (self.blocks_sent >= params.blocks) {
                 self.io.closeSocket(self.fd);
@@ -275,6 +324,11 @@ pub const SimPeer = struct {
             .silent_after => |params| if (self.blocks_sent >= params.blocks) {
                 // Drop the request silently — leave the action queue
                 // drained. The downloader will eventually time out.
+                return;
+            },
+            .greedy => {
+                // Accept the request but never respond. Stresses the
+                // downloader's request-pipeline backpressure.
                 return;
             },
             else => {},

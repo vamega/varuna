@@ -716,3 +716,161 @@ test "SimPeer silent_after stops responding after N blocks" {
     try testing.expectEqual(@as(u32, 3), seeder.requests_received);
     try testing.expectEqual(@as(u32, 2), seeder.blocks_sent);
 }
+
+test "SimPeer greedy accepts requests but never sends pieces" {
+    var io = try SimIO.init(testing.allocator, .{ .socket_capacity = 4 });
+    defer io.deinit();
+
+    var rng = std.Random.DefaultPrng.init(13);
+
+    const fds = try io.createSocketpair();
+    const seeder_fd = fds[0];
+    const test_fd = fds[1];
+
+    const info_hash: [20]u8 = .{0xab} ** 20;
+    const peer_id: [20]u8 = .{0x53} ** 20;
+    const piece_count: u32 = 4;
+    const piece_size: u32 = 16;
+    var bitfield: [1]u8 = .{0xf0};
+    var piece_data: [4 * 16]u8 = undefined;
+    @memset(&piece_data, 0x42);
+
+    var seeder = SimPeer{
+        .io = undefined,
+        .fd = 0,
+        .role = .seeder,
+        .behavior = .{ .greedy = {} },
+        .rng = &rng,
+        .info_hash = undefined,
+        .peer_id = undefined,
+        .piece_count = 0,
+        .piece_size = 0,
+        .bitfield = &.{},
+        .piece_data = &.{},
+    };
+    try seeder.init(.{
+        .io = &io,
+        .fd = seeder_fd,
+        .role = .seeder,
+        .behavior = .{ .greedy = {} },
+        .info_hash = info_hash,
+        .peer_id = peer_id,
+        .piece_count = piece_count,
+        .piece_size = piece_size,
+        .bitfield = &bitfield,
+        .piece_data = &piece_data,
+        .rng = &rng,
+    });
+
+    // Send handshake + interested + 3 requests.
+    var combined: [68 + 5 + 17 * 3]u8 = undefined;
+    const hs = peer_wire.serializeHandshake(info_hash, .{0x44} ** 20);
+    @memcpy(combined[0..68], &hs);
+    const interested_header = peer_wire.serializeHeader(2, &.{});
+    @memcpy(combined[68..73], &interested_header);
+    var off: usize = 73;
+    var p: u32 = 0;
+    while (p < 3) : (p += 1) {
+        const req = peer_wire.serializeRequest(.{ .piece_index = p, .block_offset = 0, .length = 16 });
+        @memcpy(combined[off..][0..17], &req);
+        off += 17;
+    }
+
+    var tx_c = Completion{};
+    var tx_ctx = TxCtx{};
+    try io.send(.{ .fd = test_fd, .buf = &combined }, &tx_c, &tx_ctx, txCallback);
+
+    var rx_c = Completion{};
+    var rx_ctx = RxCtx{};
+    try primeRecv(&io, test_fd, &rx_c, &rx_ctx);
+
+    var i: u32 = 0;
+    while (i < 30) : (i += 1) try io.advance(0);
+
+    // The greedy peer accepted all 3 requests but never sent any blocks.
+    try testing.expectEqual(@as(u32, 3), seeder.requests_received);
+    try testing.expectEqual(@as(u32, 0), seeder.blocks_sent);
+}
+
+test "SimPeer slow throttles piece dispatch with delay_per_block_ns" {
+    var io = try SimIO.init(testing.allocator, .{ .socket_capacity = 4 });
+    defer io.deinit();
+
+    var rng = std.Random.DefaultPrng.init(17);
+
+    const fds = try io.createSocketpair();
+    const seeder_fd = fds[0];
+    const test_fd = fds[1];
+
+    const info_hash: [20]u8 = .{0xab} ** 20;
+    const peer_id: [20]u8 = .{0x53} ** 20;
+    const piece_count: u32 = 2;
+    const piece_size: u32 = 16;
+    var bitfield: [1]u8 = .{0xc0};
+    var piece_data: [2 * 16]u8 = undefined;
+    @memset(&piece_data, 0x42);
+
+    const delay_ns: u64 = 5_000_000; // 5 ms per block
+
+    var seeder = SimPeer{
+        .io = undefined,
+        .fd = 0,
+        .role = .seeder,
+        .behavior = .{ .slow = .{ .delay_per_block_ns = delay_ns } },
+        .rng = &rng,
+        .info_hash = undefined,
+        .peer_id = undefined,
+        .piece_count = 0,
+        .piece_size = 0,
+        .bitfield = &.{},
+        .piece_data = &.{},
+    };
+    try seeder.init(.{
+        .io = &io,
+        .fd = seeder_fd,
+        .role = .seeder,
+        .behavior = .{ .slow = .{ .delay_per_block_ns = delay_ns } },
+        .info_hash = info_hash,
+        .peer_id = peer_id,
+        .piece_count = piece_count,
+        .piece_size = piece_size,
+        .bitfield = &bitfield,
+        .piece_data = &piece_data,
+        .rng = &rng,
+    });
+
+    // Send handshake + interested + 2 requests.
+    var combined: [68 + 5 + 17 * 2]u8 = undefined;
+    const hs = peer_wire.serializeHandshake(info_hash, .{0x44} ** 20);
+    @memcpy(combined[0..68], &hs);
+    const interested_header = peer_wire.serializeHeader(2, &.{});
+    @memcpy(combined[68..73], &interested_header);
+    const req1 = peer_wire.serializeRequest(.{ .piece_index = 0, .block_offset = 0, .length = 16 });
+    @memcpy(combined[73..90], &req1);
+    const req2 = peer_wire.serializeRequest(.{ .piece_index = 1, .block_offset = 0, .length = 16 });
+    @memcpy(combined[90..107], &req2);
+
+    var tx_c = Completion{};
+    var tx_ctx = TxCtx{};
+    try io.send(.{ .fd = test_fd, .buf = &combined }, &tx_c, &tx_ctx, txCallback);
+
+    var rx_c = Completion{};
+    var rx_ctx = RxCtx{};
+    try primeRecv(&io, test_fd, &rx_c, &rx_ctx);
+
+    // Drain at t=0. The first piece response should fire; the second
+    // should be held by the throttle window (5ms not yet elapsed).
+    var i: u32 = 0;
+    while (i < 5) : (i += 1) try io.advance(0);
+    try testing.expectEqual(@as(u32, 1), seeder.blocks_sent);
+
+    // Cross the throttle window. seeder.step is invoked by the simulator
+    // step path, but we don't have a Simulator here — call step directly
+    // to release the throttle. (In a Simulator-driven test the sim does
+    // this for us.)
+    io.now_ns = delay_ns + 1;
+    try seeder.step(io.now_ns);
+    try io.advance(0);
+
+    try testing.expectEqual(@as(u32, 2), seeder.blocks_sent);
+}
