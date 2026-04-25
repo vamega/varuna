@@ -1,93 +1,114 @@
-# 2026-04-25: Stage 2 EventLoop migration (#8, #9, #10, #11 part 1)
+# 2026-04-25: Stage 2 EventLoop migration — DONE
 
 ## What changed
 
-Started the Stage 2 lift of `event_loop.zig` from the legacy
-`(slot|op_type|context)` packed user_data scheme onto the new
-`io_interface`-based `RealIO` backend. Four of the five Stage 2 task
-slices landed; peer send (the second half of #11) and the rest of
-#12 remain.
+Stage 2 of the IO abstraction is complete. Every async op in the
+daemon now runs through the `io_interface` backend (`RealIO` in
+production, `SimIO` in tests). The legacy `ring: linux.IoUring`
+field, the `(slot|op_type|context)` packed-userdata scheme,
+`OpType` / `OpData` / `encodeUserData` / `decodeUserData`, and the
+giant CQE dispatch switch in `event_loop.zig` are all deleted.
 
-## Commits in this batch
+`posix.fdatasync` and `timerfd_create` / `timerfd_settime` no longer
+appear anywhere on the daemon hot path. `varuna` is the first
+production user of the new io_interface end-to-end.
+
+## Commits
+
+In chronological order:
 
 | Commit | Slice |
 |---|---|
-| `e17cd19` | #8 — `io: RealIO` field on EventLoop |
+| `e17cd19` | #8 — `io: RealIO` field on EventLoop alongside legacy `ring` |
 | `a33143d` | #9 — timerfd → native `io.timeout` |
 | `8e3e46c` | #10 — `PieceStore.sync` → async `io.fsync` |
 | `c2b903d` | #11 part 1 — peer recv on `Peer.recv_completion` |
+| `0767216` | docs: STATUS + intermediate progress report |
+| `56ff7e1` | #12 — signal poll on `io.poll` |
+| `281975d` | #12 — multishot peer accept on `io.accept(.multishot)` |
+| `b15d3ba` | #12 — recheck reads on `io.read` (per-span ReadOp) |
+| `f8cf995` | #12 — disk writes on `io.write` (per-span DiskWriteOp) |
+| `fa56885` | #12 — seed disk reads on `io.read` (per-span SeedReadOp) |
+| `1bd794a` | #12 — HTTP executor (socket / deadline-bounded connect / send / recv) |
+| `5d505cd` | #12 — RPC server (multishot accept / per-client gen-stamped ClientOp) |
+| `cfc1dd3` | #12 — metadata fetch (connect / send / recv per Slot) |
+| `c4e701d` | #12 — uTP recvmsg/sendmsg on EventLoop completions |
+| `67fe292` | #12 — UDP tracker executor (socket / sendmsg / recvmsg per Slot) |
+| `050c533` | #12 — outbound peer socket/connect on `Peer.connect_completion` |
+| `9a2cff2` | #11 part 2 — peer send (untracked + tracked PendingSend); wait swap |
+| `cd8435c` | #12 final — delete legacy `ring`, dispatch switch, `OpType`, shims |
 
-### #8: parallel `io: RealIO` field
+## Patterns that worked well
 
-`EventLoop` now embeds a second io_uring instance (`io: RealIO`)
-alongside the legacy `ring: linux.IoUring`. They share fds; each call
-site flips atomically between them during the migration. `tick()`
-drains `io` non-blockingly before the legacy ring's `submit_and_wait`
-and again after dispatch. `deinit` flushes `io` alongside `ring` in
-the existing Phase 0/Phase 2 drain loops, then deinits `io` in
-Phase 4. `RealIO.init` gained the same `COOP_TASKRUN | SINGLE_ISSUER`
-fallback path that `ring.zig:initIoUring` uses, so older kernels
-still boot.
+After 18 migrations, two shapes accounted for almost everything:
 
-### #9: timerfd → io.timeout
+### 1. Single Completion per long-lived "slot"
 
-The old timer mechanism (timerfd_create → timerfd_settime → io_uring
-read on the timerfd) is gone. `EventLoop.tick_timeout_completion`
-arms a single one-shot `io.timeout` per scheduled callback;
-`tickTimeoutComplete` clears `timer_pending` and drains expired
-callbacks via `fireExpiredTimers`, which re-arms for the next
-soonest deadline. `OpType.timerfd` is deleted; the corresponding
-dispatch arm is gone. This was the first real proof the new path
-works end-to-end.
+Used wherever the underlying state machine is fully serial. The
+Completion is embedded directly in the slot struct; `@fieldParentPtr`
+recovers the slot pointer from the completion in the callback;
+pointer arithmetic on the parent slice yields the slot index.
 
-### #10: PieceStore.sync → io.fsync
+- `Peer.recv_completion` — handshake → header → body → next header,
+  with MSE chunks; only one recv in flight per peer.
+- `Peer.connect_completion` — outbound `socket` chains a `connect` on
+  the same completion.
+- `Peer.send_completion` — *untracked* peer wire sends (handshake,
+  MSE, MSE-resubmit). One untracked send in flight per peer at a
+  time; gated by `peer.send_pending`.
+- `HttpExecutor.RequestSlot.completion` — DNS → connect → TLS or
+  send → recv loop, fully serial within a slot.
+- `AsyncMetadataFetch.Slot.completion` — connecting → handshake_send
+  → handshake_recv → ext_handshake_send → ext_handshake_recv →
+  piece_request_send → piece_recv loop, serial.
+- `UdpTrackerExecutor.RequestSlot.completion` — socket → sendmsg →
+  recvmsg, serial.
+- `EventLoop.tick_timeout_completion` — single one-shot timer.
+- `EventLoop.signal_completion` — POLL.IN on signalfd; rearm on first
+  fire so a second SIGINT during drain forces immediate exit.
+- `EventLoop.accept_completion` — multishot accept; F_MORE preserves
+  in_flight.
+- `EventLoop.utp_recv_completion` / `utp_send_completion` — UDP
+  socket recvmsg/sendmsg.
+- `EventLoop.wake_timeout_completion` — for `submitTimeout`.
+- `HttpExecutor.dns_poll_completion` /
+  `UdpTrackerExecutor.dns_poll_completion` — DNS-eventfd poll, .rearm.
 
-`posix.fdatasync` no longer appears anywhere in the daemon path.
-`PieceStore.sync` now takes a `*RealIO`, allocates one
-`io_interface.Completion` per open file, submits them all via
-`io.fsync(.datasync = true)`, and ticks the ring until every
-completion fires. The first fsync error is surfaced after all
-completions land. Both call sites (the `writer.zig` test and
-`tests/transfer_integration_test.zig`) construct a one-shot RealIO
-around the call.
+### 2. Heap-allocated tracking struct with embedded Completion
 
-A small helper, `SyncContext { pending, first_error }`, plus the
-private `syncCompleteCallback` form the count-down. It's the model
-for any future "submit N, wait for all, surface the first error"
-pattern.
+Used for fan-out where multiple ops are in flight against the same
+logical entity simultaneously. The struct is `allocator.create`d on
+submit, freed by the callback. The Completion address is stable for
+the kernel's lifetime regardless of any owning ArrayList growth.
 
-### #11 part 1: peer recv migration
+- `recheck.AsyncRecheck.ReadOp` — per-span piece read.
+- `peer_handler.DiskWriteOp` — per-span piece write.
+- `seed_handler.SeedReadOp` — per-span seed disk read for piece
+  responses.
+- `rpc.server.ApiServer.ClientOp` — per-client recv/send with a
+  generation counter so stale CQEs against a reused slot are
+  filtered.
+- `buffer_pools.PendingSend` itself — already heap-allocated for the
+  `pending_sends: ArrayList(*PendingSend)` model so the embedded
+  Completion (in-flight tracked-send tracker) has a stable address.
 
-Recvs are naturally serial per peer (handshake → header → body, with
-MSE chunks as needed), so a single `recv_completion` field on `Peer`
-is sufficient. All five recv submission helpers migrated:
+### Smaller patterns
 
-- `protocol.submitHandshakeRecv`
-- `protocol.submitHeaderRecv`
-- `protocol.submitBodyRecv`
-- `peer_handler.executeMseAction` (.recv arm)
-- `peer_handler.startMseResponder` (catch-up read)
-
-The new callback `peer_handler.peerRecvComplete`:
-
-1. Recovers `*Peer` via `@fieldParentPtr("recv_completion", c)`.
-2. Computes the slot index from `(@intFromPtr(peer) - peers.ptr) / @sizeOf(Peer)`.
-3. Translates `Result.recv` into a synthetic cqe-shaped `i32`
-   (negative on error) and calls the existing dispatch body, now
-   factored out as `handleRecvResult(self, slot, recv_res)`.
-4. Returns `.disarm`.
-
-`OpType.peer_recv` and the corresponding dispatch arm are deleted.
-`perf/workloads.runPeerAcceptBurst` stops counting `peer_recv` CQEs
-on the legacy ring (they no longer land there) and gains an
-`io.tick(0)` drain so io_interface completions still progress.
+- `io.connect` with `deadline_ns` cleanly replaces the manual
+  `IOSQE_IO_LINK + link_timeout` hack on `ud + 1` previously seen
+  in HttpExecutor.
+- `io.poll(POLL.IN)` with `.rearm` callback replaces the
+  `sentinel_dns` / `sentinel_*` userdata convention used by HTTP and
+  UDP tracker for DNS-eventfd plumbing.
+- `io.cancel(.{ .target = &c })` replaces manual
+  `ring.cancel(cancel_ud, accept_ud, 0)` with shared
+  `accept_cancel_completion` etc.
 
 ## Foundation bugs surfaced and fixed
 
-Both bugs were latent; the parity tests didn't trip them because
-their callbacks return `.disarm` without re-arming the same
-completion. The recv migration is the first real exercise of the
-"callback re-arms its own completion" path.
+Both surfaced once real callbacks started re-arming the same
+completion. The parity tests didn't trip them because their
+callbacks return `.disarm` immediately.
 
 ### Bug A — `dispatchCqe` cleared `in_flight` after the callback
 
@@ -98,7 +119,7 @@ const action = callback(...);
 if (!more) realState(c).in_flight = false;
 ```
 
-So a callback that re-armed the same completion in the natural
+A callback that re-armed the same completion in the natural
 "recv body, then immediately recv next header" pattern hit
 `AlreadyInFlight` against itself. Fix: clear `in_flight` *before*
 the callback (multishot still leaves it set, since the kernel will
@@ -112,46 +133,77 @@ casts the field to `RealState` whose first field is
 fresh completions could observe stale `in_flight=true`. Fix: default
 the byte array to `[_]u8{0} ** 64`.
 
+### The blocking-wait swap
+
+A subtler one. During the migration, `EventLoop.tick()` blocked on
+`self.ring.submit_and_wait(1)` and drained `self.io` non-blocking.
+That works while the legacy ring still has SQEs queued. Once peer
+send and the residual op types moved to `io`, the legacy ring went
+empty and `submit_and_wait(1)` blocked indefinitely. Fix
+(commit `9a2cff2`): swap to `self.io.tick(1)` as the blocking call
+and drain the legacy ring non-blocking; in the final cleanup
+(`cd8435c`) the legacy ring is gone.
+
 ## Tests
 
-163/163 (no regression). `test-io-parity 2/2`, `test-transfer 1/1`,
-`test-event-loop 3/3`, `test-sim 1/1` (the latter exercises the new
-recv path end-to-end through a VirtualPeer seeder/EventLoop
-downloader transfer).
+163/163 throughout the migration — no regression. The new tests
+the team-lead anticipated would land here didn't materialise: every
+sub-task was best validated by the existing integration suite
+(test-sim, test-transfer, test-event-loop) plus the parity tests.
+The recv path's two foundation fixes were caught by `test-sim`,
+which exercises a full handshake → header → body → request → piece
+flow against a real socketpair. `test-io-parity` stays at 2/2.
 
 ## What's left
 
-- **#11 part 2 — peer send migration.** Examination of `peer_policy.zig`
-  shows the daemon explicitly relies on multiple in-flight tracked
-  sends per peer for pipeline refills (see comment at
-  `peer_policy.zig:259`). A single `send_completion` per peer would
-  regress that. The proper shape: untracked sends (handshake, MSE)
-  use `Peer.send_completion`; tracked sends embed a Completion
-  inside `PendingSend`. This is a moderate refactor — flagged in a
-  team-lead message.
-
-- **#12 — remaining op types.** HTTP (`http_executor.zig`), RPC
-  accept/recv/send, peer listener multishot accept, disk read/write
-  (PieceStore via peer_handler/web_seed_handler), recheck
-  (`recheck.zig`), metadata (`metadata_handler.zig`), uTP
-  (`utp_handler.zig`), UDP tracker, signal poll. Once everything is
-  migrated, `encodeUserData` / `decodeUserData` / `OpType` and the
-  CQE dispatch switch all go away, along with the legacy `ring`
-  field on `EventLoop`.
+Stage 2 is complete. Stages 3+ (Simulator + sim_swarm tests, SimPeer
+behaviours, BUGGIFY) are sim-engineer's track. With the legacy ring
+gone, parameterising `EventLoop` over `comptime IO: type` is now a
+mechanical lift — every reference to `self.io` and `*RealIO` in the
+codebase becomes `self.io` and `*IO` with a generic type parameter
+threading through. That's the right entry point for whichever
+teammate picks up `Simulator + EventLoop(SimIO)`.
 
 ## Key code references
 
-- `src/io/event_loop.zig:146-153` — `io: RealIO` field.
-- `src/io/event_loop.zig:354-368` — RealIO init with fallback.
-- `src/io/event_loop.zig:415-451` — `tick()` drain order
-  (legacy + io interleaved).
-- `src/io/event_loop.zig:1480-1525` — `armNextTimer` / `tickTimeoutComplete`.
-- `src/io/peer_handler.zig:418-456` — `peerRecvComplete` callback +
-  `handleRecvResult` factoring.
-- `src/io/protocol.zig:426-450` — three migrated recv submission
+- `src/io/event_loop.zig:62-300` — EventLoop struct (no `ring` field).
+- `src/io/event_loop.zig:1426-1461` — `tick()` blocking on
+  `io.tick(1)`.
+- `src/io/event_loop.zig:1505-1525` — `submitTimeout` on
+  `wake_timeout_completion`.
+- `src/io/peer_handler.zig:21-44` — `peerAcceptComplete` rearm.
+- `src/io/peer_handler.zig:131-169` — `peerSocketComplete` chains
+  `io.connect`.
+- `src/io/peer_handler.zig:330-340` — `peerSendComplete` (untracked).
+- `src/io/peer_handler.zig:357-389` — `pendingSendComplete` (tracked).
+- `src/io/peer_handler.zig:418-456` — `peerRecvComplete`.
+- `src/io/peer_handler.zig:802-844` — `DiskWriteOp` +
+  `diskWriteComplete`.
+- `src/io/protocol.zig:426-456` — three migrated recv submission
   helpers.
 - `src/io/real_io.zig:114-140` — `dispatchCqe` with the in_flight
   fix.
-- `src/io/io_interface.zig:251-256` — zero-default `_backend_state`.
+- `src/io/io_interface.zig:251-257` — zero-default
+  `_backend_state`.
+- `src/io/buffer_pools.zig:312-331` — `PendingSend` with embedded
+  Completion.
+- `src/io/event_loop.zig:2065-2120` — `submitPendingSend` /
+  `handlePartialSend`.
 - `src/storage/writer.zig:124-160` — async `sync(io)` API.
-- `src/storage/writer.zig:200-225` — `SyncContext` + callback.
+- `src/io/recheck.zig:108-160` — `ReadOp` + `recheckReadComplete`.
+- `src/io/seed_handler.zig:24-58` — `SeedReadOp` +
+  `seedReadComplete`.
+- `src/rpc/server.zig:118-135` — `ClientOp` (per-op gen-stamped).
+- `src/rpc/server.zig:138-256` — `apiAcceptComplete` /
+  `apiRecvComplete` / `apiSendComplete`.
+- `src/io/http_executor.zig:269-330` — `httpSocketComplete` /
+  `httpConnectComplete` (deadline-bounded).
+- `src/io/http_executor.zig:560-700` — `httpSendComplete` /
+  `httpRecvComplete`.
+- `src/io/metadata_handler.zig:170-225` —
+  `metadataConnectComplete` / `metadataSendComplete` /
+  `metadataRecvComplete`.
+- `src/daemon/udp_tracker_executor.zig:225-310` —
+  `udpSocketComplete` / `udpSendComplete` / `udpRecvComplete`.
+- `src/io/utp_handler.zig:42-84` — `utpRecvComplete` /
+  `utpSendComplete`.

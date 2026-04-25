@@ -17,54 +17,6 @@ const WebSeedManager = @import("../net/web_seed.zig").WebSeedManager;
 pub const max_peers: u16 = 4096;
 pub const TorrentId = u32;
 
-// ── User data encoding ────────────────────────────────────
-
-pub const OpType = enum(u8) {
-    peer_connect = 0,
-    peer_send = 2,
-    disk_read = 4,
-    disk_write = 5,
-    http_connect = 6,
-    http_send = 7,
-    http_recv = 8,
-    timeout = 9,
-    cancel = 10,
-    utp_recv = 11,
-    utp_send = 12,
-    api_accept = 13,
-    api_recv = 14,
-    api_send = 15,
-    udp_tracker_send = 16,
-    udp_tracker_recv = 17,
-    recheck_read = 19,
-    metadata_connect = 20,
-    metadata_send = 21,
-    metadata_recv = 22,
-    peer_socket = 23,
-    http_socket = 24,
-    udp_socket = 25,
-};
-
-pub const OpData = struct {
-    slot: u16,
-    op_type: OpType,
-    context: u40,
-};
-
-pub fn encodeUserData(op: OpData) u64 {
-    return (@as(u64, op.slot) << 48) |
-        (@as(u64, @intFromEnum(op.op_type)) << 40) |
-        @as(u64, op.context);
-}
-
-pub fn decodeUserData(user_data: u64) OpData {
-    return .{
-        .slot = @intCast(user_data >> 48),
-        .op_type = @enumFromInt(@as(u8, @intCast((user_data >> 40) & 0xFF))),
-        .context = @intCast(user_data & 0xFFFFFFFFFF),
-    };
-}
-
 // ── Peer ──────────────────────────────────────────────────
 
 pub const PeerMode = enum {
@@ -200,6 +152,20 @@ pub const Peer = struct {
     // callback (`peer_handler.peerRecvComplete`) re-derives the slot via
     // pointer arithmetic on `EventLoop.peers` and dispatches.
     recv_completion: io_interface.Completion = .{},
+
+    /// Completion for outbound socket / connect ops on the
+    /// io_interface backend. Socket creation (`io.socket`) and connect
+    /// (`io.connect`) are a sequential pair during outbound peer
+    /// initialisation; they reuse the same completion since only one
+    /// is in flight at any moment.
+    connect_completion: io_interface.Completion = .{},
+
+    /// Completion for **untracked** peer wire sends (handshake, MSE,
+    /// extension handshake, choke/unchoke acks — anything that doesn't
+    /// own a heap buffer that needs to outlive the SQE). Untracked
+    /// sends are gated by `send_pending` and serialized per peer.
+    /// Tracked sends (PendingSend) embed their own completion.
+    send_completion: io_interface.Completion = .{},
 };
 
 // ── Torrent context (per-torrent state within shared event loop) ──

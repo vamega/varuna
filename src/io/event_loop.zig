@@ -45,10 +45,6 @@ const web_seed_handler = @import("web_seed_handler.zig");
 pub const types = @import("types.zig");
 pub const max_peers = types.max_peers;
 pub const TorrentId = types.TorrentId;
-pub const OpType = types.OpType;
-pub const OpData = types.OpData;
-pub const encodeUserData = types.encodeUserData;
-pub const decodeUserData = types.decodeUserData;
 pub const PeerMode = types.PeerMode;
 pub const Transport = types.Transport;
 pub const PeerState = types.PeerState;
@@ -146,12 +142,9 @@ pub const EventLoop = struct {
         peers: []std.net.Address,
     };
 
-    ring: linux.IoUring,
-    /// New `io_interface`-based backend used by migrated call sites. During
-    /// Stage 2 the legacy `ring` and the new `io` coexist on separate ring
-    /// instances. `ring` carries the packed-userdata legacy ops; `io` carries
-    /// `*Completion`-keyed ops via `RealIO`. Both share the same fds. Once
-    /// every call site is migrated (Stage 2 #12), `ring` is removed.
+    /// `io_interface`-based io_uring backend driving every async op.
+    /// Stage 2 replaced the legacy packed-userdata ring with a single
+    /// caller-owned-Completion model.
     io: RealIO,
     allocator: std.mem.Allocator,
     peers: []Peer,
@@ -231,6 +224,10 @@ pub const EventLoop = struct {
     utp_send_pending: bool = false,
     // Outbound packet queue (when a send is already in flight)
     utp_send_queue: std.ArrayList(UtpQueuedPacket) = std.ArrayList(UtpQueuedPacket).empty,
+    // io_interface completions for the UDP socket recvmsg / sendmsg.
+    // recv is re-armed indefinitely; send is one-shot per packet.
+    utp_recv_completion: io_interface.Completion = .{},
+    utp_send_completion: io_interface.Completion = .{},
 
     // DHT (BEP 5): distributed hash table engine for trackerless peer discovery.
     // Shares the UDP socket with uTP. Incoming datagrams starting with 'd'
@@ -253,8 +250,10 @@ pub const EventLoop = struct {
     // Complete pieces bitfield (for seeding -- which pieces we can serve)
     complete_pieces: ?*const Bitfield = null,
 
-    // Timeout storage (must outlive the SQE)
-    timeout_ts: linux.kernel_timespec = .{ .sec = 2, .nsec = 0 },
+    /// Wake-up timeout completion. Used by `submitTimeout` to break a
+    /// blocking `io.tick(1)` after a deadline so external callers (tests,
+    /// perf, daemon startup) can poll periodically.
+    wake_timeout_completion: io_interface.Completion = .{},
     timeout_pending: bool = false,
 
     // One-shot timer callbacks driven by `io.timeout` on the new
@@ -270,7 +269,7 @@ pub const EventLoop = struct {
     next_pending_write_id: u32 = 1,
 
     // Pending sends: track allocated send buffers (for seed piece responses).
-    pending_sends: std.ArrayList(PendingSend),
+    pending_sends: std.ArrayList(*PendingSend),
     small_send_pool: SmallSendPool,
     // Monotonic counter for unique PendingSend identification across CQEs.
     // Starts at 1 because context=0 means "untracked send" (no PendingSend entry).
@@ -362,11 +361,6 @@ pub const EventLoop = struct {
             null;
 
         return .{
-            .ring = try ring_mod.initIoUring(256, linux.IORING_SETUP_COOP_TASKRUN | linux.IORING_SETUP_SINGLE_ISSUER),
-            // Second ring instance for the new io_interface backend. Same
-            // size as the legacy ring; same flags (with kernel fallback in
-            // RealIO.init). Each call site flips atomically between `ring`
-            // and `io` during the Stage 2 migration.
             .io = try RealIO.init(.{
                 .entries = 256,
                 .flags = linux.IORING_SETUP_COOP_TASKRUN | linux.IORING_SETUP_SINGLE_ISSUER,
@@ -381,7 +375,7 @@ pub const EventLoop = struct {
             .mse_req2_to_hash = std.AutoHashMap([20]u8, [20]u8).init(allocator),
             .pending_writes = .empty,
             .pending_write_lookup = .empty,
-            .pending_sends = std.ArrayList(PendingSend).empty,
+            .pending_sends = std.ArrayList(*PendingSend).empty,
             .small_send_pool = try SmallSendPool.init(allocator, small_send_slots, small_send_capacity),
             .pending_reads = std.ArrayList(PendingPieceRead).empty,
             .queued_responses = try std.ArrayList(QueuedBlockResponse).initCapacity(allocator, 256),
@@ -466,20 +460,9 @@ pub const EventLoop = struct {
         // Before closing fds, drain any in-flight piece writes so that
         // hash-verified data is not lost on shutdown.
         {
-            _ = self.ring.submit() catch {};
-            self.io.tick(0) catch {};
             var flush_rounds: u32 = 0;
             while (self.pending_writes.count() > 0 and flush_rounds < 100) : (flush_rounds += 1) {
-                _ = self.ring.submit_and_wait(1) catch break;
-                var cqes: [cqe_batch_size]linux.io_uring_cqe = undefined;
-                const count = self.ring.copy_cqes(&cqes, 0) catch break;
-                for (cqes[0..count]) |cqe| {
-                    self.dispatch(cqe);
-                }
-                // Also drain io_interface completions that may have been
-                // produced during this round (e.g. async fsync after a
-                // piece write completes on the legacy ring).
-                self.io.tick(0) catch {};
+                self.io.tick(1) catch break;
             }
         }
 
@@ -642,49 +625,22 @@ pub const EventLoop = struct {
         self.timer_callbacks.deinit(self.allocator);
 
         // ── Phase 4: Tear down the ring ──────────────────────────
-        self.ring.deinit();
         self.io.deinit();
     }
 
-    /// Drain all remaining CQEs from the ring after fds are closed.
-    /// Used during deinit to ensure the kernel is done with our buffers
-    /// before we free them.
+    /// Drain pending CQEs from the io_interface ring after fds are closed.
+    /// Used during deinit to ensure the kernel has finished touching any
+    /// buffers we're about to free.
     fn drainRemainingCqes(self: *EventLoop) void {
-        // Submit any queued SQEs so they complete (with errors, since fds are closed)
-        _ = self.ring.submit() catch {};
-        self.io.tick(0) catch {};
-
-        // Keep dispatching until tracked buffer-owning operations are gone.
-        // This ensures late CQEs release the resources they reference before
-        // we free backing memory during deinit.
         var drain_rounds: u32 = 0;
         while (drain_rounds < 256 and self.pendingBufferOperations() > 0) : (drain_rounds += 1) {
-            _ = self.ring.submit_and_wait(1) catch break;
-            var cqes: [cqe_batch_size]linux.io_uring_cqe = undefined;
-            const count = self.ring.copy_cqes(&cqes, 0) catch break;
-            if (count == 0) {
-                // No legacy CQEs this round; still try to drain new-ring
-                // completions before continuing.
-                self.io.tick(0) catch {};
-                continue;
-            }
-            for (cqes[0..count]) |cqe| {
-                self.dispatch(cqe);
-            }
-            self.io.tick(0) catch {};
+            self.io.tick(1) catch break;
         }
-
-        // Best-effort final sweep for non-owning completions that may still be queued.
+        // Best-effort non-blocking sweep.
         drain_rounds = 0;
         while (drain_rounds < 32) : (drain_rounds += 1) {
-            var cqes: [cqe_batch_size]linux.io_uring_cqe = undefined;
-            const count = self.ring.copy_cqes(&cqes, 0) catch break;
-            if (count == 0) break;
-            for (cqes[0..count]) |cqe| {
-                self.dispatch(cqe);
-            }
+            self.io.tick(0) catch break;
         }
-        self.io.tick(0) catch {};
 
         if (self.pendingBufferOperations() > 0) {
             log.warn(
@@ -1036,11 +992,15 @@ pub const EventLoop = struct {
             .address = address,
         };
 
-        // Submit async socket creation via io_uring (IORING_OP_SOCKET, kernel 5.19+).
-        // The CQE handler (peer_handler.handleSocketCreated) will configure the fd
-        // and chain the CONNECT SQE.
-        const ud = encodeUserData(.{ .slot = slot, .op_type = .peer_socket, .context = 0 });
-        _ = try self.ring.socket(ud, family, posix.SOCK.STREAM | posix.SOCK.CLOEXEC | posix.SOCK.NONBLOCK, posix.IPPROTO.TCP, 0);
+        // Submit async socket creation via io_interface. The callback
+        // (peer_handler.peerSocketComplete) configures the fd and chains
+        // the connect.
+        try self.io.socket(
+            .{ .domain = family, .sock_type = posix.SOCK.STREAM | posix.SOCK.CLOEXEC | posix.SOCK.NONBLOCK, .protocol = posix.IPPROTO.TCP },
+            &peer.connect_completion,
+            self,
+            peer_handler.peerSocketComplete,
+        );
 
         self.peer_count += 1;
         self.half_open_count += 1;
@@ -1203,16 +1163,15 @@ pub const EventLoop = struct {
         const fd = self.udp_fd;
         self.udp_fd = -1;
 
-        // Cancel the pending RECVMSG SQE
-        const recv_ud = encodeUserData(.{ .slot = 0, .op_type = .utp_recv, .context = 0 });
-        const cancel_ud = encodeUserData(.{ .slot = 0, .op_type = .cancel, .context = 0 });
-        _ = self.ring.cancel(cancel_ud, recv_ud, 0) catch {};
+        // Cancel the pending RECVMSG on the io_interface ring.
+        self.io.cancel(
+            .{ .target = &self.utp_recv_completion },
+            &self.accept_cancel_completion,
+            null,
+            ignoredCancelComplete,
+        ) catch {};
 
-        // Close the fd via io_uring (avoids racing with the pending CQE)
-        _ = self.ring.close(cancel_ud, fd) catch {
-            // Fallback to synchronous close if we can't get an SQE
-            posix.close(fd);
-        };
+        posix.close(fd);
 
         if (self.utp_manager) |mgr| {
             mgr.deinit();
@@ -1264,21 +1223,13 @@ pub const EventLoop = struct {
         self.listen_fd = -1;
 
         // Cancel the in-flight multishot accept on the io_interface ring.
-        // The cancel completion's callback drops the result on the floor
-        // (we don't care whether it landed before close).
         self.io.cancel(
             .{ .target = &self.accept_completion },
             &self.accept_cancel_completion,
             null,
             ignoredCancelComplete,
         ) catch {};
-
-        // Close via io_uring on the legacy ring with a sentinel user_data
-        // (cancel op type) — the dispatch arm for `.cancel` is a no-op.
-        const cancel_ud = encodeUserData(.{ .slot = 0, .op_type = .cancel, .context = 0 });
-        _ = self.ring.close(cancel_ud, fd) catch {
-            posix.close(fd);
-        };
+        posix.close(fd);
 
         log.info("TCP listener stopped", .{});
     }
@@ -1433,40 +1384,20 @@ pub const EventLoop = struct {
         if (self.http_executor) |he| he.tick();
         if (self.udp_tracker_executor) |ute| ute.tick();
 
-        // Flush any queued SQEs before waiting
-        _ = self.ring.submit() catch |err| {
-            log.warn("ring submit (pre-wait): {s}", .{@errorName(err)});
-        };
-        // Submit pending SQEs on the new io_interface ring without waiting
-        // (the legacy ring's submit_and_wait below provides forward
-        // progress during the Stage 2 transition; once everything is
-        // migrated, the wait moves here).
-        self.io.tick(0) catch |err| {
-            log.warn("io tick (pre-wait): {s}", .{@errorName(err)});
-        };
-        _ = try self.ring.submit_and_wait(1);
-
-        var cqes: [cqe_batch_size]linux.io_uring_cqe = undefined;
-        const count = try self.ring.copy_cqes(&cqes, 0);
-
-        for (cqes[0..count]) |cqe| {
-            self.dispatch(cqe);
-        }
-
-        // Drain any io_interface CQEs that arrived in parallel with the
-        // legacy ring's wait. Non-blocking; callbacks fire on the same
-        // event-loop thread.
-        self.io.tick(0) catch |err| {
-            log.warn("io tick (post-dispatch): {s}", .{@errorName(err)});
+        // Block on the io_interface ring — every active op type lives
+        // there (peer recv/send/connect/socket, accept, disk r/w,
+        // timer, signal poll, HTTP/RPC/metadata/uTP/UDP tracker).
+        // Callbacks fire from inside the tick.
+        self.io.tick(1) catch |err| {
+            log.warn("io tick (wait): {s}", .{@errorName(err)});
         };
 
         // Batch-send any queued piece block responses
         seed_handler.flushQueuedResponses(self);
 
-        // Flush any SQEs queued during dispatch (piece responses, block requests, etc.)
-        _ = self.ring.submit() catch |err| {
-            log.warn("ring submit (post-dispatch): {s}", .{@errorName(err)});
-        };
+        // Drain any io_interface CQEs that were produced by callbacks
+        // re-arming during the dispatch above (e.g. submitHeaderRecv
+        // chained from a body-recv callback).
         self.io.tick(0) catch |err| {
             log.warn("io tick (post-flush): {s}", .{@errorName(err)});
         };
@@ -1511,14 +1442,24 @@ pub const EventLoop = struct {
     /// Submit a timeout SQE so that submit_and_wait returns even if
     /// no I/O completes. This allows the caller to do periodic work.
     pub fn submitTimeout(self: *EventLoop, timeout_ns: u64) !void {
-        if (self.timeout_pending) return; // previous timeout SQE still in flight
-        self.timeout_ts = .{
-            .sec = @intCast(timeout_ns / std.time.ns_per_s),
-            .nsec = @intCast(timeout_ns % std.time.ns_per_s),
-        };
-        const ud = encodeUserData(.{ .slot = 0, .op_type = .timeout, .context = 0 });
-        _ = try self.ring.timeout(ud, &self.timeout_ts, 0, 0);
+        if (self.timeout_pending) return; // previous timeout still in flight
+        try self.io.timeout(
+            .{ .ns = timeout_ns },
+            &self.wake_timeout_completion,
+            self,
+            wakeTimeoutComplete,
+        );
         self.timeout_pending = true;
+    }
+
+    fn wakeTimeoutComplete(
+        userdata: ?*anyopaque,
+        _: *io_interface.Completion,
+        _: io_interface.Result,
+    ) io_interface.CallbackAction {
+        const self: *EventLoop = @ptrCast(@alignCast(userdata.?));
+        self.timeout_pending = false;
+        return .disarm;
     }
 
     // ── io.timeout-based one-shot timers ────────────────────
@@ -1645,7 +1586,7 @@ pub const EventLoop = struct {
             self.allocator,
             session,
             fds,
-            &self.ring,
+            &self.io,
             h,
             torrent_id,
             known_complete,
@@ -1698,7 +1639,7 @@ pub const EventLoop = struct {
 
         self.metadata_fetch = try metadata_handler.AsyncMetadataFetch.create(
             self.allocator,
-            &self.ring,
+            &self.io,
             info_hash,
             peer_id,
             port,
@@ -1894,46 +1835,6 @@ pub const EventLoop = struct {
         return false;
     }
 
-    // ── CQE dispatch ──────────────────────────────────────
-
-    fn dispatch(self: *EventLoop, cqe: linux.io_uring_cqe) void {
-        const op = decodeUserData(cqe.user_data);
-        switch (op.op_type) {
-            .peer_socket => peer_handler.handleSocketCreated(self, op.slot, cqe),
-            .peer_connect => peer_handler.handleConnect(self, op.slot, cqe),
-            .peer_send => peer_handler.handleSend(self, op.slot, cqe),
-            .disk_write => peer_handler.handleDiskWrite(self, op.slot, cqe),
-            .disk_read => seed_handler.handleSeedDiskRead(self, cqe),
-            .timeout => {
-                self.timeout_pending = false;
-            },
-            .utp_recv => utp_handler.handleUtpRecv(self, cqe),
-            .utp_send => utp_handler.handleUtpSend(self, cqe),
-            .http_socket, .http_connect, .http_send, .http_recv => {
-                if (self.http_executor) |he| he.dispatchCqe(cqe);
-            },
-            .cancel => {},
-            .api_accept => if (self.api_server) |srv| srv.handleAcceptCqe(cqe),
-            .api_recv => if (self.api_server) |srv| srv.handleRecvCqe(op.slot, op.context, cqe),
-            .api_send => if (self.api_server) |srv| srv.handleSendCqe(op.slot, op.context, cqe),
-            .udp_socket, .udp_tracker_send, .udp_tracker_recv => {
-                if (self.udp_tracker_executor) |ute| ute.dispatchCqe(cqe);
-            },
-            .recheck_read => {
-                const tid: u32 = @truncate(op.context);
-                for (self.rechecks.items) |rc| {
-                    if (rc.torrent_id == tid) {
-                        rc.handleReadCqe(op.slot, cqe.res);
-                        break;
-                    }
-                }
-            },
-            .metadata_connect, .metadata_send, .metadata_recv => {
-                if (self.metadata_fetch) |mf| mf.handleCqe(op.op_type, op.slot, cqe.res);
-            },
-        }
-    }
-
     // ── Idle-peer tracking (for efficient tryAssignPieces) ─
 
     /// Returns true when a slot is eligible for piece assignment.
@@ -2077,59 +1978,67 @@ pub const EventLoop = struct {
         self.piece_buffer_pool.release(self.allocator, if (self.huge_page_cache) |*hpc| hpc else null, piece_buffer);
     }
 
-    /// Allocate a unique send_id for a new PendingSend and return the
-    /// encoded user data with the send_id in the context field.
-    /// send_id is never 0, since context=0 means "untracked send".
-    pub fn nextTrackedSendUserData(self: *EventLoop, slot: u16) struct { ud: u64, send_id: u32 } {
+    /// Allocate a unique send_id for a new PendingSend.
+    /// `send_id` is never 0; legacy callers used context=0 to mean
+    /// "untracked send", a distinction now expressed as
+    /// `Peer.send_completion` vs a heap-allocated `PendingSend`.
+    pub fn nextSendId(self: *EventLoop) u32 {
         const id = self.next_send_id;
         self.next_send_id +%= 1;
         if (self.next_send_id == 0) self.next_send_id = 1;
-        return .{
-            .ud = encodeUserData(.{ .slot = slot, .op_type = .peer_send, .context = @as(u40, id) }),
-            .send_id = id,
-        };
+        return id;
     }
 
-    /// Handle partial send: re-submit remaining bytes. Returns true if partial (more to send).
-    /// Matches by send_id (extracted from the CQE context field) so that multiple
-    /// in-flight sends for the same slot are correctly distinguished.
     pub const PartialSendResult = enum {
         resubmitted,
         complete,
         failed,
     };
 
-    pub fn handlePartialSend(self: *EventLoop, slot: u16, send_id: u32, bytes_sent: usize) PartialSendResult {
-        for (self.pending_sends.items) |*ps| {
-            if (ps.slot == slot and ps.send_id == send_id) {
-                ps.sent += bytes_sent;
-                switch (ps.storage) {
-                    .owned => |owned| {
-                        if (ps.sent < owned.buf.len) {
-                            const remaining = owned.buf[ps.sent..];
-                            const ud = encodeUserData(.{ .slot = slot, .op_type = .peer_send, .context = @as(u40, send_id) });
-                            _ = self.ring.send(ud, self.peers[slot].fd, remaining, 0) catch {
-                                return .failed;
-                            };
-                            self.peers[slot].send_pending = true;
-                            return .resubmitted;
-                        }
-                    },
-                    .vectored => |state| {
-                        if (state.advance(bytes_sent)) {
-                            const ud = encodeUserData(.{ .slot = slot, .op_type = .peer_send, .context = @as(u40, send_id) });
-                            _ = self.ring.sendmsg(ud, self.peers[slot].fd, &state.msg, 0) catch {
-                                return .failed;
-                            };
-                            self.peers[slot].send_pending = true;
-                            return .resubmitted;
-                        }
-                    },
+    /// Handle partial send for a tracked PendingSend: re-submit remaining bytes
+    /// via the io_interface backend on the same completion.
+    pub fn handlePartialSend(self: *EventLoop, ps: *PendingSend, bytes_sent: usize) PartialSendResult {
+        ps.sent += bytes_sent;
+        switch (ps.storage) {
+            .owned => |owned| {
+                if (ps.sent < owned.buf.len) {
+                    const remaining = owned.buf[ps.sent..];
+                    self.io.send(
+                        .{ .fd = self.peers[ps.slot].fd, .buf = remaining },
+                        &ps.completion,
+                        self,
+                        peer_handler.pendingSendComplete,
+                    ) catch {
+                        return .failed;
+                    };
+                    self.peers[ps.slot].send_pending = true;
+                    return .resubmitted;
                 }
-                return .complete;
-            }
+            },
+            .vectored => |state| {
+                if (state.advance(bytes_sent)) {
+                    self.io.sendmsg(
+                        .{ .fd = self.peers[ps.slot].fd, .msg = &state.msg },
+                        &ps.completion,
+                        self,
+                        peer_handler.pendingSendComplete,
+                    ) catch {
+                        return .failed;
+                    };
+                    self.peers[ps.slot].send_pending = true;
+                    return .resubmitted;
+                }
+            },
         }
         return .complete;
+    }
+
+    /// Find a PendingSend by (slot, send_id). Returns null if not present.
+    pub fn findPendingSend(self: *EventLoop, slot: u16, send_id: u32) ?*PendingSend {
+        for (self.pending_sends.items) |ps| {
+            if (ps.slot == slot and ps.send_id == send_id) return ps;
+        }
+        return null;
     }
 
     /// Free ONE pending send buffer matching the send_id.
@@ -2177,7 +2086,7 @@ pub const EventLoop = struct {
         self.vectored_send_pool.release(self.allocator, state);
     }
 
-    fn releasePendingSend(self: *EventLoop, pending_send: PendingSend) void {
+    fn releasePendingSend(self: *EventLoop, pending_send: *PendingSend) void {
         switch (pending_send.storage) {
             .owned => |owned| {
                 if (owned.small_slot) |small_slot| {
@@ -2188,12 +2097,44 @@ pub const EventLoop = struct {
             },
             .vectored => |state| self.releaseVectoredSendState(state),
         }
+        self.allocator.destroy(pending_send);
     }
 
-    pub fn trackPendingSendCopy(self: *EventLoop, slot: u16, send_id: u32, data: []const u8) ![]const u8 {
+    /// Append a freshly-allocated PendingSend to `pending_sends` and return it.
+    fn appendPendingSend(self: *EventLoop, ps: PendingSend) !*PendingSend {
+        const heap_ps = try self.allocator.create(PendingSend);
+        errdefer self.allocator.destroy(heap_ps);
+        heap_ps.* = ps;
+        try self.pending_sends.append(self.allocator, heap_ps);
+        return heap_ps;
+    }
+
+    /// Submit the in-flight send for a PendingSend through the io_interface
+    /// backend on the PendingSend's embedded completion. Picks `io.send` or
+    /// `io.sendmsg` based on the storage variant.
+    pub fn submitPendingSend(self: *EventLoop, ps: *PendingSend) !void {
+        const peer = &self.peers[ps.slot];
+        switch (ps.storage) {
+            .owned => |owned| try self.io.send(
+                .{ .fd = peer.fd, .buf = owned.buf },
+                &ps.completion,
+                self,
+                peer_handler.pendingSendComplete,
+            ),
+            .vectored => |state| try self.io.sendmsg(
+                .{ .fd = peer.fd, .msg = &state.msg },
+                &ps.completion,
+                self,
+                peer_handler.pendingSendComplete,
+            ),
+        }
+        peer.send_pending = true;
+    }
+
+    pub fn trackPendingSendCopy(self: *EventLoop, slot: u16, send_id: u32, data: []const u8) !*PendingSend {
         if (self.small_send_pool.alloc(data, small_send_capacity)) |entry| {
             errdefer self.small_send_pool.release(entry.slot);
-            try self.pending_sends.append(self.allocator, .{
+            return try self.appendPendingSend(.{
                 .slot = slot,
                 .send_id = send_id,
                 .storage = .{
@@ -2203,28 +2144,21 @@ pub const EventLoop = struct {
                     },
                 },
             });
-            return self.pending_sends.items[self.pending_sends.items.len - 1].storage.owned.buf;
         }
 
         const heap_buf = try self.allocator.dupe(u8, data);
         errdefer self.allocator.free(heap_buf);
-        try self.pending_sends.append(self.allocator, .{
+        return try self.appendPendingSend(.{
             .slot = slot,
             .send_id = send_id,
-            .storage = .{
-                .owned = .{
-                    .buf = heap_buf,
-                },
-            },
+            .storage = .{ .owned = .{ .buf = heap_buf } },
         });
-        return self.pending_sends.items[self.pending_sends.items.len - 1].storage.owned.buf;
     }
 
-    pub fn trackPendingSendOwned(self: *EventLoop, slot: u16, send_id: u32, buf: []u8) ![]const u8 {
+    pub fn trackPendingSendOwned(self: *EventLoop, slot: u16, send_id: u32, buf: []u8) !*PendingSend {
         if (self.small_send_pool.alloc(buf, small_send_capacity)) |entry| {
             errdefer self.small_send_pool.release(entry.slot);
-
-            try self.pending_sends.append(self.allocator, .{
+            const ps = try self.appendPendingSend(.{
                 .slot = slot,
                 .send_id = send_id,
                 .storage = .{
@@ -2235,29 +2169,22 @@ pub const EventLoop = struct {
                 },
             });
             self.allocator.free(buf);
-            return self.pending_sends.items[self.pending_sends.items.len - 1].storage.owned.buf;
+            return ps;
         }
 
-        try self.pending_sends.append(self.allocator, .{
+        return try self.appendPendingSend(.{
             .slot = slot,
             .send_id = send_id,
-            .storage = .{
-                .owned = .{
-                    .buf = buf,
-                },
-            },
+            .storage = .{ .owned = .{ .buf = buf } },
         });
-        return self.pending_sends.items[self.pending_sends.items.len - 1].storage.owned.buf;
     }
 
-    pub fn trackPendingSendVectored(self: *EventLoop, slot: u16, send_id: u32, state: *VectoredSendState) !void {
+    pub fn trackPendingSendVectored(self: *EventLoop, slot: u16, send_id: u32, state: *VectoredSendState) !*PendingSend {
         errdefer self.releaseVectoredSendState(state);
-        try self.pending_sends.append(self.allocator, .{
+        return try self.appendPendingSend(.{
             .slot = slot,
             .send_id = send_id,
-            .storage = .{
-                .vectored = state,
-            },
+            .storage = .{ .vectored = state },
         });
     }
 
@@ -2430,25 +2357,6 @@ pub const EventLoop = struct {
 };
 
 // ── Tests ─────────────────────────────────────────────────
-
-test "user data encode/decode roundtrip" {
-    const op = OpData{ .slot = 42, .op_type = .peer_recv, .context = 12345 };
-    const encoded = encodeUserData(op);
-    const decoded = decodeUserData(encoded);
-
-    try std.testing.expectEqual(@as(u16, 42), decoded.slot);
-    try std.testing.expectEqual(OpType.peer_recv, decoded.op_type);
-    try std.testing.expectEqual(@as(u40, 12345), decoded.context);
-}
-
-test "user data max values" {
-    const op = OpData{ .slot = 65535, .op_type = .cancel, .context = std.math.maxInt(u40) };
-    const decoded = decodeUserData(encodeUserData(op));
-
-    try std.testing.expectEqual(@as(u16, 65535), decoded.slot);
-    try std.testing.expectEqual(OpType.cancel, decoded.op_type);
-    try std.testing.expectEqual(std.math.maxInt(u40), decoded.context);
-}
 
 test "event loop supports high torrent counts with hashed lookup and slot reuse" {
     var el = try EventLoop.initBare(std.testing.allocator, 0);

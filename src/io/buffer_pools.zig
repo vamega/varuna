@@ -313,7 +313,10 @@ pub const PendingSend = struct {
     sent: usize = 0,
     slot: u16,
     /// Unique ID for matching CQEs to the correct PendingSend when
-    /// multiple sends are in-flight for the same slot.
+    /// multiple sends are in-flight for the same slot. Also used to
+    /// disambiguate after slot reuse — a stale CQE for an old PendingSend
+    /// whose slot has been re-allocated will not find a matching
+    /// (slot, send_id) pair in the active list.
     send_id: u32,
     storage: union(enum) {
         owned: struct {
@@ -322,6 +325,11 @@ pub const PendingSend = struct {
         },
         vectored: *VectoredSendState,
     },
+    /// Caller-owned completion driving the in-flight send for this
+    /// PendingSend. Stored on the heap-allocated PendingSend so the
+    /// kernel-visible address stays stable for the lifetime of the
+    /// send, regardless of the owning ArrayList's growth.
+    completion: @import("io_interface.zig").Completion = .{},
 };
 
 pub const SmallSendPool = struct {

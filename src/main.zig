@@ -586,14 +586,14 @@ fn initApiServer(
             }
         }
         socket_activated.* = true;
-        return varuna.rpc.server.ApiServer.initWithFd(allocator, &shared_el.ring, api_fd) catch |err| {
+        return varuna.rpc.server.ApiServer.initWithFd(allocator, &shared_el.io, api_fd) catch |err| {
             try stdout.print("failed to init API server with socket activation: {s}\n", .{@errorName(err)});
             try stdout.flush();
             return err;
         };
     } else {
         socket_activated.* = false;
-        return varuna.rpc.server.ApiServer.initWithDevice(allocator, &shared_el.ring, cfg.daemon.api_bind, cfg.daemon.api_port, cfg.network.bind_device) catch |err| {
+        return varuna.rpc.server.ApiServer.initWithDevice(allocator, &shared_el.io, cfg.daemon.api_bind, cfg.daemon.api_port, cfg.network.bind_device) catch |err| {
             try stdout.print("failed to start API server: {s}\n", .{@errorName(err)});
             try stdout.flush();
             return err;

@@ -9,7 +9,9 @@ const session_mod = @import("../torrent/session.zig");
 const Layout = @import("../torrent/layout.zig").Layout;
 const Hasher = @import("hasher.zig").Hasher;
 const types = @import("types.zig");
-const encodeUserData = types.encodeUserData;
+const real_io_mod = @import("real_io.zig");
+const RealIO = real_io_mod.RealIO;
+const io_interface = @import("io_interface.zig");
 
 /// Asynchronous piece recheck state machine.
 ///
@@ -29,7 +31,7 @@ pub const AsyncRecheck = struct {
     allocator: std.mem.Allocator,
     session: *const session_mod.Session,
     fds: []const posix.fd_t,
-    ring: *linux.IoUring,
+    io: *RealIO,
     hasher: *Hasher,
     torrent_id: u32,
 
@@ -76,7 +78,7 @@ pub const AsyncRecheck = struct {
         allocator: std.mem.Allocator,
         session: *const session_mod.Session,
         fds: []const posix.fd_t,
-        ring: *linux.IoUring,
+        io: *RealIO,
         hasher: *Hasher,
         torrent_id: u32,
         known_complete: ?*const Bitfield,
@@ -92,7 +94,7 @@ pub const AsyncRecheck = struct {
             .allocator = allocator,
             .session = session,
             .fds = fds,
-            .ring = ring,
+            .io = io,
             .hasher = hasher,
             .torrent_id = torrent_id,
             .complete_pieces = complete_pieces,
@@ -102,6 +104,40 @@ pub const AsyncRecheck = struct {
             .caller_ctx = caller_ctx,
         };
         return self;
+    }
+
+    /// Per-read tracking so that the io_interface callback can find the
+    /// owning recheck + slot. Heap-allocated because each piece may have
+    /// multiple spans in flight in parallel (one ReadOp per span);
+    /// recheck is a one-shot startup phase, so the per-read alloc is not
+    /// hot-path.
+    const ReadOp = struct {
+        completion: io_interface.Completion = .{},
+        parent: *AsyncRecheck,
+        slot_idx: u16,
+    };
+
+    /// Callback bound to a `ReadOp.completion`. Translates the async
+    /// result into the legacy cqe.res shape and feeds `handleReadCqe`,
+    /// then frees the ReadOp.
+    fn recheckReadComplete(
+        userdata: ?*anyopaque,
+        _: *io_interface.Completion,
+        result: io_interface.Result,
+    ) io_interface.CallbackAction {
+        const op: *ReadOp = @ptrCast(@alignCast(userdata.?));
+        const res: i32 = switch (result) {
+            .read => |r| if (r) |n|
+                std.math.cast(i32, n) orelse std.math.maxInt(i32)
+            else |_|
+                -1,
+            else => -1,
+        };
+        const parent = op.parent;
+        const slot_idx = op.slot_idx;
+        parent.allocator.destroy(op);
+        parent.handleReadCqe(slot_idx, res);
+        return .disarm;
     }
 
     /// Start the recheck by filling the pipeline with initial reads.
@@ -287,7 +323,9 @@ pub const AsyncRecheck = struct {
             .read_failed = false,
         };
 
-        // Submit io_uring reads for each span
+        // Submit io_uring reads for each span via the io_interface backend.
+        // Each ReadOp carries its own Completion so that multiple spans
+        // for the same slot can be in flight concurrently.
         var submitted: u32 = 0;
         for (plan.spans) |span| {
             if (span.file_index >= self.fds.len) {
@@ -301,13 +339,20 @@ pub const AsyncRecheck = struct {
             }
 
             const target = buf[span.piece_offset..][0..span.length];
-            const ud = encodeUserData(.{
-                .slot = @intCast(slot_idx),
-                .op_type = .recheck_read,
-                .context = @as(u40, self.torrent_id),
-            });
-            _ = self.ring.read(ud, fd, .{ .buffer = target }, span.file_offset) catch |err| {
-                log.warn("recheck: io_uring read submit for piece {d}: {s}", .{ piece_index, @errorName(err) });
+            const op = self.allocator.create(ReadOp) catch |err| {
+                log.warn("recheck: ReadOp alloc for piece {d}: {s}", .{ piece_index, @errorName(err) });
+                slot.read_failed = true;
+                continue;
+            };
+            op.* = .{ .parent = self, .slot_idx = slot_idx };
+            self.io.read(
+                .{ .fd = fd, .buf = target, .offset = span.file_offset },
+                &op.completion,
+                op,
+                recheckReadComplete,
+            ) catch |err| {
+                log.warn("recheck: io read submit for piece {d}: {s}", .{ piece_index, @errorName(err) });
+                self.allocator.destroy(op);
                 slot.read_failed = true;
                 continue;
             };

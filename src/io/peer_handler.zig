@@ -8,8 +8,6 @@ const mse = @import("../crypto/mse.zig");
 const EventLoop = @import("event_loop.zig").EventLoop;
 const Peer = @import("event_loop.zig").Peer;
 const PeerState = @import("event_loop.zig").PeerState;
-const encodeUserData = @import("event_loop.zig").encodeUserData;
-const decodeUserData = @import("event_loop.zig").decodeUserData;
 const protocol = @import("protocol.zig");
 const io_interface = @import("io_interface.zig");
 const socket_util = @import("../net/socket.zig");
@@ -112,50 +110,48 @@ fn handleAccepted(self: *EventLoop, new_fd: posix.fd_t) void {
     };
 }
 
-/// Legacy wrapper kept for residual benchmark callers (`perf/workloads.zig`)
-/// that drive accept CQEs through the legacy ring. Translates the cqe
-/// shape into the new `handleAccepted` policy path.
-pub fn handleAccept(self: *EventLoop, cqe: linux.io_uring_cqe) void {
-    if (cqe.res < 0) {
-        const e = cqe.err();
-        if (e != .CANCELED) {
-            log.warn("accept failed: errno={d}", .{-cqe.res});
-        }
-        return;
-    }
-    const new_fd: posix.fd_t = @intCast(cqe.res);
-    handleAccepted(self, new_fd);
+
+/// Callback bound to `Peer.connect_completion`. Invoked when async
+/// socket creation lands. Configures the new fd, applies bind/device
+/// settings, and chains the connect on the same completion.
+pub fn peerSocketComplete(
+    userdata: ?*anyopaque,
+    completion: *io_interface.Completion,
+    result: io_interface.Result,
+) io_interface.CallbackAction {
+    const self: *EventLoop = @ptrCast(@alignCast(userdata.?));
+    const peer: *Peer = @fieldParentPtr("connect_completion", completion);
+    const offset = @intFromPtr(peer) - @intFromPtr(self.peers.ptr);
+    const slot: u16 = @intCast(offset / @sizeOf(Peer));
+    handleSocketResult(self, slot, switch (result) {
+        .socket => |r| if (r) |fd| @intCast(fd) else |_| -1,
+        else => -1,
+    });
+    return .disarm;
 }
 
-/// Handle completion of async socket creation (IORING_OP_SOCKET).
-/// Configures the new fd (TCP options, bind config) and chains the
-/// CONNECT SQE to initiate the peer connection.
-pub fn handleSocketCreated(self: *EventLoop, slot: u16, cqe: linux.io_uring_cqe) void {
+fn handleSocketResult(self: *EventLoop, slot: u16, res: i32) void {
     const peer = &self.peers[slot];
     if (peer.state == .free) {
-        // Slot was freed while socket creation was pending — close the fd.
-        if (cqe.res >= 0) posix.close(@intCast(cqe.res));
+        if (res >= 0) posix.close(@intCast(res));
         return;
     }
 
-    // Guard: if the peer is not in connecting state, this is a stale socket
-    // CQE from a slot that was reused while a previous socket creation was
-    // in-flight. Close the new fd and ignore the CQE.
     if (peer.state != .connecting) {
         log.debug("slot {d}: ignoring stale socket CQE (state={s})", .{
             slot, @tagName(peer.state),
         });
-        if (cqe.res >= 0) posix.close(@intCast(cqe.res));
+        if (res >= 0) posix.close(@intCast(res));
         return;
     }
 
-    if (cqe.res < 0) {
-        log.warn("async socket creation failed for slot {d}: errno={d}", .{ slot, -cqe.res });
+    if (res < 0) {
+        log.warn("async socket creation failed for slot {d}: res={d}", .{ slot, res });
         self.removePeer(slot);
         return;
     }
 
-    const fd: posix.fd_t = @intCast(cqe.res);
+    const fd: posix.fd_t = @intCast(res);
     peer.fd = fd;
 
     socket_util.configurePeerSocket(fd);
@@ -164,14 +160,38 @@ pub fn handleSocketCreated(self: *EventLoop, slot: u16, cqe: linux.io_uring_cqe)
         return;
     };
 
-    const ud = encodeUserData(.{ .slot = slot, .op_type = .peer_connect, .context = 0 });
-    _ = self.ring.connect(ud, fd, &peer.address.any, peer.address.getOsSockLen()) catch {
+    self.io.connect(
+        .{ .fd = fd, .addr = peer.address },
+        &peer.connect_completion,
+        self,
+        peerConnectComplete,
+    ) catch {
         self.removePeer(slot);
         return;
     };
 }
 
-pub fn handleConnect(self: *EventLoop, slot: u16, cqe: linux.io_uring_cqe) void {
+/// Callback bound to `Peer.connect_completion` (after socket creation
+/// chains a connect on the same completion). Translates the connect
+/// result and feeds `handleConnectResult`.
+pub fn peerConnectComplete(
+    userdata: ?*anyopaque,
+    completion: *io_interface.Completion,
+    result: io_interface.Result,
+) io_interface.CallbackAction {
+    const self: *EventLoop = @ptrCast(@alignCast(userdata.?));
+    const peer: *Peer = @fieldParentPtr("connect_completion", completion);
+    const offset = @intFromPtr(peer) - @intFromPtr(self.peers.ptr);
+    const slot: u16 = @intCast(offset / @sizeOf(Peer));
+    const ok = switch (result) {
+        .connect => |r| if (r) |_| true else |_| false,
+        else => false,
+    };
+    handleConnectResult(self, slot, if (ok) 0 else -1);
+    return .disarm;
+}
+
+fn handleConnectResult(self: *EventLoop, slot: u16, res: i32) void {
     // Connection attempt completed (success or failure) -- no longer half-open
     if (self.half_open_count > 0) self.half_open_count -= 1;
 
@@ -179,7 +199,7 @@ pub fn handleConnect(self: *EventLoop, slot: u16, cqe: linux.io_uring_cqe) void 
     // Guard: stale CQE for an already-freed slot
     if (peer.state == .free) return;
 
-    if (cqe.res < 0) {
+    if (res < 0) {
         self.removePeer(slot);
         return;
     }
@@ -226,8 +246,12 @@ fn startMseInitiator(self: *EventLoop, slot: u16) !void {
         .send => |data| {
             peer.state = .mse_handshake_send;
             peer.mse_send_remaining = data;
-            const ud = encodeUserData(.{ .slot = slot, .op_type = .peer_send, .context = 0 });
-            _ = self.ring.send(ud, peer.fd, data, 0) catch {
+            self.io.send(
+                .{ .fd = peer.fd, .buf = data },
+                &peer.send_completion,
+                self,
+                peerSendComplete,
+            ) catch {
                 return error.SubmitFailed;
             };
             peer.send_pending = true;
@@ -275,30 +299,83 @@ pub fn sendBtHandshake(self: *EventLoop, slot: u16) void {
     // MSE/PE: encrypt handshake before sending (if MSE was negotiated)
     peer.crypto.encryptBuf(peer.handshake_buf[0..68]);
 
-    const ud = encodeUserData(.{ .slot = slot, .op_type = .peer_send, .context = 0 });
-    _ = self.ring.send(ud, peer.fd, peer.handshake_buf[0..68], 0) catch {
+    self.io.send(
+        .{ .fd = peer.fd, .buf = peer.handshake_buf[0..68] },
+        &peer.send_completion,
+        self,
+        peerSendComplete,
+    ) catch {
         self.removePeer(slot);
         return;
     };
     peer.send_pending = true;
 }
 
-pub fn handleSend(self: *EventLoop, slot: u16, cqe: linux.io_uring_cqe) void {
+/// Callback for an untracked peer send (handshake / MSE / state-machine
+/// transition messages). Driven by `Peer.send_completion`. Tracked sends
+/// (PendingSend) use `pendingSendComplete` instead.
+pub fn peerSendComplete(
+    userdata: ?*anyopaque,
+    completion: *io_interface.Completion,
+    result: io_interface.Result,
+) io_interface.CallbackAction {
+    const self: *EventLoop = @ptrCast(@alignCast(userdata.?));
+    const peer: *Peer = @fieldParentPtr("send_completion", completion);
+    const offset = @intFromPtr(peer) - @intFromPtr(self.peers.ptr);
+    const slot: u16 = @intCast(offset / @sizeOf(Peer));
+    const res: i32 = switch (result) {
+        .send => |r| if (r) |n|
+            std.math.cast(i32, n) orelse std.math.maxInt(i32)
+        else |_|
+            -1,
+        else => -1,
+    };
+    handleSendResult(self, slot, 0, res);
+    return .disarm;
+}
+
+/// Callback for a tracked peer send (PendingSend with a heap-owned or
+/// vectored buffer). Driven by `PendingSend.completion`. Recovers the
+/// PendingSend pointer via `@fieldParentPtr` and feeds
+/// `handleSendResult` with the (slot, send_id) pair.
+pub fn pendingSendComplete(
+    userdata: ?*anyopaque,
+    completion: *io_interface.Completion,
+    result: io_interface.Result,
+) io_interface.CallbackAction {
+    const self: *EventLoop = @ptrCast(@alignCast(userdata.?));
+    const ps: *@import("buffer_pools.zig").PendingSend = @fieldParentPtr("completion", completion);
+    const slot = ps.slot;
+    const send_id = ps.send_id;
+    const res: i32 = switch (result) {
+        .send => |r| if (r) |n|
+            std.math.cast(i32, n) orelse std.math.maxInt(i32)
+        else |_|
+            -1,
+        .sendmsg => |r| if (r) |n|
+            std.math.cast(i32, n) orelse std.math.maxInt(i32)
+        else |_|
+            -1,
+        else => -1,
+    };
+    handleSendResult(self, slot, send_id, res);
+    return .disarm;
+}
+
+fn handleSendResult(self: *EventLoop, slot: u16, send_id: u32, send_res: i32) void {
     const peer = &self.peers[slot];
-    const op = decodeUserData(cqe.user_data);
-    const send_id: u32 = @truncate(op.context);
 
     // Guard: if the peer slot was already freed (stale CQE from a
     // previously-closed fd), just free the tracked buffer if any.
     if (peer.state == .free) {
-        if (op.context != 0) self.freeOnePendingSend(slot, send_id);
+        if (send_id != 0) self.freeOnePendingSend(slot, send_id);
         return;
     }
 
-    if (cqe.res <= 0) {
+    if (send_res <= 0) {
         // Check if this was a tracked send buffer -- free it on error.
         // Only free ONE buffer: removePeer will clean up the rest.
-        if (op.context != 0) self.freeOnePendingSend(slot, send_id);
+        if (send_id != 0) self.freeOnePendingSend(slot, send_id);
         // Guard: if the peer is reconnecting (connecting state), this is a stale
         // send CQE from the previous connection's fd. Ignore it.
         if (peer.state == .connecting) {
@@ -308,7 +385,7 @@ pub fn handleSend(self: *EventLoop, slot: u16, cqe: linux.io_uring_cqe) void {
         // MSE fallback: if send failed during MSE handshake and mode is "preferred",
         // try reconnecting without MSE
         if (peer.state == .mse_handshake_send and self.encryption_mode == .preferred and !peer.mse_fallback) {
-            log.debug("slot {d}: MSE send failed (res={}), attempting plaintext fallback", .{ slot, cqe.res });
+            log.debug("slot {d}: MSE send failed (res={}), attempting plaintext fallback", .{ slot, send_res });
             attemptMseFallback(self, slot);
             return;
         }
@@ -316,17 +393,19 @@ pub fn handleSend(self: *EventLoop, slot: u16, cqe: linux.io_uring_cqe) void {
         return;
     }
 
-    // Check if this was a tracked send buffer (context != 0, send_id encoded)
-    if (op.context != 0) {
-        const bytes_sent: usize = @intCast(cqe.res);
-        switch (self.handlePartialSend(slot, send_id, bytes_sent)) {
-            .resubmitted => {},
-            .complete => self.freeOnePendingSend(slot, send_id),
-            .failed => {
-                self.freeOnePendingSend(slot, send_id);
-                self.removePeer(slot);
-                return;
-            },
+    // Tracked send (PendingSend): handle partial / complete / failed.
+    if (send_id != 0) {
+        if (self.findPendingSend(slot, send_id)) |ps| {
+            const bytes_sent: usize = @intCast(send_res);
+            switch (self.handlePartialSend(ps, bytes_sent)) {
+                .resubmitted => {},
+                .complete => self.freeOnePendingSend(slot, send_id),
+                .failed => {
+                    self.freeOnePendingSend(slot, send_id);
+                    self.removePeer(slot);
+                    return;
+                },
+            }
         }
     }
 
@@ -335,14 +414,20 @@ pub fn handleSend(self: *EventLoop, slot: u16, cqe: linux.io_uring_cqe) void {
     switch (peer.state) {
         .mse_handshake_send => {
             // MSE initiator: handle partial send before advancing state machine
-            const bytes_sent: usize = @intCast(cqe.res);
+            const bytes_sent: usize = @intCast(send_res);
             peer.mse_send_remaining = peer.mse_send_remaining[bytes_sent..];
             if (peer.mse_send_remaining.len > 0) {
-                // Partial send -- resubmit remaining bytes without advancing state machine
-                const ud = encodeUserData(.{ .slot = slot, .op_type = .peer_send, .context = 0 });
-                _ = self.ring.send(ud, peer.fd, peer.mse_send_remaining, 0) catch {
+                // Partial send -- resubmit remaining bytes on the same untracked
+                // send_completion without advancing the state machine.
+                self.io.send(
+                    .{ .fd = peer.fd, .buf = peer.mse_send_remaining },
+                    &peer.send_completion,
+                    self,
+                    peerSendComplete,
+                ) catch {
                     self.removePeer(slot);
                 };
+                peer.send_pending = true;
                 return;
             }
             if (peer.mse_initiator) |mi| {
@@ -353,15 +438,18 @@ pub fn handleSend(self: *EventLoop, slot: u16, cqe: linux.io_uring_cqe) void {
             }
         },
         .mse_resp_send => {
-            // MSE responder: handle partial send before advancing state machine
-            const bytes_sent: usize = @intCast(cqe.res);
+            const bytes_sent: usize = @intCast(send_res);
             peer.mse_send_remaining = peer.mse_send_remaining[bytes_sent..];
             if (peer.mse_send_remaining.len > 0) {
-                // Partial send -- resubmit remaining bytes without advancing state machine
-                const ud = encodeUserData(.{ .slot = slot, .op_type = .peer_send, .context = 0 });
-                _ = self.ring.send(ud, peer.fd, peer.mse_send_remaining, 0) catch {
+                self.io.send(
+                    .{ .fd = peer.fd, .buf = peer.mse_send_remaining },
+                    &peer.send_completion,
+                    self,
+                    peerSendComplete,
+                ) catch {
                     self.removePeer(slot);
                 };
+                peer.send_pending = true;
                 return;
             }
             if (peer.mse_responder) |mr| {
@@ -644,8 +732,12 @@ fn handleRecvResult(self: *EventLoop, slot: u16, recv_res: i32) void {
             @memcpy(peer.handshake_buf[0..68], &buf);
             // MSE/PE: encrypt handshake before sending
             peer.crypto.encryptBuf(peer.handshake_buf[0..68]);
-            const ud = encodeUserData(.{ .slot = slot, .op_type = .peer_send, .context = 0 });
-            _ = self.ring.send(ud, peer.fd, peer.handshake_buf[0..68], 0) catch {
+            self.io.send(
+                .{ .fd = peer.fd, .buf = peer.handshake_buf[0..68] },
+                &peer.send_completion,
+                self,
+                peerSendComplete,
+            ) catch {
                 self.removePeer(slot);
                 return;
             };
@@ -718,17 +810,46 @@ fn handleRecvResult(self: *EventLoop, slot: u16, recv_res: i32) void {
     }
 }
 
-pub fn handleDiskWrite(self: *EventLoop, slot: u16, cqe: linux.io_uring_cqe) void {
-    _ = slot;
-    const op = decodeUserData(cqe.user_data);
-    const write_id: u32 = @truncate(op.context);
+/// Per-write tracking for `io.write` so the callback can find the
+/// owning EventLoop + write_id. Heap-allocated; one per submitted span,
+/// freed by `diskWriteComplete`. The PendingWrite that aggregates spans
+/// still lives on EventLoop via `pending_writes`.
+pub const DiskWriteOp = struct {
+    completion: io_interface.Completion = .{},
+    el: *EventLoop,
+    write_id: u32,
+};
 
+/// Callback bound to a `DiskWriteOp.completion`. Translates the result
+/// into a synthetic `cqe.res`-shaped i32, feeds the existing
+/// `handleDiskWriteResult`, and frees the tracking struct.
+pub fn diskWriteComplete(
+    userdata: ?*anyopaque,
+    _: *io_interface.Completion,
+    result: io_interface.Result,
+) io_interface.CallbackAction {
+    const op: *DiskWriteOp = @ptrCast(@alignCast(userdata.?));
+    const res: i32 = switch (result) {
+        .write => |r| if (r) |n|
+            std.math.cast(i32, n) orelse std.math.maxInt(i32)
+        else |_|
+            -1,
+        else => -1,
+    };
+    const el = op.el;
+    const write_id = op.write_id;
+    el.allocator.destroy(op);
+    handleDiskWriteResult(el, write_id, res);
+    return .disarm;
+}
+
+fn handleDiskWriteResult(self: *EventLoop, write_id: u32, res: i32) void {
     if (self.getPendingWriteById(write_id)) |pending_w| {
         const piece_index = pending_w.piece_index;
         // Check for write errors (disk full, I/O error, etc.)
-        if (cqe.res < 0) {
+        if (res < 0) {
             log.err("disk write failed for piece {d} torrent {d}: errno={d}", .{
-                piece_index, pending_w.torrent_id, -cqe.res,
+                piece_index, pending_w.torrent_id, -res,
             });
             // Mark as failed but do NOT free the buffer yet -- other spans
             // may still be in-flight in io_uring and reference it.
@@ -767,8 +888,12 @@ fn executeMseAction(self: *EventLoop, slot: u16, action: mse.MseAction, is_initi
             const state: PeerState = if (is_initiator) .mse_handshake_send else .mse_resp_send;
             peer.state = state;
             peer.mse_send_remaining = data;
-            const ud = encodeUserData(.{ .slot = slot, .op_type = .peer_send, .context = 0 });
-            _ = self.ring.send(ud, peer.fd, data, 0) catch {
+            self.io.send(
+                .{ .fd = peer.fd, .buf = data },
+                &peer.send_completion,
+                self,
+                peerSendComplete,
+            ) catch {
                 handleMseFailure(self, slot, is_initiator);
                 return;
             };
@@ -908,11 +1033,15 @@ fn attemptMseFallback(self: *EventLoop, slot: u16) void {
     peer.crypto = mse.PeerCrypto.plaintext;
     peer.handshake_offset = 0;
 
-    // Submit async socket creation — handleSocketCreated will configure
-    // the fd and chain the CONNECT SQE.
+    // Submit async socket creation — peerSocketComplete will configure
+    // the fd and chain the connect.
     const family = address.any.family;
-    const ud = encodeUserData(.{ .slot = slot, .op_type = .peer_socket, .context = 0 });
-    _ = self.ring.socket(ud, family, posix.SOCK.STREAM | posix.SOCK.CLOEXEC | posix.SOCK.NONBLOCK, posix.IPPROTO.TCP, 0) catch {
+    self.io.socket(
+        .{ .domain = family, .sock_type = posix.SOCK.STREAM | posix.SOCK.CLOEXEC | posix.SOCK.NONBLOCK, .protocol = posix.IPPROTO.TCP },
+        &peer.connect_completion,
+        self,
+        peerSocketComplete,
+    ) catch {
         self.removePeer(slot);
         return;
     };
@@ -1026,15 +1155,7 @@ test "handleDiskWrite releases piece when any submit failed" {
         .write_failed = true,
     });
 
-    var cqe = std.mem.zeroes(linux.io_uring_cqe);
-    cqe.user_data = encodeUserData(.{
-        .slot = 0,
-        .op_type = .disk_write,
-        .context = write_id,
-    });
-    cqe.res = 16;
-
-    handleDiskWrite(&el, 0, cqe);
+    handleDiskWriteResult(&el, write_id, 16);
 
     try std.testing.expectEqual(@as(usize, 0), el.pending_writes.count());
     try std.testing.expectEqual(@as(u32, 0), tracker.completedCount());

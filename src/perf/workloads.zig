@@ -20,6 +20,7 @@ const mse_mod = varuna.crypto.mse;
 const tracker_announce = varuna.tracker.announce;
 const SessionManager = varuna.daemon.session_manager.SessionManager;
 const TrackerExecutor = varuna.daemon.tracker_executor.TrackerExecutor;
+const RealIO = varuna.io.real_io.RealIO;
 const TorrentSession = varuna.daemon.torrent_session.TorrentSession;
 const peer_policy = varuna.io.peer_policy;
 const pex_mod = varuna.net.pex;
@@ -318,37 +319,16 @@ fn runPeerAcceptBurst(
     const accepted: usize = iterations;
     const recv_eof: usize = 0;
     var idle_ticks: usize = 0;
-    var cqes: [64]linux.io_uring_cqe = undefined;
 
     while (event_loop.peer_count != 0 or remaining_workers.load(.acquire) != 0) {
         try event_loop.submitTimeout(1 * std.time.ns_per_ms);
-        // Drain io_interface completions (accept + peer recv) before the
-        // legacy ring's blocking wait so the listener can pick up
-        // connections without latency.
-        event_loop.io.tick(0) catch {};
-        _ = try event_loop.ring.submit_and_wait(1);
+        // Drain io_interface completions (accept + peer recv/send +
+        // timer) blockingly. Stage 2 #12 routed every op type through
+        // this single ring.
+        event_loop.io.tick(1) catch {};
 
-        const count = try event_loop.ring.copy_cqes(&cqes, 0);
-        if (count == 0) {
-            idle_ticks += 1;
-        } else {
-            idle_ticks = 0;
-        }
-
-        for (cqes[0..count]) |cqe| {
-            const op = event_loop_mod.decodeUserData(cqe.user_data);
-            switch (op.op_type) {
-                .peer_send => peer_handler.handleSend(&event_loop, op.slot, cqe),
-                .timeout => {
-                    event_loop.timeout_pending = false;
-                },
-                else => {},
-            }
-        }
-
-        _ = event_loop.ring.submit() catch {};
-        event_loop.io.tick(0) catch {};
-
+        if (event_loop.peer_count == 0 and remaining_workers.load(.acquire) == 0) break;
+        idle_ticks += 1;
         if (idle_ticks > 20_000) return error.BenchmarkTimeout;
     }
 
@@ -849,9 +829,9 @@ fn runApiBurst(
     config: Config,
     mode: ApiBurstMode,
 ) !Result {
-    var bench_ring = try linux.IoUring.init(64, 0);
-    defer bench_ring.deinit();
-    var server = try rpc_server.ApiServer.init(allocator, &bench_ring, "127.0.0.1", 0);
+    var bench_io = try RealIO.init(.{ .entries = 64 });
+    defer bench_io.deinit();
+    var server = try rpc_server.ApiServer.init(allocator, &bench_io, "127.0.0.1", 0);
     defer server.deinit();
 
     server.setHandler(struct {
@@ -943,9 +923,9 @@ fn runApiSequentialGet(
     iterations: usize,
     config: Config,
 ) !Result {
-    var bench_ring = try linux.IoUring.init(64, 0);
-    defer bench_ring.deinit();
-    var server = try rpc_server.ApiServer.init(allocator, &bench_ring, "127.0.0.1", 0);
+    var bench_io = try RealIO.init(.{ .entries = 64 });
+    defer bench_io.deinit();
+    var server = try rpc_server.ApiServer.init(allocator, &bench_io, "127.0.0.1", 0);
     defer server.deinit();
 
     server.setHandler(struct {
@@ -1284,9 +1264,9 @@ fn runTrackerAnnounceExecutor(
         server_thread.join();
     }
 
-    var perf_ring = try linux.IoUring.init(32, 0);
-    defer perf_ring.deinit();
-    const executor = try TrackerExecutor.create(allocator, &perf_ring, .{});
+    var perf_io = try RealIO.init(.{ .entries = 32 });
+    defer perf_io.deinit();
+    const executor = try TrackerExecutor.create(allocator, &perf_io, .{});
     defer executor.destroy();
 
     std.Thread.sleep(10 * std.time.ns_per_ms);
@@ -1467,16 +1447,8 @@ fn wakeApiServer(address: std.net.Address) !void {
 }
 
 fn drainPeerSendCompletions(event_loop: *EventLoop, slot: u16) !void {
-    var cqes: [8]linux.io_uring_cqe = undefined;
     while (event_loop.peers[slot].send_pending or event_loop.pending_sends.items.len != 0) {
-        _ = try event_loop.ring.submit_and_wait(1);
-        const count = try event_loop.ring.copy_cqes(&cqes, 0);
-        for (cqes[0..count]) |cqe| {
-            const op = event_loop_mod.decodeUserData(cqe.user_data);
-            if (op.op_type == .peer_send) {
-                peer_handler.handleSend(event_loop, op.slot, cqe);
-            }
-        }
+        try event_loop.io.tick(1);
     }
 }
 
@@ -1502,15 +1474,9 @@ fn createLoopbackUdpReceiver() !struct { fd: posix.fd_t, address: std.net.Addres
 }
 
 fn drainUtpSendCompletions(event_loop: *EventLoop) !void {
-    var cqes: [16]linux.io_uring_cqe = undefined;
-    _ = try event_loop.ring.submit_and_wait(1);
-    const count = try event_loop.ring.copy_cqes(&cqes, 0);
-    for (cqes[0..count]) |cqe| {
-        const op = event_loop_mod.decodeUserData(cqe.user_data);
-        if (op.op_type == .utp_send) {
-            utp_handler.handleUtpSend(event_loop, cqe);
-        }
-    }
+    // uTP send CQEs land on the io_interface ring after Stage 2 #12;
+    // tick(1) drains them through the utpSendComplete callback.
+    try event_loop.io.tick(1);
 }
 
 fn drainUdpReceiver(fd: posix.fd_t, buffer: []u8) !u64 {

@@ -8,8 +8,8 @@ const utp_mod = @import("../net/utp.zig");
 const utp_mgr = @import("../net/utp_manager.zig");
 const EventLoop = @import("event_loop.zig").EventLoop;
 const Peer = @import("event_loop.zig").Peer;
-const encodeUserData = @import("event_loop.zig").encodeUserData;
 const protocol = @import("protocol.zig");
+const io_interface = @import("io_interface.zig");
 
 // ── uTP transport ──────────────────────────────────────
 
@@ -38,8 +38,29 @@ pub fn submitUtpRecv(self: *EventLoop) !void {
         .flags = 0,
     };
 
-    const ud = encodeUserData(.{ .slot = 0, .op_type = .utp_recv, .context = 0 });
-    _ = try self.ring.recvmsg(ud, self.udp_fd, &self.utp_recv_msg, 0);
+    try self.io.recvmsg(
+        .{ .fd = self.udp_fd, .msg = &self.utp_recv_msg },
+        &self.utp_recv_completion,
+        self,
+        utpRecvComplete,
+    );
+}
+
+fn utpRecvComplete(
+    userdata: ?*anyopaque,
+    _: *io_interface.Completion,
+    result: io_interface.Result,
+) io_interface.CallbackAction {
+    const self: *EventLoop = @ptrCast(@alignCast(userdata.?));
+    const res: i32 = switch (result) {
+        .recvmsg => |r| if (r) |n|
+            std.math.cast(i32, n) orelse std.math.maxInt(i32)
+        else |err|
+            if (err == error.OperationCanceled) -125 else -1, // -ECANCELED
+        else => -1,
+    };
+    handleUtpRecvResult(self, res);
+    return .disarm; // re-armed by handleUtpRecvResult via submitUtpRecv
 }
 
 /// Submit a SENDMSG SQE to send a uTP packet over UDP.
@@ -73,9 +94,30 @@ pub fn submitUtpSend(self: *EventLoop, data: []const u8, remote: std.net.Address
         .flags = 0,
     };
 
-    const ud = encodeUserData(.{ .slot = 0, .op_type = .utp_send, .context = 0 });
-    _ = try self.ring.sendmsg(ud, self.udp_fd, &self.utp_send_msg, 0);
+    try self.io.sendmsg(
+        .{ .fd = self.udp_fd, .msg = &self.utp_send_msg },
+        &self.utp_send_completion,
+        self,
+        utpSendComplete,
+    );
     self.utp_send_pending = true;
+}
+
+fn utpSendComplete(
+    userdata: ?*anyopaque,
+    _: *io_interface.Completion,
+    result: io_interface.Result,
+) io_interface.CallbackAction {
+    const self: *EventLoop = @ptrCast(@alignCast(userdata.?));
+    const res: i32 = switch (result) {
+        .sendmsg => |r| if (r) |n|
+            std.math.cast(i32, n) orelse std.math.maxInt(i32)
+        else |_|
+            -1,
+        else => -1,
+    };
+    handleUtpSendResult(self, res);
+    return .disarm;
 }
 
 /// Queue a uTP packet for sending. If no send is in flight, submit immediately.
@@ -110,22 +152,21 @@ pub fn utpDrainSendQueue(self: *EventLoop) void {
     };
 }
 
-/// Handle a completed RECVMSG CQE: a UDP datagram arrived.
-pub fn handleUtpRecv(self: *EventLoop, cqe: linux.io_uring_cqe) void {
+fn handleUtpRecvResult(self: *EventLoop, recv_res: i32) void {
     // Always re-submit recv for the next datagram
     defer submitUtpRecv(self) catch |err| {
         log.err("failed to re-submit uTP recv: {s}", .{@errorName(err)});
     };
 
-    if (cqe.res < 0) {
+    if (recv_res < 0) {
         // ECANCELED is expected when stopUtpListener cancels the pending recvmsg.
-        if (cqe.err() != .CANCELED) {
-            log.warn("uTP recvmsg failed: errno={d}", .{-cqe.res});
+        if (recv_res != -125) {
+            log.warn("uTP recvmsg failed: res={d}", .{recv_res});
         }
         return;
     }
 
-    const datagram_len: usize = @intCast(cqe.res);
+    const datagram_len: usize = @intCast(recv_res);
     if (datagram_len == 0) return;
 
     const data = self.utp_recv_buf[0..datagram_len];
@@ -174,12 +215,11 @@ pub fn handleUtpRecv(self: *EventLoop, cqe: linux.io_uring_cqe) void {
     }
 }
 
-/// Handle a completed SENDMSG CQE: a UDP datagram was sent.
-pub fn handleUtpSend(self: *EventLoop, cqe: linux.io_uring_cqe) void {
+fn handleUtpSendResult(self: *EventLoop, send_res: i32) void {
     self.utp_send_pending = false;
 
-    if (cqe.res < 0) {
-        log.warn("uTP sendmsg failed: errno={d}", .{-cqe.res});
+    if (send_res < 0) {
+        log.warn("uTP sendmsg failed: res={d}", .{send_res});
     }
 
     // Drain the send queue

@@ -8,11 +8,9 @@ const http = @import("http_parse.zig");
 const TlsStream = @import("tls.zig").TlsStream;
 const build_options = @import("build_options");
 
-// Reuse the event loop's user data encoding.
-const event_loop = @import("event_loop.zig");
-const encodeUserData = event_loop.encodeUserData;
-const decodeUserData = event_loop.decodeUserData;
-const OpType = event_loop.OpType;
+const io_interface = @import("io_interface.zig");
+const real_io_mod = @import("real_io.zig");
+const RealIO = real_io_mod.RealIO;
 
 const log = std.log.scoped(.http_executor);
 
@@ -32,8 +30,12 @@ pub const HttpExecutor = struct {
     allocator: std.mem.Allocator,
     running: std.atomic.Value(bool) = std.atomic.Value(bool).init(true),
 
-    ring: *linux.IoUring,
+    io: *RealIO,
     dns_event_fd: posix.fd_t,
+    /// Completion for the persistent `io.poll(POLL_IN)` against
+    /// `dns_event_fd`. Re-armed indefinitely so DNS completions on
+    /// background threads are observable on the event-loop thread.
+    dns_poll_completion: io_interface.Completion = .{},
 
     // Thread-safe job queue (producer: any thread, consumer: ring thread).
     queue_mutex: std.Thread.Mutex = .{},
@@ -58,11 +60,9 @@ pub const HttpExecutor = struct {
     // Deferred jobs that couldn't start due to concurrency limits.
     deferred_jobs: std.ArrayList(Job),
 
-    const sentinel_wake: u16 = 0xFFFF;
-    const sentinel_dns: u16 = 0xFFFE;
-    const sentinel_timeout: u16 = 0xFFFD;
     const cqe_batch_size = 32;
     const request_timeout_s: i64 = 30;
+    const connect_deadline_ns: u64 = 10 * std.time.ns_per_s;
 
     pub const CompletionFn = *const fn (context: *anyopaque, result: RequestResult) void;
 
@@ -152,6 +152,10 @@ pub const HttpExecutor = struct {
         target_written: u32 = 0,
         /// Whether headers have been fully received (body start found).
         headers_done: bool = false,
+        /// Caller-owned completion used for socket / connect / send / recv.
+        /// Only one io op is in flight per slot at a time, so a single
+        /// completion is sufficient.
+        completion: io_interface.Completion = .{},
 
         const State = enum {
             free,
@@ -256,7 +260,7 @@ pub const HttpExecutor = struct {
 
     // ── Public API ───────────────────────────────────────────
 
-    pub fn create(allocator: std.mem.Allocator, ring: *linux.IoUring, config: Config) !*HttpExecutor {
+    pub fn create(allocator: std.mem.Allocator, io: *RealIO, config: Config) !*HttpExecutor {
         const self = try allocator.create(HttpExecutor);
         errdefer allocator.destroy(self);
 
@@ -265,7 +269,7 @@ pub const HttpExecutor = struct {
 
         self.* = .{
             .allocator = allocator,
-            .ring = ring,
+            .io = io,
             .dns_event_fd = dns_event_fd,
             .pending_jobs = std.ArrayList(Job).empty,
             .deferred_jobs = std.ArrayList(Job).empty,
@@ -281,7 +285,7 @@ pub const HttpExecutor = struct {
         errdefer allocator.free(self.slots);
         for (self.slots) |*slot| slot.* = .{};
 
-        // Register DNS eventfd poll on the shared ring
+        // Register DNS eventfd poll on the io_interface ring.
         self.submitDnsPoll();
 
         return self;
@@ -336,33 +340,32 @@ pub const HttpExecutor = struct {
     }
 
     fn submitDnsPoll(self: *HttpExecutor) void {
-        const ud = encodeUserData(.{ .slot = sentinel_dns, .op_type = .http_connect, .context = 0 });
-        _ = self.ring.poll_add(ud, self.dns_event_fd, linux.POLL.IN) catch {};
+        self.io.poll(
+            .{ .fd = self.dns_event_fd, .events = linux.POLL.IN },
+            &self.dns_poll_completion,
+            self,
+            dnsPollComplete,
+        ) catch {};
     }
 
-    /// Dispatch a CQE from the shared event loop. Called by EventLoop.dispatch().
-    pub fn dispatchCqe(self: *HttpExecutor, cqe: linux.io_uring_cqe) void {
-        const op = decodeUserData(cqe.user_data);
+    /// Callback bound to `dns_poll_completion`. Drains the eventfd
+    /// counter, processes any newly-resolved DNS jobs, and re-arms.
+    fn dnsPollComplete(
+        userdata: ?*anyopaque,
+        _: *io_interface.Completion,
+        _: io_interface.Result,
+    ) io_interface.CallbackAction {
+        const self: *HttpExecutor = @ptrCast(@alignCast(userdata.?));
+        var buf: [8]u8 = undefined;
+        _ = posix.read(self.dns_event_fd, &buf) catch {};
+        self.processDnsCompletions();
+        return .rearm;
+    }
 
-        // Sentinel: DNS eventfd
-        if (op.slot == sentinel_dns) {
-            var buf: [8]u8 = undefined;
-            _ = posix.read(self.dns_event_fd, &buf) catch {};
-            self.submitDnsPoll();
-            self.processDnsCompletions();
-            return;
-        }
-
-        if (op.slot >= self.slots.len) return;
-        const slot = &self.slots[op.slot];
-
-        switch (op.op_type) {
-            .http_socket => self.handleSocketCreated(slot, op.slot, cqe),
-            .http_connect => self.handleConnect(slot, op.slot, cqe),
-            .http_send => self.handleSend(slot, op.slot, cqe),
-            .http_recv => self.handleRecv(slot, op.slot, cqe),
-            else => {},
-        }
+    /// Recover the slot index for a callback firing on `slot.completion`.
+    fn slotIdxFor(self: *const HttpExecutor, slot: *const RequestSlot) u16 {
+        const offset = @intFromPtr(slot) - @intFromPtr(self.slots.ptr);
+        return @intCast(offset / @sizeOf(RequestSlot));
     }
 
     // ── Job queue draining ───────────────────────────────────
@@ -490,56 +493,71 @@ pub const HttpExecutor = struct {
 
     fn startConnect(self: *HttpExecutor, slot: *RequestSlot, slot_idx: u16) void {
         const family: u32 = slot.address.any.family;
-        // Submit async socket creation -- handleSocketCreated will chain the connect.
-        const ud = encodeUserData(.{ .slot = slot_idx, .op_type = .http_socket, .context = 0 });
-        _ = self.ring.socket(ud, family, posix.SOCK.STREAM | posix.SOCK.CLOEXEC | posix.SOCK.NONBLOCK, posix.IPPROTO.TCP, 0) catch {
+        // Submit async socket creation -- httpSocketComplete will chain the connect.
+        self.io.socket(
+            .{ .domain = family, .sock_type = posix.SOCK.STREAM | posix.SOCK.CLOEXEC | posix.SOCK.NONBLOCK, .protocol = posix.IPPROTO.TCP },
+            &slot.completion,
+            self,
+            httpSocketComplete,
+        ) catch {
             self.completeSlot(slot_idx, .{ .err = error.SocketCreateFailed });
             return;
         };
         slot.state = .connecting;
     }
 
-    /// Handle async socket creation CQE -- store the fd and chain the connect.
-    fn handleSocketCreated(self: *HttpExecutor, slot: *RequestSlot, slot_idx: u16, cqe: linux.io_uring_cqe) void {
-        if (slot.state != .connecting) return;
+    /// Callback for the async socket creation. Stores the new fd on the
+    /// slot and chains the deadline-bounded connect.
+    fn httpSocketComplete(
+        userdata: ?*anyopaque,
+        completion: *io_interface.Completion,
+        result: io_interface.Result,
+    ) io_interface.CallbackAction {
+        const self: *HttpExecutor = @ptrCast(@alignCast(userdata.?));
+        const slot: *RequestSlot = @fieldParentPtr("completion", completion);
+        const slot_idx = self.slotIdxFor(slot);
+        if (slot.state != .connecting) return .disarm;
 
-        if (cqe.res < 0) {
-            self.completeSlot(slot_idx, .{ .err = error.SocketCreateFailed });
-            return;
-        }
-
-        const fd: posix.fd_t = @intCast(cqe.res);
+        const fd = switch (result) {
+            .socket => |r| r catch {
+                self.completeSlot(slot_idx, .{ .err = error.SocketCreateFailed });
+                return .disarm;
+            },
+            else => return .disarm,
+        };
         slot.fd = fd;
 
-        const ud = encodeUserData(.{ .slot = slot_idx, .op_type = .http_connect, .context = 0 });
-        const sqe = self.ring.connect(ud, fd, &slot.address.any, slot.address.getOsSockLen()) catch {
+        self.io.connect(
+            .{ .fd = fd, .addr = slot.address, .deadline_ns = connect_deadline_ns },
+            &slot.completion,
+            self,
+            httpConnectComplete,
+        ) catch {
             posix.close(fd);
             slot.fd = -1;
             self.completeSlot(slot_idx, .{ .err = error.SubmitFailed });
-            return;
         };
-        // Link a timeout to the connect.
-        sqe.flags |= linux.IOSQE_IO_LINK;
-        const ts = linux.kernel_timespec{ .sec = 10, .nsec = 0 };
-        _ = self.ring.link_timeout(ud + 1, &ts, 0) catch {};
+        return .disarm;
     }
 
-    fn handleConnect(self: *HttpExecutor, slot: *RequestSlot, slot_idx: u16, cqe: linux.io_uring_cqe) void {
-        // We may get the link_timeout CQE too -- ignore it if slot is no longer connecting.
-        if (slot.state != .connecting) return;
+    /// Callback for the deadline-bounded connect. On success, advances
+    /// to TLS or plain-text request build.
+    fn httpConnectComplete(
+        userdata: ?*anyopaque,
+        completion: *io_interface.Completion,
+        result: io_interface.Result,
+    ) io_interface.CallbackAction {
+        const self: *HttpExecutor = @ptrCast(@alignCast(userdata.?));
+        const slot: *RequestSlot = @fieldParentPtr("completion", completion);
+        const slot_idx = self.slotIdxFor(slot);
+        if (slot.state != .connecting) return .disarm;
 
-        const e = cqe.err();
-        if (e != .SUCCESS) {
-            // Drain the linked timeout CQE.
-            if (e == .CANCELED) {
-                self.completeSlot(slot_idx, .{ .err = error.ConnectionTimedOut });
-            } else {
-                self.completeSlot(slot_idx, .{ .err = blk: {
-                    ring_mod.checkCqe(cqe) catch |err| break :blk err;
-                    break :blk null;
-                } });
-            }
-            return;
+        switch (result) {
+            .connect => |r| r catch |err| {
+                self.completeSlot(slot_idx, .{ .err = err });
+                return .disarm;
+            },
+            else => return .disarm,
         }
 
         if (slot.parsed.is_https) {
@@ -547,6 +565,7 @@ pub const HttpExecutor = struct {
         } else {
             self.buildAndSendRequest(slot, slot_idx);
         }
+        return .disarm;
     }
 
     // ── TLS handshake (async via BIO pairs) ──────────────────
@@ -588,8 +607,12 @@ pub const HttpExecutor = struct {
                 self.flushTlsPendingSend(slot, slot_idx);
             },
             .want_read => {
-                const ud = encodeUserData(.{ .slot = slot_idx, .op_type = .http_recv, .context = 0 });
-                _ = self.ring.recv(ud, slot.fd, .{ .buffer = &slot.recv_tmp }, 0) catch {
+                self.io.recv(
+                    .{ .fd = slot.fd, .buf = &slot.recv_tmp },
+                    &slot.completion,
+                    self,
+                    httpRecvComplete,
+                ) catch {
                     self.completeSlot(slot_idx, .{ .err = error.SubmitFailed });
                 };
             },
@@ -604,14 +627,22 @@ pub const HttpExecutor = struct {
         };
         if (n == 0) {
             // Nothing to send -- need more data from peer.
-            const ud = encodeUserData(.{ .slot = slot_idx, .op_type = .http_recv, .context = 0 });
-            _ = self.ring.recv(ud, slot.fd, .{ .buffer = &slot.recv_tmp }, 0) catch {
+            self.io.recv(
+                .{ .fd = slot.fd, .buf = &slot.recv_tmp },
+                &slot.completion,
+                self,
+                httpRecvComplete,
+            ) catch {
                 self.completeSlot(slot_idx, .{ .err = error.SubmitFailed });
             };
             return;
         }
-        const ud = encodeUserData(.{ .slot = slot_idx, .op_type = .http_send, .context = 0 });
-        _ = self.ring.send(ud, slot.fd, slot.tls_send_buf[0..n], 0) catch {
+        self.io.send(
+            .{ .fd = slot.fd, .buf = slot.tls_send_buf[0..n] },
+            &slot.completion,
+            self,
+            httpSendComplete,
+        ) catch {
             self.completeSlot(slot_idx, .{ .err = error.SubmitFailed });
         };
     }
@@ -651,94 +682,115 @@ pub const HttpExecutor = struct {
 
     fn submitSend(self: *HttpExecutor, slot: *RequestSlot, slot_idx: u16) void {
         const remaining = slot.send_buf.items[slot.send_offset..];
-        const ud = encodeUserData(.{ .slot = slot_idx, .op_type = .http_send, .context = 0 });
-        _ = self.ring.send(ud, slot.fd, remaining, 0) catch {
+        self.io.send(
+            .{ .fd = slot.fd, .buf = remaining },
+            &slot.completion,
+            self,
+            httpSendComplete,
+        ) catch {
             self.completeSlot(slot_idx, .{ .err = error.SubmitFailed });
         };
     }
 
-    fn handleSend(self: *HttpExecutor, slot: *RequestSlot, slot_idx: u16, cqe: linux.io_uring_cqe) void {
-        const e = cqe.err();
-        if (e != .SUCCESS) {
-            // If pooled connection was stale, retry with fresh connect.
-            if (slot.pooled and slot.state == .sending and slot.send_offset == 0) {
-                posix.close(slot.fd);
-                slot.fd = -1;
-                slot.pooled = false;
-                self.startConnect(slot, slot_idx);
-                return;
-            }
-            self.completeSlot(slot_idx, .{ .err = blk: {
-                ring_mod.checkCqe(cqe) catch |err| break :blk err;
-                break :blk null;
-            } });
-            return;
-        }
-
-        const n: usize = @intCast(cqe.res);
+    fn httpSendComplete(
+        userdata: ?*anyopaque,
+        completion: *io_interface.Completion,
+        result: io_interface.Result,
+    ) io_interface.CallbackAction {
+        const self: *HttpExecutor = @ptrCast(@alignCast(userdata.?));
+        const slot: *RequestSlot = @fieldParentPtr("completion", completion);
+        const slot_idx = self.slotIdxFor(slot);
+        const n = switch (result) {
+            .send => |r| r catch |err| {
+                // If pooled connection was stale, retry with fresh connect.
+                if (slot.pooled and slot.state == .sending and slot.send_offset == 0) {
+                    posix.close(slot.fd);
+                    slot.fd = -1;
+                    slot.pooled = false;
+                    self.startConnect(slot, slot_idx);
+                    return .disarm;
+                }
+                self.completeSlot(slot_idx, .{ .err = err });
+                return .disarm;
+            },
+            else => return .disarm,
+        };
         if (n == 0) {
             self.completeSlot(slot_idx, .{ .err = error.ConnectionClosed });
-            return;
+            return .disarm;
         }
 
         if (slot.state == .tls_handshaking) {
-            // TLS handshake send completed -- continue handshake.
             self.advanceTlsHandshake(slot, slot_idx);
-            return;
+            return .disarm;
         }
 
         if (slot.parsed.is_https and slot.tls_stream != null) {
-            // Encrypted send completed -- check if more ciphertext to flush.
-            var tls = &(slot.tls_stream orelse return);
+            var tls = &(slot.tls_stream orelse return .disarm);
             const pending = tls.pendingSend(&slot.tls_send_buf) catch {
                 self.completeSlot(slot_idx, .{ .err = error.TlsReadFailed });
-                return;
+                return .disarm;
             };
             if (pending > 0) {
-                const ud = encodeUserData(.{ .slot = slot_idx, .op_type = .http_send, .context = 0 });
-                _ = self.ring.send(ud, slot.fd, slot.tls_send_buf[0..pending], 0) catch {
+                self.io.send(
+                    .{ .fd = slot.fd, .buf = slot.tls_send_buf[0..pending] },
+                    &slot.completion,
+                    self,
+                    httpSendComplete,
+                ) catch {
                     self.completeSlot(slot_idx, .{ .err = error.SubmitFailed });
                 };
-                return;
+                return .disarm;
             }
-            // All ciphertext sent -- start receiving.
             slot.state = .receiving;
             self.submitRecv(slot, slot_idx);
-            return;
+            return .disarm;
         }
 
-        // Plain HTTP: track partial sends.
         slot.send_offset += n;
         if (slot.send_offset < slot.send_buf.items.len) {
             self.submitSend(slot, slot_idx);
-            return;
+            return .disarm;
         }
-
-        // All sent -- start receiving.
         slot.state = .receiving;
         self.submitRecv(slot, slot_idx);
+        return .disarm;
     }
 
     // ── HTTP response receiving ──────────────────────────────
 
     fn submitRecv(self: *HttpExecutor, slot: *RequestSlot, slot_idx: u16) void {
-        const ud = encodeUserData(.{ .slot = slot_idx, .op_type = .http_recv, .context = 0 });
-        _ = self.ring.recv(ud, slot.fd, .{ .buffer = &slot.recv_tmp }, 0) catch {
+        self.io.recv(
+            .{ .fd = slot.fd, .buf = &slot.recv_tmp },
+            &slot.completion,
+            self,
+            httpRecvComplete,
+        ) catch {
             self.completeSlot(slot_idx, .{ .err = error.SubmitFailed });
         };
     }
 
-    fn handleRecv(self: *HttpExecutor, slot: *RequestSlot, slot_idx: u16, cqe: linux.io_uring_cqe) void {
-        const e = cqe.err();
-        if (e != .SUCCESS) {
-            self.completeSlot(slot_idx, .{ .err = blk: {
-                ring_mod.checkCqe(cqe) catch |err| break :blk err;
-                break :blk null;
-            } });
-            return;
-        }
+    fn httpRecvComplete(
+        userdata: ?*anyopaque,
+        completion: *io_interface.Completion,
+        result: io_interface.Result,
+    ) io_interface.CallbackAction {
+        const self: *HttpExecutor = @ptrCast(@alignCast(userdata.?));
+        const slot: *RequestSlot = @fieldParentPtr("completion", completion);
+        const slot_idx = self.slotIdxFor(slot);
+        const n = switch (result) {
+            .recv => |r| r catch |err| {
+                self.completeSlot(slot_idx, .{ .err = err });
+                return .disarm;
+            },
+            else => return .disarm,
+        };
+        handleRecvBytes(self, slot, slot_idx, n);
+        return .disarm;
+    }
 
-        const n: usize = @intCast(cqe.res);
+    fn handleRecvBytes(self: *HttpExecutor, slot: *RequestSlot, slot_idx: u16, n_in: usize) void {
+        const n: usize = n_in;
 
         // During TLS handshake, feed received ciphertext to BoringSSL.
         if (slot.state == .tls_handshaking) {
