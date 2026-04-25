@@ -20,6 +20,7 @@ pub const http_executor = @import("http_executor.zig");
 pub const metadata_handler = @import("metadata_handler.zig");
 pub const rate_limiter = @import("rate_limiter.zig");
 pub const recheck = @import("recheck.zig");
+pub const real_io = @import("real_io.zig");
 pub const ring = @import("ring.zig");
 pub const sim_io = @import("sim_io.zig");
 pub const signal = @import("signal.zig");
