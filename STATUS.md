@@ -196,12 +196,20 @@ Update it whenever a milestone lands, the near-term backlog changes, or a new op
 - `zig build test-swarm`: automated end-to-end swarm transfer test — creates a torrent, starts a seeder and downloader daemon, verifies piece transfer completes.
 - Docker cross-client conformance test infrastructure (`test/docker/`): containerized testing harness for validating protocol compatibility with third-party clients.
 
-### IO Abstraction (foundation)
-- **Public IO contract (`src/io/io_interface.zig`)**: `Operation` and `Result` tagged unions (one variant per op), `CallbackAction = enum { disarm, rearm }`, single-callback signature, caller-owned `Completion` with opaque per-backend state (`backend_state_size = 64`, comptime-asserted by each backend).
+### IO Abstraction (foundation + Stage 2 partial)
+- **Public IO contract (`src/io/io_interface.zig`)**: `Operation` and `Result` tagged unions (one variant per op), `CallbackAction = enum { disarm, rearm }`, single-callback signature, caller-owned `Completion` with opaque per-backend state (`backend_state_size = 64`, comptime-asserted by each backend). `_backend_state` now defaults to all-zero so backends can safely read flags like `in_flight` on a fresh completion.
 - **`SimIO` (`src/io/sim_io.zig`)**: in-process simulation backend with min-heap pending queue, seeded `std.Random.DefaultPrng`, `FaultConfig` (per-op error probabilities + latency injection). Zero-alloc after init. 8 unit tests cover timeout ordering, fault injection, queue-full, cancel, rearm.
-- **`RealIO` (`src/io/real_io.zig`)**: io_uring backend implementing the same interface. Encodes `Completion*` as SQE `user_data`; multishot accept honours `IORING_CQE_F_MORE`; connect deadlines submit a paired `link_timeout`. 5 tests cover real socketpair recv/send, cancel, fsync, timeout.
+- **`RealIO` (`src/io/real_io.zig`)**: io_uring backend implementing the same interface. Encodes `Completion*` as SQE `user_data`; multishot accept honours `IORING_CQE_F_MORE`; connect deadlines submit a paired `link_timeout`. `dispatchCqe` now clears `in_flight` *before* invoking the callback (multishot still preserves the flag) so callbacks can re-arm the same completion in the natural "header → body → next header" pattern. 5 tests cover real socketpair recv/send, cancel, fsync, timeout.
 - **Backend parity test (`tests/io_backend_parity_test.zig`)**: comptime check that both backends expose the required method set + runtime tests running identical bodies against each. Wired into `zig build test` and `zig build test-io-parity`.
-- Remaining: `event_loop.zig` migration to call `self.io.*` instead of `self.ring.*` (86 sites, 18 op types — see `progress-reports/2026-04-25-io-abstraction-foundation.md` for the decomposed task list).
+
+### Stage 2 (event-loop migration) — in progress
+- ~~**#8 — `io: RealIO` field on EventLoop**~~: (DONE, commit `e17cd19`) parallel ring instance alongside legacy `ring`; non-blocking drain in `tick()` and `deinit`; `RealIO.init` falls back to plain init if `COOP_TASKRUN | SINGLE_ISSUER` is unsupported.
+- ~~**#9 — timerfd → native `io.timeout`**~~: (DONE, commit `a33143d`) `EventLoop.tick_timeout_completion` arms a one-shot timeout per scheduled callback; `tickTimeoutComplete` re-arms for the next deadline. `OpType.timerfd` deleted.
+- ~~**#10 — `PieceStore.sync` async via `io.fsync`**~~: (DONE, commit `8e3e46c`) `posix.fdatasync` no longer appears anywhere in the daemon path. The new API takes `*RealIO`, allocates one Completion per open file, and ticks until every fsync completes; first error is surfaced after all completions land.
+- 🟡 **#11 — peer recv/send to `Completion.callback` dispatch**: peer recv DONE (commit `c2b903d`) — `Peer.recv_completion` + `peerRecvComplete` callback handle every peer wire recv submission. `OpType.peer_recv` deleted. Peer send still pending (multi-in-flight tracked-send model needs a per-PendingSend Completion or a Completion pool — moderate refactor).
+- ⚪ **#12 — remaining op types + delete dispatch switch**: not started. HTTP, RPC accept/recv/send, peer listener multishot accept, disk read/write, recheck, metadata, uTP, UDP tracker, signal poll. Once everything is migrated, `encodeUserData` / `decodeUserData` / `OpType` and the CQE switch all go away, along with the legacy `ring` field.
+
+See `progress-reports/2026-04-25-stage2-event-loop-migration.md` for the slice-by-slice writeup.
 
 ## Next
 
