@@ -572,3 +572,147 @@ test "SimPeer disconnect_after closes after N blocks" {
     // reset on the parked recv that was active when the seeder closed.
     try testing.expectEqual(@as(?anyerror, error.ConnectionResetByPeer), rx_ctx.err);
 }
+
+test "SimPeer lie_bitfield advertises all-pieces-present regardless of stored bitfield" {
+    var io = try SimIO.init(testing.allocator, .{ .socket_capacity = 4 });
+    defer io.deinit();
+
+    var rng = std.Random.DefaultPrng.init(7);
+
+    const fds = try io.createSocketpair();
+    const seeder_fd = fds[0];
+    const test_fd = fds[1];
+
+    const info_hash: [20]u8 = .{0xab} ** 20;
+    const peer_id: [20]u8 = .{0x53} ** 20;
+    const piece_count: u32 = 4;
+    const piece_size: u32 = 16;
+    // Real bitfield says we only have piece 0.
+    var real_bitfield: [1]u8 = .{0x80};
+    var piece_data: [4 * 16]u8 = undefined;
+    @memset(&piece_data, 0x42);
+
+    var seeder = SimPeer{
+        .io = undefined,
+        .fd = 0,
+        .role = .seeder,
+        .behavior = .{ .lie_bitfield = {} },
+        .rng = &rng,
+        .info_hash = undefined,
+        .peer_id = undefined,
+        .piece_count = 0,
+        .piece_size = 0,
+        .bitfield = &.{},
+        .piece_data = &.{},
+    };
+    try seeder.init(.{
+        .io = &io,
+        .fd = seeder_fd,
+        .role = .seeder,
+        .behavior = .{ .lie_bitfield = {} },
+        .info_hash = info_hash,
+        .peer_id = peer_id,
+        .piece_count = piece_count,
+        .piece_size = piece_size,
+        .bitfield = &real_bitfield,
+        .piece_data = &piece_data,
+        .rng = &rng,
+    });
+
+    const my_handshake = peer_wire.serializeHandshake(info_hash, .{0x44} ** 20);
+    var tx_c = Completion{};
+    var tx_ctx = TxCtx{};
+    try io.send(.{ .fd = test_fd, .buf = &my_handshake }, &tx_c, &tx_ctx, txCallback);
+
+    var rx_c = Completion{};
+    var rx_ctx = RxCtx{};
+    try primeRecv(&io, test_fd, &rx_c, &rx_ctx);
+
+    var i: u32 = 0;
+    while (i < 5) : (i += 1) try io.advance(0);
+
+    // Bitfield message starts at byte 68. Layout: [0,0,0,2][5][bf_byte].
+    try testing.expect(rx_ctx.received >= 68 + 6);
+    const bf_byte = rx_ctx.bytes[68 + 5];
+    // Lie advertises 4 ones in the high nibble (mask trims trailing bits
+    // past piece_count).
+    try testing.expectEqual(@as(u8, 0xf0), bf_byte);
+    // The seeder's stored bitfield is unchanged — only the wire form lies.
+    try testing.expectEqual(@as(u8, 0x80), real_bitfield[0]);
+}
+
+test "SimPeer silent_after stops responding after N blocks" {
+    var io = try SimIO.init(testing.allocator, .{ .socket_capacity = 4 });
+    defer io.deinit();
+
+    var rng = std.Random.DefaultPrng.init(11);
+
+    const fds = try io.createSocketpair();
+    const seeder_fd = fds[0];
+    const test_fd = fds[1];
+
+    const info_hash: [20]u8 = .{0xab} ** 20;
+    const peer_id: [20]u8 = .{0x53} ** 20;
+    const piece_count: u32 = 4;
+    const piece_size: u32 = 16;
+    var bitfield: [1]u8 = .{0xf0};
+    var piece_data: [4 * 16]u8 = undefined;
+    for (&piece_data, 0..) |*b, idx| b.* = @as(u8, @intCast(idx));
+
+    var seeder = SimPeer{
+        .io = undefined,
+        .fd = 0,
+        .role = .seeder,
+        .behavior = .{ .silent_after = .{ .blocks = 2 } },
+        .rng = &rng,
+        .info_hash = undefined,
+        .peer_id = undefined,
+        .piece_count = 0,
+        .piece_size = 0,
+        .bitfield = &.{},
+        .piece_data = &.{},
+    };
+    try seeder.init(.{
+        .io = &io,
+        .fd = seeder_fd,
+        .role = .seeder,
+        .behavior = .{ .silent_after = .{ .blocks = 2 } },
+        .info_hash = info_hash,
+        .peer_id = peer_id,
+        .piece_count = piece_count,
+        .piece_size = piece_size,
+        .bitfield = &bitfield,
+        .piece_data = &piece_data,
+        .rng = &rng,
+    });
+
+    // Send handshake + interested + 3 requests; the seeder should respond
+    // to the first 2 and silently drop the third.
+    var combined: [68 + 5 + 17 * 3]u8 = undefined;
+    const hs = peer_wire.serializeHandshake(info_hash, .{0x44} ** 20);
+    @memcpy(combined[0..68], &hs);
+    const interested_header = peer_wire.serializeHeader(2, &.{});
+    @memcpy(combined[68..73], &interested_header);
+    var off: usize = 73;
+    var p: u32 = 0;
+    while (p < 3) : (p += 1) {
+        const req = peer_wire.serializeRequest(.{ .piece_index = p, .block_offset = 0, .length = 16 });
+        @memcpy(combined[off..][0..17], &req);
+        off += 17;
+    }
+
+    var tx_c = Completion{};
+    var tx_ctx = TxCtx{};
+    try io.send(.{ .fd = test_fd, .buf = &combined }, &tx_c, &tx_ctx, txCallback);
+
+    var rx_c = Completion{};
+    var rx_ctx = RxCtx{};
+    try primeRecv(&io, test_fd, &rx_c, &rx_ctx);
+
+    var i: u32 = 0;
+    while (i < 30) : (i += 1) try io.advance(0);
+
+    // Three requests received but only two block sends fired.
+    try testing.expectEqual(@as(u32, 3), seeder.requests_received);
+    try testing.expectEqual(@as(u32, 2), seeder.blocks_sent);
+}
