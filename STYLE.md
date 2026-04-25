@@ -172,6 +172,17 @@ Patterns that fell out of the Stage 2 migration (Apr 2026) and the bugs they cat
     the next test driving the next conversion. **Do not pre-convert** for hypothetical
     future usage — convert only what compiles when actually called.
 
+11. **`@TypeOf(self.*).X` for namespace access inside `anytype` methods.** When a generic
+    method takes `self: anytype` and needs to reference a nested type, constant, or static
+    method on the EL type (e.g. `EventLoop.PendingWriteKey{...}`,
+    `EventLoop.isIdleCandidate(...)`, `std.ArrayList(EventLoop.AnnounceResult)`), use
+    `@TypeOf(self.*).X` rather than the concrete `EventLoop` alias. Each instantiation
+    (`EventLoopOf(RealIO)`, `EventLoopOf(SimIO)`) has its own nested-type instances; using
+    the alias hard-codes one instantiation. The same idiom carries inner closures: bind
+    `const Ctx = @TypeOf(self);` outside the closure so the inner anonymous-struct
+    callback (`std.mem.sort` comparator, etc.) can name the parameterised receiver type
+    at comptime without explicit type-parameter plumbing.
+
 ---
 
 ## Memory
