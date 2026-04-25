@@ -1902,7 +1902,6 @@ pub const EventLoop = struct {
             .peer_socket => peer_handler.handleSocketCreated(self, op.slot, cqe),
             .peer_connect => peer_handler.handleConnect(self, op.slot, cqe),
             .peer_send => peer_handler.handleSend(self, op.slot, cqe),
-            .disk_write => peer_handler.handleDiskWrite(self, op.slot, cqe),
             .disk_read => seed_handler.handleSeedDiskRead(self, cqe),
             .timeout => {
                 self.timeout_pending = false;

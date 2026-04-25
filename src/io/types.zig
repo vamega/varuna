@@ -23,7 +23,6 @@ pub const OpType = enum(u8) {
     peer_connect = 0,
     peer_send = 2,
     disk_read = 4,
-    disk_write = 5,
     http_connect = 6,
     http_send = 7,
     http_recv = 8,

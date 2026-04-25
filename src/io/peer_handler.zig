@@ -718,17 +718,55 @@ fn handleRecvResult(self: *EventLoop, slot: u16, recv_res: i32) void {
     }
 }
 
+/// Per-write tracking for `io.write` so the callback can find the
+/// owning EventLoop + write_id. Heap-allocated; one per submitted span,
+/// freed by `diskWriteComplete`. The PendingWrite that aggregates spans
+/// still lives on EventLoop via `pending_writes`.
+pub const DiskWriteOp = struct {
+    completion: io_interface.Completion = .{},
+    el: *EventLoop,
+    write_id: u32,
+};
+
+/// Callback bound to a `DiskWriteOp.completion`. Translates the result
+/// into a synthetic `cqe.res`-shaped i32, feeds the existing
+/// `handleDiskWriteResult`, and frees the tracking struct.
+pub fn diskWriteComplete(
+    userdata: ?*anyopaque,
+    _: *io_interface.Completion,
+    result: io_interface.Result,
+) io_interface.CallbackAction {
+    const op: *DiskWriteOp = @ptrCast(@alignCast(userdata.?));
+    const res: i32 = switch (result) {
+        .write => |r| if (r) |n|
+            std.math.cast(i32, n) orelse std.math.maxInt(i32)
+        else |_|
+            -1,
+        else => -1,
+    };
+    const el = op.el;
+    const write_id = op.write_id;
+    el.allocator.destroy(op);
+    handleDiskWriteResult(el, write_id, res);
+    return .disarm;
+}
+
+/// Legacy wrapper kept for any residual legacy-ring callers (currently
+/// none in the daemon path; perf workloads don't drive disk_write).
 pub fn handleDiskWrite(self: *EventLoop, slot: u16, cqe: linux.io_uring_cqe) void {
     _ = slot;
     const op = decodeUserData(cqe.user_data);
     const write_id: u32 = @truncate(op.context);
+    handleDiskWriteResult(self, write_id, cqe.res);
+}
 
+fn handleDiskWriteResult(self: *EventLoop, write_id: u32, res: i32) void {
     if (self.getPendingWriteById(write_id)) |pending_w| {
         const piece_index = pending_w.piece_index;
         // Check for write errors (disk full, I/O error, etc.)
-        if (cqe.res < 0) {
+        if (res < 0) {
             log.err("disk write failed for piece {d} torrent {d}: errno={d}", .{
-                piece_index, pending_w.torrent_id, -cqe.res,
+                piece_index, pending_w.torrent_id, -res,
             });
             // Mark as failed but do NOT free the buffer yet -- other spans
             // may still be in-flight in io_uring and reference it.
