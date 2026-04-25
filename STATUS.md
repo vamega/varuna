@@ -207,7 +207,14 @@ Update it whenever a milestone lands, the near-term backlog changes, or a new op
   - `posix.fdatasync` and `timerfd_*` calls no longer appear anywhere in the daemon hot path.
   - Two patterns settled: (a) **single Completion per long-lived slot** for serial state machines; (b) **heap-allocated tracking struct** with embedded Completion for fan-out parallel ops (per-span piece writes/reads, per-PendingSend tracked sends, per-client RPC ops with generation guard).
 
-See `progress-reports/2026-04-25-stage2-event-loop-migration.md` for the slice-by-slice writeup.
+### Sim test surface (post-Stage-2)
+For sim-driven integration tests (smart-ban et al.) per `docs/sim-test-setup.md`:
+- **`EventLoop.addInboundPeer(torrent_id, fd, peer_addr) -> u16`** (commit `8a93275`) — drop a paired socketpair fd directly into a peer slot in `.inbound_handshake_recv` state, skipping `accept_multishot`. Pre-attaches to the torrent.
+- **`EventLoop.PeerView` + `EventLoop.getPeerView(slot) -> ?PeerView`** (commit `8a93275`) — read-only snapshot exposing `address`, `trust_points`, `hashfails`, `is_banned`, `blocks_received`, `bytes_downloaded`, `bytes_uploaded`. Returns null for unused slots.
+- **`EventLoop.isPieceComplete(torrent_id, piece_index) -> bool`** (commit `8a93275`) — read-only proxy to `PieceTracker.isPieceComplete`.
+- **Hasher inline mode** (commit `139da15`) — `Hasher.create(allocator, 0)` selects no-thread inline-execution: `submitVerifyEx` computes the SHA synchronously and pushes the result before returning, so the next `peer_policy.processHashResults` sees it deterministically per tick.
+
+See `progress-reports/2026-04-25-stage2-event-loop-migration.md` for the Stage 2 slice-by-slice writeup.
 
 ## Next
 
