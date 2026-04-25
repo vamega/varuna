@@ -1908,9 +1908,6 @@ pub const EventLoop = struct {
             .utp_recv => utp_handler.handleUtpRecv(self, cqe),
             .utp_send => utp_handler.handleUtpSend(self, cqe),
             .cancel => {},
-            .api_accept => if (self.api_server) |srv| srv.handleAcceptCqe(cqe),
-            .api_recv => if (self.api_server) |srv| srv.handleRecvCqe(op.slot, op.context, cqe),
-            .api_send => if (self.api_server) |srv| srv.handleSendCqe(op.slot, op.context, cqe),
             .udp_socket, .udp_tracker_send, .udp_tracker_recv => {
                 if (self.udp_tracker_executor) |ute| ute.dispatchCqe(cqe);
             },

@@ -850,9 +850,9 @@ fn runApiBurst(
     config: Config,
     mode: ApiBurstMode,
 ) !Result {
-    var bench_ring = try linux.IoUring.init(64, 0);
-    defer bench_ring.deinit();
-    var server = try rpc_server.ApiServer.init(allocator, &bench_ring, "127.0.0.1", 0);
+    var bench_io = try RealIO.init(.{ .entries = 64 });
+    defer bench_io.deinit();
+    var server = try rpc_server.ApiServer.init(allocator, &bench_io, "127.0.0.1", 0);
     defer server.deinit();
 
     server.setHandler(struct {
@@ -944,9 +944,9 @@ fn runApiSequentialGet(
     iterations: usize,
     config: Config,
 ) !Result {
-    var bench_ring = try linux.IoUring.init(64, 0);
-    defer bench_ring.deinit();
-    var server = try rpc_server.ApiServer.init(allocator, &bench_ring, "127.0.0.1", 0);
+    var bench_io = try RealIO.init(.{ .entries = 64 });
+    defer bench_io.deinit();
+    var server = try rpc_server.ApiServer.init(allocator, &bench_io, "127.0.0.1", 0);
     defer server.deinit();
 
     server.setHandler(struct {

@@ -4,6 +4,9 @@ const linux = std.os.linux;
 const ring_mod = @import("../io/ring.zig");
 const socket_util = @import("../net/socket.zig");
 const auth = @import("auth.zig");
+const io_interface = @import("../io/io_interface.zig");
+const real_io_mod = @import("../io/real_io.zig");
+const RealIO = real_io_mod.RealIO;
 
 const max_api_clients = 64;
 const recv_buf_size = 8192;
@@ -14,32 +17,36 @@ pub const response_header_inline_size = header_buf_size;
 
 const event_loop_mod = @import("../io/event_loop.zig");
 
-/// HTTP API server running on a shared io_uring ring.
-/// Accept, recv, parse, route, send -- all via SQEs on the event loop's ring.
+/// HTTP API server running on the shared io_interface backend.
+/// Accept, recv, parse, route, send -- all via `io.*` ops with caller-
+/// owned Completions. Each in-flight per-client op carries a generation
+/// counter via a heap-allocated ClientOp tracker so stale CQEs after
+/// slot reuse are filtered cheaply.
 pub const ApiServer = struct {
-    ring: *linux.IoUring,
+    io: *RealIO,
     allocator: std.mem.Allocator,
     listen_fd: posix.fd_t = -1,
     clients: [max_api_clients]ApiClient = [_]ApiClient{.{}} ** max_api_clients,
     client_generations: [max_api_clients]u32 = [_]u32{0} ** max_api_clients,
     handler: *const fn (std.mem.Allocator, Request) Response = defaultHandler,
     running: bool = true,
+    accept_completion: io_interface.Completion = .{},
 
-    pub fn init(allocator: std.mem.Allocator, ring: *linux.IoUring, bind_addr: []const u8, port: u16) !ApiServer {
-        return initWithDevice(allocator, ring, bind_addr, port, null);
+    pub fn init(allocator: std.mem.Allocator, io: *RealIO, bind_addr: []const u8, port: u16) !ApiServer {
+        return initWithDevice(allocator, io, bind_addr, port, null);
     }
 
     /// Create an API server using a pre-existing listen socket (e.g. from
     /// systemd socket activation). The caller retains ownership of the fd.
-    pub fn initWithFd(allocator: std.mem.Allocator, ring: *linux.IoUring, listen_fd: posix.fd_t) !ApiServer {
+    pub fn initWithFd(allocator: std.mem.Allocator, io: *RealIO, listen_fd: posix.fd_t) !ApiServer {
         return .{
-            .ring = ring,
+            .io = io,
             .allocator = allocator,
             .listen_fd = listen_fd,
         };
     }
 
-    pub fn initWithDevice(allocator: std.mem.Allocator, ring: *linux.IoUring, bind_addr: []const u8, port: u16, bind_device: ?[]const u8) !ApiServer {
+    pub fn initWithDevice(allocator: std.mem.Allocator, io: *RealIO, bind_addr: []const u8, port: u16, bind_device: ?[]const u8) !ApiServer {
         // Create and bind listen socket
         const addr = try std.net.Address.parseIp4(bind_addr, port);
         const fd = try posix.socket(
@@ -62,7 +69,7 @@ pub const ApiServer = struct {
         try posix.listen(fd, 128);
 
         return .{
-            .ring = ring,
+            .io = io,
             .allocator = allocator,
             .listen_fd = fd,
         };
@@ -88,156 +95,124 @@ pub const ApiServer = struct {
         self.handler = handler;
     }
 
-    // In production, CQEs are dispatched by the event loop via handleAcceptCqe/etc.
-    // The run() and poll() methods below are for standalone use (tests, benchmarks).
-
-    /// Run a standalone event loop. For tests and benchmarks only.
-    pub fn run(self: *ApiServer) !void {
-        try self.submitAccept();
-        while (self.running) {
-            _ = try self.ring.submit_and_wait(1);
-            var cqes: [32]linux.io_uring_cqe = undefined;
-            const count = try self.ring.copy_cqes(&cqes, 0);
-            for (cqes[0..count]) |cqe| self.dispatch(cqe);
-        }
-    }
-
-    /// Process one batch of CQEs. Non-blocking. For tests and benchmarks only.
-    pub fn poll(self: *ApiServer) !bool {
-        _ = try self.ring.submit();
-        var cqes: [32]linux.io_uring_cqe = undefined;
-        const count = try self.ring.copy_cqes(&cqes, 0);
-        for (cqes[0..count]) |cqe| self.dispatch(cqe);
-        return count > 0;
-    }
+    /// Per-op tracking struct, heap-allocated. Carries the generation
+    /// counter so stale CQEs against a reused slot can be filtered.
+    const ClientOp = struct {
+        completion: io_interface.Completion = .{},
+        server: *ApiServer,
+        slot: u8,
+        gen: u32,
+    };
 
     pub fn stop(self: *ApiServer) void {
         self.running = false;
     }
 
-    // ── CQE dispatch ──────────────────────────────────────
+    // ── Run helpers (tests / benchmarks) ──────────────────
 
-    // User data encoding uses the event loop's scheme:
-    //   slot:16 = API client index (0-63)
-    //   op_type:8 = api_accept/api_recv/api_send
-    //   context:40 = generation counter
-
-    fn encodeUd(slot: u8, generation: u32, op_type: event_loop_mod.OpType) u64 {
-        return event_loop_mod.encodeUserData(.{
-            .slot = slot,
-            .op_type = op_type,
-            .context = @intCast(generation),
-        });
-    }
-
-    /// Dispatch a CQE from the shared event loop. Called by EventLoop.dispatch().
-    fn dispatch(self: *ApiServer, cqe: linux.io_uring_cqe) void {
-        const op = event_loop_mod.decodeUserData(cqe.user_data);
-        switch (op.op_type) {
-            .api_accept => self.handleAccept(cqe),
-            .api_recv => self.handleRecv(@intCast(op.slot), @intCast(op.context), cqe),
-            .api_send => self.handleSend(@intCast(op.slot), @intCast(op.context), cqe),
-            else => {},
+    /// Run a standalone event loop. For tests and benchmarks only.
+    pub fn run(self: *ApiServer) !void {
+        try self.submitAccept();
+        while (self.running) {
+            try self.io.tick(1);
         }
     }
 
-    // Public CQE handlers for the event loop's dispatch to call directly.
-    pub fn handleAcceptCqe(self: *ApiServer, cqe: linux.io_uring_cqe) void {
-        self.handleAccept(cqe);
-    }
-    pub fn handleRecvCqe(self: *ApiServer, slot: u16, context: u40, cqe: linux.io_uring_cqe) void {
-        self.handleRecv(@intCast(slot), @intCast(context), cqe);
-    }
-    pub fn handleSendCqe(self: *ApiServer, slot: u16, context: u40, cqe: linux.io_uring_cqe) void {
-        self.handleSend(@intCast(slot), @intCast(context), cqe);
+    /// Process one batch of completions. Non-blocking. For tests and
+    /// benchmarks only.
+    pub fn poll(self: *ApiServer) !bool {
+        try self.io.tick(0);
+        return true;
     }
 
-    fn handleAccept(self: *ApiServer, cqe: linux.io_uring_cqe) void {
-        const more = (cqe.flags & linux.IORING_CQE_F_MORE) != 0;
-        if (cqe.res < 0) {
-            if (!more) self.submitAccept() catch {};
-            return;
-        }
-        const new_fd: posix.fd_t = @intCast(cqe.res);
+    // ── Accept ────────────────────────────────────────────
+
+    pub fn submitAccept(self: *ApiServer) !void {
+        try self.io.accept(
+            .{ .fd = self.listen_fd, .multishot = true },
+            &self.accept_completion,
+            self,
+            apiAcceptComplete,
+        );
+    }
+
+    fn apiAcceptComplete(
+        userdata: ?*anyopaque,
+        _: *io_interface.Completion,
+        result: io_interface.Result,
+    ) io_interface.CallbackAction {
+        const self: *ApiServer = @ptrCast(@alignCast(userdata.?));
+        const new_fd = switch (result) {
+            .accept => |r| r catch return .rearm,
+            else => return .rearm,
+        };
+        const accepted_fd = new_fd.fd;
 
         const slot = self.allocClientSlot() orelse {
-            posix.close(new_fd);
-            if (!more) self.submitAccept() catch {};
-            return;
+            posix.close(accepted_fd);
+            return .rearm;
         };
 
         const client = &self.clients[slot];
-        client.fd = new_fd;
+        client.fd = accepted_fd;
         client.recv_offset = 0;
 
-        // Submit recv for request
         self.submitRecv(slot) catch {
             self.closeClient(slot);
         };
-
-        if (!more) self.submitAccept() catch {};
+        return .rearm;
     }
 
-    fn handleRecv(self: *ApiServer, slot: u8, generation: u32, cqe: linux.io_uring_cqe) void {
-        if (!self.isLiveClient(slot, generation)) return;
-        const client = &self.clients[slot];
-        if (cqe.res <= 0) {
-            self.closeClient(slot);
-            return;
-        }
-        client.recv_offset += @intCast(cqe.res);
-        self.processBufferedRequest(slot);
-    }
-
-    fn handleSend(self: *ApiServer, slot: u8, generation: u32, cqe: linux.io_uring_cqe) void {
-        if (!self.isLiveClient(slot, generation)) return;
-        if (cqe.res <= 0) {
-            self.closeClient(slot);
-            return;
-        }
-
-        const client = &self.clients[slot];
-        const sent: usize = @intCast(cqe.res);
-        const complete = advanceSendProgress(client, sent) catch {
-            self.closeClient(slot);
-            return;
-        };
-        if (complete) {
-            if (!client.keep_alive) {
-                self.closeClient(slot);
-                return;
-            }
-
-            releaseClientResponse(self, client);
-            if (client.recv_offset > 0) {
-                self.processBufferedRequest(slot);
-            } else {
-                self.submitRecv(slot) catch {
-                    self.closeClient(slot);
-                };
-            }
-            return;
-        }
-
-        self.submitSend(slot) catch {
-            self.closeClient(slot);
-        };
-    }
-
-    // ── SQE helpers ───────────────────────────────────────
-
-    pub fn submitAccept(self: *ApiServer) !void {
-        const ud = encodeUd(0, 0, .api_accept);
-        _ = try self.ring.accept_multishot(ud, self.listen_fd, null, null, posix.SOCK.CLOEXEC);
-    }
+    // ── Recv ──────────────────────────────────────────────
 
     fn submitRecv(self: *ApiServer, slot: u8) !void {
         const client = &self.clients[slot];
         if (client.fd < 0) return error.InvalidClientSlot;
-        const ud = encodeUd(slot, self.client_generations[slot], .api_recv);
+        const op = try self.allocator.create(ClientOp);
+        op.* = .{ .server = self, .slot = slot, .gen = self.client_generations[slot] };
         const storage = recvStorage(client);
-        _ = try self.ring.recv(ud, client.fd, .{ .buffer = storage[client.recv_offset..] }, 0);
+        self.io.recv(
+            .{ .fd = client.fd, .buf = storage[client.recv_offset..] },
+            &op.completion,
+            op,
+            apiRecvComplete,
+        ) catch |err| {
+            self.allocator.destroy(op);
+            return err;
+        };
     }
+
+    fn apiRecvComplete(
+        userdata: ?*anyopaque,
+        _: *io_interface.Completion,
+        result: io_interface.Result,
+    ) io_interface.CallbackAction {
+        const op: *ClientOp = @ptrCast(@alignCast(userdata.?));
+        const self = op.server;
+        const slot = op.slot;
+        const gen = op.gen;
+        self.allocator.destroy(op);
+
+        if (!self.isLiveClient(slot, gen)) return .disarm;
+
+        const n = switch (result) {
+            .recv => |r| r catch {
+                self.closeClient(slot);
+                return .disarm;
+            },
+            else => return .disarm,
+        };
+        if (n == 0) {
+            self.closeClient(slot);
+            return .disarm;
+        }
+        const client = &self.clients[slot];
+        client.recv_offset += n;
+        self.processBufferedRequest(slot);
+        return .disarm;
+    }
+
+    // ── Send ──────────────────────────────────────────────
 
     fn submitSend(self: *ApiServer, slot: u8) !void {
         const client = &self.clients[slot];
@@ -269,8 +244,67 @@ pub const ApiServer = struct {
             .controllen = 0,
             .flags = 0,
         };
-        const ud = encodeUd(slot, self.client_generations[slot], .api_send);
-        _ = try self.ring.sendmsg(ud, client.fd, &client.send_msg, 0);
+        const op = try self.allocator.create(ClientOp);
+        op.* = .{ .server = self, .slot = slot, .gen = self.client_generations[slot] };
+        self.io.sendmsg(
+            .{ .fd = client.fd, .msg = &client.send_msg },
+            &op.completion,
+            op,
+            apiSendComplete,
+        ) catch |err| {
+            self.allocator.destroy(op);
+            return err;
+        };
+    }
+
+    fn apiSendComplete(
+        userdata: ?*anyopaque,
+        _: *io_interface.Completion,
+        result: io_interface.Result,
+    ) io_interface.CallbackAction {
+        const op: *ClientOp = @ptrCast(@alignCast(userdata.?));
+        const self = op.server;
+        const slot = op.slot;
+        const gen = op.gen;
+        self.allocator.destroy(op);
+
+        if (!self.isLiveClient(slot, gen)) return .disarm;
+        const sent = switch (result) {
+            .sendmsg => |r| r catch {
+                self.closeClient(slot);
+                return .disarm;
+            },
+            else => return .disarm,
+        };
+        if (sent == 0) {
+            self.closeClient(slot);
+            return .disarm;
+        }
+
+        const client = &self.clients[slot];
+        const complete = advanceSendProgress(client, sent) catch {
+            self.closeClient(slot);
+            return .disarm;
+        };
+        if (complete) {
+            if (!client.keep_alive) {
+                self.closeClient(slot);
+                return .disarm;
+            }
+            releaseClientResponse(self, client);
+            if (client.recv_offset > 0) {
+                self.processBufferedRequest(slot);
+            } else {
+                self.submitRecv(slot) catch {
+                    self.closeClient(slot);
+                };
+            }
+            return .disarm;
+        }
+        self.submitSend(slot) catch {
+            self.closeClient(slot);
+        };
+        return .disarm;
     }
 
     fn sendResponse(self: *ApiServer, slot: u8, response: Response) void {
@@ -384,7 +418,7 @@ pub const ApiServer = struct {
         const client = &self.clients[slot];
         var retained_recv_buf: ?[]u8 = null;
         if (client.fd >= 0) {
-            _ = self.ring.close(0, client.fd) catch {};
+            posix.close(client.fd);
             client.fd = -1;
         }
         if (client.recv_buf) |buf| {
@@ -698,16 +732,16 @@ test "parseContentLength returns null when missing" {
 }
 
 test "api server init and deinit" {
-    var test_ring = linux.IoUring.init(64, 0) catch return error.SkipZigTest;
-    defer test_ring.deinit();
-    var server = ApiServer.init(std.testing.allocator, &test_ring, "127.0.0.1", 0) catch return error.SkipZigTest;
+    var test_io = RealIO.init(.{ .entries = 64 }) catch return error.SkipZigTest;
+    defer test_io.deinit();
+    var server = ApiServer.init(std.testing.allocator, &test_io, "127.0.0.1", 0) catch return error.SkipZigTest;
     defer server.deinit();
 }
 
 test "api server handles request via io_uring" {
-    var test_ring = linux.IoUring.init(64, 0) catch return error.SkipZigTest;
-    defer test_ring.deinit();
-    var server = ApiServer.init(std.testing.allocator, &test_ring, "127.0.0.1", 0) catch return error.SkipZigTest;
+    var test_io = RealIO.init(.{ .entries = 64 }) catch return error.SkipZigTest;
+    defer test_io.deinit();
+    var server = ApiServer.init(std.testing.allocator, &test_io, "127.0.0.1", 0) catch return error.SkipZigTest;
     defer server.deinit();
 
     // Get the actual port
@@ -757,9 +791,9 @@ test "api server handles request via io_uring" {
 }
 
 test "api server keeps HTTP/1.1 connection alive for sequential requests" {
-    var test_ring = linux.IoUring.init(64, 0) catch return error.SkipZigTest;
-    defer test_ring.deinit();
-    var server = ApiServer.init(std.testing.allocator, &test_ring, "127.0.0.1", 0) catch return error.SkipZigTest;
+    var test_io = RealIO.init(.{ .entries = 64 }) catch return error.SkipZigTest;
+    defer test_io.deinit();
+    var server = ApiServer.init(std.testing.allocator, &test_io, "127.0.0.1", 0) catch return error.SkipZigTest;
     defer server.deinit();
 
     var addr: posix.sockaddr = undefined;
