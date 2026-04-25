@@ -82,12 +82,36 @@ piece is released back to the picker and rerequested from another
 peer. The EL never confuses "connection died" with "peer sent bad
 data".
 
+## Vacuous-pass guard
+
+Team-lead's calibration note flagged a real risk: if a fault lands on
+the *corrupt* peer's send before its bad bytes reach the EL, no hash
+failure → no ban → the test passes the safety invariant trivially with
+nothing actually exercised. To reject this pathology,
+`runOneSeedAgainstEventLoop` now returns a `SeedOutcome` and the
+BUGGIFY harness asserts:
+
+* At least half the seeds (`ban_seeds * 2 >= seeds.len`) observe an
+  actual `ban_list.isBanned(corrupt_addr)` hit.
+* At least half the seed-piece pairs verify
+  (`pieces_done_total * 2 >= seeds.len * 3`).
+
+Empirically this run produces:
+
+    BUGGIFY summary: 23/32 seeds banned corrupt, 96/96 honest pieces verified
+
+72% ban rate and 100% piece verification — well above the threshold and
+strong evidence the test is exercising the algorithm rather than masking
+it. The 9 seeds that don't ban are seeds where `FaultConfig` severed
+the corrupt peer's connection before its 4th hash-fail, which is itself
+a meaningful EL recovery path (cleanup of a half-banned peer mid-fail).
+
 ## Validation
 
 * `zig build test-sim-smart-ban-eventloop` — both tests green:
   - "5 honest + 1 corrupt over 8 seeds" — strict liveness, 8 seeds.
-  - "BUGGIFY: 32 seeds, p=0.02 fault injection" — safety only, 32
-    seeds, all `ticks=4096`.
+  - "BUGGIFY: 32 seeds, p=0.02 fault injection" — safety + the
+    vacuous-pass guard above.
 * `zig build test` — full suite green, no leaks.
 
 ## Key code references
