@@ -555,7 +555,8 @@ fn inlineVerifyMultiPiece(el: *EventLoop, slot: *WebSeedSlot) void {
         for (plan.spans) |span| {
             if (tc.shared_fds[span.file_index] < 0) continue;
             const block = piece_buf[span.piece_offset .. span.piece_offset + span.length];
-            const wop = el.allocator.create(peer_handler.DiskWriteOp) catch |err| {
+            const EL = @TypeOf(el.*);
+            const wop = el.allocator.create(peer_handler.DiskWriteOpOf(EL)) catch |err| {
                 log.warn("web seed: write op alloc for piece {d}: {s}", .{ piece_index, @errorName(err) });
                 if (el.getPendingWrite(pending_key)) |pending_w| {
                     pending_w.write_failed = true;
@@ -567,7 +568,7 @@ fn inlineVerifyMultiPiece(el: *EventLoop, slot: *WebSeedSlot) void {
                 .{ .fd = tc.shared_fds[span.file_index], .buf = block, .offset = span.file_offset },
                 &wop.completion,
                 wop,
-                peer_handler.diskWriteComplete,
+                peer_handler.diskWriteCompleteFor(EL),
             ) catch |err| {
                 log.warn("web seed: disk write for piece {d}: {s}", .{ piece_index, @errorName(err) });
                 el.allocator.destroy(wop);

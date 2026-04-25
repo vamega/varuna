@@ -13,39 +13,51 @@ const io_interface = @import("io_interface.zig");
 const socket_util = @import("../net/socket.zig");
 const BanList = @import("../net/ban_list.zig").BanList;
 
+// ── Generic callback shape ────────────────────────────────
+//
+// `EventLoop` is parameterised over a comptime `IO: type` (see
+// `EventLoopOf` in event_loop.zig). Each callback below is exposed via a
+// factory `xCompleteFor(comptime EL: type)` that returns a concrete
+// `io_interface.Callback` baked against that EL instantiation. The
+// factory's inner cast `*EL = @ptrCast(userdata)` varies per type;
+// everything else stays shared. Helper functions take `self: anytype`
+// so the compiler infers the EL at the callsite.
+
 // ── CQE dispatch handlers ──────────────────────────────
 
-/// Callback bound to `EventLoop.accept_completion`. Invoked once per
-/// accepted inbound connection (multishot keeps the SQE armed kernel-side
-/// until F_MORE clears, at which point we return `.rearm` and the io
-/// backend resubmits). Returns `.rearm` so the listener stays open.
-pub fn peerAcceptComplete(
-    userdata: ?*anyopaque,
-    _: *io_interface.Completion,
-    result: io_interface.Result,
-) io_interface.CallbackAction {
-    const self: *EventLoop = @ptrCast(@alignCast(userdata.?));
+/// Factory for the multishot-accept callback bound to
+/// `EventLoop.accept_completion`. Returns `.rearm` so the listener stays
+/// open across CQEs.
+pub fn peerAcceptCompleteFor(comptime EL: type) io_interface.Callback {
+    return struct {
+        fn cb(
+            userdata: ?*anyopaque,
+            _: *io_interface.Completion,
+            result: io_interface.Result,
+        ) io_interface.CallbackAction {
+            const self: *EL = @ptrCast(@alignCast(userdata.?));
 
-    const accepted = switch (result) {
-        .accept => |r| r catch |err| {
-            // ECANCELED is expected when stopTcpListener cancels the
-            // pending accept; other errors are worth surfacing once.
-            if (err != error.OperationCanceled) {
-                log.warn("accept failed: {s}", .{@errorName(err)});
-            }
+            const accepted = switch (result) {
+                .accept => |r| r catch |err| {
+                    // ECANCELED is expected when stopTcpListener cancels
+                    // the pending accept; other errors are worth surfacing.
+                    if (err != error.OperationCanceled) {
+                        log.warn("accept failed: {s}", .{@errorName(err)});
+                    }
+                    return .rearm;
+                },
+                else => return .disarm,
+            };
+
+            handleAccepted(self, accepted.fd);
             return .rearm;
-        },
-        else => return .disarm,
-    };
-
-    handleAccepted(self, accepted.fd);
-    return .rearm;
+        }
+    }.cb;
 }
 
 /// Apply the policy/ban/limit checks against a freshly accepted fd and,
-/// if it's keepable, install it as an inbound peer slot. Factored out so
-/// the callback above stays readable.
-fn handleAccepted(self: *EventLoop, new_fd: posix.fd_t) void {
+/// if it's keepable, install it as an inbound peer slot.
+fn handleAccepted(self: anytype, new_fd: posix.fd_t) void {
     // Extract peer address and check ban list before allocating a slot
     if (self.ban_list) |bl| {
         var peer_addr: posix.sockaddr.storage = undefined;
@@ -110,27 +122,30 @@ fn handleAccepted(self: *EventLoop, new_fd: posix.fd_t) void {
     };
 }
 
-
-/// Callback bound to `Peer.connect_completion`. Invoked when async
-/// socket creation lands. Configures the new fd, applies bind/device
-/// settings, and chains the connect on the same completion.
-pub fn peerSocketComplete(
-    userdata: ?*anyopaque,
-    completion: *io_interface.Completion,
-    result: io_interface.Result,
-) io_interface.CallbackAction {
-    const self: *EventLoop = @ptrCast(@alignCast(userdata.?));
-    const peer: *Peer = @fieldParentPtr("connect_completion", completion);
-    const offset = @intFromPtr(peer) - @intFromPtr(self.peers.ptr);
-    const slot: u16 = @intCast(offset / @sizeOf(Peer));
-    handleSocketResult(self, slot, switch (result) {
-        .socket => |r| if (r) |fd| @intCast(fd) else |_| -1,
-        else => -1,
-    });
-    return .disarm;
+/// Factory: callback bound to `Peer.connect_completion`. Invoked when
+/// async socket creation lands. Configures the new fd and chains the
+/// connect on the same completion.
+pub fn peerSocketCompleteFor(comptime EL: type) io_interface.Callback {
+    return struct {
+        fn cb(
+            userdata: ?*anyopaque,
+            completion: *io_interface.Completion,
+            result: io_interface.Result,
+        ) io_interface.CallbackAction {
+            const self: *EL = @ptrCast(@alignCast(userdata.?));
+            const peer: *Peer = @fieldParentPtr("connect_completion", completion);
+            const offset = @intFromPtr(peer) - @intFromPtr(self.peers.ptr);
+            const slot: u16 = @intCast(offset / @sizeOf(Peer));
+            handleSocketResult(self, slot, switch (result) {
+                .socket => |r| if (r) |fd| @intCast(fd) else |_| -1,
+                else => -1,
+            });
+            return .disarm;
+        }
+    }.cb;
 }
 
-fn handleSocketResult(self: *EventLoop, slot: u16, res: i32) void {
+fn handleSocketResult(self: anytype, slot: u16, res: i32) void {
     const peer = &self.peers[slot];
     if (peer.state == .free) {
         if (res >= 0) posix.close(@intCast(res));
@@ -164,34 +179,38 @@ fn handleSocketResult(self: *EventLoop, slot: u16, res: i32) void {
         .{ .fd = fd, .addr = peer.address },
         &peer.connect_completion,
         self,
-        peerConnectComplete,
+        peerConnectCompleteFor(@TypeOf(self.*)),
     ) catch {
         self.removePeer(slot);
         return;
     };
 }
 
-/// Callback bound to `Peer.connect_completion` (after socket creation
-/// chains a connect on the same completion). Translates the connect
-/// result and feeds `handleConnectResult`.
-pub fn peerConnectComplete(
-    userdata: ?*anyopaque,
-    completion: *io_interface.Completion,
-    result: io_interface.Result,
-) io_interface.CallbackAction {
-    const self: *EventLoop = @ptrCast(@alignCast(userdata.?));
-    const peer: *Peer = @fieldParentPtr("connect_completion", completion);
-    const offset = @intFromPtr(peer) - @intFromPtr(self.peers.ptr);
-    const slot: u16 = @intCast(offset / @sizeOf(Peer));
-    const ok = switch (result) {
-        .connect => |r| if (r) |_| true else |_| false,
-        else => false,
-    };
-    handleConnectResult(self, slot, if (ok) 0 else -1);
-    return .disarm;
+/// Factory: callback bound to `Peer.connect_completion` (after socket
+/// creation chains a connect on the same completion). Translates the
+/// connect result and feeds `handleConnectResult`.
+pub fn peerConnectCompleteFor(comptime EL: type) io_interface.Callback {
+    return struct {
+        fn cb(
+            userdata: ?*anyopaque,
+            completion: *io_interface.Completion,
+            result: io_interface.Result,
+        ) io_interface.CallbackAction {
+            const self: *EL = @ptrCast(@alignCast(userdata.?));
+            const peer: *Peer = @fieldParentPtr("connect_completion", completion);
+            const offset = @intFromPtr(peer) - @intFromPtr(self.peers.ptr);
+            const slot: u16 = @intCast(offset / @sizeOf(Peer));
+            const ok = switch (result) {
+                .connect => |r| if (r) |_| true else |_| false,
+                else => false,
+            };
+            handleConnectResult(self, slot, if (ok) 0 else -1);
+            return .disarm;
+        }
+    }.cb;
 }
 
-fn handleConnectResult(self: *EventLoop, slot: u16, res: i32) void {
+fn handleConnectResult(self: anytype, slot: u16, res: i32) void {
     // Connection attempt completed (success or failure) -- no longer half-open
     if (self.half_open_count > 0) self.half_open_count -= 1;
 
@@ -231,7 +250,7 @@ fn handleConnectResult(self: *EventLoop, slot: u16, res: i32) void {
 }
 
 /// Start the async MSE initiator handshake for an outbound peer.
-fn startMseInitiator(self: *EventLoop, slot: u16) !void {
+fn startMseInitiator(self: anytype, slot: u16) !void {
     const peer = &self.peers[slot];
     const tc = self.getTorrentContext(peer.torrent_id) orelse return error.TorrentNotFound;
 
@@ -250,7 +269,7 @@ fn startMseInitiator(self: *EventLoop, slot: u16) !void {
                 .{ .fd = peer.fd, .buf = data },
                 &peer.send_completion,
                 self,
-                peerSendComplete,
+                peerSendCompleteFor(@TypeOf(self.*)),
             ) catch {
                 return error.SubmitFailed;
             };
@@ -261,7 +280,7 @@ fn startMseInitiator(self: *EventLoop, slot: u16) !void {
 }
 
 /// Determine whether to initiate MSE on an outbound connection.
-fn shouldInitiateMse(self: *EventLoop, peer: *const Peer) bool {
+fn shouldInitiateMse(self: anytype, peer: *const Peer) bool {
     // Never MSE if mode is disabled
     if (self.encryption_mode == .disabled) return false;
     // Don't retry MSE if this peer previously rejected it
@@ -275,7 +294,7 @@ fn shouldInitiateMse(self: *EventLoop, peer: *const Peer) bool {
 }
 
 /// Send a standard BitTorrent protocol handshake (no MSE).
-pub fn sendBtHandshake(self: *EventLoop, slot: u16) void {
+pub fn sendBtHandshake(self: anytype, slot: u16) void {
     const peer = &self.peers[slot];
     const tc = self.getTorrentContext(peer.torrent_id) orelse {
         self.removePeer(slot);
@@ -303,7 +322,7 @@ pub fn sendBtHandshake(self: *EventLoop, slot: u16) void {
         .{ .fd = peer.fd, .buf = peer.handshake_buf[0..68] },
         &peer.send_completion,
         self,
-        peerSendComplete,
+        peerSendCompleteFor(@TypeOf(self.*)),
     ) catch {
         self.removePeer(slot);
         return;
@@ -311,58 +330,66 @@ pub fn sendBtHandshake(self: *EventLoop, slot: u16) void {
     peer.send_pending = true;
 }
 
-/// Callback for an untracked peer send (handshake / MSE / state-machine
-/// transition messages). Driven by `Peer.send_completion`. Tracked sends
-/// (PendingSend) use `pendingSendComplete` instead.
-pub fn peerSendComplete(
-    userdata: ?*anyopaque,
-    completion: *io_interface.Completion,
-    result: io_interface.Result,
-) io_interface.CallbackAction {
-    const self: *EventLoop = @ptrCast(@alignCast(userdata.?));
-    const peer: *Peer = @fieldParentPtr("send_completion", completion);
-    const offset = @intFromPtr(peer) - @intFromPtr(self.peers.ptr);
-    const slot: u16 = @intCast(offset / @sizeOf(Peer));
-    const res: i32 = switch (result) {
-        .send => |r| if (r) |n|
-            std.math.cast(i32, n) orelse std.math.maxInt(i32)
-        else |_|
-            -1,
-        else => -1,
-    };
-    handleSendResult(self, slot, 0, res);
-    return .disarm;
+/// Factory: callback for an untracked peer send (handshake / MSE /
+/// state-machine transition messages). Driven by `Peer.send_completion`.
+/// Tracked sends (PendingSend) use `pendingSendCompleteFor` instead.
+pub fn peerSendCompleteFor(comptime EL: type) io_interface.Callback {
+    return struct {
+        fn cb(
+            userdata: ?*anyopaque,
+            completion: *io_interface.Completion,
+            result: io_interface.Result,
+        ) io_interface.CallbackAction {
+            const self: *EL = @ptrCast(@alignCast(userdata.?));
+            const peer: *Peer = @fieldParentPtr("send_completion", completion);
+            const offset = @intFromPtr(peer) - @intFromPtr(self.peers.ptr);
+            const slot: u16 = @intCast(offset / @sizeOf(Peer));
+            const res: i32 = switch (result) {
+                .send => |r| if (r) |n|
+                    std.math.cast(i32, n) orelse std.math.maxInt(i32)
+                else |_|
+                    -1,
+                else => -1,
+            };
+            handleSendResult(self, slot, 0, res);
+            return .disarm;
+        }
+    }.cb;
 }
 
-/// Callback for a tracked peer send (PendingSend with a heap-owned or
-/// vectored buffer). Driven by `PendingSend.completion`. Recovers the
-/// PendingSend pointer via `@fieldParentPtr` and feeds
+/// Factory: callback for a tracked peer send (PendingSend with a
+/// heap-owned or vectored buffer). Driven by `PendingSend.completion`.
+/// Recovers the PendingSend pointer via `@fieldParentPtr` and feeds
 /// `handleSendResult` with the (slot, send_id) pair.
-pub fn pendingSendComplete(
-    userdata: ?*anyopaque,
-    completion: *io_interface.Completion,
-    result: io_interface.Result,
-) io_interface.CallbackAction {
-    const self: *EventLoop = @ptrCast(@alignCast(userdata.?));
-    const ps: *@import("buffer_pools.zig").PendingSend = @fieldParentPtr("completion", completion);
-    const slot = ps.slot;
-    const send_id = ps.send_id;
-    const res: i32 = switch (result) {
-        .send => |r| if (r) |n|
-            std.math.cast(i32, n) orelse std.math.maxInt(i32)
-        else |_|
-            -1,
-        .sendmsg => |r| if (r) |n|
-            std.math.cast(i32, n) orelse std.math.maxInt(i32)
-        else |_|
-            -1,
-        else => -1,
-    };
-    handleSendResult(self, slot, send_id, res);
-    return .disarm;
+pub fn pendingSendCompleteFor(comptime EL: type) io_interface.Callback {
+    return struct {
+        fn cb(
+            userdata: ?*anyopaque,
+            completion: *io_interface.Completion,
+            result: io_interface.Result,
+        ) io_interface.CallbackAction {
+            const self: *EL = @ptrCast(@alignCast(userdata.?));
+            const ps: *@import("buffer_pools.zig").PendingSend = @fieldParentPtr("completion", completion);
+            const slot = ps.slot;
+            const send_id = ps.send_id;
+            const res: i32 = switch (result) {
+                .send => |r| if (r) |n|
+                    std.math.cast(i32, n) orelse std.math.maxInt(i32)
+                else |_|
+                    -1,
+                .sendmsg => |r| if (r) |n|
+                    std.math.cast(i32, n) orelse std.math.maxInt(i32)
+                else |_|
+                    -1,
+                else => -1,
+            };
+            handleSendResult(self, slot, send_id, res);
+            return .disarm;
+        }
+    }.cb;
 }
 
-fn handleSendResult(self: *EventLoop, slot: u16, send_id: u32, send_res: i32) void {
+fn handleSendResult(self: anytype, slot: u16, send_id: u32, send_res: i32) void {
     const peer = &self.peers[slot];
 
     // Guard: if the peer slot was already freed (stale CQE from a
@@ -423,7 +450,7 @@ fn handleSendResult(self: *EventLoop, slot: u16, send_id: u32, send_res: i32) vo
                     .{ .fd = peer.fd, .buf = peer.mse_send_remaining },
                     &peer.send_completion,
                     self,
-                    peerSendComplete,
+                    peerSendCompleteFor(@TypeOf(self.*)),
                 ) catch {
                     self.removePeer(slot);
                 };
@@ -445,7 +472,7 @@ fn handleSendResult(self: *EventLoop, slot: u16, send_id: u32, send_res: i32) vo
                     .{ .fd = peer.fd, .buf = peer.mse_send_remaining },
                     &peer.send_completion,
                     self,
-                    peerSendComplete,
+                    peerSendCompleteFor(@TypeOf(self.*)),
                 ) catch {
                     self.removePeer(slot);
                 };
@@ -517,36 +544,37 @@ fn handleSendResult(self: *EventLoop, slot: u16, send_id: u32, send_res: i32) vo
     }
 }
 
-pub fn handleRecv(self: *EventLoop, slot: u16, cqe: linux.io_uring_cqe) void {
+pub fn handleRecv(self: anytype, slot: u16, cqe: linux.io_uring_cqe) void {
     handleRecvResult(self, slot, cqe.res);
 }
 
-/// Callback bound to `Peer.recv_completion`. The completion's address lets
-/// us recover the owning `Peer` (via @fieldParentPtr) and from there the
-/// slot index in `EventLoop.peers`. `userdata` carries the owning
-/// `*EventLoop`.
-pub fn peerRecvComplete(
-    userdata: ?*anyopaque,
-    completion: *io_interface.Completion,
-    result: io_interface.Result,
-) io_interface.CallbackAction {
-    const self: *EventLoop = @ptrCast(@alignCast(userdata.?));
-    const peer: *Peer = @fieldParentPtr("recv_completion", completion);
-    // Pointer arithmetic against `peers.ptr` recovers the slot index. The
-    // peers slice is allocated once with fixed size; addresses are stable
-    // for the lifetime of the EventLoop.
-    const offset = @intFromPtr(peer) - @intFromPtr(self.peers.ptr);
-    const slot: u16 = @intCast(offset / @sizeOf(Peer));
+/// Factory: callback bound to `Peer.recv_completion`. The completion's
+/// address lets us recover the owning `Peer` (via @fieldParentPtr) and
+/// from there the slot index in `EventLoop.peers`. `userdata` carries
+/// the owning `*EL`.
+pub fn peerRecvCompleteFor(comptime EL: type) io_interface.Callback {
+    return struct {
+        fn cb(
+            userdata: ?*anyopaque,
+            completion: *io_interface.Completion,
+            result: io_interface.Result,
+        ) io_interface.CallbackAction {
+            const self: *EL = @ptrCast(@alignCast(userdata.?));
+            const peer: *Peer = @fieldParentPtr("recv_completion", completion);
+            const offset = @intFromPtr(peer) - @intFromPtr(self.peers.ptr);
+            const slot: u16 = @intCast(offset / @sizeOf(Peer));
 
-    const res: i32 = switch (result) {
-        .recv => |r| if (r) |n|
-            std.math.cast(i32, n) orelse std.math.maxInt(i32)
-        else |err|
-            errToCqeRes(err),
-        else => unreachable,
-    };
-    handleRecvResult(self, slot, res);
-    return .disarm;
+            const res: i32 = switch (result) {
+                .recv => |r| if (r) |n|
+                    std.math.cast(i32, n) orelse std.math.maxInt(i32)
+                else |err|
+                    errToCqeRes(err),
+                else => unreachable,
+            };
+            handleRecvResult(self, slot, res);
+            return .disarm;
+        }
+    }.cb;
 }
 
 /// Translate a recv error into a synthetic negative cqe.res value.
@@ -556,7 +584,7 @@ inline fn errToCqeRes(_: anyerror) i32 {
     return -1;
 }
 
-fn handleRecvResult(self: *EventLoop, slot: u16, recv_res: i32) void {
+fn handleRecvResult(self: anytype, slot: u16, recv_res: i32) void {
     const peer = &self.peers[slot];
 
     // Guard: if the peer slot was already freed (stale CQE from a
@@ -736,7 +764,7 @@ fn handleRecvResult(self: *EventLoop, slot: u16, recv_res: i32) void {
                 .{ .fd = peer.fd, .buf = peer.handshake_buf[0..68] },
                 &peer.send_completion,
                 self,
-                peerSendComplete,
+                peerSendCompleteFor(@TypeOf(self.*)),
             ) catch {
                 self.removePeer(slot);
                 return;
@@ -812,38 +840,52 @@ fn handleRecvResult(self: *EventLoop, slot: u16, recv_res: i32) void {
 
 /// Per-write tracking for `io.write` so the callback can find the
 /// owning EventLoop + write_id. Heap-allocated; one per submitted span,
-/// freed by `diskWriteComplete`. The PendingWrite that aggregates spans
-/// still lives on EventLoop via `pending_writes`.
-pub const DiskWriteOp = struct {
-    completion: io_interface.Completion = .{},
-    el: *EventLoop,
-    write_id: u32,
-};
-
-/// Callback bound to a `DiskWriteOp.completion`. Translates the result
-/// into a synthetic `cqe.res`-shaped i32, feeds the existing
-/// `handleDiskWriteResult`, and frees the tracking struct.
-pub fn diskWriteComplete(
-    userdata: ?*anyopaque,
-    _: *io_interface.Completion,
-    result: io_interface.Result,
-) io_interface.CallbackAction {
-    const op: *DiskWriteOp = @ptrCast(@alignCast(userdata.?));
-    const res: i32 = switch (result) {
-        .write => |r| if (r) |n|
-            std.math.cast(i32, n) orelse std.math.maxInt(i32)
-        else |_|
-            -1,
-        else => -1,
+/// freed by `diskWriteCompleteFor(EL).cb`. The PendingWrite that
+/// aggregates spans still lives on the EventLoop via `pending_writes`.
+///
+/// Generic over the EventLoop instantiation `EL` so a SimIO-driven
+/// EventLoop and a RealIO-driven one each get their own DiskWriteOp
+/// type with the right `el` pointer.
+pub fn DiskWriteOpOf(comptime EL: type) type {
+    return struct {
+        completion: io_interface.Completion = .{},
+        el: *EL,
+        write_id: u32,
     };
-    const el = op.el;
-    const write_id = op.write_id;
-    el.allocator.destroy(op);
-    handleDiskWriteResult(el, write_id, res);
-    return .disarm;
 }
 
-fn handleDiskWriteResult(self: *EventLoop, write_id: u32, res: i32) void {
+/// Backwards-compat alias for daemon callsites that pre-date the
+/// parameterisation. Resolves to `DiskWriteOpOf(EventLoop)`.
+pub const DiskWriteOp = DiskWriteOpOf(EventLoop);
+
+/// Factory: callback bound to a `DiskWriteOp.completion`. Translates
+/// the result into a synthetic `cqe.res`-shaped i32, feeds the
+/// existing `handleDiskWriteResult`, and frees the tracking struct.
+pub fn diskWriteCompleteFor(comptime EL: type) io_interface.Callback {
+    return struct {
+        fn cb(
+            userdata: ?*anyopaque,
+            _: *io_interface.Completion,
+            result: io_interface.Result,
+        ) io_interface.CallbackAction {
+            const op: *DiskWriteOpOf(EL) = @ptrCast(@alignCast(userdata.?));
+            const res: i32 = switch (result) {
+                .write => |r| if (r) |n|
+                    std.math.cast(i32, n) orelse std.math.maxInt(i32)
+                else |_|
+                    -1,
+                else => -1,
+            };
+            const el = op.el;
+            const write_id = op.write_id;
+            el.allocator.destroy(op);
+            handleDiskWriteResult(el, write_id, res);
+            return .disarm;
+        }
+    }.cb;
+}
+
+fn handleDiskWriteResult(self: anytype, write_id: u32, res: i32) void {
     if (self.getPendingWriteById(write_id)) |pending_w| {
         const piece_index = pending_w.piece_index;
         // Check for write errors (disk full, I/O error, etc.)
@@ -881,7 +923,7 @@ fn handleDiskWriteResult(self: *EventLoop, write_id: u32, res: i32) void {
 
 /// Execute an MseAction returned by the async state machine.
 /// `is_initiator` controls which state (mse_handshake_* vs mse_resp_*) to use.
-fn executeMseAction(self: *EventLoop, slot: u16, action: mse.MseAction, is_initiator: bool) void {
+fn executeMseAction(self: anytype, slot: u16, action: mse.MseAction, is_initiator: bool) void {
     const peer = &self.peers[slot];
     switch (action) {
         .send => |data| {
@@ -892,7 +934,7 @@ fn executeMseAction(self: *EventLoop, slot: u16, action: mse.MseAction, is_initi
                 .{ .fd = peer.fd, .buf = data },
                 &peer.send_completion,
                 self,
-                peerSendComplete,
+                peerSendCompleteFor(@TypeOf(self.*)),
             ) catch {
                 handleMseFailure(self, slot, is_initiator);
                 return;
@@ -906,7 +948,7 @@ fn executeMseAction(self: *EventLoop, slot: u16, action: mse.MseAction, is_initi
                 .{ .fd = peer.fd, .buf = buf },
                 &peer.recv_completion,
                 self,
-                peerRecvComplete,
+                peerRecvCompleteFor(@TypeOf(self.*)),
             ) catch {
                 handleMseFailure(self, slot, is_initiator);
                 return;
@@ -965,7 +1007,7 @@ fn executeMseAction(self: *EventLoop, slot: u16, action: mse.MseAction, is_initi
 }
 
 /// Handle MSE failure -- either fallback to plaintext or disconnect.
-fn handleMseFailure(self: *EventLoop, slot: u16, is_initiator: bool) void {
+fn handleMseFailure(self: anytype, slot: u16, is_initiator: bool) void {
     const peer = &self.peers[slot];
 
     // Clean up MSE state
@@ -1001,7 +1043,7 @@ fn handleMseFailure(self: *EventLoop, slot: u16, is_initiator: bool) void {
 }
 
 /// Attempt to reconnect to a peer without MSE (plaintext fallback).
-fn attemptMseFallback(self: *EventLoop, slot: u16) void {
+fn attemptMseFallback(self: anytype, slot: u16) void {
     const peer = &self.peers[slot];
     const address = peer.address;
     const torrent_id = peer.torrent_id;
@@ -1040,7 +1082,7 @@ fn attemptMseFallback(self: *EventLoop, slot: u16) void {
         .{ .domain = family, .sock_type = posix.SOCK.STREAM | posix.SOCK.CLOEXEC | posix.SOCK.NONBLOCK, .protocol = posix.IPPROTO.TCP },
         &peer.connect_completion,
         self,
-        peerSocketComplete,
+        peerSocketCompleteFor(@TypeOf(self.*)),
     ) catch {
         self.removePeer(slot);
         return;
@@ -1055,7 +1097,7 @@ fn attemptMseFallback(self: *EventLoop, slot: u16) void {
 /// non-BT-protocol bytes.
 /// `bytes_received` is the number of bytes already in `peer.handshake_buf`
 /// from the initial inbound recv (may be more than 1).
-fn startMseResponder(self: *EventLoop, slot: u16, bytes_received: usize) void {
+fn startMseResponder(self: anytype, slot: u16, bytes_received: usize) void {
     const peer = &self.peers[slot];
 
     if (self.mse_req2_to_hash.count() == 0) {
@@ -1085,7 +1127,7 @@ fn startMseResponder(self: *EventLoop, slot: u16, bytes_received: usize) void {
             .{ .fd = peer.fd, .buf = recv_buf },
             &peer.recv_completion,
             self,
-            peerRecvComplete,
+            peerRecvCompleteFor(@TypeOf(self.*)),
         ) catch {
             self.removePeer(slot);
             return;
@@ -1101,7 +1143,7 @@ fn startMseResponder(self: *EventLoop, slot: u16, bytes_received: usize) void {
 /// like an MSE DH key exchange (not a BT protocol handshake).
 /// Called from handleRecv when we get the first bytes on an inbound peer.
 /// `n` is the total number of bytes already received into `peer.handshake_buf`.
-pub fn detectAndHandleInboundMse(self: *EventLoop, slot: u16, first_byte: u8, n: usize) bool {
+pub fn detectAndHandleInboundMse(self: anytype, slot: u16, first_byte: u8, n: usize) bool {
     // If encryption is disabled, never try MSE detection
     if (self.encryption_mode == .disabled) return false;
 

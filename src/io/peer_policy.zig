@@ -564,7 +564,8 @@ pub fn completePieceDownload(self: *EventLoop, slot: u16) void {
                 // Skip spans for do_not_download files (fd == -1)
                 if (tc.shared_fds[span.file_index] < 0) continue;
                 const block = piece_buf[span.piece_offset .. span.piece_offset + span.length];
-                const wop = self.allocator.create(peer_handler.DiskWriteOp) catch |err| {
+                const EL = @TypeOf(self.*);
+                const wop = self.allocator.create(peer_handler.DiskWriteOpOf(EL)) catch |err| {
                     log.warn("inline disk write op alloc for piece {d}: {s}", .{ piece_index, @errorName(err) });
                     if (self.getPendingWrite(pending_key)) |pending_w| {
                         pending_w.write_failed = true;
@@ -576,7 +577,7 @@ pub fn completePieceDownload(self: *EventLoop, slot: u16) void {
                     .{ .fd = tc.shared_fds[span.file_index], .buf = block, .offset = span.file_offset },
                     &wop.completion,
                     wop,
-                    peer_handler.diskWriteComplete,
+                    peer_handler.diskWriteCompleteFor(EL),
                 ) catch |err| {
                     log.warn("inline disk write for piece {d}: {s}", .{ piece_index, @errorName(err) });
                     self.allocator.destroy(wop);
@@ -781,7 +782,8 @@ pub fn processHashResults(self: *EventLoop) void {
                 // Skip spans for do_not_download files (fd == -1)
                 if (tc.shared_fds[span.file_index] < 0) continue;
                 const block = result.piece_buf[span.piece_offset .. span.piece_offset + span.length];
-                const wop = self.allocator.create(peer_handler.DiskWriteOp) catch |err| {
+                const EL = @TypeOf(self.*);
+                const wop = self.allocator.create(peer_handler.DiskWriteOpOf(EL)) catch |err| {
                     log.warn("disk write op alloc for piece {d}: {s}", .{ result.piece_index, @errorName(err) });
                     if (self.getPendingWrite(pending_key)) |pending_w| {
                         pending_w.write_failed = true;
@@ -793,7 +795,7 @@ pub fn processHashResults(self: *EventLoop) void {
                     .{ .fd = tc.shared_fds[span.file_index], .buf = block, .offset = span.file_offset },
                     &wop.completion,
                     wop,
-                    peer_handler.diskWriteComplete,
+                    peer_handler.diskWriteCompleteFor(EL),
                 ) catch |err| {
                     log.warn("disk write submit for piece {d}: {s}", .{ result.piece_index, @errorName(err) });
                     self.allocator.destroy(wop);
