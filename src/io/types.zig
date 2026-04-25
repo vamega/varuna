@@ -37,7 +37,6 @@ pub const OpType = enum(u8) {
     api_send = 15,
     udp_tracker_send = 16,
     udp_tracker_recv = 17,
-    timerfd = 18,
     recheck_read = 19,
     metadata_connect = 20,
     metadata_send = 21,

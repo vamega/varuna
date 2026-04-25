@@ -246,9 +246,10 @@ pub const EventLoop = struct {
     timeout_ts: linux.kernel_timespec = .{ .sec = 2, .nsec = 0 },
     timeout_pending: bool = false,
 
-    // timerfd: one-shot timer callbacks driven by timerfd + io_uring read
-    timer_fd: posix.fd_t = -1,
-    timer_read_buf: [8]u8 = undefined,
+    // One-shot timer callbacks driven by `io.timeout` on the new
+    // io_interface ring. The completion is owned by the EventLoop and
+    // re-armed for each next-earliest deadline.
+    tick_timeout_completion: io_interface.Completion = .{},
     timer_pending: bool = false,
     timer_callbacks: std.ArrayList(TimerCallback) = std.ArrayList(TimerCallback).empty,
 
@@ -349,11 +350,6 @@ pub const EventLoop = struct {
         else
             null;
 
-        // Create a timerfd for one-shot timer callbacks (e.g. delayed announces).
-        // Non-fatal: if the syscall fails we fall back to no timer support.
-        const tfd_rc = linux.timerfd_create(.MONOTONIC, .{ .CLOEXEC = true, .NONBLOCK = true });
-        const timer_fd: posix.fd_t = if (@as(isize, @bitCast(tfd_rc)) < 0) -1 else @intCast(tfd_rc);
-
         return .{
             .ring = try ring_mod.initIoUring(256, linux.IORING_SETUP_COOP_TASKRUN | linux.IORING_SETUP_SINGLE_ISSUER),
             // Second ring instance for the new io_interface backend. Same
@@ -383,7 +379,6 @@ pub const EventLoop = struct {
             .idle_peers = std.ArrayList(u16).empty,
             .active_peer_slots = std.ArrayList(u16).empty,
             .hasher = hasher,
-            .timer_fd = timer_fd,
         };
     }
 
@@ -469,10 +464,6 @@ pub const EventLoop = struct {
         if (self.udp_fd >= 0) {
             posix.close(self.udp_fd);
             self.udp_fd = -1;
-        }
-        if (self.timer_fd >= 0) {
-            posix.close(self.timer_fd);
-            self.timer_fd = -1;
         }
         if (self.signal_fd >= 0) {
             posix.close(self.signal_fd);
@@ -1469,7 +1460,7 @@ pub const EventLoop = struct {
         self.timeout_pending = true;
     }
 
-    // ── timerfd-based one-shot timers ──────────────────────
+    // ── io.timeout-based one-shot timers ────────────────────
 
     /// Schedule a one-shot timer that fires `delay_ms` milliseconds from now.
     /// When the timer fires, `callback(context)` is invoked from the event
@@ -1487,13 +1478,16 @@ pub const EventLoop = struct {
         self.armNextTimer();
     }
 
-    /// Arm the timerfd for the earliest pending callback and submit
-    /// an io_uring read if one is not already in flight.
+    /// Arm `tick_timeout_completion` against the earliest pending callback's
+    /// deadline. If a timeout is already in flight we leave it; the next
+    /// callback dispatch (`tickTimeoutComplete`) re-arms with the up-to-date
+    /// soonest deadline, which is sufficient because `fireExpiredTimers`
+    /// drains *all* expired entries every wakeup.
     fn armNextTimer(self: *EventLoop) void {
-        if (self.timer_fd < 0) return;
         if (self.timer_callbacks.items.len == 0) return;
+        if (self.timer_pending) return; // CQE will fire fireExpiredTimers + re-arm.
 
-        // Find earliest deadline
+        // Find earliest deadline.
         var earliest_ms: i64 = std.math.maxInt(i64);
         for (self.timer_callbacks.items) |cb| {
             if (cb.fire_at_ms < earliest_ms) earliest_ms = cb.fire_at_ms;
@@ -1501,24 +1495,31 @@ pub const EventLoop = struct {
 
         const now_ms = nowMonotonicMs();
         const delta_ms: i64 = @max(earliest_ms - now_ms, 1); // at least 1ms
+        const ns: u64 = @as(u64, @intCast(delta_ms)) * std.time.ns_per_ms;
 
-        const secs = @divTrunc(delta_ms, 1000);
-        const nsecs = @mod(delta_ms, 1000) * std.time.ns_per_ms;
-
-        const spec = linux.itimerspec{
-            .it_interval = .{ .sec = 0, .nsec = 0 },
-            .it_value = .{ .sec = @intCast(secs), .nsec = @intCast(nsecs) },
+        self.io.timeout(
+            .{ .ns = ns },
+            &self.tick_timeout_completion,
+            self,
+            tickTimeoutComplete,
+        ) catch |err| {
+            log.warn("io.timeout submit: {s}", .{@errorName(err)});
+            return;
         };
-        _ = linux.timerfd_settime(self.timer_fd, .{}, &spec, null);
+        self.timer_pending = true;
+    }
 
-        if (!self.timer_pending) {
-            const ud = encodeUserData(.{ .slot = 0, .op_type = .timerfd, .context = 0 });
-            _ = self.ring.read(ud, self.timer_fd, .{ .buffer = &self.timer_read_buf }, 0) catch |err| {
-                log.warn("timerfd read submit: {s}", .{@errorName(err)});
-                return;
-            };
-            self.timer_pending = true;
-        }
+    /// Callback for `tick_timeout_completion`. Fires expired timers and
+    /// re-arms the completion if more callbacks remain.
+    fn tickTimeoutComplete(
+        userdata: ?*anyopaque,
+        _: *io_interface.Completion,
+        _: io_interface.Result,
+    ) io_interface.CallbackAction {
+        const self: *EventLoop = @ptrCast(@alignCast(userdata.?));
+        self.timer_pending = false;
+        self.fireExpiredTimers();
+        return .disarm;
     }
 
     /// Fire all timer callbacks whose deadline has passed, then re-arm
@@ -1883,10 +1884,6 @@ pub const EventLoop = struct {
             .api_send => if (self.api_server) |srv| srv.handleSendCqe(op.slot, op.context, cqe),
             .udp_socket, .udp_tracker_send, .udp_tracker_recv => {
                 if (self.udp_tracker_executor) |ute| ute.dispatchCqe(cqe);
-            },
-            .timerfd => {
-                self.timer_pending = false;
-                self.fireExpiredTimers();
             },
             .recheck_read => {
                 const tid: u32 = @truncate(op.context);
@@ -2633,3 +2630,4 @@ test "selectTransport falls back to tcp when no outgoing enabled" {
         try std.testing.expectEqual(Transport.tcp, el.selectTransport());
     }
 }
+
