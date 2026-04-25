@@ -34,6 +34,17 @@ const SimPeer = sim_peer_mod.SimPeer;
 /// above this as "no work scheduled".
 const sentinel_deadline_ns: u64 = std.math.maxInt(u64) / 2;
 
+pub const BuggifyConfig = struct {
+    /// Per-step probability of injecting a fault into a randomly-chosen
+    /// in-flight operation. 0.0 disables BUGGIFY entirely; values in
+    /// [1e-3, 1e-1] are typical for stress-testing the smart-ban swarm.
+    probability: f32 = 0.0,
+    /// Optional log sink: when set, each injection writes a line of the
+    /// form `"fault injected: <op>\n"` so failing seeds are diagnosable.
+    /// Pass `null` (default) for silent injection.
+    log: ?std.fs.File = null,
+};
+
 pub const Config = struct {
     /// Maximum number of `SimPeer` pointers the swarm can hold.
     swarm_capacity: u32 = 32,
@@ -42,17 +53,24 @@ pub const Config = struct {
     seed: u64 = 0,
     /// Pass-through to SimIO.init.
     sim_io: sim_io_mod.Config = .{},
+    /// BUGGIFY (TigerBeetle VOPR-style) randomized fault injection.
+    buggify: BuggifyConfig = .{},
 };
 
 pub const Simulator = struct {
     allocator: std.mem.Allocator,
     rng: std.Random.DefaultPrng,
     io: SimIO,
+    buggify: BuggifyConfig,
 
     /// Logical clock in nanoseconds. Independent of `SimIO.now_ns` so the
     /// simulator can advance state machines (peer step, future EventLoop
     /// tick) on the same timeline that drives IO.
     clock_ns: u64 = 0,
+
+    /// Counter incremented on every successful BUGGIFY injection. Tests
+    /// inspect this to confirm BUGGIFY actually fired.
+    buggify_hits: u32 = 0,
 
     /// Fixed-capacity swarm of peer pointers. Caller-owned; the simulator
     /// stores a slot but doesn't allocate the SimPeer.
@@ -71,6 +89,7 @@ pub const Simulator = struct {
             .allocator = allocator,
             .rng = std.Random.DefaultPrng.init(config.seed),
             .io = io,
+            .buggify = config.buggify,
             .swarm = slots,
         };
     }
@@ -90,7 +109,7 @@ pub const Simulator = struct {
     }
 
     /// Advance the simulated clock by `delta_ns`, drive every swarm peer
-    /// once, then tick the IO backend.
+    /// once, optionally inject a BUGGIFY fault, then tick the IO backend.
     pub fn step(self: *Simulator, delta_ns: u64) !void {
         self.clock_ns += delta_ns;
         // Keep SimIO's clock in lockstep so `recv_latency_ns`/timeouts
@@ -103,6 +122,32 @@ pub const Simulator = struct {
                 try peer.step(self.clock_ns);
             }
         }
+
+        // BUGGIFY: with probability `buggify.probability`, mutate a random
+        // pending op's result so its callback fires with an injected
+        // fault. The deadline is unchanged so heap order is preserved.
+        if (self.buggify.probability > 0) {
+            if (self.rng.random().float(f32) < self.buggify.probability) {
+                if (self.io.injectRandomFault(&self.rng)) |hit| {
+                    self.buggify_hits += 1;
+                    if (self.buggify.log) |log| {
+                        // One short line per injection — failing seeds
+                        // can grep the log to find the trigger.
+                        var name_buf: [32]u8 = undefined;
+                        const tag_name = @tagName(hit.op_tag);
+                        const n = @min(name_buf.len, tag_name.len);
+                        @memcpy(name_buf[0..n], tag_name[0..n]);
+                        const line = std.fmt.bufPrint(
+                            &name_buf,
+                            "fault injected: {s}\n",
+                            .{tag_name},
+                        ) catch return self.io.tick();
+                        _ = log.write(line) catch {};
+                    }
+                }
+            }
+        }
+
         try self.io.tick();
     }
 
@@ -305,4 +350,68 @@ test "Simulator.nextPendingDeadlineNs returns null when heap is empty" {
     var sim = try Simulator.init(testing.allocator, .{});
     defer sim.deinit();
     try testing.expectEqual(@as(?u64, null), sim.nextPendingDeadlineNs());
+}
+
+test "BUGGIFY at probability 1.0 hits every step" {
+    var sim = try Simulator.init(testing.allocator, .{
+        .buggify = .{ .probability = 1.0 },
+    });
+    defer sim.deinit();
+
+    const Counter = struct { calls: u32 = 0, errs: u32 = 0 };
+    var ctx = Counter{};
+    const cb = struct {
+        fn cb(ud: ?*anyopaque, _: *Completion, result: Result) CallbackAction {
+            const c: *Counter = @ptrCast(@alignCast(ud.?));
+            c.calls += 1;
+            switch (result) {
+                .recv => |r| _ = r catch {
+                    c.errs += 1;
+                },
+                else => {},
+            }
+            return .disarm;
+        }
+    }.cb;
+
+    // 4 recv ops on legacy (non-socket) fds — each lands in the heap
+    // with `.recv = 0` by default. BUGGIFY should overwrite some/all
+    // with `error.ConnectionResetByPeer`.
+    var c1 = Completion{};
+    var c2 = Completion{};
+    var c3 = Completion{};
+    var c4 = Completion{};
+    var buf1: [4]u8 = undefined;
+    var buf2: [4]u8 = undefined;
+    var buf3: [4]u8 = undefined;
+    var buf4: [4]u8 = undefined;
+    try sim.io.recv(.{ .fd = 7, .buf = &buf1 }, &c1, &ctx, cb);
+    try sim.io.recv(.{ .fd = 7, .buf = &buf2 }, &c2, &ctx, cb);
+    try sim.io.recv(.{ .fd = 7, .buf = &buf3 }, &c3, &ctx, cb);
+    try sim.io.recv(.{ .fd = 7, .buf = &buf4 }, &c4, &ctx, cb);
+
+    // One step injects (probability=1.0) before the tick fires.
+    try sim.step(0);
+    try testing.expect(sim.buggify_hits >= 1);
+    try testing.expectEqual(@as(u32, 4), ctx.calls);
+    // At least one call should have observed the injected error.
+    try testing.expect(ctx.errs >= 1);
+}
+
+test "BUGGIFY at probability 0.0 never injects" {
+    var sim = try Simulator.init(testing.allocator, .{
+        .buggify = .{ .probability = 0.0 },
+    });
+    defer sim.deinit();
+
+    var c = Completion{};
+    var buf: [4]u8 = undefined;
+    const cb = struct {
+        fn cb(_: ?*anyopaque, _: *Completion, _: Result) CallbackAction {
+            return .disarm;
+        }
+    }.cb;
+    try sim.io.recv(.{ .fd = 7, .buf = &buf }, &c, null, cb);
+    try sim.step(0);
+    try testing.expectEqual(@as(u32, 0), sim.buggify_hits);
 }

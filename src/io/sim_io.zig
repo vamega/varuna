@@ -791,6 +791,40 @@ pub const SimIO = struct {
         return self.schedule(c, .{ .poll = @as(u32, 0) }, 0);
     }
 
+    /// Result of a BUGGIFY fault injection — describes the op kind that
+    /// got its result mutated, for telemetry/logging on the simulator side.
+    pub const BuggifyHit = struct {
+        op_tag: std.meta.Tag(Operation),
+    };
+
+    /// Replace the result of a randomly-chosen in-flight heap entry with
+    /// a fault appropriate to its op type. Returns the op kind whose
+    /// result was overridden so the simulator can log "fault injected:
+    /// <op>", or `null` if no schedulable entry was available.
+    ///
+    /// Heap order is unchanged (deadline isn't touched), so the entry
+    /// fires at its original time but with the fault result. Parked
+    /// completions are not eligible (they're not in the heap), and the
+    /// `accept` sentinel deadline (`u64.maxInt`) is skipped.
+    pub fn injectRandomFault(self: *SimIO, rng: *std.Random.DefaultPrng) ?BuggifyHit {
+        if (self.pending_len == 0) return null;
+        // Probe a few entries — the heap may contain non-schedulable
+        // sentinel entries (parked accept), so skip those.
+        var probes: u32 = 0;
+        while (probes < 8) : (probes += 1) {
+            const idx = rng.random().uintLessThan(u32, self.pending_len);
+            const entry = &self.pending[idx];
+            if (entry.deadline_ns == std.math.maxInt(u64)) {
+                probes += 1;
+                continue;
+            }
+            const op_tag = std.meta.activeTag(entry.completion.op);
+            entry.result = buggifyResultFor(entry.completion.op);
+            return .{ .op_tag = op_tag };
+        }
+        return null;
+    }
+
     /// Cancel an in-flight operation by completion pointer. The cancelled
     /// op's callback fires with `error.OperationCanceled` on the same
     /// tick; the cancel completion itself fires with `.cancel = {}` on
@@ -841,6 +875,28 @@ fn cancelResultFor(op: Operation) Result {
         .socket => .{ .socket = error.OperationCanceled },
         .connect => .{ .connect = error.OperationCanceled },
         .accept => .{ .accept = error.OperationCanceled },
+        .timeout => .{ .timeout = error.OperationCanceled },
+        .poll => .{ .poll = error.OperationCanceled },
+        .cancel => .{ .cancel = error.OperationCanceled },
+    };
+}
+
+/// Per-op fault chosen by BUGGIFY. The errors are picked to match what
+/// the kernel would surface for the corresponding syscall under stress
+/// (transient network failure, EIO on disk, ENOSPC on write, etc.).
+fn buggifyResultFor(op: Operation) Result {
+    return switch (op) {
+        .none => .{ .timeout = error.UnknownOperation },
+        .recv => .{ .recv = error.ConnectionResetByPeer },
+        .send => .{ .send = error.BrokenPipe },
+        .recvmsg => .{ .recvmsg = error.ConnectionResetByPeer },
+        .sendmsg => .{ .sendmsg = error.BrokenPipe },
+        .read => .{ .read = error.InputOutput },
+        .write => .{ .write = error.NoSpaceLeft },
+        .fsync => .{ .fsync = error.InputOutput },
+        .socket => .{ .socket = error.ProcessFdQuotaExceeded },
+        .connect => .{ .connect = error.ConnectionRefused },
+        .accept => .{ .accept = error.ConnectionAborted },
         .timeout => .{ .timeout = error.OperationCanceled },
         .poll => .{ .poll = error.OperationCanceled },
         .cancel => .{ .cancel = error.OperationCanceled },

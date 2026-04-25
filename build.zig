@@ -313,6 +313,20 @@ pub fn build(b: *std.Build) void {
     test_sim_minimal_step.dependOn(&run_sim_minimal_tests.step);
     test_step.dependOn(&run_sim_minimal_tests.step);
 
+    // ── Simulator unit + BUGGIFY tests ─────────────────────
+    const sim_simulator_tests = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("tests/sim_simulator_test.zig"),
+            .target = target,
+            .optimize = optimize,
+            .imports = &varuna_import,
+        }),
+    });
+    const run_sim_simulator_tests = b.addRunArtifact(sim_simulator_tests);
+    const test_sim_simulator_step = b.step("test-sim-simulator", "Run Simulator init / step / BUGGIFY tests");
+    test_sim_simulator_step.dependOn(&run_sim_simulator_tests.step);
+    test_step.dependOn(&run_sim_simulator_tests.step);
+
     // ── Event loop health tests ────────────────────────────
     const el_health_tests = b.addTest(.{
         .root_module = b.createModule(.{
