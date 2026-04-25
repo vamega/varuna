@@ -81,9 +81,12 @@ pub const RealIO = struct {
     ring: linux.IoUring,
 
     pub fn init(config: Config) !RealIO {
-        return .{
-            .ring = try linux.IoUring.init(config.entries, config.flags),
-        };
+        // Fall back to plain init if the kernel doesn't accept the requested
+        // flags (e.g. COOP_TASKRUN / SINGLE_ISSUER on older kernels). Mirrors
+        // the policy in `ring.zig:initIoUring`.
+        const ring = linux.IoUring.init(config.entries, config.flags) catch
+            try linux.IoUring.init(config.entries, 0);
+        return .{ .ring = ring };
     }
 
     pub fn deinit(self: *RealIO) void {

@@ -17,6 +17,9 @@ const utp_mod = @import("../net/utp.zig");
 const utp_mgr = @import("../net/utp_manager.zig");
 const mse = @import("../crypto/mse.zig");
 const ring_mod = @import("ring.zig");
+const real_io_mod = @import("real_io.zig");
+pub const RealIO = real_io_mod.RealIO;
+pub const io_interface = @import("io_interface.zig");
 const SuperSeedState = @import("super_seed.zig").SuperSeedState;
 const HugePageCache = @import("../storage/huge_page_cache.zig").HugePageCache;
 const MerkleCache = @import("../torrent/merkle_cache.zig").MerkleCache;
@@ -144,6 +147,12 @@ pub const EventLoop = struct {
     };
 
     ring: linux.IoUring,
+    /// New `io_interface`-based backend used by migrated call sites. During
+    /// Stage 2 the legacy `ring` and the new `io` coexist on separate ring
+    /// instances. `ring` carries the packed-userdata legacy ops; `io` carries
+    /// `*Completion`-keyed ops via `RealIO`. Both share the same fds. Once
+    /// every call site is migrated (Stage 2 #12), `ring` is removed.
+    io: RealIO,
     allocator: std.mem.Allocator,
     peers: []Peer,
     peer_count: u16 = 0,
@@ -347,6 +356,14 @@ pub const EventLoop = struct {
 
         return .{
             .ring = try ring_mod.initIoUring(256, linux.IORING_SETUP_COOP_TASKRUN | linux.IORING_SETUP_SINGLE_ISSUER),
+            // Second ring instance for the new io_interface backend. Same
+            // size as the legacy ring; same flags (with kernel fallback in
+            // RealIO.init). Each call site flips atomically between `ring`
+            // and `io` during the Stage 2 migration.
+            .io = try RealIO.init(.{
+                .entries = 256,
+                .flags = linux.IORING_SETUP_COOP_TASKRUN | linux.IORING_SETUP_SINGLE_ISSUER,
+            }),
             .allocator = allocator,
             .peers = peers,
             .torrents = try std.ArrayList(?TorrentContext).initCapacity(allocator, default_torrent_capacity),
@@ -411,6 +428,7 @@ pub const EventLoop = struct {
         // hash-verified data is not lost on shutdown.
         {
             _ = self.ring.submit() catch {};
+            self.io.tick(0) catch {};
             var flush_rounds: u32 = 0;
             while (self.pending_writes.count() > 0 and flush_rounds < 100) : (flush_rounds += 1) {
                 _ = self.ring.submit_and_wait(1) catch break;
@@ -419,6 +437,10 @@ pub const EventLoop = struct {
                 for (cqes[0..count]) |cqe| {
                     self.dispatch(cqe);
                 }
+                // Also drain io_interface completions that may have been
+                // produced during this round (e.g. async fsync after a
+                // piece write completes on the legacy ring).
+                self.io.tick(0) catch {};
             }
         }
 
@@ -586,6 +608,7 @@ pub const EventLoop = struct {
 
         // ── Phase 4: Tear down the ring ──────────────────────────
         self.ring.deinit();
+        self.io.deinit();
     }
 
     /// Drain all remaining CQEs from the ring after fds are closed.
@@ -594,6 +617,7 @@ pub const EventLoop = struct {
     fn drainRemainingCqes(self: *EventLoop) void {
         // Submit any queued SQEs so they complete (with errors, since fds are closed)
         _ = self.ring.submit() catch {};
+        self.io.tick(0) catch {};
 
         // Keep dispatching until tracked buffer-owning operations are gone.
         // This ensures late CQEs release the resources they reference before
@@ -603,10 +627,16 @@ pub const EventLoop = struct {
             _ = self.ring.submit_and_wait(1) catch break;
             var cqes: [cqe_batch_size]linux.io_uring_cqe = undefined;
             const count = self.ring.copy_cqes(&cqes, 0) catch break;
-            if (count == 0) continue;
+            if (count == 0) {
+                // No legacy CQEs this round; still try to drain new-ring
+                // completions before continuing.
+                self.io.tick(0) catch {};
+                continue;
+            }
             for (cqes[0..count]) |cqe| {
                 self.dispatch(cqe);
             }
+            self.io.tick(0) catch {};
         }
 
         // Best-effort final sweep for non-owning completions that may still be queued.
@@ -619,6 +649,7 @@ pub const EventLoop = struct {
                 self.dispatch(cqe);
             }
         }
+        self.io.tick(0) catch {};
 
         if (self.pendingBufferOperations() > 0) {
             log.warn(
@@ -1354,6 +1385,13 @@ pub const EventLoop = struct {
         _ = self.ring.submit() catch |err| {
             log.warn("ring submit (pre-wait): {s}", .{@errorName(err)});
         };
+        // Submit pending SQEs on the new io_interface ring without waiting
+        // (the legacy ring's submit_and_wait below provides forward
+        // progress during the Stage 2 transition; once everything is
+        // migrated, the wait moves here).
+        self.io.tick(0) catch |err| {
+            log.warn("io tick (pre-wait): {s}", .{@errorName(err)});
+        };
         _ = try self.ring.submit_and_wait(1);
 
         var cqes: [cqe_batch_size]linux.io_uring_cqe = undefined;
@@ -1363,12 +1401,22 @@ pub const EventLoop = struct {
             self.dispatch(cqe);
         }
 
+        // Drain any io_interface CQEs that arrived in parallel with the
+        // legacy ring's wait. Non-blocking; callbacks fire on the same
+        // event-loop thread.
+        self.io.tick(0) catch |err| {
+            log.warn("io tick (post-dispatch): {s}", .{@errorName(err)});
+        };
+
         // Batch-send any queued piece block responses
         seed_handler.flushQueuedResponses(self);
 
         // Flush any SQEs queued during dispatch (piece responses, block requests, etc.)
         _ = self.ring.submit() catch |err| {
             log.warn("ring submit (post-dispatch): {s}", .{@errorName(err)});
+        };
+        self.io.tick(0) catch |err| {
+            log.warn("io tick (post-flush): {s}", .{@errorName(err)});
         };
 
         // Graceful shutdown drain check
