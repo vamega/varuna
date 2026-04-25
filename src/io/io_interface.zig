@@ -248,7 +248,10 @@ pub const Completion = struct {
 
     /// Opaque per-backend state. The backend casts the address of this
     /// field to its own state type. Sized to fit the largest backend state.
-    _backend_state: [backend_state_size]u8 align(backend_state_align) = undefined,
+    /// Zero-initialised so that backends can safely read flags like
+    /// `in_flight` on a fresh Completion without observing 0xaa-pattern
+    /// debug fill.
+    _backend_state: [backend_state_size]u8 align(backend_state_align) = [_]u8{0} ** backend_state_size,
 
     /// Fluent helper: arm a completion in one call.
     pub fn arm(

@@ -19,6 +19,7 @@ const address = @import("../net/address.zig");
 const policy = @import("peer_policy.zig");
 const seed_handler = @import("seed_handler.zig");
 const utp_handler = @import("utp_handler.zig");
+const peer_handler = @import("peer_handler.zig");
 
 // ── Peer wire protocol message processing ─────────────────
 
@@ -426,22 +427,34 @@ fn sendUtMetadataReject(self: *EventLoop, slot: u16, peer: *Peer, piece: u32) vo
 pub fn submitHandshakeRecv(self: *EventLoop, slot: u16) !void {
     const peer = &self.peers[slot];
     const buf = peer.handshake_buf[peer.handshake_offset..68];
-    const ud = encodeUserData(.{ .slot = slot, .op_type = .peer_recv, .context = 0 });
-    _ = try self.ring.recv(ud, peer.fd, .{ .buffer = buf }, 0);
+    try self.io.recv(
+        .{ .fd = peer.fd, .buf = buf },
+        &peer.recv_completion,
+        self,
+        peer_handler.peerRecvComplete,
+    );
 }
 
 pub fn submitHeaderRecv(self: *EventLoop, slot: u16) !void {
     const peer = &self.peers[slot];
     const buf = peer.header_buf[peer.header_offset..4];
-    const ud = encodeUserData(.{ .slot = slot, .op_type = .peer_recv, .context = 0 });
-    _ = try self.ring.recv(ud, peer.fd, .{ .buffer = buf }, 0);
+    try self.io.recv(
+        .{ .fd = peer.fd, .buf = buf },
+        &peer.recv_completion,
+        self,
+        peer_handler.peerRecvComplete,
+    );
 }
 
 pub fn submitBodyRecv(self: *EventLoop, slot: u16) !void {
     const peer = &self.peers[slot];
     const buf = peer.body_buf orelse return error.NullBuffer;
-    const ud = encodeUserData(.{ .slot = slot, .op_type = .peer_recv, .context = 0 });
-    _ = try self.ring.recv(ud, peer.fd, .{ .buffer = buf[peer.body_offset..peer.body_expected] }, 0);
+    try self.io.recv(
+        .{ .fd = peer.fd, .buf = buf[peer.body_offset..peer.body_expected] },
+        &peer.recv_completion,
+        self,
+        peer_handler.peerRecvComplete,
+    );
 }
 
 pub fn submitMessage(self: *EventLoop, slot: u16, id: u8, payload: []const u8) !void {

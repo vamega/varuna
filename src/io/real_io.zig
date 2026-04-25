@@ -127,11 +127,18 @@ pub const RealIO = struct {
         const more = (cqe.flags & linux.IORING_CQE_F_MORE) != 0;
 
         const result = buildResult(c.op, cqe);
-        const action = callback(c.userdata, c, result);
 
+        // Clear in_flight BEFORE invoking the callback so that callbacks
+        // which immediately submit a follow-on op on the same completion
+        // (e.g., a peer reading the next protocol header after the body
+        // completes) don't trip the AlreadyInFlight guard against
+        // themselves. For multishot CQEs the kernel will deliver more
+        // completions against the same SQE — leave in_flight set.
         if (!more) {
             realState(c).in_flight = false;
         }
+
+        const action = callback(c.userdata, c, result);
 
         switch (action) {
             .disarm => {},

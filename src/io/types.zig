@@ -1,5 +1,6 @@
 const std = @import("std");
 const posix = std.posix;
+const io_interface = @import("io_interface.zig");
 const Bitfield = @import("../bitfield.zig").Bitfield;
 const PieceTracker = @import("../torrent/piece_tracker.zig").PieceTracker;
 const session_mod = @import("../torrent/session.zig");
@@ -20,7 +21,6 @@ pub const TorrentId = u32;
 
 pub const OpType = enum(u8) {
     peer_connect = 0,
-    peer_recv = 1,
     peer_send = 2,
     accept = 3,
     disk_read = 4,
@@ -194,6 +194,13 @@ pub const Peer = struct {
     // Used to handle partial sends during MSE handshake without prematurely
     // advancing the state machine.
     mse_send_remaining: []const u8 = &.{},
+
+    // Caller-owned completion for the peer's in-flight recv on the
+    // io_interface backend. Recvs are naturally serial per peer (handshake,
+    // header, body, MSE chunks); only one is in flight at a time. The
+    // callback (`peer_handler.peerRecvComplete`) re-derives the slot via
+    // pointer arithmetic on `EventLoop.peers` and dispatches.
+    recv_completion: io_interface.Completion = .{},
 };
 
 // ── Torrent context (per-torrent state within shared event loop) ──

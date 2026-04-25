@@ -1865,7 +1865,6 @@ pub const EventLoop = struct {
         switch (op.op_type) {
             .peer_socket => peer_handler.handleSocketCreated(self, op.slot, cqe),
             .peer_connect => peer_handler.handleConnect(self, op.slot, cqe),
-            .peer_recv => peer_handler.handleRecv(self, op.slot, cqe),
             .peer_send => peer_handler.handleSend(self, op.slot, cqe),
             .disk_write => peer_handler.handleDiskWrite(self, op.slot, cqe),
             .accept => peer_handler.handleAccept(self, cqe),

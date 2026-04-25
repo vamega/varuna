@@ -11,6 +11,7 @@ const PeerState = @import("event_loop.zig").PeerState;
 const encodeUserData = @import("event_loop.zig").encodeUserData;
 const decodeUserData = @import("event_loop.zig").decodeUserData;
 const protocol = @import("protocol.zig");
+const io_interface = @import("io_interface.zig");
 const socket_util = @import("../net/socket.zig");
 const BanList = @import("../net/ban_list.zig").BanList;
 
@@ -412,13 +413,52 @@ pub fn handleSend(self: *EventLoop, slot: u16, cqe: linux.io_uring_cqe) void {
 }
 
 pub fn handleRecv(self: *EventLoop, slot: u16, cqe: linux.io_uring_cqe) void {
+    handleRecvResult(self, slot, cqe.res);
+}
+
+/// Callback bound to `Peer.recv_completion`. The completion's address lets
+/// us recover the owning `Peer` (via @fieldParentPtr) and from there the
+/// slot index in `EventLoop.peers`. `userdata` carries the owning
+/// `*EventLoop`.
+pub fn peerRecvComplete(
+    userdata: ?*anyopaque,
+    completion: *io_interface.Completion,
+    result: io_interface.Result,
+) io_interface.CallbackAction {
+    const self: *EventLoop = @ptrCast(@alignCast(userdata.?));
+    const peer: *Peer = @fieldParentPtr("recv_completion", completion);
+    // Pointer arithmetic against `peers.ptr` recovers the slot index. The
+    // peers slice is allocated once with fixed size; addresses are stable
+    // for the lifetime of the EventLoop.
+    const offset = @intFromPtr(peer) - @intFromPtr(self.peers.ptr);
+    const slot: u16 = @intCast(offset / @sizeOf(Peer));
+
+    const res: i32 = switch (result) {
+        .recv => |r| if (r) |n|
+            std.math.cast(i32, n) orelse std.math.maxInt(i32)
+        else |err|
+            errToCqeRes(err),
+        else => unreachable,
+    };
+    handleRecvResult(self, slot, res);
+    return .disarm;
+}
+
+/// Translate a recv error into a synthetic negative cqe.res value.
+/// Matches the kernel's convention that errors are negative errnos. The
+/// exact mapping is unimportant — `handleRecvResult` only checks `<= 0`.
+inline fn errToCqeRes(_: anyerror) i32 {
+    return -1;
+}
+
+fn handleRecvResult(self: *EventLoop, slot: u16, recv_res: i32) void {
     const peer = &self.peers[slot];
 
     // Guard: if the peer slot was already freed (stale CQE from a
     // previously-closed fd), ignore the completion entirely.
     if (peer.state == .free) return;
 
-    if (cqe.res <= 0) {
+    if (recv_res <= 0) {
         // Guard: if the peer is reconnecting (connecting state), this is a stale
         // recv CQE from the previous connection's fd. Ignore it.
         if (peer.state == .connecting) {
@@ -429,7 +469,7 @@ pub fn handleRecv(self: *EventLoop, slot: u16, cqe: linux.io_uring_cqe) void {
         // reconnect without MSE
         if (peer.state == .mse_handshake_recv or peer.state == .mse_resp_recv) {
             if (self.encryption_mode == .preferred and !peer.mse_fallback) {
-                log.debug("slot {d}: MSE recv failed (state={s} res={}), attempting plaintext fallback", .{ slot, @tagName(peer.state), cqe.res });
+                log.debug("slot {d}: MSE recv failed (state={s} res={}), attempting plaintext fallback", .{ slot, @tagName(peer.state), recv_res });
                 attemptMseFallback(self, slot);
                 return;
             }
@@ -437,7 +477,7 @@ pub fn handleRecv(self: *EventLoop, slot: u16, cqe: linux.io_uring_cqe) void {
         self.removePeer(slot);
         return;
     }
-    const n: usize = @intCast(cqe.res);
+    const n: usize = @intCast(recv_res);
 
     // MSE handshake states: the async state machine manages its own
     // encryption, so handle them before the crypto.decryptBuf block.
@@ -720,8 +760,12 @@ fn executeMseAction(self: *EventLoop, slot: u16, action: mse.MseAction, is_initi
         .recv => |buf| {
             const state: PeerState = if (is_initiator) .mse_handshake_recv else .mse_resp_recv;
             peer.state = state;
-            const ud = encodeUserData(.{ .slot = slot, .op_type = .peer_recv, .context = 0 });
-            _ = self.ring.recv(ud, peer.fd, .{ .buffer = buf }, 0) catch {
+            self.io.recv(
+                .{ .fd = peer.fd, .buf = buf },
+                &peer.recv_completion,
+                self,
+                peerRecvComplete,
+            ) catch {
                 handleMseFailure(self, slot, is_initiator);
                 return;
             };
@@ -891,8 +935,12 @@ fn startMseResponder(self: *EventLoop, slot: u16, bytes_received: usize) void {
     if (mr.recv_offset < mse.dh_key_size) {
         peer.state = .mse_resp_recv;
         const recv_buf = mr.peer_public_key[mr.recv_offset..];
-        const ud = encodeUserData(.{ .slot = slot, .op_type = .peer_recv, .context = 0 });
-        _ = self.ring.recv(ud, peer.fd, .{ .buffer = recv_buf }, 0) catch {
+        self.io.recv(
+            .{ .fd = peer.fd, .buf = recv_buf },
+            &peer.recv_completion,
+            self,
+            peerRecvComplete,
+        ) catch {
             self.removePeer(slot);
             return;
         };
