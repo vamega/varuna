@@ -370,7 +370,24 @@ pub fn EventLoopOf(comptime IO: type) type {
         // ── Lifecycle ──────────────────────────────────────────
 
         /// Create a bare event loop with no initial torrent (for daemon mode).
-        pub fn initBare(allocator: std.mem.Allocator, hasher_threads: u32) !EventLoop {
+        ///
+        /// Hardcodes `RealIO.init` and so only works on the
+        /// `EventLoopOf(RealIO)` instantiation. SimIO-backed callers
+        /// (sim tests) use `initBareWithIO` instead, passing a SimIO
+        /// instance configured with the test's socket pool capacity.
+        pub fn initBare(allocator: std.mem.Allocator, hasher_threads: u32) !@This() {
+            const io = try RealIO.init(.{
+                .entries = 256,
+                .flags = linux.IORING_SETUP_COOP_TASKRUN | linux.IORING_SETUP_SINGLE_ISSUER,
+            });
+            return initBareWithIO(allocator, io, hasher_threads);
+        }
+
+        /// Create a bare event loop with a pre-built IO backend instance.
+        /// The caller is responsible for constructing the IO appropriate
+        /// for the instantiation: `RealIO.init(...)` for the daemon path
+        /// or `SimIO.init(allocator, .{...})` for sim tests.
+        pub fn initBareWithIO(allocator: std.mem.Allocator, io: IO, hasher_threads: u32) !@This() {
             const peers = try allocator.alloc(Peer, max_peers);
             @memset(peers, Peer{});
 
@@ -380,10 +397,7 @@ pub fn EventLoopOf(comptime IO: type) type {
                 null;
 
             return .{
-                .io = try RealIO.init(.{
-                    .entries = 256,
-                    .flags = linux.IORING_SETUP_COOP_TASKRUN | linux.IORING_SETUP_SINGLE_ISSUER,
-                }),
+                .io = io,
                 .allocator = allocator,
                 .peers = peers,
                 .torrents = try std.ArrayList(?TorrentContext).initCapacity(allocator, default_torrent_capacity),
@@ -681,7 +695,7 @@ pub fn EventLoopOf(comptime IO: type) type {
             }
         }
 
-        fn pendingBufferOperations(self: *const EventLoop) usize {
+        fn pendingBufferOperations(self: *const Self) usize {
             var count = self.pending_writes.count() + self.pending_sends.items.len + self.pending_reads.items.len;
             if (self.timeout_pending) count += 1;
             return count;
@@ -800,18 +814,18 @@ pub fn EventLoopOf(comptime IO: type) type {
         }
 
         /// Count the number of active peers for a specific torrent.
-        pub fn peerCountForTorrent(self: *const EventLoop, torrent_id: TorrentId) u16 {
+        pub fn peerCountForTorrent(self: *const Self, torrent_id: TorrentId) u16 {
             const tc = self.getTorrentContextConst(torrent_id) orelse return 0;
             return @intCast(@min(tc.peer_slots.items.len, std.math.maxInt(u16)));
         }
 
         /// Return the current half-open (connecting) peer count.
-        pub fn halfOpenCount(self: *const EventLoop) u16 {
+        pub fn halfOpenCount(self: *const Self) u16 {
             return @intCast(@min(self.half_open_count, std.math.maxInt(u16)));
         }
 
         /// Get speed and total byte stats for a specific torrent.
-        pub fn getSpeedStats(self: *const EventLoop, torrent_id: TorrentId) SpeedStats {
+        pub fn getSpeedStats(self: *const Self, torrent_id: TorrentId) SpeedStats {
             const tc = self.getTorrentContextConst(torrent_id) orelse return .{};
 
             return .{
@@ -1799,18 +1813,18 @@ pub fn EventLoopOf(comptime IO: type) type {
         }
 
         /// Get global download rate limit (bytes/sec). 0 = unlimited.
-        pub fn getGlobalDlLimit(self: *const EventLoop) u64 {
+        pub fn getGlobalDlLimit(self: *const Self) u64 {
             return self.global_rate_limiter.download.rate;
         }
 
         /// Get global upload rate limit (bytes/sec). 0 = unlimited.
-        pub fn getGlobalUlLimit(self: *const EventLoop) u64 {
+        pub fn getGlobalUlLimit(self: *const Self) u64 {
             return self.global_rate_limiter.upload.rate;
         }
 
         /// Get the number of nodes in the DHT routing table.
         /// Returns 0 if DHT is not enabled.
-        pub fn getDhtNodeCount(self: *const EventLoop) usize {
+        pub fn getDhtNodeCount(self: *const Self) usize {
             if (self.dht_engine) |engine| {
                 return engine.table.nodeCount();
             }
@@ -1832,13 +1846,13 @@ pub fn EventLoopOf(comptime IO: type) type {
         }
 
         /// Get per-torrent download rate limit (bytes/sec). 0 = unlimited.
-        pub fn getTorrentDlLimit(self: *const EventLoop, torrent_id: TorrentId) u64 {
+        pub fn getTorrentDlLimit(self: *const Self, torrent_id: TorrentId) u64 {
             const tc = self.getTorrentContextConst(torrent_id) orelse return 0;
             return tc.rate_limiter.download.rate;
         }
 
         /// Get per-torrent upload rate limit (bytes/sec). 0 = unlimited.
-        pub fn getTorrentUlLimit(self: *const EventLoop, torrent_id: TorrentId) u64 {
+        pub fn getTorrentUlLimit(self: *const Self, torrent_id: TorrentId) u64 {
             const tc = self.getTorrentContextConst(torrent_id) orelse return 0;
             return tc.rate_limiter.upload.rate;
         }
@@ -1867,7 +1881,7 @@ pub fn EventLoopOf(comptime IO: type) type {
         }
 
         /// Check if super-seeding is enabled for a torrent.
-        pub fn isSuperSeedEnabled(self: *const EventLoop, torrent_id: TorrentId) bool {
+        pub fn isSuperSeedEnabled(self: *const Self, torrent_id: TorrentId) bool {
             const tc = self.getTorrentContextConst(torrent_id) orelse return false;
             return tc.super_seed != null;
         }
@@ -2185,7 +2199,7 @@ pub fn EventLoopOf(comptime IO: type) type {
             }
         }
 
-        pub fn hasPendingSendForSlot(self: *const EventLoop, slot: u16) bool {
+        pub fn hasPendingSendForSlot(self: *const Self, slot: u16) bool {
             for (self.pending_sends.items) |ps| {
                 if (ps.slot == slot) return true;
             }
@@ -2345,7 +2359,7 @@ pub fn EventLoopOf(comptime IO: type) type {
             return self.pending_writes.getPtr(write_id);
         }
 
-        pub fn hasPendingWrite(self: *const EventLoop, key: PendingWriteKey) bool {
+        pub fn hasPendingWrite(self: *const Self, key: PendingWriteKey) bool {
             return self.pending_write_lookup.contains(key);
         }
 
@@ -2373,7 +2387,7 @@ pub fn EventLoopOf(comptime IO: type) type {
             return if (self.torrents.items[torrent_id]) |*tc| tc else null;
         }
 
-        pub fn getTorrentContextConst(self: *const EventLoop, torrent_id: TorrentId) ?*const TorrentContext {
+        pub fn getTorrentContextConst(self: *const Self, torrent_id: TorrentId) ?*const TorrentContext {
             if (torrent_id >= self.torrents.items.len) return null;
             return if (self.torrents.items[torrent_id]) |*tc| tc else null;
         }
@@ -2387,7 +2401,7 @@ pub fn EventLoopOf(comptime IO: type) type {
             });
         }
 
-        pub fn findTorrentIdByInfoHash(self: *const EventLoop, info_hash: []const u8) ?TorrentId {
+        pub fn findTorrentIdByInfoHash(self: *const Self, info_hash: []const u8) ?TorrentId {
             if (info_hash.len != 20) return null;
             var key: [20]u8 = undefined;
             @memcpy(&key, info_hash[0..20]);

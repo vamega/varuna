@@ -166,7 +166,7 @@ pub fn SimulatorOf(comptime Driver: type) type {
                                 &line_buf,
                                 "fault injected: {s}\n",
                                 .{@tagName(hit.op_tag)},
-                            ) catch return self.io.tick();
+                            ) catch return self.io.tick(0);
                             _ = log.write(line) catch {};
                         }
                     }
@@ -174,7 +174,7 @@ pub fn SimulatorOf(comptime Driver: type) type {
             }
 
             try self.driver.tick(&self.io);
-            try self.io.tick();
+            try self.io.tick(0);
         }
 
         /// Run `step(step_ns)` until either `cond(self) == true` or

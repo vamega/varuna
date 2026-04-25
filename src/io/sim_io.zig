@@ -321,7 +321,7 @@ pub const SimIO = struct {
     /// Equivalent to `now_ns += delta_ns; try self.tick()`.
     pub fn advance(self: *SimIO, delta_ns: u64) !void {
         self.now_ns += delta_ns;
-        try self.tick();
+        try self.tick(0);
     }
 
     /// Deliver every completion with `deadline_ns <= now_ns`. Callbacks
@@ -335,7 +335,13 @@ pub const SimIO = struct {
     /// (e.g. recv into a different buffer slice after the previous chunk
     /// was processed) sees a clean `in_flight=false`. Callbacks must not
     /// both submit a new op AND return `.rearm` — that would double-arm.
-    pub fn tick(self: *SimIO) !void {
+    ///
+    /// `wait_at_least` is accepted for signature parity with
+    /// `RealIO.tick(wait_at_least)` — production code generic over the
+    /// IO type uniformly calls `io.tick(1)`. SimIO is synchronous and
+    /// never blocks; the parameter is ignored.
+    pub fn tick(self: *SimIO, wait_at_least: u32) !void {
+        _ = wait_at_least;
         assert(!self.in_tick); // no recursive ticks
         self.in_tick = true;
         defer self.in_tick = false;
@@ -943,7 +949,7 @@ test "SimIO timeout fires after specified delay" {
     try io.timeout(.{ .ns = 1_000_000 }, &c, &ctx, testCallback);
 
     // No fire yet (now_ns = 0, deadline = 1_000_000).
-    try io.tick();
+    try io.tick(0);
     try testing.expectEqual(@as(u32, 0), ctx.calls);
 
     // Halfway — still no fire.
@@ -1017,7 +1023,7 @@ test "SimIO recv with fault probability 1.0 always errors" {
     var c = Completion{};
     var ctx = TestCtx{};
     try io.recv(.{ .fd = 7, .buf = &buf }, &c, &ctx, testCallback);
-    try io.tick();
+    try io.tick(0);
 
     try testing.expectEqual(@as(u32, 1), ctx.calls);
     switch (ctx.last_result.?) {
@@ -1037,7 +1043,7 @@ test "SimIO connect with fault probability 0.0 always succeeds" {
     var ctx = TestCtx{};
     const addr = try std.net.Address.parseIp4("127.0.0.1", 6881);
     try io.connect(.{ .fd = 3, .addr = addr }, &c, &ctx, testCallback);
-    try io.tick();
+    try io.tick(0);
 
     try testing.expectEqual(@as(u32, 1), ctx.calls);
     switch (ctx.last_result.?) {
@@ -1099,7 +1105,7 @@ test "SimIO cancel removes target and delivers OperationCanceled" {
     try io.recv(.{ .fd = 7, .buf = &buf }, &target, &state, target_cb);
     try io.cancel(.{ .target = &target }, &canceller, &state, cancel_cb);
 
-    try io.tick();
+    try io.tick(0);
 
     try testing.expectEqual(@as(u32, 1), state.target_calls);
     try testing.expectEqual(@as(u32, 1), state.cancel_calls);
@@ -1122,7 +1128,7 @@ test "SimIO cancel returns OperationNotFound for unsubmitted target" {
     var ctx = TestCtx{};
 
     try io.cancel(.{ .target = &unsubmitted }, &canceller, &ctx, testCallback);
-    try io.tick();
+    try io.tick(0);
 
     try testing.expectEqual(@as(u32, 1), ctx.calls);
     switch (ctx.last_result.?) {

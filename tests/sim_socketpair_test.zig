@@ -71,7 +71,7 @@ test "socketpair round-trip: send then recv delivers bytes" {
     // Then post the recv on the partner; it should pull from queue.
     try io.recv(.{ .fd = fds[1], .buf = &recv_buf }, &recv_c, &recv_ctx, testCallback);
 
-    try io.tick();
+    try io.tick(0);
     try testing.expectEqual(@as(u32, 1), send_ctx.calls);
     try testing.expectEqual(@as(u32, 1), recv_ctx.calls);
     switch (send_ctx.last_result.?) {
@@ -102,12 +102,12 @@ test "recv parks until partner sends" {
 
     // Recv first — queue is empty, so it parks.
     try io.recv(.{ .fd = fds[0], .buf = &recv_buf }, &recv_c, &recv_ctx, testCallback);
-    try io.tick();
+    try io.tick(0);
     try testing.expectEqual(@as(u32, 0), recv_ctx.calls);
 
     // Send wakes the parked recv.
     try io.send(.{ .fd = fds[1], .buf = "pong" }, &send_c, &send_ctx, testCallback);
-    try io.tick();
+    try io.tick(0);
 
     try testing.expectEqual(@as(u32, 1), recv_ctx.calls);
     try testing.expectEqual(@as(u32, 1), send_ctx.calls);
@@ -136,7 +136,7 @@ test "partial recv leaves remaining bytes in queue" {
     var buf1: [4]u8 = undefined;
     try io.recv(.{ .fd = fds[1], .buf = &buf1 }, &recv1_c, &recv1_ctx, testCallback);
 
-    try io.tick();
+    try io.tick(0);
     switch (recv1_ctx.last_result.?) {
         .recv => |r| {
             const n = try r;
@@ -151,7 +151,7 @@ test "partial recv leaves remaining bytes in queue" {
     var recv2_ctx = TestCtx{};
     var buf2: [4]u8 = undefined;
     try io.recv(.{ .fd = fds[1], .buf = &buf2 }, &recv2_c, &recv2_ctx, testCallback);
-    try io.tick();
+    try io.tick(0);
     switch (recv2_ctx.last_result.?) {
         .recv => |r| {
             const n = try r;
@@ -181,7 +181,7 @@ test "multiple sends accumulate in partner queue" {
     var buf: [16]u8 = undefined;
     try io.recv(.{ .fd = fds[1], .buf = &buf }, &r, &rctx, testCallback);
 
-    try io.tick();
+    try io.tick(0);
     try testing.expectEqual(@as(u32, 3), sctx.calls);
     try testing.expectEqual(@as(u32, 1), rctx.calls);
     switch (rctx.last_result.?) {
@@ -206,11 +206,11 @@ test "closeSocket fails parked recv with ConnectionResetByPeer" {
     try io.recv(.{ .fd = fds[0], .buf = &buf }, &recv_c, &ctx, testCallback);
 
     // Parked — no fire yet.
-    try io.tick();
+    try io.tick(0);
     try testing.expectEqual(@as(u32, 0), ctx.calls);
 
     io.closeSocket(fds[0]);
-    try io.tick();
+    try io.tick(0);
     try testing.expectEqual(@as(u32, 1), ctx.calls);
     switch (ctx.last_result.?) {
         .recv => |r| try testing.expectError(error.ConnectionResetByPeer, r),
@@ -229,12 +229,12 @@ test "closeSocket fails partner's parked recv too" {
     var buf: [16]u8 = undefined;
     // Park a recv on fds[1].
     try io.recv(.{ .fd = fds[1], .buf = &buf }, &recv_c, &ctx, testCallback);
-    try io.tick();
+    try io.tick(0);
     try testing.expectEqual(@as(u32, 0), ctx.calls);
 
     // Close fds[0] — partner's parked recv should be woken with reset.
     io.closeSocket(fds[0]);
-    try io.tick();
+    try io.tick(0);
     try testing.expectEqual(@as(u32, 1), ctx.calls);
     switch (ctx.last_result.?) {
         .recv => |r| try testing.expectError(error.ConnectionResetByPeer, r),
@@ -252,7 +252,7 @@ test "send on closed local fd returns BrokenPipe" {
     var send_c = Completion{};
     var ctx = TestCtx{};
     try io.send(.{ .fd = fds[0], .buf = "x" }, &send_c, &ctx, testCallback);
-    try io.tick();
+    try io.tick(0);
     try testing.expectEqual(@as(u32, 1), ctx.calls);
     switch (ctx.last_result.?) {
         .send => |r| try testing.expectError(error.BrokenPipe, r),
@@ -270,7 +270,7 @@ test "send to closed peer returns BrokenPipe" {
     var send_c = Completion{};
     var ctx = TestCtx{};
     try io.send(.{ .fd = fds[0], .buf = "x" }, &send_c, &ctx, testCallback);
-    try io.tick();
+    try io.tick(0);
     try testing.expectEqual(@as(u32, 1), ctx.calls);
     switch (ctx.last_result.?) {
         .send => |r| try testing.expectError(error.BrokenPipe, r),
@@ -289,7 +289,7 @@ test "recv on closed local fd returns ConnectionResetByPeer" {
     var ctx = TestCtx{};
     var buf: [4]u8 = undefined;
     try io.recv(.{ .fd = fds[0], .buf = &buf }, &recv_c, &ctx, testCallback);
-    try io.tick();
+    try io.tick(0);
     try testing.expectEqual(@as(u32, 1), ctx.calls);
     switch (ctx.last_result.?) {
         .recv => |r| try testing.expectError(error.ConnectionResetByPeer, r),
@@ -333,11 +333,11 @@ test "cancel of parked recv delivers OperationCanceled" {
 
     var buf: [16]u8 = undefined;
     try io.recv(.{ .fd = fds[0], .buf = &buf }, &recv_c, &st, recv_cb);
-    try io.tick();
+    try io.tick(0);
     try testing.expectEqual(@as(u32, 0), st.recv_calls);
 
     try io.cancel(.{ .target = &recv_c }, &cancel_c, &st, cancel_cb);
-    try io.tick();
+    try io.tick(0);
     try testing.expectEqual(@as(u32, 1), st.recv_calls);
     try testing.expectEqual(@as(u32, 1), st.cancel_calls);
     switch (st.recv_result.?) {
@@ -354,7 +354,7 @@ test "cancel of parked recv delivers OperationCanceled" {
     var send_c = Completion{};
     var send_ctx = TestCtx{};
     try io.send(.{ .fd = fds[1], .buf = "late" }, &send_c, &send_ctx, testCallback);
-    try io.tick();
+    try io.tick(0);
     try testing.expectEqual(@as(u32, 1), send_ctx.calls);
     // recv_calls still 1 — i.e., not re-fired.
     try testing.expectEqual(@as(u32, 1), st.recv_calls);
@@ -384,7 +384,7 @@ test "mixed: heap-pending timeout coexists with socket-parked recv" {
 
     // Partner sends — wakes parked recv.
     try io.send(.{ .fd = fds[1], .buf = "hi" }, &send_c, &send_ctx, testCallback);
-    try io.tick();
+    try io.tick(0);
     try testing.expectEqual(@as(u32, 1), recv_ctx.calls);
     try testing.expectEqual(@as(u32, 1), send_ctx.calls);
     try testing.expectEqual(@as(u32, 0), timer_ctx.calls); // timer still pending
@@ -411,7 +411,7 @@ test "recv on non-socket fd uses legacy zero-byte path" {
     var ctx = TestCtx{};
     var buf: [4]u8 = undefined;
     try io.recv(.{ .fd = 7, .buf = &buf }, &recv_c, &ctx, testCallback);
-    try io.tick();
+    try io.tick(0);
     try testing.expectEqual(@as(u32, 1), ctx.calls);
     switch (ctx.last_result.?) {
         .recv => |r| try testing.expectEqual(@as(usize, 0), try r),
