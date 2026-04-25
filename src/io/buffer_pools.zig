@@ -311,26 +311,130 @@ pub fn vectoredSendLayout(block_capacity: usize) VectoredSendLayout {
 
 pub const PendingSend = struct {
     sent: usize = 0,
-    slot: u16,
+    slot: u16 = 0,
     /// Unique ID for matching CQEs to the correct PendingSend when
     /// multiple sends are in-flight for the same slot. Also used to
     /// disambiguate after slot reuse — a stale CQE for an old PendingSend
     /// whose slot has been re-allocated will not find a matching
     /// (slot, send_id) pair in the active list.
-    send_id: u32,
+    /// `send_id == 0` is a sentinel meaning "this pool slot is free".
+    send_id: u32 = 0,
     storage: union(enum) {
+        /// Pool-free sentinel. Active PendingSends have either `owned`
+        /// or `vectored`; `free` is only set by `PendingSendPool.release`.
+        /// The `next_free` u32 forms the free-list (`PendingSendPool.free_head`
+        /// chases this through inactive slots).
+        free: u32,
         owned: struct {
             buf: []u8,
             small_slot: ?u16 = null,
         },
         vectored: *VectoredSendState,
-    },
+    } = .{ .free = 0 },
     /// Caller-owned completion driving the in-flight send for this
-    /// PendingSend. Stored on the heap-allocated PendingSend so the
-    /// kernel-visible address stays stable for the lifetime of the
-    /// send, regardless of the owning ArrayList's growth.
+    /// PendingSend. The PendingSend's address is the kernel's user_data,
+    /// so it must be stable for the lifetime of the send. Achieved via
+    /// `PendingSendPool` allocating a fixed-size backing array at init
+    /// — pool slot addresses never move.
     completion: @import("io_interface.zig").Completion = .{},
 };
+
+/// Fixed-size pool of `PendingSend` slots with a free-list head.
+/// Pre-allocated once at EventLoop init; per-send claim/release is
+/// O(1) and zero-alloc on the hot path. The kernel sees stable
+/// `Completion*` addresses because pool slots never move.
+///
+/// Sized to `max_connections * max_in_flight_per_peer` at init —
+/// generous enough to absorb the worst-case pipeline-refill +
+/// keepalive + piece-response burst across all peers without
+/// exhausting the pool. If the pool *does* exhaust, callers fall
+/// back to `error.OutOfMemory` and the daemon drops the send (peer
+/// will be retried on the next refill cycle).
+pub const PendingSendPool = struct {
+    storage: []PendingSend,
+    free_head: ?u32, // index into storage; null if exhausted
+    in_use: u32 = 0,
+
+    /// Sentinel for "no next free" (used at the tail of the free list).
+    const free_tail: u32 = std.math.maxInt(u32);
+
+    pub fn init(allocator: std.mem.Allocator, capacity: u32) !PendingSendPool {
+        const slots = try allocator.alloc(PendingSend, capacity);
+        // Build the initial free list: slot 0 -> 1 -> 2 -> ... -> N-1 -> tail.
+        for (slots, 0..) |*s, i| {
+            const next: u32 = if (i + 1 < capacity) @intCast(i + 1) else free_tail;
+            s.* = .{ .storage = .{ .free = next } };
+        }
+        return .{
+            .storage = slots,
+            .free_head = if (capacity > 0) 0 else null,
+        };
+    }
+
+    pub fn deinit(self: *PendingSendPool, allocator: std.mem.Allocator) void {
+        allocator.free(self.storage);
+        self.* = undefined;
+    }
+
+    pub fn claim(self: *PendingSendPool) ?*PendingSend {
+        const head = self.free_head orelse return null;
+        const slot = &self.storage[head];
+        const next = switch (slot.storage) {
+            .free => |n| n,
+            else => unreachable, // slot in free-list head must be free
+        };
+        self.free_head = if (next == free_tail) null else next;
+        self.in_use += 1;
+        // Caller will overwrite `storage` to its active variant and reset
+        // `sent` / `slot` / `send_id` / `completion`.
+        return slot;
+    }
+
+    pub fn release(self: *PendingSendPool, ps: *PendingSend) void {
+        const base = @intFromPtr(self.storage.ptr);
+        const offset = @intFromPtr(ps) - base;
+        const idx: u32 = @intCast(offset / @sizeOf(PendingSend));
+        std.debug.assert(idx < self.storage.len);
+        const next: u32 = if (self.free_head) |h| h else free_tail;
+        ps.* = .{ .storage = .{ .free = next } };
+        self.free_head = idx;
+        std.debug.assert(self.in_use > 0);
+        self.in_use -= 1;
+    }
+};
+
+test "PendingSendPool claims and releases slots in LIFO order" {
+    var pool = try PendingSendPool.init(std.testing.allocator, 4);
+    defer pool.deinit(std.testing.allocator);
+
+    try std.testing.expectEqual(@as(u32, 0), pool.in_use);
+    const a = pool.claim() orelse return error.PoolExhausted;
+    const b = pool.claim() orelse return error.PoolExhausted;
+    const c = pool.claim() orelse return error.PoolExhausted;
+    try std.testing.expectEqual(@as(u32, 3), pool.in_use);
+
+    // LIFO: release c then claim should return c again.
+    pool.release(c);
+    try std.testing.expectEqual(@as(u32, 2), pool.in_use);
+    const c2 = pool.claim() orelse return error.PoolExhausted;
+    try std.testing.expectEqual(c, c2);
+
+    pool.release(a);
+    pool.release(b);
+    pool.release(c2);
+    try std.testing.expectEqual(@as(u32, 0), pool.in_use);
+}
+
+test "PendingSendPool returns null when exhausted" {
+    var pool = try PendingSendPool.init(std.testing.allocator, 2);
+    defer pool.deinit(std.testing.allocator);
+
+    const a = pool.claim() orelse return error.PoolExhausted;
+    const b = pool.claim() orelse return error.PoolExhausted;
+    try std.testing.expectEqual(@as(?*PendingSend, null), pool.claim());
+    pool.release(a);
+    pool.release(b);
+}
 
 pub const SmallSendPool = struct {
     storage: []u8,

@@ -109,6 +109,46 @@ equivalent that returns results through the same callback path.
 All fault decisions are driven by a seeded `std.rand.DefaultPrng`. Any failing test prints
 its seed. Re-running with the same seed reproduces the failure exactly.
 
+### Migration patterns (Stage 2 lessons)
+
+Patterns that fell out of the Stage 2 migration (Apr 2026) and the bugs they catch:
+
+1. **Single Completion per long-lived "slot"** for serial state machines. The Completion
+   embeds in the slot struct (Peer, RequestSlot, etc.); `@fieldParentPtr("completion", c)`
+   recovers the slot pointer from the Completion in the callback; pointer arithmetic on the
+   parent slice yields the slot index. Use this when the underlying state machine is fully
+   serial (handshake → header → body, or DNS → connect → TLS → send → recv).
+
+2. **Heap-allocated tracking struct with embedded Completion** for fan-out parallel ops
+   where multiple ops are in flight against the same logical entity. Per-op `allocator.create`
+   is acceptable on cold paths (recheck reads, RPC per-client gen-stamped ops). On hot paths
+   (PendingSend for tracked peer wire sends), use a fixed-size pool (see `PendingSendPool`)
+   pre-allocated at init — stable addresses, zero alloc churn, bound auditable at startup.
+
+3. **`io.connect(.{ .deadline_ns = ... })`** replaces manual `IOSQE_IO_LINK + link_timeout`
+   on a sentinel `ud + 1`. The backend does the chaining; callers just specify the deadline.
+
+4. **`io.poll(POLL.IN)` with `.rearm`** replaces sentinel-userdata schemes for eventfd-driven
+   plumbing (DNS thread completion, signalfd, anything where a fd becomes readable on a
+   signal you don't control).
+
+5. **`Completion._backend_state` defaults to all-zero, never `undefined`.** In Debug,
+   `undefined` fills with `0xaa`, which a backend's RealState would observe as `in_flight = true`
+   on a fresh completion. Explicit zero-init at the contract level prevents this.
+
+6. **`dispatchCqe` clears `in_flight` *before* invoking the callback** (multishot still
+   preserves the flag because the kernel will deliver more CQEs). A callback that re-arms
+   the same completion in the natural "header → body → next header" pattern would otherwise
+   trip `AlreadyInFlight` against itself.
+
+7. **When running two backends side-by-side during a migration, the unused backend's
+   `tick` must be non-blocking.** Stage 2 had `EventLoop` blocking on the legacy ring's
+   `submit_and_wait(1)` while the new ring drained non-blocking. Once the migration drained
+   the legacy ring of all SQEs, the blocking call deadlocked indefinitely. The fix was
+   swapping which ring blocks — but the general lesson is: **the backend you're tearing
+   down still has to be drainable correctly during the tear-down**. Future migrations of
+   similar shape should plan the wait swap up front, not as a fire drill.
+
 ---
 
 ## Memory
