@@ -127,35 +127,53 @@ pub fn handleAccept(self: *EventLoop, cqe: linux.io_uring_cqe) void {
     handleAccepted(self, new_fd);
 }
 
-/// Handle completion of async socket creation (IORING_OP_SOCKET).
-/// Configures the new fd (TCP options, bind config) and chains the
-/// CONNECT SQE to initiate the peer connection.
+/// Callback bound to `Peer.connect_completion`. Invoked when async
+/// socket creation lands. Configures the new fd, applies bind/device
+/// settings, and chains the connect on the same completion.
+pub fn peerSocketComplete(
+    userdata: ?*anyopaque,
+    completion: *io_interface.Completion,
+    result: io_interface.Result,
+) io_interface.CallbackAction {
+    const self: *EventLoop = @ptrCast(@alignCast(userdata.?));
+    const peer: *Peer = @fieldParentPtr("connect_completion", completion);
+    const offset = @intFromPtr(peer) - @intFromPtr(self.peers.ptr);
+    const slot: u16 = @intCast(offset / @sizeOf(Peer));
+    handleSocketResult(self, slot, switch (result) {
+        .socket => |r| if (r) |fd| @intCast(fd) else |_| -1,
+        else => -1,
+    });
+    return .disarm;
+}
+
+/// Legacy wrapper retained for any tests that still drive sockets via
+/// the legacy ring (currently none).
 pub fn handleSocketCreated(self: *EventLoop, slot: u16, cqe: linux.io_uring_cqe) void {
+    handleSocketResult(self, slot, cqe.res);
+}
+
+fn handleSocketResult(self: *EventLoop, slot: u16, res: i32) void {
     const peer = &self.peers[slot];
     if (peer.state == .free) {
-        // Slot was freed while socket creation was pending — close the fd.
-        if (cqe.res >= 0) posix.close(@intCast(cqe.res));
+        if (res >= 0) posix.close(@intCast(res));
         return;
     }
 
-    // Guard: if the peer is not in connecting state, this is a stale socket
-    // CQE from a slot that was reused while a previous socket creation was
-    // in-flight. Close the new fd and ignore the CQE.
     if (peer.state != .connecting) {
         log.debug("slot {d}: ignoring stale socket CQE (state={s})", .{
             slot, @tagName(peer.state),
         });
-        if (cqe.res >= 0) posix.close(@intCast(cqe.res));
+        if (res >= 0) posix.close(@intCast(res));
         return;
     }
 
-    if (cqe.res < 0) {
-        log.warn("async socket creation failed for slot {d}: errno={d}", .{ slot, -cqe.res });
+    if (res < 0) {
+        log.warn("async socket creation failed for slot {d}: res={d}", .{ slot, res });
         self.removePeer(slot);
         return;
     }
 
-    const fd: posix.fd_t = @intCast(cqe.res);
+    const fd: posix.fd_t = @intCast(res);
     peer.fd = fd;
 
     socket_util.configurePeerSocket(fd);
@@ -164,14 +182,43 @@ pub fn handleSocketCreated(self: *EventLoop, slot: u16, cqe: linux.io_uring_cqe)
         return;
     };
 
-    const ud = encodeUserData(.{ .slot = slot, .op_type = .peer_connect, .context = 0 });
-    _ = self.ring.connect(ud, fd, &peer.address.any, peer.address.getOsSockLen()) catch {
+    self.io.connect(
+        .{ .fd = fd, .addr = peer.address },
+        &peer.connect_completion,
+        self,
+        peerConnectComplete,
+    ) catch {
         self.removePeer(slot);
         return;
     };
 }
 
+/// Callback bound to `Peer.connect_completion` (after socket creation
+/// chains a connect on the same completion). Translates the connect
+/// result and feeds `handleConnectResult`.
+pub fn peerConnectComplete(
+    userdata: ?*anyopaque,
+    completion: *io_interface.Completion,
+    result: io_interface.Result,
+) io_interface.CallbackAction {
+    const self: *EventLoop = @ptrCast(@alignCast(userdata.?));
+    const peer: *Peer = @fieldParentPtr("connect_completion", completion);
+    const offset = @intFromPtr(peer) - @intFromPtr(self.peers.ptr);
+    const slot: u16 = @intCast(offset / @sizeOf(Peer));
+    const ok = switch (result) {
+        .connect => |r| if (r) |_| true else |_| false,
+        else => false,
+    };
+    handleConnectResult(self, slot, if (ok) 0 else -1);
+    return .disarm;
+}
+
+/// Legacy wrapper retained for tests/perf paths still on the legacy ring.
 pub fn handleConnect(self: *EventLoop, slot: u16, cqe: linux.io_uring_cqe) void {
+    handleConnectResult(self, slot, cqe.res);
+}
+
+fn handleConnectResult(self: *EventLoop, slot: u16, res: i32) void {
     // Connection attempt completed (success or failure) -- no longer half-open
     if (self.half_open_count > 0) self.half_open_count -= 1;
 
@@ -179,7 +226,7 @@ pub fn handleConnect(self: *EventLoop, slot: u16, cqe: linux.io_uring_cqe) void 
     // Guard: stale CQE for an already-freed slot
     if (peer.state == .free) return;
 
-    if (cqe.res < 0) {
+    if (res < 0) {
         self.removePeer(slot);
         return;
     }
@@ -946,11 +993,15 @@ fn attemptMseFallback(self: *EventLoop, slot: u16) void {
     peer.crypto = mse.PeerCrypto.plaintext;
     peer.handshake_offset = 0;
 
-    // Submit async socket creation — handleSocketCreated will configure
-    // the fd and chain the CONNECT SQE.
+    // Submit async socket creation — peerSocketComplete will configure
+    // the fd and chain the connect.
     const family = address.any.family;
-    const ud = encodeUserData(.{ .slot = slot, .op_type = .peer_socket, .context = 0 });
-    _ = self.ring.socket(ud, family, posix.SOCK.STREAM | posix.SOCK.CLOEXEC | posix.SOCK.NONBLOCK, posix.IPPROTO.TCP, 0) catch {
+    self.io.socket(
+        .{ .domain = family, .sock_type = posix.SOCK.STREAM | posix.SOCK.CLOEXEC | posix.SOCK.NONBLOCK, .protocol = posix.IPPROTO.TCP },
+        &peer.connect_completion,
+        self,
+        peerSocketComplete,
+    ) catch {
         self.removePeer(slot);
         return;
     };

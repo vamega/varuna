@@ -20,11 +20,9 @@ pub const TorrentId = u32;
 // ── User data encoding ────────────────────────────────────
 
 pub const OpType = enum(u8) {
-    peer_connect = 0,
     peer_send = 2,
     timeout = 9,
     cancel = 10,
-    peer_socket = 23,
 };
 
 pub const OpData = struct {
@@ -182,6 +180,13 @@ pub const Peer = struct {
     // callback (`peer_handler.peerRecvComplete`) re-derives the slot via
     // pointer arithmetic on `EventLoop.peers` and dispatches.
     recv_completion: io_interface.Completion = .{},
+
+    /// Completion for outbound socket / connect ops on the
+    /// io_interface backend. Socket creation (`io.socket`) and connect
+    /// (`io.connect`) are a sequential pair during outbound peer
+    /// initialisation; they reuse the same completion since only one
+    /// is in flight at any moment.
+    connect_completion: io_interface.Completion = .{},
 };
 
 // ── Torrent context (per-torrent state within shared event loop) ──

@@ -1040,11 +1040,15 @@ pub const EventLoop = struct {
             .address = address,
         };
 
-        // Submit async socket creation via io_uring (IORING_OP_SOCKET, kernel 5.19+).
-        // The CQE handler (peer_handler.handleSocketCreated) will configure the fd
-        // and chain the CONNECT SQE.
-        const ud = encodeUserData(.{ .slot = slot, .op_type = .peer_socket, .context = 0 });
-        _ = try self.ring.socket(ud, family, posix.SOCK.STREAM | posix.SOCK.CLOEXEC | posix.SOCK.NONBLOCK, posix.IPPROTO.TCP, 0);
+        // Submit async socket creation via io_interface. The callback
+        // (peer_handler.peerSocketComplete) configures the fd and chains
+        // the connect.
+        try self.io.socket(
+            .{ .domain = family, .sock_type = posix.SOCK.STREAM | posix.SOCK.CLOEXEC | posix.SOCK.NONBLOCK, .protocol = posix.IPPROTO.TCP },
+            &peer.connect_completion,
+            self,
+            peer_handler.peerSocketComplete,
+        );
 
         self.peer_count += 1;
         self.half_open_count += 1;
@@ -1907,8 +1911,6 @@ pub const EventLoop = struct {
     fn dispatch(self: *EventLoop, cqe: linux.io_uring_cqe) void {
         const op = decodeUserData(cqe.user_data);
         switch (op.op_type) {
-            .peer_socket => peer_handler.handleSocketCreated(self, op.slot, cqe),
-            .peer_connect => peer_handler.handleConnect(self, op.slot, cqe),
             .peer_send => peer_handler.handleSend(self, op.slot, cqe),
             .timeout => {
                 self.timeout_pending = false;
