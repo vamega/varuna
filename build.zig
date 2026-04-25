@@ -355,6 +355,20 @@ pub fn build(b: *std.Build) void {
     test_sim_smart_ban_swarm_step.dependOn(&run_sim_smart_ban_swarm_tests.step);
     test_step.dependOn(&run_sim_smart_ban_swarm_tests.step);
 
+    // ── Smart-ban EventLoop integration test (scaffold only today) ─
+    const sim_smart_ban_eventloop_tests = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("tests/sim_smart_ban_eventloop_test.zig"),
+            .target = target,
+            .optimize = optimize,
+            .imports = &varuna_import,
+        }),
+    });
+    const run_sim_smart_ban_eventloop_tests = b.addRunArtifact(sim_smart_ban_eventloop_tests);
+    const test_sim_smart_ban_eventloop_step = b.step("test-sim-smart-ban-eventloop", "Run smart-ban EventLoop integration (scaffold; lights up after Stage 2 #12)");
+    test_sim_smart_ban_eventloop_step.dependOn(&run_sim_smart_ban_eventloop_tests.step);
+    test_step.dependOn(&run_sim_smart_ban_eventloop_tests.step);
+
     // ── Event loop health tests ────────────────────────────
     const el_health_tests = b.addTest(.{
         .root_module = b.createModule(.{
