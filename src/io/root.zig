@@ -21,6 +21,7 @@ pub const metadata_handler = @import("metadata_handler.zig");
 pub const rate_limiter = @import("rate_limiter.zig");
 pub const recheck = @import("recheck.zig");
 pub const ring = @import("ring.zig");
+pub const sim_io = @import("sim_io.zig");
 pub const signal = @import("signal.zig");
 pub const tls = @import("tls.zig");
 pub const web_seed_handler = @import("web_seed_handler.zig");
