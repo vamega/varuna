@@ -5,6 +5,7 @@ pub const dht_handler = @import("dht_handler.zig");
 pub const downloading_piece = @import("downloading_piece.zig");
 pub const dns = @import("dns.zig");
 pub const event_loop = @import("event_loop.zig");
+pub const io_interface = @import("io_interface.zig");
 pub const types = @import("types.zig");
 pub const peer_handler = @import("peer_handler.zig");
 pub const protocol = @import("protocol.zig");
