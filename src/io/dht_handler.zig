@@ -18,7 +18,7 @@ pub fn handleDhtRecv(self: *EventLoop, data: []const u8, sender: std.net.Address
 /// Periodic DHT tick. Called from the event loop's main tick().
 pub fn dhtTick(self: *EventLoop) void {
     const engine = self.dht_engine orelse return;
-    const now = std.time.timestamp();
+    const now = self.clock.now();
     engine.tick(now);
 
     // Drain outbound packets

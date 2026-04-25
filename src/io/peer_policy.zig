@@ -912,7 +912,7 @@ pub fn processMerkleResults(self: *EventLoop) void {
 // ── Peer timeout ───────────────────────────────────────
 
 pub fn checkPeerTimeouts(self: *EventLoop) void {
-    const now = std.time.timestamp();
+    const now = self.clock.now();
     var to_remove = std.ArrayList(u16).empty;
     defer to_remove.deinit(self.allocator);
 
@@ -935,7 +935,7 @@ const keepalive_interval_secs: i64 = 90; // send keep-alive if we've been quiet 
 /// Send keep-alive messages to peers we haven't sent anything to recently.
 /// Prevents remote peers from disconnecting us for inactivity.
 pub fn sendKeepAlives(self: *EventLoop) void {
-    const now = std.time.timestamp();
+    const now = self.clock.now();
     for (self.active_peer_slots.items) |slot| {
         const peer = &self.peers[slot];
         if (peer.state != .active_recv_header and peer.state != .active_recv_body) continue;
@@ -966,7 +966,7 @@ pub fn sendKeepAlives(self: *EventLoop) void {
 // ── Choking algorithm (tit-for-tat) ─────────────────
 
 pub fn recalculateUnchokes(self: *EventLoop) void {
-    const now = std.time.timestamp();
+    const now = self.clock.now();
     if (now - self.last_unchoke_recalc < unchoke_interval_secs) return;
     self.last_unchoke_recalc = now;
 
@@ -1088,7 +1088,7 @@ pub fn checkPex(self: *EventLoop) void {
     if (!self.pex_enabled) return;
     if (self.active_peer_slots.items.len == 0) return;
 
-    const now = std.time.timestamp();
+    const now = self.clock.now();
 
     for (self.torrents_with_peers.items) |tid| {
         const tc = self.getTorrentContext(tid) orelse continue;
@@ -1149,7 +1149,7 @@ pub fn checkPex(self: *EventLoop) void {
 pub fn updateSpeedCounters(self: *EventLoop) void {
     if (self.active_peer_slots.items.len == 0) return;
 
-    const now = std.time.timestamp();
+    const now = self.clock.now();
 
     // Update per-peer speed counters
     for (self.active_peer_slots.items) |slot| {

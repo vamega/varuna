@@ -1,4 +1,6 @@
 pub const buffer_pools = @import("buffer_pools.zig");
+pub const clock = @import("clock.zig");
+pub const Clock = clock.Clock;
 pub const dht_handler = @import("dht_handler.zig");
 pub const downloading_piece = @import("downloading_piece.zig");
 pub const dns = @import("dns.zig");

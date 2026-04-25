@@ -165,7 +165,7 @@ pub fn handleConnect(self: *EventLoop, slot: u16, cqe: linux.io_uring_cqe) void 
         self.removePeer(slot);
         return;
     }
-    peer.last_activity = std.time.timestamp();
+    peer.last_activity = self.clock.now();
 
     // Guard: if the peer is not in connecting state, this is a stale connect CQE
     // from a slot that was reused while a previous connect was still in-flight.
@@ -233,7 +233,7 @@ fn shouldInitiateMse(self: *EventLoop, peer: *const Peer) bool {
 }
 
 /// Send a standard BitTorrent protocol handshake (no MSE).
-fn sendBtHandshake(self: *EventLoop, slot: u16) void {
+pub fn sendBtHandshake(self: *EventLoop, slot: u16) void {
     const peer = &self.peers[slot];
     const tc = self.getTorrentContext(peer.torrent_id) orelse {
         self.removePeer(slot);
@@ -606,7 +606,7 @@ pub fn handleRecv(self: *EventLoop, slot: u16, cqe: linux.io_uring_cqe) void {
             const msg_len = std.mem.readInt(u32, &peer.header_buf, .big);
             if (msg_len == 0) {
                 // Keep-alive -- peer is alive
-                peer.last_activity = std.time.timestamp();
+                peer.last_activity = self.clock.now();
                 peer.header_offset = 0;
                 protocol.submitHeaderRecv(self, slot) catch {
                     self.removePeer(slot);

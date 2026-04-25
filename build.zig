@@ -278,6 +278,20 @@ pub fn build(b: *std.Build) void {
     const test_transfer_step = b.step("test-transfer", "Run single-process piece transfer integration test");
     test_transfer_step.dependOn(&run_transfer_tests.step);
 
+    // ── Sim swarm tests (VirtualPeer, clock injection) ──────
+    const sim_swarm_tests = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("tests/sim_swarm_test.zig"),
+            .target = target,
+            .optimize = optimize,
+            .imports = &varuna_import,
+        }),
+    });
+    const run_sim_swarm_tests = b.addRunArtifact(sim_swarm_tests);
+    const test_sim_swarm_step = b.step("test-sim", "Run virtual-peer swarm simulation tests");
+    test_sim_swarm_step.dependOn(&run_sim_swarm_tests.step);
+    test_step.dependOn(&run_sim_swarm_tests.step);
+
     // ── uTP byte stream tests ─────────────────────────────
     const utp_bs_tests = b.addTest(.{
         .root_module = b.createModule(.{

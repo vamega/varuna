@@ -201,7 +201,7 @@ fn checkOutboundUtpConnect(self: *EventLoop, utp_slot: u16, mgr: *utp_mgr.UtpMan
     // uTP handshake complete -- connection is established.
     if (self.half_open_count > 0) self.half_open_count -= 1;
     peer.state = .handshake_send;
-    peer.last_activity = std.time.timestamp();
+    peer.last_activity = self.clock.now();
 
     log.info("outbound uTP connection established to {any}", .{peer.address});
 
@@ -353,7 +353,7 @@ fn deliverUtpData(self: *EventLoop, utp_slot: u16, data: []const u8) void {
                 const msg_len = std.mem.readInt(u32, &peer.header_buf, .big);
                 if (msg_len == 0) {
                     // Keep-alive
-                    peer.last_activity = std.time.timestamp();
+                    peer.last_activity = self.clock.now();
                     peer.header_offset = 0;
                     return;
                 }

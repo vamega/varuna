@@ -53,6 +53,9 @@ pub const Peer = types.Peer;
 pub const SpeedStats = types.SpeedStats;
 pub const TorrentContext = types.TorrentContext;
 
+const clock_mod = @import("clock.zig");
+pub const Clock = clock_mod.Clock;
+
 const cqe_batch_size = 64;
 
 // ── Event loop ────────────────────────────────────────────
@@ -145,6 +148,7 @@ pub const EventLoop = struct {
     peers: []Peer,
     peer_count: u16 = 0,
     running: bool = true,
+    clock: Clock = .real,
 
     /// Graceful shutdown: when true, the event loop stops accepting new work
     /// and waits for in-flight transfers to complete before setting running=false.
@@ -979,6 +983,31 @@ pub const EventLoop = struct {
         return slot;
     }
 
+    /// Register a pre-connected fd as an outbound peer for `torrent_id`.
+    /// Bypasses the async socket/connect SQE chain — intended for testing
+    /// with socketpairs. MSE is skipped; the peer uses plaintext BitTorrent.
+    pub fn addConnectedPeer(self: *EventLoop, fd: posix.fd_t, torrent_id: TorrentId) !u16 {
+        if (self.getTorrentContext(torrent_id) == null) return error.TorrentNotFound;
+        if (self.peer_count >= self.max_connections) return error.ConnectionLimitReached;
+
+        const slot = self.allocSlot() orelse return error.TooManyPeers;
+        const peer = &self.peers[slot];
+        peer.* = Peer{
+            .fd = fd,
+            .state = .connecting,
+            .mode = .outbound,
+            .torrent_id = torrent_id,
+            .address = std.net.Address.initIp4(.{ 127, 0, 0, 1 }, 0),
+        };
+        peer.last_activity = self.clock.now();
+
+        self.peer_count += 1;
+        self.markActivePeer(slot);
+        self.attachPeerToTorrent(torrent_id, slot);
+        peer_handler.sendBtHandshake(self, slot);
+        return slot;
+    }
+
     /// Initiate an outbound uTP connection to a peer. Creates the uTP
     /// socket via the UtpManager, sends the SYN packet, and allocates a
     /// peer slot in the event loop.
@@ -1349,7 +1378,7 @@ pub const EventLoop = struct {
                 const signal = @import("signal.zig");
                 signal.requestShutdown();
                 self.running = false;
-            } else if (std.time.timestamp() >= self.drain_deadline) {
+            } else if (self.clock.now() >= self.drain_deadline) {
                 log.info("drain timeout expired, forcing shutdown", .{});
                 const signal = @import("signal.zig");
                 signal.requestShutdown();
@@ -1777,7 +1806,7 @@ pub const EventLoop = struct {
             }
             log.info("shutting down gracefully, draining in-flight transfers (timeout={d}s)...", .{self.shutdown_timeout});
             self.draining = true;
-            self.drain_deadline = std.time.timestamp() + @as(i64, @intCast(self.shutdown_timeout));
+            self.drain_deadline = self.clock.now() + @as(i64, @intCast(self.shutdown_timeout));
             // Re-arm the signalfd poll so a second signal is caught
             _ = self.ring.poll_add(signal_sentinel, self.signal_fd, linux.POLL.IN) catch {};
             return;

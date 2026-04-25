@@ -28,7 +28,7 @@ pub fn processMessage(self: *EventLoop, slot: u16) void {
     if (body.len == 0) return;
 
     // Any message from the peer means it's alive
-    peer.last_activity = std.time.timestamp();
+    peer.last_activity = self.clock.now();
 
     const id = body[0];
     const payload = body[1..];
@@ -610,7 +610,7 @@ pub fn submitPexMessage(self: *EventLoop, slot: u16) !void {
     if (peer.transport == .utp) {
         defer self.allocator.free(frame);
         try utp_handler.utpSendData(self, slot, frame);
-        peer_pex.last_pex_time = std.time.timestamp();
+        peer_pex.last_pex_time = self.clock.now();
         log.debug("slot {d}: sent PEX message", .{slot});
         return;
     }
@@ -623,7 +623,7 @@ pub fn submitPexMessage(self: *EventLoop, slot: u16) !void {
 
     _ = try self.ring.send(ts.ud, peer.fd, tracked, 0);
     peer.send_pending = true;
-    peer_pex.last_pex_time = std.time.timestamp();
+    peer_pex.last_pex_time = self.clock.now();
 
     log.debug("slot {d}: sent PEX message", .{slot});
 }

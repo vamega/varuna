@@ -74,7 +74,7 @@ pub fn tryAssignWebSeedPieces(el: *EventLoop) void {
         const pt = tc.piece_tracker orelse continue;
         const sess = tc.session orelse continue;
 
-        const now = std.time.timestamp();
+        const now = el.clock.now();
         if (wsm.availableCount(now) == 0) continue;
 
         const max_bytes = el.web_seed_max_request_bytes;
@@ -596,7 +596,7 @@ fn inlineVerifyMultiPiece(el: *EventLoop, slot: *WebSeedSlot) void {
 
 /// Release all pieces in a multi-piece slot on failure and free the slot.
 fn failSlot(el: *EventLoop, slot: *WebSeedSlot) void {
-    const now = std.time.timestamp();
+    const now = el.clock.now();
 
     if (el.getTorrentContext(slot.torrent_id)) |tc| {
         if (tc.piece_tracker) |pt| {
