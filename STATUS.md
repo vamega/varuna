@@ -196,6 +196,13 @@ Update it whenever a milestone lands, the near-term backlog changes, or a new op
 - `zig build test-swarm`: automated end-to-end swarm transfer test — creates a torrent, starts a seeder and downloader daemon, verifies piece transfer completes.
 - Docker cross-client conformance test infrastructure (`test/docker/`): containerized testing harness for validating protocol compatibility with third-party clients.
 
+### IO Abstraction (foundation)
+- **Public IO contract (`src/io/io_interface.zig`)**: `Operation` and `Result` tagged unions (one variant per op), `CallbackAction = enum { disarm, rearm }`, single-callback signature, caller-owned `Completion` with opaque per-backend state (`backend_state_size = 64`, comptime-asserted by each backend).
+- **`SimIO` (`src/io/sim_io.zig`)**: in-process simulation backend with min-heap pending queue, seeded `std.Random.DefaultPrng`, `FaultConfig` (per-op error probabilities + latency injection). Zero-alloc after init. 8 unit tests cover timeout ordering, fault injection, queue-full, cancel, rearm.
+- **`RealIO` (`src/io/real_io.zig`)**: io_uring backend implementing the same interface. Encodes `Completion*` as SQE `user_data`; multishot accept honours `IORING_CQE_F_MORE`; connect deadlines submit a paired `link_timeout`. 5 tests cover real socketpair recv/send, cancel, fsync, timeout.
+- **Backend parity test (`tests/io_backend_parity_test.zig`)**: comptime check that both backends expose the required method set + runtime tests running identical bodies against each. Wired into `zig build test` and `zig build test-io-parity`.
+- Remaining: `event_loop.zig` migration to call `self.io.*` instead of `self.ring.*` (86 sites, 18 op types — see `progress-reports/2026-04-25-io-abstraction-foundation.md` for the decomposed task list).
+
 ## Next
 
 ### Protocol
