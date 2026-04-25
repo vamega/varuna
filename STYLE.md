@@ -149,6 +149,40 @@ Patterns that fell out of the Stage 2 migration (Apr 2026) and the bugs they cat
    down still has to be drainable correctly during the tear-down**. Future migrations of
    similar shape should plan the wait swap up front, not as a fire drill.
 
+8. **Prefer single coherent commits over split ones for migrations if the splits would
+   leave non-compiling intermediates.** "Tests pass at every commit" is the discipline that
+   makes migrations rollback-safe and `git bisect`-able; splitting commits for review
+   readability that lands non-buildable intermediates trades that for nothing. When the
+   must-convert files are tightly coupled (peer_handler ↔ protocol ↔ event_loop registration
+   sites was one such cluster), pick a coherent slice and ship it as one commit with a
+   message that walks file-by-file. Bisectability beats reviewability.
+
+9. **Run a representative perf bench after a hot-path migration.** Integration tests catch
+   correctness regressions; perf benches catch alloc-churn and microarchitectural
+   regressions that pass green tests cleanly. The `seed_plaintext_burst` 3× regression after
+   the Stage 2 #12 PendingSend migration was invisible to the test suite — caught only when
+   benchmarks were rerun. Make `zig build bench` (or the relevant subset) a checkpoint at
+   the end of a hot-path migration, alongside `zig build test`.
+
+10. **Lazy method compilation lets generic conversions ship partially.** Zig only compiles
+    methods of `Foo(Bar)` when they're called — instantiating the type as `const T = Foo(Bar)`
+    doesn't force every method body through the type-checker. This means a parameterisation
+    migration can ship one subsystem at a time: convert the run path the next test will
+    exercise, leave the rest as concrete-typed `*EventLoop` (or equivalent), and rely on
+    the next test driving the next conversion. **Do not pre-convert** for hypothetical
+    future usage — convert only what compiles when actually called.
+
+11. **`@TypeOf(self.*).X` for namespace access inside `anytype` methods.** When a generic
+    method takes `self: anytype` and needs to reference a nested type, constant, or static
+    method on the EL type (e.g. `EventLoop.PendingWriteKey{...}`,
+    `EventLoop.isIdleCandidate(...)`, `std.ArrayList(EventLoop.AnnounceResult)`), use
+    `@TypeOf(self.*).X` rather than the concrete `EventLoop` alias. Each instantiation
+    (`EventLoopOf(RealIO)`, `EventLoopOf(SimIO)`) has its own nested-type instances; using
+    the alias hard-codes one instantiation. The same idiom carries inner closures: bind
+    `const Ctx = @TypeOf(self);` outside the closure so the inner anonymous-struct
+    callback (`std.mem.sort` comparator, etc.) can name the parameterised receiver type
+    at comptime without explicit type-parameter plumbing.
+
 ---
 
 ## Memory
