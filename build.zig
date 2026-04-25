@@ -252,6 +252,20 @@ pub fn build(b: *std.Build) void {
     const test_safety_step = b.step("test-safety", "Run compile-time and runtime safety regression tests");
     test_safety_step.dependOn(&run_safety_tests.step);
 
+    // ── IO backend parity tests (RealIO vs SimIO) ─────────
+    const io_parity_tests = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("tests/io_backend_parity_test.zig"),
+            .target = target,
+            .optimize = optimize,
+            .imports = &varuna_import,
+        }),
+    });
+    const run_io_parity = b.addRunArtifact(io_parity_tests);
+    const test_io_parity_step = b.step("test-io-parity", "Run IO backend parity tests (RealIO vs SimIO)");
+    test_io_parity_step.dependOn(&run_io_parity.step);
+    test_step.dependOn(&run_io_parity.step);
+
     // ── Event loop health tests ────────────────────────────
     const el_health_tests = b.addTest(.{
         .root_module = b.createModule(.{
