@@ -314,9 +314,16 @@ pub const SimIO = struct {
     }
 
     /// Deliver every completion with `deadline_ns <= now_ns`. Callbacks
-    /// may submit new operations during delivery; if a callback returns
-    /// `.rearm`, the operation is re-submitted via the public path
-    /// (so socket / heap routing decisions are recomputed each time).
+    /// may submit new operations during delivery — including a fresh op
+    /// on the same completion. If a callback returns `.rearm`, the
+    /// operation is re-submitted via the public path (so socket / heap
+    /// routing is recomputed each time).
+    ///
+    /// Contract: state is cleared to "not in flight" before the callback
+    /// runs, so a callback that submits a new op on the same completion
+    /// (e.g. recv into a different buffer slice after the previous chunk
+    /// was processed) sees a clean `in_flight=false`. Callbacks must not
+    /// both submit a new op AND return `.rearm` — that would double-arm.
     pub fn tick(self: *SimIO) !void {
         assert(!self.in_tick); // no recursive ticks
         self.in_tick = true;
@@ -327,14 +334,20 @@ pub const SimIO = struct {
             const c = entry.completion;
             const callback = c.callback orelse continue; // disarmed mid-flight
 
+            // Mark the completion no-longer-in-flight before the callback
+            // runs. popMin already cleared heap_index; a parked completion
+            // would never reach the heap. So clearing in_flight here means
+            // the callback can submit a new op on the same completion via
+            // the public API without armCompletion tripping AlreadyInFlight.
+            simState(c).in_flight = false;
+
             const action = callback(c.userdata, c, entry.result);
             switch (action) {
-                .disarm => {
-                    simState(c).in_flight = false;
-                },
+                .disarm => {},
                 .rearm => {
-                    // popMin only cleared heap_index; reset state fully so
-                    // resubmit through the public path is clean.
+                    // Reset state fully (callback may have left fields
+                    // dirty from an earlier op) and resubmit through the
+                    // public path.
                     simState(c).* = .{};
                     try self.resubmit(c);
                 },
@@ -615,6 +628,14 @@ pub const SimIO = struct {
                 const got = sock.recv_queue.consume(op.buf[0..want]);
                 assert(got == want);
                 return self.schedule(c, .{ .recv = got }, self.config.faults.recv_latency_ns);
+            }
+            // If the partner has already closed, no more bytes will ever
+            // arrive — fail the recv now instead of parking forever.
+            if (sock.partner_index != sentinel_index) {
+                const partner = &self.sockets[sock.partner_index];
+                if (partner.closed) {
+                    return self.schedule(c, .{ .recv = error.ConnectionResetByPeer }, 0);
+                }
             }
             // Park: stay in-flight, leave the heap, point at this slot.
             assert(sock.parked_recv == null);

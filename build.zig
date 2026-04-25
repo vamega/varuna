@@ -285,6 +285,20 @@ pub fn build(b: *std.Build) void {
     test_sim_io_step.dependOn(&run_sim_io_tests.step);
     test_step.dependOn(&run_sim_io_tests.step);
 
+    // ── SimPeer protocol tests ─────────────────────────────
+    const sim_peer_tests = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("tests/sim_peer_test.zig"),
+            .target = target,
+            .optimize = optimize,
+            .imports = &varuna_import,
+        }),
+    });
+    const run_sim_peer_tests = b.addRunArtifact(sim_peer_tests);
+    const test_sim_peer_step = b.step("test-sim-peer", "Run SimPeer behavior / protocol tests");
+    test_sim_peer_step.dependOn(&run_sim_peer_tests.step);
+    test_step.dependOn(&run_sim_peer_tests.step);
+
     // ── Event loop health tests ────────────────────────────
     const el_health_tests = b.addTest(.{
         .root_module = b.createModule(.{
