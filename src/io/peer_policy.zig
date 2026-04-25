@@ -421,14 +421,13 @@ fn submitPipelineRequests(
     // MSE/PE: encrypt in-place before copying into tracked buffer
     peer.crypto.encryptBuf(buf);
 
-    const ts = self.nextTrackedSendUserData(slot);
-    const tracked = self.trackPendingSendCopy(slot, ts.send_id, buf) catch return;
+    const send_id = self.nextSendId();
+    const ps = self.trackPendingSendCopy(slot, send_id, buf) catch return;
 
-    _ = self.ring.send(ts.ud, peer.fd, tracked, 0) catch {
-        self.freeOnePendingSend(slot, ts.send_id);
+    self.submitPendingSend(ps) catch {
+        self.freeOnePendingSend(slot, send_id);
         return;
     };
-    peer.send_pending = true;
     peer.pipeline_sent += p1;
     peer.next_pipeline_sent += p2;
     peer.inflight_requests += total;
@@ -977,13 +976,12 @@ pub fn sendKeepAlives(self: *EventLoop) void {
             } else {
                 var keepalive = [_]u8{ 0, 0, 0, 0 };
                 peer.crypto.encryptBuf(&keepalive);
-                const ts = self.nextTrackedSendUserData(slot);
-                const tracked = self.trackPendingSendCopy(slot, ts.send_id, &keepalive) catch continue;
-                _ = self.ring.send(ts.ud, peer.fd, tracked, 0) catch {
-                    self.freeOnePendingSend(slot, ts.send_id);
+                const send_id = self.nextSendId();
+                const ps = self.trackPendingSendCopy(slot, send_id, &keepalive) catch continue;
+                self.submitPendingSend(ps) catch {
+                    self.freeOnePendingSend(slot, send_id);
                     continue;
                 };
-                peer.send_pending = true;
             }
             peer.last_activity = now;
         }

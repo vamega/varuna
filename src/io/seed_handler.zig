@@ -170,17 +170,16 @@ fn createPlaintextBatchSendState(
 }
 
 fn submitPlaintextPieceBatch(self: *EventLoop, slot: u16, batch: []const EventLoop.QueuedBlockResponse) bool {
-    const peer = &self.peers[slot];
+    _ = &self.peers[slot]; // ensure slot is valid
     const state = createPlaintextBatchSendState(self, batch) catch return false;
 
-    const ts = self.nextTrackedSendUserData(slot);
-    self.trackPendingSendVectored(slot, ts.send_id, state) catch return false;
+    const send_id = self.nextSendId();
+    const ps = self.trackPendingSendVectored(slot, send_id, state) catch return false;
 
-    _ = self.ring.sendmsg(ts.ud, peer.fd, &state.msg, 0) catch {
-        self.freeOnePendingSend(slot, ts.send_id);
+    self.submitPendingSend(ps) catch {
+        self.freeOnePendingSend(slot, send_id);
         return false;
     };
-    peer.send_pending = true;
     return true;
 }
 
@@ -209,17 +208,16 @@ fn submitCopiedPieceBatch(self: *EventLoop, slot: u16, batch: []const EventLoop.
 
     peer.crypto.encryptBuf(send_buf);
 
-    const ts = self.nextTrackedSendUserData(slot);
-    const tracked = self.trackPendingSendOwned(slot, ts.send_id, send_buf) catch {
+    const send_id = self.nextSendId();
+    const ps = self.trackPendingSendOwned(slot, send_id, send_buf) catch {
         self.allocator.free(send_buf);
         return false;
     };
 
-    _ = self.ring.send(ts.ud, peer.fd, tracked, 0) catch {
-        self.freeOnePendingSend(slot, ts.send_id);
+    self.submitPendingSend(ps) catch {
+        self.freeOnePendingSend(slot, send_id);
         return false;
     };
-    peer.send_pending = true;
     return true;
 }
 

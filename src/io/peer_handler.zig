@@ -273,8 +273,12 @@ fn startMseInitiator(self: *EventLoop, slot: u16) !void {
         .send => |data| {
             peer.state = .mse_handshake_send;
             peer.mse_send_remaining = data;
-            const ud = encodeUserData(.{ .slot = slot, .op_type = .peer_send, .context = 0 });
-            _ = self.ring.send(ud, peer.fd, data, 0) catch {
+            self.io.send(
+                .{ .fd = peer.fd, .buf = data },
+                &peer.send_completion,
+                self,
+                peerSendComplete,
+            ) catch {
                 return error.SubmitFailed;
             };
             peer.send_pending = true;
@@ -322,30 +326,90 @@ pub fn sendBtHandshake(self: *EventLoop, slot: u16) void {
     // MSE/PE: encrypt handshake before sending (if MSE was negotiated)
     peer.crypto.encryptBuf(peer.handshake_buf[0..68]);
 
-    const ud = encodeUserData(.{ .slot = slot, .op_type = .peer_send, .context = 0 });
-    _ = self.ring.send(ud, peer.fd, peer.handshake_buf[0..68], 0) catch {
+    self.io.send(
+        .{ .fd = peer.fd, .buf = peer.handshake_buf[0..68] },
+        &peer.send_completion,
+        self,
+        peerSendComplete,
+    ) catch {
         self.removePeer(slot);
         return;
     };
     peer.send_pending = true;
 }
 
+/// Callback for an untracked peer send (handshake / MSE / state-machine
+/// transition messages). Driven by `Peer.send_completion`. Tracked sends
+/// (PendingSend) use `pendingSendComplete` instead.
+pub fn peerSendComplete(
+    userdata: ?*anyopaque,
+    completion: *io_interface.Completion,
+    result: io_interface.Result,
+) io_interface.CallbackAction {
+    const self: *EventLoop = @ptrCast(@alignCast(userdata.?));
+    const peer: *Peer = @fieldParentPtr("send_completion", completion);
+    const offset = @intFromPtr(peer) - @intFromPtr(self.peers.ptr);
+    const slot: u16 = @intCast(offset / @sizeOf(Peer));
+    const res: i32 = switch (result) {
+        .send => |r| if (r) |n|
+            std.math.cast(i32, n) orelse std.math.maxInt(i32)
+        else |_|
+            -1,
+        else => -1,
+    };
+    handleSendResult(self, slot, 0, res);
+    return .disarm;
+}
+
+/// Callback for a tracked peer send (PendingSend with a heap-owned or
+/// vectored buffer). Driven by `PendingSend.completion`. Recovers the
+/// PendingSend pointer via `@fieldParentPtr` and feeds
+/// `handleSendResult` with the (slot, send_id) pair.
+pub fn pendingSendComplete(
+    userdata: ?*anyopaque,
+    completion: *io_interface.Completion,
+    result: io_interface.Result,
+) io_interface.CallbackAction {
+    const self: *EventLoop = @ptrCast(@alignCast(userdata.?));
+    const ps: *@import("buffer_pools.zig").PendingSend = @fieldParentPtr("completion", completion);
+    const slot = ps.slot;
+    const send_id = ps.send_id;
+    const res: i32 = switch (result) {
+        .send => |r| if (r) |n|
+            std.math.cast(i32, n) orelse std.math.maxInt(i32)
+        else |_|
+            -1,
+        .sendmsg => |r| if (r) |n|
+            std.math.cast(i32, n) orelse std.math.maxInt(i32)
+        else |_|
+            -1,
+        else => -1,
+    };
+    handleSendResult(self, slot, send_id, res);
+    return .disarm;
+}
+
+/// Legacy wrapper retained for tests/perf paths still on the legacy ring.
 pub fn handleSend(self: *EventLoop, slot: u16, cqe: linux.io_uring_cqe) void {
-    const peer = &self.peers[slot];
     const op = decodeUserData(cqe.user_data);
     const send_id: u32 = @truncate(op.context);
+    handleSendResult(self, slot, send_id, cqe.res);
+}
+
+fn handleSendResult(self: *EventLoop, slot: u16, send_id: u32, send_res: i32) void {
+    const peer = &self.peers[slot];
 
     // Guard: if the peer slot was already freed (stale CQE from a
     // previously-closed fd), just free the tracked buffer if any.
     if (peer.state == .free) {
-        if (op.context != 0) self.freeOnePendingSend(slot, send_id);
+        if (send_id != 0) self.freeOnePendingSend(slot, send_id);
         return;
     }
 
-    if (cqe.res <= 0) {
+    if (send_res <= 0) {
         // Check if this was a tracked send buffer -- free it on error.
         // Only free ONE buffer: removePeer will clean up the rest.
-        if (op.context != 0) self.freeOnePendingSend(slot, send_id);
+        if (send_id != 0) self.freeOnePendingSend(slot, send_id);
         // Guard: if the peer is reconnecting (connecting state), this is a stale
         // send CQE from the previous connection's fd. Ignore it.
         if (peer.state == .connecting) {
@@ -355,7 +419,7 @@ pub fn handleSend(self: *EventLoop, slot: u16, cqe: linux.io_uring_cqe) void {
         // MSE fallback: if send failed during MSE handshake and mode is "preferred",
         // try reconnecting without MSE
         if (peer.state == .mse_handshake_send and self.encryption_mode == .preferred and !peer.mse_fallback) {
-            log.debug("slot {d}: MSE send failed (res={}), attempting plaintext fallback", .{ slot, cqe.res });
+            log.debug("slot {d}: MSE send failed (res={}), attempting plaintext fallback", .{ slot, send_res });
             attemptMseFallback(self, slot);
             return;
         }
@@ -363,17 +427,19 @@ pub fn handleSend(self: *EventLoop, slot: u16, cqe: linux.io_uring_cqe) void {
         return;
     }
 
-    // Check if this was a tracked send buffer (context != 0, send_id encoded)
-    if (op.context != 0) {
-        const bytes_sent: usize = @intCast(cqe.res);
-        switch (self.handlePartialSend(slot, send_id, bytes_sent)) {
-            .resubmitted => {},
-            .complete => self.freeOnePendingSend(slot, send_id),
-            .failed => {
-                self.freeOnePendingSend(slot, send_id);
-                self.removePeer(slot);
-                return;
-            },
+    // Tracked send (PendingSend): handle partial / complete / failed.
+    if (send_id != 0) {
+        if (self.findPendingSend(slot, send_id)) |ps| {
+            const bytes_sent: usize = @intCast(send_res);
+            switch (self.handlePartialSend(ps, bytes_sent)) {
+                .resubmitted => {},
+                .complete => self.freeOnePendingSend(slot, send_id),
+                .failed => {
+                    self.freeOnePendingSend(slot, send_id);
+                    self.removePeer(slot);
+                    return;
+                },
+            }
         }
     }
 
@@ -382,14 +448,20 @@ pub fn handleSend(self: *EventLoop, slot: u16, cqe: linux.io_uring_cqe) void {
     switch (peer.state) {
         .mse_handshake_send => {
             // MSE initiator: handle partial send before advancing state machine
-            const bytes_sent: usize = @intCast(cqe.res);
+            const bytes_sent: usize = @intCast(send_res);
             peer.mse_send_remaining = peer.mse_send_remaining[bytes_sent..];
             if (peer.mse_send_remaining.len > 0) {
-                // Partial send -- resubmit remaining bytes without advancing state machine
-                const ud = encodeUserData(.{ .slot = slot, .op_type = .peer_send, .context = 0 });
-                _ = self.ring.send(ud, peer.fd, peer.mse_send_remaining, 0) catch {
+                // Partial send -- resubmit remaining bytes on the same untracked
+                // send_completion without advancing the state machine.
+                self.io.send(
+                    .{ .fd = peer.fd, .buf = peer.mse_send_remaining },
+                    &peer.send_completion,
+                    self,
+                    peerSendComplete,
+                ) catch {
                     self.removePeer(slot);
                 };
+                peer.send_pending = true;
                 return;
             }
             if (peer.mse_initiator) |mi| {
@@ -400,15 +472,18 @@ pub fn handleSend(self: *EventLoop, slot: u16, cqe: linux.io_uring_cqe) void {
             }
         },
         .mse_resp_send => {
-            // MSE responder: handle partial send before advancing state machine
-            const bytes_sent: usize = @intCast(cqe.res);
+            const bytes_sent: usize = @intCast(send_res);
             peer.mse_send_remaining = peer.mse_send_remaining[bytes_sent..];
             if (peer.mse_send_remaining.len > 0) {
-                // Partial send -- resubmit remaining bytes without advancing state machine
-                const ud = encodeUserData(.{ .slot = slot, .op_type = .peer_send, .context = 0 });
-                _ = self.ring.send(ud, peer.fd, peer.mse_send_remaining, 0) catch {
+                self.io.send(
+                    .{ .fd = peer.fd, .buf = peer.mse_send_remaining },
+                    &peer.send_completion,
+                    self,
+                    peerSendComplete,
+                ) catch {
                     self.removePeer(slot);
                 };
+                peer.send_pending = true;
                 return;
             }
             if (peer.mse_responder) |mr| {
@@ -691,8 +766,12 @@ fn handleRecvResult(self: *EventLoop, slot: u16, recv_res: i32) void {
             @memcpy(peer.handshake_buf[0..68], &buf);
             // MSE/PE: encrypt handshake before sending
             peer.crypto.encryptBuf(peer.handshake_buf[0..68]);
-            const ud = encodeUserData(.{ .slot = slot, .op_type = .peer_send, .context = 0 });
-            _ = self.ring.send(ud, peer.fd, peer.handshake_buf[0..68], 0) catch {
+            self.io.send(
+                .{ .fd = peer.fd, .buf = peer.handshake_buf[0..68] },
+                &peer.send_completion,
+                self,
+                peerSendComplete,
+            ) catch {
                 self.removePeer(slot);
                 return;
             };
@@ -852,8 +931,12 @@ fn executeMseAction(self: *EventLoop, slot: u16, action: mse.MseAction, is_initi
             const state: PeerState = if (is_initiator) .mse_handshake_send else .mse_resp_send;
             peer.state = state;
             peer.mse_send_remaining = data;
-            const ud = encodeUserData(.{ .slot = slot, .op_type = .peer_send, .context = 0 });
-            _ = self.ring.send(ud, peer.fd, data, 0) catch {
+            self.io.send(
+                .{ .fd = peer.fd, .buf = data },
+                &peer.send_completion,
+                self,
+                peerSendComplete,
+            ) catch {
                 handleMseFailure(self, slot, is_initiator);
                 return;
             };

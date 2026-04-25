@@ -187,6 +187,13 @@ pub const Peer = struct {
     /// initialisation; they reuse the same completion since only one
     /// is in flight at any moment.
     connect_completion: io_interface.Completion = .{},
+
+    /// Completion for **untracked** peer wire sends (handshake, MSE,
+    /// extension handshake, choke/unchoke acks — anything that doesn't
+    /// own a heap buffer that needs to outlive the SQE). Untracked
+    /// sends are gated by `send_pending` and serialized per peer.
+    /// Tracked sends (PendingSend) embed their own completion.
+    send_completion: io_interface.Completion = .{},
 };
 
 // ── Torrent context (per-torrent state within shared event loop) ──
