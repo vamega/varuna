@@ -3,6 +3,8 @@ const posix = std.posix;
 const linux = std.os.linux;
 const torrent = @import("../torrent/root.zig");
 const FilePriority = torrent.file_priority.FilePriority;
+const real_io = @import("../io/real_io.zig");
+const io_interface = @import("../io/io_interface.zig");
 
 pub const PieceStore = struct {
     allocator: std.mem.Allocator,
@@ -121,12 +123,47 @@ pub const PieceStore = struct {
         }
     }
 
-    pub fn sync(self: *PieceStore) !void {
+    /// Flush all open files via async `io.fsync` (datasync). Submits one
+    /// fsync op per open file through `io` and blocks the calling thread on
+    /// `io.tick` until every fsync completes. Daemon callers run this from
+    /// the event-loop thread; tests may create a one-shot `RealIO` to drive
+    /// completions.
+    ///
+    /// Replaces the previous synchronous `posix.fdatasync` loop. The async
+    /// path lets the event loop interleave other CQEs (e.g. a peer recv)
+    /// while the kernel walks the file's metadata.
+    pub fn sync(self: *PieceStore, io: *real_io.RealIO) !void {
+        var open_count: usize = 0;
+        for (self.files) |maybe_file| if (maybe_file != null) {
+            open_count += 1;
+        };
+        if (open_count == 0) return;
+
+        const completions = try self.allocator.alignedAlloc(
+            io_interface.Completion,
+            .of(io_interface.Completion),
+            open_count,
+        );
+        defer self.allocator.free(completions);
+        @memset(completions, .{});
+
+        var ctx = SyncContext{ .pending = open_count };
+
+        var i: usize = 0;
         for (self.files) |maybe_file| {
             if (maybe_file) |file| {
-                try posix.fdatasync(file.handle);
+                try io.fsync(
+                    .{ .fd = file.handle, .datasync = true },
+                    &completions[i],
+                    &ctx,
+                    syncCompleteCallback,
+                );
+                i += 1;
             }
         }
+
+        while (ctx.pending > 0) try io.tick(1);
+        if (ctx.first_error) |err| return err;
     }
 
     /// Return the raw fd_t values for sharing with other threads.
@@ -194,6 +231,32 @@ fn preadAll(fd: posix.fd_t, buf: []u8, offset: u64) !usize {
     return total;
 }
 
+/// Tracking state for a multi-file `PieceStore.sync` that's blocking on
+/// async fsync completions. Updated from the io_interface callback fired
+/// by every fsync CQE; the caller polls `pending` and surfaces
+/// `first_error` once all completions have landed.
+const SyncContext = struct {
+    pending: usize,
+    first_error: ?anyerror = null,
+};
+
+fn syncCompleteCallback(
+    userdata: ?*anyopaque,
+    _: *io_interface.Completion,
+    result: io_interface.Result,
+) io_interface.CallbackAction {
+    const ctx: *SyncContext = @ptrCast(@alignCast(userdata.?));
+    std.debug.assert(ctx.pending > 0);
+    ctx.pending -= 1;
+    switch (result) {
+        .fsync => |r| _ = r catch |err| {
+            if (ctx.first_error == null) ctx.first_error = err;
+        },
+        else => unreachable,
+    }
+    return .disarm;
+}
+
 /// Pre-allocate disk space using the fallocate syscall.
 fn fallocate(fd: posix.fd_t, offset: u64, len: u64) !void {
     const rc = linux.fallocate(fd, 0, @bitCast(offset), @bitCast(len));
@@ -240,7 +303,9 @@ test "write piece data across multiple files" {
     defer plan.deinit(std.testing.allocator);
 
     try store.writePiece(plan.spans, "spam");
-    try store.sync();
+    var io = real_io.RealIO.init(.{ .entries = 16 }) catch return error.SkipZigTest;
+    defer io.deinit();
+    try store.sync(&io);
 
     const first = try tmp.dir.readFileAlloc(std.testing.allocator, "download/root/alpha", 16);
     defer std.testing.allocator.free(first);

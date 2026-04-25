@@ -112,7 +112,11 @@ test "single-piece transfer between seeder and downloader on shared event loop" 
     );
     defer plan.deinit(allocator);
     try store.writePiece(plan.spans, &piece_data);
-    try store.sync();
+    {
+        var sync_io = varuna.io.real_io.RealIO.init(.{ .entries = 16 }) catch return error.SkipZigTest;
+        defer sync_io.deinit();
+        try store.sync(&sync_io);
+    }
 
     const shared_fds = try store.fileHandles(allocator);
     defer allocator.free(shared_fds);
