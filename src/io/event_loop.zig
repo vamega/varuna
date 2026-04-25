@@ -1645,7 +1645,7 @@ pub const EventLoop = struct {
             self.allocator,
             session,
             fds,
-            &self.ring,
+            &self.io,
             h,
             torrent_id,
             known_complete,
@@ -1918,15 +1918,6 @@ pub const EventLoop = struct {
             .api_send => if (self.api_server) |srv| srv.handleSendCqe(op.slot, op.context, cqe),
             .udp_socket, .udp_tracker_send, .udp_tracker_recv => {
                 if (self.udp_tracker_executor) |ute| ute.dispatchCqe(cqe);
-            },
-            .recheck_read => {
-                const tid: u32 = @truncate(op.context);
-                for (self.rechecks.items) |rc| {
-                    if (rc.torrent_id == tid) {
-                        rc.handleReadCqe(op.slot, cqe.res);
-                        break;
-                    }
-                }
             },
             .metadata_connect, .metadata_send, .metadata_recv => {
                 if (self.metadata_fetch) |mf| mf.handleCqe(op.op_type, op.slot, cqe.res);
