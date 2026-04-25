@@ -73,17 +73,87 @@ before implementation begins.
 ///
 /// Required methods (called by EventLoop):
 ///   fn tick(self: *IO) void
+///
+///   -- Stream I/O (peer wire, RPC, HTTP tracker) --
 ///   fn recv(self: *IO, fd: posix.fd_t, buf: []u8, c: *Completion, cb: Callback) void
 ///   fn send(self: *IO, fd: posix.fd_t, buf: []const u8, c: *Completion, cb: Callback) void
+///
+///   -- Datagram I/O (UDP tracker, uTP) --
+///   fn recvmsg(self: *IO, fd: posix.fd_t, msg: *posix.msghdr, c: *Completion, cb: Callback) void
+///   fn sendmsg(self: *IO, fd: posix.fd_t, msg: *const posix.msghdr, c: *Completion, cb: Callback) void
+///
+///   -- Disk I/O (PieceStore reads, writes, sync) --
 ///   fn read(self: *IO, fd: posix.fd_t, buf: []u8, offset: u64, c: *Completion, cb: Callback) void
 ///   fn write(self: *IO, fd: posix.fd_t, buf: []const u8, offset: u64, c: *Completion, cb: Callback) void
-///   fn fsync(self: *IO, fd: posix.fd_t, c: *Completion, cb: Callback) void
+///   fn fsync(self: *IO, fd: posix.fd_t, flags: u32, c: *Completion, cb: Callback) void
+///
+///   -- Connection lifecycle --
+///   fn socket(self: *IO, family: u32, type_flags: u32, proto: u32, c: *Completion, cb: Callback) void
+///   fn connect(self: *IO, fd: posix.fd_t, addr: *const posix.sockaddr, addrlen: posix.socklen_t, c: *Completion, cb: Callback) void
+///   fn accept(self: *IO, fd: posix.fd_t, c: *Completion, cb: Callback) void
+///
+///   -- Timers --
 ///   fn timeout(self: *IO, ns: u64, c: *Completion, cb: Callback) void
+///
+///   -- Readiness / signals --
+///   fn poll(self: *IO, fd: posix.fd_t, events: u32, c: *Completion, cb: Callback) void
+///
+///   -- Cancellation --
 ///   fn cancel(self: *IO, c: *Completion) void
 ///
 /// Callback type (per-operation result union):
 ///   fn (userdata: ?*anyopaque, io: *IO, c: *Completion, result: Result) CallbackAction
 ```
+
+### Async operations — full inventory
+
+This table is derived from a codebase audit of all `ring.*` call sites as of 2026-04-25.
+It determines the minimum interface that `RealIO` must expose and that `SimIO` must model.
+
+| Operation | Count | Users | Notes |
+|---|---|---|---|
+| `recv` | 10 | peer wire, RPC server, HTTP tracker client | stream receive |
+| `send` | 20 | peer wire, RPC server, HTTP tracker client, metadata fetch | stream send |
+| `recvmsg` | 2 | uTP, UDP tracker client | datagram receive with ancillary data |
+| `sendmsg` | 5 | peer have_all, RPC, uTP, UDP tracker client | datagram send |
+| `read` | 3 | piece data from disk, timerfd reads | offset read into buffer |
+| `write` | 3 | piece data to disk | offset write from buffer |
+| `fsync` | — | `storage/writer.zig` (fdatasync — see below) | sync after piece write; currently synchronous, must go async |
+| `socket` | 4 | outbound TCP, UDP sockets | async socket creation |
+| `connect` | 3 | outbound peer TCP, HTTP tracker TCP | outbound connection |
+| `accept` | 2 | RPC listen socket, peer listen socket | `accept_multishot` in RealIO |
+| `timeout` | 1 | event loop tick timer | native io_uring timeout op |
+| `link_timeout` | 1 | HTTP connect deadline | SQE flag, not a separate interface method; `connect` impl chains it |
+| `poll_add` | 4 | signal fd, DNS event fd | readiness notification |
+| `cancel` | 2 | recv/accept cancellation on disconnect | cancels in-flight op by completion pointer |
+| `splice` | 2 | zero-copy perf test only | not needed in initial interface; perf path only |
+
+`link_timeout` is an io_uring SQE flag applied when submitting a linked `connect` SQE. It
+is not a separate interface method — the `connect` implementation in `RealIO` sets it
+internally based on a deadline argument. `SimIO` models it as: if the connect completion is
+not delivered before the deadline, deliver a `ETIMEDOUT` result instead.
+
+`splice` is used only in `src/perf/` benchmark paths. It is excluded from the initial
+interface; add it if the perf path is ever wired through the EventLoop.
+
+### Synchronous syscalls — not in the interface
+
+These calls are made directly today and do **not** need to be in the `IO` interface.
+`SimIO` does not need to intercept them for correctness — they are setup operations, not
+data-plane operations. The one exception is `fdatasync`, which is on the hot path.
+
+| Syscall | Count | Site | SimIO treatment |
+|---|---|---|---|
+| `setsockopt` | 18 | TCP_NODELAY, SO_RCVBUF (2 MB), SO_SNDBUF (512 KB), SO_REUSEADDR, IPV6_V6ONLY, SO_RCVTIMEO, SO_SNDTIMEO, SO_BINDTODEVICE | setup only; SimIO ignores |
+| `fcntl` | 4 | GETFL/SETFL for O_NONBLOCK, GETFD/SETFD for FD_CLOEXEC | setup only; SimIO ignores |
+| `fallocate` | 2 | `storage/writer.zig:53,90` — disk pre-allocation at file init | file-init only; SimIO models as immediate success |
+| `fdatasync` | 1 | `storage/writer.zig:127` — sync after each piece write | **hot path** — must move to async `fsync` op before the IO interface lands |
+| `timerfd_create` | 1 | `event_loop.zig:345` — once at startup | replaced by native `timeout` op in new design |
+| `timerfd_settime` | 1 | `event_loop.zig:1464` | replaced by native `timeout` op in new design |
+
+**`fdatasync` migration**: `storage/writer.zig:127` calls `posix.fdatasync(fd)` synchronously after each piece write, blocking the event-loop thread for a disk round-trip. This must be converted to the async `fsync` interface method (io_uring `IORING_OP_FSYNC` with `IORING_FSYNC_DATASYNC`) before the IO interface lands. The conversion is part of Stage 2 of the extraction plan.
+
+**`timerfd` retirement**: The event loop currently creates a `timerfd` at startup and `read`s it on each tick to drive timeouts. After Stage 1, the `timeout` interface method replaces this pattern. `timerfd_create` and `timerfd_settime` disappear; `SimIO.timeout` inserts a completion into the pending queue with the appropriate deadline.
 
 **[OPEN]** Should the callback be a tagged union of per-operation callbacks, or a single
 callback with a `Result` union? libxev uses a single callback with a result union. That
@@ -315,7 +385,10 @@ interface documentation. No EventLoop changes yet.
 
 **Stage 2**: Extract `RealIO` from `EventLoop`. Move the ring submission and CQE dispatch
 into `real_io.zig`. `EventLoop` becomes `EventLoop(comptime IO: type)` with `IO = RealIO`
-hardcoded initially. All existing tests must pass.
+hardcoded initially. All existing tests must pass. As part of this stage, convert the
+synchronous `posix.fdatasync` in `storage/writer.zig:127` to the async `fsync` interface
+method, and retire the `timerfd` pattern in `event_loop.zig:345,1464` in favour of the
+native `timeout` op.
 
 **Stage 3**: Write `SimIO` with a static pending queue and the `FaultConfig`. Write a
 minimal sim test using `Simulator` with a single honest `SimPeer` — equivalent to the
