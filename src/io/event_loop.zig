@@ -231,6 +231,10 @@ pub const EventLoop = struct {
     utp_send_pending: bool = false,
     // Outbound packet queue (when a send is already in flight)
     utp_send_queue: std.ArrayList(UtpQueuedPacket) = std.ArrayList(UtpQueuedPacket).empty,
+    // io_interface completions for the UDP socket recvmsg / sendmsg.
+    // recv is re-armed indefinitely; send is one-shot per packet.
+    utp_recv_completion: io_interface.Completion = .{},
+    utp_send_completion: io_interface.Completion = .{},
 
     // DHT (BEP 5): distributed hash table engine for trackerless peer discovery.
     // Shares the UDP socket with uTP. Incoming datagrams starting with 'd'
@@ -1203,14 +1207,18 @@ pub const EventLoop = struct {
         const fd = self.udp_fd;
         self.udp_fd = -1;
 
-        // Cancel the pending RECVMSG SQE
-        const recv_ud = encodeUserData(.{ .slot = 0, .op_type = .utp_recv, .context = 0 });
-        const cancel_ud = encodeUserData(.{ .slot = 0, .op_type = .cancel, .context = 0 });
-        _ = self.ring.cancel(cancel_ud, recv_ud, 0) catch {};
+        // Cancel the pending RECVMSG on the io_interface ring.
+        self.io.cancel(
+            .{ .target = &self.utp_recv_completion },
+            &self.accept_cancel_completion,
+            null,
+            ignoredCancelComplete,
+        ) catch {};
 
-        // Close the fd via io_uring (avoids racing with the pending CQE)
+        // Close the fd via the legacy ring (still kept around for the
+        // `.cancel` op type which is a no-op in dispatch).
+        const cancel_ud = encodeUserData(.{ .slot = 0, .op_type = .cancel, .context = 0 });
         _ = self.ring.close(cancel_ud, fd) catch {
-            // Fallback to synchronous close if we can't get an SQE
             posix.close(fd);
         };
 
@@ -1905,8 +1913,6 @@ pub const EventLoop = struct {
             .timeout => {
                 self.timeout_pending = false;
             },
-            .utp_recv => utp_handler.handleUtpRecv(self, cqe),
-            .utp_send => utp_handler.handleUtpSend(self, cqe),
             .cancel => {},
             .udp_socket, .udp_tracker_send, .udp_tracker_recv => {
                 if (self.udp_tracker_executor) |ute| ute.dispatchCqe(cqe);

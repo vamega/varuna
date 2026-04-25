@@ -1503,15 +1503,9 @@ fn createLoopbackUdpReceiver() !struct { fd: posix.fd_t, address: std.net.Addres
 }
 
 fn drainUtpSendCompletions(event_loop: *EventLoop) !void {
-    var cqes: [16]linux.io_uring_cqe = undefined;
-    _ = try event_loop.ring.submit_and_wait(1);
-    const count = try event_loop.ring.copy_cqes(&cqes, 0);
-    for (cqes[0..count]) |cqe| {
-        const op = event_loop_mod.decodeUserData(cqe.user_data);
-        if (op.op_type == .utp_send) {
-            utp_handler.handleUtpSend(event_loop, cqe);
-        }
-    }
+    // uTP send CQEs land on the io_interface ring after Stage 2 #12;
+    // tick(1) drains them through the utpSendComplete callback.
+    try event_loop.io.tick(1);
 }
 
 fn drainUdpReceiver(fd: posix.fd_t, buffer: []u8) !u64 {
