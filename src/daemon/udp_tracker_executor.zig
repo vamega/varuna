@@ -5,11 +5,9 @@ const udp = @import("../tracker/udp.zig");
 const DnsResolver = @import("../io/dns.zig").DnsResolver;
 const DnsJob = @import("../io/dns_threadpool.zig").DnsJob;
 
-// Reuse the event loop's user data encoding.
-const event_loop = @import("../io/event_loop.zig");
-const encodeUserData = event_loop.encodeUserData;
-const decodeUserData = event_loop.decodeUserData;
-const OpType = event_loop.OpType;
+const io_interface = @import("../io/io_interface.zig");
+const real_io_mod = @import("../io/real_io.zig");
+const RealIO = real_io_mod.RealIO;
 
 const log = std.log.scoped(.udp_tracker_executor);
 
@@ -28,8 +26,9 @@ pub const UdpTrackerExecutor = struct {
     allocator: std.mem.Allocator,
     running: std.atomic.Value(bool) = std.atomic.Value(bool).init(true),
 
-    ring: *linux.IoUring,
+    io: *RealIO,
     dns_event_fd: posix.fd_t,
+    dns_poll_completion: io_interface.Completion = .{},
 
     // Thread-safe job queue (producer: any thread, consumer: ring thread).
     queue_mutex: std.Thread.Mutex = .{},
@@ -44,7 +43,6 @@ pub const UdpTrackerExecutor = struct {
 
     dns_resolver: DnsResolver,
 
-    const sentinel_dns: u16 = 0xFFFE;
     const max_response_size: usize = udp.max_response_size;
 
     pub const CompletionFn = *const fn (context: *anyopaque, result: RequestResult) void;
@@ -124,6 +122,10 @@ pub const UdpTrackerExecutor = struct {
         // Deadline for the overall request
         deadline: i64 = 0,
 
+        /// Caller-owned completion for the slot's in-flight io op.
+        /// One op at a time per slot (socket → send → recv loop).
+        completion: io_interface.Completion = .{},
+
         const State = enum {
             free,
             dns_resolving,
@@ -148,7 +150,7 @@ pub const UdpTrackerExecutor = struct {
 
     // ── Public API ───────────────────────────────────────────
 
-    pub fn create(allocator: std.mem.Allocator, ring: *linux.IoUring, config: Config) !*UdpTrackerExecutor {
+    pub fn create(allocator: std.mem.Allocator, io: *RealIO, config: Config) !*UdpTrackerExecutor {
         const self = try allocator.create(UdpTrackerExecutor);
         errdefer allocator.destroy(self);
 
@@ -157,7 +159,7 @@ pub const UdpTrackerExecutor = struct {
 
         self.* = .{
             .allocator = allocator,
-            .ring = ring,
+            .io = io,
             .dns_event_fd = dns_event_fd,
             .pending_jobs = std.ArrayList(Job).empty,
             .max_slots = config.max_slots,
@@ -208,32 +210,89 @@ pub const UdpTrackerExecutor = struct {
     }
 
     fn submitDnsPoll(self: *UdpTrackerExecutor) void {
-        const ud = encodeUserData(.{ .slot = sentinel_dns, .op_type = .udp_tracker_recv, .context = 0 });
-        _ = self.ring.poll_add(ud, self.dns_event_fd, linux.POLL.IN) catch {};
+        self.io.poll(
+            .{ .fd = self.dns_event_fd, .events = linux.POLL.IN },
+            &self.dns_poll_completion,
+            self,
+            udpDnsPollComplete,
+        ) catch {};
     }
 
-    /// Dispatch a CQE from the shared event loop.
-    pub fn dispatchCqe(self: *UdpTrackerExecutor, cqe: linux.io_uring_cqe) void {
-        const op = decodeUserData(cqe.user_data);
+    fn udpDnsPollComplete(
+        userdata: ?*anyopaque,
+        _: *io_interface.Completion,
+        _: io_interface.Result,
+    ) io_interface.CallbackAction {
+        const self: *UdpTrackerExecutor = @ptrCast(@alignCast(userdata.?));
+        var buf: [8]u8 = undefined;
+        _ = posix.read(self.dns_event_fd, &buf) catch {};
+        self.processDnsCompletions();
+        return .rearm;
+    }
 
-        // Sentinel: DNS eventfd
-        if (op.slot == sentinel_dns) {
-            var buf: [8]u8 = undefined;
-            _ = posix.read(self.dns_event_fd, &buf) catch {};
-            self.submitDnsPoll();
-            self.processDnsCompletions();
-            return;
-        }
+    fn slotIdxFor(self: *const UdpTrackerExecutor, slot: *const RequestSlot) u16 {
+        const offset = @intFromPtr(slot) - @intFromPtr(self.slots.ptr);
+        return @intCast(offset / @sizeOf(RequestSlot));
+    }
 
-        if (op.slot >= self.slots.len) return;
-        const slot = &self.slots[op.slot];
+    fn udpSocketComplete(
+        userdata: ?*anyopaque,
+        completion: *io_interface.Completion,
+        result: io_interface.Result,
+    ) io_interface.CallbackAction {
+        const self: *UdpTrackerExecutor = @ptrCast(@alignCast(userdata.?));
+        const slot: *RequestSlot = @fieldParentPtr("completion", completion);
+        const slot_idx = self.slotIdxFor(slot);
+        const fake_cqe = makeFakeCqe(switch (result) {
+            .socket => |r| if (r) |fd| @intCast(fd) else |_| -1,
+            else => -1,
+        });
+        self.handleSocketCreated(slot, slot_idx, fake_cqe);
+        return .disarm;
+    }
 
-        switch (op.op_type) {
-            .udp_socket => self.handleSocketCreated(slot, op.slot, cqe),
-            .udp_tracker_send => self.handleSend(slot, op.slot, cqe),
-            .udp_tracker_recv => self.handleRecv(slot, op.slot, cqe),
-            else => {},
-        }
+    fn udpSendComplete(
+        userdata: ?*anyopaque,
+        completion: *io_interface.Completion,
+        result: io_interface.Result,
+    ) io_interface.CallbackAction {
+        const self: *UdpTrackerExecutor = @ptrCast(@alignCast(userdata.?));
+        const slot: *RequestSlot = @fieldParentPtr("completion", completion);
+        const slot_idx = self.slotIdxFor(slot);
+        const fake_cqe = makeFakeCqe(switch (result) {
+            .sendmsg => |r| if (r) |n|
+                std.math.cast(i32, n) orelse std.math.maxInt(i32)
+            else |_|
+                -1,
+            else => -1,
+        });
+        self.handleSend(slot, slot_idx, fake_cqe);
+        return .disarm;
+    }
+
+    fn udpRecvComplete(
+        userdata: ?*anyopaque,
+        completion: *io_interface.Completion,
+        result: io_interface.Result,
+    ) io_interface.CallbackAction {
+        const self: *UdpTrackerExecutor = @ptrCast(@alignCast(userdata.?));
+        const slot: *RequestSlot = @fieldParentPtr("completion", completion);
+        const slot_idx = self.slotIdxFor(slot);
+        const fake_cqe = makeFakeCqe(switch (result) {
+            .recvmsg => |r| if (r) |n|
+                std.math.cast(i32, n) orelse std.math.maxInt(i32)
+            else |_|
+                -1,
+            else => -1,
+        });
+        self.handleRecv(slot, slot_idx, fake_cqe);
+        return .disarm;
+    }
+
+    /// Build a synthetic `linux.io_uring_cqe` so the existing handle*
+    /// bodies (which still read `cqe.res`) can stay unchanged.
+    fn makeFakeCqe(res: i32) linux.io_uring_cqe {
+        return .{ .user_data = 0, .res = res, .flags = 0 };
     }
 
     // ── Job queue draining ───────────────────────────────────
@@ -318,11 +377,15 @@ pub const UdpTrackerExecutor = struct {
     // ── UDP request flow ─────────────────────────────────────
 
     fn startUdpRequest(self: *UdpTrackerExecutor, slot: *RequestSlot, slot_idx: u16) void {
-        // Submit async socket creation via io_uring — handleSocketCreated
+        // Submit async socket creation via io_interface — udpSocketComplete
         // will set the destination and start the BEP 15 flow.
         const family: u32 = slot.address.any.family;
-        const ud = encodeUserData(.{ .slot = slot_idx, .op_type = .udp_socket, .context = 0 });
-        _ = self.ring.socket(ud, family, posix.SOCK.DGRAM | posix.SOCK.CLOEXEC | posix.SOCK.NONBLOCK, posix.IPPROTO.UDP, 0) catch {
+        self.io.socket(
+            .{ .domain = family, .sock_type = posix.SOCK.DGRAM | posix.SOCK.CLOEXEC | posix.SOCK.NONBLOCK, .protocol = posix.IPPROTO.UDP },
+            &slot.completion,
+            self,
+            udpSocketComplete,
+        ) catch {
             self.completeSlot(slot_idx, .{ .err = error.SocketCreateFailed });
             return;
         };
@@ -434,8 +497,12 @@ pub const UdpTrackerExecutor = struct {
             .flags = 0,
         };
 
-        const ud = encodeUserData(.{ .slot = slot_idx, .op_type = .udp_tracker_send, .context = 0 });
-        _ = self.ring.sendmsg(ud, slot.fd, &slot.send_msg, 0) catch {
+        self.io.sendmsg(
+            .{ .fd = slot.fd, .msg = &slot.send_msg },
+            &slot.completion,
+            self,
+            udpSendComplete,
+        ) catch {
             self.completeSlot(slot_idx, .{ .err = error.SubmitFailed });
         };
     }
@@ -456,8 +523,12 @@ pub const UdpTrackerExecutor = struct {
             .flags = 0,
         };
 
-        const ud = encodeUserData(.{ .slot = slot_idx, .op_type = .udp_tracker_recv, .context = 0 });
-        _ = self.ring.recvmsg(ud, slot.fd, &slot.recv_msg, 0) catch {
+        self.io.recvmsg(
+            .{ .fd = slot.fd, .msg = &slot.recv_msg },
+            &slot.completion,
+            self,
+            udpRecvComplete,
+        ) catch {
             self.completeSlot(slot_idx, .{ .err = error.SubmitFailed });
         };
     }

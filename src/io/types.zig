@@ -24,10 +24,7 @@ pub const OpType = enum(u8) {
     peer_send = 2,
     timeout = 9,
     cancel = 10,
-    udp_tracker_send = 16,
-    udp_tracker_recv = 17,
     peer_socket = 23,
-    udp_socket = 25,
 };
 
 pub const OpData = struct {

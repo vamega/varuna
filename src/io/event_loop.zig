@@ -1914,9 +1914,6 @@ pub const EventLoop = struct {
                 self.timeout_pending = false;
             },
             .cancel => {},
-            .udp_socket, .udp_tracker_send, .udp_tracker_recv => {
-                if (self.udp_tracker_executor) |ute| ute.dispatchCqe(cqe);
-            },
         }
     }
 
