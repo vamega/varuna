@@ -299,6 +299,20 @@ pub fn build(b: *std.Build) void {
     test_sim_peer_step.dependOn(&run_sim_peer_tests.step);
     test_step.dependOn(&run_sim_peer_tests.step);
 
+    // ── Minimal Simulator swarm test ───────────────────────
+    const sim_minimal_tests = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("tests/sim_minimal_swarm_test.zig"),
+            .target = target,
+            .optimize = optimize,
+            .imports = &varuna_import,
+        }),
+    });
+    const run_sim_minimal_tests = b.addRunArtifact(sim_minimal_tests);
+    const test_sim_minimal_step = b.step("test-sim-minimal", "Run minimal Simulator swarm test");
+    test_sim_minimal_step.dependOn(&run_sim_minimal_tests.step);
+    test_step.dependOn(&run_sim_minimal_tests.step);
+
     // ── Event loop health tests ────────────────────────────
     const el_health_tests = b.addTest(.{
         .root_module = b.createModule(.{
