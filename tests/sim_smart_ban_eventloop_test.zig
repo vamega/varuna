@@ -58,6 +58,7 @@ const Session = varuna.torrent.session.Session;
 const PieceStore = varuna.storage.writer.PieceStore;
 const PieceTracker = varuna.torrent.piece_tracker.PieceTracker;
 const Bitfield = varuna.bitfield.Bitfield;
+const BanList = varuna.net.ban_list.BanList;
 
 const Completion = ifc.Completion;
 const Result = ifc.Result;
@@ -87,7 +88,7 @@ fn buildTorrentBytes(allocator: std.mem.Allocator, piece_hashes: *const [piece_c
     try buf.appendSlice(allocator, "6:lengthi");
     try buf.writer(allocator).print("{d}", .{piece_count * piece_size});
     try buf.append(allocator, 'e');
-    try buf.appendSlice(allocator, "4:name15:smart_ban_sim.bin");
+    try buf.appendSlice(allocator, "4:name17:smart_ban_sim.bin");
     try buf.appendSlice(allocator, "12:piece lengthi");
     try buf.writer(allocator).print("{d}", .{piece_size});
     try buf.append(allocator, 'e');
@@ -107,7 +108,7 @@ fn runOneSeedAgainstEventLoop(seed: u64) !void {
     // (`processHashResults` / `tryAssignPieces` / `recalculateUnchokes`
     // etc.) still takes `*EventLoop` directly. Migration-engineer is
     // converting; my body below is what activates once they do.
-    if (true) return;
+    // if (true) return; // gate flipped — let it compile to surface what's needed
 
     const allocator = testing.allocator;
     var arena = std.heap.ArenaAllocator.init(allocator);
@@ -155,8 +156,15 @@ fn runOneSeedAgainstEventLoop(seed: u64) !void {
         .socket_capacity = num_peers * 2,
         .seed = seed,
     });
-    var el = try EL_SimIO.initBareWithIO(allocator, sim_io, 0);
+    var el = try EL_SimIO.initBareWithIO(allocator, sim_io, 1);
     defer el.deinit();
+
+    // Smart-ban needs a real BanList — penalizePeerTrust → bl.banIp.
+    // Without one, the corrupt peer is removed but is_banned() always
+    // returns false, so the assertions can't observe the ban.
+    var ban_list = BanList.init(allocator);
+    defer ban_list.deinit();
+    el.ban_list = &ban_list;
 
     el.encryption_mode = .disabled;
     el.clock = .{ .sim = 1_000_000 }; // 1 ms past zero so time-gated logic opens
@@ -212,7 +220,11 @@ fn runOneSeedAgainstEventLoop(seed: u64) !void {
             .rng = &rng,
         });
 
-        slots[i] = try el.addInboundPeer(tid, downloader_fd, syntheticAddr(i));
+        // Use addConnectedPeerWithAddress so the EventLoop sends the
+        // BitTorrent handshake first. SimPeer's `armRecv` then receives it
+        // and (since role=seeder) responds with handshake + bitfield.
+        // Distinct synthetic addresses keep BanList per-peer.
+        slots[i] = try el.addConnectedPeerWithAddress(downloader_fd, tid, syntheticAddr(i));
     }
 
     // ── 7. Drive ticks until corrupt is banned + pieces 1..3 done ──
@@ -226,14 +238,37 @@ fn runOneSeedAgainstEventLoop(seed: u64) !void {
             try peer.step(@as(u64, @intCast(el.clock.now())) * std.time.ns_per_s);
         }
 
-        const corrupt_banned = if (el.getPeerView(slots[corrupt_peer_index])) |v| v.is_banned else false;
+        const corrupt_banned = ban_list.isBanned(syntheticAddr(corrupt_peer_index));
         const all_target_pieces_done = el.isPieceComplete(tid, 1) and
             el.isPieceComplete(tid, 2) and
             el.isPieceComplete(tid, 3);
         if (corrupt_banned and all_target_pieces_done) break;
     }
 
-    // ── 8. Smart-ban assertions ──────────────────────────────────
+    // ── 8. Drain hasher results so valid piece buffers don't leak.
+    //
+    // The hasher hands valid piece bufs to the EL via `processHashResults`,
+    // which queues an async disk write that frees the buf. If we tear down
+    // before processing those results, the bufs sit in `completed_results`
+    // (whose deinit only frees *invalid* bufs, on the assumption that valid
+    // ones were already passed to disk-write). Force-close the SimPeer
+    // connections to stop new piece downloads, then spin until the hasher
+    // and pending-write queues are quiescent.
+    for (&peers) |*peer| {
+        if (peer.fd >= 0) {
+            el.io.closeSocket(peer.fd);
+            peer.fd = -1;
+        }
+    }
+    var drain_ticks: u32 = 0;
+    while (drain_ticks < 256) : (drain_ticks += 1) {
+        const hasher_busy = if (el.hasher) |h| h.hasPendingWork() else false;
+        const writes_pending = el.pending_writes.count() > 0;
+        if (!hasher_busy and !writes_pending) break;
+        try el.tick();
+    }
+
+    // ── 9. Smart-ban assertions ──────────────────────────────────
 
     // Pieces 1..3 must verify (multiple honest sources for each).
     try testing.expect(el.isPieceComplete(tid, 1));
@@ -244,19 +279,25 @@ fn runOneSeedAgainstEventLoop(seed: u64) !void {
     // who got banned. This is the correct production outcome.
     try testing.expect(!el.isPieceComplete(tid, 0));
 
-    // Corrupt peer banned with hashfails >= 4 (4 failures × -2 = -8 ≤ -7).
-    const corrupt_view = el.getPeerView(slots[corrupt_peer_index]).?;
-    try testing.expect(corrupt_view.is_banned);
-    try testing.expect(corrupt_view.trust_points <= trust_ban_threshold);
-    try testing.expect(corrupt_view.hashfails >= 4);
+    // Corrupt peer banned. The slot is freed by `removePeer` immediately
+    // after the smart-ban threshold trips, so the canonical EL-integration
+    // assertion is `ban_list.isBanned(addr)`. A hit there is sufficient:
+    // `peer_policy.penalizePeerTrust` is the only call site for
+    // `bl.banIp` at the smart-ban threshold, so a present ban implies
+    // `trust_points <= trust_ban_threshold` and `hashfails >= 4` were
+    // both observed inside the EventLoop. The exact trust_points /
+    // hashfails math is exercised by `sim_smart_ban_protocol_test.zig`
+    // against the Peer struct directly (without the EL).
+    try testing.expect(ban_list.isBanned(syntheticAddr(corrupt_peer_index)));
 
     // No honest peer banned, none with hashfails.
     var j: u8 = 0;
     while (j < num_peers) : (j += 1) {
         if (j == corrupt_peer_index) continue;
-        const v = el.getPeerView(slots[j]).?;
-        try testing.expect(!v.is_banned);
-        try testing.expectEqual(@as(u8, 0), v.hashfails);
+        try testing.expect(!ban_list.isBanned(syntheticAddr(j)));
+        if (el.getPeerView(slots[j])) |v| {
+            try testing.expectEqual(@as(u8, 0), v.hashfails);
+        }
     }
 }
 

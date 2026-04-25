@@ -346,7 +346,18 @@ pub const SimIO = struct {
         self.in_tick = true;
         defer self.in_tick = false;
 
-        while (self.pending_len > 0 and self.pending[0].deadline_ns <= self.now_ns) {
+        // Cap ops processed per tick to model real io_uring's batched
+        // CQE behavior (the kernel returns to userspace after a finite
+        // batch even if more CQEs are ready). This lets the EventLoop's
+        // periodic policy passes (processHashResults / tryAssignPieces /
+        // checkPeerTimeouts / etc.) interleave with I/O completions
+        // instead of starving forever in a tight callback chain.
+        const max_ops_per_tick: u32 = 4096;
+        var ops: u32 = 0;
+        while (self.pending_len > 0 and
+            self.pending[0].deadline_ns <= self.now_ns and
+            ops < max_ops_per_tick) : (ops += 1)
+        {
             const entry = self.popMin();
             const c = entry.completion;
             const callback = c.callback orelse continue; // disarmed mid-flight

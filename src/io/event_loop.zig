@@ -521,7 +521,7 @@ pub fn EventLoopOf(comptime IO: type) type {
                     }
                 }
                 if (peer.fd >= 0) {
-                    posix.close(peer.fd);
+                    self.io.closeSocket(peer.fd);
                     peer.fd = -1;
                 }
             }
@@ -1053,6 +1053,20 @@ pub fn EventLoopOf(comptime IO: type) type {
         /// Bypasses the async socket/connect SQE chain — intended for testing
         /// with socketpairs. MSE is skipped; the peer uses plaintext BitTorrent.
         pub fn addConnectedPeer(self: *Self, fd: posix.fd_t, torrent_id: TorrentId) !u16 {
+            return self.addConnectedPeerWithAddress(fd, torrent_id, null);
+        }
+
+        /// Variant of `addConnectedPeer` that lets the caller supply the peer
+        /// address used for ban tracking. Sim tests that spin up many SimPeer
+        /// seeders need distinct addresses so per-peer ban state doesn't bleed
+        /// across peers (BanList keys on address). When `address_opt` is null,
+        /// defaults to 127.0.0.1 like the original entry point.
+        pub fn addConnectedPeerWithAddress(
+            self: *Self,
+            fd: posix.fd_t,
+            torrent_id: TorrentId,
+            address_opt: ?std.net.Address,
+        ) !u16 {
             if (self.getTorrentContext(torrent_id) == null) return error.TorrentNotFound;
             if (self.peer_count >= self.max_connections) return error.ConnectionLimitReached;
 
@@ -1063,7 +1077,7 @@ pub fn EventLoopOf(comptime IO: type) type {
                 .state = .connecting,
                 .mode = .outbound,
                 .torrent_id = torrent_id,
-                .address = std.net.Address.initIp4(.{ 127, 0, 0, 1 }, 0),
+                .address = address_opt orelse std.net.Address.initIp4(.{ 127, 0, 0, 1 }, 0),
             };
             peer.last_activity = self.clock.now();
 
@@ -2431,7 +2445,7 @@ pub fn EventLoopOf(comptime IO: type) type {
                 if (peer.transport == .tcp) {
                     self.shutdownPeerFd(peer.fd);
                 }
-                posix.close(peer.fd);
+                self.io.closeSocket(peer.fd);
             }
             if (peer.body_is_heap) {
                 if (peer.body_buf) |buf| self.allocator.free(buf);

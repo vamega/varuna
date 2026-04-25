@@ -57,7 +57,7 @@ const RangeContext = struct {
 /// Called each tick from the event loop. Scans torrents for available
 /// web seeds and unclaimed pieces, then submits batched HTTP range requests
 /// covering contiguous runs of pieces (up to web_seed_max_request_bytes).
-pub fn tryAssignWebSeedPieces(el: *EventLoop) void {
+pub fn tryAssignWebSeedPieces(el: anytype) void {
     // During graceful shutdown drain, don't start new web seed requests
     if (el.draining) return;
 
@@ -200,14 +200,14 @@ fn releaseRunPieces(pt: anytype, first_piece: u32, count: u32) void {
     }
 }
 
-fn slotIndex(el: *EventLoop, slot: *WebSeedSlot) u8 {
+fn slotIndex(el: anytype, slot: *WebSeedSlot) u8 {
     const base = @intFromPtr(&el.web_seed_slots[0]);
     const ptr = @intFromPtr(slot);
     return @intCast((ptr - base) / @sizeOf(WebSeedSlot));
 }
 
 fn submitMultiPieceRangeRequest(
-    el: *EventLoop,
+    el: anytype,
     he: *HttpExecutor,
     wsm: *WebSeedManager,
     slot_idx: u8,
@@ -225,7 +225,10 @@ fn submitMultiPieceRangeRequest(
     // Freed in the completion callback.
     const ctx = el.allocator.create(RangeContext) catch return error.OutOfMemory;
     ctx.* = .{
-        .event_loop = el,
+        // RangeContext.event_loop is concrete `*EventLoop` (RealIO).
+        // Web-seed path doesn't fire under simulator_mode usage; cast
+        // keeps SimIO instantiations compiling.
+        .event_loop = @ptrCast(@alignCast(el)),
         .slot_index = slot_idx,
     };
 
@@ -375,7 +378,7 @@ fn webSeedRangeComplete(context: *anyopaque, result: HttpExecutor.RequestResult)
 
 /// Split the completed multi-piece buffer at piece boundaries and submit
 /// each piece to the background hasher for SHA verification.
-fn submitPiecesToHasher(el: *EventLoop, slot: *WebSeedSlot, slot_idx: u8) void {
+fn submitPiecesToHasher(el: anytype, slot: *WebSeedSlot, slot_idx: u8) void {
     const tc = el.getTorrentContext(slot.torrent_id) orelse {
         failSlot(el, slot);
         return;
@@ -461,7 +464,7 @@ fn submitPiecesToHasher(el: *EventLoop, slot: *WebSeedSlot, slot_idx: u8) void {
 
 /// Inline SHA-1 verification and disk write for multi-piece runs
 /// (fallback when hasher is unavailable).
-fn inlineVerifyMultiPiece(el: *EventLoop, slot: *WebSeedSlot) void {
+fn inlineVerifyMultiPiece(el: anytype, slot: *WebSeedSlot) void {
     const Sha1 = @import("../crypto/root.zig").Sha1;
 
     const tc = el.getTorrentContext(slot.torrent_id) orelse {
@@ -610,7 +613,7 @@ fn inlineVerifyMultiPiece(el: *EventLoop, slot: *WebSeedSlot) void {
 }
 
 /// Release all pieces in a multi-piece slot on failure and free the slot.
-fn failSlot(el: *EventLoop, slot: *WebSeedSlot) void {
+fn failSlot(el: anytype, slot: *WebSeedSlot) void {
     const now = el.clock.now();
 
     if (el.getTorrentContext(slot.torrent_id)) |tc| {

@@ -7,7 +7,7 @@ const address = @import("../net/address.zig");
 
 /// Process a UDP datagram as a DHT/KRPC message.
 /// Called from the uTP recv handler when the first byte is 'd' (bencode dict).
-pub fn handleDhtRecv(self: *EventLoop, data: []const u8, sender: std.net.Address) void {
+pub fn handleDhtRecv(self: anytype, data: []const u8, sender: std.net.Address) void {
     const engine = self.dht_engine orelse return;
     engine.handleIncoming(data, sender);
 
@@ -16,7 +16,7 @@ pub fn handleDhtRecv(self: *EventLoop, data: []const u8, sender: std.net.Address
 }
 
 /// Periodic DHT tick. Called from the event loop's main tick().
-pub fn dhtTick(self: *EventLoop) void {
+pub fn dhtTick(self: anytype) void {
     const engine = self.dht_engine orelse return;
     const now = self.clock.now();
     engine.tick(now);
@@ -30,7 +30,7 @@ pub fn dhtTick(self: *EventLoop) void {
 
 /// Drain the DHT engine's outbound send queue and send packets via
 /// the shared UDP socket (reusing the uTP send path).
-fn drainDhtSendQueue(self: *EventLoop) void {
+fn drainDhtSendQueue(self: anytype) void {
     const engine = self.dht_engine orelse return;
 
     while (engine.send_queue.items.len > 0) {
@@ -42,7 +42,7 @@ fn drainDhtSendQueue(self: *EventLoop) void {
 
 /// Drain DHT peer results and feed discovered peers into the peer
 /// connection pipeline.
-fn drainDhtPeerResults(self: *EventLoop) void {
+fn drainDhtPeerResults(self: anytype) void {
     const engine = self.dht_engine orelse return;
 
     while (engine.peer_results.items.len > 0) {

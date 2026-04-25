@@ -94,6 +94,14 @@ pub const RealIO = struct {
         self.* = undefined;
     }
 
+    /// Synchronously close a file descriptor. The signature matches
+    /// `SimIO.closeSocket` so EventLoop.deinit can use `self.io.closeSocket(fd)`
+    /// uniformly across both backends. RealIO calls `posix.close`; SimIO
+    /// marks its slot closed and fails any parked recv on it.
+    pub fn closeSocket(_: *RealIO, fd: posix.fd_t) void {
+        posix.close(fd);
+    }
+
     /// Submit any pending SQEs and dispatch all available CQEs by
     /// invoking the corresponding `Completion.callback`. Returns once the
     /// CQ is empty.
