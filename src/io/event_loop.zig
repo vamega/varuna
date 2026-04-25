@@ -195,9 +195,12 @@ pub const EventLoop = struct {
     /// When both outgoing TCP and uTP are enabled, even values use TCP and odd values use uTP.
     utp_transport_counter: u32 = 0,
 
-    // signalfd for SIGINT/SIGTERM — produces a CQE via POLL_ADD when
-    // a shutdown signal arrives, breaking submit_and_wait immediately.
+    // signalfd for SIGINT/SIGTERM — produces a CQE via `io.poll` when
+    // a shutdown signal arrives. The callback (`signalPollComplete`)
+    // sets `running = false` and re-arms after the first signal so a
+    // second signal forces immediate shutdown.
     signal_fd: posix.fd_t = -1,
+    signal_completion: io_interface.Completion = .{},
 
     // Accept socket for seeding (-1 if not seeding)
     listen_fd: posix.fd_t = -1,
@@ -382,18 +385,51 @@ pub const EventLoop = struct {
         };
     }
 
-    /// Sentinel user_data for signalfd POLL_ADD CQEs.
-    const signal_sentinel: u64 = 0xDEAD_51C0A1_DEAD;
-
-    /// Create a signalfd for SIGINT/SIGTERM and register it with the ring
-    /// via POLL_ADD. When a signal arrives, the CQE fires and dispatch()
-    /// sets self.running = false, breaking the submit_and_wait loop.
+    /// Create a signalfd for SIGINT/SIGTERM and arm a one-shot
+    /// `io.poll(POLL_IN)` against it. When a signal arrives, the
+    /// completion fires and `signalPollComplete` decides between graceful
+    /// drain and immediate shutdown.
     pub fn installSignalFd(self: *EventLoop) !void {
         const signal = @import("signal.zig");
         const fd = try signal.createSignalFd();
         self.signal_fd = fd;
-        // Register a oneshot POLL_ADD — we only need one signal to shut down.
-        _ = try self.ring.poll_add(signal_sentinel, fd, linux.POLL.IN);
+        try self.io.poll(
+            .{ .fd = fd, .events = linux.POLL.IN },
+            &self.signal_completion,
+            self,
+            signalPollComplete,
+        );
+    }
+
+    /// Callback for `signal_completion`. Fires when the kernel posts a
+    /// readable signalfd. First fire enters graceful drain (or immediate
+    /// shutdown if `shutdown_timeout == 0`); a second fire while draining
+    /// forces immediate exit. Re-arms after the first fire so the second
+    /// signal is caught.
+    fn signalPollComplete(
+        userdata: ?*anyopaque,
+        _: *io_interface.Completion,
+        _: io_interface.Result,
+    ) io_interface.CallbackAction {
+        const self: *EventLoop = @ptrCast(@alignCast(userdata.?));
+        const signal = @import("signal.zig");
+        if (self.draining) {
+            log.info("second shutdown signal received, forcing immediate exit", .{});
+            self.running = false;
+            signal.requestShutdown();
+            return .disarm;
+        }
+        if (self.shutdown_timeout == 0) {
+            log.info("shutdown signal received via signalfd", .{});
+            self.running = false;
+            signal.requestShutdown();
+            return .disarm;
+        }
+        log.info("shutting down gracefully, draining in-flight transfers (timeout={d}s)...", .{self.shutdown_timeout});
+        self.draining = true;
+        self.drain_deadline = self.clock.now() + @as(i64, @intCast(self.shutdown_timeout));
+        // Re-arm so a second signal during drain forces immediate exit.
+        return .rearm;
     }
 
     pub fn init(
@@ -1836,31 +1872,6 @@ pub const EventLoop = struct {
     // ── CQE dispatch ──────────────────────────────────────
 
     fn dispatch(self: *EventLoop, cqe: linux.io_uring_cqe) void {
-        // signalfd CQE — SIGINT or SIGTERM received
-        if (cqe.user_data == signal_sentinel) {
-            const signal = @import("signal.zig");
-            if (self.draining) {
-                // Second signal while draining: force immediate shutdown
-                log.info("second shutdown signal received, forcing immediate exit", .{});
-                self.running = false;
-                signal.requestShutdown();
-                return;
-            }
-            if (self.shutdown_timeout == 0) {
-                // Immediate shutdown (no drain)
-                log.info("shutdown signal received via signalfd", .{});
-                self.running = false;
-                signal.requestShutdown();
-                return;
-            }
-            log.info("shutting down gracefully, draining in-flight transfers (timeout={d}s)...", .{self.shutdown_timeout});
-            self.draining = true;
-            self.drain_deadline = self.clock.now() + @as(i64, @intCast(self.shutdown_timeout));
-            // Re-arm the signalfd poll so a second signal is caught
-            _ = self.ring.poll_add(signal_sentinel, self.signal_fd, linux.POLL.IN) catch {};
-            return;
-        }
-
         const op = decodeUserData(cqe.user_data);
         switch (op.op_type) {
             .peer_socket => peer_handler.handleSocketCreated(self, op.slot, cqe),
