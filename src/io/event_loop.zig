@@ -88,6 +88,7 @@ pub const EventLoop = struct {
     const VectoredSendLayout = bp.VectoredSendLayout;
     const VectoredSendPool = bp.VectoredSendPool;
     pub const PendingSend = bp.PendingSend;
+    pub const PendingSendPool = bp.PendingSendPool;
     const SmallSendPool = bp.SmallSendPool;
 
     /// A uTP packet waiting to be sent over the UDP socket.
@@ -269,10 +270,14 @@ pub const EventLoop = struct {
     next_pending_write_id: u32 = 1,
 
     // Pending sends: track allocated send buffers (for seed piece responses).
+    // The PendingSends themselves live in `pending_send_pool`; this list
+    // holds pointers into the pool for O(N) lookup by (slot, send_id).
     pending_sends: std.ArrayList(*PendingSend),
+    pending_send_pool: PendingSendPool,
     small_send_pool: SmallSendPool,
     // Monotonic counter for unique PendingSend identification across CQEs.
-    // Starts at 1 because context=0 means "untracked send" (no PendingSend entry).
+    // Starts at 1; send_id == 0 is reserved as the pool's "free slot"
+    // sentinel (see `PendingSend.send_id` comment).
     next_send_id: u32 = 1,
 
     // Pending piece reads: async disk reads for seed piece serving.
@@ -376,6 +381,12 @@ pub const EventLoop = struct {
             .pending_writes = .empty,
             .pending_write_lookup = .empty,
             .pending_sends = std.ArrayList(*PendingSend).empty,
+            // Pool capacity: max_peers (4096) * worst-case in-flight tracked
+            // sends per peer (4 — pipeline refill + keepalive + piece response
+            // + extension handshake leeway). Sized once at init; if the pool
+            // exhausts under abnormal load, callers see error.OutOfMemory and
+            // the daemon retries on the next refill cycle.
+            .pending_send_pool = try PendingSendPool.init(allocator, max_peers * 4),
             .small_send_pool = try SmallSendPool.init(allocator, small_send_slots, small_send_capacity),
             .pending_reads = std.ArrayList(PendingPieceRead).empty,
             .queued_responses = try std.ArrayList(QueuedBlockResponse).initCapacity(allocator, 256),
@@ -541,6 +552,7 @@ pub const EventLoop = struct {
             self.releasePendingSend(ps);
         }
         self.pending_sends.deinit(self.allocator);
+        self.pending_send_pool.deinit(self.allocator);
         self.vectored_send_pool.deinit(self.allocator);
         self.small_send_pool.deinit(self.allocator);
         for (self.pending_reads.items) |pr| {
@@ -2115,6 +2127,7 @@ pub const EventLoop = struct {
                     return .resubmitted;
                 }
             },
+            .free => unreachable, // active PendingSend can't be in `free` state
         }
         return .complete;
     }
@@ -2182,23 +2195,28 @@ pub const EventLoop = struct {
                 }
             },
             .vectored => |state| self.releaseVectoredSendState(state),
+            .free => unreachable, // releasing an already-released PendingSend
         }
-        self.allocator.destroy(pending_send);
+        self.pending_send_pool.release(pending_send);
     }
 
-    /// Append a freshly-allocated PendingSend to `pending_sends` and return it.
-    ///
-    /// TODO(zero-alloc): replace per-send `allocator.create` with a fixed-size
-    /// per-peer pool (`[max_in_flight_sends]PendingSend` + free-list head on
-    /// `Peer`). Stable address for the embedded Completion is the only hard
-    /// requirement; an in-Peer pool gives that without alloc churn on the hot
-    /// path. Bound is auditable at startup.
+    /// Claim a PendingSend slot from the per-EventLoop pool and append it to
+    /// the active list. Zero-alloc on the hot path (the pool's storage is
+    /// pre-allocated at init); the kernel sees stable Completion addresses
+    /// because pool slots never move.
     fn appendPendingSend(self: *EventLoop, ps: PendingSend) !*PendingSend {
-        const heap_ps = try self.allocator.create(PendingSend);
-        errdefer self.allocator.destroy(heap_ps);
-        heap_ps.* = ps;
-        try self.pending_sends.append(self.allocator, heap_ps);
-        return heap_ps;
+        const slot = self.pending_send_pool.claim() orelse return error.OutOfMemory;
+        slot.* = ps;
+        // Reset the embedded Completion to a fresh state. Pool slots are
+        // reused; the previous tenant's `_backend_state` (RealState) had
+        // `in_flight = false` set by `dispatchCqe` before its callback fired,
+        // but explicit reset is cheap and defensive.
+        slot.completion = .{};
+        self.pending_sends.append(self.allocator, slot) catch |err| {
+            self.pending_send_pool.release(slot);
+            return err;
+        };
+        return slot;
     }
 
     /// Submit the in-flight send for a PendingSend through the io_interface
@@ -2226,6 +2244,7 @@ pub const EventLoop = struct {
                 self,
                 peer_handler.pendingSendComplete,
             ),
+            .free => unreachable, // active PendingSend can't be in `free` state
         }
         peer.send_pending = true;
     }
