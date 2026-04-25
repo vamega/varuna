@@ -110,7 +110,16 @@ const BuggifyOpts = struct {
     safety_only: bool = false,
 };
 
-fn runOneSeedAgainstEventLoop(seed: u64, opts: BuggifyOpts) !void {
+/// Outcome of a single seed run, returned to the harness so the BUGGIFY
+/// loop can count "smart-ban actually fired" rates and reject vacuous
+/// passes (e.g. all 32 seeds dropped the corrupt peer's bytes before
+/// the first hash fail).
+const SeedOutcome = struct {
+    corrupt_banned: bool,
+    pieces_done: u8, // count of pieces 1..3 that verified
+};
+
+fn runOneSeedAgainstEventLoop(seed: u64, opts: BuggifyOpts) !SeedOutcome {
     const allocator = testing.allocator;
     var arena = std.heap.ArenaAllocator.init(allocator);
     defer arena.deinit();
@@ -372,6 +381,15 @@ fn runOneSeedAgainstEventLoop(seed: u64, opts: BuggifyOpts) !void {
             try testing.expectEqual(@as(u8, 0), v.hashfails);
         }
     }
+
+    var done_count: u8 = 0;
+    if (el.isPieceComplete(tid, 1)) done_count += 1;
+    if (el.isPieceComplete(tid, 2)) done_count += 1;
+    if (el.isPieceComplete(tid, 3)) done_count += 1;
+    return .{
+        .corrupt_banned = ban_list.isBanned(syntheticAddr(corrupt_peer_index)),
+        .pieces_done = done_count,
+    };
 }
 
 test "smart-ban EventLoop integration: 5 honest + 1 corrupt over 8 seeds" {
@@ -392,7 +410,7 @@ test "smart-ban EventLoop integration: 5 honest + 1 corrupt over 8 seeds" {
         0x9876_5432,
     };
     for (seeds) |seed| {
-        runOneSeedAgainstEventLoop(seed, .{}) catch |err| {
+        _ = runOneSeedAgainstEventLoop(seed, .{}) catch |err| {
             std.debug.print("\n  SEED 0x{x} FAILED: {any}\n", .{ seed, err });
             return err;
         };
@@ -430,10 +448,33 @@ test "smart-ban EventLoop integration with BUGGIFY: 32 seeds, p=0.02 fault injec
         0xE5F6_0708, 0x1A2B_3C4D, 0x5E6F_7080, 0xDEAD_DEAD,
     };
     const opts: BuggifyOpts = .{ .probability = 0.02, .safety_only = true };
+    var ban_seeds: u32 = 0;
+    var pieces_done_total: u32 = 0;
     for (seeds) |seed| {
-        runOneSeedAgainstEventLoop(seed, opts) catch |err| {
+        const outcome = runOneSeedAgainstEventLoop(seed, opts) catch |err| {
             std.debug.print("\n  BUGGIFY SEED 0x{x} FAILED: {any}\n", .{ seed, err });
             return err;
         };
+        if (outcome.corrupt_banned) ban_seeds += 1;
+        pieces_done_total += outcome.pieces_done;
     }
+    std.debug.print("\n  BUGGIFY summary: {d}/{d} seeds banned corrupt, {d}/{d} honest pieces verified\n", .{
+        ban_seeds,
+        seeds.len,
+        pieces_done_total,
+        seeds.len * 3,
+    });
+
+    // Reject vacuous-pass scenarios: BUGGIFY can mask the smart-ban
+    // signal entirely if every seed happens to inject a fault on the
+    // corrupt peer's send before its bytes ever reach the EL — under
+    // that pathology the test passes the safety check trivially with
+    // nothing actually exercised. Demand the corrupt peer be banned in
+    // a meaningful majority of seeds (pinned at half — empirically 30+
+    // of 32 ban under p=0.02 + FaultConfig=0.003, but pinning at half
+    // gives headroom against future fault-density tweaks).
+    try testing.expect(ban_seeds * 2 >= seeds.len);
+    // Honest pieces should also verify in most seed-piece pairs (96
+    // total: 32 seeds × 3 pieces). Same headroom rationale.
+    try testing.expect(pieces_done_total * 2 >= seeds.len * 3);
 }
