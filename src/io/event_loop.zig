@@ -58,8 +58,22 @@ pub const Clock = clock_mod.Clock;
 const cqe_batch_size = 64;
 
 // ── Event loop ────────────────────────────────────────────
+//
+// `EventLoop` is generic over its IO backend at compile time. Daemon
+// callsites use the concrete `EventLoop = EventLoopOf(RealIO)` alias
+// declared below the function; sim tests instantiate `EventLoopOf(SimIO)`
+// directly. The struct body and methods are identical for either; only
+// the `io: IO` field type and any direct `IO.init` calls vary.
+//
+// Cross-module handler functions (peer_handler / utp_handler / protocol /
+// seed_handler / web_seed_handler / dht_handler) take `self: anytype` so
+// they work with either instantiation without per-IO duplication of
+// signatures.
 
-pub const EventLoop = struct {
+pub fn EventLoopOf(comptime IO: type) type {
+    return struct {
+        const Self = @This();
+
     pub const small_send_capacity: usize = 256;
     const small_send_slots: usize = max_peers * 2;
     const default_torrent_capacity: usize = 64;
@@ -145,7 +159,7 @@ pub const EventLoop = struct {
     /// `io_interface`-based io_uring backend driving every async op.
     /// Stage 2 replaced the legacy packed-userdata ring with a single
     /// caller-owned-Completion model.
-    io: RealIO,
+    io: IO,
     allocator: std.mem.Allocator,
     peers: []Peer,
     peer_count: u16 = 0,
@@ -391,7 +405,7 @@ pub const EventLoop = struct {
     /// `io.poll(POLL_IN)` against it. When a signal arrives, the
     /// completion fires and `signalPollComplete` decides between graceful
     /// drain and immediate shutdown.
-    pub fn installSignalFd(self: *EventLoop) !void {
+    pub fn installSignalFd(self: *Self) !void {
         const signal = @import("signal.zig");
         const fd = try signal.createSignalFd();
         self.signal_fd = fd;
@@ -413,7 +427,7 @@ pub const EventLoop = struct {
         _: *io_interface.Completion,
         _: io_interface.Result,
     ) io_interface.CallbackAction {
-        const self: *EventLoop = @ptrCast(@alignCast(userdata.?));
+        const self: *Self = @ptrCast(@alignCast(userdata.?));
         const signal = @import("signal.zig");
         if (self.draining) {
             log.info("second shutdown signal received, forcing immediate exit", .{});
@@ -450,7 +464,7 @@ pub const EventLoop = struct {
         return el;
     }
 
-    pub fn deinit(self: *EventLoop) void {
+    pub fn deinit(self: *Self) void {
         if (self.hasher) |h| {
             h.deinit();
             self.allocator.destroy(h);
@@ -631,7 +645,7 @@ pub const EventLoop = struct {
     /// Drain pending CQEs from the io_interface ring after fds are closed.
     /// Used during deinit to ensure the kernel has finished touching any
     /// buffers we're about to free.
-    fn drainRemainingCqes(self: *EventLoop) void {
+    fn drainRemainingCqes(self: *Self) void {
         var drain_rounds: u32 = 0;
         while (drain_rounds < 256 and self.pendingBufferOperations() > 0) : (drain_rounds += 1) {
             self.io.tick(1) catch break;
@@ -665,7 +679,7 @@ pub const EventLoop = struct {
 
     /// Add a new torrent context to the event loop. Returns torrent_id.
     pub fn addTorrent(
-        self: *EventLoop,
+        self: *Self,
         session: *const session_mod.Session,
         piece_tracker: *PieceTracker,
         shared_fds: []const posix.fd_t,
@@ -676,7 +690,7 @@ pub const EventLoop = struct {
 
     /// Add a new torrent context with a tracker key. Returns torrent_id.
     pub fn addTorrentWithKey(
-        self: *EventLoop,
+        self: *Self,
         session: *const session_mod.Session,
         piece_tracker: *PieceTracker,
         shared_fds: []const posix.fd_t,
@@ -703,7 +717,7 @@ pub const EventLoop = struct {
         });
     }
 
-    pub fn addTorrentContext(self: *EventLoop, tc: TorrentContext) !TorrentId {
+    pub fn addTorrentContext(self: *Self, tc: TorrentContext) !TorrentId {
         const torrent_id = if (self.free_torrent_ids.pop()) |free_id|
             free_id
         else blk: {
@@ -725,7 +739,7 @@ pub const EventLoop = struct {
 
     /// Check whether peer discovery (DHT, PEX, LSD) is allowed for a torrent.
     /// Private torrents MUST only use tracker-provided peers.
-    pub fn isPeerDiscoveryAllowed(self: *EventLoop, torrent_id: TorrentId) bool {
+    pub fn isPeerDiscoveryAllowed(self: *Self, torrent_id: TorrentId) bool {
         if (self.getTorrentContext(torrent_id)) |tc| {
             return !tc.is_private;
         }
@@ -733,7 +747,7 @@ pub const EventLoop = struct {
     }
 
     /// Set the complete_pieces bitfield for a torrent (enables seed mode).
-    pub fn setTorrentCompletePieces(self: *EventLoop, torrent_id: TorrentId, cp: *const Bitfield) void {
+    pub fn setTorrentCompletePieces(self: *Self, torrent_id: TorrentId, cp: *const Bitfield) void {
         if (self.getTorrentContext(torrent_id)) |tc| {
             tc.complete_pieces = cp;
         }
@@ -744,7 +758,7 @@ pub const EventLoop = struct {
     /// Initialize the BEP 52 Merkle tree cache for a v2/hybrid torrent.
     /// Must be called after the torrent is added and has a valid session.
     /// Safe to call for v1 torrents (no-op) or multiple times (idempotent).
-    pub fn initMerkleCache(self: *EventLoop, torrent_id: TorrentId) void {
+    pub fn initMerkleCache(self: *Self, torrent_id: TorrentId) void {
         const tc = self.getTorrentContext(torrent_id) orelse return;
         if (tc.merkle_cache != null) return; // already initialized
 
@@ -767,7 +781,7 @@ pub const EventLoop = struct {
 
     /// Ensure the event loop is accepting inbound connections.
     /// Safe to call multiple times -- only sets up accepting once.
-    pub fn ensureAccepting(self: *EventLoop, listen_fd: posix.fd_t) !void {
+    pub fn ensureAccepting(self: *Self, listen_fd: posix.fd_t) !void {
         if (self.listen_fd >= 0) return;
         self.listen_fd = listen_fd;
         try self.submitAccept();
@@ -796,7 +810,7 @@ pub const EventLoop = struct {
         };
     }
 
-    pub fn accountTorrentBytes(self: *EventLoop, torrent_id: TorrentId, dl_bytes: usize, ul_bytes: usize) void {
+    pub fn accountTorrentBytes(self: *Self, torrent_id: TorrentId, dl_bytes: usize, ul_bytes: usize) void {
         if (self.getTorrentContext(torrent_id)) |tc| {
             if (dl_bytes != 0) tc.downloaded_bytes +%= @intCast(dl_bytes);
             if (ul_bytes != 0) tc.uploaded_bytes +%= @intCast(ul_bytes);
@@ -804,7 +818,7 @@ pub const EventLoop = struct {
     }
 
     /// Remove a torrent context and disconnect all its peers.
-    pub fn removeTorrent(self: *EventLoop, torrent_id: TorrentId) void {
+    pub fn removeTorrent(self: *Self, torrent_id: TorrentId) void {
         // Smart Ban: free any per-block records / pending attribution for
         // this torrent (otherwise they'd leak).
         if (self.smart_ban) |sb| sb.clearTorrent(torrent_id);
@@ -848,7 +862,7 @@ pub const EventLoop = struct {
         if (self.torrent_count > 0) self.torrent_count -= 1;
     }
 
-    pub fn attachPeerToTorrent(self: *EventLoop, torrent_id: TorrentId, slot: u16) void {
+    pub fn attachPeerToTorrent(self: *Self, torrent_id: TorrentId, slot: u16) void {
         const tc = self.getTorrentContext(torrent_id) orelse return;
         const peer = &self.peers[slot];
         if (peer.torrent_peer_index != null) return;
@@ -869,7 +883,7 @@ pub const EventLoop = struct {
         }
     }
 
-    fn detachPeerFromTorrent(self: *EventLoop, torrent_id: TorrentId, slot: u16) void {
+    fn detachPeerFromTorrent(self: *Self, torrent_id: TorrentId, slot: u16) void {
         const tc = self.getTorrentContext(torrent_id) orelse return;
         const peer = &self.peers[slot];
         const idx = peer.torrent_peer_index orelse return;
@@ -906,7 +920,7 @@ pub const EventLoop = struct {
     /// transport disposition. When both outgoing TCP and uTP are enabled,
     /// alternates using a simple counter (approximately 50/50 split).
     /// When only one outgoing transport is enabled, always returns that one.
-    pub fn selectTransport(self: *EventLoop) Transport {
+    pub fn selectTransport(self: *Self) Transport {
         const disp = self.transport_disposition;
         if (disp.outgoing_tcp and disp.outgoing_utp) {
             // Both enabled: alternate
@@ -923,7 +937,7 @@ pub const EventLoop = struct {
     /// Add a peer using the transport selected by `selectTransport()`.
     /// When uTP is selected but the connection fails (e.g. no UDP socket),
     /// falls back to TCP transparently.
-    pub fn addPeerAutoTransport(self: *EventLoop, address: std.net.Address, torrent_id: TorrentId) !u16 {
+    pub fn addPeerAutoTransport(self: *Self, address: std.net.Address, torrent_id: TorrentId) !u16 {
         const transport = self.selectTransport();
         if (transport == .utp) {
             return self.addUtpPeer(address, torrent_id) catch |err| switch (err) {
@@ -934,11 +948,11 @@ pub const EventLoop = struct {
         return self.addPeerForTorrent(address, torrent_id);
     }
 
-    pub fn addPeer(self: *EventLoop, address: std.net.Address) !u16 {
+    pub fn addPeer(self: *Self, address: std.net.Address) !u16 {
         return self.addPeerForTorrent(address, 0);
     }
 
-    pub fn addPeerForTorrent(self: *EventLoop, address: std.net.Address, torrent_id: TorrentId) !u16 {
+    pub fn addPeerForTorrent(self: *Self, address: std.net.Address, torrent_id: TorrentId) !u16 {
         // Reject new outbound connections during graceful shutdown drain
         if (self.draining) return error.ShuttingDown;
 
@@ -1012,7 +1026,7 @@ pub const EventLoop = struct {
     /// Register a pre-connected fd as an outbound peer for `torrent_id`.
     /// Bypasses the async socket/connect SQE chain — intended for testing
     /// with socketpairs. MSE is skipped; the peer uses plaintext BitTorrent.
-    pub fn addConnectedPeer(self: *EventLoop, fd: posix.fd_t, torrent_id: TorrentId) !u16 {
+    pub fn addConnectedPeer(self: *Self, fd: posix.fd_t, torrent_id: TorrentId) !u16 {
         if (self.getTorrentContext(torrent_id) == null) return error.TorrentNotFound;
         if (self.peer_count >= self.max_connections) return error.ConnectionLimitReached;
 
@@ -1046,7 +1060,7 @@ pub const EventLoop = struct {
     /// the network). The torrent_id is known up front so we can attach
     /// immediately rather than wait for the handshake's info_hash match.
     pub fn addInboundPeer(
-        self: *EventLoop,
+        self: *Self,
         torrent_id: TorrentId,
         fd: posix.fd_t,
         peer_addr: std.net.Address,
@@ -1095,7 +1109,7 @@ pub const EventLoop = struct {
     /// Return a snapshot of the peer at `slot`, or null if the slot is
     /// unused. `is_banned` consults the shared `BanList` if one is
     /// installed, else reports false.
-    pub fn getPeerView(self: *EventLoop, slot: u16) ?PeerView {
+    pub fn getPeerView(self: *Self, slot: u16) ?PeerView {
         if (slot >= self.peers.len) return null;
         const peer = &self.peers[slot];
         if (peer.state == .free) return null;
@@ -1114,7 +1128,7 @@ pub const EventLoop = struct {
     /// Returns true if the torrent's piece tracker reports this piece as
     /// complete (downloaded + verified). Returns false if the torrent
     /// doesn't exist or has no piece tracker attached.
-    pub fn isPieceComplete(self: *EventLoop, torrent_id: TorrentId, piece_index: u32) bool {
+    pub fn isPieceComplete(self: *Self, torrent_id: TorrentId, piece_index: u32) bool {
         const tc = self.getTorrentContext(torrent_id) orelse return false;
         const pt = tc.piece_tracker orelse return false;
         return pt.isPieceComplete(piece_index);
@@ -1123,7 +1137,7 @@ pub const EventLoop = struct {
     /// Initiate an outbound uTP connection to a peer. Creates the uTP
     /// socket via the UtpManager, sends the SYN packet, and allocates a
     /// peer slot in the event loop.
-    pub fn addUtpPeer(self: *EventLoop, address: std.net.Address, torrent_id: TorrentId) !u16 {
+    pub fn addUtpPeer(self: *Self, address: std.net.Address, torrent_id: TorrentId) !u16 {
         // Reject new outbound connections during graceful shutdown drain
         if (self.draining) return error.ShuttingDown;
 
@@ -1184,7 +1198,7 @@ pub const EventLoop = struct {
     }
 
     /// Start accepting inbound connections for seeding.
-    pub fn startAccepting(self: *EventLoop, listen_fd: posix.fd_t, complete_pieces: *const Bitfield) !void {
+    pub fn startAccepting(self: *Self, listen_fd: posix.fd_t, complete_pieces: *const Bitfield) !void {
         self.listen_fd = listen_fd;
         self.complete_pieces = complete_pieces;
         try self.submitAccept();
@@ -1194,7 +1208,7 @@ pub const EventLoop = struct {
     /// Creates a dual-stack IPv6 UDP socket (handles IPv4-mapped addresses too),
     /// binds to the daemon's listen port, initializes the UtpManager, and
     /// submits the first RECVMSG.
-    pub fn startUtpListener(self: *EventLoop) !void {
+    pub fn startUtpListener(self: *Self) !void {
         if (self.udp_fd >= 0) return; // already listening
 
         // Create a dual-stack IPv6 UDP socket. When IPV6_V6ONLY is 0, the
@@ -1244,7 +1258,7 @@ pub const EventLoop = struct {
     /// closes the UDP socket via io_uring, and frees the UtpManager.
     /// The cancel and close CQEs will be processed on the next tick;
     /// setting udp_fd = -1 immediately ensures the dispatch loop ignores them.
-    pub fn stopUtpListener(self: *EventLoop) void {
+    pub fn stopUtpListener(self: *Self) void {
         if (self.udp_fd < 0) return;
         const fd = self.udp_fd;
         self.udp_fd = -1;
@@ -1270,7 +1284,7 @@ pub const EventLoop = struct {
     /// Create and bind a TCP listen socket on the configured port.
     /// Tries each port in [port, port] (single port for now).
     /// Submits the first ACCEPT to the ring.
-    pub fn startTcpListener(self: *EventLoop) !void {
+    pub fn startTcpListener(self: *Self) !void {
         if (self.listen_fd >= 0) return; // already listening
 
         const bind_addr_str = self.bind_address orelse "0.0.0.0";
@@ -1303,7 +1317,7 @@ pub const EventLoop = struct {
     /// Stop the TCP listener. Cancels the pending multishot ACCEPT,
     /// then closes the listen socket via io_uring. Setting listen_fd = -1
     /// immediately ensures the dispatch loop ignores stale CQEs.
-    pub fn stopTcpListener(self: *EventLoop) void {
+    pub fn stopTcpListener(self: *Self) void {
         if (self.listen_fd < 0) return;
         const fd = self.listen_fd;
         self.listen_fd = -1;
@@ -1333,7 +1347,7 @@ pub const EventLoop = struct {
     /// Ensure listeners match the current transport disposition.
     /// Call after changing transport_disposition at runtime.
     /// Starts or stops TCP and UDP listeners as needed.
-    pub fn reconcileListeners(self: *EventLoop) void {
+    pub fn reconcileListeners(self: *Self) void {
         const disp = self.transport_disposition;
         const dht_active = self.dht_engine != null;
 
@@ -1363,7 +1377,7 @@ pub const EventLoop = struct {
         }
     }
 
-    pub fn removePeer(self: *EventLoop, slot: u16) void {
+    pub fn removePeer(self: *Self, slot: u16) void {
         const peer = &self.peers[slot];
         // Track half-open connection cleanup
         if (peer.state == .connecting and self.half_open_count > 0) {
@@ -1436,7 +1450,7 @@ pub const EventLoop = struct {
 
     // ── Run loop ───────────────────────────────────────────
 
-    pub fn run(self: *EventLoop) !void {
+    pub fn run(self: *Self) !void {
         const signal = @import("signal.zig");
         while (self.running and !(if (self.getTorrentContext(0)) |tc| if (tc.piece_tracker) |pt| pt.isComplete() else false else false)) {
             if (signal.isShutdownRequested()) {
@@ -1448,7 +1462,7 @@ pub const EventLoop = struct {
         }
     }
 
-    pub fn tick(self: *EventLoop) !void {
+    pub fn tick(self: *Self) !void {
         // Check if ban list was updated by API handlers
         if (self.ban_list_dirty.swap(false, .acquire)) {
             self.enforceBans();
@@ -1507,7 +1521,7 @@ pub const EventLoop = struct {
     /// Returns true if there is in-flight transfer work that should complete
     /// before a graceful shutdown. Checks pending disk writes, hasher work,
     /// and peers with active piece downloads.
-    pub fn hasPendingTransferWork(self: *EventLoop) bool {
+    pub fn hasPendingTransferWork(self: *Self) bool {
         // Pending disk writes
         if (self.pending_writes.count() > 0) return true;
 
@@ -1527,7 +1541,7 @@ pub const EventLoop = struct {
 
     /// Submit a timeout SQE so that submit_and_wait returns even if
     /// no I/O completes. This allows the caller to do periodic work.
-    pub fn submitTimeout(self: *EventLoop, timeout_ns: u64) !void {
+    pub fn submitTimeout(self: *Self, timeout_ns: u64) !void {
         if (self.timeout_pending) return; // previous timeout still in flight
         try self.io.timeout(
             .{ .ns = timeout_ns },
@@ -1543,7 +1557,7 @@ pub const EventLoop = struct {
         _: *io_interface.Completion,
         _: io_interface.Result,
     ) io_interface.CallbackAction {
-        const self: *EventLoop = @ptrCast(@alignCast(userdata.?));
+        const self: *Self = @ptrCast(@alignCast(userdata.?));
         self.timeout_pending = false;
         return .disarm;
     }
@@ -1553,7 +1567,7 @@ pub const EventLoop = struct {
     /// Schedule a one-shot timer that fires `delay_ms` milliseconds from now.
     /// When the timer fires, `callback(context)` is invoked from the event
     /// loop thread during CQE dispatch.
-    pub fn scheduleTimer(self: *EventLoop, delay_ms: u64, context: *anyopaque, callback: *const fn (*anyopaque) void) !void {
+    pub fn scheduleTimer(self: *Self, delay_ms: u64, context: *anyopaque, callback: *const fn (*anyopaque) void) !void {
         const now_ms = nowMonotonicMs();
         const fire_at_ms: i64 = now_ms +| @as(i64, @intCast(@min(delay_ms, std.math.maxInt(i63))));
 
@@ -1571,7 +1585,7 @@ pub const EventLoop = struct {
     /// callback dispatch (`tickTimeoutComplete`) re-arms with the up-to-date
     /// soonest deadline, which is sufficient because `fireExpiredTimers`
     /// drains *all* expired entries every wakeup.
-    fn armNextTimer(self: *EventLoop) void {
+    fn armNextTimer(self: *Self) void {
         if (self.timer_callbacks.items.len == 0) return;
         if (self.timer_pending) return; // CQE will fire fireExpiredTimers + re-arm.
 
@@ -1604,7 +1618,7 @@ pub const EventLoop = struct {
         _: *io_interface.Completion,
         _: io_interface.Result,
     ) io_interface.CallbackAction {
-        const self: *EventLoop = @ptrCast(@alignCast(userdata.?));
+        const self: *Self = @ptrCast(@alignCast(userdata.?));
         self.timer_pending = false;
         self.fireExpiredTimers();
         return .disarm;
@@ -1612,7 +1626,7 @@ pub const EventLoop = struct {
 
     /// Fire all timer callbacks whose deadline has passed, then re-arm
     /// for the next pending timer (if any).
-    fn fireExpiredTimers(self: *EventLoop) void {
+    fn fireExpiredTimers(self: *Self) void {
         const now_ms = nowMonotonicMs();
 
         var i: usize = 0;
@@ -1639,13 +1653,13 @@ pub const EventLoop = struct {
         return @as(i64, @intCast(ts.sec)) * std.time.ms_per_s + @divFloor(@as(i64, @intCast(ts.nsec)), std.time.ns_per_ms);
     }
 
-    pub fn stop(self: *EventLoop) void {
+    pub fn stop(self: *Self) void {
         self.running = false;
     }
 
     /// Process completed hash results from the background hasher.
     /// Public wrapper for external callers (e.g. torrent_session).
-    pub fn processHashResults(self: *EventLoop) void {
+    pub fn processHashResults(self: *Self) void {
         peer_policy.processHashResults(self);
     }
 
@@ -1658,7 +1672,7 @@ pub const EventLoop = struct {
     /// `caller_ctx` is an opaque pointer stored on the AsyncRecheck for
     /// the on_complete callback to retrieve its parent object.
     pub fn startRecheck(
-        self: *EventLoop,
+        self: *Self,
         session: *const @import("../torrent/session.zig").Session,
         fds: []const posix.fd_t,
         torrent_id: TorrentId,
@@ -1685,7 +1699,7 @@ pub const EventLoop = struct {
 
     /// Cancel and destroy the recheck for a specific torrent. Safe to call
     /// if no recheck is active for that torrent.
-    pub fn cancelRecheckForTorrent(self: *EventLoop, torrent_id: TorrentId) void {
+    pub fn cancelRecheckForTorrent(self: *Self, torrent_id: TorrentId) void {
         var i: usize = 0;
         while (i < self.rechecks.items.len) {
             if (self.rechecks.items[i].torrent_id == torrent_id) {
@@ -1699,7 +1713,7 @@ pub const EventLoop = struct {
     }
 
     /// Cancel and destroy all active rechecks. Used during shutdown.
-    pub fn cancelAllRechecks(self: *EventLoop) void {
+    pub fn cancelAllRechecks(self: *Self) void {
         for (self.rechecks.items) |rc| {
             rc.destroy();
         }
@@ -1712,7 +1726,7 @@ pub const EventLoop = struct {
     /// Start an async BEP 9 metadata fetch for a magnet link.
     /// The on_complete callback fires when metadata is available or all peers fail.
     pub fn startMetadataFetch(
-        self: *EventLoop,
+        self: *Self,
         info_hash: [20]u8,
         peer_id: [20]u8,
         port: u16,
@@ -1738,7 +1752,7 @@ pub const EventLoop = struct {
     }
 
     /// Cancel and destroy an active metadata fetch. Safe to call if none is active.
-    pub fn cancelMetadataFetch(self: *EventLoop) void {
+    pub fn cancelMetadataFetch(self: *Self) void {
         if (self.metadata_fetch) |mf| {
             mf.destroy();
             self.metadata_fetch = null;
@@ -1749,7 +1763,7 @@ pub const EventLoop = struct {
 
     /// Scan all connected peers and disconnect any that are banned.
     /// Called from tick() when the ban_list_dirty flag is set.
-    pub fn enforceBans(self: *EventLoop) void {
+    pub fn enforceBans(self: *Self) void {
         const bl = self.ban_list orelse return;
         for (self.peers, 0..) |*peer, i| {
             if (peer.state == .free) continue;
@@ -1763,12 +1777,12 @@ pub const EventLoop = struct {
     // ── Rate limiting ────────────────────────────────────
 
     /// Set global download rate limit (bytes/sec). 0 = unlimited.
-    pub fn setGlobalDlLimit(self: *EventLoop, rate: u64) void {
+    pub fn setGlobalDlLimit(self: *Self, rate: u64) void {
         self.global_rate_limiter.setDownloadRate(rate);
     }
 
     /// Set global upload rate limit (bytes/sec). 0 = unlimited.
-    pub fn setGlobalUlLimit(self: *EventLoop, rate: u64) void {
+    pub fn setGlobalUlLimit(self: *Self, rate: u64) void {
         self.global_rate_limiter.setUploadRate(rate);
     }
 
@@ -1792,14 +1806,14 @@ pub const EventLoop = struct {
     }
 
     /// Set per-torrent download rate limit (bytes/sec). 0 = unlimited.
-    pub fn setTorrentDlLimit(self: *EventLoop, torrent_id: TorrentId, rate: u64) void {
+    pub fn setTorrentDlLimit(self: *Self, torrent_id: TorrentId, rate: u64) void {
         if (self.getTorrentContext(torrent_id)) |tc| {
             tc.rate_limiter.setDownloadRate(rate);
         }
     }
 
     /// Set per-torrent upload rate limit (bytes/sec). 0 = unlimited.
-    pub fn setTorrentUlLimit(self: *EventLoop, torrent_id: TorrentId, rate: u64) void {
+    pub fn setTorrentUlLimit(self: *Self, torrent_id: TorrentId, rate: u64) void {
         if (self.getTorrentContext(torrent_id)) |tc| {
             tc.rate_limiter.setUploadRate(rate);
         }
@@ -1820,7 +1834,7 @@ pub const EventLoop = struct {
     /// Enable BEP 16 super-seeding for a torrent. The seeder will send
     /// individual HAVE messages instead of a full bitfield, tracking
     /// which pieces each peer has seen to maximize piece diversity.
-    pub fn enableSuperSeed(self: *EventLoop, torrent_id: TorrentId) !void {
+    pub fn enableSuperSeed(self: *Self, torrent_id: TorrentId) !void {
         const tc = self.getTorrentContext(torrent_id) orelse return error.TorrentNotFound;
         if (tc.super_seed != null) return; // already enabled
         const sess = tc.session orelse return error.NoSession;
@@ -1831,7 +1845,7 @@ pub const EventLoop = struct {
     }
 
     /// Disable BEP 16 super-seeding for a torrent.
-    pub fn disableSuperSeed(self: *EventLoop, torrent_id: TorrentId) void {
+    pub fn disableSuperSeed(self: *Self, torrent_id: TorrentId) void {
         const tc = self.getTorrentContext(torrent_id) orelse return;
         if (tc.super_seed) |ss| {
             ss.deinit();
@@ -1848,7 +1862,7 @@ pub const EventLoop = struct {
 
     /// Configure the huge page piece cache. Call after init, before tick.
     /// `capacity` is the desired cache size in bytes (0 = default 64 MB).
-    pub fn initHugePageCache(self: *EventLoop, capacity: u64) void {
+    pub fn initHugePageCache(self: *Self, capacity: u64) void {
         const default_cache_size: usize = 64 * 1024 * 1024; // 64 MB
         const size: usize = if (capacity > 0) @intCast(@min(capacity, 1 << 32)) else default_cache_size;
         self.huge_page_cache = HugePageCache.init(self.allocator, size);
@@ -1863,7 +1877,7 @@ pub const EventLoop = struct {
     /// Check if a download of `amount` bytes is allowed by both per-torrent
     /// and global rate limiters. Returns the number of bytes allowed (may be
     /// less than requested). Returns 0 if throttled.
-    pub fn consumeDownloadTokens(self: *EventLoop, torrent_id: TorrentId, amount: u64) u64 {
+    pub fn consumeDownloadTokens(self: *Self, torrent_id: TorrentId, amount: u64) u64 {
         // Check per-torrent limit first
         var allowed = amount;
         if (self.getTorrentContext(torrent_id)) |tc| {
@@ -1881,7 +1895,7 @@ pub const EventLoop = struct {
 
     /// Check if an upload of `amount` bytes is allowed by both per-torrent
     /// and global rate limiters. Returns the number of bytes allowed.
-    pub fn consumeUploadTokens(self: *EventLoop, torrent_id: TorrentId, amount: u64) u64 {
+    pub fn consumeUploadTokens(self: *Self, torrent_id: TorrentId, amount: u64) u64 {
         var allowed = amount;
         if (self.getTorrentContext(torrent_id)) |tc| {
             if (tc.rate_limiter.upload.isActive()) {
@@ -1896,7 +1910,7 @@ pub const EventLoop = struct {
     }
 
     /// Check if download is currently throttled for a torrent.
-    pub fn isDownloadThrottled(self: *EventLoop, torrent_id: TorrentId) bool {
+    pub fn isDownloadThrottled(self: *Self, torrent_id: TorrentId) bool {
         if (self.global_rate_limiter.download.isActive()) {
             if (self.global_rate_limiter.download.available() == 0) return true;
         }
@@ -1909,7 +1923,7 @@ pub const EventLoop = struct {
     }
 
     /// Check if upload is currently throttled for a torrent.
-    pub fn isUploadThrottled(self: *EventLoop, torrent_id: TorrentId) bool {
+    pub fn isUploadThrottled(self: *Self, torrent_id: TorrentId) bool {
         if (self.global_rate_limiter.upload.isActive()) {
             if (self.global_rate_limiter.upload.available() == 0) return true;
         }
@@ -1935,7 +1949,7 @@ pub const EventLoop = struct {
     /// Immediately tries to claim a piece and start downloading so that a peer
     /// that sends UNCHOKE + HAVE + EOF in rapid succession still gets served
     /// before the EOF CQE lands and removes the slot.
-    pub fn markIdle(self: *EventLoop, slot: u16) void {
+    pub fn markIdle(self: *Self, slot: u16) void {
         const peer = &self.peers[slot];
         if (!isIdleCandidate(peer)) return;
         if (peer.idle_peer_index != null) return;
@@ -1974,7 +1988,7 @@ pub const EventLoop = struct {
     }
 
     /// Remove a slot from the idle_peers list (swap-remove for O(1)).
-    pub fn unmarkIdle(self: *EventLoop, slot: u16) void {
+    pub fn unmarkIdle(self: *Self, slot: u16) void {
         const peer = &self.peers[slot];
         const idx = peer.idle_peer_index orelse return;
         if (idx + 1 < self.idle_peers.items.len) {
@@ -1987,7 +2001,7 @@ pub const EventLoop = struct {
         peer.idle_peer_index = null;
     }
 
-    pub fn markActivePeer(self: *EventLoop, slot: u16) void {
+    pub fn markActivePeer(self: *Self, slot: u16) void {
         const peer = &self.peers[slot];
         if (peer.active_peer_index != null) return;
         const idx: u16 = @intCast(self.active_peer_slots.items.len);
@@ -1998,7 +2012,7 @@ pub const EventLoop = struct {
         peer.active_peer_index = idx;
     }
 
-    pub fn unmarkActivePeer(self: *EventLoop, slot: u16) void {
+    pub fn unmarkActivePeer(self: *Self, slot: u16) void {
         const peer = &self.peers[slot];
         const idx = peer.active_peer_index orelse return;
         if (idx + 1 < self.active_peer_slots.items.len) {
@@ -2013,7 +2027,7 @@ pub const EventLoop = struct {
 
     // ── Internal helpers ─────────────────────────────────
 
-    pub fn submitAccept(self: *EventLoop) !void {
+    pub fn submitAccept(self: *Self) !void {
         if (self.listen_fd < 0) return;
         try self.io.accept(
             .{ .fd = self.listen_fd, .multishot = true },
@@ -2023,11 +2037,11 @@ pub const EventLoop = struct {
         );
     }
 
-    pub fn createPieceBuffer(self: *EventLoop, size: usize) !*PieceBuffer {
+    pub fn createPieceBuffer(self: *Self, size: usize) !*PieceBuffer {
         return self.piece_buffer_pool.acquire(self.allocator, if (self.huge_page_cache) |*hpc| hpc else null, size);
     }
 
-    pub fn acquireVectoredSendState(self: *EventLoop, batch_len: usize) !*VectoredSendState {
+    pub fn acquireVectoredSendState(self: *Self, batch_len: usize) !*VectoredSendState {
         const state = try self.vectored_send_pool.acquire(self.allocator, batch_len);
         const layout = vectoredSendLayout(state.backing_capacity);
         const headers_bytes = @sizeOf([13]u8) * batch_len;
@@ -2051,12 +2065,12 @@ pub const EventLoop = struct {
         return state;
     }
 
-    pub fn retainPieceBuffer(self: *EventLoop, piece_buffer: *PieceBuffer) void {
+    pub fn retainPieceBuffer(self: *Self, piece_buffer: *PieceBuffer) void {
         _ = self;
         piece_buffer.ref_count += 1;
     }
 
-    pub fn releasePieceBuffer(self: *EventLoop, piece_buffer: *PieceBuffer) void {
+    pub fn releasePieceBuffer(self: *Self, piece_buffer: *PieceBuffer) void {
         std.debug.assert(piece_buffer.ref_count > 0);
         piece_buffer.ref_count -= 1;
         if (piece_buffer.ref_count != 0) return;
@@ -2068,7 +2082,7 @@ pub const EventLoop = struct {
     /// `send_id` is never 0; legacy callers used context=0 to mean
     /// "untracked send", a distinction now expressed as
     /// `Peer.send_completion` vs a heap-allocated `PendingSend`.
-    pub fn nextSendId(self: *EventLoop) u32 {
+    pub fn nextSendId(self: *Self) u32 {
         const id = self.next_send_id;
         self.next_send_id +%= 1;
         if (self.next_send_id == 0) self.next_send_id = 1;
@@ -2083,7 +2097,7 @@ pub const EventLoop = struct {
 
     /// Handle partial send for a tracked PendingSend: re-submit remaining bytes
     /// via the io_interface backend on the same completion.
-    pub fn handlePartialSend(self: *EventLoop, ps: *PendingSend, bytes_sent: usize) PartialSendResult {
+    pub fn handlePartialSend(self: *Self, ps: *PendingSend, bytes_sent: usize) PartialSendResult {
         ps.sent += bytes_sent;
         switch (ps.storage) {
             .owned => |owned| {
@@ -2120,7 +2134,7 @@ pub const EventLoop = struct {
     }
 
     /// Find a PendingSend by (slot, send_id). Returns null if not present.
-    pub fn findPendingSend(self: *EventLoop, slot: u16, send_id: u32) ?*PendingSend {
+    pub fn findPendingSend(self: *Self, slot: u16, send_id: u32) ?*PendingSend {
         for (self.pending_sends.items) |ps| {
             if (ps.slot == slot and ps.send_id == send_id) return ps;
         }
@@ -2132,7 +2146,7 @@ pub const EventLoop = struct {
     /// exactly one buffer.  Freeing all buffers for a slot here would be a
     /// use-after-free when multiple tracked sends are in flight for the
     /// same peer (e.g. extension handshake + piece response).
-    pub fn freeOnePendingSend(self: *EventLoop, slot: u16, send_id: u32) void {
+    pub fn freeOnePendingSend(self: *Self, slot: u16, send_id: u32) void {
         for (self.pending_sends.items, 0..) |ps, i| {
             if (ps.slot == slot and ps.send_id == send_id) {
                 self.releasePendingSend(ps);
@@ -2146,7 +2160,7 @@ pub const EventLoop = struct {
     /// Called during peer removal to clean up any buffers that won't be
     /// reclaimed by future CQE processing (the fd is closed so remaining
     /// CQEs will arrive as errors for a potentially-reused slot).
-    fn freeAllPendingSends(self: *EventLoop, slot: u16) void {
+    fn freeAllPendingSends(self: *Self, slot: u16) void {
         var i: usize = 0;
         while (i < self.pending_sends.items.len) {
             if (self.pending_sends.items[i].slot == slot) {
@@ -2165,14 +2179,14 @@ pub const EventLoop = struct {
         return false;
     }
 
-    fn releaseVectoredSendState(self: *EventLoop, state: *VectoredSendState) void {
+    fn releaseVectoredSendState(self: *Self, state: *VectoredSendState) void {
         for (state.piece_buffers) |piece_buffer| {
             self.releasePieceBuffer(piece_buffer);
         }
         self.vectored_send_pool.release(self.allocator, state);
     }
 
-    fn releasePendingSend(self: *EventLoop, pending_send: *PendingSend) void {
+    fn releasePendingSend(self: *Self, pending_send: *PendingSend) void {
         switch (pending_send.storage) {
             .owned => |owned| {
                 if (owned.small_slot) |small_slot| {
@@ -2193,7 +2207,7 @@ pub const EventLoop = struct {
     /// `Peer`). Stable address for the embedded Completion is the only hard
     /// requirement; an in-Peer pool gives that without alloc churn on the hot
     /// path. Bound is auditable at startup.
-    fn appendPendingSend(self: *EventLoop, ps: PendingSend) !*PendingSend {
+    fn appendPendingSend(self: *Self, ps: PendingSend) !*PendingSend {
         const heap_ps = try self.allocator.create(PendingSend);
         errdefer self.allocator.destroy(heap_ps);
         heap_ps.* = ps;
@@ -2211,7 +2225,7 @@ pub const EventLoop = struct {
     /// PendingSend itself has a stable heap address (carrying the Completion
     /// the kernel CQE references), and (b) the VectoredSendState is only
     /// freed by `freeOnePendingSend(slot, send_id)` after the CQE arrives.
-    pub fn submitPendingSend(self: *EventLoop, ps: *PendingSend) !void {
+    pub fn submitPendingSend(self: *Self, ps: *PendingSend) !void {
         const peer = &self.peers[ps.slot];
         switch (ps.storage) {
             .owned => |owned| try self.io.send(
@@ -2230,7 +2244,7 @@ pub const EventLoop = struct {
         peer.send_pending = true;
     }
 
-    pub fn trackPendingSendCopy(self: *EventLoop, slot: u16, send_id: u32, data: []const u8) !*PendingSend {
+    pub fn trackPendingSendCopy(self: *Self, slot: u16, send_id: u32, data: []const u8) !*PendingSend {
         if (self.small_send_pool.alloc(data, small_send_capacity)) |entry| {
             errdefer self.small_send_pool.release(entry.slot);
             return try self.appendPendingSend(.{
@@ -2254,7 +2268,7 @@ pub const EventLoop = struct {
         });
     }
 
-    pub fn trackPendingSendOwned(self: *EventLoop, slot: u16, send_id: u32, buf: []u8) !*PendingSend {
+    pub fn trackPendingSendOwned(self: *Self, slot: u16, send_id: u32, buf: []u8) !*PendingSend {
         if (self.small_send_pool.alloc(buf, small_send_capacity)) |entry| {
             errdefer self.small_send_pool.release(entry.slot);
             const ps = try self.appendPendingSend(.{
@@ -2278,7 +2292,7 @@ pub const EventLoop = struct {
         });
     }
 
-    pub fn trackPendingSendVectored(self: *EventLoop, slot: u16, send_id: u32, state: *VectoredSendState) !*PendingSend {
+    pub fn trackPendingSendVectored(self: *Self, slot: u16, send_id: u32, state: *VectoredSendState) !*PendingSend {
         errdefer self.releaseVectoredSendState(state);
         return try self.appendPendingSend(.{
             .slot = slot,
@@ -2289,14 +2303,14 @@ pub const EventLoop = struct {
 
     const vectoredSendLayout = bp.vectoredSendLayout;
 
-    pub fn nextPendingWriteId(self: *EventLoop) u32 {
+    pub fn nextPendingWriteId(self: *Self) u32 {
         const write_id = self.next_pending_write_id;
         self.next_pending_write_id +%= 1;
         if (self.next_pending_write_id == 0) self.next_pending_write_id = 1;
         return write_id;
     }
 
-    pub fn createPendingWrite(self: *EventLoop, key: PendingWriteKey, pending_write: PendingWrite) !u32 {
+    pub fn createPendingWrite(self: *Self, key: PendingWriteKey, pending_write: PendingWrite) !u32 {
         const write_id = self.nextPendingWriteId();
 
         try self.pending_writes.put(self.allocator, write_id, pending_write);
@@ -2307,7 +2321,7 @@ pub const EventLoop = struct {
         return write_id;
     }
 
-    pub fn getPendingWrite(self: *EventLoop, key: PendingWriteKey) ?*PendingWrite {
+    pub fn getPendingWrite(self: *Self, key: PendingWriteKey) ?*PendingWrite {
         const write_id = self.pending_write_lookup.get(key) orelse return null;
         return self.pending_writes.getPtr(write_id);
     }
@@ -2316,17 +2330,17 @@ pub const EventLoop = struct {
         return self.pending_write_lookup.contains(key);
     }
 
-    pub fn removePendingWrite(self: *EventLoop, key: PendingWriteKey) ?PendingWrite {
+    pub fn removePendingWrite(self: *Self, key: PendingWriteKey) ?PendingWrite {
         const write_id = self.pending_write_lookup.get(key) orelse return null;
         _ = self.pending_write_lookup.remove(key);
         return if (self.pending_writes.fetchRemove(write_id)) |entry| entry.value else null;
     }
 
-    pub fn getPendingWriteById(self: *EventLoop, write_id: u32) ?*PendingWrite {
+    pub fn getPendingWriteById(self: *Self, write_id: u32) ?*PendingWrite {
         return self.pending_writes.getPtr(write_id);
     }
 
-    pub fn removePendingWriteById(self: *EventLoop, write_id: u32) ?PendingWrite {
+    pub fn removePendingWriteById(self: *Self, write_id: u32) ?PendingWrite {
         const removed = self.pending_writes.fetchRemove(write_id) orelse return null;
         _ = self.pending_write_lookup.remove(.{
             .piece_index = removed.value.piece_index,
@@ -2335,7 +2349,7 @@ pub const EventLoop = struct {
         return removed.value;
     }
 
-    pub fn getTorrentContext(self: *EventLoop, torrent_id: TorrentId) ?*TorrentContext {
+    pub fn getTorrentContext(self: *Self, torrent_id: TorrentId) ?*TorrentContext {
         if (torrent_id >= self.torrents.items.len) return null;
         return if (self.torrents.items[torrent_id]) |*tc| tc else null;
     }
@@ -2345,7 +2359,7 @@ pub const EventLoop = struct {
         return if (self.torrents.items[torrent_id]) |*tc| tc else null;
     }
 
-    pub fn enqueueAnnounceResult(self: *EventLoop, torrent_id: TorrentId, peers: []std.net.Address) !void {
+    pub fn enqueueAnnounceResult(self: *Self, torrent_id: TorrentId, peers: []std.net.Address) !void {
         self.announce_mutex.lock();
         defer self.announce_mutex.unlock();
         try self.announce_results.append(self.allocator, .{
@@ -2361,14 +2375,14 @@ pub const EventLoop = struct {
         return self.info_hash_to_torrent.get(key);
     }
 
-    pub fn allocSlot(self: *EventLoop) ?u16 {
+    pub fn allocSlot(self: *Self) ?u16 {
         for (self.peers, 0..) |*peer, i| {
             if (peer.state == .free) return @intCast(i);
         }
         return null;
     }
 
-    fn cleanupPeer(self: *EventLoop, peer: *Peer) void {
+    fn cleanupPeer(self: *Self, peer: *Peer) void {
         // Clean up uTP slot if this is a uTP peer
         if (peer.transport == .utp) {
             if (peer.utp_slot) |utp_slot| {
@@ -2407,7 +2421,7 @@ pub const EventLoop = struct {
         if (peer.mse_responder) |mr| self.allocator.destroy(mr);
     }
 
-    fn registerTorrentHashes(self: *EventLoop, torrent_id: TorrentId, info_hash: [20]u8, info_hash_v2: ?[20]u8) !void {
+    fn registerTorrentHashes(self: *Self, torrent_id: TorrentId, info_hash: [20]u8, info_hash_v2: ?[20]u8) !void {
         const hash_slot = try self.info_hash_to_torrent.getOrPut(info_hash);
         if (hash_slot.found_existing and hash_slot.value_ptr.* != torrent_id) return error.DuplicateInfoHash;
         hash_slot.value_ptr.* = torrent_id;
@@ -2427,7 +2441,7 @@ pub const EventLoop = struct {
         }
     }
 
-    fn unregisterTorrentHashes(self: *EventLoop, info_hash: [20]u8, info_hash_v2: ?[20]u8) void {
+    fn unregisterTorrentHashes(self: *Self, info_hash: [20]u8, info_hash_v2: ?[20]u8) void {
         _ = self.info_hash_to_torrent.remove(info_hash);
         _ = self.mse_req2_to_hash.remove(mse.hashReq2ForInfoHash(info_hash));
         if (info_hash_v2) |v2_hash| {
@@ -2438,7 +2452,7 @@ pub const EventLoop = struct {
         }
     }
 
-    fn removeActiveTorrentId(self: *EventLoop, torrent_id: TorrentId) void {
+    fn removeActiveTorrentId(self: *Self, torrent_id: TorrentId) void {
         for (self.active_torrent_ids.items, 0..) |active_id, idx| {
             if (active_id == torrent_id) {
                 _ = self.active_torrent_ids.swapRemove(idx);
@@ -2450,10 +2464,16 @@ pub const EventLoop = struct {
     /// Issue shutdown(SHUT_RDWR) on a TCP peer fd for clean disconnect.
     /// Uses conventional syscall since this is a cleanup path (not hot path).
     /// Best-effort: errors do not prevent close().
-    fn shutdownPeerFd(_: *EventLoop, fd: posix.fd_t) void {
+    fn shutdownPeerFd(_: *Self, fd: posix.fd_t) void {
         _ = linux.shutdown(fd, linux.SHUT.RDWR);
     }
-};
+    };
+}
+
+/// Daemon's concrete instantiation. Daemon callers continue to write
+/// `EventLoop` and `EventLoop.method(...)`; tests that instantiate
+/// against SimIO write `EventLoopOf(SimIO)` directly.
+pub const EventLoop = EventLoopOf(RealIO);
 
 // ── Tests ─────────────────────────────────────────────────
 
