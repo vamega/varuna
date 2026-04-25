@@ -28,3 +28,6 @@
 [submodule "reference-codebases/libxev"]
 	path = reference-codebases/libxev
 	url = https://github.com/mitchellh/libxev.git
+[submodule "reference-codebases/zio"]
+	path = reference-codebases/zio
+	url = https://github.com/lalinsky/zio.git
