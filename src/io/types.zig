@@ -22,9 +22,6 @@ pub const TorrentId = u32;
 pub const OpType = enum(u8) {
     peer_connect = 0,
     peer_send = 2,
-    http_connect = 6,
-    http_send = 7,
-    http_recv = 8,
     timeout = 9,
     cancel = 10,
     utp_recv = 11,
@@ -38,7 +35,6 @@ pub const OpType = enum(u8) {
     metadata_send = 21,
     metadata_recv = 22,
     peer_socket = 23,
-    http_socket = 24,
     udp_socket = 25,
 };
 

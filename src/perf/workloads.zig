@@ -20,6 +20,7 @@ const mse_mod = varuna.crypto.mse;
 const tracker_announce = varuna.tracker.announce;
 const SessionManager = varuna.daemon.session_manager.SessionManager;
 const TrackerExecutor = varuna.daemon.tracker_executor.TrackerExecutor;
+const RealIO = varuna.io.real_io.RealIO;
 const TorrentSession = varuna.daemon.torrent_session.TorrentSession;
 const peer_policy = varuna.io.peer_policy;
 const pex_mod = varuna.net.pex;
@@ -1284,9 +1285,9 @@ fn runTrackerAnnounceExecutor(
         server_thread.join();
     }
 
-    var perf_ring = try linux.IoUring.init(32, 0);
-    defer perf_ring.deinit();
-    const executor = try TrackerExecutor.create(allocator, &perf_ring, .{});
+    var perf_io = try RealIO.init(.{ .entries = 32 });
+    defer perf_io.deinit();
+    const executor = try TrackerExecutor.create(allocator, &perf_io, .{});
     defer executor.destroy();
 
     std.Thread.sleep(10 * std.time.ns_per_ms);

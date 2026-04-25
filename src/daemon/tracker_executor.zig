@@ -1,6 +1,7 @@
 const std = @import("std");
 const linux = std.os.linux;
 pub const HttpExecutor = @import("../io/http_executor.zig").HttpExecutor;
+const RealIO = @import("../io/real_io.zig").RealIO;
 
 const log = std.log.scoped(.tracker_executor);
 
@@ -45,13 +46,13 @@ pub const TrackerExecutor = struct {
 
     // ── Public API ───────────────────────────────────────────
 
-    pub fn create(allocator: std.mem.Allocator, ring: *linux.IoUring, config: Config) !*TrackerExecutor {
+    pub fn create(allocator: std.mem.Allocator, io: *RealIO, config: Config) !*TrackerExecutor {
         const self = try allocator.create(TrackerExecutor);
         errdefer allocator.destroy(self);
 
         self.* = .{
             .allocator = allocator,
-            .http = try HttpExecutor.create(allocator, ring, .{
+            .http = try HttpExecutor.create(allocator, io, .{
                 .max_concurrent = config.max_concurrent,
                 .max_per_host = config.max_per_host,
             }),

@@ -698,8 +698,8 @@ pub const SessionManager = struct {
     fn ensureTrackerExecutor(self: *SessionManager) !*TrackerExecutor {
         if (self.tracker_executor == null) {
             const el = self.shared_event_loop orelse return error.SharedEventLoopNotConfigured;
-            self.tracker_executor = try TrackerExecutor.create(self.allocator, &el.ring, .{});
-            // Wire the underlying HttpExecutor into event loop for CQE dispatch
+            self.tracker_executor = try TrackerExecutor.create(self.allocator, &el.io, .{});
+            // Wire the underlying HttpExecutor into event loop for tick().
             el.http_executor = self.tracker_executor.?.http;
             el.tracker_executor = self.tracker_executor;
         }

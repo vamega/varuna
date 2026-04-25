@@ -1907,9 +1907,6 @@ pub const EventLoop = struct {
             },
             .utp_recv => utp_handler.handleUtpRecv(self, cqe),
             .utp_send => utp_handler.handleUtpSend(self, cqe),
-            .http_socket, .http_connect, .http_send, .http_recv => {
-                if (self.http_executor) |he| he.dispatchCqe(cqe);
-            },
             .cancel => {},
             .api_accept => if (self.api_server) |srv| srv.handleAcceptCqe(cqe),
             .api_recv => if (self.api_server) |srv| srv.handleRecvCqe(op.slot, op.context, cqe),
