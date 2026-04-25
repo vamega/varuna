@@ -108,6 +108,8 @@ When adding daemon I/O, use the ring or event loop and verify with `strace -f -y
 - [docs/future-features.md](docs/future-features.md) - deferred and follow-up work only, not a missing-feature inventory
 - [docs/dht-bep52-plan.md](docs/dht-bep52-plan.md) - planning/follow-up context; check [STATUS.md](STATUS.md) before assuming items are still pending
 - [docs/api-compatibility.md](docs/api-compatibility.md) - endpoint coverage, placeholders, unsupported endpoints
+- [docs/sim-test-setup.md](docs/sim-test-setup.md) - sim test API requirements (Phase 0 smart-ban / `EventLoopOf(SimIO)` baseline)
+- [docs/multi-source-test-setup.md](docs/multi-source-test-setup.md) - Phase 2A multi-source piece assembly + Phase 2B smart-ban Phase 1-2 test API surface
 
 Before assuming a feature is absent, check [STATUS.md](STATUS.md), recent `progress-reports/`, and the relevant subsystem under `src/`.
 
