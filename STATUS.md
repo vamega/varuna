@@ -307,6 +307,7 @@ post-warm; first-iteration cold-cache numbers omitted):
 Conclusions:
 - No `>2×` regressions. Stage 2 perf is clean for shipping.
 - `peer_accept_burst` and `api_get_burst` are substantially faster than the 2026-04-16 baselines. The io_interface migration is a net perf win on the accept path and the RPC GET path.
+- The 14× `peer_accept_burst` speedup is suspiciously large for "we just changed dispatch shape." Hypothesis: the legacy dispatch had redundant accept-handling work (duplicate slot lookup or per-CQE state validation) that the io_interface multishot consolidated. Worth a focused profile pass post-Phase-2 to confirm and document, since the win is large enough to inform future op-type migrations.
 - The `tick_sparse_torrents` 1.4× regression is the only watch-item. Worth profiling once Stage-2 cleanup is settled to identify whether it's the parameterisation overhead or one of the deinit-order changes.
 - `api_get_burst` allocation regression (`0 → 8000 transient`) is suspicious. May be a buffer that was previously stashed in inline storage now allocating; needs root-cause before declaring api perf clean.
 
