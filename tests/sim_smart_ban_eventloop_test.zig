@@ -2,9 +2,21 @@
 //!
 //! Drives the production `EventLoop` against `SimIO` with 5 honest
 //! SimPeer seeders + 1 corrupt SimPeer seeder. Asserts the smart-ban
-//! Phase 0 algorithm bans the corrupt peer (`trust_points <= -7`,
-//! `hashfails >= 4`) without false-positive bans on honest peers, while
-//! pieces 1..3 verify cleanly.
+//! Phase 0 algorithm bans the corrupt peer without false-positive bans
+//! on honest peers, while pieces 1..3 verify cleanly.
+//!
+//! Two top-level tests share the `runOneSeedAgainstEventLoop` body:
+//!
+//!   * "5 honest + 1 corrupt over 8 seeds" — clean smart-ban,
+//!     `BuggifyOpts{}` (DoD #2 + #3).
+//!   * "5 honest + 1 corrupt + BUGGIFY over 32 seeds" — same scenario
+//!     with `BuggifyOpts{ .probability = 0.02 }` randomized fault
+//!     injection on every tick. Asserts the safety invariant only
+//!     (no honest peer falsely banned, no panic, no leak); the
+//!     corrupt-peer ban is *informational* because a recv/send fault
+//!     can sever the corrupt peer's connection before 4 hash-fails
+//!     accumulate, in which case the ban legitimately doesn't fire
+//!     (DoD #4).
 //!
 //! ## Bitfield layout (option 1 — rarest-first deterministic)
 //!
@@ -23,23 +35,6 @@
 //! After 4 failures (trust = 0 → -2 → -4 → -6 → -8) the corrupt peer is
 //! banned. Piece 0 then has no source → stays incomplete (correct
 //! production behaviour, no other holder advertised it).
-//!
-//! Asserts:
-//!   * Pieces 1..3 verified.
-//!   * Piece 0 NOT verified (no honest source after corrupt is banned).
-//!   * Corrupt peer banned with `hashfails >= 4`.
-//!   * No honest peer banned and no honest peer has any hashfails.
-//!
-//! Loops over 8 different seeds (DoD #3).
-//!
-//! ## Status
-//!
-//! Currently the test body is gated on Task #14 (peer_policy.zig
-//! parameterisation). Until that lands, `EventLoopOf(SimIO).tick()`
-//! doesn't compile because `peer_policy.processHashResults` /
-//! `tryAssignPieces` / etc. still take `*EventLoop` directly. Once #14
-//! ships, the `if (false)` guard at the top of `runOneSeedAgainstEventLoop`
-//! flips to `if (true)` and the seed loop activates.
 
 const std = @import("std");
 const testing = std.testing;
@@ -48,7 +43,8 @@ const linux = std.os.linux;
 
 const varuna = @import("varuna");
 const ifc = varuna.io.io_interface;
-const SimIO = varuna.io.sim_io.SimIO;
+const sim_io_mod = varuna.io.sim_io;
+const SimIO = sim_io_mod.SimIO;
 const event_loop_mod = varuna.io.event_loop;
 const SimPeer = varuna.sim.SimPeer;
 const SimPeerBehavior = varuna.sim.sim_peer.Behavior;
@@ -101,15 +97,20 @@ fn buildTorrentBytes(allocator: std.mem.Allocator, piece_hashes: *const [piece_c
     return buf.toOwnedSlice(allocator);
 }
 
-fn runOneSeedAgainstEventLoop(seed: u64) !void {
-    // GATED: re-enable the body when Task #14 (peer_policy.zig
-    // parameterisation) lands. Today `EventLoopOf(SimIO).tick()` doesn't
-    // compile because the per-tick scheduler family
-    // (`processHashResults` / `tryAssignPieces` / `recalculateUnchokes`
-    // etc.) still takes `*EventLoop` directly. Migration-engineer is
-    // converting; my body below is what activates once they do.
-    // if (true) return; // gate flipped — let it compile to surface what's needed
+/// Per-run knobs for `runOneSeedAgainstEventLoop`.
+const BuggifyOpts = struct {
+    /// Per-tick probability of mutating a randomly-chosen in-flight op's
+    /// result via `SimIO.injectRandomFault`. Zero disables the wrap.
+    probability: f32 = 0.0,
+    /// When true, skip the strict piece-completion + ban assertions and
+    /// keep only the safety invariant: no honest peer is wrongly banned.
+    /// Set by the BUGGIFY harness — under randomized faults, the corrupt
+    /// peer's socket can die before 4 hash-fails accumulate, in which
+    /// case the ban legitimately doesn't fire.
+    safety_only: bool = false,
+};
 
+fn runOneSeedAgainstEventLoop(seed: u64, opts: BuggifyOpts) !void {
     const allocator = testing.allocator;
     var arena = std.heap.ArenaAllocator.init(allocator);
     defer arena.deinit();
@@ -151,10 +152,35 @@ fn runOneSeedAgainstEventLoop(seed: u64) !void {
     defer tracker.deinit(allocator);
 
     // ── 4. Spin up EventLoopOf(SimIO) ─────────────────────────────
+    //
+    // Under BUGGIFY we throttle the per-tick op budget so the active
+    // workload spans many ticks instead of bursting through in 1-2.
+    // That gives the per-tick BUGGIFY roll real in-flight heap entries
+    // to land on; without this, smart-ban completes inside one
+    // io.tick() and the per-tick check sees an empty heap on every
+    // subsequent tick.
+    //
+    // Per-op `FaultConfig` probabilities complement the per-tick
+    // BUGGIFY: every recv/send/read/write submission rolls for a
+    // transient failure independently. This produces thousands of
+    // injection opportunities per seed (one per submitted op) without
+    // burning per-tick budget. Set well below 0.01 so smart-ban can
+    // still observe ≥4 hash failures on the corrupt peer in most seeds
+    // (the test's safety invariant doesn't require it, but stronger
+    // signals are better).
+    const max_ops_per_tick: u32 = if (opts.probability > 0.0) 128 else 4096;
+    const fault_config: sim_io_mod.FaultConfig = if (opts.probability > 0.0) .{
+        .recv_error_probability = 0.003,
+        .send_error_probability = 0.003,
+        .read_error_probability = 0.001,
+        .write_error_probability = 0.001,
+    } else .{};
     const EL_SimIO = event_loop_mod.EventLoopOf(SimIO);
     const sim_io = try SimIO.init(allocator, .{
         .socket_capacity = num_peers * 2,
         .seed = seed,
+        .max_ops_per_tick = max_ops_per_tick,
+        .faults = fault_config,
     });
     var el = try EL_SimIO.initBareWithIO(allocator, sim_io, 1);
     defer el.deinit();
@@ -227,9 +253,34 @@ fn runOneSeedAgainstEventLoop(seed: u64) !void {
         slots[i] = try el.addConnectedPeerWithAddress(downloader_fd, tid, syntheticAddr(i));
     }
 
-    // ── 7. Drive ticks until corrupt is banned + pieces 1..3 done ──
+    // ── 7. Drive ticks ───────────────────────────────────────────
+    //
+    // Under no-fault runs we break as soon as the smart-ban condition
+    // is met (corrupt banned + pieces 1..3 complete) — this is a
+    // liveness check.
+    //
+    // Under BUGGIFY runs we deliberately *don't* break: the goal is to
+    // give the fault-injection loop enough turns to actually fire on
+    // real in-flight ops. With a 4096-op-per-tick budget the smart-ban
+    // condition is usually reached in 1-2 el.tick iterations, which at
+    // p=0.02 produces near-zero injections — meaningless. Running for
+    // `buggify_min_ticks` instead gives ~80 injections per seed and
+    // exercises the fault-recovery paths the test is actually about.
+    const buggify_min_ticks: u32 = 4096;
+    var buggify_hits: u32 = 0;
     var ticks: u32 = 0;
     while (ticks < max_ticks) : (ticks += 1) {
+        // BUGGIFY: per-tick chance to mutate a random in-flight op's
+        // result. We use the same rng for both the inject decision and
+        // SimIO.injectRandomFault's heap probe — deterministic per seed.
+        if (opts.probability > 0.0) {
+            if (rng.random().float(f32) < opts.probability) {
+                if (el.io.injectRandomFault(&rng)) |_| {
+                    buggify_hits += 1;
+                }
+            }
+        }
+
         try el.tick();
 
         // Step each SimPeer (honest peers no-op; future slow-behaviour
@@ -238,11 +289,17 @@ fn runOneSeedAgainstEventLoop(seed: u64) !void {
             try peer.step(@as(u64, @intCast(el.clock.now())) * std.time.ns_per_s);
         }
 
-        const corrupt_banned = ban_list.isBanned(syntheticAddr(corrupt_peer_index));
-        const all_target_pieces_done = el.isPieceComplete(tid, 1) and
-            el.isPieceComplete(tid, 2) and
-            el.isPieceComplete(tid, 3);
-        if (corrupt_banned and all_target_pieces_done) break;
+        if (opts.probability == 0.0) {
+            const corrupt_banned = ban_list.isBanned(syntheticAddr(corrupt_peer_index));
+            const all_target_pieces_done = el.isPieceComplete(tid, 1) and
+                el.isPieceComplete(tid, 2) and
+                el.isPieceComplete(tid, 3);
+            if (corrupt_banned and all_target_pieces_done) break;
+        } else {
+            // BUGGIFY: keep running long enough for fault injection to
+            // exercise meaningful op state.
+            if (ticks >= buggify_min_ticks) break;
+        }
     }
 
     // ── 8. Drain hasher results so valid piece buffers don't leak.
@@ -268,29 +325,45 @@ fn runOneSeedAgainstEventLoop(seed: u64) !void {
         try el.tick();
     }
 
+    // BUGGIFY telemetry: surface the per-seed hit count so failing seeds
+    // are diagnosable. Quiet under no-fault runs.
+    if (opts.probability > 0.0) {
+        std.debug.print("  BUGGIFY seed=0x{x} hits={d} ticks={d}\n", .{ seed, buggify_hits, ticks });
+    }
+
     // ── 9. Smart-ban assertions ──────────────────────────────────
+    //
+    // Under BUGGIFY (`safety_only`) we drop the strict liveness
+    // assertions. A recv/send fault can sever any peer's connection at
+    // an arbitrary moment — including the corrupt peer before its 4th
+    // hash-fail, or an honest peer mid-piece. Liveness invariants
+    // (pieces 1..3 verify, corrupt banned, piece 0 incomplete) only
+    // hold reliably without faults; under faults all we guarantee is
+    // safety: no honest peer is wrongly banned.
+    if (!opts.safety_only) {
+        // Pieces 1..3 must verify (multiple honest sources for each).
+        try testing.expect(el.isPieceComplete(tid, 1));
+        try testing.expect(el.isPieceComplete(tid, 2));
+        try testing.expect(el.isPieceComplete(tid, 3));
 
-    // Pieces 1..3 must verify (multiple honest sources for each).
-    try testing.expect(el.isPieceComplete(tid, 1));
-    try testing.expect(el.isPieceComplete(tid, 2));
-    try testing.expect(el.isPieceComplete(tid, 3));
+        // Piece 0 must NOT verify — its only source is the corrupt
+        // peer, who got banned. Correct production outcome.
+        try testing.expect(!el.isPieceComplete(tid, 0));
 
-    // Piece 0 must NOT verify — its only source is the corrupt peer,
-    // who got banned. This is the correct production outcome.
-    try testing.expect(!el.isPieceComplete(tid, 0));
+        // Corrupt peer banned. The slot is freed by `removePeer`
+        // immediately after the smart-ban threshold trips, so the
+        // canonical EL-integration assertion is `ban_list.isBanned`.
+        // A hit means `penalizePeerTrust` ran with `trust_points <=
+        // trust_ban_threshold` (the only `bl.banIp` call site at the
+        // smart-ban threshold), which under the `-2`-per-fail rule
+        // implies at least four hash failures were observed inside
+        // the EventLoop. Exact trust arithmetic is unit-tested in
+        // `sim_smart_ban_protocol_test.zig` against the bare Peer.
+        try testing.expect(ban_list.isBanned(syntheticAddr(corrupt_peer_index)));
+    }
 
-    // Corrupt peer banned. The slot is freed by `removePeer` immediately
-    // after the smart-ban threshold trips, so the canonical EL-integration
-    // assertion is `ban_list.isBanned(addr)`. A hit there is sufficient:
-    // `peer_policy.penalizePeerTrust` is the only call site for
-    // `bl.banIp` at the smart-ban threshold, so a present ban implies
-    // `trust_points <= trust_ban_threshold` and `hashfails >= 4` were
-    // both observed inside the EventLoop. The exact trust_points /
-    // hashfails math is exercised by `sim_smart_ban_protocol_test.zig`
-    // against the Peer struct directly (without the EL).
-    try testing.expect(ban_list.isBanned(syntheticAddr(corrupt_peer_index)));
-
-    // No honest peer banned, none with hashfails.
+    // Safety invariant — holds under both clean runs and BUGGIFY:
+    // no honest peer is banned, no honest peer has any hashfails.
     var j: u8 = 0;
     while (j < num_peers) : (j += 1) {
         if (j == corrupt_peer_index) continue;
@@ -301,24 +374,13 @@ fn runOneSeedAgainstEventLoop(seed: u64) !void {
     }
 }
 
-test "smart-ban EventLoop integration: 5 honest + 1 corrupt over 8 seeds (gated on Task #14)" {
+test "smart-ban EventLoop integration: 5 honest + 1 corrupt over 8 seeds" {
     // Bitfield-layout sanity: catches drift if somebody "fixes" the
     // option (1) layout and silently breaks the rarest-first guarantee.
     const piece_0_mask: u8 = 0b1000_0000;
     try testing.expectEqual(@as(u8, 0), honest_bitfield[0] & piece_0_mask);
     try testing.expectEqual(piece_0_mask, corrupt_bitfield[0] & piece_0_mask);
 
-    // EventLoopOf(SimIO) instantiates and `initBareWithIO` runs cleanly.
-    // (`tick()` is gated on Task #14.)
-    const EL_SimIO = event_loop_mod.EventLoopOf(SimIO);
-    const sim_io = try SimIO.init(testing.allocator, .{ .socket_capacity = 4 });
-    var el = try EL_SimIO.initBareWithIO(testing.allocator, sim_io, 0);
-    defer el.deinit();
-    _ = el.peers.len;
-
-    // Ready-to-fire seed loop. Today `runOneSeedAgainstEventLoop` is
-    // gated; once Task #14 (peer_policy.zig parameterisation) ships,
-    // flip the early-return inside it and these 8 seeds activate.
     const seeds = [_]u64{
         0x0000_0001,
         0xDEAD_BEEF,
@@ -330,8 +392,47 @@ test "smart-ban EventLoop integration: 5 honest + 1 corrupt over 8 seeds (gated 
         0x9876_5432,
     };
     for (seeds) |seed| {
-        runOneSeedAgainstEventLoop(seed) catch |err| {
+        runOneSeedAgainstEventLoop(seed, .{}) catch |err| {
             std.debug.print("\n  SEED 0x{x} FAILED: {any}\n", .{ seed, err });
+            return err;
+        };
+    }
+}
+
+test "smart-ban EventLoop integration with BUGGIFY: 32 seeds, p=0.02 fault injection" {
+    // BUGGIFY (TigerBeetle VOPR-style) randomized fault injection: per
+    // tick, with probability 2%, mutate a random in-flight op's result
+    // to a fault appropriate to its op kind (`recv =>
+    // ConnectionResetByPeer`, `send => BrokenPipe`, `write =>
+    // NoSpaceLeft`, etc.). Stresses the smart-ban + peer-cleanup paths
+    // with arbitrary, deterministic-per-seed connection failures.
+    //
+    // Asserts the *safety* invariant only — under randomized faults,
+    // the corrupt peer's socket can be severed before 4 hash-fails
+    // accumulate, in which case the ban legitimately doesn't fire.
+    // What must hold under any fault sequence:
+    //
+    //   * No honest peer is wrongly banned.
+    //   * No honest peer accumulates any hashfails (honest data is
+    //     never corrupted, only delivered or not).
+    //   * The test exits cleanly (no panic, no leak).
+    //
+    // 32 seeds (DoD #4); p=0.02 keeps fault density meaningful (~80
+    // injections per 4096-tick run) without strangling progress.
+    const seeds = [_]u64{
+        0x0000_0001, 0xDEAD_BEEF, 0xFEED_FACE, 0xCAFE_BABE,
+        0x0F0F_0F0F, 0x1234_5678, 0xABCD_EF01, 0x9876_5432,
+        0x1111_1111, 0x2222_2222, 0x3333_3333, 0x4444_4444,
+        0x5555_5555, 0x6666_6666, 0x7777_7777, 0x8888_8888,
+        0x9999_9999, 0xAAAA_AAAA, 0xBBBB_BBBB, 0xCCCC_CCCC,
+        0xDDDD_DDDD, 0xEEEE_EEEE, 0xFFFF_FFFF, 0x0123_4567,
+        0x89AB_CDEF, 0xFEDC_BA98, 0x7654_3210, 0xA1B2_C3D4,
+        0xE5F6_0708, 0x1A2B_3C4D, 0x5E6F_7080, 0xDEAD_DEAD,
+    };
+    const opts: BuggifyOpts = .{ .probability = 0.02, .safety_only = true };
+    for (seeds) |seed| {
+        runOneSeedAgainstEventLoop(seed, opts) catch |err| {
+            std.debug.print("\n  BUGGIFY SEED 0x{x} FAILED: {any}\n", .{ seed, err });
             return err;
         };
     }

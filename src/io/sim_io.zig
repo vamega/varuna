@@ -126,6 +126,15 @@ pub const Config = struct {
     /// per-test seed and print it on failure.
     seed: u64 = 0,
     faults: FaultConfig = .{},
+    /// Cap on ops processed per `tick(...)` call. Models real io_uring's
+    /// batched CQE behaviour (the kernel returns to userspace after a
+    /// finite batch even if more CQEs are ready). Lets the EventLoop's
+    /// periodic policy passes (processHashResults, tryAssignPieces,
+    /// checkPeerTimeouts, etc.) interleave with I/O completions instead
+    /// of starving inside a tight callback chain. BUGGIFY tests lower
+    /// this so the work spans more ticks and faults can land on
+    /// in-flight ops.
+    max_ops_per_tick: u32 = 4096,
 };
 
 // ── Pending entry ─────────────────────────────────────────
@@ -346,17 +355,12 @@ pub const SimIO = struct {
         self.in_tick = true;
         defer self.in_tick = false;
 
-        // Cap ops processed per tick to model real io_uring's batched
-        // CQE behavior (the kernel returns to userspace after a finite
-        // batch even if more CQEs are ready). This lets the EventLoop's
-        // periodic policy passes (processHashResults / tryAssignPieces /
-        // checkPeerTimeouts / etc.) interleave with I/O completions
-        // instead of starving forever in a tight callback chain.
-        const max_ops_per_tick: u32 = 4096;
+        // Cap ops processed per tick (Config.max_ops_per_tick). See
+        // Config docstring for rationale.
         var ops: u32 = 0;
         while (self.pending_len > 0 and
             self.pending[0].deadline_ns <= self.now_ns and
-            ops < max_ops_per_tick) : (ops += 1)
+            ops < self.config.max_ops_per_tick) : (ops += 1)
         {
             const entry = self.popMin();
             const c = entry.completion;
