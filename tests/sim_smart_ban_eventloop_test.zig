@@ -260,12 +260,21 @@ fn runOneSeedUnderBuggify(seed: u64) !void {
 
 // ── Placeholder test ──────────────────────────────────────
 
-test "EventLoop smart-ban integration: scaffold compiles (waiting for Stage 2 #12)" {
+test "EventLoop smart-ban integration: scaffold compiles (waiting for handler-conversion follow-up)" {
     // This test asserts the scaffold itself: imports resolve, the
-    // bitfield layout is what option (1) requires, and the helper
-    // functions compile. When Stage 2 #12 lands, the placeholder body
-    // is replaced with calls into `runOneSeedAgainstEventLoop` over the
-    // 8-seed array.
+    // bitfield layout is what option (1) requires, the helper
+    // functions compile, and `EventLoopOf(SimIO)` instantiates as a
+    // valid type. When the handler-conversion follow-up lands, the
+    // placeholder body is replaced with calls into
+    // `runOneSeedAgainstEventLoop` over the 8-seed array.
+
+    // Stage 1 of EventLoop parameterisation has shipped — `EventLoopOf`
+    // is generic. Confirm the SimIO instantiation is a valid type. The
+    // struct compiles; making its callbacks fire correctly under SimIO
+    // is the follow-up that lights up `runOneSeedAgainstEventLoop`.
+    const EL_SimIO = varuna.io.event_loop.EventLoopOf(varuna.io.sim_io.SimIO);
+    _ = EL_SimIO;
+
     try testing.expect(num_peers == 6);
     try testing.expectEqual(@as(u8, 0b0111_0000), honest_bitfield[0]);
     try testing.expectEqual(@as(u8, 0b1000_0000), corrupt_bitfield[0]);
