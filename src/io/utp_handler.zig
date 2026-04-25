@@ -152,11 +152,6 @@ pub fn utpDrainSendQueue(self: *EventLoop) void {
     };
 }
 
-/// Legacy wrapper kept for any residual legacy-ring callers.
-pub fn handleUtpRecv(self: *EventLoop, cqe: linux.io_uring_cqe) void {
-    handleUtpRecvResult(self, cqe.res);
-}
-
 fn handleUtpRecvResult(self: *EventLoop, recv_res: i32) void {
     // Always re-submit recv for the next datagram
     defer submitUtpRecv(self) catch |err| {
@@ -218,11 +213,6 @@ fn handleUtpRecvResult(self: *EventLoop, recv_res: i32) void {
     if (result.data) |utp_data| {
         deliverUtpData(self, result.slot, utp_data);
     }
-}
-
-/// Legacy wrapper kept for any residual legacy-ring callers.
-pub fn handleUtpSend(self: *EventLoop, cqe: linux.io_uring_cqe) void {
-    handleUtpSendResult(self, cqe.res);
 }
 
 fn handleUtpSendResult(self: *EventLoop, send_res: i32) void {

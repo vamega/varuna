@@ -45,10 +45,6 @@ const web_seed_handler = @import("web_seed_handler.zig");
 pub const types = @import("types.zig");
 pub const max_peers = types.max_peers;
 pub const TorrentId = types.TorrentId;
-pub const OpType = types.OpType;
-pub const OpData = types.OpData;
-pub const encodeUserData = types.encodeUserData;
-pub const decodeUserData = types.decodeUserData;
 pub const PeerMode = types.PeerMode;
 pub const Transport = types.Transport;
 pub const PeerState = types.PeerState;
@@ -146,12 +142,9 @@ pub const EventLoop = struct {
         peers: []std.net.Address,
     };
 
-    ring: linux.IoUring,
-    /// New `io_interface`-based backend used by migrated call sites. During
-    /// Stage 2 the legacy `ring` and the new `io` coexist on separate ring
-    /// instances. `ring` carries the packed-userdata legacy ops; `io` carries
-    /// `*Completion`-keyed ops via `RealIO`. Both share the same fds. Once
-    /// every call site is migrated (Stage 2 #12), `ring` is removed.
+    /// `io_interface`-based io_uring backend driving every async op.
+    /// Stage 2 replaced the legacy packed-userdata ring with a single
+    /// caller-owned-Completion model.
     io: RealIO,
     allocator: std.mem.Allocator,
     peers: []Peer,
@@ -257,8 +250,10 @@ pub const EventLoop = struct {
     // Complete pieces bitfield (for seeding -- which pieces we can serve)
     complete_pieces: ?*const Bitfield = null,
 
-    // Timeout storage (must outlive the SQE)
-    timeout_ts: linux.kernel_timespec = .{ .sec = 2, .nsec = 0 },
+    /// Wake-up timeout completion. Used by `submitTimeout` to break a
+    /// blocking `io.tick(1)` after a deadline so external callers (tests,
+    /// perf, daemon startup) can poll periodically.
+    wake_timeout_completion: io_interface.Completion = .{},
     timeout_pending: bool = false,
 
     // One-shot timer callbacks driven by `io.timeout` on the new
@@ -366,11 +361,6 @@ pub const EventLoop = struct {
             null;
 
         return .{
-            .ring = try ring_mod.initIoUring(256, linux.IORING_SETUP_COOP_TASKRUN | linux.IORING_SETUP_SINGLE_ISSUER),
-            // Second ring instance for the new io_interface backend. Same
-            // size as the legacy ring; same flags (with kernel fallback in
-            // RealIO.init). Each call site flips atomically between `ring`
-            // and `io` during the Stage 2 migration.
             .io = try RealIO.init(.{
                 .entries = 256,
                 .flags = linux.IORING_SETUP_COOP_TASKRUN | linux.IORING_SETUP_SINGLE_ISSUER,
@@ -470,20 +460,9 @@ pub const EventLoop = struct {
         // Before closing fds, drain any in-flight piece writes so that
         // hash-verified data is not lost on shutdown.
         {
-            _ = self.ring.submit() catch {};
-            self.io.tick(0) catch {};
             var flush_rounds: u32 = 0;
             while (self.pending_writes.count() > 0 and flush_rounds < 100) : (flush_rounds += 1) {
-                _ = self.ring.submit_and_wait(1) catch break;
-                var cqes: [cqe_batch_size]linux.io_uring_cqe = undefined;
-                const count = self.ring.copy_cqes(&cqes, 0) catch break;
-                for (cqes[0..count]) |cqe| {
-                    self.dispatch(cqe);
-                }
-                // Also drain io_interface completions that may have been
-                // produced during this round (e.g. async fsync after a
-                // piece write completes on the legacy ring).
-                self.io.tick(0) catch {};
+                self.io.tick(1) catch break;
             }
         }
 
@@ -646,49 +625,22 @@ pub const EventLoop = struct {
         self.timer_callbacks.deinit(self.allocator);
 
         // ── Phase 4: Tear down the ring ──────────────────────────
-        self.ring.deinit();
         self.io.deinit();
     }
 
-    /// Drain all remaining CQEs from the ring after fds are closed.
-    /// Used during deinit to ensure the kernel is done with our buffers
-    /// before we free them.
+    /// Drain pending CQEs from the io_interface ring after fds are closed.
+    /// Used during deinit to ensure the kernel has finished touching any
+    /// buffers we're about to free.
     fn drainRemainingCqes(self: *EventLoop) void {
-        // Submit any queued SQEs so they complete (with errors, since fds are closed)
-        _ = self.ring.submit() catch {};
-        self.io.tick(0) catch {};
-
-        // Keep dispatching until tracked buffer-owning operations are gone.
-        // This ensures late CQEs release the resources they reference before
-        // we free backing memory during deinit.
         var drain_rounds: u32 = 0;
         while (drain_rounds < 256 and self.pendingBufferOperations() > 0) : (drain_rounds += 1) {
-            _ = self.ring.submit_and_wait(1) catch break;
-            var cqes: [cqe_batch_size]linux.io_uring_cqe = undefined;
-            const count = self.ring.copy_cqes(&cqes, 0) catch break;
-            if (count == 0) {
-                // No legacy CQEs this round; still try to drain new-ring
-                // completions before continuing.
-                self.io.tick(0) catch {};
-                continue;
-            }
-            for (cqes[0..count]) |cqe| {
-                self.dispatch(cqe);
-            }
-            self.io.tick(0) catch {};
+            self.io.tick(1) catch break;
         }
-
-        // Best-effort final sweep for non-owning completions that may still be queued.
+        // Best-effort non-blocking sweep.
         drain_rounds = 0;
         while (drain_rounds < 32) : (drain_rounds += 1) {
-            var cqes: [cqe_batch_size]linux.io_uring_cqe = undefined;
-            const count = self.ring.copy_cqes(&cqes, 0) catch break;
-            if (count == 0) break;
-            for (cqes[0..count]) |cqe| {
-                self.dispatch(cqe);
-            }
+            self.io.tick(0) catch break;
         }
-        self.io.tick(0) catch {};
 
         if (self.pendingBufferOperations() > 0) {
             log.warn(
@@ -1219,12 +1171,7 @@ pub const EventLoop = struct {
             ignoredCancelComplete,
         ) catch {};
 
-        // Close the fd via the legacy ring (still kept around for the
-        // `.cancel` op type which is a no-op in dispatch).
-        const cancel_ud = encodeUserData(.{ .slot = 0, .op_type = .cancel, .context = 0 });
-        _ = self.ring.close(cancel_ud, fd) catch {
-            posix.close(fd);
-        };
+        posix.close(fd);
 
         if (self.utp_manager) |mgr| {
             mgr.deinit();
@@ -1276,21 +1223,13 @@ pub const EventLoop = struct {
         self.listen_fd = -1;
 
         // Cancel the in-flight multishot accept on the io_interface ring.
-        // The cancel completion's callback drops the result on the floor
-        // (we don't care whether it landed before close).
         self.io.cancel(
             .{ .target = &self.accept_completion },
             &self.accept_cancel_completion,
             null,
             ignoredCancelComplete,
         ) catch {};
-
-        // Close via io_uring on the legacy ring with a sentinel user_data
-        // (cancel op type) — the dispatch arm for `.cancel` is a no-op.
-        const cancel_ud = encodeUserData(.{ .slot = 0, .op_type = .cancel, .context = 0 });
-        _ = self.ring.close(cancel_ud, fd) catch {
-            posix.close(fd);
-        };
+        posix.close(fd);
 
         log.info("TCP listener stopped", .{});
     }
@@ -1445,33 +1384,20 @@ pub const EventLoop = struct {
         if (self.http_executor) |he| he.tick();
         if (self.udp_tracker_executor) |ute| ute.tick();
 
-        // Flush any residual SQEs on the legacy ring (now mostly empty
-        // after Stage 2 #12). We don't wait on the legacy ring anymore —
-        // all production ops live on the io_interface ring.
-        _ = self.ring.submit() catch |err| {
-            log.warn("ring submit (pre-wait): {s}", .{@errorName(err)});
-        };
         // Block on the io_interface ring — every active op type lives
-        // there now (peer recv/send/connect/socket, accept, disk r/w,
+        // there (peer recv/send/connect/socket, accept, disk r/w,
         // timer, signal poll, HTTP/RPC/metadata/uTP/UDP tracker).
+        // Callbacks fire from inside the tick.
         self.io.tick(1) catch |err| {
-            log.warn("io tick (pre-wait): {s}", .{@errorName(err)});
+            log.warn("io tick (wait): {s}", .{@errorName(err)});
         };
-
-        // Drain any residual legacy CQEs (e.g. timeout from submitTimeout).
-        var cqes: [cqe_batch_size]linux.io_uring_cqe = undefined;
-        const count = self.ring.copy_cqes(&cqes, 0) catch 0;
-        for (cqes[0..count]) |cqe| {
-            self.dispatch(cqe);
-        }
 
         // Batch-send any queued piece block responses
         seed_handler.flushQueuedResponses(self);
 
-        // Flush any SQEs queued during dispatch (piece responses, block requests, etc.)
-        _ = self.ring.submit() catch |err| {
-            log.warn("ring submit (post-dispatch): {s}", .{@errorName(err)});
-        };
+        // Drain any io_interface CQEs that were produced by callbacks
+        // re-arming during the dispatch above (e.g. submitHeaderRecv
+        // chained from a body-recv callback).
         self.io.tick(0) catch |err| {
             log.warn("io tick (post-flush): {s}", .{@errorName(err)});
         };
@@ -1516,14 +1442,24 @@ pub const EventLoop = struct {
     /// Submit a timeout SQE so that submit_and_wait returns even if
     /// no I/O completes. This allows the caller to do periodic work.
     pub fn submitTimeout(self: *EventLoop, timeout_ns: u64) !void {
-        if (self.timeout_pending) return; // previous timeout SQE still in flight
-        self.timeout_ts = .{
-            .sec = @intCast(timeout_ns / std.time.ns_per_s),
-            .nsec = @intCast(timeout_ns % std.time.ns_per_s),
-        };
-        const ud = encodeUserData(.{ .slot = 0, .op_type = .timeout, .context = 0 });
-        _ = try self.ring.timeout(ud, &self.timeout_ts, 0, 0);
+        if (self.timeout_pending) return; // previous timeout still in flight
+        try self.io.timeout(
+            .{ .ns = timeout_ns },
+            &self.wake_timeout_completion,
+            self,
+            wakeTimeoutComplete,
+        );
         self.timeout_pending = true;
+    }
+
+    fn wakeTimeoutComplete(
+        userdata: ?*anyopaque,
+        _: *io_interface.Completion,
+        _: io_interface.Result,
+    ) io_interface.CallbackAction {
+        const self: *EventLoop = @ptrCast(@alignCast(userdata.?));
+        self.timeout_pending = false;
+        return .disarm;
     }
 
     // ── io.timeout-based one-shot timers ────────────────────
@@ -1897,19 +1833,6 @@ pub const EventLoop = struct {
             }
         }
         return false;
-    }
-
-    // ── CQE dispatch ──────────────────────────────────────
-
-    fn dispatch(self: *EventLoop, cqe: linux.io_uring_cqe) void {
-        const op = decodeUserData(cqe.user_data);
-        switch (op.op_type) {
-            .peer_send => peer_handler.handleSend(self, op.slot, cqe),
-            .timeout => {
-                self.timeout_pending = false;
-            },
-            .cancel => {},
-        }
     }
 
     // ── Idle-peer tracking (for efficient tryAssignPieces) ─
@@ -2434,25 +2357,6 @@ pub const EventLoop = struct {
 };
 
 // ── Tests ─────────────────────────────────────────────────
-
-test "user data encode/decode roundtrip" {
-    const op = OpData{ .slot = 42, .op_type = .peer_recv, .context = 12345 };
-    const encoded = encodeUserData(op);
-    const decoded = decodeUserData(encoded);
-
-    try std.testing.expectEqual(@as(u16, 42), decoded.slot);
-    try std.testing.expectEqual(OpType.peer_recv, decoded.op_type);
-    try std.testing.expectEqual(@as(u40, 12345), decoded.context);
-}
-
-test "user data max values" {
-    const op = OpData{ .slot = 65535, .op_type = .cancel, .context = std.math.maxInt(u40) };
-    const decoded = decodeUserData(encodeUserData(op));
-
-    try std.testing.expectEqual(@as(u16, 65535), decoded.slot);
-    try std.testing.expectEqual(OpType.cancel, decoded.op_type);
-    try std.testing.expectEqual(std.math.maxInt(u40), decoded.context);
-}
 
 test "event loop supports high torrent counts with hashed lookup and slot reuse" {
     var el = try EventLoop.initBare(std.testing.allocator, 0);

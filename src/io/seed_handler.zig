@@ -3,8 +3,6 @@ const posix = std.posix;
 const log = std.log.scoped(.event_loop);
 const storage = @import("../storage/root.zig");
 const EventLoop = @import("event_loop.zig").EventLoop;
-const encodeUserData = @import("event_loop.zig").encodeUserData;
-const decodeUserData = @import("event_loop.zig").decodeUserData;
 const LayoutSpan = @import("../torrent/layout.zig").Layout.Span;
 const utp_handler = @import("utp_handler.zig");
 const io_interface = @import("io_interface.zig");
@@ -23,17 +21,6 @@ fn findPendingSeedReadIndex(items: []const EventLoop.PendingPieceRead, read_id: 
         if (pr.read_id == read_id) return i;
     }
     return null;
-}
-
-fn encodeSeedReadContext(read_id: u32, span_index: u8) u40 {
-    return @as(u40, read_id) | (@as(u40, span_index) << 32);
-}
-
-fn decodeSeedReadContext(context: u40) struct { read_id: u32, span_index: u8 } {
-    return .{
-        .read_id = @truncate(context),
-        .span_index = @truncate(context >> 32),
-    };
 }
 
 /// Per-span read tracking for seed disk reads on the io_interface
@@ -339,13 +326,6 @@ pub fn servePieceRequest(self: *EventLoop, slot: u16, payload: []const u8) void 
     self.pending_reads.items[pending_index].submitted_span_count = @intCast(submitted_reads);
 }
 
-/// Legacy wrapper kept for any residual legacy-ring callers.
-pub fn handleSeedDiskRead(self: *EventLoop, cqe: @import("std").os.linux.io_uring_cqe) void {
-    const op = decodeUserData(cqe.user_data);
-    const read_ctx = decodeSeedReadContext(op.context);
-    handleSeedReadResult(self, read_ctx.read_id, read_ctx.span_index, cqe.res);
-}
-
 fn handleSeedReadResult(self: *EventLoop, read_id: u32, span_index: u8, res: i32) void {
     const idx = findPendingSeedReadIndex(self.pending_reads.items, read_id) orelse return;
     var pending = self.pending_reads.items[idx];
@@ -584,10 +564,3 @@ test "findPendingSeedReadIndex matches by unique read id" {
     try std.testing.expectEqual(@as(?usize, null), findPendingSeedReadIndex(reads[0..], 99));
 }
 
-test "seed read context roundtrips read id and span index" {
-    const encoded = encodeSeedReadContext(0x1234_5678, 7);
-    const decoded = decodeSeedReadContext(encoded);
-
-    try std.testing.expectEqual(@as(u32, 0x1234_5678), decoded.read_id);
-    try std.testing.expectEqual(@as(u8, 7), decoded.span_index);
-}

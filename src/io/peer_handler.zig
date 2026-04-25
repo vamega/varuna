@@ -8,8 +8,6 @@ const mse = @import("../crypto/mse.zig");
 const EventLoop = @import("event_loop.zig").EventLoop;
 const Peer = @import("event_loop.zig").Peer;
 const PeerState = @import("event_loop.zig").PeerState;
-const encodeUserData = @import("event_loop.zig").encodeUserData;
-const decodeUserData = @import("event_loop.zig").decodeUserData;
 const protocol = @import("protocol.zig");
 const io_interface = @import("io_interface.zig");
 const socket_util = @import("../net/socket.zig");
@@ -112,20 +110,6 @@ fn handleAccepted(self: *EventLoop, new_fd: posix.fd_t) void {
     };
 }
 
-/// Legacy wrapper kept for residual benchmark callers (`perf/workloads.zig`)
-/// that drive accept CQEs through the legacy ring. Translates the cqe
-/// shape into the new `handleAccepted` policy path.
-pub fn handleAccept(self: *EventLoop, cqe: linux.io_uring_cqe) void {
-    if (cqe.res < 0) {
-        const e = cqe.err();
-        if (e != .CANCELED) {
-            log.warn("accept failed: errno={d}", .{-cqe.res});
-        }
-        return;
-    }
-    const new_fd: posix.fd_t = @intCast(cqe.res);
-    handleAccepted(self, new_fd);
-}
 
 /// Callback bound to `Peer.connect_completion`. Invoked when async
 /// socket creation lands. Configures the new fd, applies bind/device
@@ -144,12 +128,6 @@ pub fn peerSocketComplete(
         else => -1,
     });
     return .disarm;
-}
-
-/// Legacy wrapper retained for any tests that still drive sockets via
-/// the legacy ring (currently none).
-pub fn handleSocketCreated(self: *EventLoop, slot: u16, cqe: linux.io_uring_cqe) void {
-    handleSocketResult(self, slot, cqe.res);
 }
 
 fn handleSocketResult(self: *EventLoop, slot: u16, res: i32) void {
@@ -211,11 +189,6 @@ pub fn peerConnectComplete(
     };
     handleConnectResult(self, slot, if (ok) 0 else -1);
     return .disarm;
-}
-
-/// Legacy wrapper retained for tests/perf paths still on the legacy ring.
-pub fn handleConnect(self: *EventLoop, slot: u16, cqe: linux.io_uring_cqe) void {
-    handleConnectResult(self, slot, cqe.res);
 }
 
 fn handleConnectResult(self: *EventLoop, slot: u16, res: i32) void {
@@ -387,13 +360,6 @@ pub fn pendingSendComplete(
     };
     handleSendResult(self, slot, send_id, res);
     return .disarm;
-}
-
-/// Legacy wrapper retained for tests/perf paths still on the legacy ring.
-pub fn handleSend(self: *EventLoop, slot: u16, cqe: linux.io_uring_cqe) void {
-    const op = decodeUserData(cqe.user_data);
-    const send_id: u32 = @truncate(op.context);
-    handleSendResult(self, slot, send_id, cqe.res);
 }
 
 fn handleSendResult(self: *EventLoop, slot: u16, send_id: u32, send_res: i32) void {
@@ -877,15 +843,6 @@ pub fn diskWriteComplete(
     return .disarm;
 }
 
-/// Legacy wrapper kept for any residual legacy-ring callers (currently
-/// none in the daemon path; perf workloads don't drive disk_write).
-pub fn handleDiskWrite(self: *EventLoop, slot: u16, cqe: linux.io_uring_cqe) void {
-    _ = slot;
-    const op = decodeUserData(cqe.user_data);
-    const write_id: u32 = @truncate(op.context);
-    handleDiskWriteResult(self, write_id, cqe.res);
-}
-
 fn handleDiskWriteResult(self: *EventLoop, write_id: u32, res: i32) void {
     if (self.getPendingWriteById(write_id)) |pending_w| {
         const piece_index = pending_w.piece_index;
@@ -1198,15 +1155,7 @@ test "handleDiskWrite releases piece when any submit failed" {
         .write_failed = true,
     });
 
-    var cqe = std.mem.zeroes(linux.io_uring_cqe);
-    cqe.user_data = encodeUserData(.{
-        .slot = 0,
-        .op_type = .disk_write,
-        .context = write_id,
-    });
-    cqe.res = 16;
-
-    handleDiskWrite(&el, 0, cqe);
+    handleDiskWriteResult(&el, write_id, 16);
 
     try std.testing.expectEqual(@as(usize, 0), el.pending_writes.count());
     try std.testing.expectEqual(@as(u32, 0), tracker.completedCount());

@@ -17,34 +17,6 @@ const WebSeedManager = @import("../net/web_seed.zig").WebSeedManager;
 pub const max_peers: u16 = 4096;
 pub const TorrentId = u32;
 
-// ── User data encoding ────────────────────────────────────
-
-pub const OpType = enum(u8) {
-    peer_send = 2,
-    timeout = 9,
-    cancel = 10,
-};
-
-pub const OpData = struct {
-    slot: u16,
-    op_type: OpType,
-    context: u40,
-};
-
-pub fn encodeUserData(op: OpData) u64 {
-    return (@as(u64, op.slot) << 48) |
-        (@as(u64, @intFromEnum(op.op_type)) << 40) |
-        @as(u64, op.context);
-}
-
-pub fn decodeUserData(user_data: u64) OpData {
-    return .{
-        .slot = @intCast(user_data >> 48),
-        .op_type = @enumFromInt(@as(u8, @intCast((user_data >> 40) & 0xFF))),
-        .context = @intCast(user_data & 0xFFFFFFFFFF),
-    };
-}
-
 // ── Peer ──────────────────────────────────────────────────
 
 pub const PeerMode = enum {

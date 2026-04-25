@@ -319,37 +319,16 @@ fn runPeerAcceptBurst(
     const accepted: usize = iterations;
     const recv_eof: usize = 0;
     var idle_ticks: usize = 0;
-    var cqes: [64]linux.io_uring_cqe = undefined;
 
     while (event_loop.peer_count != 0 or remaining_workers.load(.acquire) != 0) {
         try event_loop.submitTimeout(1 * std.time.ns_per_ms);
-        // Drain io_interface completions (accept + peer recv) before the
-        // legacy ring's blocking wait so the listener can pick up
-        // connections without latency.
-        event_loop.io.tick(0) catch {};
-        _ = try event_loop.ring.submit_and_wait(1);
+        // Drain io_interface completions (accept + peer recv/send +
+        // timer) blockingly. Stage 2 #12 routed every op type through
+        // this single ring.
+        event_loop.io.tick(1) catch {};
 
-        const count = try event_loop.ring.copy_cqes(&cqes, 0);
-        if (count == 0) {
-            idle_ticks += 1;
-        } else {
-            idle_ticks = 0;
-        }
-
-        for (cqes[0..count]) |cqe| {
-            const op = event_loop_mod.decodeUserData(cqe.user_data);
-            switch (op.op_type) {
-                .peer_send => peer_handler.handleSend(&event_loop, op.slot, cqe),
-                .timeout => {
-                    event_loop.timeout_pending = false;
-                },
-                else => {},
-            }
-        }
-
-        _ = event_loop.ring.submit() catch {};
-        event_loop.io.tick(0) catch {};
-
+        if (event_loop.peer_count == 0 and remaining_workers.load(.acquire) == 0) break;
+        idle_ticks += 1;
         if (idle_ticks > 20_000) return error.BenchmarkTimeout;
     }
 
@@ -1468,16 +1447,8 @@ fn wakeApiServer(address: std.net.Address) !void {
 }
 
 fn drainPeerSendCompletions(event_loop: *EventLoop, slot: u16) !void {
-    var cqes: [8]linux.io_uring_cqe = undefined;
     while (event_loop.peers[slot].send_pending or event_loop.pending_sends.items.len != 0) {
-        _ = try event_loop.ring.submit_and_wait(1);
-        const count = try event_loop.ring.copy_cqes(&cqes, 0);
-        for (cqes[0..count]) |cqe| {
-            const op = event_loop_mod.decodeUserData(cqe.user_data);
-            if (op.op_type == .peer_send) {
-                peer_handler.handleSend(event_loop, op.slot, cqe);
-            }
-        }
+        try event_loop.io.tick(1);
     }
 }
 
