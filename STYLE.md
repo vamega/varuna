@@ -183,6 +183,27 @@ Patterns that fell out of the Stage 2 migration (Apr 2026) and the bugs they cat
     callback (`std.mem.sort` comparator, etc.) can name the parameterised receiver type
     at comptime without explicit type-parameter plumbing.
 
+12. **Fd-touching syscalls go through the IO interface, not posix.** Synthetic fds (e.g.
+    SimIO's slot-indices ≥ 1000) panic with `EBADF` when `posix.close` / `posix.shutdown`
+    / `posix.read` / `posix.write` is called directly on them. The cure is `closeSocket`
+    (and the analogous fd-primary helpers) on the IO trait, with each backend implementing
+    them — RealIO forwards to posix; SimIO routes through its slot table. Generalize: any
+    syscall whose primary argument is an fd has to round-trip through the backend
+    abstraction. Backend-parity tests (`tests/io_backend_parity_test.zig`) should list
+    these in the comptime-required-methods set so a future backend that forgets one fails
+    to compile.
+
+13. **Sim backends model kernel batch boundaries.** Real `io_uring` has a natural
+    throttle: each `io_uring_enter(submit_and_wait)` returns at most a CQE batch's worth
+    of completions, which interleaves callbacks with the rest of the EL tick (timers,
+    scheduler, message dispatch). A SimIO that processes to fixed point — drain every
+    pending op until the queue is empty before returning from `tick` — starves the rest
+    of the EL and produces shape-mismatched test outcomes (e.g. all peers send all pieces
+    before a single tick boundary fires). Add a `max_ops_per_tick` cap on the sim
+    backend that mirrors the kernel's batching, even if the value is approximate. This is
+    pattern #10 applied to *behavior* rather than types: invariants the real backend
+    enforces implicitly become explicit caps on the sim.
+
 ---
 
 ## Memory

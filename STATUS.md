@@ -287,6 +287,7 @@ See `progress-reports/2026-04-25-stage2-event-loop-migration.md` for the Stage 2
 
 ## Last Verified Milestone (2026-04-25)
 
+### Architecture / test infrastructure
 - **IO abstraction landed end-to-end.** Daemon EventLoop is now generic over its IO backend: `pub fn EventLoopOf(comptime IO: type) type`. Two backends in production: `RealIO` (`linux.IoUring`, the only instantiation in `varuna`/`varuna-ctl`/`varuna-tools` — zero behaviour change) and `SimIO` (deterministic in-process simulation). Comptime parity enforced by `tests/io_backend_parity_test.zig`.
 - **Stage 2 (event-loop migration to io_interface)** complete: every async op in the daemon — peer recv/send, outbound peer socket/connect, multishot accept, signal poll, recheck reads, disk reads/writes (including `PieceStore.sync`'s async fsync), HTTP executor, RPC server, metadata fetch, uTP recvmsg/sendmsg, UDP tracker, timerfd → native `io.timeout` — runs through the io_interface backend. Legacy `ring: linux.IoUring` field, the giant CQE dispatch switch, `OpType`/`OpData`/`encodeUserData`/`decodeUserData` all deleted.
 - **Stages 3-5 (sim infrastructure + integration tests)** complete: `SimIO` socketpair pool with parking semantics; `SimulatorOf(comptime Driver)` deterministic harness; `SimPeer` with 10 wire-protocol behaviours (honest, slow, corrupt, wrong_data, silent_after, disconnect_after, lie_bitfield, greedy, lie_extensions); BUGGIFY (`SimIO.injectRandomFault` per-step + `FaultConfig` per-op) randomized fault injection; `SimIO.Config.max_ops_per_tick` runtime cap modelling real io_uring's CQE batch boundary.
@@ -294,11 +295,20 @@ See `progress-reports/2026-04-25-stage2-event-loop-migration.md` for the Stage 2
   - `tests/sim_smart_ban_protocol_test.zig` — algorithm test, 8 seeds, no faults.
   - `tests/sim_smart_ban_eventloop_test.zig` (clean run) — integration test, real `EventLoopOf(SimIO)`, 8 seeds, no faults.
   - `tests/sim_smart_ban_eventloop_test.zig` (BUGGIFY run) — safety-under-faults test, 32 seeds with `recv/send_error_probability=0.003`, `read/write=0.001`, per-tick injection probability=0.02. Vacuous-pass guard demands ≥ half the seeds observe a real ban; empirically 23/32 ban + 96/96 honest pieces verify.
-- **STYLE.md migration-pattern catalogue** at 11 entries: patterns 1-7 (Stage 2 lessons), 8-10 (single-coherent-commits, bench-companion, lazy-compilation-shipping), 11 (`@TypeOf(self.*).X` namespace access in anytype methods); the new "Layered Testing Strategy" top-level section codifies the algorithm/integration/safety-under-faults split. Patterns 12 (`closeSocket` on the IO interface) and 13 (`max_ops_per_tick` modelling kernel CQE batches) are migration-engineer's follow-up.
-- Test count: 163 → 201 (+38 across Stages 2-5; +17 this final session for smart-ban EL light-up + BUGGIFY + vacuous-pass guard).
+- **STYLE.md migration-pattern catalogue** at 13 entries: patterns 1-7 (Stage 2 lessons), 8-10 (single-coherent-commits, bench-companion, lazy-compilation-shipping), 11 (`@TypeOf(self.*).X` namespace access in anytype methods), 12 (`closeSocket` on the IO interface — fd-touching syscalls round-trip through the backend), 13 (`max_ops_per_tick` modelling kernel CQE batch boundaries). Plus the new "Layered Testing Strategy" top-level section codifying the algorithm/integration/safety-under-faults split.
+- **Hasher cleanup race fix** (Task #16): `hasher.deinit` now frees valid `completed_results` bufs alongside invalid ones, so the daemon shutdown path is leak-clean even if processHashResults didn't drain results before EL teardown. The smart-ban EL test's drain phase remains as belt-and-suspenders.
+- Test count: 163 → 204 (+41 across Stages 2-5 + cleanup; sim-engineer added the smart-ban EL + BUGGIFY tests, migration-engineer's #16 fix wired three pre-existing `event_loop_health_test.zig` tests into the main `test` step).
 - All four sim-engineer DoD items closed: SimIO socketpair, Simulator runs `EventLoopOf(SimIO)`, smart-ban over 8 seeds, BUGGIFY over 32 seeds.
-- `zig build test`: 201/201 pass, no leaks.
+- `zig build test`: 204/204 pass, no leaks.
 - `zig build`: clean.
+
+### Perf benches (ReleaseFast, post-warm vs 2026-04-16 baselines)
+- `peer_accept_burst --iterations=4000 --clients=1`: `~5.0e7 ns` (vs baseline `~6.91e8 ns`, **14× faster** — io_interface multishot path dropped most of the per-accept overhead). 1 alloc / 128 B (was 0/0 — minor regression in alloc count, transient).
+- `seed_plaintext_burst --iterations=500 --scale=8`: `6.7e6 ns` to `8.7e6 ns` post-warm (vs baseline `6.79e6 ns` to `6.93e6 ns`, **stable to slightly variable**). 2 allocs / 704 B (matches baseline shape after PendingSend pool refactor in #12).
+- `api_get_burst --iterations=4000 --clients=8`: `~6.5e7 ns` to `~7.0e7 ns` (vs baseline `2.13e8 ns` to `2.31e8 ns`, **3× faster**). 8000 allocs / 1.98 MB transient, all freed (peak_live = 1984 B). **Allocation count regressed from baseline `0/0`; tracked as Task #20.**
+- `tick_sparse_torrents --iterations=500 --torrents=10000 --peers=512 --scale=20`: `~1.5e7 ns` post-warm (vs baseline `1.09e7 ns`, **~1.4× regression — under 2× threshold**). 0 allocs / 0 transient, matches baseline shape. **Tracked as Task #21.**
+
+Conclusions: no `>2×` regressions; Stage 2 perf is clean for shipping. `peer_accept_burst` and `api_get_burst` are substantially faster than 2026-04-16 baselines — io_interface migration is a net perf win on the accept path and the RPC GET path. The 14× accept-burst speedup is suspiciously large for "we just changed dispatch shape" — hypothesis is that legacy dispatch had redundant accept-handling work that multishot consolidated; worth a focused profile pass post-Phase-2 to document. Two watch-items (api_get_burst alloc regression, tick_sparse_torrents 1.4× regression) filed as Tasks #20 / #21 for post-Phase-2 cleanup.
 
 ## Last Verified Milestone (2026-04-16)
 

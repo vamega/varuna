@@ -141,8 +141,19 @@ pub const Hasher = struct {
         }
         self.pending_jobs.deinit(self.allocator);
 
+        // Defensive: free EVERY piece_buf in completed_results, not
+        // just the invalid ones. In the production path,
+        // peer_policy.processHashResults drains valid results into
+        // pending_writes (and that loop frees the bufs after the disk
+        // write fires). But on shutdown — tests calling deinit directly,
+        // graceful drains that timed out, crash paths — completed_results
+        // may still hold valid bufs the EL never got around to processing.
+        // Without this defensive free, those bufs leak (EventLoop.deinit
+        // destroys the Hasher before its own drain phase can run).
+        // Losing the verified data on disk is acceptable in shutdown;
+        // leaking the buffer is not.
         for (self.completed_results.items) |result| {
-            if (!result.valid) self.allocator.free(result.piece_buf);
+            self.allocator.free(result.piece_buf);
         }
         self.completed_results.deinit(self.allocator);
 
