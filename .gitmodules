@@ -22,3 +22,9 @@
 [submodule "vendor/c-ares"]
 	path = vendor/c-ares
 	url = https://github.com/c-ares/c-ares.git
+[submodule "reference-codebases/tigerbeetle"]
+	path = reference-codebases/tigerbeetle
+	url = https://github.com/tigerbeetle/tigerbeetle.git
+[submodule "reference-codebases/libxev"]
+	path = reference-codebases/libxev
+	url = https://github.com/mitchellh/libxev.git
