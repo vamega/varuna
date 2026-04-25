@@ -49,6 +49,17 @@ pub const Op = ifc.Operation;
 // It records the heap index so cancel can find the entry without a linear
 // scan, the socket slot the completion is parked on (if any), and an
 // `in_flight` flag.
+//
+// NOTE on layout: this is a regular struct, not a packed struct. We tried
+// a packed-struct form earlier (heap_index: u32 + in_flight: bool +
+// _padding: u31, total 64 bits / 8 bytes / 8-byte align). Adding
+// `parked_socket_index: u32` pushes the packed bit-width to 96 bits, and
+// Zig 0.15.2 rounds packed-struct alignment up to the smallest
+// power-of-two integer that fits — that's `@alignOf(u128) == 16`, which
+// blows past `backend_state_align = 8` and trips the comptime assert
+// below. The regular-struct form sits at 12 bytes / 4-byte align, well
+// inside the 64-byte / 8-byte budget. Don't try to "fix" this back to
+// packed without verifying alignment against `backend_state_align`.
 
 pub const SimState = struct {
     /// Index into `pending` while in the heap; `sentinel_index` means

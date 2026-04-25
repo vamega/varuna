@@ -13,20 +13,22 @@ const varuna = @import("varuna");
 const ifc = varuna.io.io_interface;
 const sim_io = varuna.io.sim_io;
 const Simulator = varuna.sim.Simulator;
+const SimulatorOf = varuna.sim.SimulatorOf;
+const StubDriver = varuna.sim.StubDriver;
 
 const Completion = ifc.Completion;
 const Result = ifc.Result;
 const CallbackAction = ifc.CallbackAction;
 
 test "Simulator.init / deinit cleanly with empty swarm" {
-    var sim = try Simulator.init(testing.allocator, .{});
+    var sim = try Simulator.init(testing.allocator, .{}, StubDriver{});
     defer sim.deinit();
     try testing.expectEqual(@as(u32, 0), sim.swarm_len);
     try testing.expectEqual(@as(u64, 0), sim.clock_ns);
 }
 
 test "Simulator.step advances clock and ticks IO" {
-    var sim = try Simulator.init(testing.allocator, .{});
+    var sim = try Simulator.init(testing.allocator, .{}, StubDriver{});
     defer sim.deinit();
 
     const FireCounter = struct { count: u32 = 0 };
@@ -55,7 +57,7 @@ test "Simulator.runUntil hits step ceiling and returns false" {
         }
     };
 
-    var sim = try Simulator.init(testing.allocator, .{});
+    var sim = try Simulator.init(testing.allocator, .{}, StubDriver{});
     defer sim.deinit();
 
     const ok = try sim.runUntil(State.never, 5, 1_000);
@@ -64,7 +66,7 @@ test "Simulator.runUntil hits step ceiling and returns false" {
 }
 
 test "Simulator.nextPendingDeadlineNs returns null when heap is empty" {
-    var sim = try Simulator.init(testing.allocator, .{});
+    var sim = try Simulator.init(testing.allocator, .{}, StubDriver{});
     defer sim.deinit();
     try testing.expectEqual(@as(?u64, null), sim.nextPendingDeadlineNs());
 }
@@ -72,7 +74,7 @@ test "Simulator.nextPendingDeadlineNs returns null when heap is empty" {
 test "BUGGIFY at probability 1.0 fires at least one injection" {
     var sim = try Simulator.init(testing.allocator, .{
         .buggify = .{ .probability = 1.0 },
-    });
+    }, StubDriver{});
     defer sim.deinit();
 
     const Counter = struct { calls: u32 = 0, errs: u32 = 0 };
@@ -113,7 +115,7 @@ test "BUGGIFY at probability 1.0 fires at least one injection" {
 test "BUGGIFY at probability 0.0 never injects" {
     var sim = try Simulator.init(testing.allocator, .{
         .buggify = .{ .probability = 0.0 },
-    });
+    }, StubDriver{});
     defer sim.deinit();
 
     var c = Completion{};
@@ -132,7 +134,7 @@ test "BUGGIFY across many steps with probability 0.5 hits a fraction" {
     var sim = try Simulator.init(testing.allocator, .{
         .buggify = .{ .probability = 0.5 },
         .seed = 0xDEADBEEF,
-    });
+    }, StubDriver{});
     defer sim.deinit();
 
     const cb = struct {

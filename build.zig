@@ -327,6 +327,20 @@ pub fn build(b: *std.Build) void {
     test_sim_simulator_step.dependOn(&run_sim_simulator_tests.step);
     test_step.dependOn(&run_sim_simulator_tests.step);
 
+    // ── Sim-only smart-ban protocol regression ─────────────
+    const sim_smart_ban_tests = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("tests/sim_smart_ban_protocol_test.zig"),
+            .target = target,
+            .optimize = optimize,
+            .imports = &varuna_import,
+        }),
+    });
+    const run_sim_smart_ban_tests = b.addRunArtifact(sim_smart_ban_tests);
+    const test_sim_smart_ban_step = b.step("test-sim-smart-ban", "Run protocol-only smart-ban regression (8 seeds)");
+    test_sim_smart_ban_step.dependOn(&run_sim_smart_ban_tests.step);
+    test_step.dependOn(&run_sim_smart_ban_tests.step);
+
     // ── Event loop health tests ────────────────────────────
     const el_health_tests = b.addTest(.{
         .root_module = b.createModule(.{

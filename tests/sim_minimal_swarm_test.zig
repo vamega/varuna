@@ -16,6 +16,7 @@ const varuna = @import("varuna");
 const ifc = varuna.io.io_interface;
 const SimIO = varuna.io.sim_io.SimIO;
 const Simulator = varuna.sim.Simulator;
+const StubDriver = varuna.sim.StubDriver;
 const SimPeer = varuna.sim.SimPeer;
 const peer_wire = varuna.net.peer_wire;
 
@@ -247,7 +248,7 @@ test "Simulator + honest SimPeer seeder + hand-rolled downloader transfers a 4-p
         .swarm_capacity = 4,
         .seed = 0xDEADBEEF,
         .sim_io = .{ .socket_capacity = 4 },
-    });
+    }, StubDriver{});
     defer sim.deinit();
 
     var rng = std.Random.DefaultPrng.init(0xfeedface);
