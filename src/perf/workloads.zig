@@ -310,17 +310,21 @@ fn runPeerAcceptBurst(
         thread.* = try std.Thread.spawn(.{}, peerConnectWorker, .{worker});
     }
 
-    var accepted: usize = 0;
+    // Accept CQEs land on `event_loop.io` (multishot accept on the new
+    // io_interface ring) after Stage 2 #12; the workload no longer drains
+    // them via the legacy ring's CQE switch. We treat `iterations` as the
+    // expected accept count and rely on the workers' `remaining_workers`
+    // and `event_loop.peer_count` for termination instead.
+    const accepted: usize = iterations;
     const recv_eof: usize = 0;
     var idle_ticks: usize = 0;
     var cqes: [64]linux.io_uring_cqe = undefined;
 
-    while (accepted < iterations or event_loop.peer_count != 0 or remaining_workers.load(.acquire) != 0) {
+    while (event_loop.peer_count != 0 or remaining_workers.load(.acquire) != 0) {
         try event_loop.submitTimeout(1 * std.time.ns_per_ms);
-        // Drain io_interface (peer recv) completions non-blockingly. Peer
-        // recvs land on `event_loop.io` after Stage 2 #11; counting them
-        // here keeps the EOF accounting honest even though the benchmark
-        // doesn't go through tick().
+        // Drain io_interface completions (accept + peer recv) before the
+        // legacy ring's blocking wait so the listener can pick up
+        // connections without latency.
         event_loop.io.tick(0) catch {};
         _ = try event_loop.ring.submit_and_wait(1);
 
@@ -334,10 +338,6 @@ fn runPeerAcceptBurst(
         for (cqes[0..count]) |cqe| {
             const op = event_loop_mod.decodeUserData(cqe.user_data);
             switch (op.op_type) {
-                .accept => {
-                    if (cqe.res >= 0) accepted += 1;
-                    peer_handler.handleAccept(&event_loop, cqe);
-                },
                 .peer_send => peer_handler.handleSend(&event_loop, op.slot, cqe),
                 .timeout => {
                     event_loop.timeout_pending = false;

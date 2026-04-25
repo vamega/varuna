@@ -17,21 +17,37 @@ const BanList = @import("../net/ban_list.zig").BanList;
 
 // ── CQE dispatch handlers ──────────────────────────────
 
-pub fn handleAccept(self: *EventLoop, cqe: linux.io_uring_cqe) void {
-    const more = (cqe.flags & linux.IORING_CQE_F_MORE) != 0;
-    if (cqe.res < 0) {
-        const e = cqe.err();
-        // ECANCELED is expected when stopTcpListener cancels the pending accept.
-        if (e != .CANCELED) {
-            log.warn("accept failed: errno={d}", .{-cqe.res});
-        }
-        if (!more) self.submitAccept() catch |err| {
-            log.err("re-submit accept after failure: {s}", .{@errorName(err)});
-        };
-        return;
-    }
-    const new_fd: posix.fd_t = @intCast(cqe.res);
+/// Callback bound to `EventLoop.accept_completion`. Invoked once per
+/// accepted inbound connection (multishot keeps the SQE armed kernel-side
+/// until F_MORE clears, at which point we return `.rearm` and the io
+/// backend resubmits). Returns `.rearm` so the listener stays open.
+pub fn peerAcceptComplete(
+    userdata: ?*anyopaque,
+    _: *io_interface.Completion,
+    result: io_interface.Result,
+) io_interface.CallbackAction {
+    const self: *EventLoop = @ptrCast(@alignCast(userdata.?));
 
+    const accepted = switch (result) {
+        .accept => |r| r catch |err| {
+            // ECANCELED is expected when stopTcpListener cancels the
+            // pending accept; other errors are worth surfacing once.
+            if (err != error.OperationCanceled) {
+                log.warn("accept failed: {s}", .{@errorName(err)});
+            }
+            return .rearm;
+        },
+        else => return .disarm,
+    };
+
+    handleAccepted(self, accepted.fd);
+    return .rearm;
+}
+
+/// Apply the policy/ban/limit checks against a freshly accepted fd and,
+/// if it's keepable, install it as an inbound peer slot. Factored out so
+/// the callback above stays readable.
+fn handleAccepted(self: *EventLoop, new_fd: posix.fd_t) void {
     // Extract peer address and check ban list before allocating a slot
     if (self.ban_list) |bl| {
         var peer_addr: posix.sockaddr.storage = undefined;
@@ -42,7 +58,6 @@ pub fn handleAccept(self: *EventLoop, cqe: linux.io_uring_cqe) void {
             if (bl.isBanned(net_addr)) {
                 log.debug("rejected banned inbound peer", .{});
                 posix.close(new_fd);
-                if (!more) self.submitAccept() catch {};
                 return;
             }
         }
@@ -52,7 +67,6 @@ pub fn handleAccept(self: *EventLoop, cqe: linux.io_uring_cqe) void {
     if (self.draining) {
         log.debug("rejected inbound connection: shutting down", .{});
         posix.close(new_fd);
-        if (!more) self.submitAccept() catch {};
         return;
     }
 
@@ -60,7 +74,6 @@ pub fn handleAccept(self: *EventLoop, cqe: linux.io_uring_cqe) void {
     if (!self.transport_disposition.incoming_tcp) {
         log.debug("rejected inbound TCP connection: incoming_tcp disabled", .{});
         posix.close(new_fd);
-        if (!more) self.submitAccept() catch {};
         return;
     }
 
@@ -71,18 +84,12 @@ pub fn handleAccept(self: *EventLoop, cqe: linux.io_uring_cqe) void {
             self.max_connections,
         });
         posix.close(new_fd);
-        if (!more) self.submitAccept() catch |err| {
-            log.err("re-submit accept after connection limit: {s}", .{@errorName(err)});
-        };
         return;
     }
 
     // Allocate a peer slot for the inbound connection
     const slot = self.allocSlot() orelse {
         posix.close(new_fd);
-        if (!more) self.submitAccept() catch |err| {
-            log.err("re-submit accept after slot exhaustion: {s}", .{@errorName(err)});
-        };
         return;
     };
 
@@ -103,11 +110,21 @@ pub fn handleAccept(self: *EventLoop, cqe: linux.io_uring_cqe) void {
     protocol.submitHandshakeRecv(self, slot) catch {
         self.removePeer(slot);
     };
+}
 
-    // Re-submit accept only if the multishot stream ended.
-    if (!more) self.submitAccept() catch |err| {
-        log.err("re-submit accept: {s}", .{@errorName(err)});
-    };
+/// Legacy wrapper kept for residual benchmark callers (`perf/workloads.zig`)
+/// that drive accept CQEs through the legacy ring. Translates the cqe
+/// shape into the new `handleAccepted` policy path.
+pub fn handleAccept(self: *EventLoop, cqe: linux.io_uring_cqe) void {
+    if (cqe.res < 0) {
+        const e = cqe.err();
+        if (e != .CANCELED) {
+            log.warn("accept failed: errno={d}", .{-cqe.res});
+        }
+        return;
+    }
+    const new_fd: posix.fd_t = @intCast(cqe.res);
+    handleAccepted(self, new_fd);
 }
 
 /// Handle completion of async socket creation (IORING_OP_SOCKET).

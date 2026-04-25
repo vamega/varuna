@@ -22,7 +22,6 @@ pub const TorrentId = u32;
 pub const OpType = enum(u8) {
     peer_connect = 0,
     peer_send = 2,
-    accept = 3,
     disk_read = 4,
     disk_write = 5,
     http_connect = 6,

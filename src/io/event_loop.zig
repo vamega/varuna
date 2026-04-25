@@ -204,6 +204,14 @@ pub const EventLoop = struct {
 
     // Accept socket for seeding (-1 if not seeding)
     listen_fd: posix.fd_t = -1,
+    // Caller-owned completion for the multishot accept on `listen_fd`.
+    // Re-armed by `peerAcceptComplete` when the kernel clears F_MORE.
+    accept_completion: io_interface.Completion = .{},
+    /// Tracking completion for cancelling the multishot accept during
+    /// `stopTcpListener`. Lives on the EventLoop because the cancel
+    /// CQE must arrive before the accept's `accept_completion` is
+    /// reused.
+    accept_cancel_completion: io_interface.Completion = .{},
 
     // uTP over UDP: single UDP socket + connection multiplexer
     udp_fd: posix.fd_t = -1,
@@ -1255,17 +1263,34 @@ pub const EventLoop = struct {
         const fd = self.listen_fd;
         self.listen_fd = -1;
 
-        // Cancel the pending multishot ACCEPT SQE
-        const accept_ud = encodeUserData(.{ .slot = 0, .op_type = .accept, .context = 0 });
-        const cancel_ud = encodeUserData(.{ .slot = 0, .op_type = .cancel, .context = 0 });
-        _ = self.ring.cancel(cancel_ud, accept_ud, 0) catch {};
+        // Cancel the in-flight multishot accept on the io_interface ring.
+        // The cancel completion's callback drops the result on the floor
+        // (we don't care whether it landed before close).
+        self.io.cancel(
+            .{ .target = &self.accept_completion },
+            &self.accept_cancel_completion,
+            null,
+            ignoredCancelComplete,
+        ) catch {};
 
-        // Close via io_uring
+        // Close via io_uring on the legacy ring with a sentinel user_data
+        // (cancel op type) — the dispatch arm for `.cancel` is a no-op.
+        const cancel_ud = encodeUserData(.{ .slot = 0, .op_type = .cancel, .context = 0 });
         _ = self.ring.close(cancel_ud, fd) catch {
             posix.close(fd);
         };
 
         log.info("TCP listener stopped", .{});
+    }
+
+    /// No-op callback used when we don't care about a cancel result —
+    /// e.g. the multishot accept cancel during `stopTcpListener`.
+    fn ignoredCancelComplete(
+        _: ?*anyopaque,
+        _: *io_interface.Completion,
+        _: io_interface.Result,
+    ) io_interface.CallbackAction {
+        return .disarm;
     }
 
     /// Ensure listeners match the current transport disposition.
@@ -1878,7 +1903,6 @@ pub const EventLoop = struct {
             .peer_connect => peer_handler.handleConnect(self, op.slot, cqe),
             .peer_send => peer_handler.handleSend(self, op.slot, cqe),
             .disk_write => peer_handler.handleDiskWrite(self, op.slot, cqe),
-            .accept => peer_handler.handleAccept(self, cqe),
             .disk_read => seed_handler.handleSeedDiskRead(self, cqe),
             .timeout => {
                 self.timeout_pending = false;
@@ -2004,8 +2028,12 @@ pub const EventLoop = struct {
 
     pub fn submitAccept(self: *EventLoop) !void {
         if (self.listen_fd < 0) return;
-        const ud = encodeUserData(.{ .slot = 0, .op_type = .accept, .context = 0 });
-        _ = try self.ring.accept_multishot(ud, self.listen_fd, null, null, posix.SOCK.CLOEXEC | posix.SOCK.NONBLOCK);
+        try self.io.accept(
+            .{ .fd = self.listen_fd, .multishot = true },
+            &self.accept_completion,
+            self,
+            peer_handler.peerAcceptComplete,
+        );
     }
 
     pub fn createPieceBuffer(self: *EventLoop, size: usize) !*PieceBuffer {
