@@ -2187,6 +2187,12 @@ pub const EventLoop = struct {
     }
 
     /// Append a freshly-allocated PendingSend to `pending_sends` and return it.
+    ///
+    /// TODO(zero-alloc): replace per-send `allocator.create` with a fixed-size
+    /// per-peer pool (`[max_in_flight_sends]PendingSend` + free-list head on
+    /// `Peer`). Stable address for the embedded Completion is the only hard
+    /// requirement; an in-Peer pool gives that without alloc churn on the hot
+    /// path. Bound is auditable at startup.
     fn appendPendingSend(self: *EventLoop, ps: PendingSend) !*PendingSend {
         const heap_ps = try self.allocator.create(PendingSend);
         errdefer self.allocator.destroy(heap_ps);
@@ -2198,6 +2204,13 @@ pub const EventLoop = struct {
     /// Submit the in-flight send for a PendingSend through the io_interface
     /// backend on the PendingSend's embedded completion. Picks `io.send` or
     /// `io.sendmsg` based on the storage variant.
+    ///
+    /// Lifetime note: for the vectored variant, `ps.storage.vectored` is a
+    /// heap-allocated `*VectoredSendState` from `vectored_send_pool` and the
+    /// `&state.msg` pointer the kernel sees outlives the SQE because (a) the
+    /// PendingSend itself has a stable heap address (carrying the Completion
+    /// the kernel CQE references), and (b) the VectoredSendState is only
+    /// freed by `freeOnePendingSend(slot, send_id)` after the CQE arrives.
     pub fn submitPendingSend(self: *EventLoop, ps: *PendingSend) !void {
         const peer = &self.peers[ps.slot];
         switch (ps.storage) {

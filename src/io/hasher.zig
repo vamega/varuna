@@ -86,6 +86,11 @@ pub const Hasher = struct {
 
     /// Create a heap-allocated Hasher. Must be heap-allocated because
     /// worker threads hold pointers to it.
+    ///
+    /// `thread_count == 0` selects the **inline mode**: no worker threads
+    /// are spawned, and `submitVerify` / `submitMerkleJob` process the
+    /// job synchronously on the calling thread before returning. This is
+    /// for sim tests that want deterministic step-driven hash results.
     pub fn create(allocator: std.mem.Allocator, thread_count: ?u32) !*Hasher {
         const count = thread_count orelse default_thread_count;
         const efd = try posix.eventfd(0, linux.EFD.NONBLOCK | linux.EFD.CLOEXEC);
@@ -117,6 +122,11 @@ pub const Hasher = struct {
         }
 
         return self;
+    }
+
+    /// Whether this Hasher runs in inline mode (no worker threads).
+    inline fn isInline(self: *const Hasher) bool {
+        return self.threads.len == 0;
     }
 
     pub fn deinit(self: *Hasher) void {
@@ -177,10 +187,7 @@ pub const Hasher = struct {
         torrent_id: u32,
         opts: VerifyOptions,
     ) !void {
-        self.queue_mutex.lock();
-        defer self.queue_mutex.unlock();
-
-        try self.pending_jobs.append(self.allocator, .{
+        const job = Job{
             .slot = slot,
             .piece_index = piece_index,
             .piece_buf = piece_buf,
@@ -190,8 +197,46 @@ pub const Hasher = struct {
             .hash_type = opts.hash_type,
             .torrent_id = torrent_id,
             .is_recheck = opts.is_recheck,
-        });
+        };
+
+        if (self.isInline()) {
+            // Process synchronously on the caller's thread and push the
+            // result directly. Sim tests drain via `drainResultsInto`
+            // on the next tick.
+            const valid = computeValid(job);
+            self.result_mutex.lock();
+            defer self.result_mutex.unlock();
+            try self.completed_results.append(self.allocator, .{
+                .slot = job.slot,
+                .piece_index = job.piece_index,
+                .piece_buf = job.piece_buf,
+                .valid = valid,
+                .torrent_id = job.torrent_id,
+                .is_recheck = job.is_recheck,
+            });
+            return;
+        }
+
+        self.queue_mutex.lock();
+        defer self.queue_mutex.unlock();
+
+        try self.pending_jobs.append(self.allocator, job);
         self.queue_cond.signal();
+    }
+
+    fn computeValid(job: Job) bool {
+        return switch (job.hash_type) {
+            .sha256 => blk: {
+                var actual_v2: [32]u8 = undefined;
+                Sha256.hash(job.piece_buf[0..job.piece_length], &actual_v2, .{});
+                break :blk std.mem.eql(u8, actual_v2[0..], job.expected_hash_v2[0..]);
+            },
+            .sha1 => blk: {
+                var actual: [20]u8 = undefined;
+                Sha1.hash(job.piece_buf[0..job.piece_length], &actual, .{});
+                break :blk std.mem.eql(u8, actual[0..], job.expected_hash[0..]);
+            },
+        };
     }
 
     /// Submit a Merkle tree building job (BEP 52). The worker thread reads
@@ -320,18 +365,7 @@ pub const Hasher = struct {
             self.queue_mutex.unlock();
 
             // Hash the piece (CPU-intensive, runs in parallel across pool)
-            const valid = switch (job.hash_type) {
-                .sha256 => blk: {
-                    var actual_v2: [32]u8 = undefined;
-                    Sha256.hash(job.piece_buf[0..job.piece_length], &actual_v2, .{});
-                    break :blk std.mem.eql(u8, actual_v2[0..], job.expected_hash_v2[0..]);
-                },
-                .sha1 => blk: {
-                    var actual: [20]u8 = undefined;
-                    Sha1.hash(job.piece_buf[0..job.piece_length], &actual, .{});
-                    break :blk std.mem.eql(u8, actual[0..], job.expected_hash[0..]);
-                },
-            };
+            const valid = computeValid(job);
 
             // Push result
             self.result_mutex.lock();
