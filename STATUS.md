@@ -277,6 +277,39 @@ See `progress-reports/2026-04-25-stage2-event-loop-migration.md` for the Stage 2
 - ~~**Daemon graceful shutdown**~~: Fixed. In-flight transfer draining with configurable timeout now ensures clean exit on SIGTERM/SIGINT.
 - `IORING_OP_SETSOCKOPT` (kernel 6.7+), `IORING_OP_BIND`/`LISTEN` (kernel 6.11+) not available on current kernel 6.6. Per-peer setsockopt (TCP_NODELAY, buffer sizes) remains synchronous.
 
+## Last Verified Milestone (2026-04-25)
+
+Post-Stage-2 EventLoop migration to `io_interface` + Stage 3 EventLoop
+parameterisation over `comptime IO: type` + Stage 4-5 sim infrastructure
+(SimIO/Simulator/SimPeer + smart-ban EL light-up over 8 seeds + BUGGIFY
+under randomized faults over 32 seeds). Cleanup phase: hasher leak fix
+(#16), 11 STYLE.md migration patterns, fast-forward merge to main.
+
+- `zig build test`: 204/204 tests pass (was 199 before this session)
+- `zig build`: clean build
+- 12 STYLE.md migration patterns codified covering callback dispatch,
+  pool allocation, comptime IO parameterisation, fd-touching syscall
+  routing, sim batch boundaries, lazy-method-compilation, and the
+  meta-discipline of tests-pass-at-every-commit + bench-companion
+- IO abstraction (`io_interface.zig`) ships RealIO and SimIO behind a
+  single trait surface. `EventLoopOf(comptime IO: type)` instantiates
+  for both; smart-ban scenarios now run as deterministic 32-seed
+  simulator BUGGIFY tests in addition to live-network e2e.
+
+Perf benches re-verified vs the 2026-04-16 baselines (ReleaseFast,
+post-warm; first-iteration cold-cache numbers omitted):
+
+- `zig build -Doptimize=ReleaseFast perf-workload -- peer_accept_burst --iterations=4000 --clients=1`: `~5.0e7 ns` (vs baseline `~6.91e8 ns`, **14× faster** — io_interface multishot path dropped most of the per-accept overhead). 1 alloc / 128 B (was 0/0 — minor regression in alloc count, transient).
+- `zig build -Doptimize=ReleaseFast perf-workload -- seed_plaintext_burst --iterations=500 --scale=8`: `6.7e6 ns` to `8.7e6 ns` post-warm (vs baseline `6.79e6 ns` to `6.93e6 ns`, **stable to slightly variable**). 2 allocs / 704 B (matches baseline shape after PendingSend pool refactor in #12).
+- `zig build -Doptimize=ReleaseFast perf-workload -- api_get_burst --iterations=4000 --clients=8`: `~6.5e7 ns` to `~7.0e7 ns` (vs baseline `2.13e8 ns` to `2.31e8 ns`, **3× faster**). 8000 allocs / 1.98 MB transient, all freed (peak_live = 1984 B). Allocation count regressed from baseline `0/0`; the bytes are short-lived and freed within the iteration, so no working-set inflation, but worth a follow-up to find the per-iteration allocation source.
+- `zig build -Doptimize=ReleaseFast perf-workload -- tick_sparse_torrents --iterations=500 --torrents=10000 --peers=512 --scale=20`: `~1.5e7 ns` post-warm (vs baseline `1.09e7 ns`, **~1.4× regression — under 2× threshold**). 0 allocs / 0 transient, matches baseline shape. Likely from the per-tick generic-dispatch overhead added by the EL parameterisation; not blocking, but a candidate for the next perf-tuning sweep.
+
+Conclusions:
+- No `>2×` regressions. Stage 2 perf is clean for shipping.
+- `peer_accept_burst` and `api_get_burst` are substantially faster than the 2026-04-16 baselines. The io_interface migration is a net perf win on the accept path and the RPC GET path.
+- The `tick_sparse_torrents` 1.4× regression is the only watch-item. Worth profiling once Stage-2 cleanup is settled to identify whether it's the parameterisation overhead or one of the deinit-order changes.
+- `api_get_burst` allocation regression (`0 → 8000 transient`) is suspicious. May be a buffer that was previously stashed in inline storage now allocating; needs root-cause before declaring api perf clean.
+
 ## Last Verified Milestone (2026-04-16)
 
 - Demo swarm end-to-end with uTP enabled: `demo_swarm.sh` runs TCP+uTP, seeder-to-downloader transfer verified
