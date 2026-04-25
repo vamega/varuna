@@ -112,15 +112,47 @@ deliberately untouched:
 
 ## Remaining issues / follow-up
 
-1. **peer_policy.zig conversion** — required before the smart-ban EL
-   integration test (`tests/sim_smart_ban_eventloop_test.zig`) can do
-   anything beyond type assertion. Sim-engineer's task #9. Probably
-   ~1-2h with the patterns in STYLE.md.
-2. **Shape 1 vs Shape 2** — if the team-lead wants the inverse layout,
-   it's a focused mechanical pass. Don't ship both shapes; pick one
-   and stay there.
+1. ~~**peer_policy.zig conversion**~~ — landed in commit `284f0cc`
+   (Stage 3 #14). 24 multi-arg signatures + 10 single-arg signatures
+   converted to `self: anytype`; 2 `lessThan` closures inside
+   `recalculateUnchokes` use `Ctx = @TypeOf(self)` const so the inner
+   anonymous struct picks up the parameterised type at comptime; 4
+   `EventLoop.X` type-name references rewritten to
+   `@TypeOf(self.*).X`. Test fixtures (`EventLoop.initBare(...)`) stay
+   concrete. 199/199 still passes.
+2. **Shape 1 vs Shape 2** — team-lead confirmed shape 1 stays. No
+   rework planned.
 3. **utp/dht/seed/webseed converters** — only when needed by a
    specific SimIO scenario. Don't pre-convert.
+
+## Discovered scope (post-shipment)
+
+After the original handler conversion landed, sim-engineer pushed
+commit `944a02b` (`SimIO.tick(wait_at_least) parity +
+EventLoop.initBareWithIO + *Self for *const`) which addressed three
+adjacent items:
+
+- **`SimIO.tick(wait_at_least: u32)`** — accepts the param shape for
+  parity with `RealIO.tick`. SimIO ignores the value (synchronous,
+  never blocks). Generic-over-IO callsites in EventLoop now type-check
+  against either backend.
+- **`EventLoopOf(IO).initBareWithIO(allocator, io, hasher_threads)`** —
+  parallel to `initBare` but takes a pre-built IO instance, since
+  `SimIO.init(allocator, .{...})` can't share the `RealIO.init(.{...})`
+  body that `initBare` hardcodes. Daemon callsites unchanged.
+- **`*const EventLoop` → `*const Self`** in event_loop.zig methods
+  (peerCountForTorrent, halfOpenCount, etc.) — a sed-pattern miss in
+  the original wrap commit `e3a0270`.
+
+The lesson: **the visible scope of a generic conversion is smaller
+than the actual scope** because Zig's lazy method compilation hides
+incomplete conversions behind unused methods. The first time a SimIO
+test drives a method, every transitive call site needs to type-check
+against the SimIO instantiation. peer_policy.zig was the next batch of
+that scope; sim-engineer's `944a02b` was a smaller batch (const-receiver
+methods + tick parity) that surfaced when wiring `initBareWithIO`. Both
+were "deferred Stage-2 surface" that only became visible at the moment
+a test crossed the boundary.
 
 ## Key code references
 
