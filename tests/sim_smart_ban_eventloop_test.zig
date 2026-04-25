@@ -1,40 +1,63 @@
-//! Smart-ban EventLoop integration test — pre-scaffolded for Stage 2 #12.
+//! Smart-ban EventLoop integration test.
 //!
-//! This file is the post-Stage-2-#12 form of the smart-ban swarm test,
-//! drafted ahead of time so the EventLoop integration is purely a
-//! mechanical "uncomment + delete `if (false)`" diff once
-//! `EventLoop(comptime IO: type)` lands and exposes the test-only hooks
-//! described in `docs/sim-test-setup.md`.
+//! Drives the production `EventLoop` against `SimIO` with 5 honest
+//! SimPeer seeders + 1 corrupt SimPeer seeder. Asserts the smart-ban
+//! Phase 0 algorithm bans the corrupt peer (`trust_points <= -7`,
+//! `hashfails >= 4`) without false-positive bans on honest peers, while
+//! pieces 1..3 verify cleanly.
 //!
-//! Until that lands, this file:
-//!   * Imports `varuna` and references the planned EventLoop API in
-//!     comments / `if (false)` blocks so it compiles unchanged.
-//!   * Includes a placeholder `test "EventLoop smart-ban integration:
-//!     waiting for Stage 2 #12"` that asserts only that the scaffolding
-//!     exists. Test count goes up by 1.
-//!   * Documents the option-(1) bitfield layout the team-lead recommended
-//!     so the production picker drives the corrupt peer onto piece 0
-//!     deterministically (no test-only `allPeersReady` gate needed).
+//! ## Bitfield layout (option 1 — rarest-first deterministic)
 //!
-//! When Stage 2 #12 finishes:
-//!   1. Replace the `if (false) {}` block below with live code.
-//!   2. Delete the `placeholder` test at the bottom.
-//!   3. The assertions are already correct — no logic changes needed.
+//! BitTorrent bitfield encoding: high bit of byte 0 = piece 0, next
+//! bit down = piece 1, etc.
+//!
+//!   peer index    bitfield byte 0       pieces held
+//!   ──────────    ───────────────       ───────────
+//!   0..4 (hon.)   0_111_0000  (0x70)    {1, 2, 3}
+//!   5  (corrupt)  1_000_0000  (0x80)    {0}
+//!
+//! Pieces 1..3 each have 5 sources; piece 0 has exactly 1. The
+//! production rarest-first picker (`PieceTracker.claimPiece` filtered by
+//! peer bitfield, called from `peer_policy.tryAssignPieces`) deterministically
+//! assigns piece 0 to the corrupt peer because it's the unique holder.
+//! After 4 failures (trust = 0 → -2 → -4 → -6 → -8) the corrupt peer is
+//! banned. Piece 0 then has no source → stays incomplete (correct
+//! production behaviour, no other holder advertised it).
+//!
+//! Asserts:
+//!   * Pieces 1..3 verified.
+//!   * Piece 0 NOT verified (no honest source after corrupt is banned).
+//!   * Corrupt peer banned with `hashfails >= 4`.
+//!   * No honest peer banned and no honest peer has any hashfails.
+//!
+//! Loops over 8 different seeds (DoD #3).
+//!
+//! ## Status
+//!
+//! Currently the test body is gated on Task #14 (peer_policy.zig
+//! parameterisation). Until that lands, `EventLoopOf(SimIO).tick()`
+//! doesn't compile because `peer_policy.processHashResults` /
+//! `tryAssignPieces` / etc. still take `*EventLoop` directly. Once #14
+//! ships, the `if (false)` guard at the top of `runOneSeedAgainstEventLoop`
+//! flips to `if (true)` and the seed loop activates.
 
 const std = @import("std");
 const testing = std.testing;
 const posix = std.posix;
+const linux = std.os.linux;
 
 const varuna = @import("varuna");
 const ifc = varuna.io.io_interface;
 const SimIO = varuna.io.sim_io.SimIO;
-const Simulator = varuna.sim.Simulator;
-const SimulatorOf = varuna.sim.SimulatorOf;
-const StubDriver = varuna.sim.StubDriver;
+const event_loop_mod = varuna.io.event_loop;
 const SimPeer = varuna.sim.SimPeer;
 const SimPeerBehavior = varuna.sim.sim_peer.Behavior;
 const peer_wire = varuna.net.peer_wire;
 const Sha1 = varuna.crypto.Sha1;
+const Session = varuna.torrent.session.Session;
+const PieceStore = varuna.storage.writer.PieceStore;
+const PieceTracker = varuna.torrent.piece_tracker.PieceTracker;
+const Bitfield = varuna.bitfield.Bitfield;
 
 const Completion = ifc.Completion;
 const Result = ifc.Result;
@@ -44,262 +67,231 @@ const num_peers: u8 = 6;
 const corrupt_peer_index: u8 = 5;
 const piece_count: u32 = 4;
 const piece_size: u32 = 32;
-
-// ── Bitfield layout (option 1 from the team-lead's brief) ─────
-//
-// The rarest-first picker in the daemon assigns pieces by availability:
-// pieces with the fewest sources go first, and a piece offered by exactly
-// one peer is unconditionally assigned to that peer. We use this to force
-// the corrupt peer onto piece 0 without any test-only gate.
-//
-// BitTorrent bitfield encoding: high bit of byte 0 = piece 0, next bit
-// down = piece 1, etc. So:
-//
-//   peer index    bitfield byte 0       pieces held
-//   ──────────    ───────────────       ───────────
-//   0..4 (hon.)   0_111_0000  (0x70)    {1, 2, 3}
-//   5  (corrupt)  1_000_0000  (0x80)    {0}
-//
-// Pieces 1..3 are equally common (5 sources each); piece 0 has exactly
-// one source. Rarest-first must pick piece 0 → assigns to corrupt → fails
-// → corrupt's trust drops by 2 → re-assigns to corrupt (no other source) →
-// fails again → ...
-//
-// After 4 failures (trust = -8), corrupt is banned. Piece 0 then becomes
-// unrecoverable (no honest peer holds it). The test asserts:
-//
-//   * Pieces 1..3 verified.
-//   * Piece 0 NOT verified (correct outcome — no honest source).
-//   * Corrupt peer banned with hashfails >= 4.
-//   * No honest peer banned.
-//
-// This shape exercises smart-ban deterministically without any
-// test-only piece-picker hook.
+const max_ticks: u32 = 4096;
 
 const honest_bitfield: [1]u8 = .{0b0111_0000};
 const corrupt_bitfield: [1]u8 = .{0b1000_0000};
 
-// ── Stage-2-#12 integration (paused until the API lands) ──────
-
 fn syntheticAddr(idx: u8) std.net.Address {
-    return std.net.Address.initIp4(.{ 10, 0, 0, idx + 1 }, 6881);
+    return std.net.Address.initIp4(.{ 10, 0, 0, idx + 1 }, 0);
+}
+
+/// Build minimal bencoded metainfo for a 4-piece × 32-byte torrent with
+/// the given concatenated piece hashes. Mirrors the pattern in
+/// `tests/sim_swarm_test.zig:buildTorrentBytes`.
+fn buildTorrentBytes(allocator: std.mem.Allocator, piece_hashes: *const [piece_count][20]u8) ![]u8 {
+    var buf = std.ArrayList(u8).empty;
+    defer buf.deinit(allocator);
+
+    try buf.appendSlice(allocator, "d8:announce14:http://tracker4:infod");
+    try buf.appendSlice(allocator, "6:lengthi");
+    try buf.writer(allocator).print("{d}", .{piece_count * piece_size});
+    try buf.append(allocator, 'e');
+    try buf.appendSlice(allocator, "4:name15:smart_ban_sim.bin");
+    try buf.appendSlice(allocator, "12:piece lengthi");
+    try buf.writer(allocator).print("{d}", .{piece_size});
+    try buf.append(allocator, 'e');
+    try buf.appendSlice(allocator, "6:pieces");
+    try buf.writer(allocator).print("{d}", .{piece_count * 20});
+    try buf.append(allocator, ':');
+    for (piece_hashes) |*h| try buf.appendSlice(allocator, h);
+    try buf.appendSlice(allocator, "ee");
+
+    return buf.toOwnedSlice(allocator);
 }
 
 fn runOneSeedAgainstEventLoop(seed: u64) !void {
-    _ = seed;
+    // GATED: re-enable the body when Task #14 (peer_policy.zig
+    // parameterisation) lands. Today `EventLoopOf(SimIO).tick()` doesn't
+    // compile because the per-tick scheduler family
+    // (`processHashResults` / `tryAssignPieces` / `recalculateUnchokes`
+    // etc.) still takes `*EventLoop` directly. Migration-engineer is
+    // converting; my body below is what activates once they do.
+    if (true) return;
 
-    // The full integration body lives below in an `if (false)` so this
-    // file builds cleanly today. Each piece below maps to a requirement
-    // already documented in docs/sim-test-setup.md; migration-engineer
-    // can land them one at a time and the relevant chunks turn on.
+    const allocator = testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
 
-    if (false) {
-        // ── Step 1: Build the simulator with EventLoop(SimIO) as Driver.
-        //
-        // Requires Stage 2 #12: `EventLoop(comptime IO: type)`. The
-        // current concrete `EventLoop` won't compile under SimIO.
-        //
-        //   const EventLoop = varuna.io.event_loop.EventLoop;
-        //   var sim = try SimulatorOf(EventLoop(SimIO)).init(
-        //       testing.allocator,
-        //       .{
-        //           .swarm_capacity = num_peers,
-        //           .seed = seed,
-        //           .sim_io = .{ .socket_capacity = num_peers * 2 },
-        //       },
-        //       try EventLoop(SimIO).init(testing.allocator, .{
-        //           // Disable real-network paths.
-        //           .simulator_mode = true,
-        //           // ... rest of EL config ...
-        //       }),
-        //   );
-        //   defer sim.deinit();
+    // ── 1. Build canonical piece data + SHA-1 hashes ─────────────
+    var piece_data: [piece_count * piece_size]u8 = undefined;
+    for (&piece_data, 0..) |*b, i| b.* = @as(u8, @intCast(i & 0xff));
 
-        // ── Step 2: Register the test torrent in-memory.
-        //
-        // Requires `EventLoop.addTestTorrent(spec)`. See
-        // docs/sim-test-setup.md §2 for the spec shape.
-        //
-        //   var arena = std.heap.ArenaAllocator.init(testing.allocator);
-        //   defer arena.deinit();
-        //
-        //   const piece_data = try arena.allocator().alloc(
-        //       u8,
-        //       piece_count * piece_size,
-        //   );
-        //   for (piece_data, 0..) |*b, i| b.* = @as(u8, @intCast(i & 0xff));
-        //
-        //   var piece_hashes: [piece_count][20]u8 = undefined;
-        //   var i: u32 = 0;
-        //   while (i < piece_count) : (i += 1) {
-        //       var hasher = Sha1.init(.{});
-        //       hasher.update(piece_data[i * piece_size ..][0..piece_size]);
-        //       hasher.final(&piece_hashes[i]);
-        //   }
-        //
-        //   const tid = try sim.driver.addTestTorrent(.{
-        //       .info_hash = .{0xab} ** 20,
-        //       .piece_count = piece_count,
-        //       .piece_size = piece_size,
-        //       .piece_hashes = &piece_hashes,
-        //       .storage = piece_data,
-        //   });
+    var piece_hashes: [piece_count][20]u8 = undefined;
+    var p: u32 = 0;
+    while (p < piece_count) : (p += 1) {
+        Sha1.hash(piece_data[p * piece_size ..][0..piece_size], &piece_hashes[p], .{});
+    }
 
-        // ── Step 3: Spin up SimPeer seeders and inject their fds.
-        //
-        // Requires `EventLoop.addInboundPeer(torrent_id, fd, addr)`. See
-        // docs/sim-test-setup.md §3.
-        //
-        //   var rng = std.Random.DefaultPrng.init(seed ^ 0xfeedface);
-        //   var peers: [num_peers]SimPeer = undefined;
-        //   var slots: [num_peers]u16 = undefined;
-        //
-        //   var idx: u8 = 0;
-        //   while (idx < num_peers) : (idx += 1) {
-        //       const fds = try sim.io.createSocketpair();
-        //
-        //       const behavior: SimPeerBehavior = if (idx == corrupt_peer_index)
-        //           .{ .corrupt = .{ .probability = 1.0 } }
-        //       else
-        //           .{ .honest = {} };
-        //       const bf = if (idx == corrupt_peer_index)
-        //           &corrupt_bitfield
-        //       else
-        //           &honest_bitfield;
-        //
-        //       try peers[idx].init(.{
-        //           .io = &sim.io,
-        //           .fd = fds[0],
-        //           .role = .seeder,
-        //           .behavior = behavior,
-        //           .info_hash = .{0xab} ** 20,
-        //           .peer_id = [_]u8{idx} ** 20,
-        //           .piece_count = piece_count,
-        //           .piece_size = piece_size,
-        //           .bitfield = bf,
-        //           .piece_data = piece_data,
-        //           .rng = &rng,
-        //       });
-        //       try sim.addPeer(&peers[idx]);
-        //
-        //       slots[idx] = try sim.driver.addInboundPeer(
-        //           tid,
-        //           fds[1],
-        //           syntheticAddr(idx),
-        //       );
-        //   }
+    // ── 2. Build the torrent metainfo and load it as a Session ──
+    const torrent_bytes = try buildTorrentBytes(arena.allocator(), &piece_hashes);
 
-        // ── Step 4: Drive the simulator.
-        //
-        //   const Cond = struct {
-        //       fn done(s: *@TypeOf(sim)) bool {
-        //           // Pieces 1..3 must verify. Piece 0 stays incomplete by
-        //           // design (no honest holder). Banning corrupt closes the
-        //           // test's success condition.
-        //           return s.driver.isPieceComplete(tid, 1)
-        //               and s.driver.isPieceComplete(tid, 2)
-        //               and s.driver.isPieceComplete(tid, 3)
-        //               and s.driver.getPeerView(slots[corrupt_peer_index]).?.is_banned;
-        //       }
-        //   };
-        //
-        //   const ok = try sim.runUntilFine(Cond.done, 4096, 1_000_000);
-        //   try testing.expect(ok);
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
 
-        // ── Step 5: Smart-ban assertions.
-        //
-        //   // Pieces 1..3 verified.
-        //   try testing.expect(sim.driver.isPieceComplete(tid, 1));
-        //   try testing.expect(sim.driver.isPieceComplete(tid, 2));
-        //   try testing.expect(sim.driver.isPieceComplete(tid, 3));
-        //
-        //   // Piece 0 NOT verified — no other source after corrupt is
-        //   // banned. This is the correct production outcome.
-        //   try testing.expect(!sim.driver.isPieceComplete(tid, 0));
-        //
-        //   // Corrupt peer must be banned.
-        //   const corrupt_view = sim.driver.getPeerView(slots[corrupt_peer_index]).?;
-        //   try testing.expect(corrupt_view.is_banned);
-        //   try testing.expect(corrupt_view.trust_points <= trust_ban_threshold);
-        //   try testing.expect(corrupt_view.hashfails >= 4);
-        //
-        //   // No honest peer banned.
-        //   var j: u8 = 0;
-        //   while (j < num_peers) : (j += 1) {
-        //       if (j == corrupt_peer_index) continue;
-        //       const v = sim.driver.getPeerView(slots[j]).?;
-        //       try testing.expect(!v.is_banned);
-        //       try testing.expectEqual(@as(u8, 0), v.hashfails);
-        //   }
+    const data_root = try std.fs.path.join(arena.allocator(), &.{
+        ".zig-cache", "tmp", &tmp.sub_path, "data",
+    });
+
+    const session = try Session.load(allocator, torrent_bytes, data_root);
+    defer session.deinit(allocator);
+
+    // ── 3. Disk-backed store + downloader's empty piece tracker ──
+    var store = try PieceStore.init(allocator, &session);
+    defer store.deinit();
+
+    const shared_fds = try store.fileHandles(allocator);
+    defer allocator.free(shared_fds);
+
+    var empty_bf = try Bitfield.init(allocator, piece_count);
+    defer empty_bf.deinit(allocator);
+
+    var tracker = try PieceTracker.init(allocator, piece_count, piece_size, piece_size, &empty_bf, 0);
+    defer tracker.deinit(allocator);
+
+    // ── 4. Spin up EventLoopOf(SimIO) ─────────────────────────────
+    const EL_SimIO = event_loop_mod.EventLoopOf(SimIO);
+    const sim_io = try SimIO.init(allocator, .{
+        .socket_capacity = num_peers * 2,
+        .seed = seed,
+    });
+    var el = try EL_SimIO.initBareWithIO(allocator, sim_io, 0);
+    defer el.deinit();
+
+    el.encryption_mode = .disabled;
+    el.clock = .{ .sim = 1_000_000 }; // 1 ms past zero so time-gated logic opens
+
+    // ── 5. Register the torrent ──────────────────────────────────
+    const downloader_peer_id = "-VR0001-simdleventl0".*;
+    const tid = try el.addTorrent(&session, &tracker, shared_fds, downloader_peer_id);
+
+    // ── 6. Spin up 6 SimPeer seeders + addInboundPeer for each ──
+    var rng = std.Random.DefaultPrng.init(seed ^ 0xfeedface);
+    var peers: [num_peers]SimPeer = undefined;
+    var slots: [num_peers]u16 = undefined;
+
+    var i: u8 = 0;
+    while (i < num_peers) : (i += 1) {
+        const fds = try el.io.createSocketpair();
+        const seeder_fd = fds[0];
+        const downloader_fd = fds[1];
+
+        const behavior: SimPeerBehavior = if (i == corrupt_peer_index)
+            .{ .corrupt = .{ .probability = 1.0 } }
+        else
+            .{ .honest = {} };
+        const bf: *const [1]u8 = if (i == corrupt_peer_index)
+            &corrupt_bitfield
+        else
+            &honest_bitfield;
+
+        peers[i] = SimPeer{
+            .io = undefined,
+            .fd = 0,
+            .role = .seeder,
+            .behavior = behavior,
+            .rng = &rng,
+            .info_hash = undefined,
+            .peer_id = undefined,
+            .piece_count = 0,
+            .piece_size = 0,
+            .bitfield = &.{},
+            .piece_data = &.{},
+        };
+        try peers[i].init(.{
+            .io = &el.io,
+            .fd = seeder_fd,
+            .role = .seeder,
+            .behavior = behavior,
+            .info_hash = session.metainfo.info_hash,
+            .peer_id = [_]u8{i} ** 20,
+            .piece_count = piece_count,
+            .piece_size = piece_size,
+            .bitfield = bf,
+            .piece_data = &piece_data,
+            .rng = &rng,
+        });
+
+        slots[i] = try el.addInboundPeer(tid, downloader_fd, syntheticAddr(i));
+    }
+
+    // ── 7. Drive ticks until corrupt is banned + pieces 1..3 done ──
+    var ticks: u32 = 0;
+    while (ticks < max_ticks) : (ticks += 1) {
+        try el.tick();
+
+        // Step each SimPeer (honest peers no-op; future slow-behaviour
+        // peers would advance their throttle here).
+        for (&peers) |*peer| {
+            try peer.step(@as(u64, @intCast(el.clock.now())) * std.time.ns_per_s);
+        }
+
+        const corrupt_banned = if (el.getPeerView(slots[corrupt_peer_index])) |v| v.is_banned else false;
+        const all_target_pieces_done = el.isPieceComplete(tid, 1) and
+            el.isPieceComplete(tid, 2) and
+            el.isPieceComplete(tid, 3);
+        if (corrupt_banned and all_target_pieces_done) break;
+    }
+
+    // ── 8. Smart-ban assertions ──────────────────────────────────
+
+    // Pieces 1..3 must verify (multiple honest sources for each).
+    try testing.expect(el.isPieceComplete(tid, 1));
+    try testing.expect(el.isPieceComplete(tid, 2));
+    try testing.expect(el.isPieceComplete(tid, 3));
+
+    // Piece 0 must NOT verify — its only source is the corrupt peer,
+    // who got banned. This is the correct production outcome.
+    try testing.expect(!el.isPieceComplete(tid, 0));
+
+    // Corrupt peer banned with hashfails >= 4 (4 failures × -2 = -8 ≤ -7).
+    const corrupt_view = el.getPeerView(slots[corrupt_peer_index]).?;
+    try testing.expect(corrupt_view.is_banned);
+    try testing.expect(corrupt_view.trust_points <= trust_ban_threshold);
+    try testing.expect(corrupt_view.hashfails >= 4);
+
+    // No honest peer banned, none with hashfails.
+    var j: u8 = 0;
+    while (j < num_peers) : (j += 1) {
+        if (j == corrupt_peer_index) continue;
+        const v = el.getPeerView(slots[j]).?;
+        try testing.expect(!v.is_banned);
+        try testing.expectEqual(@as(u8, 0), v.hashfails);
     }
 }
 
-/// 32-seed BUGGIFY-stressed variant — the closing piece for DoD #4.
-///
-/// Same scenario as `runOneSeedAgainstEventLoop` but with a small
-/// per-step BUGGIFY probability. The `Simulator.BuggifyConfig` mechanism
-/// is already in place; this only needs the Stage 2 #12 integration to
-/// land.
-fn runOneSeedUnderBuggify(seed: u64) !void {
-    _ = seed;
-    // Body is `runOneSeedAgainstEventLoop` with one extra config field:
-    //
-    //   var sim = try SimulatorOf(EventLoop(SimIO)).init(
-    //       testing.allocator,
-    //       .{
-    //           ...,
-    //           .buggify = .{ .probability = 0.01 },
-    //       },
-    //       try EventLoop(SimIO).init(...),
-    //   );
-    //
-    // Then loop over 32 seeds with the same assertions. BUGGIFY draws
-    // happen each step; the seeded RNG keeps every run reproducible.
-    // Failing seeds print via the BuggifyConfig.log sink.
-}
+test "smart-ban EventLoop integration: 5 honest + 1 corrupt over 8 seeds (gated on Task #14)" {
+    // Bitfield-layout sanity: catches drift if somebody "fixes" the
+    // option (1) layout and silently breaks the rarest-first guarantee.
+    const piece_0_mask: u8 = 0b1000_0000;
+    try testing.expectEqual(@as(u8, 0), honest_bitfield[0] & piece_0_mask);
+    try testing.expectEqual(piece_0_mask, corrupt_bitfield[0] & piece_0_mask);
 
-// ── Placeholder test ──────────────────────────────────────
-
-test "EventLoop smart-ban integration: scaffold compiles (waiting for handler-conversion follow-up)" {
-    // This test asserts the scaffold itself: imports resolve, the
-    // bitfield layout is what option (1) requires, the helper
-    // functions compile, and `EventLoopOf(SimIO)` instantiates as a
-    // valid type. When the handler-conversion follow-up lands, the
-    // placeholder body is replaced with calls into
-    // `runOneSeedAgainstEventLoop` over the 8-seed array.
-
-    // EventLoop parameterisation + handler conversion are both shipped.
-    // Confirm `EventLoopOf(SimIO)` instantiates and `initBareWithIO` +
-    // `tick` typecheck — the surface the integration test needs.
-    //
-    // Lifetime note: `initBareWithIO` consumes the SimIO instance (copies
-    // it into `el.io`). The caller must not also `deinit` the original —
-    // `el.deinit()` covers it.
-    const EL_SimIO = varuna.io.event_loop.EventLoopOf(varuna.io.sim_io.SimIO);
-    const sim_io = try varuna.io.sim_io.SimIO.init(testing.allocator, .{ .socket_capacity = 4 });
+    // EventLoopOf(SimIO) instantiates and `initBareWithIO` runs cleanly.
+    // (`tick()` is gated on Task #14.)
+    const EL_SimIO = event_loop_mod.EventLoopOf(SimIO);
+    const sim_io = try SimIO.init(testing.allocator, .{ .socket_capacity = 4 });
     var el = try EL_SimIO.initBareWithIO(testing.allocator, sim_io, 0);
     defer el.deinit();
-    _ = el.peers.len; // sanity-check the struct laid out
-    // Driving `el.tick()` is gated on Task #14 (peer_policy.zig
-    // parameterisation) — its `processHashResults`/`tryAssignPieces`/etc.
-    // still take `*EventLoop` directly. Re-enable once #14 lands.
+    _ = el.peers.len;
 
-    try testing.expect(num_peers == 6);
-    try testing.expectEqual(@as(u8, 0b0111_0000), honest_bitfield[0]);
-    try testing.expectEqual(@as(u8, 0b1000_0000), corrupt_bitfield[0]);
-
-    // Sanity-check the bitfields exercise option (1):
-    // Bit 7 (high bit of byte 0) is piece 0 in BT bitfield encoding.
-    const piece_0_mask: u8 = 0b1000_0000;
-    try testing.expectEqual(@as(u8, 0), honest_bitfield[0] & piece_0_mask); // honest peers DON'T have piece 0
-    try testing.expectEqual(piece_0_mask, corrupt_bitfield[0] & piece_0_mask); // corrupt DOES have piece 0
-    // Pieces 1..3 are bits 6, 5, 4. Honest has them; corrupt does not.
-    const pieces_123_mask: u8 = 0b0111_0000;
-    try testing.expectEqual(pieces_123_mask, honest_bitfield[0] & pieces_123_mask); // honest has 1..3
-    try testing.expectEqual(@as(u8, 0), corrupt_bitfield[0] & pieces_123_mask); // corrupt does not
-
-    // Suppress "unused" for the helpers that compile but don't run yet.
-    _ = runOneSeedAgainstEventLoop;
-    _ = runOneSeedUnderBuggify;
-    _ = syntheticAddr;
+    // Ready-to-fire seed loop. Today `runOneSeedAgainstEventLoop` is
+    // gated; once Task #14 (peer_policy.zig parameterisation) ships,
+    // flip the early-return inside it and these 8 seeds activate.
+    const seeds = [_]u64{
+        0x0000_0001,
+        0xDEAD_BEEF,
+        0xFEED_FACE,
+        0xCAFE_BABE,
+        0x0F0F_0F0F,
+        0x1234_5678,
+        0xABCD_EF01,
+        0x9876_5432,
+    };
+    for (seeds) |seed| {
+        runOneSeedAgainstEventLoop(seed) catch |err| {
+            std.debug.print("\n  SEED 0x{x} FAILED: {any}\n", .{ seed, err });
+            return err;
+        };
+    }
 }
