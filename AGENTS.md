@@ -17,6 +17,7 @@ Keep implementation under `src/`. The current major subsystems are:
 Keep reusable fixtures in `testdata/`. Keep profiling helpers in `perf/` or `scripts/`.
 
 Read these first when orienting:
+- [STYLE.md](STYLE.md) - coding style, design goals, IO abstraction model, simulation-first testing philosophy
 - [STATUS.md](STATUS.md) - current implementation state, completed work, known issues, next work
 - [progress-reports/2026-04-06-codebase-review.md](progress-reports/2026-04-06-codebase-review.md) - subsystem inventory and review notes
 - [docs/api-compatibility.md](docs/api-compatibility.md) - qBittorrent WebAPI compatibility status
