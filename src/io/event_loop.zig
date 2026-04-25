@@ -1034,6 +1034,92 @@ pub const EventLoop = struct {
         return slot;
     }
 
+    /// Register a pre-connected inbound fd for `torrent_id`. Test/sim-only
+    /// shortcut around the production `accept_multishot` path: the caller
+    /// (typically a `Simulator` driver) has already set up a socketpair
+    /// and assigned one end to a SimPeer; this routes the other end into
+    /// an EventLoop peer slot in the post-accept inbound state, ready to
+    /// receive the BitTorrent handshake from the peer side.
+    ///
+    /// Mirrors `peer_handler.handleAccepted` but skips ban-list / drain /
+    /// disposition / connection-limit checks (the caller is the sim, not
+    /// the network). The torrent_id is known up front so we can attach
+    /// immediately rather than wait for the handshake's info_hash match.
+    pub fn addInboundPeer(
+        self: *EventLoop,
+        torrent_id: TorrentId,
+        fd: posix.fd_t,
+        peer_addr: std.net.Address,
+    ) !u16 {
+        if (self.getTorrentContext(torrent_id) == null) return error.TorrentNotFound;
+        if (self.peer_count >= self.max_connections) return error.ConnectionLimitReached;
+
+        const slot = self.allocSlot() orelse return error.TooManyPeers;
+        const peer = &self.peers[slot];
+        peer.* = Peer{
+            .fd = fd,
+            .state = .inbound_handshake_recv,
+            .mode = .inbound,
+            .torrent_id = torrent_id,
+            .address = peer_addr,
+        };
+        peer.handshake_offset = 0;
+        peer.last_activity = self.clock.now();
+
+        self.peer_count += 1;
+        self.markActivePeer(slot);
+        self.attachPeerToTorrent(torrent_id, slot);
+
+        // Start receiving the peer's handshake. On submission failure,
+        // unwind the slot so the caller doesn't see a half-formed peer.
+        protocol.submitHandshakeRecv(self, slot) catch |err| {
+            self.removePeer(slot);
+            return err;
+        };
+        return slot;
+    }
+
+    /// Read-only view of a peer slot's interesting fields. Used by sim
+    /// tests that assert on smart-ban / trust / piece-progress state
+    /// without reaching into the private `Peer` struct.
+    pub const PeerView = struct {
+        address: std.net.Address,
+        trust_points: i8,
+        hashfails: u8,
+        is_banned: bool,
+        blocks_received: u32,
+        bytes_downloaded: u64,
+        bytes_uploaded: u64,
+    };
+
+    /// Return a snapshot of the peer at `slot`, or null if the slot is
+    /// unused. `is_banned` consults the shared `BanList` if one is
+    /// installed, else reports false.
+    pub fn getPeerView(self: *EventLoop, slot: u16) ?PeerView {
+        if (slot >= self.peers.len) return null;
+        const peer = &self.peers[slot];
+        if (peer.state == .free) return null;
+        const banned = if (self.ban_list) |bl| bl.isBanned(peer.address) else false;
+        return .{
+            .address = peer.address,
+            .trust_points = peer.trust_points,
+            .hashfails = peer.hashfails,
+            .is_banned = banned,
+            .blocks_received = peer.blocks_received,
+            .bytes_downloaded = peer.bytes_downloaded_from,
+            .bytes_uploaded = peer.bytes_uploaded_to,
+        };
+    }
+
+    /// Returns true if the torrent's piece tracker reports this piece as
+    /// complete (downloaded + verified). Returns false if the torrent
+    /// doesn't exist or has no piece tracker attached.
+    pub fn isPieceComplete(self: *EventLoop, torrent_id: TorrentId, piece_index: u32) bool {
+        const tc = self.getTorrentContext(torrent_id) orelse return false;
+        const pt = tc.piece_tracker orelse return false;
+        return pt.isPieceComplete(piece_index);
+    }
+
     /// Initiate an outbound uTP connection to a peer. Creates the uTP
     /// socket via the UtpManager, sends the SYN packet, and allocates a
     /// peer slot in the event loop.
