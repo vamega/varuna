@@ -266,6 +266,25 @@ pub fn build(b: *std.Build) void {
     test_io_parity_step.dependOn(&run_io_parity.step);
     test_step.dependOn(&run_io_parity.step);
 
+    // ── SimIO inline tests (socketpair, parking, fault injection) ─
+    //
+    // The inline `test` blocks in `src/io/sim_io.zig` aren't reachable
+    // from any of the other test roots (mod_tests/daemon_tests don't
+    // discover transitively imported tests in this codebase). This
+    // wrapper imports sim_io.zig directly so its unit tests run.
+    const sim_io_tests = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("tests/sim_socketpair_test.zig"),
+            .target = target,
+            .optimize = optimize,
+            .imports = &varuna_import,
+        }),
+    });
+    const run_sim_io_tests = b.addRunArtifact(sim_io_tests);
+    const test_sim_io_step = b.step("test-sim-io", "Run SimIO inline unit tests (socketpair, parking, fault injection)");
+    test_sim_io_step.dependOn(&run_sim_io_tests.step);
+    test_step.dependOn(&run_sim_io_tests.step);
+
     // ── Event loop health tests ────────────────────────────
     const el_health_tests = b.addTest(.{
         .root_module = b.createModule(.{
