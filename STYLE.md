@@ -284,6 +284,71 @@ A test that only proves (1) is a smoke test.
 
 ---
 
+## Layered Testing Strategy
+
+Complex protocol behaviour gets split into three test types. Each asserts a different
+property; none of them are redundant. The general rule is **safety properties are
+fault-invariant; liveness properties are not** — so the layering is built around which
+property each test is asserting.
+
+### 1. Algorithm test — pure data flow, no faults, deterministic
+
+Asserts that the algorithm computes the right answer on the right inputs. No async hashing,
+no `removePeer` reaping, no socket timing — just the bare data structure being driven through
+its state space.
+
+Canonical example: `tests/sim_smart_ban_protocol_test.zig` runs the smart-ban Phase 0
+trust-points decay/recovery + ban-at-threshold logic against scripted SimPeers, all in
+process, all synchronous. Locks in the *what*: trust goes 0 → -2 → -4 → -6 → -8 across
+four hash failures; banning fires at `<= -7`; honest peers' trust never drops.
+
+### 2. Integration test — real EventLoop, sim-driven, deterministic, multiple seeds
+
+Asserts that the algorithm fires correctly when integrated with the production code paths
+that depend on it. Real `EventLoopOf(SimIO)`, real hasher thread, real disk-write pipeline,
+real `BanList`. No fault injection. Multiple seeds for ordering coverage.
+
+Canonical example: `tests/sim_smart_ban_eventloop_test.zig` runs 5 honest + 1 corrupt
+SimPeers against `EventLoopOf(SimIO)` over 8 seeds. Asserts pieces 1..3 verify, piece 0
+stays incomplete, corrupt peer is banned, no honest peer is banned. Locks in the
+*that-it-fires-end-to-end*.
+
+### 3. Safety-under-faults test — real EventLoop, BUGGIFY + FaultConfig, many seeds
+
+Asserts safety invariants — properties that hold by construction across every possible
+fault sequence — *not* liveness. Uses both per-tick heap-probe (`SimIO.injectRandomFault`)
+and per-op `FaultConfig` probabilities to inject errors at random times into random
+in-flight operations. Many seeds. The vacuous-pass guard ensures real coverage.
+
+Canonical example: `tests/sim_smart_ban_eventloop_test.zig` "BUGGIFY" test runs the same
+scenario over 32 seeds with randomized faults. Asserts only:
+- No honest peer is wrongly banned (provable: `penalizePeerTrust` is the only `bl.banIp`
+  caller; it only runs on hash failure; honest peers don't send bad data).
+- No honest peer accumulates hashfails.
+- The test exits cleanly (no panic, no leak).
+- A meaningful majority of seeds DO observe an actual ban (vacuous-pass guard: rejects the
+  pathology where every seed silently severs the corrupt peer's connection before its
+  bytes reach the EL).
+
+Liveness is *not* asserted here. Under randomized faults, the corrupt peer's socket can
+legitimately die before its 4th hash-fail; the ban won't fire; the test must not flag
+that as a failure. Asserting liveness under randomized faults requires either (a)
+deterministic fault profiles per seed (defeats BUGGIFY's purpose), (b) a fault-aware
+liveness window per seed (test fragility), or (c) running until convergence under
+adversarial fault timing (test flakiness). None are good. Pin to safety.
+
+### When to write which
+
+A new protocol behaviour gets all three layers, in order. The algorithm test is fastest to
+write and locks the spec; the integration test surfaces wiring issues; the safety-under-
+faults test catches recovery-path bugs that only show up when the system is being kicked
+around. Skipping any layer leaves a class of bug uncovered. The "different fault profiles
+exercise different recovery paths" property of layer 3 is deliberate — the seeds where the
+ban *doesn't* fire still exercise meaningful cleanup paths (half-banned peer mid-fail), so
+don't tighten the vacuous-pass threshold to require 100% bans.
+
+---
+
 ## Safety Rules
 
 ### Control flow
