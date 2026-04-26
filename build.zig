@@ -534,6 +534,34 @@ pub fn build(b: *std.Build) void {
     test_piece_tracker_cache_step.dependOn(&run_piece_tracker_cache_tests.step);
     test_step.dependOn(&run_piece_tracker_cache_tests.step);
 
+    // ── RPC arena BUGGIFY tests (Track C: fault-injection coverage) ──
+    const rpc_arena_buggify_tests = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("tests/rpc_arena_buggify_test.zig"),
+            .target = target,
+            .optimize = optimize,
+            .imports = &varuna_import,
+        }),
+    });
+    const run_rpc_arena_buggify_tests = b.addRunArtifact(rpc_arena_buggify_tests);
+    const test_rpc_arena_buggify_step = b.step("test-rpc-arena-buggify", "Run BUGGIFY-style fault-injection coverage for the RPC bump arenas");
+    test_rpc_arena_buggify_step.dependOn(&run_rpc_arena_buggify_tests.step);
+    test_step.dependOn(&run_rpc_arena_buggify_tests.step);
+
+    // ── Piece tracker cache BUGGIFY tests (Task #5 fix safety-under-faults) ──
+    const piece_tracker_cache_buggify_tests = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("tests/piece_tracker_cache_buggify_test.zig"),
+            .target = target,
+            .optimize = optimize,
+            .imports = &varuna_import,
+        }),
+    });
+    const run_piece_tracker_cache_buggify_tests = b.addRunArtifact(piece_tracker_cache_buggify_tests);
+    const test_piece_tracker_cache_buggify_step = b.step("test-piece-tracker-cache-buggify", "Run BUGGIFY-style randomised stress test for the wanted_completed_count cache");
+    test_piece_tracker_cache_buggify_step.dependOn(&run_piece_tracker_cache_buggify_tests.step);
+    test_step.dependOn(&run_piece_tracker_cache_buggify_tests.step);
+
     // ── Soak test (long-running resource leak detection) ──
     const soak_exe = b.addExecutable(.{
         .name = "varuna-soak-test",
