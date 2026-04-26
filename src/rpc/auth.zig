@@ -177,16 +177,21 @@ test "expired session is rejected" {
 
 test "max sessions evicts oldest" {
     var store = SessionStore{};
+    const now = std.time.timestamp();
 
     // Fill all slots
     var sids: [SessionStore.max_sessions][SessionStore.sid_len]u8 = undefined;
     for (0..SessionStore.max_sessions) |i| {
         sids[i] = store.createSession();
-        // Stagger timestamps so oldest is deterministic
+        // Stagger timestamps so oldest is deterministic, but anchor them
+        // to "now" — `validateSession` rejects anything older than
+        // `session_timeout_secs` (default 1h) relative to current time.
+        // Using raw indices 0..9 (as the original test did) put every
+        // session ~50 years in the past and they all came back expired.
         for (&store.sessions) |*slot| {
             if (slot.*) |*session| {
                 if (std.mem.eql(u8, &session.sid, &sids[i])) {
-                    session.last_active = @as(i64, @intCast(i));
+                    session.last_active = now - @as(i64, @intCast(SessionStore.max_sessions - i));
                 }
             }
         }
