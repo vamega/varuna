@@ -259,9 +259,13 @@ fn parseError(tid: []const u8, e_raw: []const u8) !Error {
     var pos: usize = 1;
     const code = parseInteger(e_raw, &pos) orelse return error.InvalidKrpc;
     const msg = parseByteString(e_raw, &pos) orelse return error.InvalidKrpc;
+    // Clamp to the documented u32 range. Without the upper bound the
+    // `@intCast(i64 -> u32)` panicked on adversarial responses with
+    // `code` larger than `maxInt(u32)`.
+    const clamped: i64 = @max(@min(code, std.math.maxInt(u32)), 0);
     return .{
         .transaction_id = tid,
-        .code = @intCast(@max(code, 0)),
+        .code = @intCast(clamped),
         .message = msg,
     };
 }
@@ -274,12 +278,22 @@ fn parseByteString(data: []const u8, pos: *usize) ?[]const u8 {
     if (!std.ascii.isDigit(data[start])) return null;
 
     var i = start;
-    while (i < data.len and std.ascii.isDigit(data[i])) : (i += 1) {}
+    // Bound the digit-prefix scan: a usize fits in at most 20 base-10
+    // digits, so a length prefix longer than that cannot represent a
+    // valid offset into a UDP datagram. Capping the scan also makes
+    // `parseUnsigned` below trivially overflow-free.
+    const max_len_digits: usize = 20;
+    while (i < data.len and std.ascii.isDigit(data[i]) and (i - start) < max_len_digits) : (i += 1) {}
     if (i >= data.len or data[i] != ':') return null;
 
     const len = std.fmt.parseUnsigned(usize, data[start..i], 10) catch return null;
     i += 1; // skip ':'
-    if (i + len > data.len) return null;
+    // Saturating-subtraction form: `len > data.len - i` is overflow-safe
+    // because `i <= data.len` is invariant after the `data[i] != ':'`
+    // guard above. The naive `i + len > data.len` form panicked under
+    // adversarial inputs where `len` was near `maxInt(usize)` (Zig's
+    // safe-mode integer-overflow trap).
+    if (len > data.len - i) return null;
     pos.* = i + len;
     return data[i .. i + len];
 }
@@ -288,8 +302,14 @@ fn parseInteger(data: []const u8, pos: *usize) ?i64 {
     if (pos.* >= data.len or data[pos.*] != 'i') return null;
     pos.* += 1;
     const start = pos.*;
-    while (pos.* < data.len and data[pos.*] != 'e') : (pos.* += 1) {}
-    if (pos.* >= data.len) return null;
+    // i64 has at most 20 digits; allow 1 leading '-' for the negative
+    // case (so 21 total). A digit run longer than that cannot represent
+    // a valid i64 — bound the scan so we can't be made to spin on
+    // adversarial multi-KB digit floods (each KRPC packet is bounded
+    // by UDP MTU anyway, but the bound is also a clarity win).
+    const max_int_chars: usize = 21;
+    while (pos.* < data.len and data[pos.*] != 'e' and (pos.* - start) < max_int_chars) : (pos.* += 1) {}
+    if (pos.* >= data.len or data[pos.*] != 'e') return null;
     const digits = data[start..pos.*];
     pos.* += 1; // skip 'e'
     return std.fmt.parseInt(i64, digits, 10) catch null;
@@ -333,19 +353,88 @@ fn skipValue(data: []const u8, pos: *usize) ?void {
 }
 
 // ── Encoding ────────────────────────────────────────────
+//
+// All encoders take a caller-supplied `buf: []u8` and return either
+// `!usize` (the number of bytes written) or `error.NoSpaceLeft` if
+// the buffer is too small. Every byte written is bounds-checked
+// through the `Writer` helper below — no encoder ever writes past
+// `buf.len`. This is hardened against the unsoundness that previously
+// existed where `writeByteString`/`writeInteger` wrote directly into
+// the slice without checking, panicking in Debug and triggering UB
+// in Release.
+
+const EncodeError = error{NoSpaceLeft};
+
+/// Tiny bounds-checked write cursor over a caller-owned slice.
+/// Centralizes the "every byte goes through a length check" invariant
+/// for the encoder side. Composes well: pure data appends and bencode
+/// envelope helpers (`byteString`, `integer`, `dictBegin`, `listBegin`,
+/// `containerEnd`) share the same overflow-safe path.
+const Writer = struct {
+    buf: []u8,
+    pos: usize = 0,
+
+    fn writeByte(self: *Writer, b: u8) EncodeError!void {
+        // Fast path: pos is bounded by buf.len; +1 cannot overflow if
+        // we check *before* incrementing.
+        if (self.pos >= self.buf.len) return error.NoSpaceLeft;
+        self.buf[self.pos] = b;
+        self.pos += 1;
+    }
+
+    fn writeAll(self: *Writer, data: []const u8) EncodeError!void {
+        // Saturating-subtraction form avoids any chance of `pos+len`
+        // overflowing usize on adversarial-large `data.len`.
+        // (`buf.len - pos` is safe because `pos <= buf.len` is an
+        // invariant of every operation in this struct.)
+        std.debug.assert(self.pos <= self.buf.len);
+        if (data.len > self.buf.len - self.pos) return error.NoSpaceLeft;
+        @memcpy(self.buf[self.pos..][0..data.len], data);
+        self.pos += data.len;
+    }
+
+    fn byteString(self: *Writer, data: []const u8) EncodeError!void {
+        // Ascii decimal length is at most 20 chars (u64 max in base 10).
+        var len_buf: [20]u8 = undefined;
+        const len_str = std.fmt.bufPrint(&len_buf, "{d}", .{data.len}) catch unreachable;
+        try self.writeAll(len_str);
+        try self.writeByte(':');
+        try self.writeAll(data);
+    }
+
+    fn integer(self: *Writer, value: i64) EncodeError!void {
+        try self.writeByte('i');
+        var num_buf: [20]u8 = undefined;
+        const num_str = std.fmt.bufPrint(&num_buf, "{d}", .{value}) catch unreachable;
+        try self.writeAll(num_str);
+        try self.writeByte('e');
+    }
+
+    fn dictBegin(self: *Writer) EncodeError!void {
+        try self.writeByte('d');
+    }
+
+    fn listBegin(self: *Writer) EncodeError!void {
+        try self.writeByte('l');
+    }
+
+    fn containerEnd(self: *Writer) EncodeError!void {
+        try self.writeByte('e');
+    }
+};
 
 /// Encode a ping query.
-pub fn encodePingQuery(buf: []u8, txn_id: u16, our_id: NodeId) !usize {
+pub fn encodePingQuery(buf: []u8, txn_id: u16, our_id: NodeId) EncodeError!usize {
     return encodeQuery(buf, txn_id, .ping, our_id, null, null, null, false);
 }
 
 /// Encode a find_node query.
-pub fn encodeFindNodeQuery(buf: []u8, txn_id: u16, our_id: NodeId, target: NodeId) !usize {
+pub fn encodeFindNodeQuery(buf: []u8, txn_id: u16, our_id: NodeId, target: NodeId) EncodeError!usize {
     return encodeQuery(buf, txn_id, .find_node, our_id, &target, null, null, false);
 }
 
 /// Encode a get_peers query.
-pub fn encodeGetPeersQuery(buf: []u8, txn_id: u16, our_id: NodeId, info_hash: [20]u8) !usize {
+pub fn encodeGetPeersQuery(buf: []u8, txn_id: u16, our_id: NodeId, info_hash: [20]u8) EncodeError!usize {
     return encodeQuery(buf, txn_id, .get_peers, our_id, &info_hash, null, null, false);
 }
 
@@ -358,7 +447,7 @@ pub fn encodeAnnouncePeerQuery(
     port: u16,
     token: []const u8,
     implied_port: bool,
-) !usize {
+) EncodeError!usize {
     return encodeQuery(buf, txn_id, .announce_peer, our_id, &info_hash, port, token, implied_port);
 }
 
@@ -371,86 +460,81 @@ fn encodeQuery(
     port: ?u16,
     token: ?[]const u8,
     implied_port: bool,
-) !usize {
-    var pos: usize = 0;
+) EncodeError!usize {
+    var w = Writer{ .buf = buf };
 
-    // d
-    buf[pos] = 'd';
-    pos += 1;
+    try w.dictBegin();
 
     // "a" dict
-    pos += writeByteString(buf[pos..], "a");
-    buf[pos] = 'd';
-    pos += 1;
+    try w.byteString("a");
+    try w.dictBegin();
 
     // "id"
-    pos += writeByteString(buf[pos..], "id");
-    pos += writeByteString(buf[pos..], &our_id);
+    try w.byteString("id");
+    try w.byteString(&our_id);
 
     switch (method) {
         .announce_peer => {
             if (implied_port) {
-                pos += writeByteString(buf[pos..], "implied_port");
-                pos += writeInteger(buf[pos..], 1);
+                try w.byteString("implied_port");
+                try w.integer(1);
             }
             if (target_or_hash) |th| {
-                pos += writeByteString(buf[pos..], "info_hash");
-                pos += writeByteString(buf[pos..], th);
+                try w.byteString("info_hash");
+                try w.byteString(th);
             }
             if (port) |p| {
-                pos += writeByteString(buf[pos..], "port");
-                pos += writeInteger(buf[pos..], @intCast(p));
+                try w.byteString("port");
+                try w.integer(@intCast(p));
             }
             if (token) |t| {
-                pos += writeByteString(buf[pos..], "token");
-                pos += writeByteString(buf[pos..], t);
+                try w.byteString("token");
+                try w.byteString(t);
             }
         },
         .get_peers => {
             if (target_or_hash) |th| {
-                pos += writeByteString(buf[pos..], "info_hash");
-                pos += writeByteString(buf[pos..], th);
+                try w.byteString("info_hash");
+                try w.byteString(th);
             }
         },
         .find_node => {
             if (target_or_hash) |th| {
-                pos += writeByteString(buf[pos..], "target");
-                pos += writeByteString(buf[pos..], th);
+                try w.byteString("target");
+                try w.byteString(th);
             }
         },
         .ping => {},
     }
 
-    buf[pos] = 'e'; // end "a" dict
-    pos += 1;
+    try w.containerEnd(); // end "a" dict
 
     // "q"
-    pos += writeByteString(buf[pos..], "q");
-    pos += writeByteString(buf[pos..], method.toString());
+    try w.byteString("q");
+    try w.byteString(method.toString());
 
     // "t"
-    pos += writeByteString(buf[pos..], "t");
+    try w.byteString("t");
     var tid_bytes: [2]u8 = undefined;
     std.mem.writeInt(u16, &tid_bytes, txn_id, .big);
-    pos += writeByteString(buf[pos..], &tid_bytes);
+    try w.byteString(&tid_bytes);
 
     // "y"
-    pos += writeByteString(buf[pos..], "y");
-    pos += writeByteString(buf[pos..], "q");
+    try w.byteString("y");
+    try w.byteString("q");
 
-    buf[pos] = 'e'; // end top dict
-    pos += 1;
+    try w.containerEnd(); // end top dict
 
-    return pos;
+    return w.pos;
 }
 
 /// Encode a ping/find_node response.
-pub fn encodePingResponse(buf: []u8, txn_id: []const u8, our_id: NodeId) !usize {
+pub fn encodePingResponse(buf: []u8, txn_id: []const u8, our_id: NodeId) EncodeError!usize {
     return encodeResponse(buf, txn_id, our_id, null, null, null);
 }
 
 /// Encode a find_node response with compact nodes.
-pub fn encodeFindNodeResponse(buf: []u8, txn_id: []const u8, our_id: NodeId, nodes: []const u8) !usize {
+pub fn encodeFindNodeResponse(buf: []u8, txn_id: []const u8, our_id: NodeId, nodes: []const u8) EncodeError!usize {
     return encodeResponse(buf, txn_id, our_id, nodes, null, null);
 }
 
@@ -461,46 +545,40 @@ pub fn encodeGetPeersResponseValues(
     our_id: NodeId,
     token: []const u8,
     values: []const [6]u8,
-) !usize {
-    var pos: usize = 0;
-    buf[pos] = 'd';
-    pos += 1;
+) EncodeError!usize {
+    var w = Writer{ .buf = buf };
+    try w.dictBegin();
 
     // "r" dict
-    pos += writeByteString(buf[pos..], "r");
-    buf[pos] = 'd';
-    pos += 1;
+    try w.byteString("r");
+    try w.dictBegin();
 
-    pos += writeByteString(buf[pos..], "id");
-    pos += writeByteString(buf[pos..], &our_id);
+    try w.byteString("id");
+    try w.byteString(&our_id);
 
-    pos += writeByteString(buf[pos..], "token");
-    pos += writeByteString(buf[pos..], token);
+    try w.byteString("token");
+    try w.byteString(token);
 
-    pos += writeByteString(buf[pos..], "values");
-    buf[pos] = 'l';
-    pos += 1;
+    try w.byteString("values");
+    try w.listBegin();
     for (values) |v| {
-        pos += writeByteString(buf[pos..], &v);
+        try w.byteString(&v);
     }
-    buf[pos] = 'e';
-    pos += 1;
+    try w.containerEnd();
 
-    buf[pos] = 'e'; // end "r" dict
-    pos += 1;
+    try w.containerEnd(); // end "r" dict
 
     // "t"
-    pos += writeByteString(buf[pos..], "t");
-    pos += writeByteString(buf[pos..], txn_id);
+    try w.byteString("t");
+    try w.byteString(txn_id);
 
     // "y"
-    pos += writeByteString(buf[pos..], "y");
-    pos += writeByteString(buf[pos..], "r");
+    try w.byteString("y");
+    try w.byteString("r");
 
-    buf[pos] = 'e';
-    pos += 1;
+    try w.containerEnd();
 
-    return pos;
+    return w.pos;
 }
 
 /// Encode a get_peers response with nodes (no peers found).
@@ -510,40 +588,36 @@ pub fn encodeGetPeersResponseNodes(
     our_id: NodeId,
     token: []const u8,
     nodes: []const u8,
-) !usize {
-    var pos: usize = 0;
-    buf[pos] = 'd';
-    pos += 1;
+) EncodeError!usize {
+    var w = Writer{ .buf = buf };
+    try w.dictBegin();
 
     // "r" dict
-    pos += writeByteString(buf[pos..], "r");
-    buf[pos] = 'd';
-    pos += 1;
+    try w.byteString("r");
+    try w.dictBegin();
 
-    pos += writeByteString(buf[pos..], "id");
-    pos += writeByteString(buf[pos..], &our_id);
+    try w.byteString("id");
+    try w.byteString(&our_id);
 
-    pos += writeByteString(buf[pos..], "nodes");
-    pos += writeByteString(buf[pos..], nodes);
+    try w.byteString("nodes");
+    try w.byteString(nodes);
 
-    pos += writeByteString(buf[pos..], "token");
-    pos += writeByteString(buf[pos..], token);
+    try w.byteString("token");
+    try w.byteString(token);
 
-    buf[pos] = 'e'; // end "r" dict
-    pos += 1;
+    try w.containerEnd(); // end "r" dict
 
     // "t"
-    pos += writeByteString(buf[pos..], "t");
-    pos += writeByteString(buf[pos..], txn_id);
+    try w.byteString("t");
+    try w.byteString(txn_id);
 
     // "y"
-    pos += writeByteString(buf[pos..], "y");
-    pos += writeByteString(buf[pos..], "r");
+    try w.byteString("y");
+    try w.byteString("r");
 
-    buf[pos] = 'e';
-    pos += 1;
+    try w.containerEnd();
 
-    return pos;
+    return w.pos;
 }
 
 fn encodeResponse(
@@ -553,104 +627,74 @@ fn encodeResponse(
     nodes: ?[]const u8,
     token: ?[]const u8,
     values: ?[]const [6]u8,
-) !usize {
-    var pos: usize = 0;
-    buf[pos] = 'd';
-    pos += 1;
+) EncodeError!usize {
+    var w = Writer{ .buf = buf };
+    try w.dictBegin();
 
     // "r" dict
-    pos += writeByteString(buf[pos..], "r");
-    buf[pos] = 'd';
-    pos += 1;
+    try w.byteString("r");
+    try w.dictBegin();
 
-    pos += writeByteString(buf[pos..], "id");
-    pos += writeByteString(buf[pos..], &our_id);
+    try w.byteString("id");
+    try w.byteString(&our_id);
 
     if (nodes) |n| {
-        pos += writeByteString(buf[pos..], "nodes");
-        pos += writeByteString(buf[pos..], n);
+        try w.byteString("nodes");
+        try w.byteString(n);
     }
 
     if (token) |t| {
-        pos += writeByteString(buf[pos..], "token");
-        pos += writeByteString(buf[pos..], t);
+        try w.byteString("token");
+        try w.byteString(t);
     }
 
     if (values) |vals| {
-        pos += writeByteString(buf[pos..], "values");
-        buf[pos] = 'l';
-        pos += 1;
+        try w.byteString("values");
+        try w.listBegin();
         for (vals) |v| {
-            pos += writeByteString(buf[pos..], &v);
+            try w.byteString(&v);
         }
-        buf[pos] = 'e';
-        pos += 1;
+        try w.containerEnd();
     }
 
-    buf[pos] = 'e'; // end "r" dict
-    pos += 1;
+    try w.containerEnd(); // end "r" dict
 
     // "t"
-    pos += writeByteString(buf[pos..], "t");
-    pos += writeByteString(buf[pos..], txn_id);
+    try w.byteString("t");
+    try w.byteString(txn_id);
 
     // "y"
-    pos += writeByteString(buf[pos..], "y");
-    pos += writeByteString(buf[pos..], "r");
+    try w.byteString("y");
+    try w.byteString("r");
 
-    buf[pos] = 'e';
-    pos += 1;
+    try w.containerEnd();
 
-    return pos;
+    return w.pos;
 }
 
 /// Encode a KRPC error response.
-pub fn encodeError(buf: []u8, txn_id: []const u8, code: u32, message: []const u8) !usize {
-    var pos: usize = 0;
-    buf[pos] = 'd';
-    pos += 1;
+pub fn encodeError(buf: []u8, txn_id: []const u8, code: u32, message: []const u8) EncodeError!usize {
+    var w = Writer{ .buf = buf };
+    try w.dictBegin();
 
     // "e" list [code, message]
-    pos += writeByteString(buf[pos..], "e");
-    buf[pos] = 'l';
-    pos += 1;
-    pos += writeInteger(buf[pos..], @intCast(code));
-    pos += writeByteString(buf[pos..], message);
-    buf[pos] = 'e';
-    pos += 1;
+    try w.byteString("e");
+    try w.listBegin();
+    try w.integer(@intCast(code));
+    try w.byteString(message);
+    try w.containerEnd();
 
     // "t"
-    pos += writeByteString(buf[pos..], "t");
-    pos += writeByteString(buf[pos..], txn_id);
+    try w.byteString("t");
+    try w.byteString(txn_id);
 
     // "y"
-    pos += writeByteString(buf[pos..], "y");
-    pos += writeByteString(buf[pos..], "e");
+    try w.byteString("y");
+    try w.byteString("e");
 
-    buf[pos] = 'e';
-    pos += 1;
+    try w.containerEnd();
 
-    return pos;
-}
-
-// ── Low-level write helpers ─────────────────────────────
-
-fn writeByteString(buf: []u8, data: []const u8) usize {
-    var len_buf: [20]u8 = undefined;
-    const len_str = std.fmt.bufPrint(&len_buf, "{d}", .{data.len}) catch return 0;
-    @memcpy(buf[0..len_str.len], len_str);
-    buf[len_str.len] = ':';
-    @memcpy(buf[len_str.len + 1 ..][0..data.len], data);
-    return len_str.len + 1 + data.len;
-}
-
-fn writeInteger(buf: []u8, value: i64) usize {
-    buf[0] = 'i';
-    var num_buf: [20]u8 = undefined;
-    const num_str = std.fmt.bufPrint(&num_buf, "{d}", .{value}) catch return 0;
-    @memcpy(buf[1..][0..num_str.len], num_str);
-    buf[1 + num_str.len] = 'e';
-    return 2 + num_str.len;
+    return w.pos;
 }
 
 // ── Tests ──────────────────────────────────────────────
