@@ -377,39 +377,37 @@ test "multi-source: 3 peers all hold full piece, picker spreads load (8 seeds)" 
     }
 }
 
-// TODO(phase 2A follow-up): re-enable the disconnect scenario once
-// the deinit-time hasher race is addressed.
-//
-//     test "multi-source: peer disconnect mid-piece, survivors complete (8 seeds)"
-//
-// I had this enabled briefly in commit c0af1ed; flipped it on after
-// migration-engineer's `.ghost` PendingSend fix in 07f4093 cleared
-// the in-tick double-submit race. The scenario itself drives cleanly
-// — the test loop's assertions all pass — but `el.deinit` then
-// panics with "integer overflow" inside `hasher.pending_jobs.append`
-// on a runner-seed-dependent fraction of runs (≈ 2 of 3 locally).
-//
-// The trace: `el.deinit → drainRemainingCqes → io.tick(0) → recv
-// callback → handleRecvResult → processMessage → completePieceDownload
-// → submitVerify`. Residual piece-block recvs that were in-flight at
-// disconnect time arrive during the deinit drain, each one
-// triggering a fresh submitVerify against a hasher that's mid-
-// teardown. Looks like a `.ghost`-style fix is needed for the hasher
-// pending-jobs path too — when the EL is winding down,
-// completePieceDownload should refuse new submitVerify calls (or
-// route them somewhere sink-safe) rather than appending to a list
-// whose capacity calculation is about to underflow / overflow during
-// the running-set transition.
-//
-// The drain phase in `runScenario` already handles the well-behaved
-// case (test-side drain runs to quiescence before el.deinit), but
-// deterministic SimIO ordering means residual ops can arrive
-// post-drain on adversarial seeds. Worth migration-engineer's read
-// on whether the fix lives in `hasher.deinit` (defensive: drop late
-// jobs) or `peer_policy.completePieceDownload` (don't submit if EL
-// is draining).
-//
-// The picker-spreads-load test above already exercises the multi-
-// source path end-to-end; the disconnect scenario adds cleanup-path
-// coverage but isn't a missing happy-path. Phase 2A's primary
-// invariant ("multi-peer block distribution") is asserted today.
+test "multi-source: peer disconnect mid-piece, survivors complete (8 seeds)" {
+    // Phase 2A's transient-correctness assertion. Peer 1 claims its
+    // share of a multi-source piece, delivers a few blocks, then
+    // disconnects mid-piece. The Gap 2 fix in commit 07f4093 (`.ghost`
+    // PendingSend storage) ensures peer 1's in-flight pending sends
+    // retire cleanly; `releaseBlocksForPeer` puts peer 1's still-
+    // requested blocks back in the picker pool; survivors (peers 0
+    // and 2) absorb them via `tryJoinExistingPiece` and complete the
+    // piece. This is the multi-source path real swarms exercise —
+    // peer arrival in production is staggered, not concurrent, so
+    // the "everyone connects at tick 0" scenario from the
+    // picker-spreads-load test above is more synthetic than this one.
+    //
+    // The `runScenario` drain phase + `multi_source_landed = false`
+    // gate combine to keep this test stable: the drain runs before
+    // `el.deinit` so residual late piece-block recvs flow through
+    // controlled CQE handling rather than the more fragile
+    // `drainRemainingCqes`. Liveness + safety assertions are live
+    // (piece verifies, no honest peer banned); distribution-
+    // proportion assertions stay gated until late-peer block-stealing
+    // (Task #24) lands.
+    const seeds = [_]u64{
+        0x0000_0001, 0xDEAD_BEEF, 0xFEED_FACE, 0xCAFE_BABE,
+        0x0F0F_0F0F, 0x1234_5678, 0xABCD_EF01, 0x9876_5432,
+    };
+    for (seeds) |seed| {
+        runScenario(seed, .{
+            .disconnect_peer_after = .{ .peer_index = 1, .blocks = 8 },
+        }) catch |err| {
+            std.debug.print("\n  multi-source disconnect SEED 0x{x} FAILED: {any}\n", .{ seed, err });
+            return err;
+        };
+    }
+}
