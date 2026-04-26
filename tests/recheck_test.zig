@@ -360,3 +360,120 @@ test "daemon restart with resume data skips recheck (fast resume)" {
     // The torrent is registered and ready — no recheck needed.
     try std.testing.expectEqual(@as(usize, 0), el.rechecks.items.len);
 }
+
+// ── Live force-recheck: in-place bitfield update ──────────────────
+//
+// Mirrors the path TorrentSession.forceRecheckLive takes — a recheck
+// runs against an existing live torrent slot (rather than tearing down
+// the session via stop+start), and on completion the PieceTracker's
+// bitfield is rebuilt in place via applyRecheckResult.
+//
+// Asserts:
+//  (a) the EL holds a `*const Bitfield` pointer that survives the
+//      bitfield rebuild — i.e. the storage address doesn't move,
+//  (b) the new bitfield reflects what's actually on disk, and
+//  (c) availability counts are preserved across the rebuild.
+//
+// The full daemon-side flow (loadPiecesForRecheck for already-seeding
+// torrents, freePieces post-completion) is exercised at the algorithm
+// level in tests/piece_hash_lifecycle_test.zig and at the
+// `forceRecheckLive` entry point via the SessionManager API.
+
+test "live force-recheck rebuilds PieceTracker bitfield in place" {
+    const allocator = std.testing.allocator;
+
+    var el = EventLoop.initBare(allocator, 2) catch |err| {
+        if (err == error.SystemResources) return error.SkipZigTest;
+        return err;
+    };
+    defer el.deinit();
+
+    // Single-piece v1 torrent, so the disk content matches the hash
+    // and the recheck will mark piece 0 as complete.
+    var piece_data: [piece_data_len]u8 = undefined;
+    for (&piece_data, 0..) |*b, i| b.* = @truncate(i *% 71);
+    var piece_hash: [20]u8 = undefined;
+    Sha1.hash(&piece_data, &piece_hash, .{});
+
+    const torrent_bytes = try buildTorrentBytes(allocator, piece_hash, "lv.b");
+    defer allocator.free(torrent_bytes);
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    {
+        const f = try tmp.dir.createFile("lv.b", .{});
+        defer f.close();
+        try f.writeAll(&piece_data);
+    }
+
+    const save_path = try tmp.dir.realpathAlloc(allocator, ".");
+    defer allocator.free(save_path);
+    const session = try Session.load(allocator, torrent_bytes, save_path);
+    defer session.deinit(allocator);
+
+    var store = try PieceStore.init(allocator, &session);
+    defer store.deinit();
+    const fds = try store.fileHandles(allocator);
+    defer allocator.free(fds);
+
+    // Pre-recheck PieceTracker: pretend piece 0 is missing (stale state
+    // that the recheck will correct). Add some availability so we can
+    // verify it survives the rebuild.
+    var initial = try Bitfield.init(allocator, session.pieceCount());
+    defer initial.deinit(allocator);
+
+    var pt = try PieceTracker.init(
+        allocator,
+        session.pieceCount(),
+        session.layout.piece_length,
+        session.totalSize(),
+        &initial,
+        0,
+    );
+    defer pt.deinit(allocator);
+
+    pt.addAvailability(0);
+    pt.addAvailability(0);
+
+    // Save the storage address — the live force-recheck path's contract
+    // is that this pointer stays valid across recheck completion.
+    const original_bits_ptr = pt.complete.bits.ptr;
+
+    // Submit a recheck against the live torrent. Use a small
+    // shim callback that calls applyRecheckResult, modeling what
+    // TorrentSession.onLiveRecheckComplete does.
+    const Ctx = struct {
+        pt: *PieceTracker,
+        completed: bool = false,
+    };
+    var ctx = Ctx{ .pt = &pt };
+
+    try el.startRecheck(&session, fds, 1, null, struct {
+        fn cb(rc: *varuna.io.recheck.AsyncRecheck) void {
+            const c: *Ctx = @ptrCast(@alignCast(rc.caller_ctx.?));
+            c.pt.applyRecheckResult(&rc.complete_pieces, rc.bytes_complete);
+            c.completed = true;
+        }
+    }.cb, @ptrCast(&ctx));
+
+    var ticks: u32 = 0;
+    while (ticks < 2000 and !ctx.completed) : (ticks += 1) {
+        el.submitTimeout(10 * std.time.ns_per_ms) catch {};
+        el.tick() catch {};
+    }
+    try std.testing.expect(ctx.completed);
+
+    // (a) Storage address didn't move — EL pointer survives.
+    try std.testing.expectEqual(original_bits_ptr, pt.complete.bits.ptr);
+
+    // (b) Bitfield reflects on-disk reality (piece 0 actually present).
+    try std.testing.expect(pt.complete.has(0));
+    try std.testing.expectEqual(@as(u32, 1), pt.complete.count);
+    try std.testing.expectEqual(@as(u64, piece_data_len), pt.bytes_complete);
+
+    // (c) Availability counts preserved.
+    try std.testing.expectEqual(@as(u16, 2), pt.availability[0]);
+
+    // Clean up.
+    el.cancelAllRechecks();
+}

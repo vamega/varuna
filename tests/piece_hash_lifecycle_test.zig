@@ -348,3 +348,99 @@ test "MerkleCache.evictCompletedFile drops cached tree once file completes" {
     mc.evictCompletedFile(0, &full);
     try std.testing.expectEqual(@as(u32, 0), mc.cachedCount());
 }
+
+// ── PieceTracker.applyRecheckResult (Phase 3 in-place update) ──────
+
+const PieceTracker = varuna.torrent.piece_tracker.PieceTracker;
+
+test "applyRecheckResult overwrites complete bitfield in place (storage stable)" {
+    const allocator = std.testing.allocator;
+
+    // Initial state: 4 pieces, all complete (synthesised seeding session).
+    var initial = try Bitfield.init(allocator, 4);
+    defer initial.deinit(allocator);
+    try initial.set(0);
+    try initial.set(1);
+    try initial.set(2);
+    try initial.set(3);
+
+    var pt = try PieceTracker.init(allocator, 4, 4, 16, &initial, 16);
+    defer pt.deinit(allocator);
+
+    // Capture the storage address of the bitfield bits — applyRecheckResult
+    // must NOT reallocate (the EL holds a pointer into this storage).
+    const original_bits_ptr = pt.complete.bits.ptr;
+
+    // New recheck result: piece 1 was found corrupt.
+    var recheck_result = try Bitfield.init(allocator, 4);
+    defer recheck_result.deinit(allocator);
+    try recheck_result.set(0);
+    try recheck_result.set(2);
+    try recheck_result.set(3);
+
+    pt.applyRecheckResult(&recheck_result, 12);
+
+    // Storage didn't move.
+    try std.testing.expectEqual(original_bits_ptr, pt.complete.bits.ptr);
+    // Bits reflect new state.
+    try std.testing.expect(pt.complete.has(0));
+    try std.testing.expect(!pt.complete.has(1));
+    try std.testing.expect(pt.complete.has(2));
+    try std.testing.expect(pt.complete.has(3));
+    try std.testing.expectEqual(@as(u32, 3), pt.complete.count);
+    try std.testing.expectEqual(@as(u64, 12), pt.bytes_complete);
+}
+
+test "applyRecheckResult clears in_progress (claimed pieces are released)" {
+    const allocator = std.testing.allocator;
+
+    var initial = try Bitfield.init(allocator, 4);
+    defer initial.deinit(allocator);
+
+    var pt = try PieceTracker.init(allocator, 4, 4, 16, &initial, 0);
+    defer pt.deinit(allocator);
+
+    // Manually set in_progress to simulate a peer mid-download.
+    pt.in_progress.set(2) catch {};
+
+    var recheck_result = try Bitfield.init(allocator, 4);
+    defer recheck_result.deinit(allocator);
+    try recheck_result.set(0);
+
+    pt.applyRecheckResult(&recheck_result, 4);
+
+    // In-progress is cleared — old claims would have been against a
+    // pre-recheck state and must not survive the bitfield swap.
+    try std.testing.expectEqual(@as(u32, 0), pt.in_progress.count);
+    try std.testing.expect(!pt.in_progress.has(2));
+}
+
+test "applyRecheckResult preserves availability (peer Have/bitfield announces survive)" {
+    const allocator = std.testing.allocator;
+
+    var initial = try Bitfield.init(allocator, 4);
+    defer initial.deinit(allocator);
+
+    var pt = try PieceTracker.init(allocator, 4, 4, 16, &initial, 0);
+    defer pt.deinit(allocator);
+
+    // Two peers had pieces 0 and 1; one peer had piece 2.
+    pt.addAvailability(0);
+    pt.addAvailability(0);
+    pt.addAvailability(1);
+    pt.addAvailability(1);
+    pt.addAvailability(2);
+
+    var recheck_result = try Bitfield.init(allocator, 4);
+    defer recheck_result.deinit(allocator);
+    try recheck_result.set(3);
+
+    pt.applyRecheckResult(&recheck_result, 4);
+
+    // Availability counts unchanged — recheck only affects what WE have,
+    // not what peers have.
+    try std.testing.expectEqual(@as(u16, 2), pt.availability[0]);
+    try std.testing.expectEqual(@as(u16, 2), pt.availability[1]);
+    try std.testing.expectEqual(@as(u16, 1), pt.availability[2]);
+    try std.testing.expectEqual(@as(u16, 0), pt.availability[3]);
+}

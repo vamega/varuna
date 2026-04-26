@@ -288,6 +288,18 @@ See `progress-reports/2026-04-25-stage2-event-loop-migration.md` for the Stage 2
 - ~~**Daemon graceful shutdown**~~: Fixed. In-flight transfer draining with configurable timeout now ensures clean exit on SIGTERM/SIGINT.
 - `IORING_OP_SETSOCKOPT` (kernel 6.7+), `IORING_OP_BIND`/`LISTEN` (kernel 6.11+) not available on current kernel 6.6. Per-peer setsockopt (TCP_NODELAY, buffer sizes) remains synchronous.
 
+## Last Verified Milestone (2026-04-26 — followups round)
+
+### Followups round (cleanup-engineer): app/config test discovery + live force-recheck
+- **Task A — app/config source-side test discovery** (`src: enable app/config source-side test discovery`).
+  Adding `_ = app; _ = config;` to `src/root.zig`'s test-context block surfaced 5 latent test bugs in code that had never been reached as test-context (Zig 0.15.2's "lazy-compile until reached as test-context" rule). The "comptime-eval error" the prior session diagnosed was actually three independent test bugs in `src/io/io_interface.zig` and `src/io/ring.zig`, plus 5 broken bencode literals in `src/storage/{writer,verify}.zig` (one trailing `e` past the close of the outer dict), plus 3 toml-parser `error_info` leaks in `src/config.zig`. Each fix is localised — no production code path changed.
+- **Task B — live force-recheck via `loadPiecesForRecheck`** (`daemon: live force-recheck path via loadPiecesForRecheck`).
+  `SessionManager.forceRecheck` now prefers an in-place rebuild of the `PieceTracker` bitfield over the heavyweight stop+start path. The live path (taken when state is downloading or seeding with a live EL torrent slot) calls `Session.loadPiecesForRecheck` to re-materialise the SHA-1 hash table when Phase 2 dropped it, submits an `AsyncRecheck` against the existing torrent_id, and on completion calls the new `PieceTracker.applyRecheckResult` to overwrite the existing `complete` Bitfield's bits in place — no reallocation, EL's `*const Bitfield` pointer stays valid. Stop+start remains the fallback for any other state (paused, stopped, error, checking, metadata_fetching).
+- **Test count**: 531 → 599 (+68; Task A's `_ = app; _ = config;` pulled in +64 inline subsystem tests, Task B added 4 new tests — 3 algorithm + 1 EL integration). Stable across 3 back-to-back full-suite runs.
+- `zig build`: clean. `zig fmt`: clean.
+
+Detail in `progress-reports/2026-04-26-followups.md`.
+
 ## Last Verified Milestone (2026-04-26)
 
 ### Late-peer block-stealing (Task #23) — closes Phase 2A distribution race

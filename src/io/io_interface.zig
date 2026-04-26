@@ -365,7 +365,10 @@ test "Completion.arm fills the public fields" {
 }
 
 test "Completion.backendStateAs round-trips through opaque storage" {
-    const State = packed struct {
+    // Use a regular (non-packed) struct so alignment stays within
+    // `backend_state_align`. A `packed` struct of u32+u64+bool ends up with a
+    // u104/u128 backing integer whose alignment exceeds the contract.
+    const State = struct {
         seq: u32,
         deadline_ns: u64,
         in_flight: bool,
@@ -388,16 +391,17 @@ test "Operation tag and Result tag are kept in lockstep" {
     const res_tags = std.meta.fields(@typeInfo(Result).@"union".tag_type.?);
 
     // `Operation` has a `none` variant that `Result` does not — every other
-    // tag must be in both unions.
-    for (op_tags) |o| {
-        if (std.mem.eql(u8, o.name, "none")) continue;
-        var found = false;
-        for (res_tags) |r| {
-            if (std.mem.eql(u8, o.name, r.name)) {
-                found = true;
-                break;
+    // tag must be in both unions. `inline for` is required because
+    // `EnumField.value: comptime_int` makes the slice comptime-only.
+    inline for (op_tags) |o| {
+        if (!std.mem.eql(u8, o.name, "none")) {
+            var found = false;
+            inline for (res_tags) |r| {
+                if (std.mem.eql(u8, o.name, r.name)) {
+                    found = true;
+                }
             }
+            try std.testing.expect(found);
         }
-        try std.testing.expect(found);
     }
 }

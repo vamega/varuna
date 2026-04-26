@@ -716,15 +716,32 @@ pub const SessionManager = struct {
         return self.udp_tracker_executor.?;
     }
 
-    /// Force piece recheck for a torrent: stop, recheck, resume.
+    /// Force piece recheck for a torrent.
+    ///
+    /// Prefers the **live** path on `TorrentSession.forceRecheckLive` when
+    /// the session is downloading or seeding: re-materialises the SHA-1 hash
+    /// table (if Phase 2 of the lifecycle dropped it), submits an
+    /// `AsyncRecheck` against the existing torrent slot, and updates the
+    /// `PieceTracker` bitfield in place from the EL-thread completion
+    /// callback. Peers stay connected; tracker schedule untouched.
+    ///
+    /// Falls back to the heavyweight **stop + start** path when the session
+    /// is in any other state (paused, stopped, error, checking,
+    /// metadata_fetching) — those paths need full re-init anyway.
     pub fn forceRecheck(self: *SessionManager, hash: []const u8) !void {
         self.mutex.lock();
         defer self.mutex.unlock();
 
         const session = self.sessions.get(hash) orelse return error.TorrentNotFound;
-        // Stop the session (joins threads, frees runtime state)
+
+        const took_live = session.forceRecheckLive() catch |err| blk: {
+            std.log.warn("forceRecheck: live path failed ({s}), falling back to stop+start", .{@errorName(err)});
+            break :blk false;
+        };
+        if (took_live) return;
+
+        // Heavyweight fallback: full session teardown + re-init.
         session.stop();
-        // Restart it (will recheck from disk)
         session.start();
     }
 

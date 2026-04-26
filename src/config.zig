@@ -366,6 +366,11 @@ pub const LoadedConfig = struct {
 
 pub fn load(allocator: std.mem.Allocator, path: []const u8) !LoadedConfig {
     var parser = toml.Parser(Config).init(allocator);
+    // The parser allocates `error_info` on a struct-mapping failure
+    // (e.g. unknown field, type mismatch). That allocation lives on the
+    // parser's allocator, not the parsed-tree arena, so it must be freed
+    // even when `parseFile` itself returns an error.
+    defer parser.deinit();
     const result = try parser.parseFile(path);
     errdefer {
         var copy = result;

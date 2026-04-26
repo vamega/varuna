@@ -786,6 +786,125 @@ pub const TorrentSession = struct {
         }
     }
 
+    /// Live force-recheck: re-verify pieces against disk WITHOUT detaching
+    /// from the shared event loop or restarting the session. Peers stay
+    /// connected, the torrent keeps its EL slot, and the resume DB / tracker
+    /// announce schedule continue uninterrupted.
+    ///
+    /// Returns `true` if the live path was taken (recheck submitted; the
+    /// `onLiveRecheckComplete` callback will replace the bitfield in place).
+    /// Returns `false` if the session is in a state that can't support a
+    /// live recheck (e.g. paused, stopped, error) — caller should fall back
+    /// to the heavyweight stop+start path.
+    ///
+    /// Caller need not hold `self.mutex` — this method takes it.
+    pub fn forceRecheckLive(self: *TorrentSession) !bool {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+
+        // Live path requires a fully-attached, healthy session with
+        // a live EL torrent slot. Anything else falls back.
+        if (self.state != .downloading and self.state != .seeding) return false;
+        const sel = self.shared_event_loop orelse return false;
+        const tid = self.torrent_id_in_shared orelse return false;
+        if (self.session == null or self.piece_tracker == null or self.shared_fds == null) {
+            return false;
+        }
+
+        // Phase 3 of the piece-hash lifecycle: re-materialise the v1 hash
+        // table if a previous `freePieces` (steady-state seed) dropped it.
+        const session = &self.session.?;
+        if (!session.hasPieceHashes()) {
+            try session.loadPiecesForRecheck();
+        }
+
+        self.state = .checking;
+        sel.startRecheck(
+            session,
+            self.shared_fds.?,
+            tid,
+            null, // recheck every piece
+            onLiveRecheckComplete,
+            @ptrCast(self),
+        ) catch |err| {
+            // Roll back state. The session was downloading or seeding before;
+            // a subsequent checkSeedTransition / completion check will promote
+            // back to seeding if appropriate.
+            self.state = .downloading;
+            return err;
+        };
+
+        return true;
+    }
+
+    /// AsyncRecheck `on_complete` callback for the live force-recheck path.
+    /// Updates the existing PieceTracker in place — the EL holds a
+    /// `*const Bitfield` pointer into `piece_tracker.complete`, so we
+    /// must not tear down the tracker. `applyRecheckResult` reuses the
+    /// existing bits storage under the tracker's mutex.
+    fn onLiveRecheckComplete(recheck: *AsyncRecheck) void {
+        const self: *TorrentSession = if (recheck.caller_ctx) |ctx|
+            @ptrCast(@alignCast(ctx))
+        else
+            return;
+
+        const log = std.log.scoped(.torrent_session);
+        self.mutex.lock();
+        defer self.mutex.unlock();
+
+        const session = &(self.session orelse return);
+
+        // Persist recheck results to resume DB. Matches the upsert
+        // semantics of the stop+start `onRecheckComplete` path. Stale
+        // entries for pieces the recheck found incomplete are not pruned
+        // here (same caveat as the existing path).
+        if (self.resume_writer) |*rw| {
+            var completed_pieces = std.ArrayList(u32).empty;
+            defer completed_pieces.deinit(self.allocator);
+            var idx: u32 = 0;
+            while (idx < session.pieceCount()) : (idx += 1) {
+                if (recheck.complete_pieces.has(idx)) {
+                    completed_pieces.append(self.allocator, idx) catch {};
+                }
+            }
+            if (completed_pieces.items.len > 0) {
+                rw.db.markCompleteBatch(session.metainfo.info_hash, completed_pieces.items) catch {};
+            }
+        }
+        self.resume_last_count = recheck.complete_pieces.count;
+
+        const recheck_bytes_complete = recheck.bytes_complete;
+        const recheck_pieces_count = recheck.complete_pieces.count;
+
+        // In-place bitfield/bytes_complete update. Holds the
+        // PieceTracker's own mutex internally so EL-side reads serialise
+        // safely against this swap.
+        const pt = &(self.piece_tracker orelse return);
+        pt.applyRecheckResult(&recheck.complete_pieces, recheck_bytes_complete);
+
+        // Free the AsyncRecheck struct (returns slot to the EL).
+        if (self.shared_event_loop) |sel| {
+            sel.cancelRecheckForTorrent(recheck.torrent_id);
+        }
+
+        if (recheck_bytes_complete == session.totalSize()) {
+            self.state = .seeding;
+            if (self.completion_on == 0) {
+                self.completion_on = std.time.timestamp();
+            }
+            // Phase 2 of the piece-hash lifecycle: full verification means
+            // we don't need the SHA-1 table for the rest of the seed.
+            session.freePieces();
+            log.info("force-recheck (live): all pieces valid, entering seed mode", .{});
+        } else {
+            self.state = .downloading;
+            log.info("force-recheck (live): {d}/{d} pieces, entering download mode", .{
+                recheck_pieces_count,
+                session.pieceCount(),
+            });
+        }
+    }
+
     /// timerfd callback for jittered initial announce after recheck completes.
     fn onJitteredAnnounce(ctx: *anyopaque) void {
         const self: *TorrentSession = @ptrCast(@alignCast(ctx));

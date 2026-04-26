@@ -22,17 +22,10 @@ pub const torrent = @import("torrent/root.zig");
 // Subsystems are added one at a time as their source-side tests are
 // verified to compile and pass against current Zig std + production
 // logic. Bit-rotted subsystems stay out and are tracked in Task #9.
-// Subsystems left out:
-//  - `app`, `config`: source-side tests reference Zig std APIs that
-//    drifted (Io.GenericWriter.interface, fs.Dir.close *Dir vs *const).
-//    Test fixes are in this commit, but pulling them in via `_ = app;`
-//    triggers comptime-eval errors elsewhere in the io_interface
-//    parity check (likely a transitive-import ordering issue Zig 0.15
-//    handles when these modules aren't reached from a test context).
-//    Tracked for follow-up; the per-file test fixes are in place so
-//    a future maintainer can re-enable when the comptime issue resolves.
 test {
+    _ = app;
     _ = bitfield;
+    _ = config;
     _ = crypto;
     _ = torrent;
 }
