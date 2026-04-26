@@ -103,6 +103,37 @@ production allocation profile after Stage 2.
    ArrayList about a custom allocator surface. The vtable reads
    slab-vs-spill via `slabContains` range check on each free/resize.
 
+6. **Rebase verification surfaces real production gaps; budget for it
+   as part of the work, not as overhead.** This session converged on
+   that pattern across three independent findings:
+   - The `api_get_burst` 8000-alloc regression (Task #4) read like a
+     handler-side allocation problem at task creation. Only the
+     post-rebase verification on actual `main` (HEAD `507c6bd`)
+     surfaced the real source: the io_interface migration's
+     `allocator.create(ClientOp)` per recv/send. The companion fix
+     (embed `recv_op`/`send_op` in `ApiClient`, Pattern #1) was
+     necessary; the arena work alone would not have closed Task #4.
+   - The `tick_sparse_torrents` 1.4× regression (Task #5) was
+     hypothesised at ticket time as `EventLoopOf(IO)` generic-dispatch
+     overhead. Empirical profiling (`tick-iso` diagnostic harness)
+     showed instead it was an O(piece_count) bitfield AND-loop in
+     `wantedCompletedCountLocked` called per-tick-per-torrent — a
+     pre-existing algorithmic cost that became visible only when the
+     surrounding tick work shifted under it. The fix (an incrementally
+     maintained `wanted_completed_count` cache on `PieceTracker`)
+     made the bench 3× faster than the *original* 2026-04-16 baseline.
+   - Storage-engineer's adjacent Track A surfaced two production bugs
+     while re-enabling source-side test discovery (Task #9), and
+     surfaced a Phase 1 × Phase 2 race during their own rebase.
+
+   Pattern: **the rebase is the canary, not the fix.** Single-branch
+   tests cannot see cross-branch interactions. Either the work
+   premise was wrong (Task #5's hypothesis), or the work scope was
+   incomplete (Task #4's arena-only would have shipped a still-leaky
+   `api_get_burst`). Budget time for "rebase, re-measure, re-verify"
+   as a *first-class step*, not as overhead — it's where the
+   highest-value findings of the session emerged.
+
 ## Bench deltas
 
 Baseline runs against `main` HEAD `507c6bd` (Phase 2 merge), which is
