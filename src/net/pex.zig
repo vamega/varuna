@@ -95,14 +95,20 @@ pub const CompactPeer = struct {
                 const ip4 = @as(*const std.posix.sockaddr.in, @ptrCast(@alignCast(&addr.any)));
                 const ip_bytes = std.mem.asBytes(&ip4.addr);
                 @memcpy(result.data[0..4], ip_bytes);
-                std.mem.writeInt(u16, result.data[4..6], ip4.port, .big);
+                // `ip4.port` is already in network byte order (BE) — copying
+                // the raw bytes gives us the BEP 11 wire encoding directly.
+                // Calling `writeInt(.., .big)` on the raw value would
+                // double-swap on LE hosts, producing the wrong port (BUG
+                // surfaced by the previously-dark "CompactPeer roundtrip"
+                // tests after dark-test wiring).
+                @memcpy(result.data[4..6], std.mem.asBytes(&ip4.port));
                 result.len = compact_ipv4_size;
             },
             std.posix.AF.INET6 => {
                 const ip6 = @as(*const std.posix.sockaddr.in6, @ptrCast(@alignCast(&addr.any)));
                 const ip_bytes = std.mem.asBytes(&ip6.addr);
                 @memcpy(result.data[0..16], ip_bytes);
-                std.mem.writeInt(u16, result.data[16..18], ip6.port, .big);
+                @memcpy(result.data[16..18], std.mem.asBytes(&ip6.port));
                 result.len = compact_ipv6_size;
             },
             else => {},

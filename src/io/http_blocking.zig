@@ -585,7 +585,7 @@ test "parse status code" {
 }
 
 test "find body start" {
-    try std.testing.expectEqual(@as(?usize, 20), findBodyStart("HTTP/1.1 200 OK\r\n\r\nbody"));
+    try std.testing.expectEqual(@as(?usize, 19), findBodyStart("HTTP/1.1 200 OK\r\n\r\nbody"));
     try std.testing.expectEqual(@as(?usize, null), findBodyStart("no separator"));
 }
 

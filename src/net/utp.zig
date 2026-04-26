@@ -1069,6 +1069,11 @@ test "RTT estimation updates RTO" {
 
 test "timeout detection" {
     var sock = UtpSocket{};
+    // isTimedOut explicitly returns false for `.idle`, `.closed`, and
+    // `.reset` so torn-down sockets don't keep tripping the manager's
+    // timeout sweep. The test must put the socket in an "alive" state
+    // for the timing comparison to actually run.
+    sock.state = .connected;
     sock.last_send_time_us = 1_000_000;
     sock.rto = 500_000;
 

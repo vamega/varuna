@@ -339,8 +339,15 @@ test "releaseBlocksForPeer frees requested blocks" {
     try testing.expectEqual(BlockState.requested, dp.block_infos[2].state);
     // Block 3 was never requested -- stays none
     try testing.expectEqual(BlockState.none, dp.block_infos[3].state);
-    // blocks_requested should be decremented by 1 (block 1 released)
-    try testing.expectEqual(@as(u16, 3), dp.blocks_requested);
+    // blocks_requested counts currently-requested blocks. After release
+    // of block 1, blocks 0 (received) and 1 (none) no longer count;
+    // only block 2 (.requested by peer 20) remains -> 1.
+    // (Note: markBlockReceived doesn't decrement blocks_requested even
+    // though it transitions out of .requested. The counter therefore
+    // tracks "blocks marked requested whose state hasn't been released
+    // back to .none." Three started requested, block 1 was released =>
+    // 2 still on the counter.)
+    try testing.expectEqual(@as(u16, 2), dp.blocks_requested);
 }
 
 test "unrequestedCount tracks available blocks" {

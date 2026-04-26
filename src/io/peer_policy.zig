@@ -1969,9 +1969,11 @@ test "sendKeepAlives queues send for quiet peer" {
     peer.send_pending = false;
     // Set last_activity well beyond the keepalive interval
     peer.last_activity = std.time.timestamp() - (keepalive_interval_secs + 10);
-    // Need a valid fd for the ring.send call -- use a /dev/null fd
+    // Need a valid fd for the ring.send call -- use a /dev/null fd.
+    // EventLoop.deinit() closes peer.fd via io.closeSocket, so we must
+    // NOT close it ourselves: a double-close would panic in posix.close
+    // with `BADF -> unreachable` (kernel may have reused the fd).
     peer.fd = std.posix.open("/dev/null", .{ .ACCMODE = .WRONLY }, 0) catch -1;
-    defer if (peer.fd >= 0) std.posix.close(peer.fd);
     el.markActivePeer(slot);
 
     sendKeepAlives(&el);

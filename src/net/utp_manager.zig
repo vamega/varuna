@@ -517,26 +517,21 @@ test "manager collectRetransmits returns timed-out packets" {
     defer mgr.deinit();
     const remote = std.net.Address.initIp4(.{ 127, 0, 0, 1 }, 6881);
 
+    // `connect` already buffers the SYN as the first outbound packet at
+    // out_seq_start=0. The previous version of this test manually
+    // overrode `seq_nr=10; out_seq_start=10;` which left the SYN
+    // orphaned at idx 0; handleTimeout then marked an empty slot at
+    // idx 10 as needs_resend, and collectRetransmits returned zero.
+    // Use the natural buffered SYN as the timeout target instead.
     const conn = try mgr.connect(remote, 1_000_000);
-    const sock = mgr.getSocket(conn.slot).?;
 
-    // Manually transition to connected and buffer a data packet.
-    sock.state = .connected;
-    sock.seq_nr = 10;
-    sock.out_seq_start = 10;
-    const hdr = sock.createDataPacket(50, 2_000_000) orelse return error.WindowBlocked;
-    var datagram: [utp.Header.size + 50]u8 = undefined;
-    @memcpy(datagram[0..utp.Header.size], &hdr);
-    @memset(datagram[utp.Header.size..], 0xAA);
-    sock.bufferSentPacket(10, &datagram, 50, 2_000_000);
-
-    // Simulate timeout.
+    // Simulate timeout: advance past the initial RTO (1s).
     var timeout_buf: [64]u16 = undefined;
-    // Advance time past RTO (initial 1s).
     const timeout_count = mgr.checkTimeouts(3_500_000, &timeout_buf);
     try std.testing.expect(timeout_count > 0);
 
-    // Collect retransmits.
+    // Collect retransmits — the SYN should come back since it is the
+    // oldest unacked packet.
     var retransmits: [16]RetransmitResult = undefined;
     const retx_count = mgr.collectRetransmits(3_500_000, &retransmits);
     try std.testing.expect(retx_count > 0);

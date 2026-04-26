@@ -290,6 +290,11 @@ See `progress-reports/2026-04-25-stage2-event-loop-migration.md` for the Stage 2
 - **`truncate` op on the IO contract.** PieceStore's filesystem-portability fallback (when fallocate returns `error.OperationNotSupported` on tmpfs <5.10 / FAT32 / certain FUSE FSes) calls `file.setEndPos(...)` synchronously rather than through the contract. Adding `TruncateOp` + `RealIO.truncate` (via `IORING_OP_FTRUNCATE`, kernel ≥6.9 — likely above varuna's floor) + `SimIO.truncate` would close the asymmetry. Not urgent: rare defensive path. EpollIO/KqueueIO porting will need it (or a thread-pool bridge). Estimated 1-2 hours.
 - **Live-pipeline BUGGIFY harness for `PieceStoreOf(SimIO)`.** Wrap the integration tests in `tests/storage_writer_test.zig` with the canonical BUGGIFY shape — per-tick `injectRandomFault` + per-op `FaultConfig` × 32 seeds. Catches recovery paths the foundation tests can't see (errdefer cleanup of partially-opened files when the 2nd of 5 fallocates fails; sync's pending-counter under fsync error storms). Reference shape: `tests/recheck_live_buggify_test.zig`. Estimated 0.5 day.
 
+### Testing
+- **Dark inline test audit, round 2: net / tracker / rpc.** The 2026-04-27 round-1 audit covered io / storage / dht (mandatory) and surfaced two real production bugs (PEX port byte order, DHT IPv6 formatter). Round 2 should explicitly wire `src/net/root.zig`, `src/tracker/root.zig`, `src/rpc/root.zig` test blocks. ~404 dark inline tests across 29 files. Same recipe as round 1; ~30 min per subsystem after wiring. Some tests in those subsystems already run *transitively* through the io import chain (utp, peer_wire, ban_list, auth, server, udp), but explicit wiring adds robustness against import refactors and reaches files like address.zig, peer_id.zig, hash_exchange.zig, ipfilter_parser.zig, smart_ban.zig, bencode_scanner.zig, pex.zig, handlers.zig, sync.zig, json.zig, multipart.zig, compat.zig, announce.zig, scrape.zig that nothing in the io chain reaches. See `progress-reports/2026-04-27-dark-test-audit.md` for the recipe and table.
+- **Dark inline test audit, round 3: runtime / sim / daemon.** ~44 dark inline tests across 12 files. `src/daemon/` differs — `daemon_tests` is rooted at `daemon_exe.root_module` per `build.zig`, so wiring via `src/root.zig` doesn't reach it; needs a separate opt-in block in the daemon's root module file. Lower priority than round 2.
+- **Wider `{any}` formatter audit.** The DHT IPv6 bug exposed a Zig 0.15.2 stdlib semantic shift (`{any}` is now generic struct-dump, not the type's `format` method). Other paths that print addresses or embedded structs likely have the same drift. One-line grep audit (`grep -rn '"{any}"' src/ --include='*.zig'`) deferred from round 1.
+
 ## Known Issues
 
 - The packaged Ubuntu `opentracker` build requires explicit info-hash whitelisting (`--whitelist-hash`).
@@ -300,7 +305,52 @@ See `progress-reports/2026-04-25-stage2-event-loop-migration.md` for the Stage 2
 - ~~**Daemon graceful shutdown**~~: Fixed. In-flight transfer draining with configurable timeout now ensures clean exit on SIGTERM/SIGINT.
 - `IORING_OP_SETSOCKOPT` (kernel 6.7+), `IORING_OP_BIND`/`LISTEN` (kernel 6.11+) not available on current kernel 6.6. Per-peer setsockopt (TCP_NODELAY, buffer sizes) remains synchronous.
 
-## Last Verified Milestone (2026-04-27 — Storage IO contract: fallocate + fsync via the contract)
+## Last Verified Milestone (2026-04-27 — Dark inline test audit, round 1: io / storage / dht)
+
+Wired previously-dark inline `test "..."` blocks across the three
+mandatory subsystems (io, storage, dht) into `mod_tests` discovery.
+Surfaced two real production bugs that had been silently shipping —
+both fixed under separately-labelled commits.
+
+Six bisectable commits, all green at HEAD. Test count:
+**713 → ~1200** (+490 inline tests now reachable; transitive
+discovery cascades through `_ = event_loop;` etc into net/rpc/tracker
+files faster than the per-file audit anticipated).
+
+- `255820a net/pex: fix port byte-order in CompactPeer.fromAddress` —
+  PEX `added`/`dropped` lists carried byte-swapped ports because
+  `ip4.port` (already in network byte order) was passed through
+  `writeInt(.., .big)`, double-swapping on LE hosts. Receivers parsing
+  our PEX would fail to connect to listed peers. Tests now assert
+  the round trip.
+- `89e4187 io: wire dark inline tests + clean up bit-rot` — wires 22
+  io files; rewrites 7 tests for current production behavior; deletes
+  one bit-rotted test (bitfield handler now requires `tc.session`).
+- `e2ec92d tests: fix bit-rotted unit tests pulled in transitively
+  by io wiring` — 4 inline tests across net/utp, net/utp_manager,
+  rpc/auth, tracker/udp got pulled into discovery via
+  io's `@import` chain. Each rewritten to track production semantics.
+- `8635a30 storage: wire dark inline tests through storage/root.zig` —
+  all 51 tests passed unmodified.
+- `d340bc8 dht/persistence: fix IPv6 address formatting (was silently
+  dropping nodes)` — `formatAddress` used `"{any}"` which in Zig
+  0.15.2 is the generic struct-dump formatter, overflowing the 46-byte
+  caller buffer. Every IPv6 node was dropped from routing-table
+  snapshots. Switched to `"{f}"`.
+- `46b4efc dht: wire dark inline tests through dht/root.zig` — 48/49
+  tests pass unmodified; the one failure was the IPv6 formatter bug
+  fixed above.
+
+`zig build` (daemon): clean. `zig fmt .`: clean. `zig build test`:
+green. See `progress-reports/2026-04-27-dark-test-audit.md`.
+
+Branch: `worktree-dark-test-engineer`.
+
+Mandatory subsystems complete. ~448 dark inline tests across 41 files
+remain across `src/net/`, `src/tracker/`, `src/rpc/`, `src/runtime/`,
+`src/sim/`, `src/daemon/` — see "Next > Testing" follow-ups below.
+
+## Previously Verified Milestone (2026-04-27 — Storage IO contract: fallocate + fsync via the contract)
 
 Routed `src/storage/writer.zig`'s direct syscall paths through the IO
 contract. `PieceStore.init`'s three `linux.fallocate` call sites and

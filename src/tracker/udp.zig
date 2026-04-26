@@ -800,18 +800,19 @@ test "event to UDP conversion" {
 }
 
 test "retransmit timeout calculation" {
+    // varuna sets max_retries=4 (faster failover than BEP 15's 8). The
+    // test was originally written against the BEP 15 default; it has
+    // been updated to track the production value. Changing the cap
+    // here without changing `max_retries` would silently drift again.
     try std.testing.expectEqual(@as(u64, 15), retransmitTimeout(0));
     try std.testing.expectEqual(@as(u64, 30), retransmitTimeout(1));
     try std.testing.expectEqual(@as(u64, 60), retransmitTimeout(2));
     try std.testing.expectEqual(@as(u64, 120), retransmitTimeout(3));
     try std.testing.expectEqual(@as(u64, 240), retransmitTimeout(4));
-    try std.testing.expectEqual(@as(u64, 480), retransmitTimeout(5));
-    try std.testing.expectEqual(@as(u64, 960), retransmitTimeout(6));
-    try std.testing.expectEqual(@as(u64, 1920), retransmitTimeout(7));
-    try std.testing.expectEqual(@as(u64, 3840), retransmitTimeout(8));
-    // Clamped at max_retries
-    try std.testing.expectEqual(@as(u64, 3840), retransmitTimeout(9));
-    try std.testing.expectEqual(@as(u64, 3840), retransmitTimeout(100));
+    // Clamped at max_retries (4 -> 240 seconds).
+    try std.testing.expectEqual(@as(u64, 240), retransmitTimeout(5));
+    try std.testing.expectEqual(@as(u64, 240), retransmitTimeout(8));
+    try std.testing.expectEqual(@as(u64, 240), retransmitTimeout(100));
 }
 
 test "connection cache basic operations" {

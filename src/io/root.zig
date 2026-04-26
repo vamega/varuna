@@ -42,5 +42,35 @@ pub const web_seed_handler = @import("web_seed_handler.zig");
 // cross-package namespace imports from `tests/` don't propagate test
 // discovery in Zig 0.15.2; only the in-package `_ = io;` path works.
 test {
+    const build_options = @import("build_options");
+
+    _ = buffer_pools;
+    _ = dns;
+    _ = @import("dns_threadpool.zig");
+    // dns_cares.zig wraps `@cImport("ares.h")`. The header is only on
+    // the include path when `-Ddns=c-ares`. Default build (threadpool)
+    // would otherwise fail with "ares.h file not found". Gate the test
+    // import to match.
+    if (build_options.dns_backend == .c_ares) {
+        _ = @import("dns_cares.zig");
+    }
+    _ = downloading_piece;
+    _ = event_loop;
+    _ = hasher;
+    _ = http_blocking;
+    _ = http_parse;
+    _ = io_interface;
+    _ = metadata_handler;
+    _ = peer_handler;
+    _ = peer_policy;
+    _ = protocol;
+    _ = rate_limiter;
+    _ = real_io;
+    _ = recheck;
+    _ = ring;
+    _ = seed_handler;
     _ = sim_io;
+    _ = super_seed;
+    _ = tls;
+    _ = web_seed_handler;
 }

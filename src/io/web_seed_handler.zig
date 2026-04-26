@@ -638,8 +638,11 @@ fn failSlot(el: anytype, slot: *WebSeedSlot) void {
 // ── Tests ────────────────────────────────────────────────
 
 test "extractHost parses http url" {
+    // extractHost returns the bare hostname, stripping any explicit port.
+    // (Origin-style port preservation was removed; per-host tracking now
+    // groups by hostname only.)
     try std.testing.expectEqualStrings("example.com", extractHost("http://example.com/path/file").?);
-    try std.testing.expectEqualStrings("example.com:8080", extractHost("http://example.com:8080/path/file").?);
+    try std.testing.expectEqualStrings("example.com", extractHost("http://example.com:8080/path/file").?);
     try std.testing.expectEqualStrings("example.com", extractHost("https://example.com/").?);
     try std.testing.expectEqualStrings("example.com", extractHost("http://example.com").?);
 }
