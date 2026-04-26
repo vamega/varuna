@@ -277,7 +277,7 @@ See `progress-reports/2026-04-25-stage2-event-loop-migration.md` for the Stage 2
 - **uTP multishot receive**: `recvmsg_multishot` plus a provided-buffer strategy still needs a workload and a measured implementation before it should land.
 - **Dynamic outbound buffer for UtpSocket**: fixed `[128]OutPacket` should become ArrayList for high-throughput uTP connections.
 - **c-ares io_uring integration**: proof-of-concept in `~/projects/c-ares` — native io_uring event engine with SENDMSG/RECVMSG for DNS queries (zero direct syscalls). Could replace varuna's DNS threadpool to eliminate background-thread DNS.
-- **Recheck-IO-generic refactor (unblocks live-pipeline BUGGIFY)**: `AsyncRecheck` is hard-coded to `*RealIO` (`src/io/recheck.zig:34`). Refactoring to `AsyncRecheckOf(IO)` (or `anytype` for the io pointer) would unblock an EL+SimIO BUGGIFY harness for the live recheck pipeline — per-tick `injectRandomFault` + per-op `FaultConfig` × 32 seeds wrapping `tests/recheck_test.zig`'s `live force-recheck` integration test. Also requires a `SimIO.setFileBytes(fd, content)` extension so SimIO-backed reads return real piece data instead of `usize=0`. The recheck-followups round (2026-04-26) shipped an algorithm-level cross-product safety harness (`tests/recheck_buggify_test.zig`) for the post-recheck callback's `applyRecheckResult` + `replaceCompletePieces` surfaces, but didn't cover live-wiring recovery paths (AsyncRecheck slot cleanup under read-error injection, hasher submission failures, partial completion races). Estimated 1-2 days for the refactor + harness wrap.
+- **Live-pipeline BUGGIFY harness for AsyncRecheckOf(SimIO)**: `AsyncRecheck` is now generic over its IO backend (`AsyncRecheckOf(IO)` in `src/io/recheck.zig`; daemon callers stay on the `AsyncRecheckOf(RealIO)` alias). `SimIO.setFileBytes(fd, bytes)` registers caller-owned content so reads return real piece data instead of `usize=0`. The foundation integration tests (`tests/recheck_test.zig` — happy path, corrupt-piece detection, fast-path skip) drive `AsyncRecheckOf(SimIO)` through `EventLoopOf(SimIO)` end-to-end. The next deliverable is the canonical BUGGIFY wrapper around them — per-tick `injectRandomFault` + per-op `FaultConfig` × 32 seeds — to catch live-wiring recovery paths the algorithm-level harness can't see (AsyncRecheck slot cleanup under read-error injection, hasher submission failures, partial completion races). Estimated 0.5-1 day now that the refactor + setFileBytes are in place.
 
 ## Known Issues
 
@@ -288,6 +288,97 @@ See `progress-reports/2026-04-25-stage2-event-loop-migration.md` for the Stage 2
 - **MSE handshake failures in mixed encryption mode**: `vc_not_found` and `req1_not_found` errors occur during simultaneous inbound+outbound MSE handshakes. Timing-dependent, disappears under GDB. `demo_swarm.sh` runs with `encryption = "disabled"` as workaround.
 - ~~**Daemon graceful shutdown**~~: Fixed. In-flight transfer draining with configurable timeout now ensures clean exit on SIGTERM/SIGINT.
 - `IORING_OP_SETSOCKOPT` (kernel 6.7+), `IORING_OP_BIND`/`LISTEN` (kernel 6.11+) not available on current kernel 6.6. Per-peer setsockopt (TCP_NODELAY, buffer sizes) remains synchronous.
+
+## Last Verified Milestone (2026-04-26 — Track B: AsyncRecheck IO-generic refactor)
+
+Completes the post-Stage-2 IO abstraction migration for the recheck
+state machine, which had escaped the original sweep. Three coherent
+commits, tests pass at every commit (pattern #8). Test count: 620 → 631
+(+11): 8 new SimIO `setFileBytes` algorithm tests in
+`tests/sim_socketpair_test.zig` + 3 new `AsyncRecheckOf(SimIO)`
+integration tests in `tests/recheck_test.zig`.
+
+### B1 — `AsyncRecheckOf(comptime IO: type)` (commit `1394a20`)
+`src/io/recheck.zig` defines `AsyncRecheckOf(IO)` returning the state
+machine struct. `pub const AsyncRecheck = AsyncRecheckOf(RealIO)`
+preserves the daemon-side surface; daemon callers
+(`src/daemon/torrent_session.zig`, `tests/recheck_test.zig`) stay
+unchanged. Method bodies use `self: *Self`; the per-completion
+`ReadOp.parent` becomes `*Self` so each instantiation gets its own
+concrete type. Lazy method compilation (pattern #10) means the
+`AsyncRecheckOf(SimIO)` instantiation only forces a method body
+through the type-checker when a SimIO test actually drives it.
+`EventLoopOf` declares `pub const AsyncRecheck = recheck_mod.AsyncRecheckOf(IO)`
+so per-IO `rechecks: std.ArrayList(*AsyncRecheck)`, `startRecheck`'s
+`on_complete` callback signature, and the recheck list reset all
+reference the matching IO type.
+
+### B2 — `SimIO.setFileBytes(fd, bytes)` (commit `9ece885`)
+Caller-owned content registration. `SimIO` keeps a
+`std.AutoHashMap(posix.fd_t, []const u8)` and consults it in `read`:
+when `fd` is registered, returns
+`bytes[offset..][0..min(buf.len, len - offset)]`; otherwise falls
+through to the legacy `usize=0` success path so unrelated tests see
+no change. Fault injection still wins over registered content (a
+`read_error_probability == 1.0` returns `error.InputOutput` even on
+a registered fd). 8 algorithm tests in `tests/sim_socketpair_test.zig`
+cover offset, short reads, post-end zero, per-fd isolation, replace,
+and fault interaction.
+
+### B3 — `AsyncRecheckOf(SimIO)` integration tests (commit `be76359`)
+Three end-to-end tests in `tests/recheck_test.zig`:
+- "all pieces verify against registered file content" — happy path
+  (4-piece × 32-byte torrent, hash registered bytes, drive recheck,
+  assert all 4 verify and bytes_complete matches).
+- "corrupt piece is reported incomplete" — overwrite piece 2's
+  content after hashing; assert p0/p1/p3 set, p2 unset.
+- "all-known-complete fast path skips disk reads" — every bit set
+  in known_complete, NO setFileBytes registration. Asserted "all
+  4 complete" only holds if no reads fire.
+
+These prove the parameterisation is real (not just typecheck) and
+the SimIO read content path delivers correctly through the full
+state machine. The follow-up live-pipeline BUGGIFY wrapper (per-tick
+`injectRandomFault` + per-op `FaultConfig` × 32 seeds) is filed
+as the next deliverable in "Next" — estimated 0.5-1 day now that
+the refactor + setFileBytes are in place.
+
+### Methodology
+
+- **Pattern #15 (read existing invariants).** Mirrored the
+  `EventLoopOf(IO)` / Stage 2 migration shape exactly — same
+  `Self` substitution, same alias declaration, same per-IO nested
+  type pattern. No new design decisions, just reapplied an existing
+  one.
+- **Pattern #10 (lazy method compilation).** Daemon-side callers
+  stayed on the `AsyncRecheckOf(RealIO)` alias and didn't recompile
+  their method bodies through the type-checker — only the SimIO
+  test paths force the second instantiation, when those tests
+  actually call into the state machine.
+- **Pattern #14 (investigation discipline).** Discovered en route
+  that `src/io/sim_io.zig`'s inline `test` blocks have been silently
+  dark — `mod_tests` doesn't pull in the `io` subsystem (deliberate
+  per `src/root.zig`'s opt-in test {}-block), and `addTest` against
+  `tests/sim_socketpair_test.zig` only sees that file's tests. Did
+  not chase the wider opt-in coverage — outside scope. Filed as a
+  follow-up.
+- **Pattern #8 (tests pass at every commit).** Three coherent
+  commits, each compiling and passing the full suite. Bisectable.
+
+### Follow-ups filed
+- **Live-pipeline BUGGIFY harness for `AsyncRecheckOf(SimIO)`** — see
+  the "Next" → operational subsection for the canonical shape.
+  Estimated 0.5-1 day.
+- **`src/io/sim_io.zig` inline tests are dark.** The wrapper at
+  `tests/sim_socketpair_test.zig` (root for the `test-sim-io` step)
+  doesn't pull in `sim_io.zig`'s own `test` blocks; the original 8
+  inline tests + the `setFileBytes` ones I added would all sit dark
+  if put inline. Worked around by putting the new tests directly in
+  `tests/sim_socketpair_test.zig`, but the original 8 should
+  ideally be wired too. Mechanical fix (adding `_ = sim_io;` works
+  for namespace-side tests but `addTest` doesn't follow into
+  package-boundary modules in Zig 0.15.2; either move the tests
+  or add an explicit wrapper file).
 
 ## Last Verified Milestone (2026-04-26 — followups-2 round)
 
