@@ -29,6 +29,11 @@ const slot_a: u16 = 1;
 const slot_b: u16 = 2;
 const slot_c: u16 = 3;
 
+// Stub address for tests that don't care about per-peer attribution
+// (the protocol-level algorithm doesn't depend on addresses; only the
+// EL-side smart-ban Phase 2 path reads `BlockInfo.delivered_address`).
+const test_address = std.net.Address.initIp4(.{ 0, 0, 0, 0 }, 0);
+
 const piece_size: u32 = 16 * 4 * 1024; // 64 KiB → 4 blocks of 16 KiB
 const block_count: u16 = 4;
 
@@ -101,7 +106,7 @@ test "multi-source: markBlockReceived records sender, not requester" {
     // peer that actually sent the bytes — that's the one we'd hold
     // accountable for the data quality.
     const block_data = [_]u8{ 0x42, 0x43 };
-    try testing.expect(dp.markBlockReceived(0, slot_b, 0, &block_data));
+    try testing.expect(dp.markBlockReceived(0, slot_b, test_address, 0, &block_data));
     try testing.expectEqual(slot_b, dp.block_infos[0].peer_slot);
     try testing.expectEqual(BlockState.received, dp.block_infos[0].state);
 }
@@ -117,7 +122,7 @@ test "multi-source: releaseBlocksForPeer returns only that peer's requested bloc
     // Peer B receives block 1 — that block is now `.received`, not
     // `.requested`. release for B should NOT touch it.
     const block_data = [_]u8{0xff};
-    try testing.expect(dp.markBlockReceived(1, slot_b, 16 * 1024, &block_data));
+    try testing.expect(dp.markBlockReceived(1, slot_b, test_address, 16 * 1024, &block_data));
 
     // Peer A disconnects — release blocks 0 and 2.
     dp.releaseBlocksForPeer(slot_a);
@@ -143,10 +148,10 @@ test "multi-source: markBlockReceived rejects duplicate delivery" {
 
     const block_data = [_]u8{0xaa};
     try testing.expect(dp.markBlockRequested(0, slot_a));
-    try testing.expect(dp.markBlockReceived(0, slot_a, 0, &block_data));
+    try testing.expect(dp.markBlockReceived(0, slot_a, test_address, 0, &block_data));
     // Endgame mode: peer B also delivers block 0. Should be rejected as
     // duplicate (first delivery wins; second one's bytes are discarded).
-    try testing.expect(!dp.markBlockReceived(0, slot_b, 0, &block_data));
+    try testing.expect(!dp.markBlockReceived(0, slot_b, test_address, 0, &block_data));
     // Attribution remains with the first sender.
     try testing.expectEqual(slot_a, dp.block_infos[0].peer_slot);
 }
@@ -171,7 +176,7 @@ test "multi-source: full-piece happy path attributes every block" {
     const block_data = [_]u8{0x99};
     for (assignments) |a| {
         const offset: u32 = @as(u32, a.block) * 16 * 1024;
-        try testing.expect(dp.markBlockReceived(a.block, a.slot, offset, &block_data));
+        try testing.expect(dp.markBlockReceived(a.block, a.slot, test_address, offset, &block_data));
     }
     try testing.expect(dp.isComplete());
 
@@ -211,14 +216,14 @@ test "multi-source: piece-completion lifecycle preserves attribution" {
     // A: blocks 0, 1
     _ = dp.markBlockRequested(0, slot_a);
     _ = dp.markBlockRequested(1, slot_a);
-    _ = dp.markBlockReceived(0, slot_a, 0, &block_data);
-    _ = dp.markBlockReceived(1, slot_a, 16 * 1024, &block_data);
+    _ = dp.markBlockReceived(0, slot_a, test_address, 0, &block_data);
+    _ = dp.markBlockReceived(1, slot_a, test_address, 16 * 1024, &block_data);
     // B: block 2
     _ = dp.markBlockRequested(2, slot_b);
-    _ = dp.markBlockReceived(2, slot_b, 32 * 1024, &block_data);
+    _ = dp.markBlockReceived(2, slot_b, test_address, 32 * 1024, &block_data);
     // C: block 3
     _ = dp.markBlockRequested(3, slot_c);
-    _ = dp.markBlockReceived(3, slot_c, 48 * 1024, &block_data);
+    _ = dp.markBlockReceived(3, slot_c, test_address, 48 * 1024, &block_data);
 
     try testing.expect(dp.isComplete());
 

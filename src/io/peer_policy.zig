@@ -1425,17 +1425,16 @@ fn snapshotAttributionForSmartBan(
             block_peers[i] = null;
             continue;
         }
-        if (bi.peer_slot >= self.peers.len) {
-            block_peers[i] = null;
-            continue;
-        }
-        const p = &self.peers[bi.peer_slot];
-        if (p.state == .free) {
-            // Slot was freed mid-piece; skip attribution for this block.
-            block_peers[i] = null;
-            continue;
-        }
-        block_peers[i] = p.address;
+        // Read attribution from `bi.delivered_address` rather than
+        // dereferencing `self.peers[bi.peer_slot]`. The peer slot may
+        // have been reused (corrupt peer disconnects after delivering
+        // bad blocks, or churns IPs mid-piece) by the time this
+        // snapshot runs at piece-completion. The address captured at
+        // markBlockReceived time is the one Phase 2 needs to ban.
+        // `delivered_address` is null only for blocks not yet
+        // received, which we already filtered out via the `state !=
+        // .received` check above; defensive null-skip retained.
+        block_peers[i] = bi.delivered_address;
     }
 
     sb.snapshotAttribution(torrent_id, piece_index, block_peers) catch {
