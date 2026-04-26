@@ -24,6 +24,7 @@ const dp_mod = @import("downloading_piece.zig");
 const DownloadingPiece = dp_mod.DownloadingPiece;
 const DownloadingPieceKey = dp_mod.DownloadingPieceKey;
 const PieceTracker = @import("../torrent/piece_tracker.zig").PieceTracker;
+const session_mod = @import("../torrent/session.zig");
 
 const pipeline_depth: u32 = 64;
 
@@ -583,6 +584,21 @@ pub fn completePieceDownload(self: anytype, slot: u16) void {
         return;
     }
 
+    // Multi-source race guard / piece-hash lifecycle interaction: if the
+    // piece is already verified-and-persisted (another peer's contribution
+    // got there first), skip re-verification. This is what previously was
+    // gated by the endgame-pending-write check in `processHashResults`,
+    // but we need it here too because Phase 1 of the piece-hash lifecycle
+    // (`docs/piece-hash-lifecycle.md`) zeros the hash bytes once
+    // `pt.completePiece` returns true. Re-reading the (now-zero) hash in
+    // a duplicate completion would falsely fail the hash check and
+    // penalise an honest peer that contributed real blocks. Discard the
+    // duplicate here without going through the hasher.
+    if (pt.isPieceComplete(piece_index)) {
+        cleanupDuplicateCompletion(self, peer, dp, piece_index);
+        return;
+    }
+
     // Get the expected hash for this piece
     const expected_hash = sess.layout.pieceHash(piece_index) catch {
         cleanupCompletionFailure(self, peer, dp, pt, piece_index);
@@ -727,6 +743,36 @@ pub fn completePieceDownload(self: anytype, slot: u16) void {
         peer.current_piece = null;
         self.markIdle(slot);
     }
+}
+
+/// Clean up after a duplicate completion: another peer's contribution
+/// already verified-and-persisted this piece. Free our piece buffer and
+/// detach without re-verifying or releasing the (already-complete) piece.
+/// This is the multi-source endgame race the piece-hash lifecycle
+/// surfaces in concert with the per-piece zeroing — see the comment at
+/// the call site in `completePieceDownload`.
+fn cleanupDuplicateCompletion(
+    self: anytype,
+    peer: *Peer,
+    dp: ?*DownloadingPiece,
+    piece_index: u32,
+) void {
+    _ = piece_index;
+    if (dp) |d| {
+        const dp_key = DownloadingPieceKey{ .torrent_id = d.torrent_id, .piece_index = d.piece_index };
+        // Only the slot that *first* completed registered the DP; subsequent
+        // completers may have detached already. fetchRemove is idempotent.
+        _ = self.downloading_pieces.remove(dp_key);
+        const slot = peerSlot(self, peer);
+        detachAllPeersExcept(self, d, slot);
+        dp_mod.destroyDownloadingPieceFull(self.allocator, d);
+    } else {
+        if (peer.piece_buf) |buf| self.allocator.free(buf);
+    }
+    peer.piece_buf = null;
+    peer.downloading_piece = null;
+    peer.current_piece = null;
+    promoteNextPieceOrMarkIdle(self, peerSlot(self, peer));
 }
 
 /// Clean up after a failed piece completion (hash lookup failure, hasher submit failure, etc.).
@@ -929,7 +975,14 @@ pub fn processHashResults(self: anytype) void {
                         // All spans skipped (do_not_download) -- the piece
                         // data is verified correct, mark complete.
                         const piece_length = sess.layout.pieceSize(result.piece_index) catch 0;
-                        if (tc.piece_tracker) |pt| _ = pt.completePiece(result.piece_index, piece_length);
+                        if (tc.piece_tracker) |pt| {
+                            const first_completion = pt.completePiece(result.piece_index, piece_length);
+                            // Phase 1: also fire the piece-hash lifecycle hook
+                            // here so do_not_download torrents free hashes too.
+                            if (first_completion) {
+                                onPieceVerifiedAndPersisted(self, torrent_id, result.piece_index);
+                            }
+                        }
                     }
                     self.allocator.free(result.piece_buf);
                     continue;
@@ -1441,6 +1494,71 @@ fn snapshotAttributionForSmartBan(
         // On failure, free the slice we just allocated.
         self.allocator.free(block_peers);
     };
+}
+
+/// Phase 1 of the piece-hash lifecycle (`docs/piece-hash-lifecycle.md`):
+/// after a piece is verified-and-persisted (`pt.completePiece` returned true),
+/// the 20-byte SHA-1 hash for that piece is no longer needed for normal
+/// seeding operation. Zero it; if every piece has now been verified, free
+/// the entire pieces slice.
+///
+/// Safety: smart-ban already consumed its per-piece records in
+/// `processHashResults` (which fires before any disk-write submission). So
+/// by the time this hook runs, the hash storage has no remaining live
+/// readers.
+///
+/// The daemon holds the session storage as a heap field
+/// (`TorrentSession.session`); `tc.session` exposes a `*const` view as the
+/// EL contract for read-only consumers. The `@constCast` here is scoped to
+/// piece-hash lifecycle mutation, called only post-completePiece.
+pub fn onPieceVerifiedAndPersisted(
+    self: anytype,
+    torrent_id: u32,
+    piece_index: u32,
+) void {
+    const tc = self.getTorrentContext(torrent_id) orelse return;
+    const sess_const = tc.session orelse return;
+    const sess: *session_mod.Session = @constCast(sess_const);
+    const pt = tc.piece_tracker orelse return;
+
+    sess.zeroPieceHash(piece_index);
+
+    // v2/hybrid analog: drop any cached Merkle tree for the file containing
+    // this piece if all of that file's pieces are now complete. Per-file
+    // `pieces_root` (32 bytes) stays in metainfo; only the derived
+    // per-piece SHA-256 tree is evicted.
+    if (tc.merkle_cache) |mc| {
+        if (sess.layout.version != .v1) {
+            const file_idx = fileIndexForPiece(&sess.layout, piece_index);
+            if (file_idx) |fi| mc.evictCompletedFile(fi, &pt.complete);
+        }
+    }
+
+    // Endgame: free the entire pieces slice once every piece is verified.
+    // Use the PieceTracker's complete bitfield as the truth — it covers
+    // exactly the pieces that have been disk-persisted (this hook fires
+    // post-disk-write completion). `sess.allHashesVerified()` mirrors the
+    // tracker's full-completion state via its own bookkeeping; we additionally
+    // gate on `pt.isComplete()` so do_not_download (selective) torrents
+    // also trigger the free when the *wanted* set is exhausted.
+    if (pt.isComplete() and sess.hasPieceHashes()) {
+        sess.freePieces();
+        log.info("piece-hash lifecycle: freed pieces table for torrent {d} (Phase 1 endgame)", .{torrent_id});
+    }
+}
+
+/// Helper: locate the file containing `piece_index` for v2/hybrid layouts.
+/// v2 layouts are file-aligned so a piece belongs to exactly one file;
+/// hybrid uses v1 spans (multi-file pieces possible) so we return the
+/// first file in range as the canonical owner.
+fn fileIndexForPiece(lyt: *const @import("../torrent/layout.zig").Layout, piece_index: u32) ?u32 {
+    for (lyt.files, 0..) |file, idx| {
+        if (file.length == 0) continue;
+        if (piece_index >= file.first_piece and piece_index < file.end_piece_exclusive) {
+            return @intCast(idx);
+        }
+    }
+    return null;
 }
 
 /// Smart Ban Phase 2: given the peer addresses identified as having sent

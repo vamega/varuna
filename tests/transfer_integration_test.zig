@@ -194,15 +194,16 @@ test "single-piece transfer between seeder and downloader on shared event loop" 
     }
 
     // ── 13. Verify data integrity: re-read from disk and hash ─
+    //
+    // Don't go through `verify_mod.planPieceVerification` here — Phase 1 of
+    // the piece-hash lifecycle (`docs/piece-hash-lifecycle.md`) frees the
+    // session's `pieces` table once piece 0 (the only piece) verifies, so
+    // `layout.pieceHash` would return `error.PiecesNotLoaded`. We only need
+    // span mapping for the read; the hash check uses the locally-stashed
+    // `piece_hash` from before the EL was wired.
     var read_buf: [piece_data_len]u8 = undefined;
-    const read_plan = try verify_mod.planPieceVerificationWithScratch(
-        allocator,
-        &session,
-        0,
-        &span_scratch,
-    );
-    defer read_plan.deinit(allocator);
-    try store.readPiece(read_plan.spans, &read_buf);
+    const read_spans = try session.layout.mapPiece(0, &span_scratch);
+    try store.readPiece(read_spans, &read_buf);
 
     var actual_hash: [20]u8 = undefined;
     Sha1.hash(&read_buf, &actual_hash, .{});

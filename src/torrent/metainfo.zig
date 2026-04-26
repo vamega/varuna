@@ -50,7 +50,24 @@ pub const Metainfo = struct {
             // For v2, piece count is derived from file sizes and piece_length
             return self.pieceCountFromFiles();
         }
-        return std.math.cast(u32, self.pieces.len / 20) orelse error.PieceCountOverflow;
+        // For v1/hybrid: prefer the pieces table when present (authoritative —
+        // catches torrents with extra/missing trailing data), but fall back to
+        // file-size-derived count when pieces have been freed for seeding-only
+        // (Phase 2 of the piece-hash lifecycle).
+        if (self.pieces.len > 0) {
+            return std.math.cast(u32, self.pieces.len / 20) orelse error.PieceCountOverflow;
+        }
+        return self.pieceCountFromFileSizes();
+    }
+
+    /// Compute piece count from v1 file sizes and piece_length. Used when the
+    /// v1 `pieces` table is not materialised (Phase 2 seeding-only load).
+    pub fn pieceCountFromFileSizes(self: Metainfo) !u32 {
+        if (self.piece_length == 0) return error.InvalidPieceLength;
+        const total = self.totalSize();
+        if (total == 0) return error.EmptyTorrentData;
+        const count = (total + self.piece_length - 1) / self.piece_length;
+        return std.math.cast(u32, count) orelse error.PieceCountOverflow;
     }
 
     /// Compute piece count for v2 torrents from file tree metadata.
@@ -73,6 +90,11 @@ pub const Metainfo = struct {
         }
         if (self.version == .v2) {
             return error.UnsupportedForV2;
+        }
+        // Phase 2 of the piece-hash lifecycle: pieces may have been skipped
+        // entirely (parseSeedingOnly) or freed mid-session (Session.freePieces).
+        if (self.pieces.len == 0) {
+            return error.PiecesNotLoaded;
         }
 
         const start = @as(usize, piece_index) * 20;
@@ -112,6 +134,37 @@ pub fn detectVersion(info: []const bencode.Value.Entry) TorrentVersion {
 }
 
 pub fn parse(allocator: std.mem.Allocator, input: []const u8) !Metainfo {
+    return parseWithOptions(allocator, input, .{});
+}
+
+/// Parse a torrent's metainfo without materialising the v1 `pieces` field.
+///
+/// Used by Phase 2 of the piece-hash lifecycle (see `docs/piece-hash-lifecycle.md`):
+/// when a session is loaded for a torrent already 100% complete, the per-piece
+/// SHA-1 table buys nothing for seeding (the downloading peer verifies with their
+/// own copy). Skipping the field saves `piece_count * 20` bytes per torrent.
+///
+/// Validation that the `pieces` field is present and well-formed is intentionally
+/// skipped — for already-complete torrents the data has already been verified
+/// against this table at least once. Recheck must call
+/// `Session.loadPiecesForRecheck()` first to re-materialise the field.
+pub fn parseSeedingOnly(allocator: std.mem.Allocator, input: []const u8) !Metainfo {
+    return parseWithOptions(allocator, input, .{ .skip_pieces = true });
+}
+
+pub const ParseOptions = struct {
+    /// When true, the v1 `pieces` field is not extracted from the bencode tree.
+    /// The returned `Metainfo.pieces` is left as an empty slice. The field is
+    /// still required to be present for v1/hybrid torrents (its presence is
+    /// part of the format), but its bytes are not read.
+    skip_pieces: bool = false,
+};
+
+pub fn parseWithOptions(
+    allocator: std.mem.Allocator,
+    input: []const u8,
+    options: ParseOptions,
+) !Metainfo {
     const digest = try info_hash.compute(input);
     const root = try bencode.parse(allocator, input);
     defer bencode.freeValue(allocator, root);
@@ -124,12 +177,20 @@ pub fn parse(allocator: std.mem.Allocator, input: []const u8) !Metainfo {
     const piece_length = try expectU32(try getRequired(info, "piece length"));
     if (piece_length == 0) return error.InvalidPieceLength;
 
-    // v1 pieces field: required for v1 and hybrid, absent for pure v2
+    // v1 pieces field: required for v1 and hybrid, absent for pure v2.
+    // skip_pieces leaves the bytes unread (Phase 2 seeding-only fast path).
     var pieces: []const u8 = "";
     if (version == .v1 or version == .hybrid) {
-        pieces = try expectBytes(try getRequired(info, "pieces"));
-        if (pieces.len == 0 or pieces.len % 20 != 0) {
-            return error.InvalidPiecesField;
+        if (options.skip_pieces) {
+            // Sanity-check presence without reading the bytes; the actual
+            // field validation runs only when pieces are materialised
+            // (e.g. via Session.loadPiecesForRecheck).
+            _ = try getRequired(info, "pieces");
+        } else {
+            pieces = try expectBytes(try getRequired(info, "pieces"));
+            if (pieces.len == 0 or pieces.len % 20 != 0) {
+                return error.InvalidPiecesField;
+            }
         }
     }
 

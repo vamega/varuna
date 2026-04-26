@@ -5,7 +5,6 @@ const EventLoop = varuna.io.event_loop.EventLoop;
 const PieceTracker = varuna.torrent.piece_tracker.PieceTracker;
 const Session = varuna.torrent.session.Session;
 const PieceStore = varuna.storage.writer.PieceStore;
-const verify_mod = varuna.storage.verify;
 const Sha1 = varuna.crypto.Sha1;
 const Layout = varuna.torrent.layout.Layout;
 const VirtualPeer = varuna.sim.VirtualPeer;
@@ -181,11 +180,17 @@ test "VirtualPeer seeder transfers a piece to EventLoop downloader" {
     }
 
     // ── 12. Verify data integrity ────────────────────────────────
+    //
+    // Don't go through `verify_mod.planPieceVerification` here — Phase 1 of
+    // the piece-hash lifecycle (`docs/piece-hash-lifecycle.md`) frees the
+    // session's `pieces` table once piece 0 (the only piece) verifies, so
+    // `layout.pieceHash` would return `error.PiecesNotLoaded`. We only need
+    // span mapping for the read; the hash check uses the locally-stashed
+    // `piece_hash` from before the EL was wired.
     var read_buf: [piece_data_len]u8 = undefined;
     var span_scratch: [8]Layout.Span = undefined;
-    const plan = try verify_mod.planPieceVerificationWithScratch(allocator, &session, 0, &span_scratch);
-    defer plan.deinit(allocator);
-    try store.readPiece(plan.spans, &read_buf);
+    const read_spans = try session.layout.mapPiece(0, &span_scratch);
+    try store.readPiece(read_spans, &read_buf);
 
     var actual_hash: [20]u8 = undefined;
     Sha1.hash(&read_buf, &actual_hash, .{});

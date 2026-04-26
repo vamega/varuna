@@ -10,6 +10,7 @@ const Peer = @import("event_loop.zig").Peer;
 const PeerState = @import("event_loop.zig").PeerState;
 const protocol = @import("protocol.zig");
 const io_interface = @import("io_interface.zig");
+const peer_policy = @import("peer_policy.zig");
 const socket_util = @import("../net/socket.zig");
 const BanList = @import("../net/ban_list.zig").BanList;
 
@@ -909,7 +910,17 @@ fn handleDiskWriteResult(self: anytype, write_id: u32, res: i32) void {
                 } else if (tc.session) |sess| {
                     if (piece_index < sess.pieceCount()) {
                         const piece_length = sess.layout.pieceSize(piece_index) catch 0;
-                        if (tc.piece_tracker) |pt| _ = pt.completePiece(piece_index, piece_length);
+                        if (tc.piece_tracker) |pt| {
+                            const first_completion = pt.completePiece(piece_index, piece_length);
+                            // Phase 1 of the piece-hash lifecycle: free the
+                            // SHA-1 hash now that the piece is verified-and-
+                            // persisted. Skip duplicate completions (endgame
+                            // races) since the first completion already
+                            // handled the lifecycle hook.
+                            if (first_completion) {
+                                peer_policy.onPieceVerifiedAndPersisted(self, pending_w.torrent_id, piece_index);
+                            }
+                        }
                     }
                 }
             }

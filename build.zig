@@ -226,6 +226,23 @@ pub fn build(b: *std.Build) void {
     const test_torrent_session_step = b.step("test-torrent-session", "Run the focused TorrentSession test binary");
     test_torrent_session_step.dependOn(&run_torrent_session_tests.step);
 
+    // ── Piece hash lifecycle tests (Track A — docs/piece-hash-lifecycle.md) ──
+    const piece_hash_lifecycle_tests = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("tests/piece_hash_lifecycle_test.zig"),
+            .target = target,
+            .optimize = optimize,
+            .imports = &varuna_import,
+        }),
+    });
+    const run_piece_hash_lifecycle_tests = b.addRunArtifact(piece_hash_lifecycle_tests);
+    test_step.dependOn(&run_piece_hash_lifecycle_tests.step);
+    const test_piece_hash_step = b.step(
+        "test-piece-hash-lifecycle",
+        "Run piece hash lifecycle tests (loadForSeeding/freePieces/loadPiecesForRecheck)",
+    );
+    test_piece_hash_step.dependOn(&run_piece_hash_lifecycle_tests.step);
+
     // ── SO_BINDTODEVICE tests ────────────────────────────────
     const bind_device_tests = b.addTest(.{
         .root_module = b.createModule(.{

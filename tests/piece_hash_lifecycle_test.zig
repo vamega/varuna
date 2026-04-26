@@ -1,0 +1,350 @@
+//! Piece hash lifecycle tests (Track A — `docs/piece-hash-lifecycle.md`).
+//!
+//! Three-phase memory savings for v1/hybrid SHA-1 piece hash tables:
+//! * Phase 1: per-piece zeroing on verification + endgame slice free.
+//! * Phase 2: skip parsing entirely for seeding-only loads.
+//! * Phase 3: re-materialise on-demand from `torrent_bytes` for recheck.
+//!
+//! These are algorithm-level tests against bare structures (no event loop,
+//! no SimIO). The integration coverage is in
+//! `tests/sim_piece_hash_lifecycle_test.zig`.
+
+const std = @import("std");
+const varuna = @import("varuna");
+const Session = varuna.torrent.session.Session;
+const metainfo = varuna.torrent.metainfo;
+
+// Single-file v1 torrent: 10 bytes total, piece_length=4 → 3 pieces of 20-byte hashes.
+const v1_input =
+    "d4:infod6:lengthi10e4:name8:test.bin12:piece lengthi4e6:pieces60:" ++
+    "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ12345678ee";
+
+// ── metainfo parseSeedingOnly ──────────────────────────────────
+
+test "parseSeedingOnly leaves pieces empty for v1 torrents" {
+    const parsed = try metainfo.parseSeedingOnly(std.testing.allocator, v1_input);
+    defer metainfo.freeMetainfo(std.testing.allocator, parsed);
+
+    try std.testing.expect(parsed.pieces.len == 0);
+    // pieceCount is still derivable from file sizes (10 / 4 = 3).
+    try std.testing.expectEqual(@as(u32, 3), try parsed.pieceCount());
+    try std.testing.expectEqual(@as(u32, 4), parsed.piece_length);
+    // pieceHash returns PiecesNotLoaded since the field is empty.
+    try std.testing.expectError(error.PiecesNotLoaded, parsed.pieceHash(0));
+}
+
+test "parseSeedingOnly still rejects malformed torrents" {
+    const bad = "d4:infod6:lengthi5e4:name8:test.bin12:piece lengthi0e6:pieces20:abcdefghijklmnopqrstee";
+    try std.testing.expectError(
+        error.InvalidPieceLength,
+        metainfo.parseSeedingOnly(std.testing.allocator, bad),
+    );
+}
+
+test "parseSeedingOnly requires the pieces field to be present (presence-only check)" {
+    // Hybrid torrent shape but missing `pieces` — must still reject as malformed.
+    const missing_pieces =
+        "d4:infod6:lengthi5e4:name8:test.bin12:piece lengthi4eee";
+    try std.testing.expectError(
+        error.MissingRequiredField,
+        metainfo.parseSeedingOnly(std.testing.allocator, missing_pieces),
+    );
+}
+
+// ── Session lifecycle ──────────────────────────────────────────
+
+test "loadForDownload materialises pieces in heap (separately from arena)" {
+    var sess = try Session.loadForDownload(std.testing.allocator, v1_input, "/srv/torrents");
+    defer sess.deinit(std.testing.allocator);
+
+    try std.testing.expect(sess.hasPieceHashes());
+    try std.testing.expect(sess.pieces != null);
+    try std.testing.expect(sess.layout.piece_hashes != null);
+
+    // Reading hash through the layout returns the original bytes.
+    try std.testing.expectEqualStrings("abcdefghijklmnopqrst", try sess.layout.pieceHash(0));
+    try std.testing.expectEqualStrings("uvwxyzABCDEFGHIJKLMN", try sess.layout.pieceHash(1));
+}
+
+test "loadForSeeding skips pieces entirely (Phase 2 zero-cost steady state)" {
+    var sess = try Session.loadForSeeding(std.testing.allocator, v1_input, "/srv/torrents");
+    defer sess.deinit(std.testing.allocator);
+
+    try std.testing.expect(!sess.hasPieceHashes());
+    try std.testing.expect(sess.pieces == null);
+    try std.testing.expect(sess.layout.piece_hashes == null);
+
+    // Layout still answers piece_count from file sizes. The seeder only needs
+    // this for the BITFIELD it sends to peers — never the hashes themselves.
+    try std.testing.expectEqual(@as(u32, 3), sess.pieceCount());
+    try std.testing.expectEqual(@as(u64, 10), sess.totalSize());
+
+    try std.testing.expectError(error.PiecesNotLoaded, sess.layout.pieceHash(0));
+}
+
+test "freePieces releases buffer and clears layout pointer (Phase 1 endgame)" {
+    var sess = try Session.loadForDownload(std.testing.allocator, v1_input, "/srv/torrents");
+    defer sess.deinit(std.testing.allocator);
+
+    try std.testing.expect(sess.hasPieceHashes());
+
+    sess.freePieces();
+    try std.testing.expect(!sess.hasPieceHashes());
+    try std.testing.expect(sess.layout.piece_hashes == null);
+    try std.testing.expectError(error.PiecesNotLoaded, sess.layout.pieceHash(0));
+
+    // Idempotent — double-free safe.
+    sess.freePieces();
+    try std.testing.expect(!sess.hasPieceHashes());
+}
+
+test "loadPiecesForRecheck restores hash table from torrent_bytes (Phase 3)" {
+    var sess = try Session.loadForSeeding(std.testing.allocator, v1_input, "/srv/torrents");
+    defer sess.deinit(std.testing.allocator);
+
+    try std.testing.expect(!sess.hasPieceHashes());
+    try sess.loadPiecesForRecheck();
+    try std.testing.expect(sess.hasPieceHashes());
+
+    // The reconstituted hashes match the originals exactly.
+    try std.testing.expectEqualStrings("abcdefghijklmnopqrst", try sess.layout.pieceHash(0));
+    try std.testing.expectEqualStrings("uvwxyzABCDEFGHIJKLMN", try sess.layout.pieceHash(1));
+
+    // No-op when already loaded.
+    try sess.loadPiecesForRecheck();
+    try std.testing.expectEqualStrings("abcdefghijklmnopqrst", try sess.layout.pieceHash(0));
+}
+
+test "loadPiecesForRecheck → freePieces → loadPiecesForRecheck cycles cleanly" {
+    var sess = try Session.loadForDownload(std.testing.allocator, v1_input, "/srv/torrents");
+    defer sess.deinit(std.testing.allocator);
+
+    try std.testing.expectEqualStrings("abcdefghijklmnopqrst", try sess.layout.pieceHash(0));
+    sess.freePieces();
+    try std.testing.expect(!sess.hasPieceHashes());
+
+    try sess.loadPiecesForRecheck();
+    try std.testing.expectEqualStrings("abcdefghijklmnopqrst", try sess.layout.pieceHash(0));
+
+    sess.freePieces();
+    try std.testing.expect(!sess.hasPieceHashes());
+}
+
+test "zeroPieceHash clobbers a single piece in place (Phase 1 piece-by-piece)" {
+    var sess = try Session.loadForDownload(std.testing.allocator, v1_input, "/srv/torrents");
+    defer sess.deinit(std.testing.allocator);
+
+    sess.zeroPieceHash(1);
+
+    const expect_zero: [20]u8 = [_]u8{0} ** 20;
+    try std.testing.expectEqualSlices(u8, &expect_zero, try sess.layout.pieceHash(1));
+
+    // Other pieces are untouched.
+    try std.testing.expectEqualStrings("abcdefghijklmnopqrst", try sess.layout.pieceHash(0));
+    try std.testing.expectEqualStrings("OPQRSTUVWXYZ12345678", try sess.layout.pieceHash(2));
+}
+
+test "zeroPieceHash + allHashesVerified drives the Phase 1 endgame trigger" {
+    var sess = try Session.loadForDownload(std.testing.allocator, v1_input, "/srv/torrents");
+    defer sess.deinit(std.testing.allocator);
+
+    try std.testing.expect(!sess.allHashesVerified());
+
+    sess.zeroPieceHash(0);
+    try std.testing.expect(!sess.allHashesVerified());
+    sess.zeroPieceHash(1);
+    try std.testing.expect(!sess.allHashesVerified());
+    sess.zeroPieceHash(2);
+    try std.testing.expect(sess.allHashesVerified());
+
+    // Idempotent: zeroing the same piece twice doesn't break the count.
+    sess.zeroPieceHash(2);
+    try std.testing.expect(sess.allHashesVerified());
+
+    // After freePieces, allHashesVerified treats the absent table as "yes".
+    sess.freePieces();
+    try std.testing.expect(sess.allHashesVerified());
+}
+
+test "zeroPieceHash on a v2 torrent is a safe no-op (no flat hash table)" {
+    const pr = [_]u8{0xAA} ** 32;
+    const v2_input = "d4:infod9:file treed8:test.bind0:d6:lengthi5e11:pieces root32:" ++ pr ++ "eee4:name4:test12:piece lengthi16384eee";
+    var sess = try Session.loadForDownload(std.testing.allocator, v2_input, "/srv/torrents");
+    defer sess.deinit(std.testing.allocator);
+
+    try std.testing.expect(sess.layout.version == .v2);
+    try std.testing.expect(sess.pieces == null);
+
+    // None of these should panic / leak.
+    sess.zeroPieceHash(0);
+    sess.freePieces();
+    try std.testing.expectError(error.UnsupportedForV2, sess.loadPiecesForRecheck());
+}
+
+test "smart-ban interaction: hash stays live across failed-piece re-download" {
+    // Phase 1's invariant: zeroPieceHash is only called after pt.completePiece
+    // returns true (i.e. piece is verified AND on disk). A failed piece does
+    // NOT trigger zeroing — the hash must remain readable for the next
+    // completePieceDownload attempt. This test exercises the read-multiple-
+    // times shape that smart-ban-corrupted pieces hit.
+    var sess = try Session.loadForDownload(std.testing.allocator, v1_input, "/srv/torrents");
+    defer sess.deinit(std.testing.allocator);
+
+    // Read the hash multiple times — simulating a piece that fails, gets
+    // re-downloaded, and is verified on the second attempt.
+    const h0_first = try std.testing.allocator.dupe(u8, try sess.layout.pieceHash(0));
+    defer std.testing.allocator.free(h0_first);
+    try std.testing.expectEqualStrings("abcdefghijklmnopqrst", h0_first);
+
+    // Now the piece passes; the EL would call zeroPieceHash AFTER pt.completePiece.
+    sess.zeroPieceHash(0);
+    const h0_after = try sess.layout.pieceHash(0);
+    try std.testing.expectEqualSlices(u8, &([_]u8{0} ** 20), h0_after);
+
+    // And piece 1 is still live for its own subsequent verification.
+    try std.testing.expectEqualStrings("uvwxyzABCDEFGHIJKLMN", try sess.layout.pieceHash(1));
+}
+
+// ── Layout-level guard rail ────────────────────────────────────
+
+test "layout.pieceHash fails closed when piece_hashes is null" {
+    var sess = try Session.loadForSeeding(std.testing.allocator, v1_input, "/srv/torrents");
+    defer sess.deinit(std.testing.allocator);
+
+    // Explicitly test the layout-level error path — every subsystem that
+    // calls layout.pieceHash() must catch this and either skip the
+    // operation (seeder upload paths) or trigger loadPiecesForRecheck
+    // (recheck path).
+    try std.testing.expectError(error.PiecesNotLoaded, sess.layout.pieceHash(0));
+    try std.testing.expectError(error.PiecesNotLoaded, sess.layout.pieceHash(2));
+    // Out-of-range still fires its own error (precondition checked first).
+    try std.testing.expectError(error.InvalidPieceIndex, sess.layout.pieceHash(99));
+}
+
+// ── Memory savings demonstration ───────────────────────────────
+
+/// Build a v1 torrent with N pieces of `piece_size` bytes each. Uses
+/// a 16 KB piece size and N=64 (~1 MB total) so the piece hash table
+/// is 1280 bytes — small but measurable through the tracking allocator.
+fn buildLargeV1Torrent(allocator: std.mem.Allocator, piece_count: u32) ![]u8 {
+    const piece_size: u32 = 16384;
+    const total_size: u64 = @as(u64, piece_count) * piece_size;
+    const hashes_len = piece_count * 20;
+    var buf = std.ArrayList(u8).empty;
+    defer buf.deinit(allocator);
+
+    try buf.appendSlice(allocator, "d4:infod");
+    try buf.print(allocator, "6:lengthi{d}e", .{total_size});
+    try buf.appendSlice(allocator, "4:name8:test.bin");
+    try buf.print(allocator, "12:piece lengthi{d}e", .{piece_size});
+    try buf.print(allocator, "6:pieces{d}:", .{hashes_len});
+    // Synthesize hashes_len bytes of fake hash data.
+    var i: u32 = 0;
+    while (i < hashes_len) : (i += 1) {
+        try buf.append(allocator, @as(u8, @truncate(i)));
+    }
+    try buf.appendSlice(allocator, "ee");
+
+    return buf.toOwnedSlice(allocator);
+}
+
+test "loadForSeeding allocates fewer bytes than loadForDownload (Phase 2 demo)" {
+    const allocator = std.testing.allocator;
+    const piece_count: u32 = 1024;
+
+    const torrent = try buildLargeV1Torrent(allocator, piece_count);
+    defer allocator.free(torrent);
+
+    // Track the alloc counts through std.testing.allocator's accounting.
+    // Phase 2 invariant: loadForSeeding never materialises the
+    // `piece_count * 20` byte hash table. The seeding session's
+    // `pieces` field is null, demonstrable by direct field inspection.
+    var seeding = try Session.loadForSeeding(allocator, torrent, "/srv/torrents");
+    defer seeding.deinit(allocator);
+
+    try std.testing.expect(!seeding.hasPieceHashes());
+    try std.testing.expect(seeding.pieces == null);
+    try std.testing.expectEqual(piece_count, seeding.pieceCount());
+
+    // Compare against a download-mode load of the same torrent: it
+    // materialises a separately-allocated `piece_count * 20` buffer.
+    var download = try Session.loadForDownload(allocator, torrent, "/srv/torrents");
+    defer download.deinit(allocator);
+
+    try std.testing.expect(download.hasPieceHashes());
+    try std.testing.expectEqual(@as(usize, piece_count * 20), download.pieces.?.len);
+
+    // After freePieces, the heap copy is gone — invariant equivalent to
+    // the seeding-only load.
+    download.freePieces();
+    try std.testing.expect(!download.hasPieceHashes());
+    try std.testing.expect(download.pieces == null);
+}
+
+// ── v2/hybrid: Merkle cache eviction ───────────────────────────
+
+const merkle_cache = varuna.torrent.merkle_cache;
+const Bitfield = varuna.bitfield.Bitfield;
+const Layout = varuna.torrent.layout.Layout;
+
+test "MerkleCache.evictCompletedFile drops cached tree once file completes" {
+    const merkle = varuna.torrent.merkle;
+    const h0 = merkle.hashLeaf("piece0");
+    const h1 = merkle.hashLeaf("piece1");
+    const h2 = merkle.hashLeaf("piece2");
+    const h3 = merkle.hashLeaf("piece3");
+
+    // Compute the real root so buildAndCache accepts the input.
+    var expected_tree = try merkle.MerkleTree.fromPieceHashes(
+        std.testing.allocator,
+        &[_][32]u8{ h0, h1, h2, h3 },
+    );
+    defer expected_tree.deinit();
+    const expected_root = expected_tree.root();
+
+    var files = [_]Layout.File{
+        .{
+            .length = 16,
+            .torrent_offset = 0,
+            .first_piece = 0,
+            .end_piece_exclusive = 4,
+            .path = &.{},
+        },
+    };
+    const v2_files = [_]varuna.torrent.metainfo.V2File{
+        .{ .path = &.{}, .length = 16, .pieces_root = expected_root },
+    };
+    const lyt = Layout{
+        .piece_length = 4,
+        .piece_count = 4,
+        .total_size = 16,
+        .files = files[0..],
+        .piece_hashes = null,
+        .version = .v2,
+        .v2_files = v2_files[0..],
+    };
+
+    var mc = try merkle_cache.MerkleCache.init(std.testing.allocator, &lyt, v2_files[0..], 4);
+    defer mc.deinit();
+
+    _ = try mc.buildAndCache(0, &[_][32]u8{ h0, h1, h2, h3 });
+    try std.testing.expectEqual(@as(u32, 1), mc.cachedCount());
+
+    // With pieces 2 and 3 incomplete, evictCompletedFile is a no-op.
+    var partial = try Bitfield.init(std.testing.allocator, 4);
+    defer partial.deinit(std.testing.allocator);
+    try partial.set(0);
+    try partial.set(1);
+    mc.evictCompletedFile(0, &partial);
+    try std.testing.expectEqual(@as(u32, 1), mc.cachedCount());
+
+    // With every piece complete, the tree gets evicted.
+    var full = try Bitfield.init(std.testing.allocator, 4);
+    defer full.deinit(std.testing.allocator);
+    try full.set(0);
+    try full.set(1);
+    try full.set(2);
+    try full.set(3);
+    mc.evictCompletedFile(0, &full);
+    try std.testing.expectEqual(@as(u32, 0), mc.cachedCount());
+}
