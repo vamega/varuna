@@ -111,10 +111,41 @@ pub const PieceTracker = struct {
     /// (whose `complete` Bitfield the EventLoop holds a `*const Bitfield`
     /// pointer into via `setTorrentCompletePieces`). Reuses the existing
     /// bits storage so the EL's pointer stays valid; only the bit values
-    /// change. In-progress claims are dropped because any in-flight
-    /// downloads were tracking the pre-recheck state.
-    /// Availability counts are preserved — peer Have/bitfield announces
-    /// remain valid across a recheck.
+    /// change. Availability counts are preserved — peer Have/bitfield
+    /// announces remain valid across a recheck.
+    ///
+    /// **Surgical `in_progress` preservation.** Per-piece truth table on
+    /// the `(was_in_progress, now_complete)` pair:
+    ///
+    /// | Pre-recheck                     | Recheck result          | Action                |
+    /// |---------------------------------|-------------------------|-----------------------|
+    /// | `in_progress`, bitfield=0       | piece complete on disk  | drop claim, bitfield=1 (rare race) |
+    /// | `in_progress`, bitfield=0       | piece incomplete        | **keep claim**, bitfield=0 (surgical) |
+    /// | not `in_progress`, bitfield=1   | piece complete on disk  | no change             |
+    /// | not `in_progress`, bitfield=1   | piece incomplete        | bitfield=0            |
+    /// | not `in_progress`, bitfield=0   | (any)                   | follow recheck        |
+    ///
+    /// The "keep claim" branch is the optimization. When peer A is mid-
+    /// downloading piece N with blocks 0..7 already in `dp.buf`, and the
+    /// recheck correctly finds piece N incomplete-on-disk (some blocks
+    /// haven't flushed yet), the prior heavy clear would zero `in_progress`
+    /// and force the picker to re-claim piece N — which would discard the
+    /// existing DP/buf state and have peer A re-request blocks 0..7. The
+    /// surgical update keeps the in_progress bit so the picker treats N
+    /// as still claimed; the existing DP keeps serving deliveries; peer A
+    /// continues from where it left off.
+    ///
+    /// The rare race-case (`in_progress` AND `now_complete`) drops the
+    /// claim — the recheck's verified bytes are already on disk, so any
+    /// in-flight download for that piece is now redundant work. The
+    /// existing DownloadingPiece for such a row-1 piece is left alone:
+    /// when in-flight blocks finish arriving, `completePieceDownload`
+    /// will hash and call `completePiece`, which returns false as a
+    /// duplicate of the already-complete bit. PieceTracker can't observe
+    /// the DP map directly, so it can't proactively destroy the DP.
+    ///
+    /// Equivalent algorithm: `new_in_progress[i] = old_in_progress[i]
+    /// AND NOT new_complete[i]`.
     pub fn applyRecheckResult(
         self: *PieceTracker,
         new_complete: *const Bitfield,
@@ -123,11 +154,29 @@ pub const PieceTracker = struct {
         self.mutex.lock();
         defer self.mutex.unlock();
         std.debug.assert(new_complete.bits.len == self.complete.bits.len);
+        std.debug.assert(self.in_progress.bits.len == self.complete.bits.len);
+
+        // Drop in_progress claims for pieces the recheck found complete.
+        // For pieces still incomplete, the existing in_progress bit is
+        // preserved (the surgical optimization). Done BEFORE overwriting
+        // self.complete so we read the new_complete mask directly.
+        var idx: u32 = 0;
+        while (idx < self.piece_count) : (idx += 1) {
+            if (self.in_progress.has(idx) and new_complete.has(idx)) {
+                // Rare race: piece was in-flight but the recheck found
+                // verified bytes on disk. Caller must also abandon the DP.
+                self.in_progress.clear(idx);
+            }
+            // All other rows of the truth table leave in_progress unchanged.
+        }
+
         @memcpy(self.complete.bits, new_complete.bits);
         self.complete.count = new_complete.count;
-        @memset(self.in_progress.bits, 0);
-        self.in_progress.count = 0;
         self.bytes_complete = new_bytes_complete;
+        // Pieces preserved as in_progress sit in the picker's "claimed"
+        // band; scan_hint=0 lets the next claim scan advance past them
+        // and any newly-completed pieces in lock-step. min_availability
+        // resets because the unclaimed/in_progress partition shifted.
         self.scan_hint = 0;
         self.min_availability = 0;
         self.wanted_completed_count = computeWantedCompletedCount(self);

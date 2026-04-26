@@ -389,6 +389,55 @@ pub const ResumeDb = struct {
         }
     }
 
+    /// Replace the entire set of completed pieces for `info_hash` with
+    /// `piece_indices` in a single transaction.
+    ///
+    /// Used after a recheck (live or stop+start) to ensure the resume DB
+    /// reflects the on-disk truth: stale entries for pieces that the
+    /// recheck found incomplete are deleted, and the new completed set
+    /// is committed. This is the atomic fix for the "additive
+    /// `markCompleteBatch` after recheck" bug — before this method,
+    /// pieces marked complete pre-recheck but found incomplete after
+    /// would survive in the resume DB and cause incorrect resume state
+    /// on the next daemon restart.
+    ///
+    /// Empty `piece_indices` clears the pieces table for `info_hash`
+    /// entirely (the post-recheck state of a torrent that lost every
+    /// piece on disk). Auxiliary state for the torrent (rate_limits,
+    /// share_limits, transfer_stats, etc.) is NOT touched — recheck only
+    /// affects piece completion, never per-torrent metadata. To wipe
+    /// all torrent state, use `clearTorrent`.
+    pub fn replaceCompletePieces(
+        self: *ResumeDb,
+        info_hash: [20]u8,
+        piece_indices: []const u32,
+    ) !void {
+        if (sqlite.sqlite3_exec(self.db, "BEGIN IMMEDIATE", null, null, null) != sqlite.SQLITE_OK) {
+            return error.SqliteTransactionFailed;
+        }
+        errdefer _ = sqlite.sqlite3_exec(self.db, "ROLLBACK", null, null, null);
+
+        // Wipe the prior set of completed pieces for this info_hash. The
+        // delete and insert share a transaction so a concurrent reader
+        // never observes a partial state where stale entries are gone but
+        // the new set hasn't landed yet.
+        _ = sqlite.sqlite3_reset(self.delete_stmt);
+        _ = sqlite.sqlite3_bind_blob(self.delete_stmt, 1, &info_hash, 20, sqlite.SQLITE_TRANSIENT);
+        if (sqlite.sqlite3_step(self.delete_stmt) != sqlite.SQLITE_DONE) {
+            return error.SqliteDeleteFailed;
+        }
+
+        for (piece_indices) |piece_index| {
+            self.markComplete(info_hash, piece_index) catch {
+                return error.SqliteBatchFailed;
+            };
+        }
+
+        if (sqlite.sqlite3_exec(self.db, "COMMIT", null, null, null) != sqlite.SQLITE_OK) {
+            return error.SqliteCommitFailed;
+        }
+    }
+
     /// Load completed pieces into a Bitfield.
     /// Returns the count of pieces loaded.
     pub fn loadCompletePieces(self: *ResumeDb, info_hash: [20]u8, bitfield: *Bitfield) !u32 {
@@ -1271,6 +1320,112 @@ test "resume db clear torrent" {
 
     const count = try db.loadCompletePieces(info_hash, &bf);
     try std.testing.expectEqual(@as(u32, 0), count);
+}
+
+test "resume db replaceCompletePieces drops stale entries (recheck pruning)" {
+    var db = ResumeDb.open(":memory:") catch return error.SkipZigTest;
+    defer db.close();
+
+    // Pre-existing state: pieces 5, 6, 7 marked complete from a previous run.
+    const info_hash = [_]u8{0xC0} ** 20;
+    const before = [_]u32{ 5, 6, 7 };
+    try db.markCompleteBatch(info_hash, &before);
+
+    // Recheck finds only pieces 1 and 3 actually present on disk.
+    const after = [_]u32{ 1, 3 };
+    try db.replaceCompletePieces(info_hash, &after);
+
+    var bf = try Bitfield.init(std.testing.allocator, 16);
+    defer bf.deinit(std.testing.allocator);
+
+    const count = try db.loadCompletePieces(info_hash, &bf);
+    try std.testing.expectEqual(@as(u32, 2), count);
+    try std.testing.expect(bf.has(1));
+    try std.testing.expect(bf.has(3));
+    // The stale pre-recheck entries are gone — without the delete the
+    // additive `markCompleteBatch` would leave 5, 6, 7 visible to fast-resume.
+    try std.testing.expect(!bf.has(5));
+    try std.testing.expect(!bf.has(6));
+    try std.testing.expect(!bf.has(7));
+}
+
+test "resume db replaceCompletePieces with empty set clears all pieces" {
+    var db = ResumeDb.open(":memory:") catch return error.SkipZigTest;
+    defer db.close();
+
+    const info_hash = [_]u8{0xC1} ** 20;
+    const before = [_]u32{ 0, 1, 2, 3 };
+    try db.markCompleteBatch(info_hash, &before);
+
+    const empty = [_]u32{};
+    try db.replaceCompletePieces(info_hash, &empty);
+
+    var bf = try Bitfield.init(std.testing.allocator, 16);
+    defer bf.deinit(std.testing.allocator);
+
+    const count = try db.loadCompletePieces(info_hash, &bf);
+    try std.testing.expectEqual(@as(u32, 0), count);
+}
+
+test "resume db replaceCompletePieces is per-info_hash isolated" {
+    var db = ResumeDb.open(":memory:") catch return error.SkipZigTest;
+    defer db.close();
+
+    // Two torrents share the pieces table; replace on one must not
+    // disturb the other's rows.
+    const info_hash_a = [_]u8{0xA0} ** 20;
+    const info_hash_b = [_]u8{0xB0} ** 20;
+
+    const set_a = [_]u32{ 0, 1, 2 };
+    const set_b = [_]u32{ 4, 5, 6, 7 };
+    try db.markCompleteBatch(info_hash_a, &set_a);
+    try db.markCompleteBatch(info_hash_b, &set_b);
+
+    // Recheck on torrent A drops piece 2 and adds piece 3.
+    const new_a = [_]u32{ 0, 1, 3 };
+    try db.replaceCompletePieces(info_hash_a, &new_a);
+
+    var bf_a = try Bitfield.init(std.testing.allocator, 16);
+    defer bf_a.deinit(std.testing.allocator);
+    const count_a = try db.loadCompletePieces(info_hash_a, &bf_a);
+    try std.testing.expectEqual(@as(u32, 3), count_a);
+    try std.testing.expect(bf_a.has(0));
+    try std.testing.expect(bf_a.has(1));
+    try std.testing.expect(bf_a.has(3));
+    try std.testing.expect(!bf_a.has(2));
+
+    // Torrent B is untouched.
+    var bf_b = try Bitfield.init(std.testing.allocator, 16);
+    defer bf_b.deinit(std.testing.allocator);
+    const count_b = try db.loadCompletePieces(info_hash_b, &bf_b);
+    try std.testing.expectEqual(@as(u32, 4), count_b);
+    try std.testing.expect(bf_b.has(4));
+    try std.testing.expect(bf_b.has(5));
+    try std.testing.expect(bf_b.has(6));
+    try std.testing.expect(bf_b.has(7));
+}
+
+test "resume db replaceCompletePieces is idempotent on no-change" {
+    var db = ResumeDb.open(":memory:") catch return error.SkipZigTest;
+    defer db.close();
+
+    // Same pieces before and after — recheck found exactly what fast-resume
+    // already had. Result must round-trip cleanly without losing entries.
+    const info_hash = [_]u8{0xC2} ** 20;
+    const pieces = [_]u32{ 0, 2, 4, 6, 8 };
+    try db.markCompleteBatch(info_hash, &pieces);
+    try db.replaceCompletePieces(info_hash, &pieces);
+
+    var bf = try Bitfield.init(std.testing.allocator, 16);
+    defer bf.deinit(std.testing.allocator);
+
+    const count = try db.loadCompletePieces(info_hash, &bf);
+    try std.testing.expectEqual(@as(u32, 5), count);
+    try std.testing.expect(bf.has(0));
+    try std.testing.expect(bf.has(2));
+    try std.testing.expect(bf.has(4));
+    try std.testing.expect(bf.has(6));
+    try std.testing.expect(bf.has(8));
 }
 
 test "resume db clear torrent removes auxiliary state" {

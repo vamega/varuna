@@ -277,6 +277,7 @@ See `progress-reports/2026-04-25-stage2-event-loop-migration.md` for the Stage 2
 - **uTP multishot receive**: `recvmsg_multishot` plus a provided-buffer strategy still needs a workload and a measured implementation before it should land.
 - **Dynamic outbound buffer for UtpSocket**: fixed `[128]OutPacket` should become ArrayList for high-throughput uTP connections.
 - **c-ares io_uring integration**: proof-of-concept in `~/projects/c-ares` — native io_uring event engine with SENDMSG/RECVMSG for DNS queries (zero direct syscalls). Could replace varuna's DNS threadpool to eliminate background-thread DNS.
+- **Recheck-IO-generic refactor (unblocks live-pipeline BUGGIFY)**: `AsyncRecheck` is hard-coded to `*RealIO` (`src/io/recheck.zig:34`). Refactoring to `AsyncRecheckOf(IO)` (or `anytype` for the io pointer) would unblock an EL+SimIO BUGGIFY harness for the live recheck pipeline — per-tick `injectRandomFault` + per-op `FaultConfig` × 32 seeds wrapping `tests/recheck_test.zig`'s `live force-recheck` integration test. Also requires a `SimIO.setFileBytes(fd, content)` extension so SimIO-backed reads return real piece data instead of `usize=0`. The recheck-followups round (2026-04-26) shipped an algorithm-level cross-product safety harness (`tests/recheck_buggify_test.zig`) for the post-recheck callback's `applyRecheckResult` + `replaceCompletePieces` surfaces, but didn't cover live-wiring recovery paths (AsyncRecheck slot cleanup under read-error injection, hasher submission failures, partial completion races). Estimated 1-2 days for the refactor + harness wrap.
 
 ## Known Issues
 
@@ -287,6 +288,22 @@ See `progress-reports/2026-04-25-stage2-event-loop-migration.md` for the Stage 2
 - **MSE handshake failures in mixed encryption mode**: `vc_not_found` and `req1_not_found` errors occur during simultaneous inbound+outbound MSE handshakes. Timing-dependent, disappears under GDB. `demo_swarm.sh` runs with `encryption = "disabled"` as workaround.
 - ~~**Daemon graceful shutdown**~~: Fixed. In-flight transfer draining with configurable timeout now ensures clean exit on SIGTERM/SIGINT.
 - `IORING_OP_SETSOCKOPT` (kernel 6.7+), `IORING_OP_BIND`/`LISTEN` (kernel 6.11+) not available on current kernel 6.6. Per-peer setsockopt (TCP_NODELAY, buffer sizes) remains synchronous.
+
+## Last Verified Milestone (2026-04-26 — recheck followups round)
+
+### Recheck followups (recheck-engineer): A1 + A2 + A3
+Three contained recheck-adjacent followups deferred from the prior post-Phase-2 + cleanup-engineer sessions.
+- **Task A1 — Resume DB stale-entry pruning on recheck** (`state_db: replaceCompletePieces for atomic recheck pruning`).
+  Added `ResumeDb.replaceCompletePieces(info_hash, indices)` — atomic delete-then-insert in a single `BEGIN IMMEDIATE` / `COMMIT` transaction. Both `onRecheckComplete` (stop+start) and `onLiveRecheckComplete` (live force-recheck Task B) now call it instead of additive `markCompleteBatch`. Closes the bug where pieces marked complete pre-recheck but found incomplete kept stale rows in the `pieces` table that would corrupt fast-resume on next daemon start. 4 inline tests for the method's edge cases (stale pruning, empty replacement, multi-info_hash isolation, idempotent no-change).
+- **Task A2 — Surgical `in_progress` preservation across recheck** (`piece_tracker: surgical in_progress preservation across recheck`).
+  `PieceTracker.applyRecheckResult` previously dropped ALL in_progress claims on recheck. Now applies a per-piece truth table: `new_in_progress[i] = old_in_progress[i] AND NOT new_complete[i]`. The "keep claim" branch (`was_in_progress` AND `now_complete=false`) is the optimization — when a peer is mid-downloading piece N and the recheck correctly finds N incomplete-on-disk (some blocks haven't flushed), the prior heavy clear forced re-claim and re-request of buffered blocks; the surgical update preserves the DP/buf state. The rare row-1 race (`was_in_progress` AND `now_complete=true`) drops in_progress; the orphaned DP cleans up via the normal `completePieceDownload` → `completePiece`-returns-false-as-duplicate flow. 4 truth-table tests + 1 mixed cross-product (replacing the prior heavy-clear test).
+- **Task A3 — Safety harness for the recheck surfaces** (`recheck: 32-seed safety harness for A1+A2 surfaces`).
+  `tests/recheck_buggify_test.zig` — a 32-seed randomized cross-product safety harness for both A1 + A2 surfaces. Per seed, randomize pre-recheck `complete` + `in_progress` bitfields, recheck-result bitfield, `piece_count` ∈ [4, 256], and info_hash. Drive the surfaces in production order; assert: storage `bits.ptr` stable, complete bits match recheck, in_progress matches surgical truth table, bytes_complete reflects recheck, resume DB pieces table = recheck result exactly, no leak, no panic. Vacuous-pass guards pin coverage at ≥28/32 seeds per branch; empirically all three surfaces saturate at 32/32. First run telemetry: `RECHECK BUGGIFY summary: 32 seeds, piece_count [13, 255], A2 preserved in 32/32, A2 race-dropped in 32/32, A1 pruned in 32/32; total 516 preserved blocks, 1076 stale rows pruned`. Wired at `test-recheck-buggify`.
+- **A3 scope honesty.** The full-pipeline EL+SimIO BUGGIFY harness (per-tick `injectRandomFault` + per-op `FaultConfig` over 32 seeds at the live recheck pipeline) is blocked on `AsyncRecheck` being hard-coded to `*RealIO` (`src/io/recheck.zig:34`). Per pattern #14 (investigation discipline), filed the recheck-IO-generic refactor as a follow-up and shipped the algorithm-level cross-product harness now. The two surfaces I changed are pure algorithmic — algorithm-level testing captures their full safety contract per the layered-testing-strategy "safety properties are fault-invariant" rule.
+- **Test count**: 599 → 608 (+9; A1: +4, A2: +3 net, A3: +2). Stable across full-suite runs.
+- `zig build`: clean. `zig fmt`: clean.
+
+Detail in `progress-reports/2026-04-26-recheck-followups.md`.
 
 ## Last Verified Milestone (2026-04-26 — followups round)
 
