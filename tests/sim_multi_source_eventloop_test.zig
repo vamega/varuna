@@ -157,12 +157,25 @@ fn runScenario(seed: u64, opts: ScenarioOpts) !void {
     // `pending_capacity` likewise bumped — multi-source piece transfer
     // accumulates many in-flight ops (3 peers × pipeline_depth send/recv
     // pairs + per-block hashing CQEs). 16384 is conservative.
+    // `recv_latency_ns = 1ms` is the load-bearing knob for multi-source
+    // distribution. Default 0 latency lets the first peer's
+    // tryFillPipeline drain the entire piece in a single tick before
+    // peers 2 and 3 finish handshake — empirically observed and
+    // confirmed by migration-engineer's picker-fair-share work
+    // (commit 8553ab7): `peer_count` never grows past 1 because the
+    // race finishes before B/C become eligible. 1ms latency models
+    // real network RTT, gives all 3 peers time to handshake in
+    // lockstep before anyone starts requesting blocks, and lets
+    // tryAssignPieces see `peer_count = 3` from the start. The test
+    // loop advances `now_ns` by 1ms per iteration to drive ops
+    // through their deadlines.
     const EL_SimIO = event_loop_mod.EventLoopOf(SimIO);
     const sim_io = try SimIO.init(allocator, .{
         .socket_capacity = num_peers * 2,
         .seed = seed,
         .recv_queue_capacity_bytes = 8 * 1024 * 1024,
         .pending_capacity = 16384,
+        .faults = .{ .recv_latency_ns = 1_000_000 },
     });
     var el = try EL_SimIO.initBareWithIO(allocator, sim_io, 1);
     defer el.deinit();
@@ -225,6 +238,12 @@ fn runScenario(seed: u64, opts: ScenarioOpts) !void {
     while (ticks < max_ticks) : (ticks += 1) {
         try el.tick();
 
+        // Advance the SimIO clock so latency-throttled completions
+        // (recv_latency_ns = 1ms) become eligible on the next tick.
+        // Without this, every recv stays parked forever and the test
+        // makes no progress past the first round-trip.
+        el.io.now_ns += 1_000_000;
+
         for (&peers) |*peer| {
             try peer.step(@as(u64, @intCast(el.clock.now())) * std.time.ns_per_s);
         }
@@ -252,10 +271,11 @@ fn runScenario(seed: u64, opts: ScenarioOpts) !void {
 
     // ── 7. Liveness + safety assertions ────────────────────────
     //
-    // Live today: piece verifies, no honest peer is banned. These hold
-    // regardless of whether multi-source distribution actually fires —
-    // the picker may serialise on one peer (which is the Phase 2A
-    // production gap) but it still completes the piece correctly.
+    // Liveness: piece verifies. Safety: no honest peer banned.
+    // Distribution: ≥ 2 peers contributed, no peer monopolised
+    // (gated under `multi_source_landed`, which is now active after
+    // the picker fair-share + per-call cap landed in commit 8553ab7
+    // and the test-side `recv_latency_ns` knob in this commit).
     try testing.expect(el.isPieceComplete(tid, 0));
 
     // Safety invariant — holds under both clean runs and BUGGIFY
@@ -265,50 +285,51 @@ fn runScenario(seed: u64, opts: ScenarioOpts) !void {
         try testing.expect(!ban_list.isBanned(syntheticAddr(k)));
     }
 
-    // Gated until the Phase 2A picker change lands.
+    // Distribution assertions for Phase 2A multi-source. These rely
+    // on three pieces working together:
+    //   1. The picker's fair-share + per-call cap (`peer_policy.tryFillPipeline`,
+    //      commit 8553ab7) — caps how many blocks one peer can claim
+    //      at once and divides the unrequested pool by `peer_count`.
+    //   2. The test-side `recv_latency_ns = 1ms` (this commit) — gives
+    //      all 3 peers time to complete handshake/bitfield/unchoke in
+    //      lockstep before any tryAssignPieces / tryFillPipeline call
+    //      runs. Without this, the first peer's tryFillPipeline drains
+    //      the piece before peer_count grows past 1.
+    //   3. The bare `DownloadingPiece` machinery exercised by
+    //      `sim_multi_source_protocol_test.zig` — the data structure
+    //      that supports multi-peer block reservation.
     //
-    // Today's `peer_policy.tryFillPipeline` empirically serialises
-    // the entire piece on the first peer that runs `tryAssignPieces`
-    // — even with `pipeline_depth=64` and 256 blocks (4× the cap).
-    // The pipeline is refilled WITHIN a single tick as fast as
-    // responses arrive, so peer A drains the entire piece before
-    // peer B's tryFillPipeline ever sees an unrequested block. This
-    // is the production gap migration-engineer flagged in their
-    // Phase 2 review ("picker change: distribute pending blocks
-    // across peers {X, Y, Z} that hold the piece" rather than
-    // "claim a piece for peer X").
-    //
-    // The protocol-only test (`sim_multi_source_protocol_test.zig`)
-    // exercises the bare `DownloadingPiece` machinery that supports
-    // multi-peer block reservation; what's missing in production is
-    // the picker layer above it that *uses* multiple peers.
-    //
-    // When migration-engineer's picker change lands and Phase 2A
-    // distributes work across peers, flip `multi_source_landed = true`
-    // here and these assertions activate.
-    const multi_source_landed: bool = false;
+    // The flag stays in place as a quick disable switch if a future
+    // refactor breaks any of those three pieces; flip false to confirm
+    // the test is isolating the regression.
+    const multi_source_landed: bool = true;
     if (multi_source_landed) {
-        var peers_with_uploads: u8 = 0;
-        var max_uploaded: u64 = 0;
-        var total_uploaded: u64 = 0;
+        // `bytes_downloaded` is the right metric here — it's the count
+        // of bytes the EL DOWNLOADED FROM this peer. Each peer's
+        // contribution to the multi-source piece. (`bytes_uploaded` is
+        // the inverse — what the EL sent TO the peer, which is 0
+        // because the EL is a pure leecher in this test.)
+        var peers_with_contribs: u8 = 0;
+        var max_contrib: u64 = 0;
+        var total_contrib: u64 = 0;
         var j: u8 = 0;
         while (j < num_peers) : (j += 1) {
             if (el.getPeerView(slots[j])) |v| {
-                if (v.bytes_uploaded > 0) peers_with_uploads += 1;
-                if (v.bytes_uploaded > max_uploaded) max_uploaded = v.bytes_uploaded;
-                total_uploaded += v.bytes_uploaded;
+                if (v.bytes_downloaded > 0) peers_with_contribs += 1;
+                if (v.bytes_downloaded > max_contrib) max_contrib = v.bytes_downloaded;
+                total_contrib += v.bytes_downloaded;
             }
         }
 
         // ≥ 2 peers contributed bytes — the meaningful "not serialised
         // on one peer" invariant.
-        try testing.expect(peers_with_uploads >= 2);
+        try testing.expect(peers_with_contribs >= 2);
 
         // No peer monopolises (≤ 90% of total). Looser bound for the
         // disconnect scenario where survivors absorb the displaced
         // peer's blocks and naturally dominate.
         if (opts.disconnect_peer_after == null) {
-            try testing.expect(max_uploaded * 10 <= total_uploaded * 9);
+            try testing.expect(max_contrib * 10 <= total_contrib * 9);
         }
     }
 
