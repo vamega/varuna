@@ -85,6 +85,11 @@ pub fn EventLoopOf(comptime IO: type) type {
         // `AsyncRecheckOf(SimIO)` with the same surface.
         pub const AsyncRecheck = recheck_mod.AsyncRecheckOf(IO);
 
+        // Same shape for AsyncMetadataFetch — daemon sees the RealIO
+        // instantiation; sim tests instantiate `AsyncMetadataFetchOf(SimIO)`
+        // through this alias.
+        pub const AsyncMetadataFetch = metadata_handler.AsyncMetadataFetchOf(IO);
+
         pub const PendingWriteKey = struct {
             piece_index: u32,
             torrent_id: TorrentId,
@@ -356,7 +361,7 @@ pub fn EventLoopOf(comptime IO: type) type {
         rechecks: std.ArrayList(*AsyncRecheck) = std.ArrayList(*AsyncRecheck).empty,
 
         // Async BEP 9 metadata fetch state machine (null when no fetch is active)
-        metadata_fetch: ?*metadata_handler.AsyncMetadataFetch = null,
+        metadata_fetch: ?*AsyncMetadataFetch = null,
 
         // Stage 4 zero-alloc: pre-allocated worst-case storage for the
         // ut_metadata assembler. BEP 9 says at most one in-flight fetch
@@ -1893,7 +1898,7 @@ pub fn EventLoopOf(comptime IO: type) type {
             port: u16,
             is_private: bool,
             peers: []const std.net.Address,
-            on_complete: ?*const fn (*metadata_handler.AsyncMetadataFetch) void,
+            on_complete: ?*const fn (*AsyncMetadataFetch) void,
             caller_ctx: ?*anyopaque,
         ) !void {
             if (self.metadata_fetch != null) return error.MetadataFetchAlreadyActive;
@@ -1909,7 +1914,7 @@ pub fn EventLoopOf(comptime IO: type) type {
                 self.metadata_assembly_received = recv;
             }
 
-            self.metadata_fetch = try metadata_handler.AsyncMetadataFetch.create(
+            self.metadata_fetch = try AsyncMetadataFetch.create(
                 self.allocator,
                 &self.io,
                 info_hash,
