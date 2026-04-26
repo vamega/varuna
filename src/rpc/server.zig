@@ -972,9 +972,10 @@ test "api server keeps HTTP/1.1 connection alive for sequential requests" {
 }
 
 test "advanceSendProgress tracks partial sends" {
+    var header = [_]u8{ 'h', 'e' };
     var client = ApiClient{
-        .header_buf = "he"[0..],
-        .body = "llo"[0..],
+        .header_buf = header[0..],
+        .body = "llo",
     };
 
     try std.testing.expect(!(try advanceSendProgress(&client, 2)));
@@ -986,9 +987,10 @@ test "advanceSendProgress tracks partial sends" {
 }
 
 test "advanceSendProgress rejects invalid completions" {
+    var header = [_]u8{ 'a', 'b' };
     var client = ApiClient{
-        .header_buf = "ab"[0..],
-        .body = "c"[0..],
+        .header_buf = header[0..],
+        .body = "c",
     };
 
     try std.testing.expectError(error.InvalidSendLength, advanceSendProgress(&client, 0));

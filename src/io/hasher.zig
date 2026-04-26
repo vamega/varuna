@@ -573,20 +573,24 @@ test "merkle job hashes file pieces from disk" {
         allocator.destroy(hasher);
     }
 
-    // Create a temp file with 2 pieces of known data
+    // Create a temp file with 2 pieces of known data, in a tmpDir so
+    // parallel test runs (and stale leftovers in /tmp) don't collide.
     const piece_len: u32 = 64;
     const piece0_data = "A" ** piece_len;
     const piece1_data = "B" ** piece_len;
 
-    const tmp_path = "/tmp/varuna_merkle_test";
-    const file = std.fs.createFileAbsolute(tmp_path, .{ .truncate = true }) catch
-        return error.SkipZigTest;
-    defer std.fs.deleteFileAbsolute(tmp_path) catch {};
+    var tmp_dir = std.testing.tmpDir(.{});
+    defer tmp_dir.cleanup();
 
-    _ = file.write(piece0_data) catch return error.SkipZigTest;
-    _ = file.write(piece1_data) catch return error.SkipZigTest;
-    const fd = file.handle;
+    // Read access is required because the merkle worker reads back via
+    // pread on the same fd. Default createFile opens write-only, which
+    // returned error.NotOpenForReading from the worker.
+    const file = tmp_dir.dir.createFile("merkle_test", .{ .truncate = true, .read = true }) catch
+        return error.SkipZigTest;
     defer file.close();
+    file.writeAll(piece0_data) catch return error.SkipZigTest;
+    file.writeAll(piece1_data) catch return error.SkipZigTest;
+    const fd = file.handle;
 
     // Build a minimal v2 layout for 1 file, 2 pieces
     const metainfo_mod = @import("../torrent/metainfo.zig");
