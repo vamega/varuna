@@ -13,3 +13,27 @@ pub const metainfo = @import("metainfo.zig");
 pub const peer_id = @import("peer_id.zig");
 pub const piece_tracker = @import("piece_tracker.zig");
 pub const session = @import("session.zig");
+
+// Pull subsystem source-side `test "..."` blocks into the test runner.
+// `pub const x = @import(...)` does NOT propagate test discovery in
+// Zig 0.15.2 — only files reached from a TEST CONTEXT import
+// participate. (Mirrors `src/crypto/root.zig`'s pattern; required
+// alongside `test { _ = torrent; }` in `src/root.zig` to actually
+// reach test-context — see Task #6 audit + Task #9 cleanup.)
+test {
+    _ = bencode;
+    _ = bencode_encode;
+    _ = blocks;
+    _ = create;
+    _ = file_priority;
+    _ = file_tree;
+    _ = info_hash;
+    _ = layout;
+    _ = magnet;
+    _ = merkle;
+    _ = merkle_cache;
+    _ = metainfo;
+    _ = peer_id;
+    _ = piece_tracker;
+    _ = session;
+}

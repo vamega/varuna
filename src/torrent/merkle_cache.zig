@@ -209,11 +209,14 @@ pub const MerkleCache = struct {
         var tree = try merkle.MerkleTree.fromPieceHashes(self.allocator, piece_hashes);
         errdefer tree.deinit();
 
-        // Validate root against expected pieces_root
+        // Validate root against expected pieces_root. Don't `tree.deinit()`
+        // explicitly here — `errdefer` covers cleanup on the error path.
+        // (Production bug fixed 2026-04-26: double-deinit caused SIGABRT
+        // in the merkle-rejects-wrong-root test once the test was actually
+        // wired into `zig build test`. See Task #9 progress report.)
         const expected_root = self.v2_files[file_index].pieces_root;
         const computed_root = tree.root();
         if (!std.mem.eql(u8, &computed_root, &expected_root)) {
-            tree.deinit();
             return error.MerkleRootMismatch;
         }
 

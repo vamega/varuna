@@ -473,7 +473,7 @@ test "loadDefault stops on malformed config in current directory" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
-    const cwd = try std.fs.cwd().openDir(".", .{});
+    var cwd = try std.fs.cwd().openDir(".", .{});
     defer cwd.close();
 
     try tmp.dir.writeFile(.{
@@ -503,7 +503,7 @@ test "load rejects invalid encryption mode" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
-    const cwd = try std.fs.cwd().openDir(".", .{});
+    var cwd = try std.fs.cwd().openDir(".", .{});
     defer cwd.close();
 
     try tmp.dir.writeFile(.{
@@ -681,7 +681,7 @@ test "load rejects invalid transport preset" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
-    const cwd = try std.fs.cwd().openDir(".", .{});
+    var cwd = try std.fs.cwd().openDir(".", .{});
     defer cwd.close();
 
     try tmp.dir.writeFile(.{
@@ -701,7 +701,7 @@ test "load accepts transport as string preset" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
-    const cwd = try std.fs.cwd().openDir(".", .{});
+    var cwd = try std.fs.cwd().openDir(".", .{});
     defer cwd.close();
 
     try tmp.dir.writeFile(.{
@@ -724,7 +724,7 @@ test "load accepts transport as all preset" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
-    const cwd = try std.fs.cwd().openDir(".", .{});
+    var cwd = try std.fs.cwd().openDir(".", .{});
     defer cwd.close();
 
     try tmp.dir.writeFile(.{
@@ -747,7 +747,7 @@ test "load accepts transport as array of flags" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
-    const cwd = try std.fs.cwd().openDir(".", .{});
+    var cwd = try std.fs.cwd().openDir(".", .{});
     defer cwd.close();
 
     try tmp.dir.writeFile(.{
@@ -770,7 +770,7 @@ test "load accepts asymmetric transport array" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
-    const cwd = try std.fs.cwd().openDir(".", .{});
+    var cwd = try std.fs.cwd().openDir(".", .{});
     defer cwd.close();
 
     try tmp.dir.writeFile(.{
@@ -793,7 +793,7 @@ test "load rejects invalid transport flag in array" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
-    const cwd = try std.fs.cwd().openDir(".", .{});
+    var cwd = try std.fs.cwd().openDir(".", .{});
     defer cwd.close();
 
     try tmp.dir.writeFile(.{
@@ -813,7 +813,7 @@ test "load transport array with other network fields" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
-    const cwd = try std.fs.cwd().openDir(".", .{});
+    var cwd = try std.fs.cwd().openDir(".", .{});
     defer cwd.close();
 
     try tmp.dir.writeFile(.{

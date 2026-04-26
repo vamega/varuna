@@ -961,8 +961,12 @@ test "sha1 large streaming matches std lib" {
 test "sha1 runtime detection reports valid backend" {
     const a = Sha1.accel();
     // On any architecture the result must be one of the valid enum values.
+    // `accel()` runs detection before returning, so `.undetected` is the
+    // post-init sentinel only — failing here would mean the cache wasn't
+    // populated, which is itself a bug.
     switch (a) {
         .software, .x86_sha_ni, .aarch64_sha1 => {},
+        .undetected => return error.TestUnexpectedResult,
     }
     // hasHwAccel must be consistent with accel.
     if (a == .software) {

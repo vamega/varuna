@@ -343,6 +343,7 @@ test "build layout for single file torrent" {
         .info_hash = [_]u8{0} ** 20,
         .announce = null,
         .created_by = null,
+        .comment = null,
         .name = "test.bin",
         .piece_length = 4,
         .pieces = hashes,
@@ -374,6 +375,7 @@ test "map piece across multiple files" {
         .info_hash = [_]u8{0} ** 20,
         .announce = null,
         .created_by = null,
+        .comment = null,
         .name = "root",
         .piece_length = 4,
         .pieces = hashes,
@@ -397,13 +399,14 @@ test "map piece across multiple files" {
     try std.testing.expectEqual(@as(u64, 1), piece1[0].file_offset);
     try std.testing.expectEqual(@as(u32, 4), piece1[0].length);
 
+    // Piece 2 spans bytes 8-9 (last 2-byte short piece). Both bytes lie
+    // entirely within gamma (which starts at byte 8 with length 2), so
+    // exactly one span: file_index=2, file_offset=0, length=2.
     const piece2 = try built.mapPiece(2, spans[0..]);
-    try std.testing.expectEqual(@as(usize, 2), piece2.len);
-    try std.testing.expectEqual(@as(u32, 1), piece2[0].file_index);
-    try std.testing.expectEqual(@as(u32, 1), piece2[0].length);
-    try std.testing.expectEqual(@as(u32, 2), piece2[1].file_index);
-    try std.testing.expectEqual(@as(u32, 1), piece2[1].piece_offset);
-    try std.testing.expectEqual(@as(u32, 1), piece2[1].length);
+    try std.testing.expectEqual(@as(usize, 1), piece2.len);
+    try std.testing.expectEqual(@as(u32, 2), piece2[0].file_index);
+    try std.testing.expectEqual(@as(u64, 0), piece2[0].file_offset);
+    try std.testing.expectEqual(@as(u32, 2), piece2[0].length);
 }
 
 test "reject mismatched piece hash count" {
@@ -415,6 +418,7 @@ test "reject mismatched piece hash count" {
         .info_hash = [_]u8{0} ** 20,
         .announce = null,
         .created_by = null,
+        .comment = null,
         .name = "test.bin",
         .piece_length = 4,
         .pieces = "aaaaaaaaaaaaaaaaaaaa",
@@ -436,6 +440,7 @@ test "render relative path for multi file torrent" {
         .info_hash = [_]u8{0} ** 20,
         .announce = null,
         .created_by = null,
+        .comment = null,
         .name = "root",
         .piece_length = 4,
         .pieces = hashes,
@@ -471,6 +476,7 @@ test "build v2 file-aligned layout" {
         .info_hash = [_]u8{0} ** 20,
         .announce = null,
         .created_by = null,
+        .comment = null,
         .name = "root",
         .piece_length = 4,
         .files = @constCast(v1_files[0..]),
@@ -509,6 +515,7 @@ test "v2 piece size respects file boundaries" {
         .info_hash = [_]u8{0} ** 20,
         .announce = null,
         .created_by = null,
+        .comment = null,
         .name = "root",
         .piece_length = 4,
         .files = @constCast(v1_files[0..]),
@@ -542,6 +549,7 @@ test "v2 mapPiece returns single-file spans" {
         .info_hash = [_]u8{0} ** 20,
         .announce = null,
         .created_by = null,
+        .comment = null,
         .name = "root",
         .piece_length = 4,
         .files = @constCast(v1_files[0..]),
@@ -588,6 +596,7 @@ test "v2 pieceSpanCount is always 1" {
         .info_hash = [_]u8{0} ** 20,
         .announce = null,
         .created_by = null,
+        .comment = null,
         .name = "root",
         .piece_length = 4,
         .files = @constCast(v1_files[0..]),
@@ -616,6 +625,7 @@ test "pure v2 layout rejects v1 piece hashes" {
         .info_hash = [_]u8{0} ** 20,
         .announce = null,
         .created_by = null,
+        .comment = null,
         .name = "root",
         .piece_length = 4,
         .files = @constCast(v1_files[0..]),
@@ -645,6 +655,7 @@ test "hybrid layout keeps v1 piece mapping semantics" {
         .info_hash = [_]u8{0} ** 20,
         .announce = null,
         .created_by = null,
+        .comment = null,
         .name = "root",
         .piece_length = 4,
         .pieces = hashes,

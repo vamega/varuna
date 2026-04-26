@@ -53,6 +53,7 @@ test "derive block geometry from layout" {
         .info_hash = [_]u8{0} ** 20,
         .announce = null,
         .created_by = null,
+        .comment = null,
         .name = "test.bin",
         .piece_length = 16_384,
         .pieces = hashes,
@@ -78,12 +79,14 @@ test "split large pieces into multiple blocks" {
     const files = [_]@import("metainfo.zig").Metainfo.File{
         .{ .length = 70_000, .path = path[0..] },
     };
+    // 70_000 bytes / 32_768 piece_length = 3 pieces → 60 bytes of hash.
     const hashes =
-        "aaaaaaaaaaaaaaaaaaaabbbbbbbbbbbbbbbbbbbbccccccccccccccccccccddddddddddddddddddddeeeeeeeeeeeeeeeeeeee";
+        "aaaaaaaaaaaaaaaaaaaabbbbbbbbbbbbbbbbbbbbcccccccccccccccccccc";
     const source = @import("metainfo.zig").Metainfo{
         .info_hash = [_]u8{0} ** 20,
         .announce = null,
         .created_by = null,
+        .comment = null,
         .name = "test.bin",
         .piece_length = 32_768,
         .pieces = hashes,

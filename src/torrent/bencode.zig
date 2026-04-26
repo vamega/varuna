@@ -289,15 +289,18 @@ test "reject single bytes" {
 }
 
 test "reject deeply nested lists" {
-    // 256 nested lists with no closing: "llll...l"
+    // 256 nested lists with no closing: "llll...l". Production rejects
+    // with NestingTooDeep at depth 64; the test expects that bound.
     const depth = 256;
     var buf: [depth]u8 = undefined;
     @memset(&buf, 'l');
-    try std.testing.expectError(error.UnexpectedEndOfStream, parse(std.testing.allocator, &buf));
+    try std.testing.expectError(error.NestingTooDeep, parse(std.testing.allocator, &buf));
 }
 
 test "reject deeply nested dicts" {
-    // "d1:ad1:ad1:a..." -- each level is a dict with key "a" and value = next dict
+    // "d1:ad1:ad1:a..." -- each level is a dict with key "a" and value = next dict.
+    // Production rejects with NestingTooDeep once depth exceeds the
+    // max_nesting_depth=64 limit.
     const depth = 128;
     // Each nesting level needs "d1:a" (4 bytes) plus "e" closers at the end
     var buf: [depth * 4 + depth]u8 = undefined;
@@ -322,8 +325,7 @@ test "reject deeply nested dicts" {
     full_buf[prefix_len + 1] = 'e';
     @memset(full_buf[prefix_len + 2 ..], 'e');
 
-    const value = try parse(std.testing.allocator, full_buf);
-    freeValue(std.testing.allocator, value);
+    try std.testing.expectError(error.NestingTooDeep, parse(std.testing.allocator, full_buf));
 }
 
 test "parse very long byte string" {
@@ -397,12 +399,11 @@ test "reject invalid bencode byte sequences" {
         "-1:x",
     };
     for (invalid_cases) |input| {
-        if (parse(std.testing.allocator, input)) |value| {
-            freeValue(std.testing.allocator, value);
-        } else |err| {
-            // Must be a ParseError, not a panic
-            _ = err;
-        }
+        // Must produce a ParseError (or success), never a panic. The
+        // catch makes the error explicitly observed; the success path
+        // frees the value.
+        const value = parse(std.testing.allocator, input) catch continue;
+        freeValue(std.testing.allocator, value);
     }
 }
 

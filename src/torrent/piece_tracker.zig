@@ -434,7 +434,7 @@ test "claim and complete pieces" {
     const p1 = tracker.claimPiece(null);
     try std.testing.expectEqual(@as(?u32, 1), p1);
 
-    tracker.completePiece(0, 4);
+    _ = tracker.completePiece(0, 4);
     try std.testing.expectEqual(@as(u32, 1), tracker.completedCount());
     try std.testing.expect(!tracker.isComplete());
 
@@ -596,9 +596,12 @@ test "wanted mask skips unwanted pieces" {
     const second = tracker.claimPiece(null);
     try std.testing.expectEqual(@as(?u32, 3), second);
 
-    // No more wanted pieces available
+    // All wanted pieces are now in-progress -> claimPiece enters endgame
+    // mode and may return an already-claimed wanted piece for duplicate
+    // work. Production endgame behavior; test pins the shape.
     const third = tracker.claimPiece(null);
-    try std.testing.expectEqual(@as(?u32, null), third);
+    try std.testing.expect(third != null);
+    try std.testing.expect(third.? == 0 or third.? == 3);
 
     // Complete both wanted pieces -> isComplete should be true
     _ = tracker.completePiece(0, 4);

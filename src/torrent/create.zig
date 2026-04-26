@@ -944,7 +944,8 @@ test "create single file torrent and parse it back" {
     try std.testing.expectEqualStrings("test.bin", info.name);
     try std.testing.expectEqualStrings("http://tracker.example/announce", info.announce.?);
     try std.testing.expectEqual(@as(u32, 16), info.piece_length);
-    try std.testing.expectEqual(@as(u64, 43), info.totalSize());
+    // "hello world test data for torrent creation" = 42 bytes.
+    try std.testing.expectEqual(@as(u64, 42), info.totalSize());
     try std.testing.expectEqual(@as(u32, 3), try info.pieceCount());
     try std.testing.expectEqualStrings("varuna", info.created_by.?);
     try std.testing.expectEqual(@as(i64, 1700000000), info.creation_date.?);
