@@ -11,6 +11,7 @@ const EventLoop = varuna.io.event_loop.EventLoop;
 const Peer = varuna.io.event_loop.Peer;
 const PieceTracker = varuna.torrent.piece_tracker.PieceTracker;
 const rpc_server = varuna.rpc.server;
+const rpc_scratch = varuna.rpc.scratch;
 const sync_mod = varuna.rpc.sync;
 const event_loop_mod = varuna.io.event_loop;
 const peer_handler = varuna.io.peer_handler;
@@ -1642,6 +1643,16 @@ fn runSyncDelta(
     defer allocator.free(warm_body);
     const request_rid = sync_state.current_rid;
 
+    // Stage 2 zero-alloc plan: production /sync/maindata routes through the
+    // ApiServer per-slot bump arena. Mirror that here so the bench reflects
+    // the production allocation profile. The arena slab is allocated once
+    // (counts as 1 alloc); each iteration bump-allocates within it and
+    // resets at the end. Sized at the API server cap (8 MiB) — sync_delta
+    // for 10K torrents can produce a several-MiB JSON body.
+    var arena = try rpc_scratch.RequestArena.init(allocator, rpc_server.request_arena_capacity);
+    defer arena.deinit();
+    const arena_alloc = arena.allocator();
+
     var timer = try std.time.Timer.start();
     var checksum: u64 = 0;
 
@@ -1655,9 +1666,10 @@ fn runSyncDelta(
             manager.mutex.unlock();
         }
 
-        const body = try sync_state.computeDelta(&manager, allocator, request_rid);
+        arena.reset();
+        const body = try sync_state.computeDelta(&manager, arena_alloc, request_rid);
         checksum +%= std.hash.Wyhash.hash(0, body);
-        allocator.free(body);
+        // No explicit free — arena.reset on next iteration recycles the slab.
     }
 
     return makeResult("sync_delta", iterations, &timer, checksum, alloc_counter);

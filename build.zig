@@ -506,6 +506,20 @@ pub fn build(b: *std.Build) void {
     test_transport_step.dependOn(&run_transport_tests.step);
     test_step.dependOn(&run_transport_tests.step);
 
+    // ── RPC arena tests (Stage 2 zero-alloc bump allocator) ──
+    const rpc_arena_tests = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("tests/rpc_arena_test.zig"),
+            .target = target,
+            .optimize = optimize,
+            .imports = &varuna_import,
+        }),
+    });
+    const run_rpc_arena_tests = b.addRunArtifact(rpc_arena_tests);
+    const test_rpc_arena_step = b.step("test-rpc-arena", "Run Stage 2 RPC bump arena tests");
+    test_rpc_arena_step.dependOn(&run_rpc_arena_tests.step);
+    test_step.dependOn(&run_rpc_arena_tests.step);
+
     // ── Soak test (long-running resource leak detection) ──
     const soak_exe = b.addExecutable(.{
         .name = "varuna-soak-test",
