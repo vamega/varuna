@@ -77,6 +77,7 @@ pub const Operation = union(enum) {
     read: ReadOp,
     write: WriteOp,
     fsync: FsyncOp,
+    fallocate: FallocateOp,
 
     // Connection lifecycle.
     socket: SocketOp,
@@ -131,6 +132,17 @@ pub const FsyncOp = struct {
     fd: posix.fd_t,
     /// Mirrors IORING_FSYNC_DATASYNC. When set, sync data only (skip metadata).
     datasync: bool = true,
+};
+
+pub const FallocateOp = struct {
+    fd: posix.fd_t,
+    /// `mode` argument to `fallocate(2)`. The default `0` means "extend the
+    /// file to `offset+len`, allocating any newly-needed blocks". Other
+    /// modes (`FALLOC_FL_KEEP_SIZE`, `FALLOC_FL_PUNCH_HOLE`, etc.) are
+    /// passed through unchanged.
+    mode: i32 = 0,
+    offset: u64,
+    len: u64,
 };
 
 pub const SocketOp = struct {
@@ -192,6 +204,7 @@ pub const Result = union(enum) {
     read: anyerror!usize,
     write: anyerror!usize,
     fsync: anyerror!void,
+    fallocate: anyerror!void,
     socket: anyerror!posix.fd_t,
     connect: anyerror!void,
     accept: anyerror!Accepted,
@@ -322,6 +335,7 @@ comptime {
 //   pub fn read     (self: *@This(), op: ReadOp,     c: *Completion, ud: ?*anyopaque, cb: Callback) !void;
 //   pub fn write    (self: *@This(), op: WriteOp,    c: *Completion, ud: ?*anyopaque, cb: Callback) !void;
 //   pub fn fsync    (self: *@This(), op: FsyncOp,    c: *Completion, ud: ?*anyopaque, cb: Callback) !void;
+//   pub fn fallocate(self: *@This(), op: FallocateOp, c: *Completion, ud: ?*anyopaque, cb: Callback) !void;
 //   pub fn socket   (self: *@This(), op: SocketOp,   c: *Completion, ud: ?*anyopaque, cb: Callback) !void;
 //   pub fn connect  (self: *@This(), op: ConnectOp,  c: *Completion, ud: ?*anyopaque, cb: Callback) !void;
 //   pub fn accept   (self: *@This(), op: AcceptOp,   c: *Completion, ud: ?*anyopaque, cb: Callback) !void;
