@@ -631,3 +631,134 @@ test "SimIO read still honors fault injection over registered content" {
         else => try testing.expect(false),
     }
 }
+
+// ── fallocate / fsync contract ops ────────────────────────────
+//
+// The new disk-pre-allocation and flush ops are submission-shape
+// peers of `read` / `write`. These exercise: success delivery, the
+// per-op fault knob, and the BUGGIFY-via-injectRandomFault path.
+
+test "SimIO fallocate completes successfully by default" {
+    var io = try SimIO.init(testing.allocator, .{});
+    defer io.deinit();
+
+    var c = Completion{};
+    var ctx = TestCtx{};
+    try io.fallocate(
+        .{ .fd = 42, .mode = 0, .offset = 0, .len = 4 * 1024 },
+        &c,
+        &ctx,
+        testCallback,
+    );
+    try io.tick(0);
+
+    try testing.expectEqual(@as(u32, 1), ctx.calls);
+    switch (ctx.last_result.?) {
+        .fallocate => |r| try r,
+        else => try testing.expect(false),
+    }
+}
+
+test "SimIO fallocate with fault probability 1.0 always returns NoSpaceLeft" {
+    var io = try SimIO.init(testing.allocator, .{
+        .seed = 12345,
+        .faults = .{ .fallocate_error_probability = 1.0 },
+    });
+    defer io.deinit();
+
+    var c = Completion{};
+    var ctx = TestCtx{};
+    try io.fallocate(
+        .{ .fd = 42, .mode = 0, .offset = 0, .len = 1024 },
+        &c,
+        &ctx,
+        testCallback,
+    );
+    try io.tick(0);
+
+    try testing.expectEqual(@as(u32, 1), ctx.calls);
+    switch (ctx.last_result.?) {
+        .fallocate => |r| try testing.expectError(error.NoSpaceLeft, r),
+        else => try testing.expect(false),
+    }
+}
+
+test "SimIO fallocate fault probability 0.5 fires roughly half the time" {
+    // Sanity check that the f32 dice roll honours the configured probability.
+    // 256 trials at p=0.5 with a deterministic seed: in [25%, 75%] is plenty
+    // of margin to dodge a flake.
+    var io = try SimIO.init(testing.allocator, .{
+        .seed = 0xdeadbeef,
+        .faults = .{ .fallocate_error_probability = 0.5 },
+    });
+    defer io.deinit();
+
+    var errors: u32 = 0;
+    var i: u32 = 0;
+    while (i < 256) : (i += 1) {
+        var c = Completion{};
+        var ctx = TestCtx{};
+        try io.fallocate(
+            .{ .fd = 7, .mode = 0, .offset = 0, .len = 16 },
+            &c,
+            &ctx,
+            testCallback,
+        );
+        try io.tick(0);
+        switch (ctx.last_result.?) {
+            .fallocate => |r| _ = r catch {
+                errors += 1;
+            },
+            else => try testing.expect(false),
+        }
+    }
+
+    try testing.expect(errors > 64); // > 25%
+    try testing.expect(errors < 192); // < 75%
+}
+
+test "SimIO fsync with fault probability 1.0 always returns InputOutput" {
+    var io = try SimIO.init(testing.allocator, .{
+        .seed = 77,
+        .faults = .{ .fsync_error_probability = 1.0 },
+    });
+    defer io.deinit();
+
+    var c = Completion{};
+    var ctx = TestCtx{};
+    try io.fsync(.{ .fd = 9, .datasync = true }, &c, &ctx, testCallback);
+    try io.tick(0);
+
+    try testing.expectEqual(@as(u32, 1), ctx.calls);
+    switch (ctx.last_result.?) {
+        .fsync => |r| try testing.expectError(error.InputOutput, r),
+        else => try testing.expect(false),
+    }
+}
+
+test "SimIO fallocate result is mutated by injectRandomFault (BUGGIFY)" {
+    // BUGGIFY harness path: an in-flight fallocate sitting in the heap
+    // gets its result swapped to error.NoSpaceLeft on the next tick.
+    var io = try SimIO.init(testing.allocator, .{ .seed = 0xa1a1a1a1 });
+    defer io.deinit();
+
+    var c = Completion{};
+    var ctx = TestCtx{};
+    try io.fallocate(
+        .{ .fd = 11, .mode = 0, .offset = 0, .len = 4096 },
+        &c,
+        &ctx,
+        testCallback,
+    );
+
+    var rng = std.Random.DefaultPrng.init(0);
+    const hit = io.injectRandomFault(&rng);
+    try testing.expect(hit != null);
+    try testing.expectEqual(@as(std.meta.Tag(ifc.Operation), .fallocate), hit.?.op_tag);
+
+    try io.tick(0);
+    switch (ctx.last_result.?) {
+        .fallocate => |r| try testing.expectError(error.NoSpaceLeft, r),
+        else => try testing.expect(false),
+    }
+}
