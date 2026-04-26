@@ -133,7 +133,9 @@ fn runScenario(seed: u64, opts: ScenarioOpts) !void {
     const session = try Session.load(allocator, torrent_bytes, data_root);
     defer session.deinit(allocator);
 
-    var store = try PieceStore.init(allocator, &session);
+    var store_init_io = try varuna.io.real_io.RealIO.init(.{ .entries = 16 });
+    defer store_init_io.deinit();
+    var store = try PieceStore.init(allocator, &session, &store_init_io);
     defer store.deinit();
     const shared_fds = try store.fileHandles(allocator);
     defer allocator.free(shared_fds);

@@ -92,12 +92,12 @@ test "startRecheck allows multiple concurrent rechecks" {
     defer session_b.deinit(allocator);
 
     // Create PieceStores and get fds
-    var store_a = try PieceStore.init(allocator, &session_a);
+    var store_a = try PieceStore.init(allocator, &session_a, &el.io);
     defer store_a.deinit();
     const fds_a = try store_a.fileHandles(allocator);
     defer allocator.free(fds_a);
 
-    var store_b = try PieceStore.init(allocator, &session_b);
+    var store_b = try PieceStore.init(allocator, &session_b, &el.io);
     defer store_b.deinit();
     const fds_b = try store_b.fileHandles(allocator);
     defer allocator.free(fds_b);
@@ -239,7 +239,7 @@ test "explicit recheck after fast resume works" {
     const session = try Session.load(allocator, torrent_bytes, save_path);
     defer session.deinit(allocator);
 
-    var store = try PieceStore.init(allocator, &session);
+    var store = try PieceStore.init(allocator, &session, &el.io);
     defer store.deinit();
     const fds = try store.fileHandles(allocator);
     defer allocator.free(fds);
@@ -317,7 +317,7 @@ test "daemon restart with resume data skips recheck (fast resume)" {
     const session = try Session.load(allocator, torrent_bytes, save_path);
     defer session.deinit(allocator);
 
-    var store = try PieceStore.init(allocator, &session);
+    var store = try PieceStore.init(allocator, &session, &el.io);
     defer store.deinit();
     const fds = try store.fileHandles(allocator);
     defer allocator.free(fds);
@@ -415,7 +415,7 @@ test "live force-recheck rebuilds PieceTracker bitfield in place" {
     const session = try Session.load(allocator, torrent_bytes, save_path);
     defer session.deinit(allocator);
 
-    var store = try PieceStore.init(allocator, &session);
+    var store = try PieceStore.init(allocator, &session, &el.io);
     defer store.deinit();
     const fds = try store.fileHandles(allocator);
     defer allocator.free(fds);

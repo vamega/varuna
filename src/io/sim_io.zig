@@ -97,6 +97,14 @@ pub const FaultConfig = struct {
     read_error_probability: f32 = 0.0,
     /// Probability for write (disk EIO / ENOSPC).
     write_error_probability: f32 = 0.0,
+    /// Probability that a fallocate completes with `error.NoSpaceLeft`
+    /// (matches what the kernel surfaces when a torrent file's
+    /// pre-allocation hits a full disk).
+    fallocate_error_probability: f32 = 0.0,
+    /// Probability that an fsync completes with `error.InputOutput`
+    /// (disk failure mid-flush). Distinct from
+    /// `write_error_probability` so BUGGIFY can target sync-only paths.
+    fsync_error_probability: f32 = 0.0,
     /// Probability that a connect completes with `error.ConnectionRefused`.
     connect_error_probability: f32 = 0.0,
     /// Added to every recv delivery time (simulates network latency).
@@ -427,6 +435,7 @@ pub const SimIO = struct {
             .read => |op| try self.read(op, c, ud, cb),
             .write => |op| try self.write(op, c, ud, cb),
             .fsync => |op| try self.fsync(op, c, ud, cb),
+            .fallocate => |op| try self.fallocate(op, c, ud, cb),
             .socket => |op| try self.socket(op, c, ud, cb),
             .connect => |op| try self.connect(op, c, ud, cb),
             .accept => |op| try self.accept(op, c, ud, cb),
@@ -828,7 +837,20 @@ pub const SimIO = struct {
 
     pub fn fsync(self: *SimIO, op: ifc.FsyncOp, c: *Completion, ud: ?*anyopaque, cb: Callback) !void {
         try self.armCompletion(c, .{ .fsync = op }, ud, cb);
+        const r = self.rng.random();
+        if (r.float(f32) < self.config.faults.fsync_error_probability) {
+            return self.schedule(c, .{ .fsync = error.InputOutput }, 0);
+        }
         return self.schedule(c, .{ .fsync = {} }, 0);
+    }
+
+    pub fn fallocate(self: *SimIO, op: ifc.FallocateOp, c: *Completion, ud: ?*anyopaque, cb: Callback) !void {
+        try self.armCompletion(c, .{ .fallocate = op }, ud, cb);
+        const r = self.rng.random();
+        if (r.float(f32) < self.config.faults.fallocate_error_probability) {
+            return self.schedule(c, .{ .fallocate = error.NoSpaceLeft }, 0);
+        }
+        return self.schedule(c, .{ .fallocate = {} }, 0);
     }
 
     pub fn socket(self: *SimIO, op: ifc.SocketOp, c: *Completion, ud: ?*anyopaque, cb: Callback) !void {
@@ -951,6 +973,7 @@ fn cancelResultFor(op: Operation) Result {
         .read => .{ .read = error.OperationCanceled },
         .write => .{ .write = error.OperationCanceled },
         .fsync => .{ .fsync = error.OperationCanceled },
+        .fallocate => .{ .fallocate = error.OperationCanceled },
         .socket => .{ .socket = error.OperationCanceled },
         .connect => .{ .connect = error.OperationCanceled },
         .accept => .{ .accept = error.OperationCanceled },
@@ -973,6 +996,7 @@ fn buggifyResultFor(op: Operation) Result {
         .read => .{ .read = error.InputOutput },
         .write => .{ .write = error.NoSpaceLeft },
         .fsync => .{ .fsync = error.InputOutput },
+        .fallocate => .{ .fallocate = error.NoSpaceLeft },
         .socket => .{ .socket = error.ProcessFdQuotaExceeded },
         .connect => .{ .connect = error.ConnectionRefused },
         .accept => .{ .accept = error.ConnectionAborted },

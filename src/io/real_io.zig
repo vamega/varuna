@@ -169,6 +169,7 @@ pub const RealIO = struct {
             .read => |op| try self.read(op, c, userdata, callback),
             .write => |op| try self.write(op, c, userdata, callback),
             .fsync => |op| try self.fsync(op, c, userdata, callback),
+            .fallocate => |op| try self.fallocate(op, c, userdata, callback),
             .socket => |op| try self.socket(op, c, userdata, callback),
             .connect => |op| try self.connect(op, c, userdata, callback),
             .accept => |op| try self.accept(op, c, userdata, callback),
@@ -220,6 +221,17 @@ pub const RealIO = struct {
         try self.armCompletion(c, .{ .fsync = op }, ud, cb);
         const flags: u32 = if (op.datasync) linux.IORING_FSYNC_DATASYNC else 0;
         const sqe = try self.ring.fsync(@intFromPtr(c), op.fd, flags);
+        _ = sqe;
+    }
+
+    /// `IORING_OP_FALLOCATE` (kernel ≥5.6). The CQE delivers `0` on
+    /// success or a negative errno on failure (NOSPC, IO, OPNOTSUPP, …).
+    /// Some filesystems (tmpfs <5.10, FAT32, certain FUSE FSes) reject
+    /// fallocate entirely with `EOPNOTSUPP`; callers that need a portable
+    /// pre-allocation primitive must catch that and fall back.
+    pub fn fallocate(self: *RealIO, op: ifc.FallocateOp, c: *Completion, ud: ?*anyopaque, cb: Callback) !void {
+        try self.armCompletion(c, .{ .fallocate = op }, ud, cb);
+        const sqe = try self.ring.fallocate(@intFromPtr(c), op.fd, op.mode, op.offset, op.len);
         _ = sqe;
     }
 
@@ -316,6 +328,7 @@ fn buildResult(op: Operation, cqe: linux.io_uring_cqe) Result {
         .read => .{ .read = countOrError(cqe) },
         .write => .{ .write = countOrError(cqe) },
         .fsync => .{ .fsync = voidOrError(cqe) },
+        .fallocate => .{ .fallocate = voidOrError(cqe) },
         .socket => .{ .socket = fdOrError(cqe) },
         .connect => .{ .connect = voidOrError(cqe) },
         .accept => .{ .accept = acceptResult(cqe) },

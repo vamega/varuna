@@ -554,7 +554,9 @@ test "recheck existing on-disk pieces" {
     const session = try torrent.session.Session.load(std.testing.allocator, input, target_root);
     defer session.deinit(std.testing.allocator);
 
-    var store = try writer.PieceStore.init(std.testing.allocator, &session);
+    var verify_io = try @import("../io/real_io.zig").RealIO.init(.{ .entries = 16 });
+    defer verify_io.deinit();
+    var store = try writer.PieceStore.init(std.testing.allocator, &session, &verify_io);
     defer store.deinit();
 
     const piece0 = try planPieceVerification(std.testing.allocator, &session, 0);
