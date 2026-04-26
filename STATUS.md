@@ -315,7 +315,7 @@ Small focused algorithm-layer fuzz harness for `WebSeedManager`. Coverage: state
 **One real bug surfaced**: `computeMultiPieceRanges` writes `length: u32` derived from a `u64` byte span — `@intCast` panics on runs > 4 GB. Production today bounded by `web_seed_max_request_bytes` (TOML config, default 4 MB) so the bug is reachable only by misconfiguration; filed as STATUS.md "Next". 7 new tests, wired at `test-web-seed-buggify`.
 
 ### Combined
-**620 → 649 (+29)** tests passing across the suite. Detail in `progress-reports/2026-04-26-krpc-hardening.md`.
+**620 → 648 (+28)** tests passing across the suite. Detail in `progress-reports/2026-04-26-krpc-hardening.md`.
 
 ## Last Verified Milestone (2026-04-26 — followups-2 round)
 

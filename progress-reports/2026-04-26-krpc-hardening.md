@@ -28,6 +28,8 @@ recheck followups; tests baseline 620/620)
   node-id rejection, txn-id mismatch and short-txn-id paths,
   token-forgery fuzzing, error-code clamping, and a peer-list
   adversarial test that drives the engine end-to-end.
+
+  Test count delta this track: **+22 tests** (7 → 29).
 * **Track C** — small focused exploration of `WebSeedManager`
   (`src/net/web_seed.zig`). Algorithm-layer fuzz harness covering the
   state machine (assign/markSuccess/markFailure/disable random
@@ -38,7 +40,7 @@ recheck followups; tests baseline 620/620)
   `u64` byte span and `@intCast`-panics on runs > 4 GB. Filed as a
   follow-up; production today is bounded by
   `web_seed_max_request_bytes` (default 4 MB) so the bug is
-  reachable only by misconfiguration. 7 new tests in
+  reachable only by misconfiguration. 6 new tests in
   `tests/web_seed_buggify_test.zig`.
 
 ## A1 — Encoder bounds checks
@@ -191,9 +193,10 @@ an explicit container-stack is the canonical pattern.
   transaction ids all bypass `findAndRemovePending` cleanly.
 
 Test count delta: **+22 tests** (from 7 to 29 in
-`dht_krpc_buggify_test.zig`).
+`dht_krpc_buggify_test.zig`). Plus **+6 tests** in the new
+`tests/web_seed_buggify_test.zig` (Track C).
 
-Total project tests: **620 → 642** (22 added).
+Total project tests: **620 → 648** (28 added).
 
 ## Validation
 
