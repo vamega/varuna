@@ -117,6 +117,22 @@ pub const DownloadingPiece = struct {
         }
         return count;
     }
+
+    /// Returns the count of blocks attributed to a specific peer in any
+    /// non-`.none` state (requested *or* received). Used by the
+    /// multi-source picker as the "fair share" bound: a peer should
+    /// not claim more blocks than its share of `blocks_total /
+    /// peer_count`. Counts all attributed blocks (not just in-flight)
+    /// because `.received` blocks still represent work done by this
+    /// peer — the downloader shouldn't keep claiming blocks for a peer
+    /// that has already pulled its share.
+    pub fn attributedCountForPeer(self: *const DownloadingPiece, peer_slot: u16) u16 {
+        var count: u16 = 0;
+        for (self.block_infos) |bi| {
+            if (bi.peer_slot == peer_slot and bi.state != .none) count += 1;
+        }
+        return count;
+    }
 };
 
 /// Composite key for the downloading_pieces registry.
