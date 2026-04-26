@@ -162,6 +162,41 @@ These are reused unchanged from Phase 0:
 - `addConnectedPeerWithAddress(fd, tid, addr)` — distinct per-peer
   addresses for clean BanList separation.
 
+### A6. Phase 2B specifically requires `SmartBan` installed
+
+Phase 0 EL tests get by with just `BanList`. Phase 2B does NOT —
+without `el.smart_ban = &smart_ban`, the `SmartBan.snapshotAttribution`
+/ `onPieceFailed` / `onPiecePassed` chain doesn't fire, and a
+disconnect-mid-piece corrupt peer escapes attribution entirely (Phase
+0 alone needs 4 hash failures to ban; the peer leaves after 1-2).
+
+```zig
+var ban_list = BanList.init(allocator);
+defer ban_list.deinit();
+var smart_ban = SmartBan.init(allocator);
+defer smart_ban.deinit();
+
+var el = try EL_SimIO.initBareWithIO(allocator, sim_io, 1);
+defer el.deinit();
+
+el.ban_list = &ban_list;
+el.smart_ban = &smart_ban;
+```
+
+**Declaration order matters**: `defer` runs LIFO. The EL's
+`deinit → drainRemainingCqes` can fire `processHashResults` → smart-
+ban hooks → `BanList.banIp` for residual late CQEs. If `smart_ban`
+or `ban_list` is declared AFTER `el`, their defer runs FIRST,
+freeing them while EL is still draining → UAF panic in the
+hashmap header() pointer math (observed in practice). Declare
+`ban_list` and `smart_ban` BEFORE `el` so that LIFO defer order
+runs `el.deinit` first (while both are still alive), then
+`smart_ban.deinit`, then `ban_list.deinit`.
+
+The same pattern is correct for Phase 0 tests — and worth following
+uniformly even though Phase 0's `penalizePeerTrust` typically fires
+during the main tick loop rather than during teardown drain.
+
 ---
 
 ## Test files

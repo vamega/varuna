@@ -190,8 +190,35 @@ fn runScenario(seed: u64, specs: [num_peers]PeerSpec) !ScenarioResult {
     var tracker = try PieceTracker.init(allocator, piece_count, piece_size, piece_size, &empty_bf, 0);
     defer tracker.deinit(allocator);
 
-    // ── 3. EventLoop + BanList + 1ms latency ───────────────────
+    // ── 3. BanList + SmartBan, then EventLoop ──────────────────
     //
+    // Declaration order matters: `defer` runs LIFO. The EL's
+    // `deinit → drainRemainingCqes` can fire `processHashResults`
+    // → `SmartBan.onPieceFailed` / `onPiecePassed` → `BanList.banIp`
+    // for residual late CQEs. If smart_ban or ban_list is declared
+    // AFTER el, their defer runs FIRST, freeing them while el.deinit
+    // is still draining → UAF panic in the hashmap header() pointer
+    // math. Declare ban_list and smart_ban FIRST so el.deinit
+    // (which runs first because el is declared LAST) sees them
+    // alive.
+    //
+    // Phase 0 EL test (`sim_smart_ban_eventloop_test.zig`) doesn't
+    // hit this because Phase 0's `penalizePeerTrust` happens during
+    // the main tick loop, not during teardown drain — but the
+    // pattern is worth following uniformly in any test that wires
+    // EL → BanList / SmartBan dependencies.
+    var ban_list = BanList.init(allocator);
+    defer ban_list.deinit();
+
+    // SmartBan is the Phase 1+2 machinery — `snapshotAttribution`,
+    // `onPieceFailed`, `onPiecePassed`. Without it, the EL only runs
+    // Phase 0 (trust-points), which a disconnect-mid-piece corruptor
+    // can escape (they leave before accumulating 4 failures). Phase
+    // 2B's discriminating-power assertions specifically depend on
+    // SmartBan being installed.
+    var smart_ban = SmartBan.init(allocator);
+    defer smart_ban.deinit();
+
     // Same `recv_latency_ns = 1ms` lockstep + `now_ns` advancement
     // pattern as the Phase 2A multi-source test. Larger
     // `recv_queue_capacity_bytes` and `pending_capacity` for the
@@ -207,19 +234,7 @@ fn runScenario(seed: u64, specs: [num_peers]PeerSpec) !ScenarioResult {
     });
     var el = try EL_SimIO.initBareWithIO(allocator, sim_io, 1);
     defer el.deinit();
-
-    var ban_list = BanList.init(allocator);
-    defer ban_list.deinit();
     el.ban_list = &ban_list;
-
-    // SmartBan is the Phase 1+2 machinery — `snapshotAttribution`,
-    // `onPieceFailed`, `onPiecePassed`. Without it, the EL only runs
-    // Phase 0 (trust-points), which a disconnect-mid-piece corruptor
-    // can escape (they leave before accumulating 4 failures). Phase
-    // 2B's discriminating-power assertions specifically depend on
-    // SmartBan being installed.
-    var smart_ban = SmartBan.init(allocator);
-    defer smart_ban.deinit();
     el.smart_ban = &smart_ban;
 
     el.encryption_mode = .disabled;
