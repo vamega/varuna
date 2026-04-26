@@ -134,6 +134,31 @@ production allocation profile after Stage 2.
    as a *first-class step*, not as overhead — it's where the
    highest-value findings of the session emerged.
 
+7. **Profile-driven diagnosis beats hypothesis-driven diagnosis when
+   the hypothesis is plausible-but-untested.** Task #5's regression
+   was hypothesised at ticket-creation time as `EventLoopOf(IO)`
+   generic-dispatch overhead, with the suggested fix being either
+   "inline-hint a specific dispatch site, or restructure to amortise
+   the parameterisation cost." That hypothesis would have been wrong
+   on both diagnosis and fix.
+
+   Building a 95-line `tick-iso` diagnostic harness (one-shot, threw
+   it away after the fix) broke the bench's wall time into per-
+   function components: `checkPex` per-iter 5588 ns, `checkPartial`
+   30372 ns, `isPartialSeed only` 35098 ns, `iter+getTC only` 853
+   ns. The first three numbers said "isPartialSeed dominates"; the
+   fourth confirmed the iteration shape itself is fine. That
+   converted speculation ("dispatch overhead") into a definitive
+   measurement ("the O(piece_count) AND-loop is the entire cost"),
+   which then targeted the fix precisely.
+
+   Generalised pattern: **perf regressions in big migrations may be
+   coincident, not causal**. The migration changed the noise floor
+   enough to make a pre-existing algorithmic cost visible. Build a
+   per-function diagnostic before assuming the migration is the
+   cause — the alternative is a fix in the wrong place that doesn't
+   actually move the bench.
+
 ## Bench deltas
 
 Baseline runs against `main` HEAD `507c6bd` (Phase 2 merge), which is

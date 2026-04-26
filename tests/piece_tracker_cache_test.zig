@@ -9,6 +9,14 @@
 //! piece completion increments only when the piece is wanted, and
 //! mask-replacement (`setWanted` / `swapWanted`) recomputes from
 //! scratch.
+//!
+//! TODO(post-Task-#9): collapse these into inline `test "..."`
+//! blocks in `src/torrent/piece_tracker.zig` once Task #9's
+//! source-side test discovery fix has merged into main. They live
+//! here under `tests/` only because `mod_tests` does not currently
+//! reach inline tests in `src/torrent/` on this base; that's the
+//! exact bug Task #9 closes. Inline placement is the more natural
+//! fit for unit-level cache invariants.
 
 const std = @import("std");
 const varuna = @import("varuna");
