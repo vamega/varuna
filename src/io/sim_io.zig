@@ -790,6 +790,11 @@ pub const SimIO = struct {
     pub fn read(self: *SimIO, op: ifc.ReadOp, c: *Completion, ud: ?*anyopaque, cb: Callback) !void {
         try self.armCompletion(c, .{ .read = op }, ud, cb);
         const r = self.rng.random();
+        // Fault injection is the higher-priority signal: when both a
+        // registered content map and a fault probability fire, the fault
+        // wins. BUGGIFY tests that inject `read_error_probability == 1.0`
+        // against a fd with `setFileBytes` need to see `error.InputOutput`,
+        // not the registered bytes.
         if (r.float(f32) < self.config.faults.read_error_probability) {
             return self.schedule(c, .{ .read = error.InputOutput }, 0);
         }
