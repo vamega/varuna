@@ -225,6 +225,11 @@ pub fn build(b: *std.Build) void {
 
     const test_torrent_session_step = b.step("test-torrent-session", "Run the focused TorrentSession test binary");
     test_torrent_session_step.dependOn(&run_torrent_session_tests.step);
+    // Intentionally NOT wired into the main `test` step: known-issue
+    // intermittent Zig cache/toolchain failure (`manifest_create
+    // Unexpected`) — see STATUS.md "Known Issues". Run via
+    // `zig build test-torrent-session` for focused iteration. Re-evaluate
+    // wiring once the cache issue resolves upstream.
 
     // ── Piece hash lifecycle tests (Track A — docs/piece-hash-lifecycle.md) ──
     const piece_hash_lifecycle_tests = b.addTest(.{
@@ -255,6 +260,7 @@ pub fn build(b: *std.Build) void {
     const run_bind_device_tests = b.addRunArtifact(bind_device_tests);
     const test_bind_device_step = b.step("test-bind-device", "Run SO_BINDTODEVICE socket option tests");
     test_bind_device_step.dependOn(&run_bind_device_tests.step);
+    test_step.dependOn(&run_bind_device_tests.step);
 
     // ── Safety tests (compile-time + runtime regression guards) ─
     const safety_tests = b.addTest(.{
@@ -268,6 +274,7 @@ pub fn build(b: *std.Build) void {
     const run_safety_tests = b.addRunArtifact(safety_tests);
     const test_safety_step = b.step("test-safety", "Run compile-time and runtime safety regression tests");
     test_safety_step.dependOn(&run_safety_tests.step);
+    test_step.dependOn(&run_safety_tests.step);
 
     // ── IO backend parity tests (RealIO vs SimIO) ─────────
     const io_parity_tests = b.addTest(.{
@@ -454,6 +461,7 @@ pub fn build(b: *std.Build) void {
     const run_transfer_tests = b.addRunArtifact(transfer_tests);
     const test_transfer_step = b.step("test-transfer", "Run single-process piece transfer integration test");
     test_transfer_step.dependOn(&run_transfer_tests.step);
+    test_step.dependOn(&run_transfer_tests.step);
 
     // ── Sim swarm tests (VirtualPeer, clock injection) ──────
     const sim_swarm_tests = b.addTest(.{
@@ -481,6 +489,7 @@ pub fn build(b: *std.Build) void {
     const run_utp_bs = b.addRunArtifact(utp_bs_tests);
     const test_utp_bs_step = b.step("test-utp", "Run uTP byte stream tests (handshake, messages, fragmentation)");
     test_utp_bs_step.dependOn(&run_utp_bs.step);
+    test_step.dependOn(&run_utp_bs.step);
 
     // ── Recheck tests (parallel recheck, fast resume) ─────
     const recheck_tests = b.addTest(.{
@@ -494,6 +503,7 @@ pub fn build(b: *std.Build) void {
     const run_recheck_tests = b.addRunArtifact(recheck_tests);
     const test_recheck_step = b.step("test-recheck", "Run recheck tests (parallel, fast resume)");
     test_recheck_step.dependOn(&run_recheck_tests.step);
+    test_step.dependOn(&run_recheck_tests.step);
 
     // ── API endpoint tests ─────────────────────────────────
     const api_tests = b.addTest(.{
