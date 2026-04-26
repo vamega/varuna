@@ -397,7 +397,7 @@ test "multi-source: peer disconnect mid-piece, survivors complete (8 seeds)" {
     // `drainRemainingCqes`. Liveness + safety assertions are live
     // (piece verifies, no honest peer banned); distribution-
     // proportion assertions stay gated until late-peer block-stealing
-    // (Task #24) lands.
+    // (Task #23) lands.
     const seeds = [_]u64{
         0x0000_0001, 0xDEAD_BEEF, 0xFEED_FACE, 0xCAFE_BABE,
         0x0F0F_0F0F, 0x1234_5678, 0xABCD_EF01, 0x9876_5432,
