@@ -391,7 +391,7 @@ test "applyRecheckResult overwrites complete bitfield in place (storage stable)"
     try std.testing.expectEqual(@as(u64, 12), pt.bytes_complete);
 }
 
-test "applyRecheckResult clears in_progress (claimed pieces are released)" {
+test "applyRecheckResult preserves in_progress for pieces the recheck found incomplete (surgical row 2)" {
     const allocator = std.testing.allocator;
 
     var initial = try Bitfield.init(allocator, 4);
@@ -400,19 +400,136 @@ test "applyRecheckResult clears in_progress (claimed pieces are released)" {
     var pt = try PieceTracker.init(allocator, 4, 4, 16, &initial, 0);
     defer pt.deinit(allocator);
 
-    // Manually set in_progress to simulate a peer mid-download.
+    // Peer A is mid-downloading piece 2 (in_progress=1, bitfield=0).
     pt.in_progress.set(2) catch {};
+    try std.testing.expectEqual(@as(u32, 1), pt.in_progress.count);
 
+    // Recheck found ONLY piece 0 complete on disk; pieces 1, 2, 3 are
+    // still incomplete (e.g. some piece-2 blocks haven't flushed yet).
     var recheck_result = try Bitfield.init(allocator, 4);
     defer recheck_result.deinit(allocator);
     try recheck_result.set(0);
 
     pt.applyRecheckResult(&recheck_result, 4);
 
-    // In-progress is cleared — old claims would have been against a
-    // pre-recheck state and must not survive the bitfield swap.
-    try std.testing.expectEqual(@as(u32, 0), pt.in_progress.count);
+    // Surgical: in_progress=2 is preserved because piece 2 is still
+    // incomplete on disk. Without preservation, the picker would
+    // re-claim piece 2 fresh and peer A would re-request blocks
+    // already buffered in the DP — wasted bandwidth.
+    try std.testing.expect(pt.in_progress.has(2));
+    try std.testing.expectEqual(@as(u32, 1), pt.in_progress.count);
+    // Bitfield reflects on-disk truth (piece 0 only).
+    try std.testing.expect(pt.complete.has(0));
+    try std.testing.expect(!pt.complete.has(2));
+}
+
+test "applyRecheckResult drops in_progress for pieces the recheck found complete (surgical row 1, rare race)" {
+    const allocator = std.testing.allocator;
+
+    var initial = try Bitfield.init(allocator, 4);
+    defer initial.deinit(allocator);
+
+    var pt = try PieceTracker.init(allocator, 4, 4, 16, &initial, 0);
+    defer pt.deinit(allocator);
+
+    // in_progress[2] = true; the rare-race case is when the recheck
+    // ALSO finds piece 2 complete on disk. The verified bytes win;
+    // the in-flight download is redundant.
+    pt.in_progress.set(2) catch {};
+
+    var recheck_result = try Bitfield.init(allocator, 4);
+    defer recheck_result.deinit(allocator);
+    try recheck_result.set(2);
+
+    pt.applyRecheckResult(&recheck_result, 4);
+
     try std.testing.expect(!pt.in_progress.has(2));
+    try std.testing.expectEqual(@as(u32, 0), pt.in_progress.count);
+    try std.testing.expect(pt.complete.has(2));
+}
+
+test "applyRecheckResult leaves not-in-progress pieces alone regardless of recheck (surgical rows 3, 4, 5)" {
+    const allocator = std.testing.allocator;
+
+    var initial = try Bitfield.init(allocator, 4);
+    defer initial.deinit(allocator);
+    // Pre-recheck: bitfield=1 for pieces 0 and 1 (resume-DB say complete);
+    // in_progress is all zero. This setup exercises rows 3 and 4 of the
+    // truth table when crossed against the recheck result below.
+    try initial.set(0);
+    try initial.set(1);
+
+    var pt = try PieceTracker.init(allocator, 4, 4, 16, &initial, 8);
+    defer pt.deinit(allocator);
+
+    try std.testing.expectEqual(@as(u32, 0), pt.in_progress.count);
+
+    // Recheck: piece 0 still complete (row 3: no change), piece 1
+    // incomplete (row 4: bitfield drops from 1 → 0), pieces 2 and 3
+    // incomplete (row 5: no change, both bitfield=0 and in_progress=0).
+    var recheck_result = try Bitfield.init(allocator, 4);
+    defer recheck_result.deinit(allocator);
+    try recheck_result.set(0);
+
+    pt.applyRecheckResult(&recheck_result, 4);
+
+    // in_progress untouched.
+    try std.testing.expectEqual(@as(u32, 0), pt.in_progress.count);
+    // Bitfield reflects recheck.
+    try std.testing.expect(pt.complete.has(0));
+    try std.testing.expect(!pt.complete.has(1));
+    try std.testing.expect(!pt.complete.has(2));
+    try std.testing.expect(!pt.complete.has(3));
+    try std.testing.expectEqual(@as(u32, 1), pt.complete.count);
+    try std.testing.expectEqual(@as(u64, 4), pt.bytes_complete);
+}
+
+test "applyRecheckResult mixed truth table: preserve some, drop others, follow recheck on rest" {
+    const allocator = std.testing.allocator;
+
+    var initial = try Bitfield.init(allocator, 8);
+    defer initial.deinit(allocator);
+    try initial.set(0); // pre-recheck complete (will stay complete: row 3)
+    try initial.set(1); // pre-recheck complete (recheck disagrees: row 4)
+
+    var pt = try PieceTracker.init(allocator, 8, 4, 32, &initial, 8);
+    defer pt.deinit(allocator);
+
+    // Set in_progress for pieces 4 (recheck will say incomplete: row 2,
+    // KEEP) and 5 (recheck will say complete: row 1, drop).
+    pt.in_progress.set(4) catch {};
+    pt.in_progress.set(5) catch {};
+    try std.testing.expectEqual(@as(u32, 2), pt.in_progress.count);
+
+    var recheck_result = try Bitfield.init(allocator, 8);
+    defer recheck_result.deinit(allocator);
+    try recheck_result.set(0); // matches pre (row 3)
+    // piece 1 NOT in recheck (row 4: bitfield drops)
+    try recheck_result.set(5); // pre was in_progress, now complete (row 1)
+    try recheck_result.set(7); // pre was empty, recheck found new (row 5 → flips to 1)
+
+    pt.applyRecheckResult(&recheck_result, 12);
+
+    // Bitfield is exactly the recheck result.
+    try std.testing.expect(pt.complete.has(0));
+    try std.testing.expect(!pt.complete.has(1));
+    try std.testing.expect(!pt.complete.has(2));
+    try std.testing.expect(!pt.complete.has(3));
+    try std.testing.expect(!pt.complete.has(4));
+    try std.testing.expect(pt.complete.has(5));
+    try std.testing.expect(!pt.complete.has(6));
+    try std.testing.expect(pt.complete.has(7));
+    try std.testing.expectEqual(@as(u32, 3), pt.complete.count);
+
+    // in_progress: piece 4 preserved (row 2), piece 5 dropped (row 1).
+    try std.testing.expect(pt.in_progress.has(4));
+    try std.testing.expect(!pt.in_progress.has(5));
+    try std.testing.expectEqual(@as(u32, 1), pt.in_progress.count);
+    // Sanity: untouched pieces stay 0.
+    try std.testing.expect(!pt.in_progress.has(0));
+    try std.testing.expect(!pt.in_progress.has(7));
+
+    try std.testing.expectEqual(@as(u64, 12), pt.bytes_complete);
 }
 
 test "applyRecheckResult preserves availability (peer Have/bitfield announces survive)" {
