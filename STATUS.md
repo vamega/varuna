@@ -286,6 +286,9 @@ See `progress-reports/2026-04-25-stage2-event-loop-migration.md` for the Stage 2
 - **Live-pipeline BUGGIFY harness for AsyncMetadataFetchOf(SimIO).** Same shape as the AsyncRecheck follow-up (per-tick `injectRandomFault` + per-op `FaultConfig` over 32 deterministic seeds), gated on the happy-path integration test above. Catches handshake-recovery races, partial-send retries, slot cleanup under recv-error injection, and assembler-reset paths that the algorithm-level `tests/ut_metadata_buggify_test.zig` and the foundation error-path tests can't see together. Estimated 0.5-1 day once the happy-path is in place.
 - **uTP extension chain not consumed in production.** `src/net/utp_manager.zig:85` treats `data[Header.size..]` as the entire payload regardless of `hdr.extension`, so when a peer sets `extension == selective_ack` the SACK header bytes are fed into the BT framing layer as if they were BT message bytes. Cosmetic / protocol-correctness — a malicious peer can desync their own BT stream but cannot crash the daemon. Fix shape: walk the extension chain (uTP allows next-hop chaining via `SelectiveAck.next_extension`), strip extensions from the front of `payload`, then hand the trailing bytes to the BT layer. Estimated 1-2 hours. Surfaced by the round-3 audit (`progress-reports/2026-04-26-audit-hunt-round3.md`).
 - **uTP reorder buffer indexing mismatch + dangling-slice UAF.** `bufferReorder` indexes by *offset from `ack_nr+1`* (`src/net/utp.zig:670`); `deliverReordered` indexes by *absolute `seq_nr % 64`* (`src/net/utp.zig:682`). Stored entries are unreachable by the deliverer, so out-of-order packets are silently dropped today. Compounding bug: the stored `data: []const u8` slice points into `event_loop.utp_recv_buf`, which is reused on the next datagram — fixing the indexing bug without addressing slice ownership would convert a silent drop into a UAF. Fix shape: index by `seq_nr % 64` consistently *and* copy the payload into per-slot owned storage. Estimated 1-2 hours. Surfaced by the round-3 audit.
+- **`writePiece` / `readPiece` migration to the IO contract.** PieceStore's per-piece read/write paths still use blocking `posix.pwrite` / `posix.pread`. The 2026-04-27 storage-IO refactor routed `init` (fallocate) and `sync` (fsync) through the contract; the per-piece I/O is the bigger remaining migration. Adjacent to but not blocking the EpollIO/KqueueIO research round. Estimated 1-2 days. Reference: `src/storage/writer.zig` `pwriteAll` / `preadAll`.
+- **`truncate` op on the IO contract.** PieceStore's filesystem-portability fallback (when fallocate returns `error.OperationNotSupported` on tmpfs <5.10 / FAT32 / certain FUSE FSes) calls `file.setEndPos(...)` synchronously rather than through the contract. Adding `TruncateOp` + `RealIO.truncate` (via `IORING_OP_FTRUNCATE`, kernel ≥6.9 — likely above varuna's floor) + `SimIO.truncate` would close the asymmetry. Not urgent: rare defensive path. EpollIO/KqueueIO porting will need it (or a thread-pool bridge). Estimated 1-2 hours.
+- **Live-pipeline BUGGIFY harness for `PieceStoreOf(SimIO)`.** Wrap the integration tests in `tests/storage_writer_test.zig` with the canonical BUGGIFY shape — per-tick `injectRandomFault` + per-op `FaultConfig` × 32 seeds. Catches recovery paths the foundation tests can't see (errdefer cleanup of partially-opened files when the 2nd of 5 fallocates fails; sync's pending-counter under fsync error storms). Reference shape: `tests/recheck_live_buggify_test.zig`. Estimated 0.5 day.
 
 ## Known Issues
 
@@ -297,7 +300,26 @@ See `progress-reports/2026-04-25-stage2-event-loop-migration.md` for the Stage 2
 - ~~**Daemon graceful shutdown**~~: Fixed. In-flight transfer draining with configurable timeout now ensures clean exit on SIGTERM/SIGINT.
 - `IORING_OP_SETSOCKOPT` (kernel 6.7+), `IORING_OP_BIND`/`LISTEN` (kernel 6.11+) not available on current kernel 6.6. Per-peer setsockopt (TCP_NODELAY, buffer sizes) remains synchronous.
 
-## Last Verified Milestone (2026-04-26 — Track 1: untrusted-input parser audit hunt round 3)
+## Last Verified Milestone (2026-04-27 — Storage IO contract: fallocate + fsync via the contract)
+
+Routed `src/storage/writer.zig`'s direct syscall paths through the IO
+contract. `PieceStore.init`'s three `linux.fallocate` call sites and
+the `PieceStore.sync` method now go through `self.io.fallocate` /
+`self.io.fsync` — both BUGGIFY-injectable from SimIO and forward-
+compatible with the queued EpollIO/KqueueIO research round.
+
+Four bisectable commits, all green at HEAD. Test count: **704 → 713 (+9)**.
+
+- `c1dba64` — `io: add fallocate op to contract; fault knobs for fallocate + fsync`. New `FallocateOp` + `Result.fallocate` variant on `io_interface.zig`. `RealIO.fallocate` wired to `IORING_OP_FALLOCATE` (kernel ≥5.6, well below varuna's floor). `SimIO.fallocate` schedules synchronous completion through the heap; new `FaultConfig.fallocate_error_probability` (delivers `error.NoSpaceLeft`) and `FaultConfig.fsync_error_probability` (delivers `error.InputOutput`).
+- `fdd2b79` — `tests: SimIO algorithm tests for fallocate + fsync ops`. 5 tests in `tests/sim_socketpair_test.zig` covering success, fault probability 1.0, distribution sanity at 0.5, fsync fault, and `injectRandomFault` rewriting a fallocate result.
+- `efced8e` — `storage: parameterise PieceStore over the IO backend`. `PieceStoreOf(comptime IO: type)` returning the existing struct; `PieceStore = PieceStoreOf(RealIO)` alias preserves the daemon surface. `init` takes `*IO`; `sync` drops its `*real_io.RealIO` parameter. Daemon callers (`app.zig`, `torrent_session.zig`, tests) updated to spin up one-shot RealIO rings or pass `&el.io`. ftruncate fallback preserved on `error.OperationNotSupported` (tmpfs <5.10, FAT32, FUSE).
+- `b3ab4d5` — `tests: PieceStoreOf(SimIO) integration tests`. 4 tests in `tests/storage_writer_test.zig`: happy path, fallocate fault → init returns NoSpaceLeft, fsync fault → sync returns IoError, do_not_download skip path. New `test-storage-writer` step in `build.zig`.
+
+`zig build` (full daemon binary): clean. `zig fmt .`: clean. `zig build test --summary all`: 88/88 steps, 713/713 passed. See `progress-reports/2026-04-27-storage-io-contract.md`.
+
+Branch: `worktree-storage-io-engineer`.
+
+## Previously Verified Milestone (2026-04-26 — Track 1: untrusted-input parser audit hunt round 3)
 
 Round-3 follow-up to the round-1 KRPC hardening
 (`worktree-krpc-hardening` / commit `3108167`). Audited five
