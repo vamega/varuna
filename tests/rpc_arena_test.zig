@@ -15,6 +15,7 @@ const posix = std.posix;
 const varuna = @import("varuna");
 const rpc_server = varuna.rpc.server;
 const scratch = varuna.rpc.scratch;
+const RealIO = varuna.io.real_io.RealIO;
 
 // ── 1. Algorithm tests ────────────────────────────────────
 
@@ -152,9 +153,9 @@ fn listenPort(server: *const rpc_server.ApiServer) !u16 {
 test "ApiServer routes handler allocations through per-slot arena" {
     HandlerProbe.reset();
 
-    var test_ring = linux.IoUring.init(64, 0) catch return error.SkipZigTest;
-    defer test_ring.deinit();
-    var server = rpc_server.ApiServer.init(std.testing.allocator, &test_ring, "127.0.0.1", 0) catch return error.SkipZigTest;
+    var test_io = RealIO.init(.{ .entries = 64 }) catch return error.SkipZigTest;
+    defer test_io.deinit();
+    var server = rpc_server.ApiServer.init(std.testing.allocator, &test_io, "127.0.0.1", 0) catch return error.SkipZigTest;
     defer server.deinit();
     server.setHandler(arenaProbeHandler);
     server.submitAccept() catch return;
@@ -162,7 +163,8 @@ test "ApiServer routes handler allocations through per-slot arena" {
     const port = try listenPort(&server);
 
     const client_fd = try posix.socket(posix.AF.INET, posix.SOCK.STREAM | posix.SOCK.CLOEXEC, posix.IPPROTO.TCP);
-    defer posix.close(client_fd);
+    var client_closed = false;
+    defer if (!client_closed) posix.close(client_fd);
     const connect_addr = try std.net.Address.parseIp4("127.0.0.1", port);
     try posix.connect(client_fd, &connect_addr.any, connect_addr.getOsSockLen());
 
@@ -205,6 +207,15 @@ test "ApiServer routes handler allocations through per-slot arena" {
     const n2 = try posix.read(client_fd, &resp_buf);
     try std.testing.expect(std.mem.startsWith(u8, resp_buf[0..n2], "HTTP/1.1 200 OK"));
     try std.testing.expect(std.mem.indexOf(u8, resp_buf[0..n2], "\"call\":2") != null);
+
+    // Drain pending ops before deinit so the heap-allocated `ClientOp`
+    // tracker for the next-request recv is destroyed (recv completion
+    // path runs `allocator.destroy(op)`). Closing the socket gives the
+    // pending recv an EOF, which the server processes during the poll
+    // tail.
+    posix.close(client_fd);
+    client_closed = true;
+    pollFor(&server, 200);
 }
 
 // ── 3. Safety-under-fault: oversize response ──────────────
@@ -219,9 +230,9 @@ fn oversizeHandler(allocator: std.mem.Allocator, request: rpc_server.Request) rp
 }
 
 test "ApiServer surfaces 500 on arena cap exceeded — no leak" {
-    var test_ring = linux.IoUring.init(64, 0) catch return error.SkipZigTest;
-    defer test_ring.deinit();
-    var server = rpc_server.ApiServer.init(std.testing.allocator, &test_ring, "127.0.0.1", 0) catch return error.SkipZigTest;
+    var test_io = RealIO.init(.{ .entries = 64 }) catch return error.SkipZigTest;
+    defer test_io.deinit();
+    var server = rpc_server.ApiServer.init(std.testing.allocator, &test_io, "127.0.0.1", 0) catch return error.SkipZigTest;
     defer server.deinit();
     server.setHandler(oversizeHandler);
     server.submitAccept() catch return;
@@ -229,7 +240,8 @@ test "ApiServer surfaces 500 on arena cap exceeded — no leak" {
     const port = try listenPort(&server);
 
     const client_fd = try posix.socket(posix.AF.INET, posix.SOCK.STREAM | posix.SOCK.CLOEXEC, posix.IPPROTO.TCP);
-    defer posix.close(client_fd);
+    var client_closed = false;
+    defer if (!client_closed) posix.close(client_fd);
     const connect_addr = try std.net.Address.parseIp4("127.0.0.1", port);
     try posix.connect(client_fd, &connect_addr.any, connect_addr.getOsSockLen());
 
@@ -241,4 +253,10 @@ test "ApiServer surfaces 500 on arena cap exceeded — no leak" {
     const resp = resp_buf[0..n];
     try std.testing.expect(std.mem.indexOf(u8, resp, "HTTP/1.1 500") != null);
     try std.testing.expect(std.mem.indexOf(u8, resp, "too_big") != null);
+
+    // Drain pending recv ClientOp by closing the socket and polling once
+    // more so the recv completion runs `allocator.destroy(op)`.
+    posix.close(client_fd);
+    client_closed = true;
+    pollFor(&server, 200);
 }

@@ -129,13 +129,19 @@ pub const ApiServer = struct {
         self.handler = handler;
     }
 
-    /// Per-op tracking struct, heap-allocated. Carries the generation
-    /// counter so stale CQEs against a reused slot can be filtered.
+    /// Per-op tracking struct. Now **embedded in `ApiClient`** (one
+    /// `recv_op` + one `send_op` per slot), so submit/complete cycles
+    /// don't allocate. Each slot has at most one in-flight recv + one
+    /// in-flight send at a time, which is a Pattern #1 ("Single
+    /// Completion per long-lived slot for serial state machines")
+    /// configuration in `STYLE.md`. Stale completion filtering uses the
+    /// `gen` snapshot taken at submission time vs `client_generations`
+    /// at completion.
     const ClientOp = struct {
         completion: io_interface.Completion = .{},
-        server: *ApiServer,
-        slot: u8,
-        gen: u32,
+        server: *ApiServer = undefined,
+        slot: u8 = 0,
+        gen: u32 = 0,
     };
 
     pub fn stop(self: *ApiServer) void {
@@ -202,18 +208,20 @@ pub const ApiServer = struct {
     fn submitRecv(self: *ApiServer, slot: u8) !void {
         const client = &self.clients[slot];
         if (client.fd < 0) return error.InvalidClientSlot;
-        const op = try self.allocator.create(ClientOp);
-        op.* = .{ .server = self, .slot = slot, .gen = self.client_generations[slot] };
+        const op = &client.recv_op;
+        op.* = .{
+            .completion = .{},
+            .server = self,
+            .slot = slot,
+            .gen = self.client_generations[slot],
+        };
         const storage = recvStorage(client);
-        self.io.recv(
+        try self.io.recv(
             .{ .fd = client.fd, .buf = storage[client.recv_offset..] },
             &op.completion,
             op,
             apiRecvComplete,
-        ) catch |err| {
-            self.allocator.destroy(op);
-            return err;
-        };
+        );
     }
 
     fn apiRecvComplete(
@@ -225,7 +233,6 @@ pub const ApiServer = struct {
         const self = op.server;
         const slot = op.slot;
         const gen = op.gen;
-        self.allocator.destroy(op);
 
         if (!self.isLiveClient(slot, gen)) return .disarm;
 
@@ -278,17 +285,19 @@ pub const ApiServer = struct {
             .controllen = 0,
             .flags = 0,
         };
-        const op = try self.allocator.create(ClientOp);
-        op.* = .{ .server = self, .slot = slot, .gen = self.client_generations[slot] };
-        self.io.sendmsg(
+        const op = &client.send_op;
+        op.* = .{
+            .completion = .{},
+            .server = self,
+            .slot = slot,
+            .gen = self.client_generations[slot],
+        };
+        try self.io.sendmsg(
             .{ .fd = client.fd, .msg = &client.send_msg },
             &op.completion,
             op,
             apiSendComplete,
-        ) catch |err| {
-            self.allocator.destroy(op);
-            return err;
-        };
+        );
     }
 
     fn apiSendComplete(
@@ -300,7 +309,6 @@ pub const ApiServer = struct {
         const self = op.server;
         const slot = op.slot;
         const gen = op.gen;
-        self.allocator.destroy(op);
 
         if (!self.isLiveClient(slot, gen)) return .disarm;
         const sent = switch (result) {
@@ -545,6 +553,13 @@ pub const ApiClient = struct {
     /// requests; retained across slot reuse like `recv_buf`. See
     /// `STYLE.md` Memory section + `src/rpc/scratch.zig`.
     request_arena: ?scratch.TieredArena = null,
+    /// Embedded per-slot recv/send tracker structs (Pattern #1 in
+    /// `STYLE.md`: single Completion per long-lived slot for serial
+    /// state machines). Replaces the prior `allocator.create(ClientOp)`
+    /// per recv/send — this slot has at most one in-flight recv and at
+    /// most one in-flight send at any time, so static storage suffices.
+    recv_op: ApiServer.ClientOp = .{},
+    send_op: ApiServer.ClientOp = .{},
 };
 
 const ParsedRequest = struct {
