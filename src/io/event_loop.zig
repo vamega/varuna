@@ -490,6 +490,16 @@ pub fn EventLoopOf(comptime IO: type) type {
         }
 
         pub fn deinit(self: *Self) void {
+            // Mark draining at deinit start. The signal-handler graceful-
+            // shutdown path already sets this; tests and crash paths
+            // calling deinit directly didn't, which left the picker /
+            // hash-submission paths thinking new work was acceptable
+            // even as the hasher was being torn down.
+            // `peer_policy.completePieceDownload` (and any other
+            // hash-submitting path) checks this flag and drops new
+            // submissions during teardown. Idempotent if already set.
+            self.draining = true;
+
             // ── Phase -1: Drain hasher → pending_writes ──────────────
             // Before tearing down the hasher, give any verified piece
             // results a chance to land on disk. The graceful-shutdown
@@ -513,6 +523,12 @@ pub fn EventLoopOf(comptime IO: type) type {
                 }
                 h.deinit();
                 self.allocator.destroy(h);
+                // Null the pointer so any post-destroy submitVerify
+                // attempt (residual CQEs in Phase 2 drainRemainingCqes)
+                // hits the `self.hasher == null` guard in
+                // completePieceDownload rather than UAFing on freed
+                // memory.
+                self.hasher = null;
             }
 
             // ── Phase 0: Flush pending disk writes ────────────────────

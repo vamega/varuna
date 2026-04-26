@@ -547,6 +547,25 @@ pub fn completePieceDownload(self: anytype, slot: u16) void {
     const sess = tc.session orelse return;
     const pt = tc.piece_tracker orelse return;
 
+    // Teardown race guard: when EL is winding down (`self.draining`
+    // set by signal-handler graceful shutdown OR by deinit start), the
+    // hasher's pending_jobs structure is being torn down. Residual
+    // recv CQEs can route here from in-flight piece-block traffic for
+    // already-disconnected peers; we must not submit a new hash job
+    // against a draining or destroyed hasher. Drop the piece via
+    // cleanupCompletionFailure (releases pt + frees the piece_buf) and
+    // return early. Lost piece is acceptable in shutdown; corrupt
+    // state is not.
+    //
+    // NOTE: only check `self.draining`, not `self.hasher == null`.
+    // The latter is also a valid normal-mode state (hasher_threads=0
+    // selects the inline-verify fallback below); hard-failing on null
+    // would break the inline-mode path used by sim_swarm_test.
+    if (self.draining) {
+        cleanupCompletionFailure(self, peer, dp, pt, piece_index);
+        return;
+    }
+
     // Get the expected hash for this piece
     const expected_hash = sess.layout.pieceHash(piece_index) catch {
         cleanupCompletionFailure(self, peer, dp, pt, piece_index);
