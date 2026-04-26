@@ -106,6 +106,16 @@ pub const AsyncMetadataFetch = struct {
     };
 
     /// Create a heap-allocated AsyncMetadataFetch.
+    ///
+    /// `shared_assembly_buffer` and `shared_assembly_received`, if
+    /// non-null, are externally-owned worst-case-sized slices used by
+    /// the assembler in place of per-fetch heap allocs. This is the
+    /// daemon's hot path: the EventLoop pre-allocates these once at
+    /// init and reuses them across torrents (BEP 9 + the EventLoop's
+    /// own `metadata_fetch != null` gate guarantee at most one
+    /// in-flight metadata fetch at a time). When both are null, the
+    /// assembler falls back to allocator-owned storage (used by the
+    /// legacy direct tests in this file).
     pub fn create(
         allocator: std.mem.Allocator,
         io: *RealIO,
@@ -116,11 +126,22 @@ pub const AsyncMetadataFetch = struct {
         peers: []const std.net.Address,
         on_complete: ?*const fn (*AsyncMetadataFetch) void,
         caller_ctx: ?*anyopaque,
+        shared_assembly_buffer: ?[]u8,
+        shared_assembly_received: ?[]bool,
     ) !*AsyncMetadataFetch {
         const owned_peers = try allocator.dupe(std.net.Address, peers);
         errdefer allocator.free(owned_peers);
 
         const self = try allocator.create(AsyncMetadataFetch);
+        const assembler = if (shared_assembly_buffer != null and shared_assembly_received != null)
+            ut_metadata.MetadataAssembler.initShared(
+                info_hash,
+                shared_assembly_buffer.?,
+                shared_assembly_received.?,
+            )
+        else
+            ut_metadata.MetadataAssembler.init(allocator, info_hash);
+
         self.* = .{
             .allocator = allocator,
             .io = io,
@@ -128,7 +149,7 @@ pub const AsyncMetadataFetch = struct {
             .peer_id = peer_id,
             .port = port,
             .is_private = is_private,
-            .assembler = ut_metadata.MetadataAssembler.init(allocator, info_hash),
+            .assembler = assembler,
             .peers = owned_peers,
             .peer_count = @intCast(owned_peers.len),
             .on_complete = on_complete,
@@ -890,6 +911,8 @@ test "AsyncMetadataFetch create and destroy with no peers" {
         &peers,
         null,
         null,
+        null,
+        null,
     );
     mf.destroy();
 }
@@ -910,6 +933,8 @@ test "AsyncMetadataFetch create and destroy with peers" {
         6881,
         false,
         &peers,
+        null,
+        null,
         null,
         null,
     );
@@ -941,6 +966,8 @@ test "AsyncMetadataFetch start with no peers calls finish" {
         &peers,
         &TestCtx.onComplete,
         null,
+        null,
+        null,
     );
     defer mf.destroy();
 
@@ -954,3 +981,8 @@ test "AsyncMetadataFetch start with no peers calls finish" {
 test "AsyncMetadataFetch max_slots is 3" {
     try std.testing.expectEqual(@as(u8, 3), AsyncMetadataFetch.max_slots);
 }
+
+// Stage 4 zero-alloc shared-buffer integration tests live in
+// tests/metadata_fetch_shared_test.zig (the `net` and `io` source-side
+// tests aren't yet wired into mod_tests, but the dedicated test step
+// `test-metadata-fetch-shared` runs them as part of `zig build test`).
