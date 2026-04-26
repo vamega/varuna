@@ -27,6 +27,7 @@ test {
     _ = bitfield;
     _ = config;
     _ = crypto;
+    _ = dht;
     _ = io;
     _ = storage;
     _ = torrent;
