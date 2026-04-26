@@ -1195,6 +1195,50 @@ pub fn EventLoopOf(comptime IO: type) type {
             return pt.isPieceComplete(piece_index);
         }
 
+        /// Sentinel value for `getBlockAttribution` entries whose block
+        /// is in `.none` state (not yet requested by any peer). Tests
+        /// distinguish unattributed blocks from real slot indices via
+        /// this value rather than `0`, since slot 0 is a valid peer.
+        pub const attribution_unset: u16 = std.math.maxInt(u16);
+
+        /// Snapshot per-block peer attribution for the active download
+        /// of `piece_index` in `torrent_id`. Each entry in the returned
+        /// slice is the slot that requested or delivered the
+        /// corresponding block (or `attribution_unset` for `.none`-
+        /// state blocks). Returns null if the torrent has no active
+        /// `DownloadingPiece` for this piece (e.g. the piece is
+        /// complete, has been abandoned, or hasn't been claimed yet).
+        ///
+        /// Caller-allocated `out` buffer must be at least
+        /// `dp.blocks_total` long; the returned slice is a sub-slice
+        /// of `out`. Caller-buffered to avoid heap allocation in the
+        /// hot test loop and to let the test hold the snapshot across
+        /// ticks even after the underlying DP is destroyed (e.g. piece
+        /// completed, attribution copied into smart-ban records).
+        ///
+        /// Test-only API. Slot indices are stable across `removePeer`
+        /// (peer.state goes `.free` until `allocSlot` reuses), which
+        /// gives tests precise mid-tick attribution observability.
+        /// Resolve slot → address via `getPeerView(slot).?.address` if
+        /// the test wants to compare against `BanList.isBanned`.
+        pub fn getBlockAttribution(
+            self: *Self,
+            torrent_id: TorrentId,
+            piece_index: u32,
+            out: []u16,
+        ) ?[]const u16 {
+            const key = DownloadingPieceKey{
+                .torrent_id = torrent_id,
+                .piece_index = piece_index,
+            };
+            const dp = self.downloading_pieces.get(key) orelse return null;
+            if (out.len < dp.block_infos.len) return null;
+            for (dp.block_infos, 0..) |bi, i| {
+                out[i] = if (bi.state == .none) attribution_unset else bi.peer_slot;
+            }
+            return out[0..dp.block_infos.len];
+        }
+
         /// Initiate an outbound uTP connection to a peer. Creates the uTP
         /// socket via the UtpManager, sends the SYN packet, and allocates a
         /// peer slot in the event loop.
