@@ -106,6 +106,33 @@ pub const PieceTracker = struct {
         self.min_availability = 0;
     }
 
+    /// Apply a recheck-derived completion state in place. Used by the
+    /// live force-recheck path to avoid tearing down the PieceTracker
+    /// (whose `complete` Bitfield the EventLoop holds a `*const Bitfield`
+    /// pointer into via `setTorrentCompletePieces`). Reuses the existing
+    /// bits storage so the EL's pointer stays valid; only the bit values
+    /// change. In-progress claims are dropped because any in-flight
+    /// downloads were tracking the pre-recheck state.
+    /// Availability counts are preserved — peer Have/bitfield announces
+    /// remain valid across a recheck.
+    pub fn applyRecheckResult(
+        self: *PieceTracker,
+        new_complete: *const Bitfield,
+        new_bytes_complete: u64,
+    ) void {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        std.debug.assert(new_complete.bits.len == self.complete.bits.len);
+        @memcpy(self.complete.bits, new_complete.bits);
+        self.complete.count = new_complete.count;
+        @memset(self.in_progress.bits, 0);
+        self.in_progress.count = 0;
+        self.bytes_complete = new_bytes_complete;
+        self.scan_hint = 0;
+        self.min_availability = 0;
+        self.wanted_completed_count = computeWantedCompletedCount(self);
+    }
+
     /// Atomically replace the wanted mask and return the old one so the
     /// caller can free it outside the lock. This avoids requiring the
     /// PieceTracker to know the allocator.
