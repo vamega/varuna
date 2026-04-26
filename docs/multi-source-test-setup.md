@@ -302,6 +302,23 @@ Builds on the multi-source EL test:
    blocks silently, and the EL's request timeout re-routes to another
    peer. That's an existing path. The mask is a sim-only sleight of
    hand to *force* the picker into multi-source.
+5. **SimPeer relaxed serving (Task #23 lesson)**: `SimPeer.serveRequest`
+   does **not** enforce its advertised bitfield on the wire — when
+   asked for any piece in `piece_data`, it serves it (bounds check
+   only). Real peers reject unsolicited piece requests for unadvertised
+   pieces. This relaxed serving can magnify production-side picker
+   bugs that wouldn't manifest against real peers: e.g. an honest peer
+   pulled into a corrupt-only piece's DP via a missing bitfield gate
+   will deliver canonical bytes that race against corrupt's bad bytes
+   in the shared `dp.buf`, producing a mixed buffer → hash fails →
+   `processHashResults` penalises the slot of whoever delivered the
+   *last* block (potentially the framed honest peer). Tests that
+   depend on production-side bitfield enforcement should ensure that
+   enforcement IS exercised on the request path (e.g. picker call
+   sites checking `peer.availability.has(piece_index)`), not just on
+   the announce path. Surfaced by `tests/sim_smart_ban_eventloop_test.zig`
+   when block-stealing was first activated; the bitfield gate at
+   `tryJoinExistingPiece` is the load-bearing guard.
 
 ---
 
