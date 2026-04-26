@@ -272,6 +272,20 @@ pub const SimIO = struct {
     /// Head of the free-list of unallocated socket slots.
     free_socket_head: u32 = sentinel_index,
 
+    /// Optional per-fd content registered via `setFileBytes`. When a
+    /// `read` op targets a registered fd, SimIO returns
+    /// `bytes[offset..][0..min(buf.len, len - offset)]` instead of the
+    /// default zero-byte success. Used by recheck/disk tests that need
+    /// reads to reflect "what's on disk" rather than always returning
+    /// zero. The map is empty by default; production data-path reads
+    /// (which never go through `setFileBytes`) hit the legacy zero path
+    /// unchanged.
+    ///
+    /// Slices are caller-owned: `setFileBytes` records the pointer and
+    /// length, but does not copy. The caller must keep the underlying
+    /// memory alive for as long as reads against `fd` may fire.
+    file_content: std.AutoHashMap(posix.fd_t, []const u8),
+
     pub fn init(allocator: std.mem.Allocator, config: Config) !SimIO {
         const slots = try allocator.alloc(Pending, config.pending_capacity);
         errdefer allocator.free(slots);
@@ -311,14 +325,26 @@ pub const SimIO = struct {
             .sockets = sockets,
             .recv_queue_pool = queue_buf,
             .free_socket_head = head,
+            .file_content = std.AutoHashMap(posix.fd_t, []const u8).init(allocator),
         };
     }
 
     pub fn deinit(self: *SimIO) void {
+        self.file_content.deinit();
         self.allocator.free(self.pending);
         self.allocator.free(self.recv_queue_pool);
         self.allocator.free(self.sockets);
         self.* = undefined;
+    }
+
+    /// Register byte content for `fd`. Subsequent `read` submissions on
+    /// `fd` return slices of `bytes` at the requested offset (zero-byte
+    /// success when offset >= bytes.len). Used by recheck/disk tests that
+    /// need the read result to reflect "what's on disk" rather than
+    /// always returning zero. The slice is caller-owned; SimIO does not
+    /// copy. Calling twice with the same fd replaces the registration.
+    pub fn setFileBytes(self: *SimIO, fd: posix.fd_t, bytes: []const u8) !void {
+        try self.file_content.put(fd, bytes);
     }
 
     /// Current simulated time.
@@ -764,9 +790,30 @@ pub const SimIO = struct {
     pub fn read(self: *SimIO, op: ifc.ReadOp, c: *Completion, ud: ?*anyopaque, cb: Callback) !void {
         try self.armCompletion(c, .{ .read = op }, ud, cb);
         const r = self.rng.random();
+        // Fault injection is the higher-priority signal: when both a
+        // registered content map and a fault probability fire, the fault
+        // wins. BUGGIFY tests that inject `read_error_probability == 1.0`
+        // against a fd with `setFileBytes` need to see `error.InputOutput`,
+        // not the registered bytes.
         if (r.float(f32) < self.config.faults.read_error_probability) {
             return self.schedule(c, .{ .read = error.InputOutput }, 0);
         }
+
+        // If content was registered via setFileBytes, return bytes from
+        // the requested offset; otherwise fall through to the legacy
+        // zero-byte success behaviour for callers that don't care about
+        // disk content.
+        if (self.file_content.get(op.fd)) |content| {
+            const off = op.offset;
+            if (off >= content.len) {
+                return self.schedule(c, .{ .read = @as(usize, 0) }, 0);
+            }
+            const available: usize = content.len - @as(usize, @intCast(off));
+            const n: usize = @min(op.buf.len, available);
+            @memcpy(op.buf[0..n], content[@as(usize, @intCast(off))..][0..n]);
+            return self.schedule(c, .{ .read = n }, 0);
+        }
+
         return self.schedule(c, .{ .read = @as(usize, 0) }, 0);
     }
 

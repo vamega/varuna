@@ -443,3 +443,191 @@ test "createSocketpair: many pairs up to capacity" {
     }
     try testing.expectEqual(@as(usize, 10), seen.count());
 }
+
+// ── setFileBytes (recheck/disk content) ───────────────────
+//
+// `SimIO.setFileBytes(fd, bytes)` registers caller-owned content for
+// `fd` so a subsequent `read` returns slices of `bytes` at the
+// requested offset instead of the legacy `usize=0` success.
+// Required for recheck/disk tests whose semantics depend on bytes
+// hashing back to a piece's expected hash.
+
+test "SimIO read returns zero bytes when no content is registered" {
+    var io = try SimIO.init(testing.allocator, .{});
+    defer io.deinit();
+
+    var buf: [16]u8 = undefined;
+    var c = Completion{};
+    var ctx = TestCtx{};
+    try io.read(.{ .fd = 7, .buf = &buf, .offset = 0 }, &c, &ctx, testCallback);
+    try io.tick(0);
+
+    try testing.expectEqual(@as(u32, 1), ctx.calls);
+    switch (ctx.last_result.?) {
+        .read => |r| try testing.expectEqual(@as(usize, 0), try r),
+        else => try testing.expect(false),
+    }
+}
+
+test "SimIO setFileBytes returns content slice on read" {
+    var io = try SimIO.init(testing.allocator, .{});
+    defer io.deinit();
+
+    const content = "hello world recheck content";
+    try io.setFileBytes(7, content);
+
+    var buf: [16]u8 = undefined;
+    @memset(&buf, 0xff);
+    var c = Completion{};
+    var ctx = TestCtx{};
+    try io.read(.{ .fd = 7, .buf = &buf, .offset = 0 }, &c, &ctx, testCallback);
+    try io.tick(0);
+
+    try testing.expectEqual(@as(u32, 1), ctx.calls);
+    switch (ctx.last_result.?) {
+        .read => |r| {
+            const n = try r;
+            try testing.expectEqual(@as(usize, 16), n);
+            try testing.expectEqualSlices(u8, content[0..16], buf[0..n]);
+        },
+        else => try testing.expect(false),
+    }
+}
+
+test "SimIO setFileBytes honors offset" {
+    var io = try SimIO.init(testing.allocator, .{});
+    defer io.deinit();
+
+    const content = "0123456789abcdef";
+    try io.setFileBytes(11, content);
+
+    var buf: [4]u8 = undefined;
+    var c = Completion{};
+    var ctx = TestCtx{};
+    try io.read(.{ .fd = 11, .buf = &buf, .offset = 6 }, &c, &ctx, testCallback);
+    try io.tick(0);
+
+    switch (ctx.last_result.?) {
+        .read => |r| {
+            const n = try r;
+            try testing.expectEqual(@as(usize, 4), n);
+            try testing.expectEqualSlices(u8, "6789", buf[0..n]);
+        },
+        else => try testing.expect(false),
+    }
+}
+
+test "SimIO setFileBytes returns short read at end of content" {
+    var io = try SimIO.init(testing.allocator, .{});
+    defer io.deinit();
+
+    const content = "12345";
+    try io.setFileBytes(3, content);
+
+    var buf: [16]u8 = undefined;
+    var c = Completion{};
+    var ctx = TestCtx{};
+    try io.read(.{ .fd = 3, .buf = &buf, .offset = 2 }, &c, &ctx, testCallback);
+    try io.tick(0);
+
+    switch (ctx.last_result.?) {
+        .read => |r| {
+            const n = try r;
+            try testing.expectEqual(@as(usize, 3), n);
+            try testing.expectEqualSlices(u8, "345", buf[0..n]);
+        },
+        else => try testing.expect(false),
+    }
+}
+
+test "SimIO setFileBytes returns zero when offset is past end" {
+    var io = try SimIO.init(testing.allocator, .{});
+    defer io.deinit();
+
+    const content = "short";
+    try io.setFileBytes(2, content);
+
+    var buf: [8]u8 = undefined;
+    var c = Completion{};
+    var ctx = TestCtx{};
+    try io.read(.{ .fd = 2, .buf = &buf, .offset = 100 }, &c, &ctx, testCallback);
+    try io.tick(0);
+
+    switch (ctx.last_result.?) {
+        .read => |r| try testing.expectEqual(@as(usize, 0), try r),
+        else => try testing.expect(false),
+    }
+}
+
+test "SimIO setFileBytes is per-fd; unregistered fds get zero" {
+    var io = try SimIO.init(testing.allocator, .{});
+    defer io.deinit();
+
+    const content_a = "alpha";
+    try io.setFileBytes(40, content_a);
+
+    var buf: [8]u8 = undefined;
+    var c1 = Completion{};
+    var ctx1 = TestCtx{};
+    try io.read(.{ .fd = 40, .buf = &buf, .offset = 0 }, &c1, &ctx1, testCallback);
+
+    var buf2: [8]u8 = undefined;
+    var c2 = Completion{};
+    var ctx2 = TestCtx{};
+    try io.read(.{ .fd = 41, .buf = &buf2, .offset = 0 }, &c2, &ctx2, testCallback);
+
+    try io.tick(0);
+
+    switch (ctx1.last_result.?) {
+        .read => |r| try testing.expectEqual(@as(usize, 5), try r),
+        else => try testing.expect(false),
+    }
+    switch (ctx2.last_result.?) {
+        .read => |r| try testing.expectEqual(@as(usize, 0), try r),
+        else => try testing.expect(false),
+    }
+}
+
+test "SimIO setFileBytes second call replaces content" {
+    var io = try SimIO.init(testing.allocator, .{});
+    defer io.deinit();
+
+    try io.setFileBytes(50, "first");
+    try io.setFileBytes(50, "second-call-content");
+
+    var buf: [32]u8 = undefined;
+    var c = Completion{};
+    var ctx = TestCtx{};
+    try io.read(.{ .fd = 50, .buf = &buf, .offset = 0 }, &c, &ctx, testCallback);
+    try io.tick(0);
+
+    switch (ctx.last_result.?) {
+        .read => |r| {
+            const n = try r;
+            try testing.expectEqual(@as(usize, 19), n);
+            try testing.expectEqualSlices(u8, "second-call-content", buf[0..n]);
+        },
+        else => try testing.expect(false),
+    }
+}
+
+test "SimIO read still honors fault injection over registered content" {
+    var io = try SimIO.init(testing.allocator, .{
+        .seed = 7,
+        .faults = .{ .read_error_probability = 1.0 },
+    });
+    defer io.deinit();
+
+    try io.setFileBytes(99, "would-be-content");
+
+    var buf: [16]u8 = undefined;
+    var c = Completion{};
+    var ctx = TestCtx{};
+    try io.read(.{ .fd = 99, .buf = &buf, .offset = 0 }, &c, &ctx, testCallback);
+    try io.tick(0);
+
+    switch (ctx.last_result.?) {
+        .read => |r| try testing.expectError(error.InputOutput, r),
+        else => try testing.expect(false),
+    }
+}

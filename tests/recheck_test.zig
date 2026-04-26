@@ -1,11 +1,15 @@
 const std = @import("std");
 const varuna = @import("varuna");
-const EventLoop = varuna.io.event_loop.EventLoop;
+const event_loop_mod = varuna.io.event_loop;
+const EventLoop = event_loop_mod.EventLoop;
 const Bitfield = varuna.bitfield.Bitfield;
 const PieceTracker = varuna.torrent.piece_tracker.PieceTracker;
 const Session = varuna.torrent.session.Session;
 const PieceStore = varuna.storage.writer.PieceStore;
 const Sha1 = varuna.crypto.Sha1;
+const sim_io_mod = varuna.io.sim_io;
+const SimIO = sim_io_mod.SimIO;
+const recheck_mod = varuna.io.recheck;
 const posix = std.posix;
 
 const piece_data_len = 1024;
@@ -475,5 +479,312 @@ test "live force-recheck rebuilds PieceTracker bitfield in place" {
     try std.testing.expectEqual(@as(u16, 2), pt.availability[0]);
 
     // Clean up.
+    el.cancelAllRechecks();
+}
+
+// ── AsyncRecheckOf(SimIO) end-to-end integration ─────────────────
+//
+// Drives the full recheck pipeline against `EventLoopOf(SimIO)` with
+// `SimIO.setFileBytes` registering the canonical piece content. Asserts
+// the resulting bitfield reflects what's "on disk" exactly — every
+// piece's bytes match its expected hash, so all pieces verify.
+//
+// This is the integration shape that the live-pipeline BUGGIFY harness
+// (deferred follow-up — see progress-reports/2026-04-26-async-recheck-io-generic.md)
+// will wrap with `injectRandomFault` + per-op `FaultConfig` over many
+// seeds. The current test exercises the happy path; safety-under-faults
+// is filed as the next deliverable.
+
+const sim_piece_count: u32 = 4;
+const sim_piece_size: u32 = 32;
+const sim_total_bytes: u32 = sim_piece_count * sim_piece_size;
+
+/// Build minimal bencoded metainfo for a 4-piece × 32-byte torrent with
+/// the supplied concatenated piece hashes. The format mirrors the
+/// existing `buildTorrentBytes` in this file but with a multi-piece
+/// hash blob.
+fn buildMultiPieceTorrent(
+    allocator: std.mem.Allocator,
+    piece_hashes: *const [sim_piece_count][20]u8,
+) ![]u8 {
+    var buf = std.ArrayList(u8).empty;
+    defer buf.deinit(allocator);
+
+    try buf.appendSlice(allocator, "d8:announce14:http://tracker4:infod");
+    try buf.appendSlice(allocator, "6:lengthi");
+    try buf.writer(allocator).print("{d}", .{sim_total_bytes});
+    try buf.append(allocator, 'e');
+    try buf.appendSlice(allocator, "4:name15:sim_recheck.bin");
+    try buf.appendSlice(allocator, "12:piece lengthi");
+    try buf.writer(allocator).print("{d}", .{sim_piece_size});
+    try buf.append(allocator, 'e');
+    try buf.appendSlice(allocator, "6:pieces");
+    try buf.writer(allocator).print("{d}", .{sim_piece_count * 20});
+    try buf.append(allocator, ':');
+    for (piece_hashes) |*h| try buf.appendSlice(allocator, h);
+    try buf.appendSlice(allocator, "ee");
+
+    return buf.toOwnedSlice(allocator);
+}
+
+test "AsyncRecheckOf(SimIO): all pieces verify against registered file content" {
+    const allocator = std.testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+
+    // ── 1. Build canonical piece data + SHA-1 hashes ─────────
+    var file_bytes: [sim_total_bytes]u8 = undefined;
+    for (&file_bytes, 0..) |*b, i| b.* = @as(u8, @intCast(i & 0xff));
+
+    var piece_hashes: [sim_piece_count][20]u8 = undefined;
+    var p: u32 = 0;
+    while (p < sim_piece_count) : (p += 1) {
+        Sha1.hash(
+            file_bytes[p * sim_piece_size ..][0..sim_piece_size],
+            &piece_hashes[p],
+            .{},
+        );
+    }
+
+    // ── 2. Load the torrent as a Session ─────────────────────
+    const torrent_bytes = try buildMultiPieceTorrent(arena.allocator(), &piece_hashes);
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const data_root = try tmp.dir.realpathAlloc(arena.allocator(), ".");
+
+    const session = try Session.load(allocator, torrent_bytes, data_root);
+    defer session.deinit(allocator);
+
+    // ── 3. Spin up EventLoopOf(SimIO) with a real hasher ─────
+    const EL_SimIO = event_loop_mod.EventLoopOf(SimIO);
+    const sim_io = try SimIO.init(allocator, .{ .seed = 0xCAFE_BABE });
+    var el = EL_SimIO.initBareWithIO(allocator, sim_io, 1) catch |err| {
+        if (err == error.SystemResources) return error.SkipZigTest;
+        return err;
+    };
+    defer el.deinit();
+
+    // ── 4. Register file content for the synthetic fd ────────
+    //
+    // PieceStore would normally hand back a real kernel fd from
+    // `posix.openat`. SimIO doesn't have a kernel — we synthesise an
+    // fd value that doesn't collide with the socket-pair / synthetic
+    // ranges (`socket_fd_base = 1000`, `synthetic_fd_base = 100_000`)
+    // and register the canonical bytes. Subsequent reads on this fd
+    // return slices of `file_bytes`, which makes
+    // `verify.planPieceVerification` + the hasher's SHA-1 comparison
+    // mark every piece complete.
+    const synthetic_fd: posix.fd_t = 50;
+    try el.io.setFileBytes(synthetic_fd, &file_bytes);
+
+    const fds = [_]posix.fd_t{synthetic_fd};
+
+    // ── 5. Submit the recheck ────────────────────────────────
+    const Ctx = struct {
+        completed: bool = false,
+        complete_count: u32 = 0,
+        bytes_complete: u64 = 0,
+    };
+    var ctx = Ctx{};
+
+    try el.startRecheck(
+        &session,
+        &fds,
+        0,
+        null, // no fast-path skip; recheck every piece
+        struct {
+            fn cb(rc: *EL_SimIO.AsyncRecheck) void {
+                const c: *Ctx = @ptrCast(@alignCast(rc.caller_ctx.?));
+                c.completed = true;
+                c.complete_count = rc.complete_pieces.count;
+                c.bytes_complete = rc.bytes_complete;
+            }
+        }.cb,
+        @ptrCast(&ctx),
+    );
+
+    // ── 6. Drive ticks until the recheck completes ───────────
+    //
+    // Each tick pulls SimIO completions and feeds them into the
+    // recheck state machine, then drains hasher results from the
+    // background thread pool. The hasher is a real thread, so we
+    // spin until either the on_complete callback fires or we hit
+    // the budget.
+    var ticks: u32 = 0;
+    while (ticks < 1024 and !ctx.completed) : (ticks += 1) {
+        try el.tick();
+    }
+
+    try std.testing.expect(ctx.completed);
+    try std.testing.expectEqual(sim_piece_count, ctx.complete_count);
+    try std.testing.expectEqual(@as(u64, sim_total_bytes), ctx.bytes_complete);
+
+    // ── 7. Tidy up the recheck slot ──────────────────────────
+    el.cancelAllRechecks();
+}
+
+test "AsyncRecheckOf(SimIO): corrupt piece is reported incomplete" {
+    const allocator = std.testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+
+    // Build canonical bytes + hashes, then corrupt piece 2's content
+    // before registering. The recheck should mark pieces 0/1/3 complete
+    // and piece 2 incomplete (hash mismatch).
+    var file_bytes: [sim_total_bytes]u8 = undefined;
+    for (&file_bytes, 0..) |*b, i| b.* = @as(u8, @intCast(i & 0xff));
+
+    var piece_hashes: [sim_piece_count][20]u8 = undefined;
+    var p: u32 = 0;
+    while (p < sim_piece_count) : (p += 1) {
+        Sha1.hash(
+            file_bytes[p * sim_piece_size ..][0..sim_piece_size],
+            &piece_hashes[p],
+            .{},
+        );
+    }
+
+    // Corrupt piece 2 AFTER hashing — disk now disagrees with the hash.
+    @memset(file_bytes[2 * sim_piece_size ..][0..sim_piece_size], 0xFF);
+
+    const torrent_bytes = try buildMultiPieceTorrent(arena.allocator(), &piece_hashes);
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const data_root = try tmp.dir.realpathAlloc(arena.allocator(), ".");
+
+    const session = try Session.load(allocator, torrent_bytes, data_root);
+    defer session.deinit(allocator);
+
+    const EL_SimIO = event_loop_mod.EventLoopOf(SimIO);
+    const sim_io = try SimIO.init(allocator, .{ .seed = 0xDEAD_BEEF });
+    var el = EL_SimIO.initBareWithIO(allocator, sim_io, 1) catch |err| {
+        if (err == error.SystemResources) return error.SkipZigTest;
+        return err;
+    };
+    defer el.deinit();
+
+    const synthetic_fd: posix.fd_t = 50;
+    try el.io.setFileBytes(synthetic_fd, &file_bytes);
+
+    const fds = [_]posix.fd_t{synthetic_fd};
+
+    const Ctx = struct {
+        completed: bool = false,
+        bf_p0: bool = false,
+        bf_p1: bool = false,
+        bf_p2: bool = false,
+        bf_p3: bool = false,
+    };
+    var ctx = Ctx{};
+
+    try el.startRecheck(
+        &session,
+        &fds,
+        0,
+        null,
+        struct {
+            fn cb(rc: *EL_SimIO.AsyncRecheck) void {
+                const c: *Ctx = @ptrCast(@alignCast(rc.caller_ctx.?));
+                c.completed = true;
+                c.bf_p0 = rc.complete_pieces.has(0);
+                c.bf_p1 = rc.complete_pieces.has(1);
+                c.bf_p2 = rc.complete_pieces.has(2);
+                c.bf_p3 = rc.complete_pieces.has(3);
+            }
+        }.cb,
+        @ptrCast(&ctx),
+    );
+
+    var ticks: u32 = 0;
+    while (ticks < 1024 and !ctx.completed) : (ticks += 1) {
+        try el.tick();
+    }
+
+    try std.testing.expect(ctx.completed);
+    try std.testing.expect(ctx.bf_p0);
+    try std.testing.expect(ctx.bf_p1);
+    try std.testing.expect(!ctx.bf_p2); // corrupted
+    try std.testing.expect(ctx.bf_p3);
+
+    el.cancelAllRechecks();
+}
+
+test "AsyncRecheckOf(SimIO): all-known-complete fast path skips disk reads" {
+    // Exercises the AsyncRecheck.start() known-complete fast path through
+    // EventLoopOf(SimIO). With every piece pre-marked in `known_complete`,
+    // the state machine should fire `on_complete` without ever submitting
+    // a read — proven here by leaving the SimIO `file_content` map empty:
+    // if a read DID hit, it would return zero bytes and the hash would
+    // mismatch, so the asserted "all 4 pieces complete" outcome is only
+    // possible if no reads happened.
+    const allocator = std.testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+
+    var file_bytes: [sim_total_bytes]u8 = undefined;
+    for (&file_bytes, 0..) |*b, i| b.* = @as(u8, @intCast(i & 0xff));
+
+    var piece_hashes: [sim_piece_count][20]u8 = undefined;
+    var p: u32 = 0;
+    while (p < sim_piece_count) : (p += 1) {
+        Sha1.hash(
+            file_bytes[p * sim_piece_size ..][0..sim_piece_size],
+            &piece_hashes[p],
+            .{},
+        );
+    }
+
+    const torrent_bytes = try buildMultiPieceTorrent(arena.allocator(), &piece_hashes);
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const data_root = try tmp.dir.realpathAlloc(arena.allocator(), ".");
+
+    const session = try Session.load(allocator, torrent_bytes, data_root);
+    defer session.deinit(allocator);
+
+    const EL_SimIO = event_loop_mod.EventLoopOf(SimIO);
+    const sim_io = try SimIO.init(allocator, .{});
+    var el = EL_SimIO.initBareWithIO(allocator, sim_io, 1) catch |err| {
+        if (err == error.SystemResources) return error.SkipZigTest;
+        return err;
+    };
+    defer el.deinit();
+
+    // Mark every piece as known-complete so AsyncRecheck skips reads.
+    var known = try Bitfield.init(allocator, session.pieceCount());
+    defer known.deinit(allocator);
+    var i: u32 = 0;
+    while (i < session.pieceCount()) : (i += 1) try known.set(i);
+
+    // No setFileBytes — if the fast path is broken and reads do fire,
+    // SimIO returns zero bytes, the hash mismatches, and the assertion
+    // below catches it.
+    const fds = [_]posix.fd_t{50};
+
+    const Ctx = struct {
+        completed: bool = false,
+        complete_count: u32 = 0,
+    };
+    var ctx = Ctx{};
+
+    try el.startRecheck(&session, &fds, 0, &known, struct {
+        fn cb(rc: *EL_SimIO.AsyncRecheck) void {
+            const c: *Ctx = @ptrCast(@alignCast(rc.caller_ctx.?));
+            c.completed = true;
+            c.complete_count = rc.complete_pieces.count;
+        }
+    }.cb, @ptrCast(&ctx));
+
+    var ticks: u32 = 0;
+    while (ticks < 32 and !ctx.completed) : (ticks += 1) {
+        try el.tick();
+    }
+
+    try std.testing.expect(ctx.completed);
+    try std.testing.expectEqual(sim_piece_count, ctx.complete_count);
+
     el.cancelAllRechecks();
 }

@@ -30,6 +30,8 @@ pub const DownloadingPiece = dp_mod.DownloadingPiece;
 pub const DownloadingPieceKey = dp_mod.DownloadingPieceKey;
 pub const DownloadingPieceMap = dp_mod.DownloadingPieceMap;
 
+const recheck_mod = @import("recheck.zig");
+
 // Sub-modules: focused implementations that operate on *EventLoop
 const peer_handler = @import("peer_handler.zig");
 const protocol = @import("protocol.zig");
@@ -77,6 +79,11 @@ pub fn EventLoopOf(comptime IO: type) type {
         pub const small_send_capacity: usize = 256;
         const small_send_slots: usize = max_peers * 2;
         const default_torrent_capacity: usize = 64;
+
+        // Per-IO instantiation of the recheck state machine. The daemon
+        // sees `AsyncRecheck = AsyncRecheckOf(RealIO)`; sim tests see
+        // `AsyncRecheckOf(SimIO)` with the same surface.
+        pub const AsyncRecheck = recheck_mod.AsyncRecheckOf(IO);
 
         pub const PendingWriteKey = struct {
             piece_index: u32,
@@ -346,7 +353,7 @@ pub fn EventLoopOf(comptime IO: type) type {
         merkle_result_swap: std.ArrayList(Hasher.MerkleResult) = std.ArrayList(Hasher.MerkleResult).empty,
 
         // Async piece recheck state machines (multiple rechecks can run in parallel)
-        rechecks: std.ArrayList(*@import("recheck.zig").AsyncRecheck) = std.ArrayList(*@import("recheck.zig").AsyncRecheck).empty,
+        rechecks: std.ArrayList(*AsyncRecheck) = std.ArrayList(*AsyncRecheck).empty,
 
         // Async BEP 9 metadata fetch state machine (null when no fetch is active)
         metadata_fetch: ?*metadata_handler.AsyncMetadataFetch = null,
@@ -1820,12 +1827,12 @@ pub fn EventLoopOf(comptime IO: type) type {
             fds: []const posix.fd_t,
             torrent_id: TorrentId,
             known_complete: ?*const Bitfield,
-            on_complete: ?*const fn (*@import("recheck.zig").AsyncRecheck) void,
+            on_complete: ?*const fn (*AsyncRecheck) void,
             caller_ctx: ?*anyopaque,
         ) !void {
             const h = self.hasher orelse return error.NoHasher;
 
-            const rc = try @import("recheck.zig").AsyncRecheck.create(
+            const rc = try AsyncRecheck.create(
                 self.allocator,
                 session,
                 fds,
@@ -1861,7 +1868,7 @@ pub fn EventLoopOf(comptime IO: type) type {
                 rc.destroy();
             }
             self.rechecks.deinit(self.allocator);
-            self.rechecks = std.ArrayList(*@import("recheck.zig").AsyncRecheck).empty;
+            self.rechecks = std.ArrayList(*AsyncRecheck).empty;
         }
 
         // ── Async metadata fetch ─────────────────────────────

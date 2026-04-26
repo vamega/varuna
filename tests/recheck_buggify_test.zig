@@ -35,28 +35,27 @@
 //!   (f) No allocation leak (testing.allocator catches).
 //!   (g) Test exits cleanly (no panic, no crash).
 //!
-//! ## Why algorithm-level instead of EL+SimIO BUGGIFY
+//! ## Why algorithm-level vs EL+SimIO BUGGIFY
 //!
-//! The canonical BUGGIFY pattern (`tests/sim_smart_ban_eventloop_test.zig`)
-//! drives `EventLoopOf(SimIO)` with per-tick `injectRandomFault` plus
-//! per-op `FaultConfig` over 32 seeds, which catches recovery bugs in
-//! the live wiring. That shape is the right target for the recheck
-//! pipeline, but it's blocked on `AsyncRecheck` being hard-coded to
-//! `*RealIO` (see `src/io/recheck.zig:34`); making the recheck state
-//! machine IO-generic is a multi-file refactor that doesn't belong in
-//! the A3 task scope.
+//! The canonical EL+SimIO BUGGIFY pattern
+//! (`tests/sim_smart_ban_eventloop_test.zig`) drives `EventLoopOf(SimIO)`
+//! with per-tick `injectRandomFault` plus per-op `FaultConfig` over 32
+//! seeds, catching recovery bugs in the live wiring. With
+//! `AsyncRecheck` now parameterised over its IO backend (the followup
+//! refactor) and `SimIO.setFileBytes` available for caller-supplied
+//! disk content, that harness shape is unblocked — see
+//! `tests/recheck_test.zig` for the foundation integration tests.
+//! A live-pipeline BUGGIFY wrapper around them is the next deliverable.
 //!
-//! The investigation that surfaced the blocker is recorded in the
-//! progress report; the EL+SimIO recheck BUGGIFY harness will land
-//! once `AsyncRecheck` is parameterised. Until then, this algorithm-
-//! level cross-product harness exercises the post-recheck callback's
-//! two surfaces under randomized inputs across 32 seeds — matching
-//! BUGGIFY's per-seed reproducibility guarantee at the algorithm
-//! layer, even though faults aren't injected into a live pipeline.
-//!
-//! Because this layer doesn't need a real EventLoop, hasher, or disk
-//! reads, the per-seed run is essentially free; the harness can
-//! afford broader piece_count coverage than an EL test.
+//! This algorithm-level cross-product harness still earns its keep:
+//! it exercises the post-recheck callback's two surfaces (A1 stale
+//! pruning + A2 surgical in_progress preservation) under randomized
+//! inputs across 32 seeds, with broader piece_count coverage than an
+//! EL test can afford because no real EventLoop, hasher, or disk
+//! reads are required per seed. The two layers are complementary:
+//! algorithm-level is fast + broad-coverage on the data shape;
+//! EL+SimIO BUGGIFY (the follow-up) catches live-wiring recovery
+//! bugs the algorithm layer can't see.
 
 const std = @import("std");
 const testing = std.testing;
