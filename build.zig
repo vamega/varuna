@@ -505,6 +505,23 @@ pub fn build(b: *std.Build) void {
     test_recheck_step.dependOn(&run_recheck_tests.step);
     test_step.dependOn(&run_recheck_tests.step);
 
+    // ── Recheck BUGGIFY safety harness (Task A3) ──────────
+    const recheck_buggify_tests = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("tests/recheck_buggify_test.zig"),
+            .target = target,
+            .optimize = optimize,
+            .imports = &varuna_import,
+        }),
+    });
+    const run_recheck_buggify_tests = b.addRunArtifact(recheck_buggify_tests);
+    const test_recheck_buggify_step = b.step(
+        "test-recheck-buggify",
+        "Run recheck-surface safety-under-randomized-inputs harness (32 seeds)",
+    );
+    test_recheck_buggify_step.dependOn(&run_recheck_buggify_tests.step);
+    test_step.dependOn(&run_recheck_buggify_tests.step);
+
     // ── API endpoint tests ─────────────────────────────────
     const api_tests = b.addTest(.{
         .root_module = b.createModule(.{
