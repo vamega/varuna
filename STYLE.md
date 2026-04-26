@@ -204,6 +204,46 @@ Patterns that fell out of the Stage 2 migration (Apr 2026) and the bugs they cat
     pattern #10 applied to *behavior* rather than types: invariants the real backend
     enforces implicitly become explicit caps on the sim.
 
+### Test-first coordination
+
+When a sim-side engineer drafts a test API spec for a new production feature, the
+production-side engineer should read the relevant subsystem **before** the spec is drafted
+and DM the prior art that already exists. The goal is to keep the test-API doc from
+inventing surfaces that duplicate fields already tracked elsewhere in the codebase.
+
+Concrete shape, drawn from the smart-ban Phase 2 prep:
+
+1. Production engineer rereads the subsystem the test will exercise — even if it's been
+   touched recently. Notes which data already exists (fields, snapshots, queryable
+   structures) and how it's currently surfaced (live vs captured, public vs private).
+2. Production engineer DMs the sim engineer with three things: **the prior art** ("here
+   are the fields/types/snapshots already in place"), **the implication** ("the test API
+   doesn't need a new tracking channel; it needs a getter on existing data"), and **a
+   concrete decision** ("(a) live read, (b) post-snapshot read, (c) both — your call,
+   shapes whether Phase X is N or N+1 days").
+3. Sim engineer drafts the spec around the surfaced options.
+4. Production engineer reviews line-by-line, pushes back on anything that warps
+   production for test-readability, agrees the surface, then implements.
+
+The pattern's value: the smart-ban Phase 2 estimate dropped from "2-3 days production +
+sim work" to "~1.5 days combined" once `BlockInfo.peer_slot` (live) +
+`SmartBan.pending_attributions` (post-snapshot) + `BlockKey`/`BlockRecord` records were
+flagged as already present. Without the rereading step, the API doc would have
+specified a new attribution channel, the production-side would have refactored to add
+it, and the existing fields would have become dead code. Cost of the reread: ~30
+minutes. Cost of skipping it: 1-2 days of production-test-warp churn.
+
+**Caveat — what the protocol does NOT gate.** The protocol gates **API surface
+decisions** — anywhere "does this API shape compose with the test scaffolds?" matters.
+It does **not** gate **implementation choices inside the production body** that don't
+change the API surface. A small reversible fix (e.g. pool ghost-state vs `io.cancel` to
+close a UAF, both delivering the same observable behavior to the test) should
+ship-then-coordinate, not coordinate-then-ship. Stalling on the wrong granularity is
+itself a coordination failure: the other engineer can't review your implementation
+choices without the diff, and your "blocked on ack" idle time is pure cost. Heuristic:
+**if the diff is reversible in under an hour, ship and ping; if it changes a name the
+test scaffolds reference, get the ack first**.
+
 ---
 
 ## Memory
