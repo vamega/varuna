@@ -330,6 +330,22 @@ Detail in `progress-reports/2026-04-26-phase-2-smart-ban.md`.
 
 Conclusions: no `>2×` regressions; Stage 2 perf is clean for shipping. `peer_accept_burst` and `api_get_burst` are substantially faster than 2026-04-16 baselines — io_interface migration is a net perf win on the accept path and the RPC GET path. The 14× accept-burst speedup is suspiciously large for "we just changed dispatch shape" — hypothesis is that legacy dispatch had redundant accept-handling work that multishot consolidated; worth a focused profile pass post-Phase-2 to document. Two watch-items (api_get_burst alloc regression, tick_sparse_torrents 1.4× regression) filed as Tasks #20 / #21 for post-Phase-2 cleanup.
 
+### Zero-alloc Stage 2: control-plane bump arena (Track B / runtime-engineer)
+- **Spec**: `docs/zero-alloc-plan.md` Stage 2 — replace per-request `ArrayList(u8)` growth with a bounded bump arena reset between operations.
+- **`src/rpc/scratch.zig`** (new module): two arenas, both bounded.
+  - `RequestArena` — single fixed-size slab; `error.OutOfMemory` past the cap. Used for the tracker stack arena.
+  - `TieredArena` — small slab fast path + transparent spill to the parent allocator under a single hard cap; `reset()` returns the slab bump pointer to zero AND walks the spill chain to free spilled allocations in one sweep. Used for the per-slot RPC arena.
+- **`src/rpc/server.zig`** — per-`ApiClient` slot `TieredArena` pre-allocated at `init`/`initWithFd`/`initWithDevice` for all 64 slots: `request_arena_slab` = 256 KiB fast path + `request_arena_capacity` = 64 MiB hard cap. Total upfront slab footprint = 16 MiB. Reset between requests at `processBufferedRequest` entry — guaranteed safe because `handleSend` calls `releaseClientResponse` on send-complete *before* re-entering. Retained across slot reuse like `recv_buf`. Handler signature unchanged; the server passes the arena allocator instead of the parent. `releaseOwnedResponseBody` skips the parent free when the body lives in arena memory; `closeClient` retains the arena across slot reuse; `deinit` frees all per-slot arenas.
+- **Cap chosen for sync_delta-class workloads**: the plan suggested 8 MiB; `/sync/maindata` for 10K torrents has a transient peak of ~21 MiB (HashMaps + stats array + JSON growth). 64 MiB gives ~3× margin without making per-slot pre-allocation enormous. The two-tier design lets us pre-allocate only the 256 KiB fast path while keeping a hard upper bound on cumulative slab+spill.
+- **`src/daemon/torrent_session.zig`** — `announceComplete` + `magnetHttpAnnounceComplete` parse the bencoded tracker response into a 64 KiB stack-allocated `FixedBufferAllocator`. Zero heap churn during announce parsing; oversize responses fail the announce attempt, tracker retried later. Bound covers ~10K compact-IPv4 peers + dict overhead, well past realistic responses.
+- **Test count: 223 → 230** (`tests/rpc_arena_test.zig` adds 7 algorithm + integration + safety-under-fault tests; `src/rpc/scratch.zig` inline tests cover both arenas, 8/8 via direct `zig test`).
+- **Bench deltas (`-Doptimize=ReleaseFast`):**
+  - `api_get_burst --iterations=4000 --clients=8`: `0` allocs / `0` bytes / `8.05e7 ns` — pre-allocation at server init means steady-state requests make zero parent-allocator calls. **Closes Task #20** (post-Stage-2-#12 8000-alloc regression).
+  - `sync_delta --iterations=200 --torrents=10000`: alloc calls `4,229,925` → `222,970` (−19×); bytes `4.27 GB` → `449 MB` (−9.5×); wall `2.60e10 ns` → `3.35e9 ns` (−7.7×). Remaining 222K allocs are `SyncState` snapshot HashMap (parent-allocator persistent state, not per-request transient).
+  - `api_upload_burst --iterations=1000 --clients=8 --body-bytes=65536`: unchanged (`8` allocs / `525 KB` / `2.73e7 ns`).
+  - `sync_stats_live --iterations=1 --torrents=10000`: unchanged (`8` allocs / `4.5 MB` peak / `5.64e6 ns`).
+- DHT tick-scoped arena, PEX per-peer encode buffer, and extension handshake stack-buffer encoder deferred (modest per-event churn; cross-module lifetime reasoning needed for the DHT case). Detail in `progress-reports/2026-04-26-zero-alloc-stage-2.md`.
+
 ## Last Verified Milestone (2026-04-16)
 
 - Demo swarm end-to-end with uTP enabled: `demo_swarm.sh` runs TCP+uTP, seeder-to-downloader transfer verified
