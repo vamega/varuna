@@ -70,8 +70,14 @@ const Parser = struct {
     fn parseInteger(self: *Parser) ParseError!i64 {
         try self.expectByte('i');
         const start = self.index;
+        // i64 fits in at most 20 base-10 digits; allow 1 leading '-'
+        // for the negative case (so 21 total). A longer run cannot
+        // represent a valid i64 — bound the scan to defend against
+        // adversarial multi-MB digit floods.
+        const max_int_chars: usize = 21;
         while (self.peek()) |byte| {
             if (byte == 'e') break;
+            if (self.index - start >= max_int_chars) return error.InvalidInteger;
             self.index += 1;
         }
 
@@ -90,9 +96,17 @@ const Parser = struct {
 
     fn parseBytes(self: *Parser) ParseError![]const u8 {
         const length_start = self.index;
+        // Bound the length-prefix digit scan: a usize fits in at most 20
+        // base-10 digits (max u64 = 18446744073709551615, 20 digits). A
+        // longer run cannot represent a valid offset into the input —
+        // capping the scan also makes parseUnsigned trivially
+        // overflow-free and stops adversarial multi-MB digit floods
+        // from spinning the parser.
+        const max_len_digits: usize = 20;
         while (self.peek()) |byte| {
             if (byte == ':') break;
             if (!std.ascii.isDigit(byte)) return error.InvalidByteStringLength;
+            if (self.index - length_start >= max_len_digits) return error.InvalidByteStringLength;
             self.index += 1;
         }
 
@@ -108,10 +122,15 @@ const Parser = struct {
         self.index += 1;
         const length = try std.fmt.parseUnsigned(usize, length_slice, 10);
 
-        const end = self.index + length;
-        if (end > self.input.len) {
+        // Saturating-subtraction form: `length > self.input.len - self.index`
+        // is overflow-safe (`self.index <= self.input.len` is invariant
+        // after the `peek() == null` guard above). The naive
+        // `self.index + length > self.input.len` form panicked in safe
+        // mode on adversarial `length` values near `maxInt(usize)`.
+        if (length > self.input.len - self.index) {
             return error.UnexpectedEndOfStream;
         }
+        const end = self.index + length;
 
         defer self.index = end;
         return self.input[self.index..end];
@@ -505,4 +524,66 @@ test "max_container_elements constant is 500000" {
 
 test "max_nesting_depth constant is 64" {
     try std.testing.expectEqual(@as(u32, 64), max_nesting_depth);
+}
+
+// ── Adversarial bounds tests (parser hardening) ───────────────
+
+test "byte-string length prefix > 20 digits is rejected without overflow" {
+    // 21-digit length prefix exceeds usize digit cap; must reject
+    // cleanly. Without the bound, parseUnsigned could succeed with
+    // a value near maxInt(usize), then `index + length > input.len`
+    // would overflow usize and panic in safe mode.
+    const inputs = [_][]const u8{
+        "999999999999999999999:",
+        "9999999999999999999999999999999:",
+        "12345678901234567890987654321:hi",
+    };
+    for (inputs) |inp| {
+        try std.testing.expectError(
+            error.InvalidByteStringLength,
+            parse(std.testing.allocator, inp),
+        );
+    }
+}
+
+test "byte-string length near maxInt(usize) does not panic" {
+    // 20-digit length that fits in u64 but cannot fit in input.len.
+    // Saturating-subtraction form must catch this without overflow.
+    const inp = "99999999999999999999:abc"; // claims maxInt(u64)-ish bytes
+    if (parse(std.testing.allocator, inp)) |value| {
+        freeValue(std.testing.allocator, value);
+    } else |err| {
+        // Either Overflow (parseUnsigned saw a value > maxInt(usize) on
+        // some 32-bit platforms) or UnexpectedEndOfStream (length valid
+        // but body short). Both are clean rejections.
+        try std.testing.expect(
+            err == error.Overflow or
+                err == error.UnexpectedEndOfStream or
+                err == error.InvalidByteStringLength,
+        );
+    }
+}
+
+test "integer with > 21 chars is rejected without panic" {
+    // 22-char integer (sign + 21 digits) exceeds the i64 char bound.
+    // The parser rejects via either `error.InvalidInteger` (digit-cap
+    // hit before 'e') or `error.Overflow` (parseInt failed on a value
+    // that won't fit in i64). Both are clean rejections — the only
+    // unacceptable outcome is a panic.
+    const inputs = [_][]const u8{
+        "i999999999999999999999e", // 21 digits
+        "i-999999999999999999999e", // sign + 21 digits = 22 chars
+        "i00000000000000000000000000000000e", // many digits, even though val=0
+    };
+    for (inputs) |inp| {
+        if (parse(std.testing.allocator, inp)) |value| {
+            // Should never succeed — if it does, free and fail.
+            freeValue(std.testing.allocator, value);
+            try std.testing.expect(false);
+        } else |err| {
+            try std.testing.expect(
+                err == error.InvalidInteger or err == error.Overflow,
+            );
+        }
+    }
 }
