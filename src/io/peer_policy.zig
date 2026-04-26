@@ -338,6 +338,23 @@ pub fn tryFillPipeline(self: anytype, slot: u16) !void {
                 p1 += 1;
                 claimed_this_call += 1;
             }
+
+            // Block-stealing — REVERTED pending BUGGIFY-interaction
+            // investigation. See task #23 progress notes. The stealing
+            // helper `dp.nextStealableBlock` and the production-side
+            // duplicate-handling in `markBlockReceived`/`peer.inflight_requests`
+            // accounting are in place; what's not understood yet is
+            // why enabling stealing reliably drops 2/96 honest pieces
+            // under BUGGIFY p=0.02 fault injection on `sim_smart_ban_eventloop_test`.
+            // Honest peers don't share pieces with corrupt (bitfields
+            // disjoint), so a hashfail on an honest peer shouldn't be
+            // possible — yet enabling stealing produces it. Some
+            // interaction with `releaseBlocksForPeer` on BUGGIFY-
+            // induced disconnect, OR the `peer.current_piece` check in
+            // `protocol.processMessage` that gates piece-block recv
+            // routing, OR the `bytes_downloaded_from` accounting under
+            // raced duplicates. Needs targeted diagnosis under a
+            // failing seed before re-enabling.
         } else {
             // Legacy path (no DownloadingPiece -- should not happen after migration)
             while (peer.inflight_requests + p1 < pipeline_depth and

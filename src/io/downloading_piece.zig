@@ -133,6 +133,31 @@ pub const DownloadingPiece = struct {
         }
         return count;
     }
+
+    /// Returns the first block in `.requested` state attributed to a peer
+    /// other than `exclude_peer_slot`, or null if every `.requested`
+    /// block belongs to that peer (or no blocks are `.requested`).
+    /// Used by the multi-source picker for **block-stealing**: when a
+    /// peer joins a DP that's fully claimed but incomplete, it issues
+    /// duplicate requests for blocks another peer already claimed.
+    /// Whichever peer delivers first wins attribution via
+    /// `markBlockReceived` (which returns false for the loser's
+    /// duplicate; the data is dropped).
+    ///
+    /// The exclude bound prevents self-stealing: a peer's own
+    /// outstanding requests don't count as stealable since duplicate
+    /// requests against your own outstanding ones are pure overhead.
+    /// Does not mutate state — block-stealing leaves attribution at
+    /// the original requester until delivery, since either peer might
+    /// win the race.
+    pub fn nextStealableBlock(self: *const DownloadingPiece, exclude_peer_slot: u16) ?u16 {
+        for (self.block_infos, 0..) |bi, i| {
+            if (bi.state == .requested and bi.peer_slot != exclude_peer_slot) {
+                return @intCast(i);
+            }
+        }
+        return null;
+    }
 };
 
 /// Composite key for the downloading_pieces registry.
