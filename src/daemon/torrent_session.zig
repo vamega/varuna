@@ -4,6 +4,7 @@ const session_mod = @import("../torrent/session.zig");
 const storage = @import("../storage/root.zig");
 const tracker = @import("../tracker/root.zig");
 const EventLoop = @import("../io/event_loop.zig").EventLoop;
+const real_io = @import("../io/real_io.zig");
 const PieceTracker = @import("../torrent/piece_tracker.zig").PieceTracker;
 const file_priority = @import("../torrent/file_priority.zig");
 const FilePriority = file_priority.FilePriority;
@@ -1261,7 +1262,16 @@ pub const TorrentSession = struct {
         const session = try session_mod.Session.load(self.allocator, self.torrent_bytes, self.save_path);
         self.session = session;
 
-        const store = try storage.writer.PieceStore.init(self.allocator, &self.session.?);
+        // PieceStore.init now routes its file pre-allocation (fallocate)
+        // through the IO contract. The background worker has no
+        // long-lived ring of its own, so we spin up a small one-shot
+        // RealIO instance just for the duration of init. Cost: one
+        // io_uring_setup + one teardown per torrent (~tens of µs);
+        // benefit: every disk I/O in the daemon is uniformly
+        // ring-routed and BUGGIFY-injectable from sim tests.
+        var init_io = try real_io.RealIO.init(.{ .entries = 16 });
+        defer init_io.deinit();
+        const store = try storage.writer.PieceStore.init(self.allocator, &self.session.?, &init_io);
         self.store = store;
 
         // Open resume DB and load known-complete pieces (fast path: skip rehash)
@@ -2008,7 +2018,15 @@ pub const TorrentSession = struct {
         };
         self.session = session;
 
-        const store_result = storage.writer.PieceStore.init(self.allocator, &self.session.?);
+        // Same one-shot RealIO pattern as doStartBackground above —
+        // PieceStore.init now routes fallocate through the contract.
+        var init_io_meta = real_io.RealIO.init(.{ .entries = 16 }) catch |err| {
+            self.state = .@"error";
+            self.error_message = std.fmt.allocPrint(self.allocator, "init_io setup failed: {s}", .{@errorName(err)}) catch null;
+            return;
+        };
+        defer init_io_meta.deinit();
+        const store_result = storage.writer.PieceStore.init(self.allocator, &self.session.?, &init_io_meta);
         if (store_result) |pstore| {
             self.store = pstore;
         } else |err| {

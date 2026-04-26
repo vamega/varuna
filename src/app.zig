@@ -289,7 +289,10 @@ fn runVerify(
     const session = try torrent.session.Session.load(allocator, torrent_bytes, target_root);
     defer session.deinit(allocator);
 
-    var store = try @import("storage/root.zig").writer.PieceStore.init(allocator, &session);
+    var verify_io = try @import("io/real_io.zig").RealIO.init(.{ .entries = 16 });
+    defer verify_io.deinit();
+
+    var store = try @import("storage/root.zig").writer.PieceStore.init(allocator, &session, &verify_io);
     defer store.deinit();
 
     var recheck = try @import("storage/root.zig").verify.recheckExistingData(allocator, &session, &store, null);
