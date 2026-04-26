@@ -234,7 +234,13 @@ fn formatAddress(addr: std.net.Address, buf: *[46]u8) ?[]const u8 {
         },
         std.posix.AF.INET6 => blk: {
             const ip6 = @as(*const std.posix.sockaddr.in6, @ptrCast(@alignCast(&addr.any)));
-            break :blk std.fmt.bufPrint(buf, "{any}", .{std.net.Ip6Address.init(ip6.addr, 0, 0, 0)}) catch null;
+            // `{f}` invokes `Ip6Address.format` and produces "[2001:db8::]:0".
+            // `{any}` (the previous spec) falls back to Zig's generic
+            // struct dump in 0.15.2, e.g. ".{ .sa = .{ .family = 10, ... } }",
+            // which overflows the 46-byte buffer and silently drops every
+            // IPv6 node from persistence. Surfaced by the previously-dark
+            // "DhtPersistence format IPv6 address" test.
+            break :blk std.fmt.bufPrint(buf, "{f}", .{std.net.Ip6Address.init(ip6.addr, 0, 0, 0)}) catch null;
         },
         else => null,
     };
