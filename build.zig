@@ -562,6 +562,20 @@ pub fn build(b: *std.Build) void {
     test_piece_tracker_cache_buggify_step.dependOn(&run_piece_tracker_cache_buggify_tests.step);
     test_step.dependOn(&run_piece_tracker_cache_buggify_tests.step);
 
+    // ── RPC server stress test (Track C: connect/disconnect churn) ──
+    const rpc_server_stress_tests = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("tests/rpc_server_stress_test.zig"),
+            .target = target,
+            .optimize = optimize,
+            .imports = &varuna_import,
+        }),
+    });
+    const run_rpc_server_stress_tests = b.addRunArtifact(rpc_server_stress_tests);
+    const test_rpc_server_stress_step = b.step("test-rpc-server-stress", "Stress-test ApiServer lifecycle under random close-mid-flight strategies");
+    test_rpc_server_stress_step.dependOn(&run_rpc_server_stress_tests.step);
+    test_step.dependOn(&run_rpc_server_stress_tests.step);
+
     // ── Soak test (long-running resource leak detection) ──
     const soak_exe = b.addExecutable(.{
         .name = "varuna-soak-test",
