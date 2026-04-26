@@ -97,14 +97,28 @@ pub const DecodeError = error{
 /// Decode a ut_metadata message from the extension payload.
 ///
 /// For data messages, the payload contains a bencoded dictionary followed
-/// by raw piece data. We find the dictionary boundary by parsing and
-/// measuring the encoded size, then return the data_offset.
+/// by raw piece data. The dict boundary is measured by skipping the
+/// leading dict via the hardened `bencode_scanner.BencodeScanner`, whose
+/// length-prefix scan is digit-capped and recursion is depth-bounded.
+/// Both guards are critical: this entry point handles attacker-controlled
+/// extension payloads up to `peer_wire.max_message_length` (1 MiB), so
+/// the prior hand-rolled `findDictEnd`/`skipByteString` pair (which used
+/// the unsafe `i + len` form) was production-reachable for every
+/// connected peer.
 pub fn decode(allocator: std.mem.Allocator, payload: []const u8) DecodeError!MetadataMessage {
     _ = allocator;
-    // BEP 9 data messages have a bencoded dict followed by raw bytes.
-    // We need to find where the dict ends. Parse it, and the dict
-    // boundary is determined by the bencoded structure.
-    const dict_end = findDictEnd(payload) orelse return error.InvalidMessage;
+
+    // First pass: skip the leading bencoded dict to find the trailing
+    // raw-data boundary. The hardened scanner refuses adversarial
+    // length prefixes (>20 digits) and bounds recursion depth at 64.
+    var probe = Scanner.init(payload);
+    probe.skipValue() catch return error.InvalidMessage;
+    const dict_end = probe.pos;
+
+    // Second pass: extract the fields we care about from the dict
+    // body. We re-init a scanner over `payload[0..dict_end]` so the
+    // `isAtEnd()` check below pins "no junk between the closing 'e'
+    // and the trailing piece data".
     var scanner = Scanner.init(payload[0..dict_end]);
     try scanner.expectByte('d');
 
@@ -151,70 +165,6 @@ pub fn decode(allocator: std.mem.Allocator, payload: []const u8) DecodeError!Met
     }
 
     return result;
-}
-
-/// Find the end of a bencoded dictionary at the start of `data`.
-/// Returns null if the data does not start with a valid dict.
-fn findDictEnd(data: []const u8) ?usize {
-    if (data.len == 0 or data[0] != 'd') return null;
-    var idx: usize = 1;
-
-    while (idx < data.len) {
-        if (data[idx] == 'e') return idx + 1;
-
-        // Skip key (byte string)
-        idx = skipByteString(data, idx) orelse return null;
-        // Skip value
-        idx = skipBencodeValue(data, idx) orelse return null;
-    }
-    return null;
-}
-
-fn skipBencodeValue(data: []const u8, start: usize) ?usize {
-    if (start >= data.len) return null;
-    return switch (data[start]) {
-        'i' => {
-            // Integer: i<digits>e
-            var idx = start + 1;
-            while (idx < data.len) : (idx += 1) {
-                if (data[idx] == 'e') return idx + 1;
-            }
-            return null;
-        },
-        'l' => {
-            // List
-            var idx = start + 1;
-            while (idx < data.len) {
-                if (data[idx] == 'e') return idx + 1;
-                idx = skipBencodeValue(data, idx) orelse return null;
-            }
-            return null;
-        },
-        'd' => {
-            // Dict
-            var idx = start + 1;
-            while (idx < data.len) {
-                if (data[idx] == 'e') return idx + 1;
-                idx = skipByteString(data, idx) orelse return null;
-                idx = skipBencodeValue(data, idx) orelse return null;
-            }
-            return null;
-        },
-        '0'...'9' => skipByteString(data, start),
-        else => null,
-    };
-}
-
-fn skipByteString(data: []const u8, start: usize) ?usize {
-    var idx = start;
-    while (idx < data.len and data[idx] >= '0' and data[idx] <= '9') : (idx += 1) {}
-    if (idx >= data.len or data[idx] != ':') return null;
-    const len_str = data[start..idx];
-    const length = std.fmt.parseUnsigned(usize, len_str, 10) catch return null;
-    idx += 1;
-    const end = idx + length;
-    if (end > data.len) return null;
-    return end;
 }
 
 const Scanner = @import("bencode_scanner.zig").BencodeScanner(error{InvalidMessage});
@@ -621,15 +571,42 @@ test "decode rejects missing piece field" {
     try std.testing.expectError(error.MissingPieceField, decode(std.testing.allocator, payload));
 }
 
-test "findDictEnd basic cases" {
-    try std.testing.expectEqual(@as(?usize, 2), findDictEnd("de"));
-    try std.testing.expectEqual(@as(?usize, 12), findDictEnd("d1:ai1ee"));
-    try std.testing.expect(findDictEnd("") == null);
-    try std.testing.expect(findDictEnd("le") == null);
-
-    // Dict followed by extra data (simulates data message)
+test "decode data message records correct data_offset" {
+    // The previous `findDictEnd` test pinned the dict-boundary detector
+    // directly. The detector is now folded into `decode` via the hardened
+    // bencode scanner, so we assert the same invariant through the
+    // public surface: `data_offset` must point at the trailing raw piece
+    // bytes immediately after the dict's closing `e`.
     const input = "d8:msg_typei1e5:piecei0e10:total_sizei100eeHELLO";
-    const end = findDictEnd(input);
-    try std.testing.expect(end != null);
-    try std.testing.expectEqualStrings("HELLO", input[end.?..]);
+    const msg = try decode(std.testing.allocator, input);
+    try std.testing.expectEqual(MsgType.data, msg.msg_type);
+    try std.testing.expectEqual(@as(u32, 0), msg.piece);
+    try std.testing.expectEqual(@as(u32, 100), msg.total_size);
+    try std.testing.expectEqualStrings("HELLO", input[msg.data_offset..]);
+}
+
+test "decode rejects pathological length-prefix overflow" {
+    // Adversarial peer: a bencoded dict with a key whose declared
+    // length is `maxInt(u64)`. Pre-hardening, `findDictEnd` ->
+    // `skipByteString` computed `idx + length` directly and panicked
+    // with "integer overflow" in safe builds. The hardened scanner
+    // rejects the >20-digit prefix instead.
+    const adversarial = "d18446744073709551615:ABCD";
+    try std.testing.expectError(
+        error.InvalidMessage,
+        decode(std.testing.allocator, adversarial),
+    );
+}
+
+test "decode rejects deeply-nested adversarial bencode" {
+    // Adversarial peer: a payload that's just `l`'s. Pre-hardening,
+    // `skipBencodeValue` recursed once per `l` byte. With a 1 MiB
+    // BEP 10 message ceiling, a malicious peer could blow the native
+    // call stack. The hardened scanner caps recursion at 64.
+    var buf: [1024]u8 = undefined;
+    @memset(&buf, 'l');
+    try std.testing.expectError(
+        error.InvalidMessage,
+        decode(std.testing.allocator, &buf),
+    );
 }
