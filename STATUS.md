@@ -277,6 +277,7 @@ See `progress-reports/2026-04-25-stage2-event-loop-migration.md` for the Stage 2
 - **uTP multishot receive**: `recvmsg_multishot` plus a provided-buffer strategy still needs a workload and a measured implementation before it should land.
 - **Dynamic outbound buffer for UtpSocket**: fixed `[128]OutPacket` should become ArrayList for high-throughput uTP connections.
 - **c-ares io_uring integration**: proof-of-concept in `~/projects/c-ares` — native io_uring event engine with SENDMSG/RECVMSG for DNS queries (zero direct syscalls). Could replace varuna's DNS threadpool to eliminate background-thread DNS.
+- **`krpc.skipValue` recursive bencode parsing → explicit stack.** STYLE.md "no recursion" violation. Bounded by UDP MTU (~750 nesting depth max; 8 MiB default stack accommodates it), but a future TCP-framed KRPC variant or any caller that buffers >MTU would expose it as a remote crash. Rewrite using `std.BoundedArray` of state-machine entries as an explicit container-stack. Estimated 1-2 hours; reference `src/dht/krpc.zig:312`.
 - **Recheck-IO-generic refactor (unblocks live-pipeline BUGGIFY)**: `AsyncRecheck` is hard-coded to `*RealIO` (`src/io/recheck.zig:34`). Refactoring to `AsyncRecheckOf(IO)` (or `anytype` for the io pointer) would unblock an EL+SimIO BUGGIFY harness for the live recheck pipeline — per-tick `injectRandomFault` + per-op `FaultConfig` × 32 seeds wrapping `tests/recheck_test.zig`'s `live force-recheck` integration test. Also requires a `SimIO.setFileBytes(fd, content)` extension so SimIO-backed reads return real piece data instead of `usize=0`. The recheck-followups round (2026-04-26) shipped an algorithm-level cross-product safety harness (`tests/recheck_buggify_test.zig`) for the post-recheck callback's `applyRecheckResult` + `replaceCompletePieces` surfaces, but didn't cover live-wiring recovery paths (AsyncRecheck slot cleanup under read-error injection, hasher submission failures, partial completion races). Estimated 1-2 days for the refactor + harness wrap.
 
 ## Known Issues
@@ -288,6 +289,28 @@ See `progress-reports/2026-04-25-stage2-event-loop-migration.md` for the Stage 2
 - **MSE handshake failures in mixed encryption mode**: `vc_not_found` and `req1_not_found` errors occur during simultaneous inbound+outbound MSE handshakes. Timing-dependent, disappears under GDB. `demo_swarm.sh` runs with `encryption = "disabled"` as workaround.
 - ~~**Daemon graceful shutdown**~~: Fixed. In-flight transfer draining with configurable timeout now ensures clean exit on SIGTERM/SIGINT.
 - `IORING_OP_SETSOCKOPT` (kernel 6.7+), `IORING_OP_BIND`/`LISTEN` (kernel 6.11+) not available on current kernel 6.6. Per-peer setsockopt (TCP_NODELAY, buffer sizes) remains synchronous.
+
+## Last Verified Milestone (2026-04-26 — KRPC hardening round)
+
+KRPC parser + DHT untrusted-input audit (`parser-engineer` Track A on the correctness-2026-04-26 team), with three real adversarial-input bug fixes beyond the encoder bug filed by the prior round. Fuzz harness extended.
+
+### A1: KRPC encoder bounds checks (`dht: encoder bounds checks via Writer cursor`)
+- All 8 KRPC encoders rerouted through a new `Writer` cursor (`src/dht/krpc.zig:340-410`). Every byte goes through a saturating-subtraction bounds check; the `EncodeError = error{NoSpaceLeft}` return type is now sound.
+- Closes the bug filed by `progress-reports/2026-04-26-stage-4-and-buggify-exploration.md` ("KRPC encoders lack bounds checking, panic on too-small buffers").
+- 9 new "encoder returns NoSpaceLeft on tiny buffers" contract tests cover every encoder.
+
+### A2: Untrusted-input audit on `src/dht/`
+Three real overflow / clamp bugs surfaced in the audit beyond the encoder finding:
+- **`parseByteString` length-prefix overflow.** `i + len > data.len` overflowed `usize` for adversarial `len` near `maxInt(usize)` (panic in Debug, UB in Release). Replaced with saturating-subtraction form `len > data.len - i` and a 20-digit cap on the prefix scan.
+- **`parseError` u32 clamp.** `@intCast(@max(code, 0))` panicked when an error response carried `code > maxInt(u32)`. Now clamps both ends.
+- **`handleResponse` compact peer-list digit flood.** IPv4 / IPv6 peer-list parser had `dlen = dlen * 10 + d` and `vpos += dlen` with no bound — both overflowed `usize` on `999...:` prefixes. Refactored into a dedicated `parseCompactPeers` helper with a 5-digit cap and saturating remainder.
+- One STYLE.md violation (`skipValue` recursive bencode parsing) deferred per pattern #14: bounded by UDP MTU in production, but a TCP-framed KRPC variant would expose it. Filed for explicit-stack rewrite (~1-2 hours).
+
+### A3: Fuzz harness extended (`tests/dht_krpc_buggify_test.zig`)
++22 new tests bringing the bundle from 7 to 29 tests. Coverage adds: encoder NoSpaceLeft contract (9), parser length-prefix / integer-overflow / error-code clamp / pathological-string / type-confusion / off-by-one node-id / round-trip regression (7), token forgery fuzz (2), adversarial bencode-shaped envelope fuzz (1), compact peer-list adversarial inputs end-to-end through `DhtEngine.handleIncoming` (1), unsolicited-response and short-txn-id no-state-mutation tests (2).
+
+### Combined
+**620 → 642 (+22)** tests passing across the suite. Detail in `progress-reports/2026-04-26-krpc-hardening.md`.
 
 ## Last Verified Milestone (2026-04-26 — followups-2 round)
 
