@@ -289,7 +289,9 @@ See `progress-reports/2026-04-25-stage2-event-loop-migration.md` for the Stage 2
 - ~~**Daemon graceful shutdown**~~: Fixed. In-flight transfer draining with configurable timeout now ensures clean exit on SIGTERM/SIGINT.
 - `IORING_OP_SETSOCKOPT` (kernel 6.7+), `IORING_OP_BIND`/`LISTEN` (kernel 6.11+) not available on current kernel 6.6. Per-peer setsockopt (TCP_NODELAY, buffer sizes) remains synchronous.
 
-## Last Verified Milestone (2026-04-26 — recheck followups round)
+## Last Verified Milestone (2026-04-26 — followups-2 round)
+
+Combined work from two parallel engineers: recheck-engineer closed three recheck-adjacent followups; explorer-engineer closed Zero-alloc Stage 4 plus a DHT BUGGIFY exploration that surfaced a real production bug.
 
 ### Recheck followups (recheck-engineer): A1 + A2 + A3
 Three contained recheck-adjacent followups deferred from the prior post-Phase-2 + cleanup-engineer sessions.
@@ -299,11 +301,22 @@ Three contained recheck-adjacent followups deferred from the prior post-Phase-2 
   `PieceTracker.applyRecheckResult` previously dropped ALL in_progress claims on recheck. Now applies a per-piece truth table: `new_in_progress[i] = old_in_progress[i] AND NOT new_complete[i]`. The "keep claim" branch (`was_in_progress` AND `now_complete=false`) is the optimization — when a peer is mid-downloading piece N and the recheck correctly finds N incomplete-on-disk (some blocks haven't flushed), the prior heavy clear forced re-claim and re-request of buffered blocks; the surgical update preserves the DP/buf state. The rare row-1 race (`was_in_progress` AND `now_complete=true`) drops in_progress; the orphaned DP cleans up via the normal `completePieceDownload` → `completePiece`-returns-false-as-duplicate flow. 4 truth-table tests + 1 mixed cross-product (replacing the prior heavy-clear test).
 - **Task A3 — Safety harness for the recheck surfaces** (`recheck: 32-seed safety harness for A1+A2 surfaces`).
   `tests/recheck_buggify_test.zig` — a 32-seed randomized cross-product safety harness for both A1 + A2 surfaces. Per seed, randomize pre-recheck `complete` + `in_progress` bitfields, recheck-result bitfield, `piece_count` ∈ [4, 256], and info_hash. Drive the surfaces in production order; assert: storage `bits.ptr` stable, complete bits match recheck, in_progress matches surgical truth table, bytes_complete reflects recheck, resume DB pieces table = recheck result exactly, no leak, no panic. Vacuous-pass guards pin coverage at ≥28/32 seeds per branch; empirically all three surfaces saturate at 32/32. First run telemetry: `RECHECK BUGGIFY summary: 32 seeds, piece_count [13, 255], A2 preserved in 32/32, A2 race-dropped in 32/32, A1 pruned in 32/32; total 516 preserved blocks, 1076 stale rows pruned`. Wired at `test-recheck-buggify`.
-- **A3 scope honesty.** The full-pipeline EL+SimIO BUGGIFY harness (per-tick `injectRandomFault` + per-op `FaultConfig` over 32 seeds at the live recheck pipeline) is blocked on `AsyncRecheck` being hard-coded to `*RealIO` (`src/io/recheck.zig:34`). Per pattern #14 (investigation discipline), filed the recheck-IO-generic refactor as a follow-up and shipped the algorithm-level cross-product harness now. The two surfaces I changed are pure algorithmic — algorithm-level testing captures their full safety contract per the layered-testing-strategy "safety properties are fault-invariant" rule.
-- **Test count**: 599 → 608 (+9; A1: +4, A2: +3 net, A3: +2). Stable across full-suite runs.
+- **A3 scope honesty.** The full-pipeline EL+SimIO BUGGIFY harness (per-tick `injectRandomFault` + per-op `FaultConfig` over 32 seeds at the live recheck pipeline) is blocked on `AsyncRecheck` being hard-coded to `*RealIO` (`src/io/recheck.zig:34`). Per pattern #14 (investigation discipline), filed the recheck-IO-generic refactor as a follow-up and shipped the algorithm-level cross-product harness now. The two surfaces are pure algorithmic — algorithm-level testing captures their full safety contract per the layered-testing-strategy "safety properties are fault-invariant" rule.
+
+### Stage 4 + DHT BUGGIFY exploration (explorer-engineer)
+- **Task B1 — Zero-alloc Stage 4: ut_metadata fetch buffer** (`zero-alloc: Stage 4 — pre-allocated ut_metadata fetch buffer`).
+  EventLoop now owns one `[max_metadata_size]u8` buffer + one `[max_piece_count]bool` array (lazy-allocated on first `startMetadataFetch`, freed in `deinit`). `MetadataAssembler.initShared` routes through caller-owned storage with a panicking allocator vtable as a tripwire — the zero-alloc invariant is self-auditing under fuzz/BUGGIFY. `resetForNewFetch` cycles between fetches. The existing `metadata_fetch != null` invariant on EventLoop already serialises fetches across torrents (`event_loop.zig:1859`), so a single shared buffer suffices — multi-day savings from reading the existing invariant rather than designing a pool. 9 layered tests in `tests/metadata_fetch_shared_test.zig`.
+- **Task B2 — BUGGIFY exploration: DHT KRPC + RoutingTable** (`dht: BUGGIFY fuzz coverage for KRPC parser + RoutingTable`).
+  Added 7 fuzz/BUGGIFY tests in `tests/dht_krpc_buggify_test.zig`: random-byte fuzz of `krpc.parse` (32 seeds × 1024 packets), bit-flip mutation of valid ping queries, deeply-nested KRPC dict at UDP MTU, `decodeCompactNode` fuzz, RoutingTable adversarial flood with k-bucket invariant checks, and `findClosest` zero-buf safety.
+- **Bug found**: KRPC encoders (`encodePingQuery`, etc.) take `buf: []u8` and return `!usize` implying error-on-overflow, but internal `writeByteString` (`krpc.zig:638`) and `writeInteger` (`krpc.zig:647`) write directly into the slice with no bounds checks. Calling any encoder with a too-small buffer panics in Debug, UB in Release. Currently safe in production (only caller uses MTU-sized buffer) but the API contract is unsound. Filed as Task #6/#7 for ~30 min mechanical fix.
+
+### Combined test count
+**599 → 624 (+25)** stable across full-suite runs. Broken down:
+- Recheck round: +9 (A1: 4, A2: 3 net, A3: 2)
+- Stage 4 + BUGGIFY: +16 (Stage 4: 9, KRPC BUGGIFY: 7)
 - `zig build`: clean. `zig fmt`: clean.
 
-Detail in `progress-reports/2026-04-26-recheck-followups.md`.
+Detail in `progress-reports/2026-04-26-recheck-followups.md` and `progress-reports/2026-04-26-stage-4-and-buggify-exploration.md`.
 
 ## Last Verified Milestone (2026-04-26 — followups round)
 

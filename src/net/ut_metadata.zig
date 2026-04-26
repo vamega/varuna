@@ -219,10 +219,53 @@ fn skipByteString(data: []const u8, start: usize) ?usize {
 
 const Scanner = @import("bencode_scanner.zig").BencodeScanner(error{InvalidMessage});
 
+/// Allocator vtable that panics on every operation. Used as a sentinel
+/// for `MetadataAssembler.initShared`, where the assembler holds an
+/// `Allocator` field for layout uniformity but must never call into it
+/// (storage is externally owned). Hitting one of these panics is a
+/// real-bug signal: a code path silently routed through the owning
+/// allocator instead of the shared buffer.
+fn sharedAllocPanic(_: *anyopaque, _: usize, _: std.mem.Alignment, _: usize) ?[*]u8 {
+    @panic("MetadataAssembler.initShared: alloc not allowed; storage is caller-owned");
+}
+fn sharedResizePanic(_: *anyopaque, _: []u8, _: std.mem.Alignment, _: usize, _: usize) bool {
+    @panic("MetadataAssembler.initShared: resize not allowed; storage is caller-owned");
+}
+fn sharedRemapPanic(_: *anyopaque, _: []u8, _: std.mem.Alignment, _: usize, _: usize) ?[*]u8 {
+    @panic("MetadataAssembler.initShared: remap not allowed; storage is caller-owned");
+}
+fn sharedFreePanic(_: *anyopaque, _: []u8, _: std.mem.Alignment, _: usize) void {
+    @panic("MetadataAssembler.initShared: free not allowed; storage is caller-owned");
+}
+const noop_alloc_vtable: std.mem.Allocator.VTable = .{
+    .alloc = sharedAllocPanic,
+    .resize = sharedResizePanic,
+    .remap = sharedRemapPanic,
+    .free = sharedFreePanic,
+};
+
 // ── Metadata assembler ──────────────────────────────────────
+
+/// Maximum number of metadata pieces, given `max_metadata_size` and
+/// the fixed 16 KiB BEP 9 piece size. Used to size the pre-allocated
+/// `received` array on the EventLoop's shared metadata-fetch slot.
+pub const max_piece_count: u32 =
+    (max_metadata_size + metadata_piece_size - 1) / metadata_piece_size;
 
 /// Collects metadata pieces, verifies the assembled result against
 /// an expected info-hash, and produces the raw info dictionary bytes.
+///
+/// Two ownership models for the assembly storage:
+///   * `init` — assembler owns its allocator, allocates `buffer` and
+///     `received` lazily on `setSize` and frees them on `deinit`. Used
+///     by tests and the legacy blocking `MetadataFetcher`.
+///   * `initShared` — the caller passes in pre-allocated `buffer` and
+///     `received` slices sized to the BEP 9 worst case. The assembler
+///     uses prefixes of those slices and never frees them. Used by the
+///     daemon's `AsyncMetadataFetch`, where the EventLoop owns one
+///     16-MiB-class fetch slot shared across all torrents (BEP 9
+///     guarantees at most one in-flight metadata fetch per torrent;
+///     the EventLoop further serialises across torrents).
 pub const MetadataAssembler = struct {
     allocator: std.mem.Allocator,
     expected_hash: [20]u8,
@@ -231,6 +274,17 @@ pub const MetadataAssembler = struct {
     buffer: ?[]u8 = null,
     received: ?[]bool = null,
     pieces_received: u32 = 0,
+    /// When false, `buffer` and `received` were provided by the caller
+    /// and will not be freed in `deinit`. The assembler still uses
+    /// `buffer[0..total_size]` and `received[0..piece_count]` once
+    /// `setSize` runs; the underlying slices may be longer.
+    owns_storage: bool = true,
+    /// Capacity of the externally-provided `buffer`, in bytes. Only
+    /// meaningful when `owns_storage` is false.
+    shared_buf_capacity: u32 = 0,
+    /// Capacity of the externally-provided `received`, in entries.
+    /// Only meaningful when `owns_storage` is false.
+    shared_received_capacity: u32 = 0,
 
     pub fn init(allocator: std.mem.Allocator, expected_hash: [20]u8) MetadataAssembler {
         return .{
@@ -239,9 +293,40 @@ pub const MetadataAssembler = struct {
         };
     }
 
+    /// Construct an assembler that uses an externally-owned buffer and
+    /// `received` array. Typical use: the daemon's EventLoop owns one
+    /// pre-allocated `[max_metadata_size]u8` and `[max_piece_count]bool`,
+    /// passed in for every fetch.
+    pub fn initShared(
+        expected_hash: [20]u8,
+        buffer: []u8,
+        received: []bool,
+    ) MetadataAssembler {
+        // The assembler is BEP-9-stateless until `setSize` runs; the
+        // shared storage is reset there and on `reset()` between fetches.
+        std.debug.assert(buffer.len >= 1);
+        std.debug.assert(received.len >= 1);
+        return .{
+            // Allocator is unused on the initShared path -- assertions
+            // guard against any accidental free.
+            .allocator = std.mem.Allocator{
+                .ptr = undefined,
+                .vtable = &noop_alloc_vtable,
+            },
+            .expected_hash = expected_hash,
+            .owns_storage = false,
+            .shared_buf_capacity = std.math.cast(u32, buffer.len) orelse std.math.maxInt(u32),
+            .shared_received_capacity = std.math.cast(u32, received.len) orelse std.math.maxInt(u32),
+            .buffer = buffer,
+            .received = received,
+        };
+    }
+
     pub fn deinit(self: *MetadataAssembler) void {
-        if (self.buffer) |buf| self.allocator.free(buf);
-        if (self.received) |r| self.allocator.free(r);
+        if (self.owns_storage) {
+            if (self.buffer) |buf| self.allocator.free(buf);
+            if (self.received) |r| self.allocator.free(r);
+        }
         self.* = undefined;
     }
 
@@ -256,11 +341,26 @@ pub const MetadataAssembler = struct {
             return;
         }
 
+        const piece_count = (total_size + metadata_piece_size - 1) / metadata_piece_size;
+
+        if (self.owns_storage) {
+            self.buffer = try self.allocator.alloc(u8, total_size);
+            self.received = try self.allocator.alloc(bool, piece_count);
+            @memset(self.received.?, false);
+        } else {
+            // Shared path: the caller pre-allocated worst-case storage.
+            // Reject sizes that won't fit (defends against a future change
+            // to `max_metadata_size` outpacing the EventLoop's buffer).
+            if (total_size > self.shared_buf_capacity) return error.InvalidMetadataSize;
+            if (piece_count > self.shared_received_capacity) return error.InvalidMetadataSize;
+            // Zero only the prefix we'll actually consult. The fetch may
+            // run again on another torrent without the EventLoop having
+            // to memset the whole worst-case array.
+            @memset(self.received.?[0..piece_count], false);
+        }
+
         self.total_size = total_size;
-        self.piece_count = (total_size + metadata_piece_size - 1) / metadata_piece_size;
-        self.buffer = try self.allocator.alloc(u8, total_size);
-        self.received = try self.allocator.alloc(bool, self.piece_count);
-        @memset(self.received.?, false);
+        self.piece_count = piece_count;
     }
 
     /// How many pieces do we need?
@@ -303,7 +403,10 @@ pub const MetadataAssembler = struct {
     /// Return the index of the next unreceived piece, or null if all received.
     pub fn nextNeeded(self: *const MetadataAssembler) ?u32 {
         const received = self.received orelse return null;
-        for (received, 0..) |got, i| {
+        // Iterate only the active prefix; the shared path may have a
+        // longer `received` slice than the current fetch needs.
+        const active = received[0..self.piece_count];
+        for (active, 0..) |got, i| {
             if (!got) return @intCast(i);
         }
         return null;
@@ -326,10 +429,32 @@ pub const MetadataAssembler = struct {
         return buf[0..self.total_size];
     }
 
-    /// Reset the assembler to try again (e.g., after a hash mismatch).
+    /// Reset the assembler to try again (e.g., after a hash mismatch on
+    /// the same fetch, where total_size and piece_count remain valid).
     pub fn reset(self: *MetadataAssembler) void {
-        if (self.received) |r| @memset(r, false);
+        if (self.received) |r| {
+            // Only clear the active prefix to keep the shared-path reset
+            // O(piece_count) rather than O(max_piece_count).
+            const n: usize = if (self.piece_count > 0) self.piece_count else r.len;
+            @memset(r[0..n], false);
+        }
         self.pieces_received = 0;
+    }
+
+    /// Reset the assembler for a brand-new fetch on shared storage.
+    /// Clears `total_size`/`piece_count` so the next `setSize` call is
+    /// accepted as the first one for a new info-hash. Only valid on
+    /// `initShared` assemblers.
+    pub fn resetForNewFetch(self: *MetadataAssembler, expected_hash: [20]u8) void {
+        std.debug.assert(!self.owns_storage);
+        if (self.received) |r| {
+            const n: usize = if (self.piece_count > 0) self.piece_count else 0;
+            if (n > 0) @memset(r[0..n], false);
+        }
+        self.pieces_received = 0;
+        self.total_size = 0;
+        self.piece_count = 0;
+        self.expected_hash = expected_hash;
     }
 };
 

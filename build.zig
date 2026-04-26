@@ -606,6 +606,40 @@ pub fn build(b: *std.Build) void {
     test_piece_tracker_cache_buggify_step.dependOn(&run_piece_tracker_cache_buggify_tests.step);
     test_step.dependOn(&run_piece_tracker_cache_buggify_tests.step);
 
+    // ── DHT KRPC + RoutingTable BUGGIFY tests ─────────────
+    const dht_krpc_buggify_tests = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("tests/dht_krpc_buggify_test.zig"),
+            .target = target,
+            .optimize = optimize,
+            .imports = &varuna_import,
+        }),
+    });
+    const run_dht_krpc_buggify_tests = b.addRunArtifact(dht_krpc_buggify_tests);
+    const test_dht_krpc_buggify_step = b.step(
+        "test-dht-krpc-buggify",
+        "Run BUGGIFY-style fuzz coverage for the DHT KRPC parser and routing table",
+    );
+    test_dht_krpc_buggify_step.dependOn(&run_dht_krpc_buggify_tests.step);
+    test_step.dependOn(&run_dht_krpc_buggify_tests.step);
+
+    // ── Stage 4 zero-alloc: ut_metadata fetch buffer tests ──
+    const metadata_fetch_shared_tests = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("tests/metadata_fetch_shared_test.zig"),
+            .target = target,
+            .optimize = optimize,
+            .imports = &varuna_import,
+        }),
+    });
+    const run_metadata_fetch_shared_tests = b.addRunArtifact(metadata_fetch_shared_tests);
+    const test_metadata_fetch_shared_step = b.step(
+        "test-metadata-fetch-shared",
+        "Run Stage 4 zero-alloc shared-buffer ut_metadata fetch tests",
+    );
+    test_metadata_fetch_shared_step.dependOn(&run_metadata_fetch_shared_tests.step);
+    test_step.dependOn(&run_metadata_fetch_shared_tests.step);
+
     // ── RPC server stress test (Track C: connect/disconnect churn) ──
     const rpc_server_stress_tests = b.addTest(.{
         .root_module = b.createModule(.{

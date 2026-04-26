@@ -351,6 +351,18 @@ pub fn EventLoopOf(comptime IO: type) type {
         // Async BEP 9 metadata fetch state machine (null when no fetch is active)
         metadata_fetch: ?*metadata_handler.AsyncMetadataFetch = null,
 
+        // Stage 4 zero-alloc: pre-allocated worst-case storage for the
+        // ut_metadata assembler. BEP 9 says at most one in-flight fetch
+        // per torrent; `startMetadataFetch` further serialises across
+        // torrents (`metadata_fetch != null` gate). One buffer is
+        // therefore enough for the daemon. Sized at
+        // `ut_metadata.max_metadata_size` (10 MiB current cap; BEP 9
+        // protocol limit is 16 MiB). Allocated on first
+        // `startMetadataFetch` call and retained across fetches; freed
+        // in `deinit`.
+        metadata_assembly_buffer: ?[]u8 = null,
+        metadata_assembly_received: ?[]bool = null,
+
         // BEP 19: web seed download slots
         web_seed_slots: [web_seed_handler.max_web_seed_slots]web_seed_handler.WebSeedSlot =
             [_]web_seed_handler.WebSeedSlot{.{}} ** web_seed_handler.max_web_seed_slots,
@@ -590,6 +602,16 @@ pub fn EventLoopOf(comptime IO: type) type {
             // Clean up active async state machines (metadata fetch, recheck)
             self.cancelMetadataFetch();
             self.cancelAllRechecks();
+
+            // Free the shared metadata-assembly buffer (Stage 4 zero-alloc).
+            if (self.metadata_assembly_buffer) |buf| {
+                self.allocator.free(buf);
+                self.metadata_assembly_buffer = null;
+            }
+            if (self.metadata_assembly_received) |recv| {
+                self.allocator.free(recv);
+                self.metadata_assembly_received = null;
+            }
 
             // Free web seed slot buffers (in-flight downloads that didn't complete)
             for (&self.web_seed_slots) |*ws| {
@@ -1846,6 +1868,17 @@ pub fn EventLoopOf(comptime IO: type) type {
 
         /// Start an async BEP 9 metadata fetch for a magnet link.
         /// The on_complete callback fires when metadata is available or all peers fail.
+        ///
+        /// On first call, the worst-case-sized assembly buffer
+        /// (`max_metadata_size` bytes) and `received` array are
+        /// allocated and retained for the lifetime of the EventLoop.
+        /// All subsequent fetches reuse these slices, eliminating the
+        /// per-fetch heap alloc that the original BEP 9 path
+        /// performed inside `MetadataAssembler.setSize`. BEP 9 admits
+        /// at most one in-flight metadata fetch per torrent; this code
+        /// further serialises across torrents via the
+        /// `metadata_fetch != null` gate, so a single shared buffer is
+        /// always sufficient.
         pub fn startMetadataFetch(
             self: *Self,
             info_hash: [20]u8,
@@ -1858,6 +1891,17 @@ pub fn EventLoopOf(comptime IO: type) type {
         ) !void {
             if (self.metadata_fetch != null) return error.MetadataFetchAlreadyActive;
 
+            // Lazy first-use allocation of the shared assembly storage.
+            // Subsequent fetches reuse these slices.
+            if (self.metadata_assembly_buffer == null) {
+                const ut = @import("../net/ut_metadata.zig");
+                const buf = try self.allocator.alloc(u8, ut.max_metadata_size);
+                errdefer self.allocator.free(buf);
+                const recv = try self.allocator.alloc(bool, ut.max_piece_count);
+                self.metadata_assembly_buffer = buf;
+                self.metadata_assembly_received = recv;
+            }
+
             self.metadata_fetch = try metadata_handler.AsyncMetadataFetch.create(
                 self.allocator,
                 &self.io,
@@ -1868,6 +1912,8 @@ pub fn EventLoopOf(comptime IO: type) type {
                 peers,
                 on_complete,
                 caller_ctx,
+                self.metadata_assembly_buffer,
+                self.metadata_assembly_received,
             );
             self.metadata_fetch.?.start();
         }
