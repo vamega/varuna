@@ -330,6 +330,14 @@ pub const PendingSend = struct {
             small_slot: ?u16 = null,
         },
         vectored: *VectoredSendState,
+        /// Peer was removed mid-send. The buffer has been freed; the
+        /// pool slot stays claimed until the CQE fires (so the kernel /
+        /// SimIO heap reference to `completion` resolves cleanly before
+        /// the slot can be re-handed-out to another caller). On CQE,
+        /// `handleSendResult`'s peer-freed branch calls
+        /// `freeOnePendingSend` which routes through `releasePendingSend`,
+        /// which sees `.ghost` and only does the pool release.
+        ghost: void,
     } = .{ .free = 0 },
     /// Caller-owned completion driving the in-flight send for this
     /// PendingSend. The PendingSend's address is the kernel's user_data,

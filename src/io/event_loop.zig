@@ -2190,6 +2190,7 @@ pub fn EventLoopOf(comptime IO: type) type {
                         return .resubmitted;
                     }
                 },
+                .ghost => return .complete, // peer was removed; the CQE will route through the peer-freed branch in handleSendResult
                 .free => unreachable, // active PendingSend can't be in `free` state
             }
             return .complete;
@@ -2218,19 +2219,28 @@ pub fn EventLoopOf(comptime IO: type) type {
             }
         }
 
-        /// Free ALL pending send buffers for the given slot.
-        /// Called during peer removal to clean up any buffers that won't be
-        /// reclaimed by future CQE processing (the fd is closed so remaining
-        /// CQEs will arrive as errors for a potentially-reused slot).
+        /// Mark all pending sends for a peer as ghosts (buffer freed,
+        /// pool slot retained until CQE fires). Called during peer
+        /// removal. The entries stay in `pending_sends` so that when
+        /// the in-flight send's CQE eventually arrives — possibly with
+        /// a -EBADF / BrokenPipe error after the fd close, possibly
+        /// successfully if the kernel already flushed — the callback's
+        /// peer-freed branch can find the (slot, send_id) entry and
+        /// route through `releasePendingSend(.ghost)` for the final
+        /// pool release.
+        ///
+        /// Eagerly returning the pool slot here would be a UAF: the
+        /// SimIO/RealIO completion heap still references the
+        /// Completion, and the next pool claim would re-hand-out the
+        /// slot to a different peer's send. When the original send
+        /// finally fires, the @fieldParentPtr recovery would resolve
+        /// to the new peer's data — wrong-peer trust adjustments,
+        /// double-free of the new peer's buffer, etc.
         fn freeAllPendingSends(self: *Self, slot: u16) void {
-            var i: usize = 0;
-            while (i < self.pending_sends.items.len) {
-                if (self.pending_sends.items[i].slot == slot) {
-                    self.releasePendingSend(self.pending_sends.items[i]);
-                    _ = self.pending_sends.swapRemove(i);
-                    continue;
+            for (self.pending_sends.items) |ps| {
+                if (ps.slot == slot) {
+                    self.markPendingSendGhost(ps);
                 }
-                i += 1;
             }
         }
 
@@ -2258,9 +2268,40 @@ pub fn EventLoopOf(comptime IO: type) type {
                     }
                 },
                 .vectored => |state| self.releaseVectoredSendState(state),
+                .ghost => {
+                    // Buffer was already freed by `freeAllPendingSends` when
+                    // the peer was removed mid-send. The pool slot was kept
+                    // claimed until now (CQE fired) so SimIO/RealIO's heap
+                    // reference to `completion` resolved cleanly. Pool
+                    // release below is the only remaining cleanup.
+                },
                 .free => unreachable, // releasing an already-released PendingSend
             }
             self.pending_send_pool.release(pending_send);
+        }
+
+        /// Mark a PendingSend as a "ghost": free its buffer (peer is
+        /// gone, the bytes are dead) but keep the pool slot claimed
+        /// until the in-flight CQE fires. This avoids a UAF where the
+        /// pool would re-hand the slot to a new caller before SimIO/
+        /// RealIO finishes with the original Completion. The CQE
+        /// callback (`handleSendResult` peer-freed branch) drives the
+        /// final pool release via `freeOnePendingSend` →
+        /// `releasePendingSend(.ghost)`.
+        fn markPendingSendGhost(self: *Self, pending_send: *PendingSend) void {
+            switch (pending_send.storage) {
+                .owned => |owned| {
+                    if (owned.small_slot) |small_slot| {
+                        self.small_send_pool.release(small_slot);
+                    } else {
+                        self.allocator.free(owned.buf);
+                    }
+                },
+                .vectored => |state| self.releaseVectoredSendState(state),
+                .ghost => return, // idempotent: already marked
+                .free => unreachable, // marking an already-released PendingSend
+            }
+            pending_send.storage = .ghost;
         }
 
         /// Claim a PendingSend slot from the per-EventLoop pool and append it to
@@ -2307,6 +2348,7 @@ pub fn EventLoopOf(comptime IO: type) type {
                     self,
                     peer_handler.pendingSendCompleteFor(Self),
                 ),
+                .ghost => unreachable, // submitPendingSend is called only on freshly-claimed slots; ghost is a post-removal state
                 .free => unreachable, // active PendingSend can't be in `free` state
             }
             peer.send_pending = true;
