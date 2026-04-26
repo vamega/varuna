@@ -233,6 +233,17 @@ specified a new attribution channel, the production-side would have refactored t
 it, and the existing fields would have become dead code. Cost of the reread: ~30
 minutes. Cost of skipping it: 1-2 days of production-test-warp churn.
 
+**Caveat — what the protocol does NOT gate.** The protocol gates **API surface
+decisions** — anywhere "does this API shape compose with the test scaffolds?" matters.
+It does **not** gate **implementation choices inside the production body** that don't
+change the API surface. A small reversible fix (e.g. pool ghost-state vs `io.cancel` to
+close a UAF, both delivering the same observable behavior to the test) should
+ship-then-coordinate, not coordinate-then-ship. Stalling on the wrong granularity is
+itself a coordination failure: the other engineer can't review your implementation
+choices without the diff, and your "blocked on ack" idle time is pure cost. Heuristic:
+**if the diff is reversible in under an hour, ship and ping; if it changes a name the
+test scaffolds reference, get the ack first**.
+
 ---
 
 ## Memory
