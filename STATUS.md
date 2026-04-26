@@ -288,6 +288,37 @@ See `progress-reports/2026-04-25-stage2-event-loop-migration.md` for the Stage 2
 - ~~**Daemon graceful shutdown**~~: Fixed. In-flight transfer draining with configurable timeout now ensures clean exit on SIGTERM/SIGINT.
 - `IORING_OP_SETSOCKOPT` (kernel 6.7+), `IORING_OP_BIND`/`LISTEN` (kernel 6.11+) not available on current kernel 6.6. Per-peer setsockopt (TCP_NODELAY, buffer sizes) remains synchronous.
 
+## Last Verified Milestone (2026-04-26 — followups-2 round)
+
+### Followups-2 round (explorer-engineer): zero-alloc Stage 4 + DHT BUGGIFY
+- **Task B1 — Zero-alloc Stage 4: ut_metadata fetch buffer**
+  (`zero-alloc: Stage 4 — pre-allocated ut_metadata fetch buffer`).
+  EventLoop now owns one `[max_metadata_size]u8` buffer + one
+  `[max_piece_count]bool` array (lazy-allocated on first
+  `startMetadataFetch`, freed in `deinit`). `MetadataAssembler.initShared`
+  routes through caller-owned storage (no per-fetch heap alloc on the
+  assembler path); `resetForNewFetch` cycles between fetches. The
+  existing `metadata_fetch != null` invariant on EventLoop already
+  serialises fetches across torrents, so a single shared buffer
+  suffices (design (a) from the team-lead's spec).
+- **Task B2 — BUGGIFY exploration: DHT KRPC + RoutingTable**
+  (`dht: BUGGIFY fuzz coverage for KRPC parser + RoutingTable`).
+  Added 7 fuzz/BUGGIFY tests in `tests/dht_krpc_buggify_test.zig`:
+  random-byte fuzz of `krpc.parse` (32 seeds × 1024 packets),
+  bit-flip mutation of valid ping queries, deeply-nested KRPC dict
+  at UDP MTU, `decodeCompactNode` fuzz, RoutingTable adversarial
+  flood with k-bucket invariant checks, and `findClosest` zero-buf
+  safety. **Bug found**: KRPC encoders lack bounds checking and
+  panic on too-small buffers (filed as Task #6, not in production
+  attack surface today since the only caller uses MTU-sized
+  buffers).
+- **Test count**: 599 → 615 (+16; +9 from Stage 4 layered tests
+  in `tests/metadata_fetch_shared_test.zig`, +7 from KRPC BUGGIFY).
+  Stable across full-suite runs.
+- `zig build`: clean. `zig fmt`: clean.
+
+Detail in `progress-reports/2026-04-26-stage-4-and-buggify-exploration.md`.
+
 ## Last Verified Milestone (2026-04-26 — followups round)
 
 ### Followups round (cleanup-engineer): app/config test discovery + live force-recheck
