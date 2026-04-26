@@ -69,12 +69,47 @@ scoped pass" the task envisioned. Each file would need a small fix (struct
 literal additions, slice syntax updates, switch cases) which is mechanical
 but requires running each test and verifying expected behavior post-fix.
 
-**Recommendation**: file as a follow-up "src-tests bit-rot cleanup" task,
-not folded into Task #6's housekeeping scope. The wins:
+**Deeper exploration after team-lead's escalation** (2026-04-26 PM): I
+spent ~1h prototyping the fixes — the compile errors ARE mechanical and
+addressable. But once unblocked, ~10+ runtime test failures surface,
+showing real logic drift that needs case-by-case investigation:
+
+- `torrent.bencode` rejects-deeply-nested-lists: production added
+  depth-check (returns `error.NestingTooDeep`) but test still expects
+  `error.UnexpectedEndOfStream`.
+- `torrent.blocks` split-pieces: `layout.build` shape changed.
+- `torrent.create` torrent-bytes-length: 42 vs expected 43.
+- `torrent.layout` map-piece-across-multiple-files: span count differs.
+- `torrent.magnet` rejects-invalid-hex: error type drift.
+- `torrent.merkle_cache` rejects-wrong-root: terminates with signal 6
+  (assertion fire likely from Track A's piece_hashes ?[]const u8).
+- `torrent.metainfo` rejects-non-dict-root: `error.UnexpectedByte` vs
+  expected `error.UnexpectedBencodeType`.
+- `torrent.piece_tracker` wanted-mask: returns 0 when expected null
+  (selective-download semantics drift).
+- More once compile chain unblocks.
+
+The pattern is clear: each bit-rotted test is a small, isolated fix
+(update test expectations to match production) but the cumulative work
+is half-day to a day, not 1–2 hours. Logged in detail in **Task #9**
+description so a future engineer can resume without re-discovery.
+
+**Recommendation**: Task #9 stays separate. Tackle one subsystem at a
+time, one commit per subsystem, since the pull-in test count would be
+large enough that per-subsystem commits are more bisectable than a
+mega-commit. Start with crypto (smallest blast), then torrent (largest
+wins), leave app/config for last (require Zig std API research). The
+production-clean change `Metainfo.files: []File` → `[]const File`
+verified during this exploration is a free lunch — apply alongside
+torrent's first cleanup commit.
+
+**Wins once Task #9 lands**:
 1. Subsystem-level invariants get test coverage close to the code they
    pin (the canonical "tests live next to the code" shape).
 2. Future similar drift will be caught when tests don't compile, not
    silently when they stop running.
+3. Test count likely jumps another ~150 tests (counted source-side
+   `test "..."` blocks across all subsystems).
 
 ## Test count progression
 
