@@ -347,6 +347,13 @@ Conclusions: no `>2×` regressions; Stage 2 perf is clean for shipping. `peer_ac
   - `sync_stats_live --iterations=1 --torrents=10000`: unchanged (`8` allocs / `4.5 MB` peak / `3.67e6 ns`).
 - DHT tick-scoped arena, PEX per-peer encode buffer, and extension handshake stack-buffer encoder deferred (modest per-event churn; cross-module lifetime reasoning needed for the DHT case). Detail in `progress-reports/2026-04-26-zero-alloc-stage-2.md`.
 
+### Task #5: tick_sparse_torrents 1.4× regression closed (Track B follow-up)
+- **Root cause**: `peer_policy.checkPartialSeed` calls `PieceTracker.isPartialSeed` once per torrent per tick; `isPartialSeed` -> `wantedRemaining` -> `wantedCompletedCountLocked` was an O(piece_count) bitfield AND-loop. At 500 active torrents × 500 iterations, that's 250K calls × ~70 ns/call ≈ 17 ms per bench run, dominating wall time. NOT generic-dispatch overhead from `EventLoopOf(IO)` (the original hypothesis); machine code is identical between concrete `*EventLoop` and `anytype self` instantiations under ReleaseFast.
+- **Fix** (`src/torrent/piece_tracker.zig`): cache `wanted_completed_count` on the tracker, maintained incrementally — `completePiece` increments it when the completed piece is wanted; `setWanted` / `swapWanted` recompute on mask transitions (cold path). `wantedCompletedCountLocked` becomes a one-line read.
+- **Bench delta on `tick_sparse_torrents --iterations=500 --torrents=10000 --peers=512 --scale=20`**: `1.5e7–2.2e7 ns` (post-Stage-2 regression) → **`3.4e6–4.3e6 ns`** — **3× faster than the 2026-04-16 baseline `1.09e7 ns`**. Allocs unchanged: 0/0.
+- **Isolated bench via diagnostic harness**: `isPartialSeed` per call 70.2 ns → 12.0 ns (5.8×); `checkPartialSeed` per torrent per iter 60.7 ns → 12.6 ns (4.8×).
+- **Test count**: 230 → 233 (`tests/piece_tracker_cache_test.zig` adds three regression guards: complete-with-mask, mask-transition recompute, mask-removal recompute).
+
 ## Last Verified Milestone (2026-04-16)
 
 - Demo swarm end-to-end with uTP enabled: `demo_swarm.sh` runs TCP+uTP, seeder-to-downloader transfer verified
