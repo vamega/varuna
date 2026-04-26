@@ -354,6 +354,12 @@ Conclusions: no `>2×` regressions; Stage 2 perf is clean for shipping. `peer_ac
 - **Isolated bench via diagnostic harness**: `isPartialSeed` per call 70.2 ns → 12.0 ns (5.8×); `checkPartialSeed` per torrent per iter 60.7 ns → 12.6 ns (4.8×).
 - **Test count**: 230 → 233 (`tests/piece_tracker_cache_test.zig` adds three regression guards: complete-with-mask, mask-transition recompute, mask-removal recompute).
 
+### Track C: BUGGIFY-against-RPC + cache invariant exploration (no bugs surfaced)
+- **`tests/rpc_arena_buggify_test.zig`** (5 tests) — 64 seeds × random allocation sequences against `TieredArena`, with a custom `FailingAllocator` that rejects parent calls past a per-seed `fail_after` count. Each seed runs the same sequence twice — first to count parent calls, second with `fail_after` chosen randomly inside that range — deterministically exploring the OOM recovery path of `reset()` and `deinit()` chains. Asserts no leaks (GPA detector), no bump corruption, hard cap invariant, idempotent reset, partial-spill-chain deinit. 5/5 green.
+- **`tests/piece_tracker_cache_buggify_test.zig`** (3 tests) — 64 seeds × random op sequences against the new `wanted_completed_count` cache. Assertion: `cached == |{ wanted ∩ complete }|` after every mutation, computed via direct bitfield intersection as the oracle. Op mix: 75% `completePiece`, 12.5% `setWanted` with random mask, 12.5% `swapWanted(null)`. Plus idempotent-completePiece and known-transition `setWanted`-to-subset-of-complete. 3/3 green.
+- **`tests/rpc_server_stress_test.zig`** (2 tests) — integration stress against the real `ApiServer` on `RealIO`, 32 seeds × 4 random close-mid-flight strategies (`happy_path`, `close_mid_request`, `close_before_send_complete`, `close_immediately`), plus a rapid-reconnect test exercising the embedded `recv_op`/`send_op` generation filter under tight slot churn. Non-blocking client sockets to interleave server polls with client reads. 2/2 green.
+- **No bugs surfaced** — both pieces of Track B/Task #5 work hold up under the randomised exploration. Test count: 233 → 243 (+10 across the three Track C files).
+
 ## Last Verified Milestone (2026-04-16)
 
 - Demo swarm end-to-end with uTP enabled: `demo_swarm.sh` runs TCP+uTP, seeder-to-downloader transfer verified
