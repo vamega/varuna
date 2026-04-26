@@ -278,14 +278,83 @@ pub fn tryFillPipeline(self: anytype, slot: u16) !void {
     var p1: u32 = 0; // requests to send for current piece this call
     if (peer.current_piece) |piece_index| {
         if (peer.downloading_piece) |dp| {
-            // Use block-level tracking: request the next unrequested block
-            while (peer.inflight_requests + p1 < pipeline_depth) {
+            // Multi-source fair-share cap: when multiple peers reference
+            // the same DP, each peer's claim is bounded so it doesn't
+            // monopolise. Computed every call so the cap shrinks as
+            // additional peers join via tryJoinExistingPiece. Endgame
+            // mode (not yet implemented as a flag) would relax this:
+            // when only a few blocks remain, allow duplicate requests
+            // across peers to race for last-block delivery. Today's
+            // dedup invariant (`markBlockRequested` returns false on
+            // already-requested blocks) blocks endgame; a future
+            // `dp.endgame` bool would skip the cap when set.
+            // Multi-source claim caps:
+            //
+            // Two-part bound to balance single-source throughput against
+            // multi-source distribution:
+            //
+            // 1. **Per-call cap** (`per_call_cap`): how many blocks any
+            //    single tryFillPipeline invocation may claim. Pegged at
+            //    `pipeline_depth / max_peers_per_piece` so a peer can't
+            //    sweep an entire piece before peers still-handshaking
+            //    have a chance to join via tryJoinExistingPiece.
+            // 2. **Fair-share cap** (`remaining_share`): once peers HAVE
+            //    joined, each is bounded to `blocks_total / peer_count`
+            //    of the piece. Ceiling division so stranded blocks
+            //    don't accrue when blocks_total % peer_count != 0.
+            //
+            // The per-call cap matters even when peer_count == 1: it
+            // gives slow-handshake peers a window to land before the
+            // first responder claims everything. Without it, the
+            // multi-source picker degenerates to single-source whenever
+            // one peer's handshake finishes first (always, modulo seed).
+            //
+            // Endgame mode (not yet implemented as a flag) would relax
+            // both caps: when only a few blocks remain, allow duplicate
+            // requests across peers to race for last-block delivery.
+            // Today's dedup invariant (`markBlockRequested` returns
+            // false on already-requested blocks) blocks endgame; a
+            // future `dp.endgame` bool would skip both caps when set.
+            const peer_count = @max(@as(u8, 1), dp.peer_count);
+            const fair_share: u16 = @intCast(@max(
+                @as(u32, 1),
+                (@as(u32, dp.blocks_total) + peer_count - 1) / peer_count,
+            ));
+            const already_attributed = dp.attributedCountForPeer(slot);
+            const remaining_share: u16 = if (fair_share > already_attributed)
+                fair_share - already_attributed
+            else
+                0;
+            const per_call_cap: u16 = @max(1, pipeline_depth / max_peers_per_piece);
+            const claim_cap: u16 = @min(per_call_cap, remaining_share);
+            var claimed_this_call: u16 = 0;
+            while (peer.inflight_requests + p1 < pipeline_depth and
+                claimed_this_call < claim_cap)
+            {
                 const block_idx = dp.nextUnrequestedBlock() orelse break;
                 const req = geometry.requestForBlock(piece_index, block_idx) catch break;
                 if (!dp.markBlockRequested(block_idx, slot)) break;
                 writeRequestMsg(send_buf[p1 * request_size ..], req);
                 p1 += 1;
+                claimed_this_call += 1;
             }
+
+            // Block-stealing — REVERTED pending BUGGIFY-interaction
+            // investigation. See task #23 progress notes. The stealing
+            // helper `dp.nextStealableBlock` and the production-side
+            // duplicate-handling in `markBlockReceived`/`peer.inflight_requests`
+            // accounting are in place; what's not understood yet is
+            // why enabling stealing reliably drops 2/96 honest pieces
+            // under BUGGIFY p=0.02 fault injection on `sim_smart_ban_eventloop_test`.
+            // Honest peers don't share pieces with corrupt (bitfields
+            // disjoint), so a hashfail on an honest peer shouldn't be
+            // possible — yet enabling stealing produces it. Some
+            // interaction with `releaseBlocksForPeer` on BUGGIFY-
+            // induced disconnect, OR the `peer.current_piece` check in
+            // `protocol.processMessage` that gates piece-block recv
+            // routing, OR the `bytes_downloaded_from` accounting under
+            // raced duplicates. Needs targeted diagnosis under a
+            // failing seed before re-enabling.
         } else {
             // Legacy path (no DownloadingPiece -- should not happen after migration)
             while (peer.inflight_requests + p1 < pipeline_depth and
@@ -366,12 +435,27 @@ pub fn tryFillPipeline(self: anytype, slot: u16) !void {
         // Fill requests for next piece using DownloadingPiece
         if (peer.next_piece) |next_idx| {
             if (peer.next_downloading_piece) |next_dp| {
-                while (peer.inflight_requests + p1 + p2 < pipeline_depth) {
+                // Same fair-share cap as the current-piece path (above).
+                const next_peer_count = @max(@as(u8, 1), next_dp.peer_count);
+                const next_fair_share: u16 = @intCast(@max(
+                    @as(u32, 1),
+                    (@as(u32, next_dp.blocks_total) + next_peer_count - 1) / next_peer_count,
+                ));
+                const next_already = next_dp.attributedCountForPeer(slot);
+                const next_remaining: u16 = if (next_fair_share > next_already)
+                    next_fair_share - next_already
+                else
+                    0;
+                var next_claimed: u16 = 0;
+                while (peer.inflight_requests + p1 + p2 < pipeline_depth and
+                    next_claimed < next_remaining)
+                {
                     const block_idx = next_dp.nextUnrequestedBlock() orelse break;
                     const req = geometry.requestForBlock(next_idx, block_idx) catch break;
                     if (!next_dp.markBlockRequested(block_idx, slot)) break;
                     writeRequestMsg(send_buf[(p1 + p2) * request_size ..], req);
                     p2 += 1;
+                    next_claimed += 1;
                 }
             } else {
                 // Legacy path
@@ -479,6 +563,25 @@ pub fn completePieceDownload(self: anytype, slot: u16) void {
     const tc = self.getTorrentContext(peer.torrent_id) orelse return;
     const sess = tc.session orelse return;
     const pt = tc.piece_tracker orelse return;
+
+    // Teardown race guard: when EL is winding down (`self.draining`
+    // set by signal-handler graceful shutdown OR by deinit start), the
+    // hasher's pending_jobs structure is being torn down. Residual
+    // recv CQEs can route here from in-flight piece-block traffic for
+    // already-disconnected peers; we must not submit a new hash job
+    // against a draining or destroyed hasher. Drop the piece via
+    // cleanupCompletionFailure (releases pt + frees the piece_buf) and
+    // return early. Lost piece is acceptable in shutdown; corrupt
+    // state is not.
+    //
+    // NOTE: only check `self.draining`, not `self.hasher == null`.
+    // The latter is also a valid normal-mode state (hasher_threads=0
+    // selects the inline-verify fallback below); hard-failing on null
+    // would break the inline-mode path used by sim_swarm_test.
+    if (self.draining) {
+        cleanupCompletionFailure(self, peer, dp, pt, piece_index);
+        return;
+    }
 
     // Get the expected hash for this piece
     const expected_hash = sess.layout.pieceHash(piece_index) catch {
@@ -1322,17 +1425,16 @@ fn snapshotAttributionForSmartBan(
             block_peers[i] = null;
             continue;
         }
-        if (bi.peer_slot >= self.peers.len) {
-            block_peers[i] = null;
-            continue;
-        }
-        const p = &self.peers[bi.peer_slot];
-        if (p.state == .free) {
-            // Slot was freed mid-piece; skip attribution for this block.
-            block_peers[i] = null;
-            continue;
-        }
-        block_peers[i] = p.address;
+        // Read attribution from `bi.delivered_address` rather than
+        // dereferencing `self.peers[bi.peer_slot]`. The peer slot may
+        // have been reused (corrupt peer disconnects after delivering
+        // bad blocks, or churns IPs mid-piece) by the time this
+        // snapshot runs at piece-completion. The address captured at
+        // markBlockReceived time is the one Phase 2 needs to ban.
+        // `delivered_address` is null only for blocks not yet
+        // received, which we already filtered out via the `state !=
+        // .received` check above; defensive null-skip retained.
+        block_peers[i] = bi.delivered_address;
     }
 
     sb.snapshotAttribution(torrent_id, piece_index, block_peers) catch {

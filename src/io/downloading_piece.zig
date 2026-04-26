@@ -13,8 +13,27 @@ pub const BlockState = enum(u2) {
 /// Per-block metadata: tracks which peer owns (requested or received) each block.
 pub const BlockInfo = struct {
     state: BlockState = .none,
-    /// Peer slot that requested or received this block.
+    /// Peer slot that requested or received this block. Used by the
+    /// picker for live tracking (`releaseBlocksForPeer`,
+    /// `attributedCountForPeer`, etc.). NOT used for smart-ban
+    /// attribution — that needs the address (slot indices reuse on
+    /// peer churn). See `delivered_address` below.
     peer_slot: u16 = 0,
+    /// Address of the peer that delivered this block. Populated in
+    /// `markBlockReceived` from the live peer's address at receive
+    /// time, NOT looked up from the peer slot at snapshot time. The
+    /// distinction matters when a peer disconnects (or is banned, or
+    /// churns its IP) between block delivery and piece completion:
+    /// the slot may have been reused for a different peer by the
+    /// time `snapshotAttributionForSmartBan` runs, but the address
+    /// recorded here stays accurate. Smart-ban Phase 2 ban-targeting
+    /// reads this directly so a corrupt peer that misbehaves and
+    /// disconnects fast (intentionally evasive, or kicked by Phase
+    /// 0 trust-points) cannot escape attribution by losing their slot.
+    /// Null when state == .none (no delivery yet); also null after
+    /// `releaseBlocksForPeer` resets a `.requested` block back to
+    /// `.none`.
+    delivered_address: ?std.net.Address = null,
 };
 
 /// Shared per-piece download state.  Multiple peers can reference the same
@@ -58,10 +77,15 @@ pub const DownloadingPiece = struct {
     /// Mark a block as received.  Writes the block data into the shared
     /// buffer.  Returns true if this block was not yet received (first
     /// delivery wins), false for duplicates.
+    ///
+    /// `peer_address` is captured into `bi.delivered_address` for
+    /// smart-ban Phase 2 attribution that survives peer-slot reuse
+    /// (see `BlockInfo.delivered_address` doc comment).
     pub fn markBlockReceived(
         self: *DownloadingPiece,
         block_index: u16,
         peer_slot: u16,
+        peer_address: std.net.Address,
         block_offset: u32,
         block_data: []const u8,
     ) bool {
@@ -78,6 +102,7 @@ pub const DownloadingPiece = struct {
         }
         bi.state = .received;
         bi.peer_slot = peer_slot;
+        bi.delivered_address = peer_address;
         self.blocks_received += 1;
         return true;
     }
@@ -116,6 +141,47 @@ pub const DownloadingPiece = struct {
             if (bi.peer_slot == peer_slot and bi.state == .requested) count += 1;
         }
         return count;
+    }
+
+    /// Returns the count of blocks attributed to a specific peer in any
+    /// non-`.none` state (requested *or* received). Used by the
+    /// multi-source picker as the "fair share" bound: a peer should
+    /// not claim more blocks than its share of `blocks_total /
+    /// peer_count`. Counts all attributed blocks (not just in-flight)
+    /// because `.received` blocks still represent work done by this
+    /// peer — the downloader shouldn't keep claiming blocks for a peer
+    /// that has already pulled its share.
+    pub fn attributedCountForPeer(self: *const DownloadingPiece, peer_slot: u16) u16 {
+        var count: u16 = 0;
+        for (self.block_infos) |bi| {
+            if (bi.peer_slot == peer_slot and bi.state != .none) count += 1;
+        }
+        return count;
+    }
+
+    /// Returns the first block in `.requested` state attributed to a peer
+    /// other than `exclude_peer_slot`, or null if every `.requested`
+    /// block belongs to that peer (or no blocks are `.requested`).
+    /// Used by the multi-source picker for **block-stealing**: when a
+    /// peer joins a DP that's fully claimed but incomplete, it issues
+    /// duplicate requests for blocks another peer already claimed.
+    /// Whichever peer delivers first wins attribution via
+    /// `markBlockReceived` (which returns false for the loser's
+    /// duplicate; the data is dropped).
+    ///
+    /// The exclude bound prevents self-stealing: a peer's own
+    /// outstanding requests don't count as stealable since duplicate
+    /// requests against your own outstanding ones are pure overhead.
+    /// Does not mutate state — block-stealing leaves attribution at
+    /// the original requester until delivery, since either peer might
+    /// win the race.
+    pub fn nextStealableBlock(self: *const DownloadingPiece, exclude_peer_slot: u16) ?u16 {
+        for (self.block_infos, 0..) |bi, i| {
+            if (bi.state == .requested and bi.peer_slot != exclude_peer_slot) {
+                return @intCast(i);
+            }
+        }
+        return null;
     }
 };
 
@@ -186,6 +252,11 @@ pub fn destroyDownloadingPieceFull(allocator: std.mem.Allocator, dp: *Downloadin
     allocator.destroy(dp);
 }
 
+/// Sentinel address for tests that don't care about per-peer
+/// attribution. Real callers (`protocol.processMessage`) pass the
+/// peer's actual `peer.address`.
+const test_address = std.net.Address.initIp4(.{ 0, 0, 0, 0 }, 0);
+
 // ── Unit tests ──────────────────────────────────────────
 
 const testing = std.testing;
@@ -214,7 +285,7 @@ test "markBlockReceived writes data and increments counter" {
     defer destroyDownloadingPieceFull(allocator, dp);
 
     _ = dp.markBlockRequested(0, 5);
-    const ok = dp.markBlockReceived(0, 5, 0, &.{ 0xAA, 0xBB });
+    const ok = dp.markBlockReceived(0, 5, test_address, 0, &.{ 0xAA, 0xBB });
     try testing.expect(ok);
     try testing.expectEqual(@as(u16, 1), dp.blocks_received);
     try testing.expectEqual(@as(u8, 0xAA), dp.buf[0]);
@@ -228,8 +299,8 @@ test "markBlockReceived rejects duplicate" {
     defer destroyDownloadingPieceFull(allocator, dp);
 
     _ = dp.markBlockRequested(0, 5);
-    _ = dp.markBlockReceived(0, 5, 0, &.{ 0xAA, 0xBB });
-    const dup = dp.markBlockReceived(0, 7, 0, &.{ 0xCC, 0xDD });
+    _ = dp.markBlockReceived(0, 5, test_address, 0, &.{ 0xAA, 0xBB });
+    const dup = dp.markBlockReceived(0, 7, test_address, 0, &.{ 0xCC, 0xDD });
     try testing.expect(!dup);
     try testing.expectEqual(@as(u16, 1), dp.blocks_received);
     // Original data preserved
@@ -242,9 +313,9 @@ test "isComplete returns true when all blocks received" {
     defer destroyDownloadingPieceFull(allocator, dp);
 
     try testing.expect(!dp.isComplete());
-    _ = dp.markBlockReceived(0, 1, 0, &.{ 0x01, 0x02 });
+    _ = dp.markBlockReceived(0, 1, test_address, 0, &.{ 0x01, 0x02 });
     try testing.expect(!dp.isComplete());
-    _ = dp.markBlockReceived(1, 2, 2, &.{ 0x03, 0x04 });
+    _ = dp.markBlockReceived(1, 2, test_address, 2, &.{ 0x03, 0x04 });
     try testing.expect(dp.isComplete());
 }
 
@@ -256,7 +327,7 @@ test "releaseBlocksForPeer frees requested blocks" {
     _ = dp.markBlockRequested(0, 10);
     _ = dp.markBlockRequested(1, 10);
     _ = dp.markBlockRequested(2, 20);
-    _ = dp.markBlockReceived(0, 10, 0, &.{0xFF});
+    _ = dp.markBlockReceived(0, 10, test_address, 0, &.{0xFF});
 
     dp.releaseBlocksForPeer(10);
 
@@ -280,7 +351,7 @@ test "unrequestedCount tracks available blocks" {
     try testing.expectEqual(@as(u16, 4), dp.unrequestedCount());
     _ = dp.markBlockRequested(0, 1);
     try testing.expectEqual(@as(u16, 3), dp.unrequestedCount());
-    _ = dp.markBlockReceived(1, 2, 16384, &.{0});
+    _ = dp.markBlockReceived(1, 2, test_address, 16384, &.{0});
     try testing.expectEqual(@as(u16, 2), dp.unrequestedCount());
 }
 
@@ -290,7 +361,7 @@ test "markBlockReceived on unsolicited block counts as requested" {
     defer destroyDownloadingPieceFull(allocator, dp);
 
     // Receive block 0 without prior request
-    const ok = dp.markBlockReceived(0, 5, 0, &.{ 0xAA, 0xBB });
+    const ok = dp.markBlockReceived(0, 5, test_address, 0, &.{ 0xAA, 0xBB });
     try testing.expect(ok);
     try testing.expectEqual(@as(u16, 1), dp.blocks_requested);
     try testing.expectEqual(@as(u16, 1), dp.blocks_received);

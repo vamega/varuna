@@ -490,6 +490,16 @@ pub fn EventLoopOf(comptime IO: type) type {
         }
 
         pub fn deinit(self: *Self) void {
+            // Mark draining at deinit start. The signal-handler graceful-
+            // shutdown path already sets this; tests and crash paths
+            // calling deinit directly didn't, which left the picker /
+            // hash-submission paths thinking new work was acceptable
+            // even as the hasher was being torn down.
+            // `peer_policy.completePieceDownload` (and any other
+            // hash-submitting path) checks this flag and drops new
+            // submissions during teardown. Idempotent if already set.
+            self.draining = true;
+
             // ── Phase -1: Drain hasher → pending_writes ──────────────
             // Before tearing down the hasher, give any verified piece
             // results a chance to land on disk. The graceful-shutdown
@@ -513,6 +523,12 @@ pub fn EventLoopOf(comptime IO: type) type {
                 }
                 h.deinit();
                 self.allocator.destroy(h);
+                // Null the pointer so any post-destroy submitVerify
+                // attempt (residual CQEs in Phase 2 drainRemainingCqes)
+                // hits the `self.hasher == null` guard in
+                // completePieceDownload rather than UAFing on freed
+                // memory.
+                self.hasher = null;
             }
 
             // ── Phase 0: Flush pending disk writes ────────────────────
@@ -1193,6 +1209,50 @@ pub fn EventLoopOf(comptime IO: type) type {
             const tc = self.getTorrentContext(torrent_id) orelse return false;
             const pt = tc.piece_tracker orelse return false;
             return pt.isPieceComplete(piece_index);
+        }
+
+        /// Sentinel value for `getBlockAttribution` entries whose block
+        /// is in `.none` state (not yet requested by any peer). Tests
+        /// distinguish unattributed blocks from real slot indices via
+        /// this value rather than `0`, since slot 0 is a valid peer.
+        pub const attribution_unset: u16 = std.math.maxInt(u16);
+
+        /// Snapshot per-block peer attribution for the active download
+        /// of `piece_index` in `torrent_id`. Each entry in the returned
+        /// slice is the slot that requested or delivered the
+        /// corresponding block (or `attribution_unset` for `.none`-
+        /// state blocks). Returns null if the torrent has no active
+        /// `DownloadingPiece` for this piece (e.g. the piece is
+        /// complete, has been abandoned, or hasn't been claimed yet).
+        ///
+        /// Caller-allocated `out` buffer must be at least
+        /// `dp.blocks_total` long; the returned slice is a sub-slice
+        /// of `out`. Caller-buffered to avoid heap allocation in the
+        /// hot test loop and to let the test hold the snapshot across
+        /// ticks even after the underlying DP is destroyed (e.g. piece
+        /// completed, attribution copied into smart-ban records).
+        ///
+        /// Test-only API. Slot indices are stable across `removePeer`
+        /// (peer.state goes `.free` until `allocSlot` reuses), which
+        /// gives tests precise mid-tick attribution observability.
+        /// Resolve slot → address via `getPeerView(slot).?.address` if
+        /// the test wants to compare against `BanList.isBanned`.
+        pub fn getBlockAttribution(
+            self: *Self,
+            torrent_id: TorrentId,
+            piece_index: u32,
+            out: []u16,
+        ) ?[]const u16 {
+            const key = DownloadingPieceKey{
+                .torrent_id = torrent_id,
+                .piece_index = piece_index,
+            };
+            const dp = self.downloading_pieces.get(key) orelse return null;
+            if (out.len < dp.block_infos.len) return null;
+            for (dp.block_infos, 0..) |bi, i| {
+                out[i] = if (bi.state == .none) attribution_unset else bi.peer_slot;
+            }
+            return out[0..dp.block_infos.len];
         }
 
         /// Initiate an outbound uTP connection to a peer. Creates the uTP
@@ -2190,6 +2250,7 @@ pub fn EventLoopOf(comptime IO: type) type {
                         return .resubmitted;
                     }
                 },
+                .ghost => return .complete, // peer was removed; the CQE will route through the peer-freed branch in handleSendResult
                 .free => unreachable, // active PendingSend can't be in `free` state
             }
             return .complete;
@@ -2218,19 +2279,28 @@ pub fn EventLoopOf(comptime IO: type) type {
             }
         }
 
-        /// Free ALL pending send buffers for the given slot.
-        /// Called during peer removal to clean up any buffers that won't be
-        /// reclaimed by future CQE processing (the fd is closed so remaining
-        /// CQEs will arrive as errors for a potentially-reused slot).
+        /// Mark all pending sends for a peer as ghosts (buffer freed,
+        /// pool slot retained until CQE fires). Called during peer
+        /// removal. The entries stay in `pending_sends` so that when
+        /// the in-flight send's CQE eventually arrives — possibly with
+        /// a -EBADF / BrokenPipe error after the fd close, possibly
+        /// successfully if the kernel already flushed — the callback's
+        /// peer-freed branch can find the (slot, send_id) entry and
+        /// route through `releasePendingSend(.ghost)` for the final
+        /// pool release.
+        ///
+        /// Eagerly returning the pool slot here would be a UAF: the
+        /// SimIO/RealIO completion heap still references the
+        /// Completion, and the next pool claim would re-hand-out the
+        /// slot to a different peer's send. When the original send
+        /// finally fires, the @fieldParentPtr recovery would resolve
+        /// to the new peer's data — wrong-peer trust adjustments,
+        /// double-free of the new peer's buffer, etc.
         fn freeAllPendingSends(self: *Self, slot: u16) void {
-            var i: usize = 0;
-            while (i < self.pending_sends.items.len) {
-                if (self.pending_sends.items[i].slot == slot) {
-                    self.releasePendingSend(self.pending_sends.items[i]);
-                    _ = self.pending_sends.swapRemove(i);
-                    continue;
+            for (self.pending_sends.items) |ps| {
+                if (ps.slot == slot) {
+                    self.markPendingSendGhost(ps);
                 }
-                i += 1;
             }
         }
 
@@ -2258,9 +2328,40 @@ pub fn EventLoopOf(comptime IO: type) type {
                     }
                 },
                 .vectored => |state| self.releaseVectoredSendState(state),
+                .ghost => {
+                    // Buffer was already freed by `freeAllPendingSends` when
+                    // the peer was removed mid-send. The pool slot was kept
+                    // claimed until now (CQE fired) so SimIO/RealIO's heap
+                    // reference to `completion` resolved cleanly. Pool
+                    // release below is the only remaining cleanup.
+                },
                 .free => unreachable, // releasing an already-released PendingSend
             }
             self.pending_send_pool.release(pending_send);
+        }
+
+        /// Mark a PendingSend as a "ghost": free its buffer (peer is
+        /// gone, the bytes are dead) but keep the pool slot claimed
+        /// until the in-flight CQE fires. This avoids a UAF where the
+        /// pool would re-hand the slot to a new caller before SimIO/
+        /// RealIO finishes with the original Completion. The CQE
+        /// callback (`handleSendResult` peer-freed branch) drives the
+        /// final pool release via `freeOnePendingSend` →
+        /// `releasePendingSend(.ghost)`.
+        fn markPendingSendGhost(self: *Self, pending_send: *PendingSend) void {
+            switch (pending_send.storage) {
+                .owned => |owned| {
+                    if (owned.small_slot) |small_slot| {
+                        self.small_send_pool.release(small_slot);
+                    } else {
+                        self.allocator.free(owned.buf);
+                    }
+                },
+                .vectored => |state| self.releaseVectoredSendState(state),
+                .ghost => return, // idempotent: already marked
+                .free => unreachable, // marking an already-released PendingSend
+            }
+            pending_send.storage = .ghost;
         }
 
         /// Claim a PendingSend slot from the per-EventLoop pool and append it to
@@ -2307,6 +2408,7 @@ pub fn EventLoopOf(comptime IO: type) type {
                     self,
                     peer_handler.pendingSendCompleteFor(Self),
                 ),
+                .ghost => unreachable, // submitPendingSend is called only on freshly-claimed slots; ghost is a post-removal state
                 .free => unreachable, // active PendingSend can't be in `free` state
             }
             peer.send_pending = true;

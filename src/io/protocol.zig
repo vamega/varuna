@@ -172,7 +172,7 @@ pub fn processMessage(self: anytype, slot: u16) void {
                 if (peer.current_piece != null and peer.current_piece.? == piece_index) {
                     if (peer.downloading_piece) |dp| {
                         // Multi-source path: write through DownloadingPiece
-                        if (dp.markBlockReceived(block_index, slot, block_offset, block_data)) {
+                        if (dp.markBlockReceived(block_index, slot, peer.address, block_offset, block_data)) {
                             peer.blocks_received += 1;
                             peer.bytes_downloaded_from += block_data.len;
                             self.accountTorrentBytes(peer.torrent_id, block_data.len, 0);
@@ -207,7 +207,7 @@ pub fn processMessage(self: anytype, slot: u16) void {
                 } else if (peer.next_piece != null and peer.next_piece.? == piece_index) {
                     // Block arrived early for the pre-fetched next piece
                     if (peer.next_downloading_piece) |next_dp| {
-                        if (next_dp.markBlockReceived(block_index, slot, block_offset, block_data)) {
+                        if (next_dp.markBlockReceived(block_index, slot, peer.address, block_offset, block_data)) {
                             peer.next_blocks_received += 1;
                             peer.bytes_downloaded_from += block_data.len;
                             self.accountTorrentBytes(peer.torrent_id, block_data.len, 0);

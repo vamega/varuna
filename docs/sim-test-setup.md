@@ -149,6 +149,49 @@ pub fn isPieceComplete(self: *const EventLoop, torrent_id: u32, piece_index: u32
 These are pure-read helpers; no internal state changes. Easy to add and
 trivially safe.
 
+### 5. Smart-ban dependency wiring
+
+Phase 0 EL tests (single-source corrupt peer over many pieces) get by
+with just `BanList` installed via `el.ban_list = &ban_list`. Phase 0's
+`peer_policy.penalizePeerTrust` accumulates trust-point hits across
+hash failures and bans at the threshold; the corrupt peer typically
+stays connected long enough for the threshold to fire.
+
+**Phase 2 tests require BOTH `BanList` AND `SmartBan` installed** —
+without `el.smart_ban = &smart_ban`, the `SmartBan.snapshotAttribution`
+/ `onPieceFailed` / `onPiecePassed` chain doesn't fire and Phase 2's
+per-block discriminating power is bypassed entirely. A
+disconnect-mid-piece corrupt peer escapes attribution because Phase 0
+alone needs 4 hash failures before banning, and the peer leaves
+after 1-2.
+
+```zig
+var ban_list = BanList.init(allocator);
+defer ban_list.deinit();
+var smart_ban = SmartBan.init(allocator);
+defer smart_ban.deinit();
+
+var el = try EL_SimIO.initBareWithIO(allocator, sim_io, hasher_threads);
+defer el.deinit();
+
+el.ban_list = &ban_list;
+el.smart_ban = &smart_ban;
+```
+
+**Declaration order matters**: `defer` runs LIFO. The EL's
+`deinit → drainRemainingCqes` can fire `processHashResults` →
+`SmartBan.onPieceFailed` / `onPiecePassed` for residual late CQEs. If
+`smart_ban` or `ban_list` is declared AFTER `el`, their defer runs
+FIRST, freeing the dependencies while EL is still draining → UAF
+panic in the hashmap header() pointer math. Always declare
+`ban_list` and `smart_ban` BEFORE `el` so LIFO defer order runs
+`el.deinit` first (with both still alive), then `smart_ban.deinit`,
+then `ban_list.deinit`.
+
+This pattern was diagnosed during Phase 2B test landing
+(commit `112dd5c` on `worktree-sim-engineer`); see
+`docs/multi-source-test-setup.md` section A6 for the deeper context.
+
 ---
 
 ## Test skeleton (after Stage 2 #12 lands)

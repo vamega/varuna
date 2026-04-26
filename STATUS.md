@@ -196,7 +196,15 @@ Update it whenever a milestone lands, the near-term backlog changes, or a new op
 - `zig build test-swarm`: automated end-to-end swarm transfer test — creates a torrent, starts a seeder and downloader daemon, verifies piece transfer completes.
 - Docker cross-client conformance test infrastructure (`test/docker/`): containerized testing harness for validating protocol compatibility with third-party clients.
 
-### IO Abstraction (Stage 2 complete + sim infrastructure)
+### IO Abstraction (Stages 2-5 complete; daemon generic over IO backend)
+
+**Resulting architectural shape** (post all five stages):
+- `pub fn EventLoopOf(comptime IO: type) type` in `src/io/event_loop.zig` is the daemon event loop, generic over its IO backend. Two concrete instantiations exist: `EventLoop = EventLoopOf(RealIO)` is the production type used by `varuna`, `varuna-ctl`, and `varuna-tools` (zero behavior change); `EventLoopOf(SimIO)` is the deterministic-simulation type used by sim tests.
+- `RealIO` and `SimIO` share `src/io/io_interface.zig` as their parity contract; backend-specific state is kept in opaque `Completion._backend_state[64]`. Comptime parity is enforced by `tests/io_backend_parity_test.zig`; all fd-touching ops (including `closeSocket`) are required methods rather than direct `posix.close` calls.
+- Deterministic simulation is now a first-class test mode. `SimulatorOf(comptime Driver: type)` + `SimPeer` (10 protocol behaviours) + BUGGIFY (`SimIO.injectRandomFault` per-step + `FaultConfig` per-op) form the harness; `SimIO.Config.max_ops_per_tick` (default 4096) models real `io_uring`'s CQE batch boundary so EL periodic-policy passes interleave with I/O completions.
+- The smart-ban algorithm is the canonical demonstration of the layered testing strategy (see `STYLE.md > Layered Testing Strategy`): algorithm test in `sim_smart_ban_protocol_test.zig`, integration test in `sim_smart_ban_eventloop_test.zig` (8 seeds, no faults), safety-under-faults test in the same file's BUGGIFY case (32 seeds, vacuous-pass guard at 50% ban rate).
+
+**Components**:
 - **Public IO contract (`src/io/io_interface.zig`)**: `Operation` and `Result` tagged unions (one variant per op), `CallbackAction = enum { disarm, rearm }`, single-callback signature, caller-owned `Completion` with opaque per-backend state (`backend_state_size = 64`, comptime-asserted by each backend). `_backend_state` defaults to all-zero so backends can safely read flags like `in_flight` on a fresh completion.
 - **`SimIO` (`src/io/sim_io.zig`)**: in-process simulation backend with min-heap pending queue, seeded `std.Random.DefaultPrng`, `FaultConfig` (per-op error probabilities + latency injection). Zero-alloc after init. 8 unit tests cover timeout ordering, fault injection, queue-full, cancel, rearm.
 - **`SimIO` socketpair / parking (Stage 3 #13)**: pre-allocated `[]SimSocket` slot pool sized by `Config.socket_capacity`, `createSocketpair() -> [2]fd_t` allocates two slots and links them as partners, `closeSocket(fd)` fails parked recv with `error.ConnectionResetByPeer` (and the partner's parked recv too). `recv` on an empty queue parks the completion on the socket; `send` appends to partner's ring buffer and unparks the partner's recv. `cancel` handles parked completions. Zero-alloc on the data path. 15 socketpair tests in `tests/sim_socketpair_test.zig` (round-trip, parking, partial recv, queue accumulation, close, cancel, mixed heap+park, capacity exhaustion).
@@ -256,9 +264,10 @@ See `progress-reports/2026-04-25-stage2-event-loop-migration.md` for the Stage 2
 - ~~**Transport disposition**~~: (DONE) fine-grained TCP/uTP control via `TransportDisposition` packed struct. TOML config accepts presets or flag lists. Runtime start/stop of TCP and UDP listeners via `reconcileListeners()`. Cancel-before-close with IORING_OP_ASYNC_CANCEL. 25 integration tests.
 - ~~**IORING_OP_SOCKET for hot-path socket creation**~~: (DONE) peer connections, tracker requests, and UDP tracker all use async socket creation. Startup socket() count: 13 → 3.
 - ~~**varuna-tools create**~~: (DONE) native Zig torrent creator with mktorrent feature parity. Parallel hashing (11x speedup at 16 threads). All test scripts use `varuna-tools create` — Node.js dependency eliminated.
-- ~~**Smart ban Phase 0**~~: (DONE) trust-point banning on hash failure. `hashfails`/`trust_points` fields on `Peer`, penalization in `processHashResults`, ban at threshold -7, slow recovery on success. Web seed slots excluded. `hashfails` exposed in torrentPeers API. Phases 1-2 (per-block SHA-1 tracking) remain in `docs/future-features.md`.
+- ~~**Smart ban Phase 0**~~: (DONE) trust-point banning on hash failure. `hashfails`/`trust_points` fields on `Peer`, penalization in `processHashResults`, ban at threshold -7, slow recovery on success. Web seed slots excluded. `hashfails` exposed in torrentPeers API.
+- ~~**Smart ban Phase 1-2 (per-block SHA-1 attribution + ban-targeting)**~~: (DONE) per-block peer attribution captured in `BlockInfo.delivered_address` at receive time (decoupled from peer-slot lifetime so attribution survives disconnect/IP churn — fixed a real production gap where corrupt-and-disconnect peers escaped attribution). `SmartBan.snapshotAttribution` records on piece complete; `onPieceFailed` stores per-block SHA-1 + peer-address records; `onPiecePassed` (after re-download) compares per-block hashes and bans only the peers whose blocks mismatched. `peer_policy.snapshotAttributionForSmartBan` and `smartBanCorruptPeers` bridge the EL. Phase 2's discriminating power (honest peer co-located on a corrupt piece is NOT banned) demonstrated end-to-end in `tests/sim_smart_ban_phase12_eventloop_test.zig`'s disconnect-rejoin scenario — 8 deterministic seeds, peer 0 banned via Phase 2 attribution-survives-disconnect, peers 1+2 acquitted despite contributing to the same failed piece. See `progress-reports/2026-04-26-phase-2-smart-ban.md` for the arc.
+- ~~**Multi-source piece assembly (transient correctness)**~~: (DONE for the production path) piece can now be assembled from multiple peers — disconnect-mid-piece releases blocks via `releaseBlocksForPeer` + `tryJoinExistingPiece`; survivors absorb and complete the piece. Picker fair-share + per-call cap (`peer_policy.tryFillPipeline`) provides steady-state correctness. The "3-peers-concurrent-at-tick-0" steady-state distribution scenario hits a warmup race where the first peer's tryFillPipeline monopolises before `peer_count > 1`; covered by Task #23 (block-stealing) which is on the optional shelf — disconnect-rejoin is what real swarms exercise so #23 is bonus stress coverage.
 - **MSE simultaneous handshake robustness**: timing-dependent crash in `checkPeerTimeouts -> removePeer -> cleanupPeer` when both inbound and outbound MSE handshakes are in flight. Disappears under GDB. Needs generation counters or explicit handshake-in-progress guards.
-- **Multi-source piece assembly**: each piece is downloaded from a single peer. Requesting different blocks from different peers would improve download performance and is a prerequisite for full smart ban value.
 - **Peer hot/cold split / partial SoA**: the active-slot pass removes a lot of wasted scans, but the `Peer` struct is still wide. The next performance step is separating hot scheduling/state fields from cold crypto/buffering state.
 - **Torrent hot-summary registry**: cached cumulative byte totals now remove the hottest `/sync` stats scan, but a denser registry is still the next step if queue position, state derivation, or other per-torrent fields dominate at `10k+` torrents.
 - **Broader RPC arena coverage**: `/sync/maindata` now uses an arena for transient work; the other list-heavy endpoints still allocate temporary object graphs and strings.
@@ -272,44 +281,54 @@ See `progress-reports/2026-04-25-stage2-event-loop-migration.md` for the Stage 2
 - The packaged Ubuntu `opentracker` build requires explicit info-hash whitelisting (`--whitelist-hash`).
 - On WSL2, `perf stat`/`perf record` require kernel-matched `linux-tools` package; many hardware counters report `<not supported>`.
 - `zig build test-torrent-session` intermittently hits Zig cache/toolchain failures (`manifest_create Unexpected`).
-- **Smart ban Phases 1-2 not yet implemented**: Phase 0 (trust-point banning) is done, but per-block SHA-1 tracking for definitive identification in multi-source scenarios is not. See `docs/future-features.md`.
+- ~~**Smart ban Phases 1-2 not yet implemented**~~: closed 2026-04-26. Phase 1 (per-block SHA-1 attribution on hash failure) and Phase 2 (ban-targeting on re-download pass) live in `src/net/smart_ban.zig` and `src/io/peer_policy.zig`; attribution survives peer-slot freeing via `BlockInfo.delivered_address`. End-to-end validation in `tests/sim_smart_ban_phase12_eventloop_test.zig`.
 - **MSE handshake failures in mixed encryption mode**: `vc_not_found` and `req1_not_found` errors occur during simultaneous inbound+outbound MSE handshakes. Timing-dependent, disappears under GDB. `demo_swarm.sh` runs with `encryption = "disabled"` as workaround.
 - ~~**Daemon graceful shutdown**~~: Fixed. In-flight transfer draining with configurable timeout now ensures clean exit on SIGTERM/SIGINT.
 - `IORING_OP_SETSOCKOPT` (kernel 6.7+), `IORING_OP_BIND`/`LISTEN` (kernel 6.11+) not available on current kernel 6.6. Per-peer setsockopt (TCP_NODELAY, buffer sizes) remains synchronous.
 
+## Last Verified Milestone (2026-04-26)
+
+### Phase 2: multi-source piece assembly + smart-ban Phase 1-2 closure
+- **Smart-ban Phase 2 discriminating power demonstrated end-to-end.** `tests/sim_smart_ban_phase12_eventloop_test.zig`'s `disconnect-rejoin one-corrupt-block` scenario over 8 seeds: peer 0 corrupts block 5 + delivers 8 blocks + disconnects mid-piece; survivors complete the piece (with peer 0's bad data already mixed in); first hash fails; re-download via survivors passes; `SmartBan.onPiecePassed` per-block compare identifies peer 0's address as the corruptor; ban applied to peer 0 only. Peers 1, 2 NOT banned despite contributing to the same failed piece. Result is `[true, false, false]` consistently across all 8 seeds; full-suite stable over 5 back-to-back runs.
+- **Real production gap surfaced via test-first scaffolding.** Reading `peer_policy.snapshotAttributionForSmartBan` to validate the disconnect-rejoin scenario revealed that the snapshot was connection-state-aware: it dereferenced `peer_slot` at hash-result time, so a corrupt peer that disconnected before piece completion lost their attribution and escaped Phase 2 entirely. The fix (commit `371582d`): added `BlockInfo.delivered_address: ?std.net.Address` populated at `markBlockReceived` time, decoupled attribution lifetime from peer connection lifetime. Worked example of test-first methodology surfacing a production hole that wasn't visible from reading production code in isolation.
+- **Adjacent gaps fixed during Phase 2A**: Gap 2 (commit `07f4093`) `.ghost`-state PendingSend storage closed pool slot reuse while Completion still in SimIO heap; Task #25 (commit `08161bc`) gates `completePieceDownload` on `self.draining` so residual late piece-block recvs during EL teardown drain don't trigger `submitVerify` against a winding-down hasher. Both also fixed latent flakiness in pre-existing `sim_swarm_test`.
+- **Three new test files** matching the layered testing strategy:
+  - `tests/sim_multi_source_protocol_test.zig` — algorithm test, 8 tests against bare `DownloadingPiece`. No EL/SimIO. Locks in the per-block attribution + multi-peer block reservation + release-on-disconnect invariants.
+  - `tests/sim_multi_source_eventloop_test.zig` — integration test, 2 EL-driven scenarios live (piece-completes + safety; disconnect → survivors complete); distribution-proportion gate behind Task #23.
+  - `tests/sim_smart_ban_phase12_eventloop_test.zig` — Phase 1-2 integration test, 4 tests live (3 sanity + disconnect-rejoin discriminating-power). Two scenarios (two-peer corruption, steady-state honest co-located) gated on Task #23.
+- **Sim-test infrastructure extensions**: SimPeer gained `block_mask: ?[]const bool`, `Behavior.corrupt_blocks: { indices }`, `disconnect()` helper, `action_queue_capacity: 32 → 128`. EL gained `getBlockAttribution(torrent_id, piece_index, out)` accessor for live-DP per-block attribution. `runScenario` infrastructure with staged peer connect/disconnect via per-peer `add_at_tick` / `disconnect_at_tick` config.
+- **Test count**: 218 → 223 (+5 net new; +16 raw across the three new files, with some restructured/renamed tests). Across the full IO-abstraction-through-Phase-2 arc: 163 → 223 = +60 tests.
+- All 4 sim-engineer DoD items (Phase 0 + Phase 2A + Phase 2B + the simulation-first testing methodology) closed.
+- `zig build test`: 223/223 pass, no leaks, stable over 5 back-to-back runs.
+- `zig build`: clean.
+- BUGGIFY (32 seeds, p=0.02) reproduces 23/32 banned + 96/96 honest pieces verified.
+
+Detail in `progress-reports/2026-04-26-phase-2-smart-ban.md`.
+
 ## Last Verified Milestone (2026-04-25)
 
-Post-Stage-2 EventLoop migration to `io_interface` + Stage 3 EventLoop
-parameterisation over `comptime IO: type` + Stage 4-5 sim infrastructure
-(SimIO/Simulator/SimPeer + smart-ban EL light-up over 8 seeds + BUGGIFY
-under randomized faults over 32 seeds). Cleanup phase: hasher leak fix
-(#16), 11 STYLE.md migration patterns, fast-forward merge to main.
+### Architecture / test infrastructure
+- **IO abstraction landed end-to-end.** Daemon EventLoop is now generic over its IO backend: `pub fn EventLoopOf(comptime IO: type) type`. Two backends in production: `RealIO` (`linux.IoUring`, the only instantiation in `varuna`/`varuna-ctl`/`varuna-tools` — zero behaviour change) and `SimIO` (deterministic in-process simulation). Comptime parity enforced by `tests/io_backend_parity_test.zig`.
+- **Stage 2 (event-loop migration to io_interface)** complete: every async op in the daemon — peer recv/send, outbound peer socket/connect, multishot accept, signal poll, recheck reads, disk reads/writes (including `PieceStore.sync`'s async fsync), HTTP executor, RPC server, metadata fetch, uTP recvmsg/sendmsg, UDP tracker, timerfd → native `io.timeout` — runs through the io_interface backend. Legacy `ring: linux.IoUring` field, the giant CQE dispatch switch, `OpType`/`OpData`/`encodeUserData`/`decodeUserData` all deleted.
+- **Stages 3-5 (sim infrastructure + integration tests)** complete: `SimIO` socketpair pool with parking semantics; `SimulatorOf(comptime Driver)` deterministic harness; `SimPeer` with 10 wire-protocol behaviours (honest, slow, corrupt, wrong_data, silent_after, disconnect_after, lie_bitfield, greedy, lie_extensions); BUGGIFY (`SimIO.injectRandomFault` per-step + `FaultConfig` per-op) randomized fault injection; `SimIO.Config.max_ops_per_tick` runtime cap modelling real io_uring's CQE batch boundary.
+- **Three layered smart-ban tests** (canonical demo of `STYLE.md > Layered Testing Strategy`):
+  - `tests/sim_smart_ban_protocol_test.zig` — algorithm test, 8 seeds, no faults.
+  - `tests/sim_smart_ban_eventloop_test.zig` (clean run) — integration test, real `EventLoopOf(SimIO)`, 8 seeds, no faults.
+  - `tests/sim_smart_ban_eventloop_test.zig` (BUGGIFY run) — safety-under-faults test, 32 seeds with `recv/send_error_probability=0.003`, `read/write=0.001`, per-tick injection probability=0.02. Vacuous-pass guard demands ≥ half the seeds observe a real ban; empirically 23/32 ban + 96/96 honest pieces verify.
+- **STYLE.md migration-pattern catalogue** at 13 entries: patterns 1-7 (Stage 2 lessons), 8-10 (single-coherent-commits, bench-companion, lazy-compilation-shipping), 11 (`@TypeOf(self.*).X` namespace access in anytype methods), 12 (`closeSocket` on the IO interface — fd-touching syscalls round-trip through the backend), 13 (`max_ops_per_tick` modelling kernel CQE batch boundaries). Plus the new "Layered Testing Strategy" top-level section codifying the algorithm/integration/safety-under-faults split.
+- **Hasher cleanup race fix** (Task #16): `hasher.deinit` now frees valid `completed_results` bufs alongside invalid ones, so the daemon shutdown path is leak-clean even if processHashResults didn't drain results before EL teardown. The smart-ban EL test's drain phase remains as belt-and-suspenders.
+- Test count: 163 → 204 (+41 across Stages 2-5 + cleanup; sim-engineer added the smart-ban EL + BUGGIFY tests, migration-engineer's #16 fix wired three pre-existing `event_loop_health_test.zig` tests into the main `test` step).
+- All four sim-engineer DoD items closed: SimIO socketpair, Simulator runs `EventLoopOf(SimIO)`, smart-ban over 8 seeds, BUGGIFY over 32 seeds.
+- `zig build test`: 204/204 pass, no leaks.
+- `zig build`: clean.
 
-- `zig build test`: 204/204 tests pass (was 199 before this session)
-- `zig build`: clean build
-- 12 STYLE.md migration patterns codified covering callback dispatch,
-  pool allocation, comptime IO parameterisation, fd-touching syscall
-  routing, sim batch boundaries, lazy-method-compilation, and the
-  meta-discipline of tests-pass-at-every-commit + bench-companion
-- IO abstraction (`io_interface.zig`) ships RealIO and SimIO behind a
-  single trait surface. `EventLoopOf(comptime IO: type)` instantiates
-  for both; smart-ban scenarios now run as deterministic 32-seed
-  simulator BUGGIFY tests in addition to live-network e2e.
+### Perf benches (ReleaseFast, post-warm vs 2026-04-16 baselines)
+- `peer_accept_burst --iterations=4000 --clients=1`: `~5.0e7 ns` (vs baseline `~6.91e8 ns`, **14× faster** — io_interface multishot path dropped most of the per-accept overhead). 1 alloc / 128 B (was 0/0 — minor regression in alloc count, transient).
+- `seed_plaintext_burst --iterations=500 --scale=8`: `6.7e6 ns` to `8.7e6 ns` post-warm (vs baseline `6.79e6 ns` to `6.93e6 ns`, **stable to slightly variable**). 2 allocs / 704 B (matches baseline shape after PendingSend pool refactor in #12).
+- `api_get_burst --iterations=4000 --clients=8`: `~6.5e7 ns` to `~7.0e7 ns` (vs baseline `2.13e8 ns` to `2.31e8 ns`, **3× faster**). 8000 allocs / 1.98 MB transient, all freed (peak_live = 1984 B). **Allocation count regressed from baseline `0/0`; tracked as Task #20.**
+- `tick_sparse_torrents --iterations=500 --torrents=10000 --peers=512 --scale=20`: `~1.5e7 ns` post-warm (vs baseline `1.09e7 ns`, **~1.4× regression — under 2× threshold**). 0 allocs / 0 transient, matches baseline shape. **Tracked as Task #21.**
 
-Perf benches re-verified vs the 2026-04-16 baselines (ReleaseFast,
-post-warm; first-iteration cold-cache numbers omitted):
-
-- `zig build -Doptimize=ReleaseFast perf-workload -- peer_accept_burst --iterations=4000 --clients=1`: `~5.0e7 ns` (vs baseline `~6.91e8 ns`, **14× faster** — io_interface multishot path dropped most of the per-accept overhead). 1 alloc / 128 B (was 0/0 — minor regression in alloc count, transient).
-- `zig build -Doptimize=ReleaseFast perf-workload -- seed_plaintext_burst --iterations=500 --scale=8`: `6.7e6 ns` to `8.7e6 ns` post-warm (vs baseline `6.79e6 ns` to `6.93e6 ns`, **stable to slightly variable**). 2 allocs / 704 B (matches baseline shape after PendingSend pool refactor in #12).
-- `zig build -Doptimize=ReleaseFast perf-workload -- api_get_burst --iterations=4000 --clients=8`: `~6.5e7 ns` to `~7.0e7 ns` (vs baseline `2.13e8 ns` to `2.31e8 ns`, **3× faster**). 8000 allocs / 1.98 MB transient, all freed (peak_live = 1984 B). Allocation count regressed from baseline `0/0`; the bytes are short-lived and freed within the iteration, so no working-set inflation, but worth a follow-up to find the per-iteration allocation source.
-- `zig build -Doptimize=ReleaseFast perf-workload -- tick_sparse_torrents --iterations=500 --torrents=10000 --peers=512 --scale=20`: `~1.5e7 ns` post-warm (vs baseline `1.09e7 ns`, **~1.4× regression — under 2× threshold**). 0 allocs / 0 transient, matches baseline shape. Likely from the per-tick generic-dispatch overhead added by the EL parameterisation; not blocking, but a candidate for the next perf-tuning sweep.
-
-Conclusions:
-- No `>2×` regressions. Stage 2 perf is clean for shipping.
-- `peer_accept_burst` and `api_get_burst` are substantially faster than the 2026-04-16 baselines. The io_interface migration is a net perf win on the accept path and the RPC GET path.
-- The 14× `peer_accept_burst` speedup is suspiciously large for "we just changed dispatch shape." Hypothesis: the legacy dispatch had redundant accept-handling work (duplicate slot lookup or per-CQE state validation) that the io_interface multishot consolidated. Worth a focused profile pass post-Phase-2 to confirm and document, since the win is large enough to inform future op-type migrations.
-- The `tick_sparse_torrents` 1.4× regression is the only watch-item. Worth profiling once Stage-2 cleanup is settled to identify whether it's the parameterisation overhead or one of the deinit-order changes.
-- `api_get_burst` allocation regression (`0 → 8000 transient`) is suspicious. May be a buffer that was previously stashed in inline storage now allocating; needs root-cause before declaring api perf clean.
+Conclusions: no `>2×` regressions; Stage 2 perf is clean for shipping. `peer_accept_burst` and `api_get_burst` are substantially faster than 2026-04-16 baselines — io_interface migration is a net perf win on the accept path and the RPC GET path. The 14× accept-burst speedup is suspiciously large for "we just changed dispatch shape" — hypothesis is that legacy dispatch had redundant accept-handling work that multishot consolidated; worth a focused profile pass post-Phase-2 to document. Two watch-items (api_get_burst alloc regression, tick_sparse_torrents 1.4× regression) filed as Tasks #20 / #21 for post-Phase-2 cleanup.
 
 ## Last Verified Milestone (2026-04-16)
 
