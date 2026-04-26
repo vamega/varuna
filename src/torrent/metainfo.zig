@@ -28,7 +28,12 @@ pub const Metainfo = struct {
     piece_length: u32,
     pieces: []const u8 = "", // may be empty for pure v2
     private: bool = false,
-    files: []File,
+    /// Per-file metadata. `[]const File` rather than `[]File` because no
+    /// production code mutates the slice contents post-parse — keeps test
+    /// struct literals (which use stack-allocated const arrays) coercible
+    /// without `@constCast`. Production parse path still owns the heap
+    /// allocation and frees it via `freeMetainfo`.
+    files: []const File,
 
     // BEP 19: GetRight-style web seed URLs (url-list key)
     url_list: []const []const u8 = &.{},
@@ -50,7 +55,24 @@ pub const Metainfo = struct {
             // For v2, piece count is derived from file sizes and piece_length
             return self.pieceCountFromFiles();
         }
-        return std.math.cast(u32, self.pieces.len / 20) orelse error.PieceCountOverflow;
+        // For v1/hybrid: prefer the pieces table when present (authoritative —
+        // catches torrents with extra/missing trailing data), but fall back to
+        // file-size-derived count when pieces have been freed for seeding-only
+        // (Phase 2 of the piece-hash lifecycle).
+        if (self.pieces.len > 0) {
+            return std.math.cast(u32, self.pieces.len / 20) orelse error.PieceCountOverflow;
+        }
+        return self.pieceCountFromFileSizes();
+    }
+
+    /// Compute piece count from v1 file sizes and piece_length. Used when the
+    /// v1 `pieces` table is not materialised (Phase 2 seeding-only load).
+    pub fn pieceCountFromFileSizes(self: Metainfo) !u32 {
+        if (self.piece_length == 0) return error.InvalidPieceLength;
+        const total = self.totalSize();
+        if (total == 0) return error.EmptyTorrentData;
+        const count = (total + self.piece_length - 1) / self.piece_length;
+        return std.math.cast(u32, count) orelse error.PieceCountOverflow;
     }
 
     /// Compute piece count for v2 torrents from file tree metadata.
@@ -73,6 +95,11 @@ pub const Metainfo = struct {
         }
         if (self.version == .v2) {
             return error.UnsupportedForV2;
+        }
+        // Phase 2 of the piece-hash lifecycle: pieces may have been skipped
+        // entirely (parseSeedingOnly) or freed mid-session (Session.freePieces).
+        if (self.pieces.len == 0) {
+            return error.PiecesNotLoaded;
         }
 
         const start = @as(usize, piece_index) * 20;
@@ -112,6 +139,37 @@ pub fn detectVersion(info: []const bencode.Value.Entry) TorrentVersion {
 }
 
 pub fn parse(allocator: std.mem.Allocator, input: []const u8) !Metainfo {
+    return parseWithOptions(allocator, input, .{});
+}
+
+/// Parse a torrent's metainfo without materialising the v1 `pieces` field.
+///
+/// Used by Phase 2 of the piece-hash lifecycle (see `docs/piece-hash-lifecycle.md`):
+/// when a session is loaded for a torrent already 100% complete, the per-piece
+/// SHA-1 table buys nothing for seeding (the downloading peer verifies with their
+/// own copy). Skipping the field saves `piece_count * 20` bytes per torrent.
+///
+/// Validation that the `pieces` field is present and well-formed is intentionally
+/// skipped — for already-complete torrents the data has already been verified
+/// against this table at least once. Recheck must call
+/// `Session.loadPiecesForRecheck()` first to re-materialise the field.
+pub fn parseSeedingOnly(allocator: std.mem.Allocator, input: []const u8) !Metainfo {
+    return parseWithOptions(allocator, input, .{ .skip_pieces = true });
+}
+
+pub const ParseOptions = struct {
+    /// When true, the v1 `pieces` field is not extracted from the bencode tree.
+    /// The returned `Metainfo.pieces` is left as an empty slice. The field is
+    /// still required to be present for v1/hybrid torrents (its presence is
+    /// part of the format), but its bytes are not read.
+    skip_pieces: bool = false,
+};
+
+pub fn parseWithOptions(
+    allocator: std.mem.Allocator,
+    input: []const u8,
+    options: ParseOptions,
+) !Metainfo {
     const digest = try info_hash.compute(input);
     const root = try bencode.parse(allocator, input);
     defer bencode.freeValue(allocator, root);
@@ -124,12 +182,20 @@ pub fn parse(allocator: std.mem.Allocator, input: []const u8) !Metainfo {
     const piece_length = try expectU32(try getRequired(info, "piece length"));
     if (piece_length == 0) return error.InvalidPieceLength;
 
-    // v1 pieces field: required for v1 and hybrid, absent for pure v2
+    // v1 pieces field: required for v1 and hybrid, absent for pure v2.
+    // skip_pieces leaves the bytes unread (Phase 2 seeding-only fast path).
     var pieces: []const u8 = "";
     if (version == .v1 or version == .hybrid) {
-        pieces = try expectBytes(try getRequired(info, "pieces"));
-        if (pieces.len == 0 or pieces.len % 20 != 0) {
-            return error.InvalidPiecesField;
+        if (options.skip_pieces) {
+            // Sanity-check presence without reading the bytes; the actual
+            // field validation runs only when pieces are materialised
+            // (e.g. via Session.loadPiecesForRecheck).
+            _ = try getRequired(info, "pieces");
+        } else {
+            pieces = try expectBytes(try getRequired(info, "pieces"));
+            if (pieces.len == 0 or pieces.len % 20 != 0) {
+                return error.InvalidPiecesField;
+            }
         }
     }
 
@@ -404,7 +470,7 @@ test "parse single file torrent metainfo" {
 
 test "parse multi file torrent metainfo" {
     const input =
-        "d4:infod5:filesl" ++ "d6:lengthi3e4:pathl5:alphaee" ++ "d6:lengthi7e4:pathl4:beta5:gammaeee" ++ "4:name4:root" ++ "12:piece lengthi16384e" ++ "6:pieces20:abcdefghijklmnopqrsteee";
+        "d4:infod5:filesl" ++ "d6:lengthi3e4:pathl5:alphaee" ++ "d6:lengthi7e4:pathl4:beta5:gammaeee" ++ "4:name4:root" ++ "12:piece lengthi16384e" ++ "6:pieces20:abcdefghijklmnopqrstee";
 
     const metainfo = try parse(std.testing.allocator, input);
     defer freeMetainfo(std.testing.allocator, metainfo);
@@ -462,8 +528,12 @@ test "non-private torrent defaults to false" {
 }
 
 test "reject non-dictionary torrent root" {
+    // `info_hash.findInfoBytes` runs before bencode parse and rejects
+    // a non-dict root with `UnexpectedByte` (it expects 'd' at offset 0).
+    // The test gets the earlier error rather than the expectDict
+    // `UnexpectedBencodeType` it was originally written against.
     try std.testing.expectError(
-        error.UnexpectedBencodeType,
+        error.UnexpectedByte,
         parse(std.testing.allocator, "li1ei2ee"),
     );
 }
@@ -584,8 +654,9 @@ test "parse hybrid torrent" {
 // ── BEP 19 / BEP 17 web seed tests ───────────────────────
 
 test "parse url-list as string" {
+    // URL is 26 chars; bencode length prefix must match.
     const input =
-        "d8:announce14:http://tracker4:infod6:lengthi5e4:name8:test.bin12:piece lengthi16384e6:pieces20:abcdefghijklmnopqrste8:url-list25:http://example.com/dl/filee";
+        "d8:announce14:http://tracker4:infod6:lengthi5e4:name8:test.bin12:piece lengthi16384e6:pieces20:abcdefghijklmnopqrste8:url-list26:http://example.com/dl/filee";
 
     const meta = try parse(std.testing.allocator, input);
     defer freeMetainfo(std.testing.allocator, meta);
@@ -595,20 +666,22 @@ test "parse url-list as string" {
 }
 
 test "parse url-list as list" {
+    // Both URLs are 26 chars; bencode length prefixes must match.
     const input =
-        "d8:announce14:http://tracker4:infod6:lengthi5e4:name8:test.bin12:piece lengthi16384e6:pieces20:abcdefghijklmnopqrste8:url-listl25:http://example.com/dl/file26:http://mirror.com/dl2/fileeee";
+        "d8:announce14:http://tracker4:infod6:lengthi5e4:name8:test.bin12:piece lengthi16384e6:pieces20:abcdefghijklmnopqrste8:url-listl26:http://example.com/dl/file26:http://mirror.com/dl2/fileee";
 
     const meta = try parse(std.testing.allocator, input);
     defer freeMetainfo(std.testing.allocator, meta);
 
     try std.testing.expectEqual(@as(usize, 2), meta.url_list.len);
     try std.testing.expectEqualStrings("http://example.com/dl/file", meta.url_list[0]);
-    try std.testing.expectEqualStrings("http://mirror.com/dl2/filee", meta.url_list[1]);
+    try std.testing.expectEqualStrings("http://mirror.com/dl2/file", meta.url_list[1]);
 }
 
 test "parse httpseeds" {
+    // URL is 29 chars; bencode length prefix must match.
     const input =
-        "d8:announce14:http://tracker9:httpseedsl30:http://seed.example.com/seed1e4:infod6:lengthi5e4:name8:test.bin12:piece lengthi16384e6:pieces20:abcdefghijklmnopqrstee";
+        "d8:announce14:http://tracker9:httpseedsl29:http://seed.example.com/seed1e4:infod6:lengthi5e4:name8:test.bin12:piece lengthi16384e6:pieces20:abcdefghijklmnopqrstee";
 
     const meta = try parse(std.testing.allocator, input);
     defer freeMetainfo(std.testing.allocator, meta);

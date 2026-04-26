@@ -243,7 +243,9 @@ test "reject missing info hash" {
 }
 
 test "reject invalid hex characters" {
-    try std.testing.expectError(error.InvalidHexCharacter, parse(std.testing.allocator, "magnet:?xt=urn:btih:zzbccddeeff00112233445566778899aabbccddee"));
+    // Must be exactly 40 chars (160-bit info-hash) to reach the hex
+    // validation step; shorter/longer inputs hit InvalidInfoHashLength first.
+    try std.testing.expectError(error.InvalidHexCharacter, parse(std.testing.allocator, "magnet:?xt=urn:btih:zzbccddeeff00112233445566778899aabbccdde"));
 }
 
 test "reject wrong length info hash" {

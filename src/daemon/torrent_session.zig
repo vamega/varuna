@@ -586,6 +586,13 @@ pub const TorrentSession = struct {
                         self.completion_on = std.time.timestamp();
                     }
                     self.pending_seed_setup = true;
+                    // Phase 2 of the piece-hash lifecycle: skip-recheck with
+                    // full bitfield means we trust resume DB the torrent is
+                    // already verified. The seeder never consults piece
+                    // hashes (peers verify with their own copy), so drop
+                    // the table now to free `piece_count * 20` bytes for
+                    // the lifetime of the seeding session.
+                    session.freePieces();
                 } else {
                     self.state = .downloading;
                 }
@@ -758,6 +765,11 @@ pub const TorrentSession = struct {
                 self.completion_on = std.time.timestamp();
             }
             self.pending_seed_setup = true;
+            // Phase 2 of the piece-hash lifecycle: recheck just verified
+            // every piece — drop the SHA-1 hash table for the lifetime of
+            // the seeding session. Piece hashes aren't needed for serving
+            // blocks; peers verify with their own copy.
+            session.freePieces();
             log.info("recheck complete: all pieces valid, entering seed mode", .{});
         } else {
             self.state = .downloading;

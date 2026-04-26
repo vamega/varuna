@@ -209,11 +209,14 @@ pub const MerkleCache = struct {
         var tree = try merkle.MerkleTree.fromPieceHashes(self.allocator, piece_hashes);
         errdefer tree.deinit();
 
-        // Validate root against expected pieces_root
+        // Validate root against expected pieces_root. Don't `tree.deinit()`
+        // explicitly here — `errdefer` covers cleanup on the error path.
+        // (Production bug fixed 2026-04-26: double-deinit caused SIGABRT
+        // in the merkle-rejects-wrong-root test once the test was actually
+        // wired into `zig build test`. See Task #9 progress report.)
         const expected_root = self.v2_files[file_index].pieces_root;
         const computed_root = tree.root();
         if (!std.mem.eql(u8, &computed_root, &expected_root)) {
-            tree.deinit();
             return error.MerkleRootMismatch;
         }
 
@@ -286,6 +289,26 @@ pub const MerkleCache = struct {
             self.access_order[file_index] = 0;
             self.cached_count -= 1;
         }
+    }
+
+    /// v2/hybrid analog of Phase 1 of the piece-hash lifecycle: drop any
+    /// cached Merkle tree for a file all of whose pieces are now complete.
+    /// Called from the EL after `pt.completePiece` returns true so we
+    /// don't keep tens of MB of derived per-piece SHA-256 hashes around
+    /// once they're no longer needed for hash-exchange serving.
+    ///
+    /// The per-file `pieces_root` (32 bytes) lives in the metainfo and is
+    /// not affected — that's the small, permanent root, sufficient for
+    /// any future verification / hash-exchange protocol response.
+    pub fn evictCompletedFile(
+        self: *MerkleCache,
+        file_index: u32,
+        complete_pieces: *const Bitfield,
+    ) void {
+        if (file_index >= self.trees.len) return;
+        if (self.trees[file_index] == null) return;
+        if (!self.isFileComplete(file_index, complete_pieces)) return;
+        self.invalidate(file_index);
     }
 
     /// Return the number of cached trees.
@@ -365,7 +388,7 @@ test "merkle cache init and deinit" {
         .piece_count = 3,
         .total_size = 1536,
         .files = &files,
-        .piece_hashes = "",
+        .piece_hashes = null,
         .version = .v2,
         .v2_files = &v2_files,
     };
@@ -405,7 +428,7 @@ test "merkle cache build and retrieve" {
         .piece_count = 2,
         .total_size = 1024,
         .files = &files,
-        .piece_hashes = "",
+        .piece_hashes = null,
         .version = .v2,
         .v2_files = &v2_files,
     };
@@ -451,7 +474,7 @@ test "merkle cache rejects wrong root" {
         .piece_count = 2,
         .total_size = 1024,
         .files = &files,
-        .piece_hashes = "",
+        .piece_hashes = null,
         .version = .v2,
         .v2_files = &v2_files,
     };
@@ -492,7 +515,7 @@ test "merkle cache LRU eviction" {
         .piece_count = 3,
         .total_size = 1536,
         .files = &files,
-        .piece_hashes = "",
+        .piece_hashes = null,
         .version = .v2,
         .v2_files = &v2_files,
     };
@@ -534,7 +557,7 @@ test "merkle cache invalidate" {
         .piece_count = 1,
         .total_size = 512,
         .files = &files,
-        .piece_hashes = "",
+        .piece_hashes = null,
         .version = .v2,
         .v2_files = &v2_files,
     };
@@ -566,7 +589,7 @@ test "merkle cache isFileComplete" {
         .piece_count = 3,
         .total_size = 1536,
         .files = &files,
-        .piece_hashes = "",
+        .piece_hashes = null,
         .version = .v2,
         .v2_files = &v2_files,
     };
@@ -613,7 +636,7 @@ test "merkle cache filePieceRange" {
         .piece_count = 3,
         .total_size = 1536,
         .files = &files,
-        .piece_hashes = "",
+        .piece_hashes = null,
         .version = .v2,
         .v2_files = &v2_files,
     };
@@ -658,7 +681,7 @@ test "merkle cache serves hashes via buildHashesFromTree" {
         .piece_count = 4,
         .total_size = 2048,
         .files = &files,
-        .piece_hashes = "",
+        .piece_hashes = null,
         .version = .v2,
         .v2_files = &v2_files,
     };
@@ -702,7 +725,7 @@ test "merkle cache pending request tracking" {
         .piece_count = 2,
         .total_size = 1024,
         .files = &files,
-        .piece_hashes = "",
+        .piece_hashes = null,
         .version = .v2,
         .v2_files = &v2_files,
     };
@@ -752,7 +775,7 @@ test "merkle cache pending request removal on disconnect" {
         .piece_count = 3,
         .total_size = 1536,
         .files = &files,
-        .piece_hashes = "",
+        .piece_hashes = null,
         .version = .v2,
         .v2_files = &v2_files,
     };
@@ -806,7 +829,7 @@ test "merkle cache coalesces multiple peers requesting same file" {
         .piece_count = 4,
         .total_size = 2048,
         .files = &files,
-        .piece_hashes = "",
+        .piece_hashes = null,
         .version = .v2,
         .v2_files = &v2_files,
     };

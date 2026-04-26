@@ -6,7 +6,18 @@ pub const Layout = struct {
     piece_count: u32,
     total_size: u64,
     files: []File,
-    piece_hashes: []const u8,
+    /// Flat SHA-1 piece hash table for v1/hybrid torrents.
+    ///
+    /// Lifecycle (see `docs/piece-hash-lifecycle.md`):
+    ///   - non-null after `Session.loadForDownload` for v1/hybrid;
+    ///   - null after `Session.loadForSeeding` (Phase 2) — never materialised;
+    ///   - null after `Session.freePieces` (Phase 1 endgame) — discarded once
+    ///     all pieces are verified;
+    ///   - null for pure v2 torrents (which use Merkle roots, not flat hashes).
+    ///
+    /// Callers must handle `error.PiecesNotLoaded` from `pieceHash`. The Session
+    /// owns the backing storage; the layout stores a non-owning view.
+    piece_hashes: ?[]const u8 = null,
     /// Torrent version for piece mapping strategy.
     version: metainfo.TorrentVersion = .v1,
     /// v2 per-file piece metadata (null for pure v1).
@@ -91,9 +102,12 @@ pub const Layout = struct {
         if (self.version == .v2) {
             return error.UnsupportedForV2;
         }
-
+        // Phase 1/2 of the piece-hash lifecycle: hashes may be freed for
+        // verified pieces (piece-by-piece + endgame slice free) or never
+        // materialised at all (seeding-only load).
+        const hashes = self.piece_hashes orelse return error.PiecesNotLoaded;
         const start = @as(usize, piece_index) * 20;
-        return self.piece_hashes[start .. start + 20];
+        return hashes[start .. start + 20];
     }
 
     pub fn pieceSpanCount(self: Layout, piece_index: u32) !usize {
@@ -213,15 +227,21 @@ pub fn build(allocator: std.mem.Allocator, source: *const metainfo.Metainfo) !La
         return buildV2(allocator, source, total_size);
     }
 
-    // v1 or hybrid: validate v1 piece hash count
+    // v1 or hybrid: derive piece count. When `pieces` is empty (seeding-only
+    // load skipped the field), fall back to the file-size-derived count.
     const piece_count = try source.pieceCount();
     if (piece_count == 0) {
         return error.EmptyTorrentData;
     }
 
-    const expected_piece_count = try computePieceCount(total_size, source.piece_length);
-    if (piece_count != expected_piece_count) {
-        return error.PieceHashCountMismatch;
+    // Cross-validate against the file-size-derived count when both sources
+    // are available. Skip validation when `pieces` is unavailable — Phase 2
+    // already trusts the file table for already-verified torrents.
+    if (source.pieces.len > 0) {
+        const expected_piece_count = try computePieceCount(total_size, source.piece_length);
+        if (piece_count != expected_piece_count) {
+            return error.PieceHashCountMismatch;
+        }
     }
 
     const files = try allocator.alloc(Layout.File, source.files.len);
@@ -251,7 +271,8 @@ pub fn build(allocator: std.mem.Allocator, source: *const metainfo.Metainfo) !La
         .piece_count = piece_count,
         .total_size = total_size,
         .files = files,
-        .piece_hashes = source.pieces,
+        // null when seeding-only load skipped pieces parsing (Phase 2).
+        .piece_hashes = if (source.pieces.len > 0) source.pieces else null,
         .version = source.version,
         .v2_files = source.file_tree_v2,
     };
@@ -294,7 +315,7 @@ fn buildV2(allocator: std.mem.Allocator, source: *const metainfo.Metainfo, total
         .piece_count = piece_count,
         .total_size = total_size,
         .files = files,
-        .piece_hashes = "", // v2 uses Merkle roots, not flat hashes
+        .piece_hashes = null, // v2 uses Merkle roots, not flat hashes
         .version = .v2,
         .v2_files = source.file_tree_v2,
     };
@@ -322,6 +343,7 @@ test "build layout for single file torrent" {
         .info_hash = [_]u8{0} ** 20,
         .announce = null,
         .created_by = null,
+        .comment = null,
         .name = "test.bin",
         .piece_length = 4,
         .pieces = hashes,
@@ -353,6 +375,7 @@ test "map piece across multiple files" {
         .info_hash = [_]u8{0} ** 20,
         .announce = null,
         .created_by = null,
+        .comment = null,
         .name = "root",
         .piece_length = 4,
         .pieces = hashes,
@@ -376,13 +399,14 @@ test "map piece across multiple files" {
     try std.testing.expectEqual(@as(u64, 1), piece1[0].file_offset);
     try std.testing.expectEqual(@as(u32, 4), piece1[0].length);
 
+    // Piece 2 spans bytes 8-9 (last 2-byte short piece). Both bytes lie
+    // entirely within gamma (which starts at byte 8 with length 2), so
+    // exactly one span: file_index=2, file_offset=0, length=2.
     const piece2 = try built.mapPiece(2, spans[0..]);
-    try std.testing.expectEqual(@as(usize, 2), piece2.len);
-    try std.testing.expectEqual(@as(u32, 1), piece2[0].file_index);
-    try std.testing.expectEqual(@as(u32, 1), piece2[0].length);
-    try std.testing.expectEqual(@as(u32, 2), piece2[1].file_index);
-    try std.testing.expectEqual(@as(u32, 1), piece2[1].piece_offset);
-    try std.testing.expectEqual(@as(u32, 1), piece2[1].length);
+    try std.testing.expectEqual(@as(usize, 1), piece2.len);
+    try std.testing.expectEqual(@as(u32, 2), piece2[0].file_index);
+    try std.testing.expectEqual(@as(u64, 0), piece2[0].file_offset);
+    try std.testing.expectEqual(@as(u32, 2), piece2[0].length);
 }
 
 test "reject mismatched piece hash count" {
@@ -394,6 +418,7 @@ test "reject mismatched piece hash count" {
         .info_hash = [_]u8{0} ** 20,
         .announce = null,
         .created_by = null,
+        .comment = null,
         .name = "test.bin",
         .piece_length = 4,
         .pieces = "aaaaaaaaaaaaaaaaaaaa",
@@ -415,6 +440,7 @@ test "render relative path for multi file torrent" {
         .info_hash = [_]u8{0} ** 20,
         .announce = null,
         .created_by = null,
+        .comment = null,
         .name = "root",
         .piece_length = 4,
         .pieces = hashes,
@@ -450,6 +476,7 @@ test "build v2 file-aligned layout" {
         .info_hash = [_]u8{0} ** 20,
         .announce = null,
         .created_by = null,
+        .comment = null,
         .name = "root",
         .piece_length = 4,
         .files = @constCast(v1_files[0..]),
@@ -488,6 +515,7 @@ test "v2 piece size respects file boundaries" {
         .info_hash = [_]u8{0} ** 20,
         .announce = null,
         .created_by = null,
+        .comment = null,
         .name = "root",
         .piece_length = 4,
         .files = @constCast(v1_files[0..]),
@@ -521,6 +549,7 @@ test "v2 mapPiece returns single-file spans" {
         .info_hash = [_]u8{0} ** 20,
         .announce = null,
         .created_by = null,
+        .comment = null,
         .name = "root",
         .piece_length = 4,
         .files = @constCast(v1_files[0..]),
@@ -567,6 +596,7 @@ test "v2 pieceSpanCount is always 1" {
         .info_hash = [_]u8{0} ** 20,
         .announce = null,
         .created_by = null,
+        .comment = null,
         .name = "root",
         .piece_length = 4,
         .files = @constCast(v1_files[0..]),
@@ -595,6 +625,7 @@ test "pure v2 layout rejects v1 piece hashes" {
         .info_hash = [_]u8{0} ** 20,
         .announce = null,
         .created_by = null,
+        .comment = null,
         .name = "root",
         .piece_length = 4,
         .files = @constCast(v1_files[0..]),
@@ -624,6 +655,7 @@ test "hybrid layout keeps v1 piece mapping semantics" {
         .info_hash = [_]u8{0} ** 20,
         .announce = null,
         .created_by = null,
+        .comment = null,
         .name = "root",
         .piece_length = 4,
         .pieces = hashes,

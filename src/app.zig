@@ -332,27 +332,25 @@ fn writeUsage(writer: *std.Io.Writer) !void {
 }
 
 test "startup banner mentions kernel floors" {
-    var output = std.ArrayList(u8).empty;
-    defer output.deinit(std.testing.allocator);
+    var allocating = std.Io.Writer.Allocating.init(std.testing.allocator);
+    defer allocating.deinit();
+    try writeStartupBanner(&allocating.writer);
+    const items = allocating.writer.buffered();
 
-    var writer = output.writer(std.testing.allocator);
-    try writeStartupBanner(&writer.interface);
-
-    try std.testing.expect(std.mem.indexOf(u8, output.items, "6.6") != null);
-    try std.testing.expect(std.mem.indexOf(u8, output.items, "6.8") != null);
+    try std.testing.expect(std.mem.indexOf(u8, items, "6.6") != null);
+    try std.testing.expect(std.mem.indexOf(u8, items, "6.8") != null);
 }
 
 test "usage shows offline commands only" {
-    var output = std.ArrayList(u8).empty;
-    defer output.deinit(std.testing.allocator);
+    var allocating = std.Io.Writer.Allocating.init(std.testing.allocator);
+    defer allocating.deinit();
+    try run(std.testing.allocator, &.{"varuna-tools"}, &allocating.writer);
+    const items = allocating.writer.buffered();
 
-    var writer = output.writer(std.testing.allocator);
-    try run(std.testing.allocator, &.{"varuna-tools"}, &writer.interface);
-
-    try std.testing.expect(std.mem.indexOf(u8, output.items, "inspect") != null);
-    try std.testing.expect(std.mem.indexOf(u8, output.items, "verify") != null);
-    try std.testing.expect(std.mem.indexOf(u8, output.items, "create") != null);
+    try std.testing.expect(std.mem.indexOf(u8, items, "inspect") != null);
+    try std.testing.expect(std.mem.indexOf(u8, items, "verify") != null);
+    try std.testing.expect(std.mem.indexOf(u8, items, "create") != null);
     // download and seed should NOT appear
-    try std.testing.expect(std.mem.indexOf(u8, output.items, "download <torrent") == null);
-    try std.testing.expect(std.mem.indexOf(u8, output.items, "seed <torrent") == null);
+    try std.testing.expect(std.mem.indexOf(u8, items, "download <torrent") == null);
+    try std.testing.expect(std.mem.indexOf(u8, items, "seed <torrent") == null);
 }

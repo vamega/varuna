@@ -1385,6 +1385,23 @@ pub fn looksLikeMse(first_bytes: []const u8) bool {
 
 // ── Tests ──────────────────────────────────────────────────
 
+/// Test helper: create a Unix socket pair via the linux syscall directly.
+/// `std.posix.socketpair` was removed in Zig 0.15; we wrap the raw syscall
+/// instead so test code stays readable.
+fn testSocketPair() !struct { fd_t, fd_t } {
+    var fds: [2]i32 = undefined;
+    const rc = std.os.linux.socketpair(
+        std.os.linux.AF.UNIX,
+        std.os.linux.SOCK.STREAM,
+        0,
+        &fds,
+    );
+    const errno = std.posix.errno(rc);
+    if (errno != .SUCCESS) return error.SocketPairFailed;
+    return .{ fds[0], fds[1] };
+}
+const fd_t = std.posix.fd_t;
+
 test "DH powMod dense known-vector test (fully random 768-bit keys, Python-verified)" {
     // Dense random 768-bit keys verified against Python's pow(base, exp, P)
     const priv_a_dense = [96]u8{
@@ -1651,7 +1668,7 @@ test "PeerCrypto bidirectional encrypt/decrypt with separate keys" {
 
 test "full MSE handshake via loopback socket pair" {
     // Create a socket pair for testing
-    const fds = std.posix.socketpair(.{ .domain = .unix, .type = .stream }) catch return error.SkipZigTest;
+    const fds = testSocketPair() catch return error.SkipZigTest;
     defer std.posix.close(fds[0]);
     defer std.posix.close(fds[1]);
 
@@ -1724,7 +1741,7 @@ test "full MSE handshake via loopback socket pair" {
 
 test "threaded full MSE handshake" {
     // Create a socket pair for testing
-    const fds = std.posix.socketpair(.{ .domain = .unix, .type = .stream }) catch return error.SkipZigTest;
+    const fds = testSocketPair() catch return error.SkipZigTest;
 
     const info_hash = [_]u8{ 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0A, 0x0B, 0x0C, 0x0D, 0x0E, 0x0F, 0x10, 0x11, 0x12, 0x13, 0x14 };
 
@@ -1768,7 +1785,7 @@ test "threaded full MSE handshake" {
 }
 
 test "threaded MSE handshake with plaintext fallback" {
-    const fds = std.posix.socketpair(.{ .domain = .unix, .type = .stream }) catch return error.SkipZigTest;
+    const fds = testSocketPair() catch return error.SkipZigTest;
 
     const info_hash = [_]u8{0xAA} ** 20;
 

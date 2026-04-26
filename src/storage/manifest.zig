@@ -28,10 +28,16 @@ pub fn build(
     errdefer allocator.free(root_copy);
 
     const files = try allocator.alloc(Manifest.File, layout.files.len);
+    // Track how many entries are validly initialized so the errdefer
+    // doesn't iterate uninitialized memory (which crashes with signal 6
+    // when `if (file.relative_path.len != 0)` reads undefined bytes —
+    // production bug surfaced by the path-traversal test once it was
+    // wired into `zig build test`. See Task #9 progress report.)
+    var initialized: usize = 0;
     errdefer {
-        for (files[0..layout.files.len]) |file| {
-            if (file.relative_path.len != 0) allocator.free(file.relative_path);
-            if (file.full_path.len != 0) allocator.free(file.full_path);
+        for (files[0..initialized]) |file| {
+            allocator.free(file.relative_path);
+            allocator.free(file.full_path);
         }
         allocator.free(files);
     }
@@ -54,6 +60,7 @@ pub fn build(
             .full_path = full_path,
             .offset = layout_file.torrent_offset,
         };
+        initialized = index + 1;
     }
 
     return .{
@@ -144,7 +151,7 @@ test "build manifest for single file torrent" {
 
 test "build manifest for multi file torrent" {
     const input =
-        "d4:infod5:filesl" ++ "d6:lengthi3e4:pathl5:alphaee" ++ "d6:lengthi7e4:pathl4:beta5:gammaeee" ++ "4:name4:root" ++ "12:piece lengthi4e" ++ "6:pieces60:abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ12345678eee";
+        "d4:infod5:filesl" ++ "d6:lengthi3e4:pathl5:alphaee" ++ "d6:lengthi7e4:pathl4:beta5:gammaeee" ++ "4:name4:root" ++ "12:piece lengthi4e" ++ "6:pieces60:abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ12345678ee";
 
     const info = try metainfo.parse(std.testing.allocator, input);
     defer metainfo.freeMetainfo(std.testing.allocator, info);

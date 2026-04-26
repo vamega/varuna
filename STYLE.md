@@ -583,6 +583,17 @@ From narrowest to broadest:
    protocol message parsing. No IO. No allocator beyond testing allocator. Run in
    milliseconds.
 
+   **Zig 0.15.2 test discovery gotcha**: `pub const X = @import("file.zig");` does
+   NOT pull `file.zig`'s test blocks into the test runner. Only files reached from
+   a *test-context* import — `test { _ = X; }` or `test { _ = @import("file.zig"); }`
+   from the test root — actually run their inline tests. The pattern `test { _ = ... }`
+   in subsystem `root.zig` files (mirroring `src/crypto/root.zig`) is required at the
+   subsystem level AND a top-level `test { _ = subsystem; }` in `src/root.zig` is
+   required to reach test-context. Verified empirically: a deliberately-failing
+   `try std.testing.expect(false)` in `src/torrent/session.zig` is silently skipped
+   without these blocks. (See Task #9 progress report for the full audit.) Future
+   subsystems must add the pattern to both root files when they're created.
+
 2. **Sim tests** (`tests/sim_*.zig`): one or more `SimPeer`s against a real `EventLoop`
    driven by `SimIO`. Exercises the full download path. Seeded, deterministic, fast.
    The right place to test protocol correctness, smart ban, and banning strategies.
