@@ -711,7 +711,12 @@ pub const TorrentSession = struct {
 
         const session = &(self.session orelse return);
 
-        // Persist recheck results to resume DB for next startup
+        // Persist recheck results to resume DB for next startup. Use the
+        // atomic replace so stale entries (pieces that were marked complete
+        // pre-recheck but the recheck found incomplete) are dropped in the
+        // same transaction that commits the new set — without it, the
+        // additive `markCompleteBatch` would leave the rejected pieces
+        // marked complete and corrupt the next daemon-restart's fast-resume.
         if (self.resume_writer) |*rw| {
             var completed_pieces = std.ArrayList(u32).empty;
             defer completed_pieces.deinit(self.allocator);
@@ -721,9 +726,7 @@ pub const TorrentSession = struct {
                     completed_pieces.append(self.allocator, idx) catch {};
                 }
             }
-            if (completed_pieces.items.len > 0) {
-                rw.db.markCompleteBatch(session.metainfo.info_hash, completed_pieces.items) catch {};
-            }
+            rw.db.replaceCompletePieces(session.metainfo.info_hash, completed_pieces.items) catch {};
         }
         self.resume_last_count = recheck.complete_pieces.count;
 
@@ -854,10 +857,12 @@ pub const TorrentSession = struct {
 
         const session = &(self.session orelse return);
 
-        // Persist recheck results to resume DB. Matches the upsert
-        // semantics of the stop+start `onRecheckComplete` path. Stale
-        // entries for pieces the recheck found incomplete are not pruned
-        // here (same caveat as the existing path).
+        // Persist recheck results to resume DB. The atomic
+        // `replaceCompletePieces` (delete-then-insert in one transaction)
+        // ensures stale rows from the pre-recheck state are dropped at the
+        // same time the new completed set lands — additive
+        // `markCompleteBatch` would leak entries for pieces the recheck
+        // reclassified as incomplete and break fast-resume on next start.
         if (self.resume_writer) |*rw| {
             var completed_pieces = std.ArrayList(u32).empty;
             defer completed_pieces.deinit(self.allocator);
@@ -867,9 +872,7 @@ pub const TorrentSession = struct {
                     completed_pieces.append(self.allocator, idx) catch {};
                 }
             }
-            if (completed_pieces.items.len > 0) {
-                rw.db.markCompleteBatch(session.metainfo.info_hash, completed_pieces.items) catch {};
-            }
+            rw.db.replaceCompletePieces(session.metainfo.info_hash, completed_pieces.items) catch {};
         }
         self.resume_last_count = recheck.complete_pieces.count;
 
