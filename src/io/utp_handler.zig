@@ -55,8 +55,7 @@ fn utpRecvComplete(
     const res: i32 = switch (result) {
         .recvmsg => |r| if (r) |n|
             std.math.cast(i32, n) orelse std.math.maxInt(i32)
-        else |err|
-            if (err == error.OperationCanceled) -125 else -1, // -ECANCELED
+        else |err| if (err == error.OperationCanceled) -125 else -1, // -ECANCELED
         else => -1,
     };
     handleUtpRecvResult(self, res);

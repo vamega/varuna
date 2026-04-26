@@ -567,4 +567,3 @@ test "findPendingSeedReadIndex matches by unique read id" {
     try std.testing.expectEqual(@as(?usize, 1), findPendingSeedReadIndex(reads[0..], 12));
     try std.testing.expectEqual(@as(?usize, null), findPendingSeedReadIndex(reads[0..], 99));
 }
-

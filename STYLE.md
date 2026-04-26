@@ -204,6 +204,61 @@ Patterns that fell out of the Stage 2 migration (Apr 2026) and the bugs they cat
     pattern #10 applied to *behavior* rather than types: invariants the real backend
     enforces implicitly become explicit caps on the sim.
 
+14. **Investigation discipline — surface scoped follow-ups when the gap is bigger than the
+    task.** When an audit, exploratory test, or scoped fix surfaces work larger than the
+    original task, the right deliverable is **a filed scoped follow-up with empirical
+    evidence** (file:line citations, error counts, hypotheses), not a partial in-line fix.
+    Audit-style work has correctness measured by what it reliably exposes, not by what it
+    incidentally repairs. Worked examples this codebase has accumulated:
+
+    - Phase 2A "3-peers-at-tick-0" stress test surfaced the late-arriver block-stealing
+      gap; filed as Task #23 with the four-hypothesis diagnostic shape; bonus stress-test
+      deferred without blocking Phase 2 close. Hypothesis #1 (bitfield guard) closed it
+      in ~30 minutes a session later because the diagnosis was already on file.
+    - Task #6 build.zig audit surfaced ~32 source-side test compile errors plus stale
+      expectations; filed as Task #9 with the full per-file scope, then closed cleanly
+      in a focused session that surfaced 2 production bugs in the process.
+    - Track A3 (recheck BUGGIFY) hit `AsyncRecheck` hard-coded to `*RealIO`; filed the
+      IO-generic refactor as STATUS.md "Next" with 1-2 day estimate; shipped the
+      algorithm-level cross-product harness for the in-scope surfaces instead of blocking.
+    - Task #5 DHT BUGGIFY surfaced the KRPC encoder bounds-check unsoundness; filed as a
+      task with line-references; ~30 min mechanical fix deferred to whoever picks up.
+
+    The discipline cost is paid at scoping time, not at fix time. The audit completes,
+    the gap is mapped, and the next person resumes in minutes from clear notes instead
+    of hours of rederivation.
+
+15. **Read existing invariants before drafting an API.** Design briefs and task
+    descriptions can overstate degrees of freedom that production code has already
+    constrained. When a brief lists "options," "subtle constraints," or "design choices,"
+    the first move is **to read the production code for what's already implied** —
+    five minutes of code archaeology can collapse "design a pool with claim/release" into
+    "claim the existing serialisation invariant and reuse one buffer."
+
+    *Example: Stage 4 ut_metadata buffer brief listed three concurrency options (single
+    buffer / per-slot / pool). Reading `event_loop.zig:1859` revealed
+    `if (self.metadata_fetch != null) return error.MetadataFetchAlreadyActive` —
+    production already serialises across all torrents. Option (a) was the de facto
+    behaviour. Multi-day savings from a five-minute read.*
+
+    Companion to pattern #14: investigation discipline catches scope inflation; reading
+    invariants catches scope **deflation** — places where the brief assumes choice that
+    the code has already made.
+
+16. **Caller-owned storage + panicking-allocator-vtable as zero-alloc tripwire.** When
+    a path is contractually zero-alloc, route through caller-owned storage with a
+    `std.mem.Allocator` whose `vtable` panics on every call. Any code path that tries
+    to allocate crashes loud rather than silently growing. The invariant is enforced at
+    runtime, not just by convention or comment. Composes well with BUGGIFY: an
+    allocation-attempt panic is exactly the safety violation the harness is designed to
+    catch.
+
+    *Example: `MetadataAssembler.initShared` in Stage 4 — the assembler runs on a path
+    that's contractually zero-alloc (uses pre-allocated `EventLoop` buffer). The
+    panicking-allocator-vtable makes any future caller that re-introduces an
+    `allocator.alloc` crash immediately and visibly. The invariant survives refactors
+    that drop comments.*
+
 ### Test-first coordination
 
 When a sim-side engineer drafts a test API spec for a new production feature, the
