@@ -354,20 +354,17 @@ test "multi-source: 3 peers all hold full piece, picker spreads load (8 seeds)" 
     }
 }
 
-// TODO(phase 2A, after migration-engineer's picker change lands):
-//
-//     test "multi-source: peer disconnect mid-piece, survivors complete (8 seeds)"
-//
-// The scenario is staged in `runScenario`'s `disconnect_peer_after`
-// branch but currently surfaces an `assert(st.heap_index == sentinel_index)`
-// panic in `SimIO.schedule` when `peer_policy.submitPipelineRequests`
-// double-schedules a `PendingSend` completion after the disconnect
-// path runs `releaseBlocksForPeer`. The double-submit looks like a
-// production-side bug that the existing single-source tests don't
-// exercise — the disconnect scenario is the first one to hit
-// `releaseBlocksForPeer` mid-piece with active pending sends. Worth
-// migration-engineer's read on whether the fix lives in
-// `submitPipelineRequests` (don't reuse a still-in-flight PendingSend)
-// or in `releaseBlocksForPeer` (cancel any in-flight sends for the
-// released blocks). Either way, this scenario stays gated until Phase
-// 2A's picker work lands and the production race is understood.
+test "multi-source: peer disconnect mid-piece, survivors complete (8 seeds)" {
+    const seeds = [_]u64{
+        0x0000_0001, 0xDEAD_BEEF, 0xFEED_FACE, 0xCAFE_BABE,
+        0x0F0F_0F0F, 0x1234_5678, 0xABCD_EF01, 0x9876_5432,
+    };
+    for (seeds) |seed| {
+        runScenario(seed, .{
+            .disconnect_peer_after = .{ .peer_index = 1, .blocks = 8 },
+        }) catch |err| {
+            std.debug.print("\n  multi-source disconnect SEED 0x{x} FAILED: {any}\n", .{ seed, err });
+            return err;
+        };
+    }
+}
