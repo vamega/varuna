@@ -490,10 +490,25 @@ test "phase 2B: steady-state honest-co-located-peer (gated on Task #23)" {
     // peer 1 is NOT banned despite contributing blocks to the same
     // piece that peer 0 corrupted.
     //
-    // This scenario doesn't need Task #26 (no disconnect → snapshot
-    // captures both peers cleanly) but DOES need Task #23 (so peer 1
-    // actually contributes blocks to the multi-source piece, not
-    // monopolised by peer 0's tryFillPipeline).
+    // **Gating reason — discriminating-power non-vacuity**: this
+    // scenario doesn't need Task #26 (no disconnect → snapshot
+    // captures both peers cleanly), but it DOES need Task #23 to
+    // force peer 1 onto the wire as a co-contributor — not just
+    // for distribution proportion, but for the discriminating-power
+    // assertion to be non-vacuous. Without #23, peer 0 monopolises
+    // tryFillPipeline at piece-claim time → peer 1 contributes 0
+    // blocks → peer 1 has no `delivered_address` entries → peer 1
+    // is trivially absent from the per-block compare → "acquittal"
+    // becomes "peer 1 was never in the picture" (same as scenario
+    // 1's peer 2). Phase 2 didn't actually exercise its
+    // discriminator.
+    //
+    // For peer 1 to be a meaningful co-contributor, the picker
+    // needs to spread blocks across both peers (which is what #23
+    // unlocks for the steady-state path). Until then, scenario 3
+    // is either redundant with scenario 1 (peer 1 idle) or needs
+    // the disconnect-rejoin shape to force multi-source. Stays
+    // gated.
     if (!multi_source_landed) return;
 
     const specs: [num_peers]PeerSpec = .{
