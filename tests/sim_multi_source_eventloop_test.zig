@@ -284,32 +284,18 @@ fn runScenario(seed: u64, opts: ScenarioOpts) !void {
         try testing.expect(!ban_list.isBanned(syntheticAddr(k)));
     }
 
-    // Gated until migration-engineer's late-peer block-stealing
-    // change (Task #23) lands.
-    //
-    // Status: the picker fair-share + per-call cap (commit 8553ab7)
-    // and the test-side `recv_latency_ns = 1ms` get distribution
-    // working on most seeds. But the test is flaky (~30-40% failure
-    // rate across Zig test-runner seeds, observed locally over 8
-    // back-to-back runs). On adversarial SimIO scheduling orders the
-    // first peer's tryFillPipeline can still drain the piece before
-    // tryAssignPieces sees `peer_count > 1`. The fair_share cap of
-    // `ceil(blocks/peer_count)` doesn't constrain when peer_count
-    // is still 1 at first-claim time.
-    //
-    // Late-peer block-stealing (Task #23) addresses this: when a
-    // new peer joins a DP whose blocks are all claimed by another
-    // peer, steal some `.requested`-state blocks from the dominant
-    // peer so the new peer has work to do. With block-stealing the
-    // test becomes deterministic regardless of which peer handshakes
-    // first.
-    //
-    // Until then, the scaffold ships green. The other live assertions
-    // (piece verifies, no honest peer banned) DO exercise the multi-
-    // source code path end-to-end; only the distribution-proportion
-    // assertions are gated. Distribution is verified at the bare-
-    // data-structure level by `tests/sim_multi_source_protocol_test.zig`.
-    const multi_source_landed: bool = false;
+    // Multi-source distribution assertions — live as of Task #23
+    // landing late-peer block-stealing (`peer_policy.tryFillPipeline`
+    // duplicate-REQUEST fallback + `tryJoinExistingPiece` accepting
+    // fully-claimed DPs with stealable blocks).  The picker fair-
+    // share + per-call cap (commit 8553ab7) handles the steady-
+    // state, and block-stealing handles the "3 peers at tick 0"
+    // race where the first responder drains the piece in one tick
+    // before peers 2 and 3 finish handshake. Bitfield gate in
+    // `tryJoinExistingPiece` keeps the BUGGIFY smart-ban safety
+    // invariant intact (no honest peer falsely framed by
+    // cross-DP join).
+    const multi_source_landed: bool = true;
     if (multi_source_landed) {
         // `bytes_downloaded` is the right metric here — it's the count
         // of bytes the EL DOWNLOADED FROM this peer. Each peer's

@@ -105,14 +105,38 @@ pub fn tryAssignPieces(self: anytype) void {
     }
 }
 
-/// Try to join an existing DownloadingPiece that has unrequested blocks and
-/// fewer than max_peers_per_piece peers.  Returns true if the peer was
-/// successfully joined to an existing download.
+/// Try to join an existing DownloadingPiece that the peer can contribute
+/// to, returning true on success.  A DP is "joinable" if it has fewer than
+/// `max_peers_per_piece` peers and either:
+///
+///   * unrequested blocks remain (preferred, no duplicate work), or
+///   * every block is in `.requested` state but at least one is attributed
+///     to a different peer (block-stealing path — a late peer issues
+///     duplicate REQUESTs for in-flight blocks; whichever delivery
+///     `markBlockReceived` sees first wins, the loser's data is dropped).
+///
+/// Block-stealing unblocks the "3 peers all hold the full piece, peer A
+/// drains the entire piece in one tick before peers B+C finish handshake"
+/// race observed by `tests/sim_multi_source_eventloop_test.zig`. Without
+/// it B+C find `unreq == 0` and stay idle until the piece completes,
+/// degenerating to single-source.
+///
+/// Bitfield check (`peer_bf.has(dp.piece_index)`) is critical for the
+/// smart-ban safety invariant: an honest peer in a swarm where corrupt
+/// holds piece 0 (disjoint from honest's bitfield) must NEVER join piece
+/// 0's DP via the stealing path. Without the bitfield gate, an honest
+/// peer would issue REQUESTs for piece 0; the SimPeer `serveRequest` does
+/// not enforce bitfield at the wire (it serves any piece in `piece_data`),
+/// so honest data lands attributed to the honest slot, racing against
+/// corrupt's corrupt data → mixed buffer → hash fails →
+/// `processHashResults` penalises whichever slot delivered the *last*
+/// block. If that's an honest slot, smart-ban frames an honest peer.
+/// The bitfield check makes this impossible by construction.
 pub fn tryJoinExistingPiece(self: anytype, slot: u16, peer: *Peer) bool {
     const peer_bf = if (peer.availability) |*bf| bf else return false;
 
     var best_dp: ?*DownloadingPiece = null;
-    var best_unrequested: u16 = 0;
+    var best_score: u32 = 0;
 
     var it = self.downloading_pieces.valueIterator();
     while (it.next()) |dp_ptr| {
@@ -121,14 +145,22 @@ pub fn tryJoinExistingPiece(self: anytype, slot: u16, peer: *Peer) bool {
         if (dp.torrent_id != peer.torrent_id) continue;
         // Must have room for another peer
         if (dp.peer_count >= max_peers_per_piece) continue;
-        // Must have unrequested blocks
-        const unreq = dp.unrequestedCount();
-        if (unreq == 0) continue;
-        // Peer must have this piece
+        // Peer must have this piece (smart-ban safety, see fn doc)
         if (!peer_bf.has(dp.piece_index)) continue;
-        // Pick the piece with the most unrequested blocks
-        if (unreq > best_unrequested) {
-            best_unrequested = unreq;
+
+        // Score: unrequested blocks count for full credit (each is a
+        // unique block this peer can claim outright). Stealable blocks
+        // count for half credit — duplicate work, only useful when
+        // there are no unique blocks to claim. Always prefer DPs with
+        // unique blocks first.
+        const unreq = dp.unrequestedCount();
+        var score: u32 = @as(u32, unreq) * 2;
+        if (unreq == 0) {
+            if (dp.nextStealableBlock(slot) != null) score = 1; // some stealable
+        }
+        if (score == 0) continue;
+        if (score > best_score) {
+            best_score = score;
             best_dp = dp;
         }
     }
@@ -340,22 +372,56 @@ pub fn tryFillPipeline(self: anytype, slot: u16) !void {
                 claimed_this_call += 1;
             }
 
-            // Block-stealing — REVERTED pending BUGGIFY-interaction
-            // investigation. See task #23 progress notes. The stealing
-            // helper `dp.nextStealableBlock` and the production-side
-            // duplicate-handling in `markBlockReceived`/`peer.inflight_requests`
-            // accounting are in place; what's not understood yet is
-            // why enabling stealing reliably drops 2/96 honest pieces
-            // under BUGGIFY p=0.02 fault injection on `sim_smart_ban_eventloop_test`.
-            // Honest peers don't share pieces with corrupt (bitfields
-            // disjoint), so a hashfail on an honest peer shouldn't be
-            // possible — yet enabling stealing produces it. Some
-            // interaction with `releaseBlocksForPeer` on BUGGIFY-
-            // induced disconnect, OR the `peer.current_piece` check in
-            // `protocol.processMessage` that gates piece-block recv
-            // routing, OR the `bytes_downloaded_from` accounting under
-            // raced duplicates. Needs targeted diagnosis under a
-            // failing seed before re-enabling.
+            // Block-stealing fallback. Once `nextUnrequestedBlock`
+            // returns null (every block in `peer.downloading_piece` is
+            // either `.requested` by some peer or `.received`), fill
+            // remaining pipeline capacity with **duplicate REQUESTs**
+            // for blocks attributed to other peers. Whoever's response
+            // arrives first wins attribution via `markBlockReceived`;
+            // the loser's response is dropped (state == .received → false).
+            //
+            // Why this is safe:
+            //   * peer.current_piece was set via a bitfield-checked path
+            //     (`pt.claimPiece(peer_bf)` or `tryJoinExistingPiece`'s
+            //     `peer_bf.has(dp.piece_index)` gate), so the peer holds
+            //     this piece. We do not cross piece boundaries here.
+            //   * markBlockReceived is the single attribution authority;
+            //     the duplicate response decrements `peer.inflight_requests`
+            //     unconditionally (protocol.zig:170) and discards data.
+            //   * We do not mutate dp state — peer_slot remains the
+            //     original requester's slot until delivery. If the
+            //     original peer disconnects, `releaseBlocksForPeer`
+            //     resets state to `.none` and our duplicate response
+            //     lands as a fresh delivery (state was `.none` →
+            //     markBlockReceived writes data and sets peer_slot to us).
+            //
+            // Bound: same `per_call_cap` as the unrequested-claim loop,
+            // so a stealing peer can claim at most pipeline_depth/3
+            // duplicate-requests per tryFillPipeline call (the same per-
+            // call cap rationale: don't let one peer monopolise refills).
+            // Defensive bitfield re-check at the top of the steal loop
+            // catches any future picker path that bypassed the entry-
+            // point check.
+            const peer_has_piece = if (peer.availability) |*bf|
+                bf.has(piece_index)
+            else
+                false;
+            if (peer_has_piece) {
+                var steal_idx: u16 = 0;
+                while (peer.inflight_requests + p1 < pipeline_depth and
+                    claimed_this_call < per_call_cap and
+                    steal_idx < dp.blocks_total)
+                {
+                    const bi = dp.block_infos[steal_idx];
+                    if (bi.state == .requested and bi.peer_slot != slot) {
+                        const req = geometry.requestForBlock(piece_index, steal_idx) catch break;
+                        writeRequestMsg(send_buf[p1 * request_size ..], req);
+                        p1 += 1;
+                        claimed_this_call += 1;
+                    }
+                    steal_idx += 1;
+                }
+            }
         } else {
             // Legacy path (no DownloadingPiece -- should not happen after migration)
             while (peer.inflight_requests + p1 < pipeline_depth and
