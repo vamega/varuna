@@ -167,6 +167,12 @@ pub const Stats = struct {
     num_files: u32 = 0,
 };
 
+/// Stack-allocated bump-arena size for tracker announce parsing
+/// (Stage 2 zero-alloc plan). Compact peers are 6 B (IPv4) or 18 B (IPv6);
+/// 64 KiB covers ~10K compact-IPv4 peers plus dict overhead — well past
+/// realistic tracker responses.
+const tracker_announce_arena_bytes = 64 * 1024;
+
 pub const TorrentSession = struct {
     allocator: std.mem.Allocator,
     mutex: std.Thread.Mutex = .{},
@@ -1478,8 +1484,19 @@ pub const TorrentSession = struct {
         const self: *TorrentSession = @ptrCast(@alignCast(context));
         defer self.finishAnnounceJob();
         const body = result.body orelse return;
-        const resp = tracker.announce.parseResponse(self.allocator, body) catch return;
-        defer tracker.announce.freeResponse(self.allocator, resp);
+
+        // Stage 2 zero-alloc: parse the bencoded response into a stack-
+        // allocated bump arena.  Typical announces are small (compact peer
+        // lists are 6 B × peers; 1500 peers ≈ 9 KB).  64 KB gives margin
+        // for non-compact, dict-form, or unusual encodings without ever
+        // calling the parent allocator.  Out-of-bound responses fail this
+        // announce and the tracker is retried later — safe and bounded.
+        var arena_buf: [tracker_announce_arena_bytes]u8 = undefined;
+        var fba = std.heap.FixedBufferAllocator.init(&arena_buf);
+        const arena_alloc = fba.allocator();
+
+        const resp = tracker.announce.parseResponse(arena_alloc, body) catch return;
+        // No freeResponse needed — `fba` is stack-scoped.
 
         const el = self.shared_event_loop orelse return;
 
@@ -1686,11 +1703,16 @@ pub const TorrentSession = struct {
             self.finishMagnetAnnounceJob();
             return;
         };
-        const resp = tracker.announce.parseResponse(self.allocator, body) catch {
+
+        // Per-announce stack arena — see `announceComplete`.
+        var arena_buf: [tracker_announce_arena_bytes]u8 = undefined;
+        var fba = std.heap.FixedBufferAllocator.init(&arena_buf);
+        const arena_alloc = fba.allocator();
+
+        const resp = tracker.announce.parseResponse(arena_alloc, body) catch {
             self.finishMagnetAnnounceJob();
             return;
         };
-        defer tracker.announce.freeResponse(self.allocator, resp);
 
         self.accumulateMagnetPeers(resp.peers);
         self.finishMagnetAnnounceJob();

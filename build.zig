@@ -506,6 +506,76 @@ pub fn build(b: *std.Build) void {
     test_transport_step.dependOn(&run_transport_tests.step);
     test_step.dependOn(&run_transport_tests.step);
 
+    // ── RPC arena tests (Stage 2 zero-alloc bump allocator) ──
+    const rpc_arena_tests = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("tests/rpc_arena_test.zig"),
+            .target = target,
+            .optimize = optimize,
+            .imports = &varuna_import,
+        }),
+    });
+    const run_rpc_arena_tests = b.addRunArtifact(rpc_arena_tests);
+    const test_rpc_arena_step = b.step("test-rpc-arena", "Run Stage 2 RPC bump arena tests");
+    test_rpc_arena_step.dependOn(&run_rpc_arena_tests.step);
+    test_step.dependOn(&run_rpc_arena_tests.step);
+
+    // ── Piece tracker cache tests (Task #5 tick_sparse_torrents fix) ──
+    const piece_tracker_cache_tests = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("tests/piece_tracker_cache_test.zig"),
+            .target = target,
+            .optimize = optimize,
+            .imports = &varuna_import,
+        }),
+    });
+    const run_piece_tracker_cache_tests = b.addRunArtifact(piece_tracker_cache_tests);
+    const test_piece_tracker_cache_step = b.step("test-piece-tracker-cache", "Run wanted_completed_count cache regression tests");
+    test_piece_tracker_cache_step.dependOn(&run_piece_tracker_cache_tests.step);
+    test_step.dependOn(&run_piece_tracker_cache_tests.step);
+
+    // ── RPC arena BUGGIFY tests (Track C: fault-injection coverage) ──
+    const rpc_arena_buggify_tests = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("tests/rpc_arena_buggify_test.zig"),
+            .target = target,
+            .optimize = optimize,
+            .imports = &varuna_import,
+        }),
+    });
+    const run_rpc_arena_buggify_tests = b.addRunArtifact(rpc_arena_buggify_tests);
+    const test_rpc_arena_buggify_step = b.step("test-rpc-arena-buggify", "Run BUGGIFY-style fault-injection coverage for the RPC bump arenas");
+    test_rpc_arena_buggify_step.dependOn(&run_rpc_arena_buggify_tests.step);
+    test_step.dependOn(&run_rpc_arena_buggify_tests.step);
+
+    // ── Piece tracker cache BUGGIFY tests (Task #5 fix safety-under-faults) ──
+    const piece_tracker_cache_buggify_tests = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("tests/piece_tracker_cache_buggify_test.zig"),
+            .target = target,
+            .optimize = optimize,
+            .imports = &varuna_import,
+        }),
+    });
+    const run_piece_tracker_cache_buggify_tests = b.addRunArtifact(piece_tracker_cache_buggify_tests);
+    const test_piece_tracker_cache_buggify_step = b.step("test-piece-tracker-cache-buggify", "Run BUGGIFY-style randomised stress test for the wanted_completed_count cache");
+    test_piece_tracker_cache_buggify_step.dependOn(&run_piece_tracker_cache_buggify_tests.step);
+    test_step.dependOn(&run_piece_tracker_cache_buggify_tests.step);
+
+    // ── RPC server stress test (Track C: connect/disconnect churn) ──
+    const rpc_server_stress_tests = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("tests/rpc_server_stress_test.zig"),
+            .target = target,
+            .optimize = optimize,
+            .imports = &varuna_import,
+        }),
+    });
+    const run_rpc_server_stress_tests = b.addRunArtifact(rpc_server_stress_tests);
+    const test_rpc_server_stress_step = b.step("test-rpc-server-stress", "Stress-test ApiServer lifecycle under random close-mid-flight strategies");
+    test_rpc_server_stress_step.dependOn(&run_rpc_server_stress_tests.step);
+    test_step.dependOn(&run_rpc_server_stress_tests.step);
+
     // ── Soak test (long-running resource leak detection) ──
     const soak_exe = b.addExecutable(.{
         .name = "varuna-soak-test",

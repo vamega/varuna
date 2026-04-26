@@ -7,6 +7,7 @@ const auth = @import("auth.zig");
 const io_interface = @import("../io/io_interface.zig");
 const real_io_mod = @import("../io/real_io.zig");
 const RealIO = real_io_mod.RealIO;
+const scratch = @import("scratch.zig");
 
 const max_api_clients = 64;
 const recv_buf_size = 8192;
@@ -14,6 +15,31 @@ const header_buf_size = 512;
 const retained_recv_buf_limit = 256 * 1024;
 const max_request_size = 4 * 1024 * 1024; // 4 MiB max for torrent uploads
 pub const response_header_inline_size = header_buf_size;
+
+/// Per-slot bump-arena slab size (Stage 2 zero-alloc plan, see
+/// `docs/zero-alloc-plan.md`). The slab is the **fast-path** size:
+/// handler allocations served from the slab cost zero parent-allocator
+/// calls. Pre-allocated at server init for all 64 slots
+/// (`64 × 256 KiB = 16 MiB`), so steady-state requests that fit in the
+/// slab make zero allocator calls.
+///
+/// Allocations that exceed the slab transparently spill to the parent
+/// allocator via `scratch.TieredArena`, up to `request_arena_capacity`.
+/// Spilled allocations are freed in a single sweep on `arena.reset()`
+/// (called between requests).
+pub const request_arena_slab = 256 * 1024;
+
+/// Per-slot bump-arena hard cap (slab + spill). The plan calls for an
+/// 8 MiB upper bound; `/sync/maindata` for 10K torrents has a transient
+/// peak of ~21 MiB (HashMaps, stats arrays, JSON growth on top of the
+/// response itself). 64 MiB gives ~3× margin for that case while
+/// remaining bounded; oversize allocations surface `error.OutOfMemory`
+/// and the handler returns 500.
+///
+/// Active-slot worst-case = `max_api_clients × request_arena_capacity`
+/// = 64 × 64 MiB = 4 GiB at full saturation; in practice qBittorrent
+/// UIs hold 1–3 connections, so the typical working set is 64–192 MiB.
+pub const request_arena_capacity = 64 * 1024 * 1024;
 
 const event_loop_mod = @import("../io/event_loop.zig");
 
@@ -39,11 +65,13 @@ pub const ApiServer = struct {
     /// Create an API server using a pre-existing listen socket (e.g. from
     /// systemd socket activation). The caller retains ownership of the fd.
     pub fn initWithFd(allocator: std.mem.Allocator, io: *RealIO, listen_fd: posix.fd_t) !ApiServer {
-        return .{
+        var server: ApiServer = .{
             .io = io,
             .allocator = allocator,
             .listen_fd = listen_fd,
         };
+        preallocateRequestArenas(&server);
+        return server;
     }
 
     pub fn initWithDevice(allocator: std.mem.Allocator, io: *RealIO, bind_addr: []const u8, port: u16, bind_device: ?[]const u8) !ApiServer {
@@ -68,11 +96,13 @@ pub const ApiServer = struct {
         try posix.bind(fd, &addr.any, addr.getOsSockLen());
         try posix.listen(fd, 128);
 
-        return .{
+        var server: ApiServer = .{
             .io = io,
             .allocator = allocator,
             .listen_fd = fd,
         };
+        preallocateRequestArenas(&server);
+        return server;
     }
 
     pub fn deinit(self: *ApiServer) void {
@@ -86,22 +116,32 @@ pub const ApiServer = struct {
                 client.recv_buf = null;
             }
             releaseClientResponse(self, client);
+            if (client.request_arena) |*arena| {
+                arena.deinit();
+                client.request_arena = null;
+            }
         }
         if (self.listen_fd >= 0) posix.close(self.listen_fd);
-        // Ring is shared, not owned — don't deinit it
+        // io is shared, not owned — don't deinit it
     }
 
     pub fn setHandler(self: *ApiServer, handler: *const fn (std.mem.Allocator, Request) Response) void {
         self.handler = handler;
     }
 
-    /// Per-op tracking struct, heap-allocated. Carries the generation
-    /// counter so stale CQEs against a reused slot can be filtered.
+    /// Per-op tracking struct. Now **embedded in `ApiClient`** (one
+    /// `recv_op` + one `send_op` per slot), so submit/complete cycles
+    /// don't allocate. Each slot has at most one in-flight recv + one
+    /// in-flight send at a time, which is a Pattern #1 ("Single
+    /// Completion per long-lived slot for serial state machines")
+    /// configuration in `STYLE.md`. Stale completion filtering uses the
+    /// `gen` snapshot taken at submission time vs `client_generations`
+    /// at completion.
     const ClientOp = struct {
         completion: io_interface.Completion = .{},
-        server: *ApiServer,
-        slot: u8,
-        gen: u32,
+        server: *ApiServer = undefined,
+        slot: u8 = 0,
+        gen: u32 = 0,
     };
 
     pub fn stop(self: *ApiServer) void {
@@ -168,18 +208,20 @@ pub const ApiServer = struct {
     fn submitRecv(self: *ApiServer, slot: u8) !void {
         const client = &self.clients[slot];
         if (client.fd < 0) return error.InvalidClientSlot;
-        const op = try self.allocator.create(ClientOp);
-        op.* = .{ .server = self, .slot = slot, .gen = self.client_generations[slot] };
+        const op = &client.recv_op;
+        op.* = .{
+            .completion = .{},
+            .server = self,
+            .slot = slot,
+            .gen = self.client_generations[slot],
+        };
         const storage = recvStorage(client);
-        self.io.recv(
+        try self.io.recv(
             .{ .fd = client.fd, .buf = storage[client.recv_offset..] },
             &op.completion,
             op,
             apiRecvComplete,
-        ) catch |err| {
-            self.allocator.destroy(op);
-            return err;
-        };
+        );
     }
 
     fn apiRecvComplete(
@@ -191,7 +233,6 @@ pub const ApiServer = struct {
         const self = op.server;
         const slot = op.slot;
         const gen = op.gen;
-        self.allocator.destroy(op);
 
         if (!self.isLiveClient(slot, gen)) return .disarm;
 
@@ -244,17 +285,19 @@ pub const ApiServer = struct {
             .controllen = 0,
             .flags = 0,
         };
-        const op = try self.allocator.create(ClientOp);
-        op.* = .{ .server = self, .slot = slot, .gen = self.client_generations[slot] };
-        self.io.sendmsg(
+        const op = &client.send_op;
+        op.* = .{
+            .completion = .{},
+            .server = self,
+            .slot = slot,
+            .gen = self.client_generations[slot],
+        };
+        try self.io.sendmsg(
             .{ .fd = client.fd, .msg = &client.send_msg },
             &op.completion,
             op,
             apiSendComplete,
-        ) catch |err| {
-            self.allocator.destroy(op);
-            return err;
-        };
+        );
     }
 
     fn apiSendComplete(
@@ -266,7 +309,6 @@ pub const ApiServer = struct {
         const self = op.server;
         const slot = op.slot;
         const gen = op.gen;
-        self.allocator.destroy(op);
 
         if (!self.isLiveClient(slot, gen)) return .disarm;
         const sent = switch (result) {
@@ -310,8 +352,12 @@ pub const ApiServer = struct {
     fn sendResponse(self: *ApiServer, slot: u8, response: Response) void {
         const client = &self.clients[slot];
         var owned_body = response.owned_body;
-        errdefer if (owned_body) |owned| self.allocator.free(owned);
-        defer if (response.owned_extra_headers) |owned| self.allocator.free(owned);
+        errdefer if (owned_body) |owned| {
+            if (!ownedBodyManagedByArena(client, owned)) self.allocator.free(owned);
+        };
+        defer if (response.owned_extra_headers) |owned| {
+            if (!ownedBodyManagedByArena(client, owned)) self.allocator.free(owned);
+        };
 
         releaseClientResponse(self, client);
 
@@ -402,7 +448,15 @@ pub const ApiServer = struct {
         }
         client.recv_offset = remaining;
 
-        const response = self.handler(self.allocator, parsed.request);
+        // Stage 2 zero-alloc: route handler allocations through the per-slot
+        // bump arena. Reset before each call — guaranteed safe at this entry
+        // point because `handleSend` calls `releaseClientResponse` on
+        // send-complete *before* we re-enter `processBufferedRequest`. If
+        // the slot's arena failed to pre-allocate (rare), fall back to the
+        // parent allocator so we still respond rather than 500.
+        const handler_allocator = ensureRequestArena(self, client) catch self.allocator;
+
+        const response = self.handler(handler_allocator, parsed.request);
         self.sendResponse(slot, response);
     }
 
@@ -417,6 +471,7 @@ pub const ApiServer = struct {
     fn closeClient(self: *ApiServer, slot: u8) void {
         const client = &self.clients[slot];
         var retained_recv_buf: ?[]u8 = null;
+        var retained_arena: ?scratch.TieredArena = null;
         if (client.fd >= 0) {
             posix.close(client.fd);
             client.fd = -1;
@@ -428,9 +483,16 @@ pub const ApiServer = struct {
                 self.allocator.free(buf);
             }
         }
+        // Retain arena across slot reuse, same as `recv_buf`. The slab is
+        // reset (lazily — by `ensureRequestArena` on the next request),
+        // not freed. Only `deinit` truly frees the slab.
+        if (client.request_arena) |arena| {
+            retained_arena = arena;
+        }
         releaseClientResponse(self, client);
         client.* = .{};
         client.recv_buf = retained_recv_buf;
+        client.request_arena = retained_arena;
     }
 
     fn allocClientSlot(self: *ApiServer) ?u8 {
@@ -484,6 +546,20 @@ pub const ApiClient = struct {
     keep_alive: bool = false,
     send_iov: [2]posix.iovec_const = undefined,
     send_msg: posix.msghdr_const = std.mem.zeroes(posix.msghdr_const),
+    /// Per-slot tiered bump arena for response building (Stage 2 zero-alloc
+    /// plan). The 256 KiB slab is pre-allocated at server init via
+    /// `preallocateRequestArenas`; allocations beyond the slab spill to
+    /// the parent allocator up to `request_arena_capacity`. Reset between
+    /// requests; retained across slot reuse like `recv_buf`. See
+    /// `STYLE.md` Memory section + `src/rpc/scratch.zig`.
+    request_arena: ?scratch.TieredArena = null,
+    /// Embedded per-slot recv/send tracker structs (Pattern #1 in
+    /// `STYLE.md`: single Completion per long-lived slot for serial
+    /// state machines). Replaces the prior `allocator.create(ClientOp)`
+    /// per recv/send — this slot has at most one in-flight recv and at
+    /// most one in-flight send at any time, so static storage suffices.
+    recv_op: ApiServer.ClientOp = .{},
+    send_op: ApiServer.ClientOp = .{},
 };
 
 const ParsedRequest = struct {
@@ -626,8 +702,59 @@ pub fn writeResponseHeader(dest: []u8, response: Response, keep_alive: bool) ![]
     return dest[0..stream.pos];
 }
 
+/// Pre-allocate per-slot request arenas (Stage 2 zero-alloc plan).  Called
+/// once during `init`/`initWithFd`/`initWithDevice`.  Slots whose
+/// pre-allocation fails (rare; only on parent-allocator OOM at startup)
+/// are left null; `ensureRequestArena` lazy-inits them on first request.
+fn preallocateRequestArenas(server: *ApiServer) void {
+    for (&server.clients) |*client| {
+        client.request_arena = scratch.TieredArena.init(
+            server.allocator,
+            request_arena_slab,
+            request_arena_capacity,
+        ) catch null;
+    }
+}
+
+/// Lazy-initialize the per-client request arena (idempotent across slot
+/// reuse — server init pre-allocates the slab when possible, so this
+/// path runs only when a slot's slab failed to pre-alloc). Reset on each
+/// call; the caller must ensure the previous response's send has fully
+/// drained — which is guaranteed at the `processBufferedRequest` entry
+/// point because `handleSend` calls `releaseClientResponse` on
+/// send-complete *before* re-entering `processBufferedRequest`.
+fn ensureRequestArena(self: *ApiServer, client: *ApiClient) !std.mem.Allocator {
+    if (client.request_arena) |*arena| {
+        arena.reset();
+        return arena.allocator();
+    }
+    client.request_arena = try scratch.TieredArena.init(
+        self.allocator,
+        request_arena_slab,
+        request_arena_capacity,
+    );
+    return client.request_arena.?.allocator();
+}
+
+/// True if `slice` is owned by the slot arena (slab or spill chain).
+/// Used to keep `releaseOwnedResponseBody` from double-freeing arena
+/// memory through the parent allocator. Conservative: when the
+/// `request_arena` is present we treat any owned response body as
+/// arena-managed, since handlers in this codebase always allocate from
+/// the allocator the server passes in (the arena's). The arena's reset
+/// reclaims slab and spill in a single sweep; the parent allocator
+/// must never see arena-region pointers.
+fn ownedBodyManagedByArena(client: *const ApiClient, slice: []const u8) bool {
+    _ = slice;
+    return client.request_arena != null;
+}
+
 fn releaseOwnedResponseBody(allocator: std.mem.Allocator, client: *ApiClient) void {
-    if (client.owned_body) |owned| allocator.free(owned);
+    if (client.owned_body) |owned| {
+        // Arena-backed bodies (slab or spill) are released by the next
+        // arena.reset() — never free them through the parent allocator.
+        if (!ownedBodyManagedByArena(client, owned)) allocator.free(owned);
+    }
     client.owned_body = null;
 }
 

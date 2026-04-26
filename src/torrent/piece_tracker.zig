@@ -21,6 +21,13 @@ pub const PieceTracker = struct {
     wanted: ?Bitfield,
     /// Number of pieces we need (wanted.count when selective, else piece_count).
     wanted_count: u32,
+    /// Cached count of pieces that are both wanted AND complete. Maintained
+    /// incrementally on `complete.set()` and recomputed in `setWanted` /
+    /// `swapWanted`. Reading it is O(1), so `wantedRemaining()` and
+    /// `isPartialSeed()` no longer scan piece_count bits per call. Hot in
+    /// the per-tick `peer_policy.checkPartialSeed` loop at high torrent
+    /// counts.
+    wanted_completed_count: u32 = 0,
     availability: []u16,
     piece_count: u32,
     total_size: u64,
@@ -65,6 +72,8 @@ pub const PieceTracker = struct {
             .in_progress = in_progress,
             .wanted = null,
             .wanted_count = piece_count,
+            // No `wanted` mask yet, so every complete piece counts as wanted.
+            .wanted_completed_count = initial_complete.count,
             .availability = availability,
             .piece_count = piece_count,
             .total_size = total_size,
@@ -91,6 +100,7 @@ pub const PieceTracker = struct {
         defer self.mutex.unlock();
         self.wanted = wanted;
         self.wanted_count = if (wanted) |w| w.count else self.piece_count;
+        self.wanted_completed_count = computeWantedCompletedCount(self);
         // Reset scan hint since the wanted set changed.
         self.scan_hint = 0;
         self.min_availability = 0;
@@ -105,6 +115,7 @@ pub const PieceTracker = struct {
         const old = self.wanted;
         self.wanted = new_wanted;
         self.wanted_count = if (new_wanted) |w| w.count else self.piece_count;
+        self.wanted_completed_count = computeWantedCompletedCount(self);
         self.scan_hint = 0;
         self.min_availability = 0;
         return old;
@@ -307,6 +318,13 @@ pub const PieceTracker = struct {
         self.clearInProgress(piece_index);
         self.complete.set(piece_index) catch return false;
         self.bytes_complete += piece_length;
+        // Maintain wanted_completed_count incrementally (O(1) hot-path
+        // replacement for the per-call piece_count scan).
+        if (self.wanted) |w| {
+            if (w.has(piece_index)) self.wanted_completed_count += 1;
+        } else {
+            self.wanted_completed_count += 1;
+        }
         self.progress_cond.signal();
         return true;
     }
@@ -393,8 +411,15 @@ pub const PieceTracker = struct {
     }
 
     fn wantedCompletedCountLocked(self: *const PieceTracker) u32 {
+        return self.wanted_completed_count;
+    }
+
+    /// Recompute `wanted_completed_count` from scratch by scanning every
+    /// bit in the wanted ∩ complete intersection. Called only on
+    /// wanted-mask transitions (`setWanted` / `swapWanted`) — never on
+    /// the per-tick hot path. Caller must hold `self.mutex`.
+    fn computeWantedCompletedCount(self: *const PieceTracker) u32 {
         const w = self.wanted orelse return self.complete.count;
-        // Count pieces that are both wanted and complete.
         var count: u32 = 0;
         var i: u32 = 0;
         while (i < self.piece_count) : (i += 1) {
