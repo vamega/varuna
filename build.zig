@@ -623,6 +623,40 @@ pub fn build(b: *std.Build) void {
     test_dht_krpc_buggify_step.dependOn(&run_dht_krpc_buggify_tests.step);
     test_step.dependOn(&run_dht_krpc_buggify_tests.step);
 
+    // ── Shared bencode scanner BUGGIFY / fuzz tests ────────
+    const bencode_scanner_buggify_tests = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("tests/bencode_scanner_buggify_test.zig"),
+            .target = target,
+            .optimize = optimize,
+            .imports = &varuna_import,
+        }),
+    });
+    const run_bencode_scanner_buggify_tests = b.addRunArtifact(bencode_scanner_buggify_tests);
+    const test_bencode_scanner_buggify_step = b.step(
+        "test-bencode-scanner-buggify",
+        "Run BUGGIFY-style fuzz coverage for the shared bencode scanner",
+    );
+    test_bencode_scanner_buggify_step.dependOn(&run_bencode_scanner_buggify_tests.step);
+    test_step.dependOn(&run_bencode_scanner_buggify_tests.step);
+
+    // ── BEP 19 web seed BUGGIFY / fuzz tests ───────────────
+    const web_seed_buggify_tests = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("tests/web_seed_buggify_test.zig"),
+            .target = target,
+            .optimize = optimize,
+            .imports = &varuna_import,
+        }),
+    });
+    const run_web_seed_buggify_tests = b.addRunArtifact(web_seed_buggify_tests);
+    const test_web_seed_buggify_step = b.step(
+        "test-web-seed-buggify",
+        "Run BUGGIFY-style fuzz coverage for the BEP 19 web seed manager",
+    );
+    test_web_seed_buggify_step.dependOn(&run_web_seed_buggify_tests.step);
+    test_step.dependOn(&run_web_seed_buggify_tests.step);
+
     // ── Stage 4 zero-alloc: ut_metadata fetch buffer tests ──
     const metadata_fetch_shared_tests = b.addTest(.{
         .root_module = b.createModule(.{

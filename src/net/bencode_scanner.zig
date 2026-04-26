@@ -19,6 +19,20 @@ pub fn BencodeScanner(comptime ErrorSet: type) type {
     return struct {
         data: []const u8,
         pos: usize = 0,
+        /// Recursion depth tracker for `skipValue`. The peer-facing
+        /// extension-message and ut_metadata parsers feed up to ~1 MB
+        /// of attacker-controlled bencode through this scanner — far
+        /// past UDP MTU. An explicit recursion bound keeps a hostile
+        /// `dddd...` from blowing the native call stack. STYLE.md
+        /// "no recursion" rule is filed as a follow-up; this defensive
+        /// bound makes the recursive form safe in the meantime.
+        depth: u32 = 0,
+
+        /// Maximum nesting depth the scanner will recurse through. The
+        /// well-known torrent ecosystem rarely exceeds ~3 levels of
+        /// nesting (dict-of-list-of-bytes); 64 is a generous bound that
+        /// matches `src/torrent/bencode.zig`'s `max_nesting_depth`.
+        const max_depth: u32 = 64;
 
         const Self = @This();
 
@@ -42,9 +56,15 @@ pub fn BencodeScanner(comptime ErrorSet: type) type {
 
         pub fn parseBytes(self: *Self) ErrorSet![]const u8 {
             const start = self.pos;
+            // Bound the length-prefix scan: a usize fits in at most 20
+            // base-10 digits. A longer run cannot represent a valid
+            // offset and must be malformed — capping the scan also
+            // makes parseUnsigned trivially overflow-free.
+            const max_len_digits: usize = 20;
             while (self.peek()) |byte| {
                 if (byte == ':') break;
                 if (!std.ascii.isDigit(byte)) return sentinel;
+                if (self.pos - start >= max_len_digits) return sentinel;
                 self.pos += 1;
             }
             if (self.peek() != ':') return sentinel;
@@ -54,8 +74,11 @@ pub fn BencodeScanner(comptime ErrorSet: type) type {
 
             self.pos += 1;
             const len = std.fmt.parseUnsigned(usize, len_slice, 10) catch return sentinel;
+            // Saturating-subtraction form: overflow-safe for any `len`.
+            // The naive `self.pos + len > self.data.len` form panicked
+            // in safe mode on adversarial `len` near `maxInt(usize)`.
+            if (len > self.data.len - self.pos) return sentinel;
             const end = self.pos + len;
-            if (end > self.data.len) return sentinel;
 
             defer self.pos = end;
             return self.data[self.pos..end];
@@ -64,8 +87,11 @@ pub fn BencodeScanner(comptime ErrorSet: type) type {
         pub fn parseInteger(self: *Self) ErrorSet!i64 {
             try self.expectByte('i');
             const start = self.pos;
+            // i64 fits in 20 digits + 1 sign char; bound the scan.
+            const max_int_chars: usize = 21;
             while (self.peek()) |byte| {
                 if (byte == 'e') break;
+                if (self.pos - start >= max_int_chars) return sentinel;
                 self.pos += 1;
             }
             if (self.peek() != 'e') return sentinel;
@@ -78,6 +104,10 @@ pub fn BencodeScanner(comptime ErrorSet: type) type {
         }
 
         pub fn skipValue(self: *Self) ErrorSet!void {
+            if (self.depth >= max_depth) return sentinel;
+            self.depth += 1;
+            defer self.depth -= 1;
+
             const next = self.peek() orelse return sentinel;
             switch (next) {
                 'i' => _ = try self.parseInteger(),

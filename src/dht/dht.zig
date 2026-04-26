@@ -522,50 +522,17 @@ pub const DhtEngine = struct {
                 var peer_addrs: [50]std.net.Address = undefined;
                 var peer_count: usize = 0;
 
-                // IPv4 peers: 4-byte IP + 2-byte port
+                // IPv4 peers: 4-byte IP + 2-byte port. The element-length
+                // prefix is bounded to MTU-sized values to defend against
+                // adversarial digit floods that would overflow `dlen` in
+                // safe-mode (panic) or wrap in release-mode (UB).
                 if (r.values_raw) |raw| {
-                    // raw is `l<6:...><6:...>...e`
-                    var vpos: usize = 1; // skip 'l'
-                    while (vpos < raw.len and raw[vpos] != 'e') {
-                        if (peer_count >= peer_addrs.len) break;
-                        var dlen: usize = 0;
-                        while (vpos < raw.len and raw[vpos] >= '0' and raw[vpos] <= '9') : (vpos += 1) {
-                            dlen = dlen * 10 + (raw[vpos] - '0');
-                        }
-                        if (vpos >= raw.len or raw[vpos] != ':') break;
-                        vpos += 1;
-                        if (dlen == 6 and vpos + 6 <= raw.len) {
-                            const ip = std.mem.readInt(u32, raw[vpos..][0..4], .big);
-                            const port = std.mem.readInt(u16, raw[vpos + 4 ..][0..2], .big);
-                            peer_addrs[peer_count] = std.net.Address.initIp4(
-                                @bitCast(std.mem.nativeToBig(u32, ip)),
-                                port,
-                            );
-                            peer_count += 1;
-                        }
-                        vpos += dlen;
-                    }
+                    parseCompactPeers(raw, .v4, &peer_addrs, &peer_count);
                 }
 
-                // IPv6 peers (BEP 32): 16-byte IP + 2-byte port
+                // IPv6 peers (BEP 32): 16-byte IP + 2-byte port.
                 if (r.values6_raw) |raw| {
-                    var vpos: usize = 1; // skip 'l'
-                    while (vpos < raw.len and raw[vpos] != 'e') {
-                        if (peer_count >= peer_addrs.len) break;
-                        var dlen: usize = 0;
-                        while (vpos < raw.len and raw[vpos] >= '0' and raw[vpos] <= '9') : (vpos += 1) {
-                            dlen = dlen * 10 + (raw[vpos] - '0');
-                        }
-                        if (vpos >= raw.len or raw[vpos] != ':') break;
-                        vpos += 1;
-                        if (dlen == 18 and vpos + 18 <= raw.len) {
-                            const ip6: [16]u8 = raw[vpos..][0..16].*;
-                            const port = std.mem.readInt(u16, raw[vpos + 16 ..][0..2], .big);
-                            peer_addrs[peer_count] = std.net.Address.initIp6(ip6, port, 0, 0);
-                            peer_count += 1;
-                        }
-                        vpos += dlen;
-                    }
+                    parseCompactPeers(raw, .v6, &peer_addrs, &peer_count);
                 }
 
                 lk.handleResponse(
@@ -864,6 +831,87 @@ fn addressToBytes(addr: std.net.Address) [4]u8 {
         std.posix.AF.INET6 => addr.in6.sa.addr[0..4].*,
         else => [4]u8{ 0, 0, 0, 0 },
     };
+}
+
+const PeerWire = enum { v4, v6 };
+
+/// Parse a bencoded list of compact peer entries (`l<n:...><n:...>e`)
+/// into a fixed-size address buffer. Each entry's length prefix is
+/// bounded to defend against adversarial digit floods:
+///   * Without bounds, `dlen = dlen * 10 + d` and `vpos += dlen`
+///     overflow `usize` on inputs like `999999999999999999999:...`,
+///     panicking in safe mode or producing UB in release mode.
+///   * With the cap, malformed entries are skipped and parsing
+///     advances safely.
+///
+/// Entries with the wrong length (≠6 for IPv4, ≠18 for IPv6) are
+/// skipped per BEP 5; the loop continues until `e` or `peer_addrs` is
+/// full. SAFETY-only: we promise no panic, no UB, no out-of-bounds
+/// writes; we do not promise to recover every conceivable encoding.
+fn parseCompactPeers(
+    raw: []const u8,
+    wire: PeerWire,
+    peer_addrs: *[50]std.net.Address,
+    peer_count: *usize,
+) void {
+    if (raw.len == 0 or raw[0] != 'l') return;
+    var vpos: usize = 1; // skip 'l'
+
+    // Each entry's length prefix: ASCII decimal of `entry_len`, capped
+    // at a small bound. Full UDP MTU is ≤1500; no legitimate compact
+    // peer entry exceeds 18 bytes, so 5-digit bound is far more than
+    // enough.
+    const max_len_digits: usize = 5;
+
+    while (vpos < raw.len and raw[vpos] != 'e') {
+        if (peer_count.* >= peer_addrs.len) break;
+
+        const digit_start = vpos;
+        while (vpos < raw.len and
+            raw[vpos] >= '0' and raw[vpos] <= '9' and
+            (vpos - digit_start) < max_len_digits) : (vpos += 1)
+        {}
+
+        // Either we hit a non-digit (need ':'), exceeded the digit cap,
+        // or ran off the buffer. Anything but a ':' here is malformed.
+        if (vpos >= raw.len or raw[vpos] != ':') return;
+        if (vpos == digit_start) return; // empty length prefix
+        vpos += 1;
+
+        // Parse the bounded digit run; cannot overflow usize because
+        // <= 5 digits fits easily.
+        var dlen: usize = 0;
+        for (raw[digit_start .. vpos - 1]) |d| {
+            dlen = dlen * 10 + (d - '0');
+        }
+
+        // The remaining body must fit; `dlen <= 99999 < raw.len + small`
+        // already, but we still verify against the actual remainder
+        // (saturating-subtraction form, overflow-safe).
+        if (dlen > raw.len - vpos) return;
+
+        switch (wire) {
+            .v4 => if (dlen == 6) {
+                const ip = std.mem.readInt(u32, raw[vpos..][0..4], .big);
+                const port = std.mem.readInt(u16, raw[vpos + 4 ..][0..2], .big);
+                peer_addrs[peer_count.*] = std.net.Address.initIp4(
+                    @bitCast(std.mem.nativeToBig(u32, ip)),
+                    port,
+                );
+                peer_count.* += 1;
+            },
+            .v6 => if (dlen == 18) {
+                const ip6: [16]u8 = raw[vpos..][0..16].*;
+                const port = std.mem.readInt(u16, raw[vpos + 16 ..][0..2], .big);
+                peer_addrs[peer_count.*] = std.net.Address.initIp6(ip6, port, 0, 0);
+                peer_count.* += 1;
+            },
+        }
+        // Advance past the entry body regardless of whether we kept it
+        // (BEP 5 lists may contain entries we don't recognize). `dlen`
+        // is bounded above and `dlen <= raw.len - vpos` is checked.
+        vpos += dlen;
+    }
 }
 
 // ── Tests ──────────────────────────────────────────────

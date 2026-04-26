@@ -278,6 +278,10 @@ See `progress-reports/2026-04-25-stage2-event-loop-migration.md` for the Stage 2
 - **Dynamic outbound buffer for UtpSocket**: fixed `[128]OutPacket` should become ArrayList for high-throughput uTP connections.
 - **c-ares io_uring integration**: proof-of-concept in `~/projects/c-ares` — native io_uring event engine with SENDMSG/RECVMSG for DNS queries (zero direct syscalls). Could replace varuna's DNS threadpool to eliminate background-thread DNS.
 - **Live-pipeline BUGGIFY harness for AsyncRecheckOf(SimIO)**: `AsyncRecheck` is now generic over its IO backend (`AsyncRecheckOf(IO)` in `src/io/recheck.zig`; daemon callers stay on the `AsyncRecheckOf(RealIO)` alias). `SimIO.setFileBytes(fd, bytes)` registers caller-owned content so reads return real piece data instead of `usize=0`. The foundation integration tests (`tests/recheck_test.zig` — happy path, corrupt-piece detection, fast-path skip) drive `AsyncRecheckOf(SimIO)` through `EventLoopOf(SimIO)` end-to-end. The next deliverable is the canonical BUGGIFY wrapper around them — per-tick `injectRandomFault` + per-op `FaultConfig` × 32 seeds — to catch live-wiring recovery paths the algorithm-level harness can't see (AsyncRecheck slot cleanup under read-error injection, hasher submission failures, partial completion races). Estimated 0.5-1 day now that the refactor + setFileBytes are in place.
+- **`krpc.skipValue` recursive bencode parsing → explicit stack.** STYLE.md "no recursion" violation. Bounded by UDP MTU (~750 nesting depth max; 8 MiB default stack accommodates it), but a future TCP-framed KRPC variant or any caller that buffers >MTU would expose it as a remote crash. Rewrite using `std.BoundedArray` of state-machine entries as an explicit container-stack. Estimated 1-2 hours; reference `src/dht/krpc.zig:312`.
+- **`web_seed.MultiPieceRange.length` u32 truncation.** `computeMultiPieceRanges` (`src/net/web_seed.zig:273`/`:303`) writes a `u64` byte span into a `u32` length field via `@intCast`, panicking on runs > `maxInt(u32)`. Production today is bounded by the TOML config knob `web_seed_max_request_bytes` (default 4 MB) which keeps runs well under 4 GB, but the API surface admits a misconfigured value (e.g. `web_seed_max_request_bytes = 8 GB`) that crashes the daemon on the first multi-piece request. Fix shape: either widen `length: u64` and ripple through downstream iovec/split logic, or clamp `count` upstream so `count * piece_length ≤ maxInt(u32)`. Estimated <1 hour. Surfaced by `tests/web_seed_buggify_test.zig`.
+- **`bencode_scanner.skipValue` explicit-stack rewrite.** Same STYLE.md "no recursion" violation as `krpc.skipValue`, but operates on much larger peer-controlled bencode (BEP 10 extension messages can be ~1 MiB). The defensive `max_depth = 64` bound shipped here makes the recursive form safe in practice, but the rewrite to an explicit container-stack mirrors the pending `krpc.skipValue` work and should land alongside it. Estimated 1-2 hours total for both. Reference: `src/net/bencode_scanner.zig:80`.
+- **BT PIECE block_index regression test.** The protocol.zig fix ships with a comment but no inline regression test because `src/io` source-side tests are dark in mod_tests (Task #7) and a SimIO-driven test would require standing up an EventLoop. Add a small algorithm-level helper + test once Task #7 lands or once `tests/peer_wire_buggify_test.zig` is set up. Estimated 30 minutes once unblocked. Reference: `src/io/protocol.zig:166-178`.
 
 ## Known Issues
 
@@ -379,6 +383,40 @@ the refactor + setFileBytes are in place.
   for namespace-side tests but `addTest` doesn't follow into
   package-boundary modules in Zig 0.15.2; either move the tests
   or add an explicit wrapper file).
+
+## Last Verified Milestone (2026-04-26 — KRPC hardening round)
+
+KRPC parser + DHT untrusted-input audit (`parser-engineer` Track A on the correctness-2026-04-26 team), with three real adversarial-input bug fixes beyond the encoder bug filed by the prior round. Fuzz harness extended.
+
+### A1: KRPC encoder bounds checks (`dht: encoder bounds checks via Writer cursor`)
+- All 8 KRPC encoders rerouted through a new `Writer` cursor (`src/dht/krpc.zig:340-410`). Every byte goes through a saturating-subtraction bounds check; the `EncodeError = error{NoSpaceLeft}` return type is now sound.
+- Closes the bug filed by `progress-reports/2026-04-26-stage-4-and-buggify-exploration.md` ("KRPC encoders lack bounds checking, panic on too-small buffers").
+- 9 new "encoder returns NoSpaceLeft on tiny buffers" contract tests cover every encoder.
+
+### A2: Untrusted-input audit on `src/dht/`
+Three real overflow / clamp bugs surfaced in the audit beyond the encoder finding:
+- **`parseByteString` length-prefix overflow.** `i + len > data.len` overflowed `usize` for adversarial `len` near `maxInt(usize)` (panic in Debug, UB in Release). Replaced with saturating-subtraction form `len > data.len - i` and a 20-digit cap on the prefix scan.
+- **`parseError` u32 clamp.** `@intCast(@max(code, 0))` panicked when an error response carried `code > maxInt(u32)`. Now clamps both ends.
+- **`handleResponse` compact peer-list digit flood.** IPv4 / IPv6 peer-list parser had `dlen = dlen * 10 + d` and `vpos += dlen` with no bound — both overflowed `usize` on `999...:` prefixes. Refactored into a dedicated `parseCompactPeers` helper with a 5-digit cap and saturating remainder.
+- One STYLE.md violation (`skipValue` recursive bencode parsing) deferred per pattern #14: bounded by UDP MTU in production, but a TCP-framed KRPC variant would expose it. Filed for explicit-stack rewrite (~1-2 hours).
+
+### A3: Fuzz harness extended (`tests/dht_krpc_buggify_test.zig`)
++22 new tests bringing the bundle from 7 to 29 tests. Coverage adds: encoder NoSpaceLeft contract (9), parser length-prefix / integer-overflow / error-code clamp / pathological-string / type-confusion / off-by-one node-id / round-trip regression (7), token forgery fuzz (2), adversarial bencode-shaped envelope fuzz (1), compact peer-list adversarial inputs end-to-end through `DhtEngine.handleIncoming` (1), unsolicited-response and short-txn-id no-state-mutation tests (2).
+
+### Track C — web seed BUGGIFY exploration (`tests/web_seed_buggify_test.zig`)
+Small focused algorithm-layer fuzz harness for `WebSeedManager`. Coverage: state-machine random op sequences (assignPiece/markSuccess/markFailure/disable), `computePieceRanges` single- and multi-file with sum-to-piece-bytes invariant, `computeMultiPieceRanges`, URL-encoder over random bytes.
+**One real bug surfaced**: `computeMultiPieceRanges` writes `length: u32` derived from a `u64` byte span — `@intCast` panics on runs > 4 GB. Production today bounded by `web_seed_max_request_bytes` (TOML config, default 4 MB) so the bug is reachable only by misconfiguration; filed as STATUS.md "Next". 7 new tests, wired at `test-web-seed-buggify`.
+
+### Combined
+**620 → 648 (+28)** tests passing across the suite. Detail in `progress-reports/2026-04-26-krpc-hardening.md`.
+
+### Round-2 audit extension (continued from Track A)
+The same audit pattern (saturating-subtraction bounds + digit caps + explicit recursion limits) generalised to three more peer-controlled parsing surfaces, surfacing **three additional production bugs**:
+- **`src/torrent/bencode.zig:parseBytes`** had the same `i + len > data.len` overflow as the old `krpc.parseByteString` — adversarial metainfo / BEP 9 metadata payloads with `len` near `maxInt(usize)` panicked in safe mode. Fixed in-place: saturating-subtraction form + 20-digit prefix cap + 21-char `parseInteger` cap.
+- **`src/net/bencode_scanner.zig`** (shared zero-alloc scanner used by BEP 10 + BEP 9): same `parseBytes` overflow + caps; plus an explicit `max_depth = 64` recursion bound on `skipValue` — the recursive form would blow the native call stack on hostile `dddd...` chains carried in extension messages (which can be ~1 MiB, far past UDP MTU). Defensive bound; explicit-stack rewrite filed similarly to `krpc.skipValue` (Task #4 shape).
+- **`src/io/protocol.zig` BT PIECE handler**: `block_index: u16 = @intCast(block_offset / block_size)` panicked on peer-controlled `block_offset >= 1 GiB` (real DoS vector). Fixed in-place with a u32 → u16 range check before the cast.
+
+Test count delta this round: **648 → 661 (+13)**: 3 inline in `bencode.zig` + 10 in the new `tests/bencode_scanner_buggify_test.zig` (parseBytes ×4, parseInteger ×2, skipValue ×3, random-byte fuzz ×1). Wired at `test-bencode-scanner-buggify`.
 
 ## Last Verified Milestone (2026-04-26 — followups-2 round)
 

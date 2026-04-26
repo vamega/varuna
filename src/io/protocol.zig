@@ -161,7 +161,19 @@ pub fn processMessage(self: anytype, slot: u16) void {
                 const block_offset = std.mem.readInt(u32, payload[4..8], .big);
                 const block_data = payload[8..];
                 const block_size: u32 = 16 * 1024;
-                const block_index: u16 = @intCast(block_offset / block_size);
+                // `block_index` is `u16` because `markBlockReceived` /
+                // `DownloadingPiece.block_infos` are keyed by u16.
+                // `block_offset` is peer-controlled u32 — without the
+                // pre-check below, a hostile PIECE message with
+                // `block_offset >= 65536 * 16384` (= 1 GiB) would panic
+                // the `@intCast` in safe mode (real DoS vector).
+                // `markBlockReceived` and the legacy bounds check below
+                // both reject blocks past the piece end anyway, so
+                // dropping out-of-range messages here is the same
+                // observable behaviour.
+                const block_index_u32: u32 = block_offset / block_size;
+                if (block_index_u32 > std.math.maxInt(u16)) return;
+                const block_index: u16 = @intCast(block_index_u32);
 
                 // Consume download tokens for rate limiting accounting
                 _ = self.consumeDownloadTokens(peer.torrent_id, block_data.len);
