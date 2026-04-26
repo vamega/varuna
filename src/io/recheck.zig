@@ -225,9 +225,26 @@ pub fn AsyncRecheckOf(comptime IO: type) type {
             ) catch {
                 log.warn("recheck: failed to submit piece {d} to hasher", .{slot.piece_index});
                 self.in_flight_hashes -= 1;
+                // submitVerifyEx failed: hasher did NOT take ownership.
+                // finishSlot will free `slot.buf` correctly.
                 self.finishSlot(slot_idx, false);
                 return;
             };
+
+            // Submission succeeded: ownership of `buf` has transferred to
+            // the hasher (it lives in `pending_jobs` or `completed_results`
+            // until the result fires through `handleHashResult`). Null the
+            // slot's pointer so a teardown-time `destroy()` (or any other
+            // path that walks slots and frees `slot.buf`) doesn't double-
+            // free against the hasher.
+            //
+            // BUGGIFY harness `tests/recheck_live_buggify_test.zig`
+            // surfaced this: under `EventLoop.deinit`, `hasher.deinit`
+            // frees pending jobs' `piece_buf`s first (line 140 of
+            // hasher.zig), then `cancelAllRechecks` runs and `destroy()`
+            // sees `slot.state = .hashing` with `slot.buf` still pointing
+            // at the freed memory → second free → SIGABRT.
+            slot.buf = null;
         }
 
         /// Called when a hasher result arrives for a recheck piece.
@@ -268,6 +285,14 @@ pub fn AsyncRecheckOf(comptime IO: type) type {
 
         /// Free all resources. The caller must ensure no CQEs or hash results
         /// referencing this recheck are still in flight.
+        ///
+        /// `slot.buf` is freed only for slots in `.reading` state (and on
+        /// the OOM path before the read submit) — for `.hashing` slots the
+        /// buffer is owned by the hasher (cleared to null in
+        /// `handleReadCqe` on successful submit), and the hasher's own
+        /// teardown / `handleHashResult` defer is responsible for freeing
+        /// it. Freeing it here would double-free against `hasher.deinit`'s
+        /// pending-job sweep during `EventLoop.deinit`.
         pub fn destroy(self: *Self) void {
             for (&self.slots) |*slot| {
                 if (slot.plan) |plan| plan.deinit(self.allocator);
