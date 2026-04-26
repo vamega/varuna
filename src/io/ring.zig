@@ -22,7 +22,7 @@ pub const FixedBufferPool = struct {
         const iovecs: []posix.iovec = @as([*]posix.iovec, @ptrCast(@alignCast(backing.ptr)))[0..count];
 
         for (iovecs) |*iov| {
-            const mem = posix.mmap(null, buf_size, posix.PROT.READ | posix.PROT.WRITE, .{ .TYPE = .PRIVATE, .ANONYMOUS = true }, -1, 0);
+            const mem = try posix.mmap(null, buf_size, posix.PROT.READ | posix.PROT.WRITE, .{ .TYPE = .PRIVATE, .ANONYMOUS = true }, -1, 0);
             iov.* = .{
                 .base = @ptrCast(mem),
                 .len = buf_size,
