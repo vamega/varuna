@@ -105,24 +105,40 @@ production allocation profile after Stage 2.
 
 ## Bench deltas
 
-Baseline runs against `main` HEAD `507c6bd`:
+Baseline runs against `main` HEAD `507c6bd` (Phase 2 merge), which is
+the post-IO-abstraction-migration baseline that introduced the
+`api_get_burst` 8000-alloc regression noted in STATUS.md as Task #4.
 
 | Bench | Baseline | After Stage 2 | Delta |
 |---|---|---|---|
-| `api_get_burst --iterations=4000 --clients=8` | 0 allocs / 0 B / 5.65e7 ns | 0 allocs / 0 B / 8.11e7 ns | 0 alloc preserved (pre-alloc at server init) |
-| `api_upload_burst --iterations=1000 --clients=8 --body-bytes=65536` | 8 allocs / 525 KB live / 2.82e7 ns | 8 allocs / 525 KB live / 2.73e7 ns | unchanged |
-| **`sync_delta --iterations=200 --torrents=10000`** | **4,229,925 allocs / 4.27 GB allocated / 26.0s** | **222,970 allocs / 449 MB / 4.27s** | **−19× allocs, −9.5× bytes, −7.3× wall** |
-| `sync_stats_live --iterations=1 --torrents=10000` | 8 allocs / 4.5 MB peak / 4.14e6 ns | 8 allocs / 4.5 MB peak / 5.64e6 ns | unchanged |
+| **`api_get_burst --iterations=4000 --clients=8`** | **8000 allocs / 1.98 MB / 6.5e7–7.0e7 ns** | **0 allocs / 0 B / 6.12e7 ns** | **−8000 allocs (−100%)** |
+| `api_upload_burst --iterations=1000 --clients=8 --body-bytes=65536` | 8 allocs / 525 KB live | 8 allocs / 525 KB live / 2.86e7 ns | unchanged |
+| **`sync_delta --iterations=200 --torrents=10000`** | **4,229,925 allocs / 4.27 GB / 31.3s** | **222,970 allocs / 449 MB / 3.13s** | **−19× allocs, −9.5× bytes, −10× wall** |
+| `sync_stats_live --iterations=1 --torrents=10000` | 8 allocs / 4.5 MB peak | 8 allocs / 4.5 MB peak / 3.67e6 ns | unchanged |
 
-The sync_delta win is the headline. The remaining 222K allocs are not
-on the arena path — they're `SyncState` snapshot HashMap creation
-(persistent state, not per-request transient).
+The two headlines:
+
+1. **`api_get_burst` back to 0 allocs / 0 bytes.** Closes Task #4. The
+   8000-alloc regression turned out to be 2 heap-allocated `ClientOp`
+   trackers per request × 4000 iterations — *not* handler-side
+   allocations. The arena work alone wouldn't have closed it; the
+   companion fix is to embed the `recv_op` and `send_op` `ClientOp`
+   structs directly in `ApiClient` (Pattern #1 in `STYLE.md`: Single
+   Completion per long-lived slot for serial state machines). Each
+   slot has at most one in-flight recv and one in-flight send at any
+   time, so static storage suffices.
+
+2. **`sync_delta` 19× alloc reduction, 10× wall reduction.** The
+   `/sync/maindata` path now flows through the per-slot `TieredArena`.
+   Remaining 222K allocs are `SyncState` snapshot HashMap creation
+   (persistent state, not per-request transient).
 
 ## Test count delta
 
-* Baseline: 160/160
-* After: 167/167 (+7 — new `tests/rpc_arena_test.zig` integration tests)
+* Baseline: 223/223 (post-Phase-2 main, HEAD `507c6bd`)
+* After: 230/230 (+7 — new `tests/rpc_arena_test.zig` integration tests)
 * Direct `zig test src/rpc/scratch.zig`: 8/8 (unit tests for both arenas)
+* No leaks under the GPA leak-detector across the suite.
 
 ## Remaining issues / follow-up
 
@@ -151,25 +167,27 @@ on the arena path — they're `SyncState` snapshot HashMap creation
 
 ## Watch-items closed by this work
 
-* **Task #4: api_get_burst alloc count regression.** Resolved: 0 allocs
-  / 0 bytes confirmed via pre-allocation at server init.
+* **Task #4: api_get_burst alloc count regression (8000 allocs / 1.98 MB).**
+  Resolved: 0 allocs / 0 bytes confirmed by `api_get_burst` after the
+  ClientOp embed fix (commit `48752d5`). The pre-allocated per-slot
+  arena handles handler-side allocations; the embedded
+  `recv_op`/`send_op` close the per-op heap-create.
 
 ## File changes
 
 ```
 src/rpc/scratch.zig         (new) — RequestArena + TieredArena
 src/rpc/root.zig            +scratch export
-src/rpc/server.zig          per-slot arena lifecycle
+src/rpc/server.zig          per-slot arena lifecycle + embedded ClientOps
 src/daemon/torrent_session.zig — stack arena for tracker parse
 src/perf/workloads.zig      — sync_delta uses arena (production-mirror)
 tests/rpc_arena_test.zig    (new) — algorithm + integration + safety tests
 build.zig                   +test-rpc-arena step
 ```
 
-## Commit chain
+## Commit chain (rebased onto HEAD `507c6bd`)
 
-* `0d2265b rpc: per-slot bump arena for response building (Stage 2 zero-alloc)`
-* `<next> tracker: per-announce stack arena (Stage 2 zero-alloc)`
-
-(Plus local-only `1f5c7c2 worktree: include flake.nix/flake.lock for nix
-develop` — do not cherry-pick to main.)
+* `aa909e0 rpc: per-slot bump arena for response building (Stage 2 zero-alloc)`
+* `ff9cd0b tracker: per-announce stack arena for response parse (Stage 2 zero-alloc)`
+* `c50fe45 docs: STATUS milestone + progress report for Stage 2 zero-alloc`
+* `48752d5 rpc: embed per-slot recv/send ClientOp; closes Task #4 8000-alloc regression`
