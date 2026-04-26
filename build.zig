@@ -742,6 +742,29 @@ pub fn build(b: *std.Build) void {
     test_metadata_fetch_step.dependOn(&run_metadata_fetch_tests.step);
     test_step.dependOn(&run_metadata_fetch_tests.step);
 
+    // ── PieceStoreOf(SimIO) integration tests ──────────────
+    //
+    // Exercises the new fallocate + fsync ops on the IO contract via
+    // PieceStoreOf(SimIO) — happy path, fault-injected fallocate
+    // returning NoSpaceLeft, fault-injected fsync returning IoError,
+    // and the skip-when-do_not_download path. Forces the SimIO
+    // instantiation through the typechecker (pattern #10).
+    const storage_writer_tests = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("tests/storage_writer_test.zig"),
+            .target = target,
+            .optimize = optimize,
+            .imports = &varuna_import,
+        }),
+    });
+    const run_storage_writer_tests = b.addRunArtifact(storage_writer_tests);
+    const test_storage_writer_step = b.step(
+        "test-storage-writer",
+        "Run PieceStoreOf(SimIO) integration tests for the new fallocate / fsync contract surface",
+    );
+    test_storage_writer_step.dependOn(&run_storage_writer_tests.step);
+    test_step.dependOn(&run_storage_writer_tests.step);
+
     // ── RPC server stress test (Track C: connect/disconnect churn) ──
     const rpc_server_stress_tests = b.addTest(.{
         .root_module = b.createModule(.{
