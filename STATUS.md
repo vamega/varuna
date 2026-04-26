@@ -278,6 +278,7 @@ See `progress-reports/2026-04-25-stage2-event-loop-migration.md` for the Stage 2
 - **Dynamic outbound buffer for UtpSocket**: fixed `[128]OutPacket` should become ArrayList for high-throughput uTP connections.
 - **c-ares io_uring integration**: proof-of-concept in `~/projects/c-ares` — native io_uring event engine with SENDMSG/RECVMSG for DNS queries (zero direct syscalls). Could replace varuna's DNS threadpool to eliminate background-thread DNS.
 - **`krpc.skipValue` recursive bencode parsing → explicit stack.** STYLE.md "no recursion" violation. Bounded by UDP MTU (~750 nesting depth max; 8 MiB default stack accommodates it), but a future TCP-framed KRPC variant or any caller that buffers >MTU would expose it as a remote crash. Rewrite using `std.BoundedArray` of state-machine entries as an explicit container-stack. Estimated 1-2 hours; reference `src/dht/krpc.zig:312`.
+- **`web_seed.MultiPieceRange.length` u32 truncation.** `computeMultiPieceRanges` (`src/net/web_seed.zig:273`/`:303`) writes a `u64` byte span into a `u32` length field via `@intCast`, panicking on runs > `maxInt(u32)`. Production today is bounded by the TOML config knob `web_seed_max_request_bytes` (default 4 MB) which keeps runs well under 4 GB, but the API surface admits a misconfigured value (e.g. `web_seed_max_request_bytes = 8 GB`) that crashes the daemon on the first multi-piece request. Fix shape: either widen `length: u64` and ripple through downstream iovec/split logic, or clamp `count` upstream so `count * piece_length ≤ maxInt(u32)`. Estimated <1 hour. Surfaced by `tests/web_seed_buggify_test.zig`.
 - **Recheck-IO-generic refactor (unblocks live-pipeline BUGGIFY)**: `AsyncRecheck` is hard-coded to `*RealIO` (`src/io/recheck.zig:34`). Refactoring to `AsyncRecheckOf(IO)` (or `anytype` for the io pointer) would unblock an EL+SimIO BUGGIFY harness for the live recheck pipeline — per-tick `injectRandomFault` + per-op `FaultConfig` × 32 seeds wrapping `tests/recheck_test.zig`'s `live force-recheck` integration test. Also requires a `SimIO.setFileBytes(fd, content)` extension so SimIO-backed reads return real piece data instead of `usize=0`. The recheck-followups round (2026-04-26) shipped an algorithm-level cross-product safety harness (`tests/recheck_buggify_test.zig`) for the post-recheck callback's `applyRecheckResult` + `replaceCompletePieces` surfaces, but didn't cover live-wiring recovery paths (AsyncRecheck slot cleanup under read-error injection, hasher submission failures, partial completion races). Estimated 1-2 days for the refactor + harness wrap.
 
 ## Known Issues
@@ -309,8 +310,12 @@ Three real overflow / clamp bugs surfaced in the audit beyond the encoder findin
 ### A3: Fuzz harness extended (`tests/dht_krpc_buggify_test.zig`)
 +22 new tests bringing the bundle from 7 to 29 tests. Coverage adds: encoder NoSpaceLeft contract (9), parser length-prefix / integer-overflow / error-code clamp / pathological-string / type-confusion / off-by-one node-id / round-trip regression (7), token forgery fuzz (2), adversarial bencode-shaped envelope fuzz (1), compact peer-list adversarial inputs end-to-end through `DhtEngine.handleIncoming` (1), unsolicited-response and short-txn-id no-state-mutation tests (2).
 
+### Track C — web seed BUGGIFY exploration (`tests/web_seed_buggify_test.zig`)
+Small focused algorithm-layer fuzz harness for `WebSeedManager`. Coverage: state-machine random op sequences (assignPiece/markSuccess/markFailure/disable), `computePieceRanges` single- and multi-file with sum-to-piece-bytes invariant, `computeMultiPieceRanges`, URL-encoder over random bytes.
+**One real bug surfaced**: `computeMultiPieceRanges` writes `length: u32` derived from a `u64` byte span — `@intCast` panics on runs > 4 GB. Production today bounded by `web_seed_max_request_bytes` (TOML config, default 4 MB) so the bug is reachable only by misconfiguration; filed as STATUS.md "Next". 7 new tests, wired at `test-web-seed-buggify`.
+
 ### Combined
-**620 → 642 (+22)** tests passing across the suite. Detail in `progress-reports/2026-04-26-krpc-hardening.md`.
+**620 → 649 (+29)** tests passing across the suite. Detail in `progress-reports/2026-04-26-krpc-hardening.md`.
 
 ## Last Verified Milestone (2026-04-26 — followups-2 round)
 

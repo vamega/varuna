@@ -28,9 +28,18 @@ recheck followups; tests baseline 620/620)
   node-id rejection, txn-id mismatch and short-txn-id paths,
   token-forgery fuzzing, error-code clamping, and a peer-list
   adversarial test that drives the engine end-to-end.
-* **Track C** — deliberately deferred in this commit chain;
-  out-of-budget once the audit work expanded. Two new audit findings
-  filed instead.
+* **Track C** — small focused exploration of `WebSeedManager`
+  (`src/net/web_seed.zig`). Algorithm-layer fuzz harness covering the
+  state machine (assign/markSuccess/markFailure/disable random
+  sequences), range encoders (`computePieceRanges` /
+  `computeMultiPieceRanges` for both single- and multi-file
+  layouts), and URL-encoder. **One real bug surfaced**: the
+  multi-piece range encoder writes `length: u32` derived from a
+  `u64` byte span and `@intCast`-panics on runs > 4 GB. Filed as a
+  follow-up; production today is bounded by
+  `web_seed_max_request_bytes` (default 4 MB) so the bug is
+  reachable only by misconfiguration. 7 new tests in
+  `tests/web_seed_buggify_test.zig`.
 
 ## A1 — Encoder bounds checks
 
@@ -192,16 +201,44 @@ Total project tests: **620 → 642** (22 added).
 * `zig fmt` clean across all touched files.
 * `zig build test-dht-krpc-buggify` green for the targeted bundle.
 
+## Track C — web seed BUGGIFY exploration
+
+A small focused fuzz harness for `WebSeedManager` covering three
+algorithm-only surfaces (state machine, range encoders, URL encoder).
+The harness immediately surfaced a real bug:
+
+**Bug found — `MultiPieceRange.length` u32 truncation
+(`src/net/web_seed.zig:273`).**
+`computeMultiPieceRanges` computes a u64 run span (`run_end - run_start`)
+and writes it into `MultiPieceRange.length: u32` via `@intCast`. The
+intcast panics if the run exceeds `maxInt(u32)` ≈ 4 GB. Today
+production avoids this because the only caller is bounded by
+`web_seed_max_request_bytes` (TOML config, default 4 MB), but the API
+surface does not enforce the bound. A misconfigured value
+(`web_seed_max_request_bytes = 8 GB`) or a future caller with a
+larger budget would trigger the panic. Filed as STATUS.md "Next"
+with a 1-2-line fix shape: either widen `length: u64` (and downstream
+splits/iovecs to match) or clamp the `count` argument upstream.
+
+The other surfaces — state machine, single-file `computePieceRanges`,
+multi-file `computePieceRanges` (sum-to-piece-bytes invariant),
+URL-encoder — are panic-free across `8 × 256` = 2048 randomized
+shapes per surface. Coverage now serves as a regression guard.
+
+Tests live in `tests/web_seed_buggify_test.zig`, wired through
+`zig build test-web-seed-buggify`.
+
 ## Filed follow-ups
 
 1. **`skipValue` recursion → explicit stack.** STYLE.md violation;
    bounded in production by UDP MTU but unsafe for any future
    TCP-framed KRPC variant. Estimated 1-2 hours. Reference:
    `src/dht/krpc.zig:312`.
-2. **Track C — BUGGIFY exploration of one untouched system** (web
-   seeds preferred). Time-boxed at 3-4 hours; out of this round's
-   budget after the audit expanded into three real bug fixes. Carry
-   over.
+2. **`MultiPieceRange.length` u32 truncation.** Surfaced by Track C.
+   Production today bounds via TOML config (`web_seed_max_request_bytes`),
+   but the API surface admits a misconfiguration that crashes the
+   daemon. Estimated <1 hour. Reference: `src/net/web_seed.zig:273` +
+   `:303`.
 
 ## Lessons
 
