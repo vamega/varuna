@@ -28,5 +28,6 @@ test {
     _ = config;
     _ = crypto;
     _ = io;
+    _ = storage;
     _ = torrent;
 }
