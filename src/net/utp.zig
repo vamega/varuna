@@ -79,13 +79,20 @@ pub const Header = struct {
 /// header when extension == selective_ack. The bitmask indicates which
 /// packets after ack_nr+2 have been received (ack_nr+1 is implicitly
 /// not received -- that is the gap being NACKed).
+/// Maximum SACK bitmask size we are willing to accept on the wire.
+/// BEP 29 allows a u8 length, but the in-memory `bitmask` array is fixed
+/// at 32 bytes (256 sequence numbers). Anything larger is either a
+/// malformed peer or an adversarial input designed to trigger an
+/// out-of-bounds `@memcpy` panic in `SelectiveAck.decode`.
+pub const sack_bitmask_max: u8 = 32;
+
 pub const SelectiveAck = struct {
     /// Next extension type.
     next_extension: Extension,
     /// Bitmask length in bytes (must be a multiple of 4, BEP 29).
     len: u8,
     /// Bitmask data (up to 32 bytes = 256 sequence numbers).
-    bitmask: [32]u8 = [_]u8{0} ** 32,
+    bitmask: [sack_bitmask_max]u8 = [_]u8{0} ** sack_bitmask_max,
 
     /// Minimum overhead: 2 bytes header + 4 bytes bitmask.
     pub const min_size: usize = 6;
@@ -101,7 +108,15 @@ pub const SelectiveAck = struct {
     pub fn decode(buf: []const u8) ?SelectiveAck {
         if (buf.len < 2) return null;
         const len = buf[1];
-        if (len == 0 or len % 4 != 0 or buf.len < 2 + @as(usize, len)) return null;
+        // The on-wire `len` is u8, so up to 252 is "valid" per the
+        // length encoding alone, but the in-memory `bitmask` is only
+        // 32 bytes. A peer-controlled `len` of 36/40/.../252 (multiple
+        // of 4, > 32) would bypass the BEP 29 multiple-of-4 check and
+        // panic the `@memcpy` below with "index out of bounds". Cap to
+        // the local capacity. (Also defends `setBit`/`isAcked`, both
+        // of which compare `byte_idx >= self.len` against `bitmask[byte_idx]`.)
+        if (len == 0 or len > sack_bitmask_max or len % 4 != 0) return null;
+        if (buf.len < 2 + @as(usize, len)) return null;
         var sack = SelectiveAck{
             .next_extension = @enumFromInt(buf[0]),
             .len = len,

@@ -282,6 +282,10 @@ See `progress-reports/2026-04-25-stage2-event-loop-migration.md` for the Stage 2
 - **`web_seed.MultiPieceRange.length` u32 truncation.** `computeMultiPieceRanges` (`src/net/web_seed.zig:273`/`:303`) writes a `u64` byte span into a `u32` length field via `@intCast`, panicking on runs > `maxInt(u32)`. Production today is bounded by the TOML config knob `web_seed_max_request_bytes` (default 4 MB) which keeps runs well under 4 GB, but the API surface admits a misconfigured value (e.g. `web_seed_max_request_bytes = 8 GB`) that crashes the daemon on the first multi-piece request. Fix shape: either widen `length: u64` and ripple through downstream iovec/split logic, or clamp `count` upstream so `count * piece_length ≤ maxInt(u32)`. Estimated <1 hour. Surfaced by `tests/web_seed_buggify_test.zig`.
 - **`bencode_scanner.skipValue` explicit-stack rewrite.** Same STYLE.md "no recursion" violation as `krpc.skipValue`, but operates on much larger peer-controlled bencode (BEP 10 extension messages can be ~1 MiB). The defensive `max_depth = 64` bound shipped here makes the recursive form safe in practice, but the rewrite to an explicit container-stack mirrors the pending `krpc.skipValue` work and should land alongside it. Estimated 1-2 hours total for both. Reference: `src/net/bencode_scanner.zig:80`.
 - **BT PIECE block_index regression test.** The protocol.zig fix ships with a comment but no inline regression test because `src/io` source-side tests are dark in mod_tests (Task #7) and a SimIO-driven test would require standing up an EventLoop. Add a small algorithm-level helper + test once Task #7 lands or once `tests/peer_wire_buggify_test.zig` is set up. Estimated 30 minutes once unblocked. Reference: `src/io/protocol.zig:166-178`.
+- **Happy-path `AsyncMetadataFetchOf(SimIO)` integration test.** The Track 3 refactor landed `AsyncMetadataFetchOf(IO)` plus three foundation error-path tests (`tests/metadata_fetch_test.zig`), but the happy-path test (peer scripts a valid info dictionary; assembler completes; `verifyAndComplete` fires; `result_bytes != null`) is deferred. Two design options: (a) refactor `connectPeer`'s `posix.socket()` call to route through `self.io.socket()` so SimIO returns a synthetic fd that's tied to a SimIO socket-pool slot — this requires an async chain (`socket → connect → send`) instead of the current sync `socket()` + async `connect()`; (b) extend SimIO with `setSocketRecvScript(fd, bytes)` that overrides recv for arbitrary fds (mirrors `setFileBytes` shape) plus a "swallow sends to scripted fds" path. Option (a) is cleaner architecturally; option (b) is closer to the recheck pattern. Either approach also unlocks a live-pipeline BUGGIFY harness for `AsyncMetadataFetchOf(SimIO)` (per-tick `injectRandomFault` + per-op `FaultConfig` × 32 seeds), which would catch state-machine recovery paths the foundation tests can't see. Estimated 1-2 days for happy-path + BUGGIFY combined.
+- **Live-pipeline BUGGIFY harness for AsyncMetadataFetchOf(SimIO).** Same shape as the AsyncRecheck follow-up (per-tick `injectRandomFault` + per-op `FaultConfig` over 32 deterministic seeds), gated on the happy-path integration test above. Catches handshake-recovery races, partial-send retries, slot cleanup under recv-error injection, and assembler-reset paths that the algorithm-level `tests/ut_metadata_buggify_test.zig` and the foundation error-path tests can't see together. Estimated 0.5-1 day once the happy-path is in place.
+- **uTP extension chain not consumed in production.** `src/net/utp_manager.zig:85` treats `data[Header.size..]` as the entire payload regardless of `hdr.extension`, so when a peer sets `extension == selective_ack` the SACK header bytes are fed into the BT framing layer as if they were BT message bytes. Cosmetic / protocol-correctness — a malicious peer can desync their own BT stream but cannot crash the daemon. Fix shape: walk the extension chain (uTP allows next-hop chaining via `SelectiveAck.next_extension`), strip extensions from the front of `payload`, then hand the trailing bytes to the BT layer. Estimated 1-2 hours. Surfaced by the round-3 audit (`progress-reports/2026-04-26-audit-hunt-round3.md`).
+- **uTP reorder buffer indexing mismatch + dangling-slice UAF.** `bufferReorder` indexes by *offset from `ack_nr+1`* (`src/net/utp.zig:670`); `deliverReordered` indexes by *absolute `seq_nr % 64`* (`src/net/utp.zig:682`). Stored entries are unreachable by the deliverer, so out-of-order packets are silently dropped today. Compounding bug: the stored `data: []const u8` slice points into `event_loop.utp_recv_buf`, which is reused on the next datagram — fixing the indexing bug without addressing slice ownership would convert a silent drop into a UAF. Fix shape: index by `seq_nr % 64` consistently *and* copy the payload into per-slot owned storage. Estimated 1-2 hours. Surfaced by the round-3 audit.
 
 ## Known Issues
 
@@ -292,6 +296,176 @@ See `progress-reports/2026-04-25-stage2-event-loop-migration.md` for the Stage 2
 - **MSE handshake failures in mixed encryption mode**: `vc_not_found` and `req1_not_found` errors occur during simultaneous inbound+outbound MSE handshakes. Timing-dependent, disappears under GDB. `demo_swarm.sh` runs with `encryption = "disabled"` as workaround.
 - ~~**Daemon graceful shutdown**~~: Fixed. In-flight transfer draining with configurable timeout now ensures clean exit on SIGTERM/SIGINT.
 - `IORING_OP_SETSOCKOPT` (kernel 6.7+), `IORING_OP_BIND`/`LISTEN` (kernel 6.11+) not available on current kernel 6.6. Per-peer setsockopt (TCP_NODELAY, buffer sizes) remains synchronous.
+
+## Last Verified Milestone (2026-04-26 — Track 1: untrusted-input parser audit hunt round 3)
+
+Round-3 follow-up to the round-1 KRPC hardening
+(`worktree-krpc-hardening` / commit `3108167`). Audited five
+peer-controlled parsers per the standdown brief: uTP wire codecs,
+MSE handshake, HTTP/UDP tracker response, and BEP 9 metadata-fetch
+network glue. Spot-checked adjacent code (`extensions.zig`,
+`pex.zig`, `http_parse.zig`).
+
+### Critical finding — every-peer-trivial daemon panic / stack overflow
+
+`src/net/ut_metadata.zig:decode` (the BEP 9 ut_metadata extension
+parser) was invoked from `src/io/protocol.zig:handleUtMetadata` for
+every BEP 10 ut_metadata extension message a connected peer sends.
+The inline `findDictEnd` / `skipByteString` / `skipBencodeValue`
+helpers carried two of the same bug shapes round 1 fixed in DHT KRPC:
+
+* `skipByteString` computed `idx + length` directly. A peer-controlled
+  declared length of `maxInt(u64)` (the literal digit string
+  `"18446744073709551615"`) parses successfully and overflows the
+  addition, panicking "integer overflow" in safe builds.
+* `skipBencodeValue` recursed without a depth bound. The BEP 10
+  extension-message ceiling is 1 MiB
+  (`peer_wire.max_message_length`), so a payload of `lll...l` would
+  blow the native call stack.
+
+Both reachable for *every* connected peer — same shape and reachability
+as the round-1 BT PIECE crash. Dropped the hand-rolled helpers
+entirely; replaced with a single `Scanner.skipValue()` over the
+hardened `BencodeScanner` (already capped at 20-digit length prefixes,
+21-char integer scans, and `max_depth = 64`).
+
+### Defense-in-depth fix — uTP SACK decoder
+
+`src/net/utp.zig:SelectiveAck.decode` accepted a peer-controlled
+`len ∈ {36, 40, …, 252}` (multiple of 4, > 32) and panicked the
+`@memcpy` into the 32-byte `bitmask`. Not currently peer-reachable
+(uTP packets bypass the SACK extension chain — see "uTP extension
+chain not consumed" follow-up above), but pinned now so it can't
+regress when SACK parsing lands. New `sack_bitmask_max` constant
+ties the array size and the input cap together.
+
+### Subsystems audited and cleared
+
+* uTP wire codecs (`src/net/utp.zig`, `src/net/utp_manager.zig`,
+  `src/io/utp_handler.zig`) — header decode bounded; recv buffer
+  is 1500 bytes so `data_len = @intCast(payload.len)` to u16 is
+  safe.
+* MSE handshake (`src/crypto/mse.zig`) — all `pad_b/c/d_len`,
+  `ia_len`, `pad_c_len` are bounded before use; the
+  `remaining_buf` and `ia_buf` arrays are sized to the bound. No
+  findings.
+* HTTP tracker announce/scrape (`src/tracker/announce.zig`,
+  `src/tracker/scrape.zig`) — routes through hardened
+  `bencode.parse` + `dictGet` + `expectU32/U64`. No findings.
+* UDP tracker (`src/tracker/udp.zig`,
+  `src/daemon/udp_tracker_executor.zig`) — fixed-size structured
+  records with explicit length checks. `recv_buf[max_response_size = 4096]`
+  bounds `n: usize = @intCast(cqe.res)`. No findings.
+* BEP 9 metadata-fetch network glue (`src/net/metadata_fetch.zig`)
+  — calls `ut_metadata.decode` (now hardened); `msg_buf[2 + meta_msg.data_offset ..]`
+  is now bounds-safe via the hardened scanner. No further findings.
+* BEP 10 extension handshake (`src/net/extensions.zig`) — already
+  routes through the hardened scanner. No findings.
+* ut_pex (`src/net/pex.zig`) — `bencode.parse` + bounded compact-peer
+  arithmetic. No findings.
+
+### Tests
+
+New `tests/ut_metadata_buggify_test.zig` (17 tests) wired through
+`zig build test-ut-metadata-buggify`:
+
+* ut_metadata.decode random-byte fuzz: 32 seeds × 1024 random
+  buffers (length 0..2048) = 32 768 panic-free probes.
+* ut_metadata adversarial corpus (10 tests): the killer
+  `maxInt(u64)` length-prefix; 21-digit length flood; 1024-deep `l`
+  recursion attack; 65-deep `d` recursion attack; truncated input;
+  negative msg_type / piece; out-of-u32 piece; non-dict top-level;
+  request/reject/data round-trips with `data_offset` correctness.
+* uTP SACK adversarial probe: every `len ∈ [0, 255]`. Killer
+  inputs (36 and 252) pinned as named regression tests.
+* uTP SACK roundtrip pinning: every legal `len` in `[4, 8, …, 32]`.
+* uTP SACK random-byte fuzz: 32 seeds × 512 random buffers.
+
+### One pre-existing bug surfaced
+
+The previous `src/net/ut_metadata.zig:findDictEnd basic cases`
+test asserted `findDictEnd("d1:ai1ee") == 12` for an 8-byte string.
+The test was silently dark — the `src/net/` source-side test
+hierarchy is the same one Task #7 has already filed. Replaced with
+a `decode`-based test that exercises the same invariant through the
+public surface, plus three adversarial-input regression tests.
+
+### Test count
+
+648 → 665 project tests (+17). All green at every commit on
+`worktree-parser-audit-roundN`. `nix develop --command zig build test`
+clean.
+
+### Filed follow-ups (round 3)
+
+* uTP extension chain not consumed in production
+  (`src/net/utp_manager.zig:85`).
+* uTP reorder buffer indexing mismatch + dangling-slice UAF
+  (`src/net/utp.zig:667-689`).
+
+### Commit chain (on `worktree-parser-audit-roundN`)
+
+* `199a0b6 ut_metadata: harden BEP 9 parser via shared bencode_scanner`
+* `76a7043 utp: bound SelectiveAck.decode len to bitmask capacity`
+* `c026158 tests: BUGGIFY harness for ut_metadata parser + uTP SACK decoder`
+
+Reference: `progress-reports/2026-04-26-audit-hunt-round3.md`.
+
+## Last Verified Milestone (2026-04-26 — Track 3: AsyncMetadataFetch IO-generic refactor)
+
+Mirrors the Track B (AsyncRecheck) IO-generic refactor against the BEP 9
+metadata fetch state machine (`src/io/metadata_handler.zig`). Two coherent
+commits, tests pass at every commit (pattern #8). Test count: 689 → 692
+(+3 `AsyncMetadataFetchOf(SimIO)` integration tests).
+
+### 3A — `AsyncMetadataFetchOf(comptime IO: type)` (commit `69c9287`)
+
+`src/io/metadata_handler.zig` defines `AsyncMetadataFetchOf(IO)` returning
+the state machine struct. `pub const AsyncMetadataFetch = AsyncMetadataFetchOf(RealIO)`
+preserves the daemon-side surface; daemon callers
+(`src/daemon/torrent_session.zig`, `tests/metadata_fetch_shared_test.zig`)
+stay unchanged. Method bodies use `self: *Self`; the three per-op
+completion callbacks (`metadataConnectComplete`, `metadataSendComplete`,
+`metadataRecvComplete`) dispatch through `*Self` so each instantiation
+gets its own concrete type. Lazy method compilation (pattern #10) means
+the `AsyncMetadataFetchOf(SimIO)` instantiation only forces methods
+through the type-checker when a SimIO test actually drives them.
+`EventLoopOf` declares `pub const AsyncMetadataFetch = metadata_handler.AsyncMetadataFetchOf(IO)`
+so per-IO `metadata_fetch: ?*AsyncMetadataFetch`, `startMetadataFetch`'s
+`on_complete` callback signature, and the `AsyncMetadataFetch.create`
+call all reference the matching IO type.
+
+No SimIO extension was needed: unlike the recheck refactor's `setFileBytes`
+disk-read content registration, metadata fetch's I/O is bidirectional
+network protocol. The integration tests below exercise error paths
+through SimIO's existing connect / send / recv simulation.
+
+### 3B — `AsyncMetadataFetchOf(SimIO)` integration tests (commit `478fa19`)
+
+Three foundation tests in `tests/metadata_fetch_test.zig`:
+- "no peers finishes immediately" — empty peer list. `start()` must call
+  `finish(false)` synchronously; callback fires before any ticks.
+- "connect-error fault drains all peers and finishes" — five peers (more
+  than `max_slots = 3`) with `connect_error_probability = 1.0`. Drives
+  the connect → fail → tryNextPeer refill loop. Asserts `peers_attempted == 5`.
+- "legacy-fd send path causes all peers to fail" — three peers, no fault
+  injection. `posix.socket()` returns a real kernel fd below SimIO's
+  `socket_fd_base = 1000`, so SimIO's `slotForFd` returns null and `send`
+  returns 0 → `onSendComplete` treats as failure → cleanup. Drives the
+  connect → send → fail → next-peer cycle through three slots.
+
+Together these prove `AsyncMetadataFetchOf(IO)` is real (not just
+typechecks) and force compilation of every method that the state
+machine traverses for connect / send / recv error handling.
+
+The happy-path test (peer scripts a valid info dictionary, assembler
+completes, `verifyAndComplete` fires) is filed as a follow-up in "Next"
+— it requires either a refactor of `connectPeer`'s `posix.socket()` to
+route through the IO interface, or a SimIO `setSocketRecvScript`-style
+extension that scripts BEP 9 protocol responses on arbitrary fds. The
+state machine's bidirectional protocol shape is substantively different
+from the recheck refactor's one-way disk-read shape; `setFileBytes`
+doesn't trivially port.
 
 ## Last Verified Milestone (2026-04-26 — Track B: AsyncRecheck IO-generic refactor)
 

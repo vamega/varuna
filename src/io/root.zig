@@ -26,3 +26,21 @@ pub const sim_io = @import("sim_io.zig");
 pub const signal = @import("signal.zig");
 pub const tls = @import("tls.zig");
 pub const web_seed_handler = @import("web_seed_handler.zig");
+
+// Pull subsystem source-side `test "..."` blocks into the test runner.
+// Mirrors the pattern in `src/torrent/root.zig` and `src/crypto/root.zig`:
+// `pub const x = @import(...)` does NOT propagate test discovery in Zig
+// 0.15.2; an explicit `_ = ...;` reference inside a `test {}` block
+// is required, AND the parent root must opt-in via `_ = io;` (in
+// `src/root.zig`'s test block).
+//
+// Files NOT listed here either have no inline tests, or have inline
+// tests that aren't yet verified to compile + pass against current Zig
+// std + production logic. Tracked in Task #9; expand this list as each
+// subsystem's tests are validated. Wired into `mod_tests` (the
+// `varuna_mod` test root) — there's no separate `addTest` step because
+// cross-package namespace imports from `tests/` don't propagate test
+// discovery in Zig 0.15.2; only the in-package `_ = io;` path works.
+test {
+    _ = sim_io;
+}
