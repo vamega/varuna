@@ -290,12 +290,17 @@ pub fn build(b: *std.Build) void {
     test_io_parity_step.dependOn(&run_io_parity.step);
     test_step.dependOn(&run_io_parity.step);
 
-    // ── SimIO inline tests (socketpair, parking, fault injection) ─
+    // ── SimIO socketpair / parking / fault-injection tests ────────
     //
-    // The inline `test` blocks in `src/io/sim_io.zig` aren't reachable
-    // from any of the other test roots (mod_tests/daemon_tests don't
-    // discover transitively imported tests in this codebase). This
-    // wrapper imports sim_io.zig directly so its unit tests run.
+    // `tests/sim_socketpair_test.zig` is itself a top-level test file
+    // — its tests are defined inline in that file, NOT pulled in from
+    // `src/io/sim_io.zig` despite the `const sim_io = varuna.io.sim_io`
+    // import. Cross-package namespace import in Zig 0.15.2 doesn't
+    // propagate test discovery; only the explicitly-named symbols the
+    // test body references get pulled in. The inline `test "..."`
+    // blocks in `src/io/sim_io.zig` are now wired via mod_tests:
+    // `src/root.zig` opts in `_ = io;` and `src/io/root.zig` has
+    // `test { _ = sim_io; }` (Track 2 #7).
     const sim_io_tests = b.addTest(.{
         .root_module = b.createModule(.{
             .root_source_file = b.path("tests/sim_socketpair_test.zig"),
@@ -305,7 +310,7 @@ pub fn build(b: *std.Build) void {
         }),
     });
     const run_sim_io_tests = b.addRunArtifact(sim_io_tests);
-    const test_sim_io_step = b.step("test-sim-io", "Run SimIO inline unit tests (socketpair, parking, fault injection)");
+    const test_sim_io_step = b.step("test-sim-io", "Run SimIO socketpair / parking / fault-injection wrapper tests");
     test_sim_io_step.dependOn(&run_sim_io_tests.step);
     test_step.dependOn(&run_sim_io_tests.step);
 
@@ -521,6 +526,30 @@ pub fn build(b: *std.Build) void {
     );
     test_recheck_buggify_step.dependOn(&run_recheck_buggify_tests.step);
     test_step.dependOn(&run_recheck_buggify_tests.step);
+
+    // ── Recheck live-pipeline BUGGIFY harness (Track 2 #6) ─
+    //
+    // Wraps the `AsyncRecheckOf(SimIO)` integration tests in
+    // `tests/recheck_test.zig` with per-tick `injectRandomFault` plus
+    // per-op `FaultConfig.read_error_probability` over 32 deterministic
+    // seeds. Catches live-wiring failures the algorithm-level harness
+    // can't see: slot cleanup under read-error injection, hasher
+    // submission failures, partial completion races.
+    const recheck_live_buggify_tests = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("tests/recheck_live_buggify_test.zig"),
+            .target = target,
+            .optimize = optimize,
+            .imports = &varuna_import,
+        }),
+    });
+    const run_recheck_live_buggify_tests = b.addRunArtifact(recheck_live_buggify_tests);
+    const test_recheck_live_buggify_step = b.step(
+        "test-recheck-live-buggify",
+        "Run recheck live-pipeline (EventLoopOf(SimIO)) BUGGIFY harness (32 seeds × 3 variants)",
+    );
+    test_recheck_live_buggify_step.dependOn(&run_recheck_live_buggify_tests.step);
+    test_step.dependOn(&run_recheck_live_buggify_tests.step);
 
     // ── API endpoint tests ─────────────────────────────────
     const api_tests = b.addTest(.{
