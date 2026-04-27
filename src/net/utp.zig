@@ -967,6 +967,49 @@ test "out-of-order packet is buffered" {
     try std.testing.expectEqual(@as(u16, 5), sock.ack_nr);
 }
 
+// ── Reorder buffer regression test (failing-first) ─────────
+//
+// The reorder buffer has an indexing mismatch (filed in
+// `progress-reports/2026-04-26-audit-hunt-round3.md`):
+// `bufferReorder` indexes by offset from `ack_nr+1` but
+// `deliverReordered` indexes by absolute `seq_nr % max_reorder_buf`.
+// Stored entries are unreachable, so out-of-order packets are silently
+// dropped today. This test should fail on the broken implementation and
+// pass once the indexing is consistent.
+
+test "reorder buffer delivers buffered packets when gap is filled" {
+    var sock = UtpSocket{};
+    sock.state = .connected;
+    sock.send_id = 10;
+    sock.ack_nr = 5;
+
+    const make_pkt = struct {
+        fn f(seq: u16) Header {
+            return .{
+                .packet_type = .st_data,
+                .extension = .none,
+                .connection_id = 10,
+                .timestamp_us = 100,
+                .timestamp_diff_us = 0,
+                .wnd_size = 65536,
+                .seq_nr = seq,
+                .ack_nr = 0,
+            };
+        }
+    }.f;
+
+    // Buffer seq 8 and seq 7 out of order (gap at seq 6).
+    _ = sock.processPacket(make_pkt(8), "eight", 200);
+    _ = sock.processPacket(make_pkt(7), "seven", 200);
+    try std.testing.expectEqual(@as(u16, 5), sock.ack_nr);
+
+    // Seq 6 fills the gap. Reorder delivery should drain seq 7 and 8.
+    const result = sock.processPacket(make_pkt(6), "six", 200);
+    try std.testing.expectEqualStrings("six", result.data.?);
+    try std.testing.expectEqual(@as(u16, 2), result.reorder_delivered);
+    try std.testing.expectEqual(@as(u16, 8), sock.ack_nr);
+}
+
 test "FIN transitions to closed" {
     var sock = UtpSocket{};
     sock.state = .connected;
