@@ -148,6 +148,28 @@ test "scanner: skipValue list nesting is also bounded" {
     try testing.expectError(error.InvalidMessage, s.skipValue());
 }
 
+test "scanner: skipValue rejects 1024+ deep nesting without blowing the stack" {
+    // The post-rewrite skipValue is iterative (explicit container stack
+    // sized at `max_depth`). This exercises a depth far beyond what any
+    // valid bencode payload would carry — even a 1500-byte UDP MTU could
+    // only fit ~750 'd' bytes — so the input crosses well past the
+    // recursion limit a hostile peer could realistically craft. The
+    // safety property is "no native-stack overflow"; the visible
+    // outcome is a clean `error.InvalidMessage` thanks to the
+    // `max_depth = 64` cap.
+    const depth: usize = 4096;
+    var buf = try testing.allocator.alloc(u8, depth + 1);
+    defer testing.allocator.free(buf);
+    @memset(buf[0..depth], 'l');
+    // Drop a single trailing 'e' to make the input syntactically
+    // closeable in principle, even though the depth bound rejects it
+    // first.
+    buf[depth] = 'e';
+
+    var s = Scanner.init(buf);
+    try testing.expectError(error.InvalidMessage, s.skipValue());
+}
+
 // ── Random-byte fuzz ──────────────────────────────────────────
 
 const fuzz_seeds = [_]u64{

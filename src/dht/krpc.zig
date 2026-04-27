@@ -315,40 +315,102 @@ fn parseInteger(data: []const u8, pos: *usize) ?i64 {
     return std.fmt.parseInt(i64, digits, 10) catch null;
 }
 
+/// What an open container expects next after consuming a value.
+const ContainerKind = enum {
+    /// Inside a list — every item is a value; no key precedes it.
+    list,
+    /// Inside a dict — alternates key (byte string) / value / key /
+    /// value. The next thing after a completed value is always a key
+    /// (or the closing 'e').
+    dict,
+};
+
+/// Maximum nesting depth `skipValue` will traverse. KRPC packets are
+/// bounded by UDP MTU (~1500 bytes), so a properly-formed packet can
+/// nest at most ~750 levels deep — but the explicit-stack form below
+/// makes "blow the native call stack" structurally impossible
+/// regardless of input size, satisfying STYLE.md's "no recursion" rule
+/// and matching `src/torrent/bencode.zig`'s `max_nesting_depth` and
+/// `src/net/bencode_scanner.zig`'s `max_depth`. Anything deeper is
+/// rejected (returns null) — the same outcome as a malformed packet.
+const skip_max_depth: u32 = 64;
+
+/// Skip exactly one bencode value starting at `pos.*`.
+///
+/// Uses an explicit container stack instead of recursion so a hostile
+/// peer cannot blow the native call stack with a `dddd...` chain (or
+/// any future TCP-framed KRPC variant that buffers >MTU). Mirrors the
+/// shape of `src/net/bencode_scanner.zig`'s `skipValue`.
 fn skipValue(data: []const u8, pos: *usize) ?void {
-    if (pos.* >= data.len) return null;
-    switch (data[pos.*]) {
-        'i' => {
-            // Integer: i<digits>e
-            pos.* += 1;
-            while (pos.* < data.len and data[pos.*] != 'e') : (pos.* += 1) {}
+    // Explicit container stack: each entry records "we are currently
+    // inside a list/dict". A fixed-size array sized by `skip_max_depth`
+    // makes "blow the native call stack" impossible regardless of
+    // input size — Zig 0.15.2 does not expose `std.BoundedArray`, so
+    // we hand-roll the same shape.
+    var stack: [skip_max_depth]ContainerKind = undefined;
+    var depth: u32 = 0;
+
+    // Each iteration consumes one "thing": either a primitive value,
+    // opens a new container (pushing the stack), or closes the
+    // innermost container (popping the stack).
+    consume: while (true) {
+        // If we're inside a dict, the next thing to read is either
+        // the closing 'e' or a key (byte string) followed by its
+        // value. Handle the key-or-close here so the value-dispatch
+        // below is uniform across list/dict/top contexts.
+        if (depth > 0 and stack[depth - 1] == .dict) {
             if (pos.* >= data.len) return null;
-            pos.* += 1; // skip 'e'
-        },
-        'l' => {
-            // List: l<values>e
-            pos.* += 1;
-            while (pos.* < data.len and data[pos.*] != 'e') {
-                skipValue(data, pos) orelse return null;
+            if (data[pos.*] == 'e') {
+                pos.* += 1;
+                depth -= 1;
+                if (depth == 0) return;
+                continue :consume;
             }
-            if (pos.* >= data.len) return null;
-            pos.* += 1; // skip 'e'
-        },
-        'd' => {
-            // Dict: d<key><value>e
-            pos.* += 1;
-            while (pos.* < data.len and data[pos.*] != 'e') {
-                _ = parseByteString(data, pos) orelse return null;
-                skipValue(data, pos) orelse return null;
-            }
-            if (pos.* >= data.len) return null;
-            pos.* += 1; // skip 'e'
-        },
-        '0'...'9' => {
-            // Byte string
+            // Otherwise: read a key, then fall through to read its
+            // value below.
             _ = parseByteString(data, pos) orelse return null;
-        },
-        else => return null,
+        }
+
+        // Now read the next value. If we're inside a list, the
+        // closing 'e' replaces "next value".
+        if (depth > 0 and stack[depth - 1] == .list) {
+            if (pos.* >= data.len) return null;
+            if (data[pos.*] == 'e') {
+                pos.* += 1;
+                depth -= 1;
+                if (depth == 0) return;
+                continue :consume;
+            }
+        }
+
+        if (pos.* >= data.len) return null;
+        switch (data[pos.*]) {
+            'i' => {
+                // Integer: i<digits>e
+                pos.* += 1;
+                while (pos.* < data.len and data[pos.*] != 'e') : (pos.* += 1) {}
+                if (pos.* >= data.len) return null;
+                pos.* += 1; // skip 'e'
+                if (depth == 0) return;
+            },
+            'l' => {
+                if (depth >= skip_max_depth) return null;
+                pos.* += 1;
+                stack[depth] = .list;
+                depth += 1;
+            },
+            'd' => {
+                if (depth >= skip_max_depth) return null;
+                pos.* += 1;
+                stack[depth] = .dict;
+                depth += 1;
+            },
+            '0'...'9' => {
+                _ = parseByteString(data, pos) orelse return null;
+                if (depth == 0) return;
+            },
+            else => return null,
+        }
     }
 }
 

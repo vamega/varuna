@@ -278,10 +278,10 @@ See `progress-reports/2026-04-25-stage2-event-loop-migration.md` for the Stage 2
 - **Dynamic outbound buffer for UtpSocket**: fixed `[128]OutPacket` should become ArrayList for high-throughput uTP connections.
 - **c-ares io_uring integration**: proof-of-concept in `~/projects/c-ares` — native io_uring event engine with SENDMSG/RECVMSG for DNS queries (zero direct syscalls). Could replace varuna's DNS threadpool to eliminate background-thread DNS.
 - **Live-pipeline BUGGIFY harness for AsyncRecheckOf(SimIO)**: `AsyncRecheck` is now generic over its IO backend (`AsyncRecheckOf(IO)` in `src/io/recheck.zig`; daemon callers stay on the `AsyncRecheckOf(RealIO)` alias). `SimIO.setFileBytes(fd, bytes)` registers caller-owned content so reads return real piece data instead of `usize=0`. The foundation integration tests (`tests/recheck_test.zig` — happy path, corrupt-piece detection, fast-path skip) drive `AsyncRecheckOf(SimIO)` through `EventLoopOf(SimIO)` end-to-end. The next deliverable is the canonical BUGGIFY wrapper around them — per-tick `injectRandomFault` + per-op `FaultConfig` × 32 seeds — to catch live-wiring recovery paths the algorithm-level harness can't see (AsyncRecheck slot cleanup under read-error injection, hasher submission failures, partial completion races). Estimated 0.5-1 day now that the refactor + setFileBytes are in place.
-- **`krpc.skipValue` recursive bencode parsing → explicit stack.** STYLE.md "no recursion" violation. Bounded by UDP MTU (~750 nesting depth max; 8 MiB default stack accommodates it), but a future TCP-framed KRPC variant or any caller that buffers >MTU would expose it as a remote crash. Rewrite using `std.BoundedArray` of state-machine entries as an explicit container-stack. Estimated 1-2 hours; reference `src/dht/krpc.zig:312`.
-- **`web_seed.MultiPieceRange.length` u32 truncation.** `computeMultiPieceRanges` (`src/net/web_seed.zig:273`/`:303`) writes a `u64` byte span into a `u32` length field via `@intCast`, panicking on runs > `maxInt(u32)`. Production today is bounded by the TOML config knob `web_seed_max_request_bytes` (default 4 MB) which keeps runs well under 4 GB, but the API surface admits a misconfigured value (e.g. `web_seed_max_request_bytes = 8 GB`) that crashes the daemon on the first multi-piece request. Fix shape: either widen `length: u64` and ripple through downstream iovec/split logic, or clamp `count` upstream so `count * piece_length ≤ maxInt(u32)`. Estimated <1 hour. Surfaced by `tests/web_seed_buggify_test.zig`.
-- **`bencode_scanner.skipValue` explicit-stack rewrite.** Same STYLE.md "no recursion" violation as `krpc.skipValue`, but operates on much larger peer-controlled bencode (BEP 10 extension messages can be ~1 MiB). The defensive `max_depth = 64` bound shipped here makes the recursive form safe in practice, but the rewrite to an explicit container-stack mirrors the pending `krpc.skipValue` work and should land alongside it. Estimated 1-2 hours total for both. Reference: `src/net/bencode_scanner.zig:80`.
-- **BT PIECE block_index regression test.** The protocol.zig fix ships with a comment but no inline regression test because `src/io` source-side tests are dark in mod_tests (Task #7) and a SimIO-driven test would require standing up an EventLoop. Add a small algorithm-level helper + test once Task #7 lands or once `tests/peer_wire_buggify_test.zig` is set up. Estimated 30 minutes once unblocked. Reference: `src/io/protocol.zig:166-178`.
+- ~~**`krpc.skipValue` recursive bencode parsing → explicit stack**~~: (DONE 2026-04-27) rewritten as a fixed-size container stack with `skip_max_depth = 64` cap; structurally cannot blow the native call stack regardless of input size. Mirrors `bencode_scanner.skipValue` shape. See `progress-reports/2026-04-27-quick-wins.md`.
+- ~~**`web_seed.MultiPieceRange.length` u32 truncation**~~: (DONE 2026-04-27) `computeMultiPieceRanges` now rejects with `error.RunTooLarge` when the byte span would overflow u32, instead of panicking on the inner `@intCast`. Investigation showed `MultiPieceRange.length` is never read by the production handler and the rest of the pipeline is u32-byte-bounded throughout, so the entry-validation form is the cleanest fix. Regression test added in `tests/web_seed_buggify_test.zig`.
+- ~~**`bencode_scanner.skipValue` explicit-stack rewrite**~~: (DONE 2026-04-27) replaced the recursion-with-depth-counter form with the same explicit container stack used by `krpc.skipValue`. Same `max_depth = 64` cap, same observable behaviour, but no recursion. Hand-rolled because Zig 0.15.2 does not expose `std.BoundedArray`.
+- ~~**BT PIECE block_index regression test**~~: (DONE 2026-04-27) inline tests in `src/io/protocol.zig` covering `block_offset = 1 GiB` (the exact pre-fix panic value) and `block_offset = maxInt(u32)` (the absolute upper bound of the wire field). Now visible because round-1 dark-test audit landed `src/io/root.zig`'s `test {}` block.
 - **Happy-path `AsyncMetadataFetchOf(SimIO)` integration test.** The Track 3 refactor landed `AsyncMetadataFetchOf(IO)` plus three foundation error-path tests (`tests/metadata_fetch_test.zig`), but the happy-path test (peer scripts a valid info dictionary; assembler completes; `verifyAndComplete` fires; `result_bytes != null`) is deferred. Two design options: (a) refactor `connectPeer`'s `posix.socket()` call to route through `self.io.socket()` so SimIO returns a synthetic fd that's tied to a SimIO socket-pool slot — this requires an async chain (`socket → connect → send`) instead of the current sync `socket()` + async `connect()`; (b) extend SimIO with `setSocketRecvScript(fd, bytes)` that overrides recv for arbitrary fds (mirrors `setFileBytes` shape) plus a "swallow sends to scripted fds" path. Option (a) is cleaner architecturally; option (b) is closer to the recheck pattern. Either approach also unlocks a live-pipeline BUGGIFY harness for `AsyncMetadataFetchOf(SimIO)` (per-tick `injectRandomFault` + per-op `FaultConfig` × 32 seeds), which would catch state-machine recovery paths the foundation tests can't see. Estimated 1-2 days for happy-path + BUGGIFY combined.
 - **Live-pipeline BUGGIFY harness for AsyncMetadataFetchOf(SimIO).** Same shape as the AsyncRecheck follow-up (per-tick `injectRandomFault` + per-op `FaultConfig` over 32 deterministic seeds), gated on the happy-path integration test above. Catches handshake-recovery races, partial-send retries, slot cleanup under recv-error injection, and assembler-reset paths that the algorithm-level `tests/ut_metadata_buggify_test.zig` and the foundation error-path tests can't see together. Estimated 0.5-1 day once the happy-path is in place.
 - **uTP extension chain not consumed in production.** `src/net/utp_manager.zig:85` treats `data[Header.size..]` as the entire payload regardless of `hdr.extension`, so when a peer sets `extension == selective_ack` the SACK header bytes are fed into the BT framing layer as if they were BT message bytes. Cosmetic / protocol-correctness — a malicious peer can desync their own BT stream but cannot crash the daemon. Fix shape: walk the extension chain (uTP allows next-hop chaining via `SelectiveAck.next_extension`), strip extensions from the front of `payload`, then hand the trailing bytes to the BT layer. Estimated 1-2 hours. Surfaced by the round-3 audit (`progress-reports/2026-04-26-audit-hunt-round3.md`).
@@ -366,6 +366,40 @@ passes on rerun — pre-existing, not caused by this round). See
 `progress-reports/2026-04-27-dark-test-audit-r2r3.md`.
 
 Branch: `worktree-dark-test-r2r3`.
+
+## Last Verified Milestone (2026-04-27 — Quick wins: 4 round-2/3 audit follow-ups closed)
+
+Resolved the four short-tail audit follow-ups filed under round-2 and
+round-3 untrusted-input audits:
+
+- `61e8a17 krpc: rewrite skipValue with explicit container stack` —
+  Task #4. Fixed-size container stack sized at `skip_max_depth = 64`.
+  Structurally cannot blow the native call stack; satisfies STYLE.md's
+  "no recursion" rule. 4096-deep regression test added.
+- `89df10c bencode_scanner: rewrite skipValue with explicit container stack` —
+  Task #10. Same shape applied to the BEP 10 / BEP 9 shared scanner
+  (Pattern #17 audit-pattern-transfer). Hand-rolled container stack
+  because Zig 0.15.2 does not expose `std.BoundedArray`. 1024+ deep
+  regression test added.
+- `5b63065 web_seed: reject multi-piece runs > maxInt(u32) bytes` —
+  Task #5. Investigation (Pattern #14): `MultiPieceRange.length` is
+  never read by the production handler and the rest of the pipeline
+  is u32-byte-bounded throughout; entry-validation with
+  `error.RunTooLarge` is the cleanest fix. Closes the misconfigured
+  `web_seed_max_request_bytes = 8 GiB` daemon-crash vector.
+- `7e13b8e protocol: regression test for BT PIECE block_index u16 cast` —
+  Task #9. Two inline tests in `src/io/protocol.zig` pin the round-3
+  fix at lines 166-178: `block_offset = 1 GiB` (exact pre-fix panic
+  value) and `block_offset = maxInt(u32)` (absolute wire-field upper
+  bound). No production code changes — round-1 dark-test audit
+  unblocked source-side test discovery.
+
+`zig build` (daemon): clean. `zig fmt .`: clean. `zig build test`:
+green (1 pre-existing flaky sim-eventloop test unrelated; pinned to
+the same baseline 812e104 produces). Test count: +5 (3 BUGGIFY
+deeply-nested / runs-too-large + 2 protocol regression).
+
+Branch: `worktree-quick-wins`. See `progress-reports/2026-04-27-quick-wins.md`.
 
 ## Previously Verified Milestone (2026-04-27 — Dark inline test audit, round 1: io / storage / dht)
 

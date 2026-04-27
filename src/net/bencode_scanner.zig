@@ -19,19 +19,19 @@ pub fn BencodeScanner(comptime ErrorSet: type) type {
     return struct {
         data: []const u8,
         pos: usize = 0,
-        /// Recursion depth tracker for `skipValue`. The peer-facing
-        /// extension-message and ut_metadata parsers feed up to ~1 MB
-        /// of attacker-controlled bencode through this scanner — far
-        /// past UDP MTU. An explicit recursion bound keeps a hostile
-        /// `dddd...` from blowing the native call stack. STYLE.md
-        /// "no recursion" rule is filed as a follow-up; this defensive
-        /// bound makes the recursive form safe in the meantime.
-        depth: u32 = 0,
 
-        /// Maximum nesting depth the scanner will recurse through. The
+        /// Maximum nesting depth `skipValue` will traverse. The
         /// well-known torrent ecosystem rarely exceeds ~3 levels of
         /// nesting (dict-of-list-of-bytes); 64 is a generous bound that
         /// matches `src/torrent/bencode.zig`'s `max_nesting_depth`.
+        ///
+        /// `skipValue` uses an explicit container stack — there is no
+        /// recursion. The peer-facing extension-message and ut_metadata
+        /// parsers feed up to ~1 MB of attacker-controlled bencode
+        /// through this scanner, far past UDP MTU. The explicit-stack
+        /// form makes "blow the native call stack" structurally
+        /// impossible regardless of input size, satisfying STYLE.md's
+        /// "no recursion" rule.
         const max_depth: u32 = 64;
 
         const Self = @This();
@@ -103,39 +103,92 @@ pub fn BencodeScanner(comptime ErrorSet: type) type {
             return std.fmt.parseInt(i64, digits, 10) catch sentinel;
         }
 
-        pub fn skipValue(self: *Self) ErrorSet!void {
-            if (self.depth >= max_depth) return sentinel;
-            self.depth += 1;
-            defer self.depth -= 1;
+        /// What an open container expects next after consuming a value.
+        const ContainerKind = enum {
+            /// Inside a list — every item is a value; no key precedes it.
+            list,
+            /// Inside a dict — alternates key (byte string) / value /
+            /// key / value. The next thing after a completed value is
+            /// always a key (or the closing 'e').
+            dict,
+        };
 
-            const next = self.peek() orelse return sentinel;
-            switch (next) {
-                'i' => _ = try self.parseInteger(),
-                'l' => {
-                    self.pos += 1;
-                    while (true) {
-                        const item = self.peek() orelse return sentinel;
-                        if (item == 'e') {
-                            self.pos += 1;
-                            return;
-                        }
-                        try self.skipValue();
+        /// Skip exactly one bencode value starting at `pos`.
+        ///
+        /// Uses an explicit container stack instead of recursion so a
+        /// hostile peer cannot blow the native call stack with a
+        /// `dddd...` chain. Mirrors the shape of `dht/krpc.zig`'s
+        /// `skipValue`. Bounded by `max_depth` (64) — anything deeper
+        /// is rejected with `sentinel`, the same outcome as before.
+        pub fn skipValue(self: *Self) ErrorSet!void {
+            // Explicit container stack: each entry records "we are
+            // currently inside a list/dict". When the stack is empty
+            // after consuming a primitive (or after closing a
+            // container), we're done. A fixed-size array sized by
+            // `max_depth` makes "blow the native call stack" impossible
+            // regardless of input size — Zig 0.15.2 does not expose
+            // `std.BoundedArray`, so we hand-roll the same shape.
+            var stack: [max_depth]ContainerKind = undefined;
+            var depth: u32 = 0;
+
+            // Each iteration consumes one "thing": either a primitive
+            // value, opens a new container (pushing the stack), or
+            // closes the innermost container (popping the stack).
+            consume: while (true) {
+                // If we're inside a dict, the next thing to read is
+                // either the closing 'e' or a key (byte string) followed
+                // by its value. Handle the key-or-close here so the
+                // value-dispatch below is uniform across list/dict/top
+                // contexts.
+                if (depth > 0 and stack[depth - 1] == .dict) {
+                    const peeked = self.peek() orelse return sentinel;
+                    if (peeked == 'e') {
+                        self.pos += 1;
+                        depth -= 1;
+                        if (depth == 0) return;
+                        continue :consume;
                     }
-                },
-                'd' => {
-                    self.pos += 1;
-                    while (true) {
-                        const item = self.peek() orelse return sentinel;
-                        if (item == 'e') {
-                            self.pos += 1;
-                            return;
-                        }
+                    // Otherwise: read a key, then fall through to read
+                    // its value below.
+                    _ = try self.parseBytes();
+                }
+
+                // Now read the next value. If we're inside a list, the
+                // closing 'e' replaces "next value".
+                if (depth > 0 and stack[depth - 1] == .list) {
+                    const peeked = self.peek() orelse return sentinel;
+                    if (peeked == 'e') {
+                        self.pos += 1;
+                        depth -= 1;
+                        if (depth == 0) return;
+                        continue :consume;
+                    }
+                }
+
+                const next = self.peek() orelse return sentinel;
+                switch (next) {
+                    'i' => {
+                        _ = try self.parseInteger();
+                        if (depth == 0) return;
+                    },
+                    'l' => {
+                        if (depth >= max_depth) return sentinel;
+                        self.pos += 1;
+                        stack[depth] = .list;
+                        depth += 1;
+                    },
+                    'd' => {
+                        if (depth >= max_depth) return sentinel;
+                        self.pos += 1;
+                        stack[depth] = .dict;
+                        depth += 1;
+                    },
+                    '0'...'9' => {
                         _ = try self.parseBytes();
-                        try self.skipValue();
-                    }
-                },
-                '0'...'9' => _ = try self.parseBytes(),
-                else => return sentinel,
+                        if (depth == 0) return;
+                    },
+                    else => return sentinel,
+                }
             }
         }
     };
