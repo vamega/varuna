@@ -101,6 +101,18 @@ pub const FaultConfig = struct {
     /// (matches what the kernel surfaces when a torrent file's
     /// pre-allocation hits a full disk).
     fallocate_error_probability: f32 = 0.0,
+    /// Probability that a fallocate completes with
+    /// `error.OperationNotSupported`, simulating a filesystem that
+    /// rejects fallocate entirely (tmpfs <5.10, FAT32, certain FUSE
+    /// FSes). PieceStore.init reacts by falling back to `io.truncate`,
+    /// so this knob is what tests use to drive the fallback path.
+    /// Independent of `fallocate_error_probability`; checked first.
+    fallocate_unsupported_probability: f32 = 0.0,
+    /// Probability that a truncate completes with `error.InputOutput`
+    /// (disk failure during ftruncate). Exercised by the
+    /// `PieceStore.init` fallback path that fires on filesystems
+    /// rejecting fallocate (tmpfs <5.10, FAT32, certain FUSE FSes).
+    truncate_error_probability: f32 = 0.0,
     /// Probability that an fsync completes with `error.InputOutput`
     /// (disk failure mid-flush). Distinct from
     /// `write_error_probability` so BUGGIFY can target sync-only paths.
@@ -436,6 +448,7 @@ pub const SimIO = struct {
             .write => |op| try self.write(op, c, ud, cb),
             .fsync => |op| try self.fsync(op, c, ud, cb),
             .fallocate => |op| try self.fallocate(op, c, ud, cb),
+            .truncate => |op| try self.truncate(op, c, ud, cb),
             .socket => |op| try self.socket(op, c, ud, cb),
             .connect => |op| try self.connect(op, c, ud, cb),
             .accept => |op| try self.accept(op, c, ud, cb),
@@ -853,10 +866,27 @@ pub const SimIO = struct {
     pub fn fallocate(self: *SimIO, op: ifc.FallocateOp, c: *Completion, ud: ?*anyopaque, cb: Callback) !void {
         try self.armCompletion(c, .{ .fallocate = op }, ud, cb);
         const r = self.rng.random();
+        if (r.float(f32) < self.config.faults.fallocate_unsupported_probability) {
+            return self.schedule(c, .{ .fallocate = error.OperationNotSupported }, 0);
+        }
         if (r.float(f32) < self.config.faults.fallocate_error_probability) {
             return self.schedule(c, .{ .fallocate = error.NoSpaceLeft }, 0);
         }
         return self.schedule(c, .{ .fallocate = {} }, 0);
+    }
+
+    /// SimIO doesn't model on-disk file lengths, so truncate is a no-op
+    /// on success — it just delivers a `.truncate = {}` completion
+    /// through the heap. The fault knob delivers `error.InputOutput`,
+    /// matching the kind of error a real ftruncate could surface on disk
+    /// failure mid-call.
+    pub fn truncate(self: *SimIO, op: ifc.TruncateOp, c: *Completion, ud: ?*anyopaque, cb: Callback) !void {
+        try self.armCompletion(c, .{ .truncate = op }, ud, cb);
+        const r = self.rng.random();
+        if (r.float(f32) < self.config.faults.truncate_error_probability) {
+            return self.schedule(c, .{ .truncate = error.InputOutput }, 0);
+        }
+        return self.schedule(c, .{ .truncate = {} }, 0);
     }
 
     pub fn socket(self: *SimIO, op: ifc.SocketOp, c: *Completion, ud: ?*anyopaque, cb: Callback) !void {
@@ -980,6 +1010,7 @@ fn cancelResultFor(op: Operation) Result {
         .write => .{ .write = error.OperationCanceled },
         .fsync => .{ .fsync = error.OperationCanceled },
         .fallocate => .{ .fallocate = error.OperationCanceled },
+        .truncate => .{ .truncate = error.OperationCanceled },
         .socket => .{ .socket = error.OperationCanceled },
         .connect => .{ .connect = error.OperationCanceled },
         .accept => .{ .accept = error.OperationCanceled },
@@ -1003,6 +1034,7 @@ fn buggifyResultFor(op: Operation) Result {
         .write => .{ .write = error.NoSpaceLeft },
         .fsync => .{ .fsync = error.InputOutput },
         .fallocate => .{ .fallocate = error.NoSpaceLeft },
+        .truncate => .{ .truncate = error.InputOutput },
         .socket => .{ .socket = error.ProcessFdQuotaExceeded },
         .connect => .{ .connect = error.ConnectionRefused },
         .accept => .{ .accept = error.ConnectionAborted },

@@ -78,6 +78,7 @@ pub const Operation = union(enum) {
     write: WriteOp,
     fsync: FsyncOp,
     fallocate: FallocateOp,
+    truncate: TruncateOp,
 
     // Connection lifecycle.
     socket: SocketOp,
@@ -145,6 +146,21 @@ pub const FallocateOp = struct {
     len: u64,
 };
 
+pub const TruncateOp = struct {
+    fd: posix.fd_t,
+    /// New file length in bytes. `ftruncate(2)` either grows the file to
+    /// `length` (filling with zeros / sparse blocks) or shrinks it,
+    /// discarding bytes past `length`.
+    ///
+    /// Used by `PieceStore.init` as the filesystem-portability fallback
+    /// when fallocate returns `error.OperationNotSupported` (tmpfs <5.10,
+    /// FAT32, certain FUSE FSes). On those filesystems we still want
+    /// every file extended to its torrent-declared length so that
+    /// per-piece writes against `offset+len` past the original EOF
+    /// don't surprise the kernel.
+    length: u64,
+};
+
 pub const SocketOp = struct {
     domain: u32,
     sock_type: u32,
@@ -205,6 +221,7 @@ pub const Result = union(enum) {
     write: anyerror!usize,
     fsync: anyerror!void,
     fallocate: anyerror!void,
+    truncate: anyerror!void,
     socket: anyerror!posix.fd_t,
     connect: anyerror!void,
     accept: anyerror!Accepted,
@@ -336,6 +353,7 @@ comptime {
 //   pub fn write    (self: *@This(), op: WriteOp,    c: *Completion, ud: ?*anyopaque, cb: Callback) !void;
 //   pub fn fsync    (self: *@This(), op: FsyncOp,    c: *Completion, ud: ?*anyopaque, cb: Callback) !void;
 //   pub fn fallocate(self: *@This(), op: FallocateOp, c: *Completion, ud: ?*anyopaque, cb: Callback) !void;
+//   pub fn truncate (self: *@This(), op: TruncateOp, c: *Completion, ud: ?*anyopaque, cb: Callback) !void;
 //   pub fn socket   (self: *@This(), op: SocketOp,   c: *Completion, ud: ?*anyopaque, cb: Callback) !void;
 //   pub fn connect  (self: *@This(), op: ConnectOp,  c: *Completion, ud: ?*anyopaque, cb: Callback) !void;
 //   pub fn accept   (self: *@This(), op: AcceptOp,   c: *Completion, ud: ?*anyopaque, cb: Callback) !void;

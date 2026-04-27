@@ -462,19 +462,19 @@ pub const PieceStore = PieceStoreOf(RealIO);
 
 /// Per-fallocate completion ticket: tracks pending count + first error,
 /// shared across the batch by &PreallocCtx in `userdata`. The fallback
-/// to `setEndPos` only fires when the kernel reports the filesystem
+/// to `io.truncate` only fires when the kernel reports the filesystem
 /// can't do fallocate at all (EOPNOTSUPP); other errors propagate.
 const PreallocCtx = struct {
     pending: usize,
     first_error: ?anyerror = null,
-    /// Per-file file handle, captured so the fallback path knows which
-    /// fd to ftruncate when fallocate returns OperationNotSupported.
-    /// Same length and ordering as `lengths`.
+    /// Same length and ordering as `lengths`. Indexed by `slot.file_index`
+    /// so `slot.needs_truncate` decisions don't need to walk the slots
+    /// array.
     files: []const ?std.fs.File,
     /// Per-file lengths, parallel to `files`.
     lengths: []const u64,
     /// Overall flag set if any completion took the fallback path; lets
-    /// the caller log "n files fell back to ftruncate" if desired (we
+    /// the caller log "n files fell back to truncate" if desired (we
     /// currently just consume it silently).
     fallback_count: usize = 0,
 };
@@ -482,6 +482,10 @@ const PreallocCtx = struct {
 const PreallocSlot = struct {
     ctx: *PreallocCtx,
     file_index: usize,
+    /// Set by the fallocate callback when the kernel returned
+    /// `error.OperationNotSupported`. The caller then submits an
+    /// `io.truncate` against `file_index` in a second drain pass.
+    needs_truncate: bool = false,
 };
 
 fn preallocCallback(
@@ -497,17 +501,16 @@ fn preallocCallback(
         .fallocate => |r| _ = r catch |err| {
             // OperationNotSupported is the historical filesystem-portability
             // case (tmpfs <5.10, FAT32, certain FUSE FSes) — fall back to
-            // ftruncate. Other errors (NoSpaceLeft, IoError, …) propagate.
+            // truncate. Other errors (NoSpaceLeft, IoError, …) propagate.
+            // The actual truncate is submitted by the caller after the
+            // fallocate drain completes — we just record the need here.
             if (err == error.OperationNotSupported) {
-                if (ctx.files[slot.file_index]) |file| {
-                    file.setEndPos(ctx.lengths[slot.file_index]) catch |trunc_err| {
-                        if (ctx.first_error == null) ctx.first_error = trunc_err;
-                        return .disarm;
-                    };
+                if (ctx.files[slot.file_index] != null) {
+                    slot.needs_truncate = true;
                     ctx.fallback_count += 1;
-                    return .disarm;
+                } else if (ctx.first_error == null) {
+                    ctx.first_error = error.FileNotOpen;
                 }
-                if (ctx.first_error == null) ctx.first_error = error.FileNotOpen;
             } else {
                 if (ctx.first_error == null) ctx.first_error = err;
             }
@@ -517,8 +520,37 @@ fn preallocCallback(
     return .disarm;
 }
 
+/// Per-truncate completion ticket. The fallback truncate phase
+/// re-uses the slot's pre-allocation completion and the same drain
+/// pattern, but tracks pending separately from the fallocate ctx.
+const TruncateCtx = struct {
+    pending: usize,
+    first_error: ?anyerror = null,
+};
+
+fn truncateCallback(
+    userdata: ?*anyopaque,
+    _: *io_interface.Completion,
+    result: io_interface.Result,
+) io_interface.CallbackAction {
+    const ctx: *TruncateCtx = @ptrCast(@alignCast(userdata.?));
+    std.debug.assert(ctx.pending > 0);
+    ctx.pending -= 1;
+    switch (result) {
+        .truncate => |r| _ = r catch |err| {
+            if (ctx.first_error == null) ctx.first_error = err;
+        },
+        else => unreachable,
+    }
+    return .disarm;
+}
+
 /// Submit one fallocate per open file in `files` and drain the ring.
 /// Files at indices marked `do_not_download` (null entries) are skipped.
+/// On filesystems where fallocate returns `error.OperationNotSupported`
+/// (tmpfs <5.10, FAT32, certain FUSE FSes), a second drain pass
+/// submits `io.truncate` per affected file so each file is still
+/// extended to its torrent-declared length.
 fn preallocateAll(
     allocator: std.mem.Allocator,
     io: anytype,
@@ -572,6 +604,29 @@ fn preallocateAll(
 
     while (ctx.pending > 0) try io.tick(1);
     if (ctx.first_error) |err| return err;
+
+    // Fallback phase: any slot whose fallocate completed with
+    // `error.OperationNotSupported` now needs an `io.truncate`. Submit
+    // them all and drain. Re-uses the per-slot completions that just
+    // disarmed during the fallocate drain.
+    if (ctx.fallback_count > 0) {
+        var t_ctx = TruncateCtx{ .pending = ctx.fallback_count };
+        var slot_idx: usize = 0;
+        for (slots) |*slot| {
+            if (slot.needs_truncate) {
+                const file = ctx.files[slot.file_index].?;
+                try io.truncate(
+                    .{ .fd = file.handle, .length = ctx.lengths[slot.file_index] },
+                    &completions[slot_idx],
+                    &t_ctx,
+                    truncateCallback,
+                );
+            }
+            slot_idx += 1;
+        }
+        while (t_ctx.pending > 0) try io.tick(1);
+        if (t_ctx.first_error) |err| return err;
+    }
 }
 
 /// Submit a single fallocate and wait for it. Used by `ensureFileOpen`
@@ -587,8 +642,17 @@ fn preallocateOne(io: anytype, file: std.fs.File, length: u64) !void {
     );
     while (ctx.pending > 0) try io.tick(1);
     if (ctx.fallback) {
-        // Filesystem doesn't support fallocate — fall back to ftruncate.
-        try file.setEndPos(length);
+        // Filesystem doesn't support fallocate — fall back to truncate.
+        // Reuse the same completion (the fallocate already disarmed it).
+        var t_ctx = TruncateCtx{ .pending = 1 };
+        try io.truncate(
+            .{ .fd = file.handle, .length = length },
+            &c,
+            &t_ctx,
+            truncateCallback,
+        );
+        while (t_ctx.pending > 0) try io.tick(1);
+        if (t_ctx.first_error) |err| return err;
     }
     if (ctx.err) |err| return err;
 }
