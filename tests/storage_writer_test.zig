@@ -301,6 +301,77 @@ test "PieceStoreOf(SimIO): readPiece propagates SimIO read fault" {
     try std.testing.expectError(error.InputOutput, store.readPiece(plan.spans, piece_buffer[0..]));
 }
 
+// ── truncate fallback path (filesystem-portability) ───────
+
+test "PieceStoreOf(SimIO): fallocate OperationNotSupported triggers truncate fallback" {
+    // When fallocate returns OperationNotSupported (tmpfs <5.10,
+    // FAT32, certain FUSE FSes), PieceStore.init must fall back to
+    // io.truncate so each file is still extended to its declared
+    // length. With truncate succeeding, init must return cleanly.
+    const allocator = std.testing.allocator;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const target_root = try std.fs.path.join(allocator, &.{
+        ".zig-cache", "tmp", &tmp.sub_path, "download",
+    });
+    defer allocator.free(target_root);
+
+    const session = try Session.load(allocator, torrent_multifile, target_root);
+    defer session.deinit(allocator);
+
+    var sim = try SimIO.init(allocator, .{
+        .seed = 0x7777,
+        .faults = .{
+            // 100% of fallocate calls deliver OperationNotSupported
+            // → fallback fires for every file.
+            .fallocate_unsupported_probability = 1.0,
+            // Truncate succeeds (default 0.0).
+        },
+    });
+    defer sim.deinit();
+
+    var store = try PieceStoreOfSim.init(allocator, &session, &sim);
+    defer store.deinit();
+
+    // Both files should still be open; the fallback path doesn't
+    // change file ownership, just the disk-extension primitive used.
+    try std.testing.expect(store.files.len == 2);
+    try std.testing.expect(store.files[0] != null);
+    try std.testing.expect(store.files[1] != null);
+}
+
+test "PieceStoreOf(SimIO): truncate fault propagates from fallback path" {
+    // Pair of fault knobs: fallocate forced to OperationNotSupported
+    // (so the fallback runs), then truncate forced to InputOutput.
+    // PieceStore.init must surface InputOutput, not silently succeed.
+    const allocator = std.testing.allocator;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const target_root = try std.fs.path.join(allocator, &.{
+        ".zig-cache", "tmp", &tmp.sub_path, "download",
+    });
+    defer allocator.free(target_root);
+
+    const session = try Session.load(allocator, torrent_3byte_single, target_root);
+    defer session.deinit(allocator);
+
+    var sim = try SimIO.init(allocator, .{
+        .seed = 0xbadbad,
+        .faults = .{
+            .fallocate_unsupported_probability = 1.0,
+            .truncate_error_probability = 1.0,
+        },
+    });
+    defer sim.deinit();
+
+    const result = PieceStoreOfSim.init(allocator, &session, &sim);
+    try std.testing.expectError(error.InputOutput, result);
+}
+
 test "PieceStoreOf(SimIO): writePiece + readPiece across three spans" {
     // 3-file torrent forces a 3-span piece. Exercises the multi-
     // completion drain path with N > 2 (the existing happy-path test

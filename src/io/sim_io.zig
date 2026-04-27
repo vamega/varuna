@@ -101,6 +101,13 @@ pub const FaultConfig = struct {
     /// (matches what the kernel surfaces when a torrent file's
     /// pre-allocation hits a full disk).
     fallocate_error_probability: f32 = 0.0,
+    /// Probability that a fallocate completes with
+    /// `error.OperationNotSupported`, simulating a filesystem that
+    /// rejects fallocate entirely (tmpfs <5.10, FAT32, certain FUSE
+    /// FSes). PieceStore.init reacts by falling back to `io.truncate`,
+    /// so this knob is what tests use to drive the fallback path.
+    /// Independent of `fallocate_error_probability`; checked first.
+    fallocate_unsupported_probability: f32 = 0.0,
     /// Probability that a truncate completes with `error.InputOutput`
     /// (disk failure during ftruncate). Exercised by the
     /// `PieceStore.init` fallback path that fires on filesystems
@@ -859,6 +866,9 @@ pub const SimIO = struct {
     pub fn fallocate(self: *SimIO, op: ifc.FallocateOp, c: *Completion, ud: ?*anyopaque, cb: Callback) !void {
         try self.armCompletion(c, .{ .fallocate = op }, ud, cb);
         const r = self.rng.random();
+        if (r.float(f32) < self.config.faults.fallocate_unsupported_probability) {
+            return self.schedule(c, .{ .fallocate = error.OperationNotSupported }, 0);
+        }
         if (r.float(f32) < self.config.faults.fallocate_error_probability) {
             return self.schedule(c, .{ .fallocate = error.NoSpaceLeft }, 0);
         }
