@@ -177,7 +177,7 @@ pub const DhtEngine = struct {
         if (data.len < 2 or data[0] != 'd') return;
 
         const msg = krpc.parse(data) catch {
-            log.debug("malformed KRPC from {any}", .{sender});
+            log.debug("malformed KRPC from {f}", .{sender});
             return;
         };
 
@@ -443,7 +443,7 @@ pub const DhtEngine = struct {
         const len = krpc.encodePingResponse(&buf, q.transaction_id, self.own_id) catch return;
         self.queueSend(buf[0..len], sender);
 
-        log.debug("accepted announce_peer from {any}", .{sender});
+        log.debug("accepted announce_peer from {f}", .{sender});
     }
 
     fn sendError(self: *DhtEngine, txn_id: []const u8, code: u32, message: []const u8, sender: std.net.Address) void {
@@ -459,7 +459,7 @@ pub const DhtEngine = struct {
 
         // Find and remove the pending query
         const pending = self.findAndRemovePending(r.transaction_id, sender) orelse {
-            log.debug("response for unknown txn from {any}", .{sender});
+            log.debug("response for unknown txn from {f}", .{sender});
             return;
         };
 
@@ -547,7 +547,7 @@ pub const DhtEngine = struct {
 
     fn handleError(self: *DhtEngine, e: krpc.Error, sender: std.net.Address) void {
         _ = self;
-        log.debug("KRPC error from {any}: [{d}] {s}", .{ sender, e.code, e.message });
+        log.debug("KRPC error from {f}: [{d}] {s}", .{ sender, e.code, e.message });
     }
 
     // ── Lookup driving ──────────────────────────────────

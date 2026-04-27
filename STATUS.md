@@ -293,8 +293,8 @@ See `progress-reports/2026-04-25-stage2-event-loop-migration.md` for the Stage 2
 ### Testing
 - ~~**Dark inline test audit, round 2: net / tracker / rpc.**~~ Closed 2026-04-27. `src/net/root.zig` (14 files wired; bencode_scanner / web_seed deferred to quick-wins-engineer), `src/tracker/root.zig` (3 files), `src/rpc/root.zig` (8 files) all wired. Surfaced two production bugs and one bit-rotted test. See `progress-reports/2026-04-27-dark-test-audit-r2r3.md`.
 - ~~**Dark inline test audit, round 3: runtime / sim / daemon.**~~ Closed 2026-04-27. `src/runtime/root.zig` (3 files), `src/sim/root.zig` (1 file), `src/daemon/root.zig` (5 files) wired through `mod_tests` (`src/root.zig`'s `_ = daemon;` reaches `daemon/root.zig` directly — round 1's note about needing a separate `daemon_exe.root_module` opt-in turned out to be unnecessary in practice). Surfaced one production safety fix (`isListenSocketOnPort` panic on negative fd). See `progress-reports/2026-04-27-dark-test-audit-r2r3.md`.
-- **Wider `{any}` formatter audit.** The DHT IPv6 bug exposed a Zig 0.15.2 stdlib semantic shift (`{any}` is now generic struct-dump, not the type's `format` method). Other paths that print addresses or embedded structs likely have the same drift. One-line grep audit (`grep -rn '"{any}"' src/ --include='*.zig'`) deferred from round 1.
-- **Wire `src/net/bencode_scanner.zig` + `src/net/web_seed.zig`.** Owned by quick-wins-engineer this round (skipValue rewrite + `MultiPieceRange.length` u64 fix). Wire the inline tests after those land; the round 2 commit `cad9c53` lists every other net/ file but skips these two.
+- ~~**Wider `{any}` formatter audit.**~~ Closed 2026-04-27. 23 sites audited; one production bug surfaced (`session_manager.formatPeerIp` was emitting ~640-byte struct dumps as the qBittorrent peer-list JSON `ip` field), 10 log-verbosity sites (uTP, event_loop, dht, peer_policy) shrunk from 700-byte multi-line dumps to plain `IP:port`, 12 test-diagnostic sites kept (benign — `{any}` on `anyerror` prints the error name). Regression test asserts `{f}` form for IPv4 and IPv6, and explicitly that the output contains no struct-dump tokens. See `progress-reports/2026-04-27-any-formatter-audit.md`.
+- **Wire `src/net/bencode_scanner.zig` + `src/net/web_seed.zig`.** Excluded from the round-2 dark-test commit `cad9c53` because they were owned by quick-wins-engineer this round (skipValue rewrite + `MultiPieceRange.length` fix). Quick-wins did not modify `src/net/root.zig`, so these two files remain unwired. ~30 minutes mechanical fix.
 
 ## Known Issues
 
@@ -305,6 +305,21 @@ See `progress-reports/2026-04-25-stage2-event-loop-migration.md` for the Stage 2
 - **MSE handshake failures in mixed encryption mode**: `vc_not_found` and `req1_not_found` errors occur during simultaneous inbound+outbound MSE handshakes. Timing-dependent, disappears under GDB. `demo_swarm.sh` runs with `encryption = "disabled"` as workaround.
 - ~~**Daemon graceful shutdown**~~: Fixed. In-flight transfer draining with configurable timeout now ensures clean exit on SIGTERM/SIGINT.
 - `IORING_OP_SETSOCKOPT` (kernel 6.7+), `IORING_OP_BIND`/`LISTEN` (kernel 6.11+) not available on current kernel 6.6. Per-peer setsockopt (TCP_NODELAY, buffer sizes) remains synchronous.
+
+## Last Verified Milestone (2026-04-27 — `{any}` formatter audit)
+
+Systematic follow-up to the round-1 IPv6 persistence bug (commit `d340bc8`). Audited every `{any}` format specifier in the codebase to find other instances of the Zig 0.15.2 semantic drift (`{any}` no longer delegates to a type's `format` method; emits a generic struct dump instead).
+
+23 production/test sites surveyed. Two bisectable commits, all green at HEAD.
+
+- `377c216 session_manager: fix peer-list IP becoming a 642-byte struct dump` — **production bug**. `getTorrentPeers` formatted `peer.address` with `"{any}"` and shipped the result through the qBittorrent peer-list JSON `ip` field. For `std.net.Address` (an `extern union`) `{any}` produces a ~640-byte dump covering every overlapping field (`.any`, `.in`, `.in6`, `.un` with its 108-byte path) instead of `127.0.0.1`. Every peer reported via the WebAPI had a malformed `ip` field, breaking the qBittorrent web UI peer table since the Zig 0.15.2 upgrade. Same class as the round-1 persistence bug — different consumer (JSON vs. fixed-size buffer). New `formatPeerIp` helper + three regression tests asserting bare-IP form for IPv4/IPv6 and explicitly that the output contains no struct-dump tokens.
+- `763c831 io,dht: replace {any} with {f} on std.net.Address log lines` — 10 log-only sites across `src/io/utp_handler.zig`, `src/io/event_loop.zig`, `src/dht/dht.zig`, `src/io/peer_policy.zig`. No correctness impact (log writers grow), but every smart-ban warning was a 700-byte multi-line dump that buried the real signal. After the fix, the same line reads `[event_loop] (warn): banning peer 10.0.0.6:0 (slot 5): trust_points=-8, hashfails=4`.
+
+12 test-diagnostic sites left as-is — `{any}` on `anyerror` calls `printErrorSet` and emits `error.OutOfMemory` (not a struct dump), so those are benign.
+
+`zig build`: clean. `zig fmt .`: clean. `zig build test`: green. See `progress-reports/2026-04-27-any-formatter-audit.md`.
+
+Branch: `worktree-any-audit`.
 
 ## Last Verified Milestone (2026-04-27 — Dark inline test audit, rounds 2 + 3: net / tracker / rpc / runtime / sim / daemon)
 
