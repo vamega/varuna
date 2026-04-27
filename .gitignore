@@ -9,4 +9,5 @@
 /vendor/sqlite/sqlite3.h
 *.deb
 .claude/worktrees/
+.claude/ralph-loop.local.md
 .codex/worktrees/
