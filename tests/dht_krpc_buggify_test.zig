@@ -199,6 +199,44 @@ test "BUGGIFY: deeply-nested KRPC dict does not blow the stack within UDP MTU" {
     };
 }
 
+test "BUGGIFY: 4096-deep KRPC list does not blow the native stack" {
+    // The post-rewrite `skipValue` is iterative (explicit container
+    // stack sized at `skip_max_depth = 64`). This crafts a packet whose
+    // `a` body is a list of 4096+ open 'l' bytes — far beyond what any
+    // valid bencode payload could carry inside a UDP MTU, but the
+    // iterative form must still terminate cleanly with `error.InvalidKrpc`
+    // rather than blow the native stack. If a future TCP-framed KRPC
+    // variant ever buffered packets >MTU, this would have been the
+    // hostile payload to defend against.
+    const depth: usize = 4096;
+    const total = 4 + depth + 1 + "1:t1:t1:y1:qe".len;
+    var buf = try testing.allocator.alloc(u8, total);
+    defer testing.allocator.free(buf);
+
+    // Top-level envelope `d1:a` then `depth` 'l' bytes (open lists, no
+    // closing 'e') then a single 'e' to close the outer dict's `a`
+    // value, then the rest of the envelope. The packet is not
+    // syntactically valid (the depth bound rejects it first), but the
+    // parser must reject cleanly without recursing through every 'l'.
+    var len: usize = 0;
+    @memcpy(buf[len..][0..4], "d1:a");
+    len += 4;
+    @memset(buf[len .. len + depth], 'l');
+    len += depth;
+    buf[len] = 'e';
+    len += 1;
+    const tail = "1:t1:t1:y1:qe";
+    @memcpy(buf[len..][0..tail.len], tail);
+    len += tail.len;
+
+    _ = krpc.parse(buf[0..len]) catch |err| {
+        try testing.expectEqual(@as(anyerror, error.InvalidKrpc), err);
+        return;
+    };
+    // If parse returns OK on a malformed packet, fail.
+    try testing.expect(false);
+}
+
 // ── Layer 1: KRPC parse on partially-corrupted valid envelopes ──
 
 test "BUGGIFY: bit-flip mutation of valid KRPC ping query stays safe" {
