@@ -308,6 +308,27 @@ See `progress-reports/2026-04-25-stage2-event-loop-migration.md` for the Stage 2
 - ~~**Daemon graceful shutdown**~~: Fixed. In-flight transfer draining with configurable timeout now ensures clean exit on SIGTERM/SIGINT.
 - `IORING_OP_SETSOCKOPT` (kernel 6.7+), `IORING_OP_BIND`/`LISTEN` (kernel 6.11+) not available on current kernel 6.6. Per-peer setsockopt (TCP_NODELAY, buffer sizes) remains synchronous.
 
+## Last Verified Milestone (2026-04-29 — EpollIO MVP: socket + timer + cancel surface)
+
+Implements a minimum-viable `EpollIO` Linux readiness backend behind a new `-Dio=` build flag. `EpollIO` is the fallback for environments where `io_uring` is forbidden (seccomp policies, ancient kernels, hostile sandboxes); see `docs/epoll-kqueue-design.md` for the full design and `progress-reports/2026-04-29-epoll-io-mvp.md` for the round-by-round rationale.
+
+Two bisectable commits, all green at HEAD. Test count: **1418 → 1430 (+12)**: 6 inline tests in `src/io/epoll_io.zig`, 5 in `tests/epoll_io_test.zig`, 1 in `src/io/backend.zig`. Daemon binary: builds under both `-Dio=io_uring` (default) and `-Dio=epoll`.
+
+- `91eb57e` — `io: add EpollIO MVP backend (sockets + timers + cancel)`. ~720 LOC of `src/io/epoll_io.zig` covering `socket`, `connect`, `accept`, `recv`, `send`, `recvmsg`, `sendmsg`, `poll`, `timeout`, `cancel`, plus `tick` (epoll_pwait + flat-array timer "heap" + wakeup eventfd). File ops (`read`, `write`, `pread`, `pwrite`, `fallocate`, `fsync`, `truncate`) intentionally return `error.Unimplemented` — they require a worker thread pool because epoll cannot signal regular-file readiness, and that thread pool is the next big follow-up. New `src/io/backend.zig` comptime selector resolves the daemon's `RealIO` alias to the chosen backend; daemon callers still `@import("real_io.zig")` directly today (rewiring gated on file-op follow-up). New `-Dio=io_uring|epoll` build flag with `kqueue` slot reserved for the parallel macOS engineer.
+- `d6b2af8` — `io: add tests/epoll_io_test.zig + zig build test-epoll-io step`. Standalone smoke tests covering multi-tick socketpair round-trip (recv parks → send unparks → callback fires on next tick), multiple concurrent timers in deadline order, cancel of registered recv with `OperationCanceled` delivery, file-op `Unimplemented` contract, and non-blocking-fd socket creation. Wired into `zig build test` and exposed as the focused `zig build test-epoll-io` step.
+
+Architecture choices worth flagging:
+- **Self-contained submission methods.** Each socket method runs its own `.rearm` loop; mutual recursion through callbacks would otherwise produce an inferred-error-set cycle Zig 0.15.2 cannot resolve. Same trick `real_io.zig`'s `truncate` uses.
+- **EPOLLONESHOT, not EPOLLET.** Per design doc recommendation; varuna's hot path has at most one outstanding op per fd.
+- **Flat-array timer heap.** O(n) `peekMin`. ~hundreds of timers in the hot path; promote to binary heap when profiled.
+- **Single eventfd** for cross-thread wakeup. Wired in `tick` so the file-op worker pool follow-up doesn't need to revisit lifecycle.
+
+What does NOT yet work under `-Dio=epoll`: any daemon path that touches the storage IO contract (PieceStore reads/writes, recheck verification, fsync-after-batch, fallocate-on-init, truncate fallback). The MVP is enough to run the daemon's network surface (peer wire, RPC, tracker, DHT, uTP) in isolation; full daemon end-to-end requires the file-op worker pool. See `progress-reports/2026-04-29-epoll-io-mvp.md` for the prioritised follow-up list.
+
+`zig fmt .`: clean. `zig build`: clean. `zig build -Dio=epoll`: clean. `zig build test`: green. `zig build test -Dio=epoll`: green. `zig build test-epoll-io`: green.
+
+Branch: `worktree-epoll-io`.
+
 ## Last Verified Milestone (2026-04-29 — runtime per-op feature probe + RealIO.truncate async on supporting kernels)
 
 Converted the previous "switch RealIO.truncate to `IORING_OP_FTRUNCATE` once kernel floor bumps to 6.9+" follow-up into a runtime decision. New `FeatureSupport` struct in `src/io/ring.zig` (currently one flag, `supports_ftruncate`) populated by `probeFeatures(&ring)` (calls `IoUring.get_probe()` → `IORING_REGISTER_PROBE`). `RealIO.init` caches the result; `RealIO.truncate` branches — async `IORING_OP_FTRUNCATE` SQE on supporting kernels (kernel ≥6.9 or backports), synchronous `posix.ftruncate(2)` fallback otherwise. Varuna's overall floor is unchanged (6.6 minimum / 6.8 preferred). Picks up backports / custom kernels that the kernel-version-string approach would miss.

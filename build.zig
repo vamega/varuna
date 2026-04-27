@@ -18,6 +18,30 @@ pub fn build(b: *std.Build) void {
         "DNS resolver backend: 'threadpool' uses getaddrinfo on background threads (default), 'c-ares' uses the c-ares async DNS library",
     ) orelse .threadpool;
 
+    // ── IO backend selection ──────────────────────────────────
+    //
+    // Picks the kernel IO primitive for the daemon's event loop.
+    //
+    // - `io_uring` (default on Linux ≥5.10): production backend. Real CQE
+    //   plumbing through `src/io/real_io.zig`.
+    // - `epoll`: Linux fallback for sandboxes / seccomp policies that block
+    //   io_uring. Implemented in `src/io/epoll_io.zig`. Socket ops use the
+    //   epoll readiness model; file ops (when implemented) offload to a
+    //   thread pool because epoll cannot deliver readiness for regular
+    //   files.
+    // - kqueue slot: reserved for the parallel KqueueIO engineer's macOS
+    //   developer backend. Will be added as a third choice in their branch.
+    //
+    // Daemon callers reach the chosen backend through `src/io/backend.zig`
+    // which resolves `RealIO` to either the io_uring or epoll type at
+    // comptime. The MVP EpollIO is socket + timer + cancel only (no file
+    // ops); see `progress-reports/2026-04-29-epoll-io-mvp.md`.
+    const io_backend = b.option(
+        IoBackend,
+        "io",
+        "IO backend: 'io_uring' uses Linux io_uring (default), 'epoll' uses the epoll readiness fallback (MVP — sockets + timers only). 'kqueue' slot reserved for the parallel macOS engineer.",
+    ) orelse .io_uring;
+
     const cares_mode = b.option(
         enum { system, bundled },
         "cares",
@@ -46,6 +70,7 @@ pub fn build(b: *std.Build) void {
     build_options.addOption(DnsBackend, "dns_backend", dns_backend);
     build_options.addOption(TlsBackend, "tls_backend", tls_backend);
     build_options.addOption(CryptoBackend, "crypto_backend", crypto_backend);
+    build_options.addOption(IoBackend, "io_backend", io_backend);
 
     const toml_dep = b.dependency("toml", .{
         .target = target,
@@ -303,6 +328,27 @@ pub fn build(b: *std.Build) void {
     const test_io_parity_step = b.step("test-io-parity", "Run IO backend parity tests (RealIO vs SimIO)");
     test_io_parity_step.dependOn(&run_io_parity.step);
     test_step.dependOn(&run_io_parity.step);
+
+    // ── EpollIO smoke tests (real socketpair, real epoll fd) ────────
+    //
+    // Backend-specific coverage for `src/io/epoll_io.zig`. Only meaningful
+    // on Linux (skipped at runtime on other platforms via the test's
+    // `skipIfUnavailable`). The bulk of the EpollIO inline tests are pulled
+    // in via `src/io/root.zig` → `_ = epoll_io;`; this addTest target
+    // exists so engineers can iterate on a focused build step
+    // (`zig build test-epoll-io`) instead of running the full suite.
+    const epoll_io_tests = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("tests/epoll_io_test.zig"),
+            .target = target,
+            .optimize = optimize,
+            .imports = &varuna_import,
+        }),
+    });
+    const run_epoll_io_tests = b.addRunArtifact(epoll_io_tests);
+    const test_epoll_io_step = b.step("test-epoll-io", "Run EpollIO smoke tests (real socketpair + real epoll)");
+    test_epoll_io_step.dependOn(&run_epoll_io_tests.step);
+    test_step.dependOn(&run_epoll_io_tests.step);
 
     // ── SimIO socketpair / parking / fault-injection tests ────────
     //
@@ -1020,6 +1066,24 @@ pub const TlsBackend = enum {
     boringssl,
     /// No TLS — HTTPS tracker URLs will return error.HttpsNotSupported.
     none,
+};
+
+/// IO backend selection. See the long doc-comment near the option definition
+/// for context. The `kqueue` slot below is reserved for the parallel
+/// kqueue-io-engineer's macOS developer backend; it is wired through the
+/// option enum so adding the third choice is a one-line change in their
+/// branch.
+pub const IoBackend = enum {
+    /// Default: Linux io_uring via `src/io/real_io.zig`. Production backend.
+    io_uring,
+    /// Linux epoll readiness fallback via `src/io/epoll_io.zig`. Used in
+    /// sandboxes or seccomp policies that block io_uring. MVP is sockets +
+    /// timers + cancel (no file ops yet).
+    epoll,
+    // kqueue slot — reserved for the parallel kqueue-io-engineer.
+    // Uncomment in their branch:
+    //   /// macOS / FreeBSD developer backend via `src/io/kqueue_io.zig`.
+    //   kqueue,
 };
 
 /// Cryptographic algorithm backend selection.
