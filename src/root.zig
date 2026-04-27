@@ -27,6 +27,7 @@ test {
     _ = bitfield;
     _ = config;
     _ = crypto;
+    _ = daemon;
     _ = dht;
     _ = io;
     _ = net;
