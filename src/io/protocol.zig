@@ -1554,6 +1554,100 @@ test "piece with zero inflight_requests does not underflow" {
     try testing.expectEqual(@as(u32, 1), peer.blocks_received);
 }
 
+test "piece with block_offset >= 1 GiB does not panic on the u16 cast" {
+    // Round-3 hardening regression: `block_index_u32 = block_offset / block_size`
+    // (block_size = 16 KiB) used to be cast straight to `block_index: u16`,
+    // which panicked in safe mode whenever `block_offset >= 65536 * 16384`
+    // (= 1 GiB) — a hostile peer could DoS the daemon with one PIECE
+    // message. The fix at processMessage's id=7 branch range-checks
+    // `block_index_u32 > maxInt(u16)` and returns early.
+    //
+    // This test pins the regression: a piece message with a 1 GiB+
+    // block_offset must be silently dropped without panic. Mirrors the
+    // existing "piece with out-of-bounds offset is rejected" test
+    // shape.
+    var el = try EventLoop.initBare(testing.allocator, 0);
+    defer el.deinit();
+    try setupTestTorrent(&el, null);
+    const slot = try setupTestPeer(&el);
+    const peer = &el.peers[slot];
+
+    // Set up a peer that's actively downloading piece 0 so the
+    // piece-handling path runs end-to-end.
+    peer.current_piece = 0;
+    const piece_size: usize = 16;
+    peer.piece_buf = try testing.allocator.alloc(u8, piece_size);
+    @memset(peer.piece_buf.?, 0);
+    peer.blocks_received = 0;
+    peer.blocks_expected = 2;
+    peer.inflight_requests = 1;
+
+    // Build a piece message with block_offset = 0x40000000 (1 GiB);
+    // 0x40000000 / 16384 = 0x10000 = 65536 = maxInt(u16) + 1 — exactly
+    // one over the bound that the @intCast(u16) safe-mode trap rejects.
+    const data = "X";
+    const body_len = 1 + 4 + 4 + data.len;
+    const body = try testing.allocator.alloc(u8, body_len);
+    defer testing.allocator.free(body);
+    body[0] = 7;
+    std.mem.writeInt(u32, body[1..5], 0, .big);
+    std.mem.writeInt(u32, body[5..9], 0x40000000, .big); // 1 GiB
+    @memcpy(body[9..], data);
+
+    peer.body_buf = body;
+
+    // The hardened path returns early on block_index > maxInt(u16),
+    // BEFORE the @intCast that previously panicked. Observable: no
+    // panic; piece_buf untouched; blocks_received unchanged.
+    processMessage(&el, slot);
+
+    for (peer.piece_buf.?) |b| {
+        try testing.expectEqual(@as(u8, 0), b);
+    }
+    try testing.expectEqual(@as(u32, 0), peer.blocks_received);
+    // inflight_requests is decremented INSIDE the hardened range
+    // check (the early-return is BEFORE the inflight bookkeeping),
+    // so it stays at 1.
+    try testing.expectEqual(@as(u32, 1), peer.inflight_requests);
+}
+
+test "piece with block_offset = maxInt(u32) does not panic" {
+    // Edge case: the absolute upper bound of the u32 block_offset wire
+    // field. block_index_u32 = maxInt(u32) / 16384 = 262143, well past
+    // maxInt(u16) = 65535 — must early-return cleanly.
+    var el = try EventLoop.initBare(testing.allocator, 0);
+    defer el.deinit();
+    try setupTestTorrent(&el, null);
+    const slot = try setupTestPeer(&el);
+    const peer = &el.peers[slot];
+
+    peer.current_piece = 0;
+    const piece_size: usize = 16;
+    peer.piece_buf = try testing.allocator.alloc(u8, piece_size);
+    @memset(peer.piece_buf.?, 0);
+    peer.blocks_received = 0;
+    peer.blocks_expected = 2;
+    peer.inflight_requests = 1;
+
+    const data = "Y";
+    const body_len = 1 + 4 + 4 + data.len;
+    const body = try testing.allocator.alloc(u8, body_len);
+    defer testing.allocator.free(body);
+    body[0] = 7;
+    std.mem.writeInt(u32, body[1..5], 0, .big);
+    std.mem.writeInt(u32, body[5..9], std.math.maxInt(u32), .big);
+    @memcpy(body[9..], data);
+
+    peer.body_buf = body;
+    processMessage(&el, slot);
+
+    // No panic; piece_buf untouched.
+    for (peer.piece_buf.?) |b| {
+        try testing.expectEqual(@as(u8, 0), b);
+    }
+    try testing.expectEqual(@as(u32, 0), peer.blocks_received);
+}
+
 test "piece with out-of-bounds offset is rejected" {
     var el = try EventLoop.initBare(testing.allocator, 0);
     defer el.deinit();
