@@ -1,11 +1,27 @@
-//! EpollIO — Linux epoll readiness backend implementing the public
-//! `io_interface`.
+//! EpollPosixIO — Linux epoll readiness backend with POSIX file-op strategy.
 //!
-//! `EpollIO` is the fallback for environments where `io_uring` is forbidden
+//! `EpollPosixIO` is the fallback for environments where `io_uring` is forbidden
 //! (seccomp policies that block `io_uring_setup`, ancient kernels, hostile
 //! sandboxes). The contract is identical to `RealIO`: each method submits
 //! an asynchronous operation and a CQE-equivalent fires the
 //! `Completion.callback` from `tick`.
+//!
+//! ## Bifurcation rationale
+//!
+//! The readiness layer (epoll) is one axis. The file-I/O strategy is a
+//! separate axis. There are two valid choices for a readiness-based backend:
+//!
+//!   * **POSIX (this file)**: `pread`/`pwrite`/`fsync`/`fallocate` syscalls
+//!     offloaded to a thread pool to keep the EL non-blocking. Predictable,
+//!     matches io_uring semantics, copies through syscall buffers.
+//!   * **mmap (`epoll_mmap_io.zig`)**: file is mapped at open; reads/writes
+//!     are `memcpy`s; durability via `msync`. Zero-copy, OS pagecache
+//!     implicit, but page faults can stall the calling thread.
+//!
+//! These deserve separate backends because they make different tradeoffs.
+//! The socket / timer / cancel machinery is shared in design — both files
+//! mirror the same readiness layer; only the file-op submission methods
+//! differ.
 //!
 //! Design follows `docs/epoll-kqueue-design.md`:
 //!
@@ -21,7 +37,7 @@
 //!     `truncate`) MUST be offloaded to a thread pool because epoll cannot
 //!     deliver readiness for regular files. **MVP STATUS: file ops are not
 //!     implemented yet — they return `error.Unimplemented`.** Track:
-//!     `progress-reports/2026-04-29-epoll-io-mvp.md`.
+//!     `progress-reports/2026-04-30-epoll-bifurcation.md`.
 //!   * Cancel is best-effort: for socket ops we `epoll_ctl(EPOLL_CTL_DEL)`
 //!     the fd and complete the cancelled op with `error.OperationCanceled`.
 //!     For timers we remove from the heap and deliver cancellation. Already
@@ -61,7 +77,7 @@ const CallbackAction = ifc.CallbackAction;
 
 // ── Backend state ─────────────────────────────────────────
 //
-// EpollIO stores per-completion bookkeeping in `Completion._backend_state`.
+// EpollPosixIO stores per-completion bookkeeping in `Completion._backend_state`.
 // State must fit in `ifc.backend_state_size` (64 bytes). Required slots:
 //
 //   * `in_flight`         — guards against double-submission.
@@ -164,9 +180,9 @@ const TimerHeap = struct {
     }
 };
 
-// ── EpollIO ───────────────────────────────────────────────
+// ── EpollPosixIO ───────────────────────────────────────────────
 
-pub const EpollIO = struct {
+pub const EpollPosixIO = struct {
     allocator: std.mem.Allocator,
     epoll_fd: posix.fd_t,
     /// Cross-thread wakeup primitive. Background workers (file-op thread
@@ -179,7 +195,7 @@ pub const EpollIO = struct {
     /// Cached monotonic-clock reading, refreshed in `tick`.
     cached_now_ns: u64 = 0,
 
-    pub fn init(allocator: std.mem.Allocator, config: Config) !EpollIO {
+    pub fn init(allocator: std.mem.Allocator, config: Config) !EpollPosixIO {
         const epoll_rc = linux.epoll_create1(linux.EPOLL.CLOEXEC);
         switch (linux.E.init(epoll_rc)) {
             .SUCCESS => {},
@@ -221,7 +237,7 @@ pub const EpollIO = struct {
         };
     }
 
-    pub fn deinit(self: *EpollIO) void {
+    pub fn deinit(self: *EpollPosixIO) void {
         self.timers.deinit();
         posix.close(self.wakeup_fd);
         posix.close(self.epoll_fd);
@@ -233,7 +249,7 @@ pub const EpollIO = struct {
     /// "closed-fd-still-in-epoll-set" footgun called out in
     /// `docs/epoll-kqueue-design.md`. ENOENT is fine — fd was never
     /// registered.
-    pub fn closeSocket(self: *EpollIO, fd: posix.fd_t) void {
+    pub fn closeSocket(self: *EpollPosixIO, fd: posix.fd_t) void {
         _ = linux.epoll_ctl(self.epoll_fd, linux.EPOLL.CTL_DEL, fd, null);
         posix.close(fd);
     }
@@ -243,7 +259,7 @@ pub const EpollIO = struct {
     /// Drain expired timers, `epoll_wait` for the next event, dispatch
     /// ready fds, drain any timers that became due during the wait.
     /// Mirrors the contract's `tick` semantics.
-    pub fn tick(self: *EpollIO, wait_at_least: u32) !void {
+    pub fn tick(self: *EpollPosixIO, wait_at_least: u32) !void {
         self.updateNow();
 
         var fired: u32 = 0;
@@ -276,7 +292,7 @@ pub const EpollIO = struct {
         try self.fireExpiredTimers(&fired);
     }
 
-    fn computeEpollTimeout(self: *EpollIO, wait_at_least: u32, fired: u32) i32 {
+    fn computeEpollTimeout(self: *EpollPosixIO, wait_at_least: u32, fired: u32) i32 {
         if (fired >= wait_at_least and wait_at_least > 0) return 0;
         const next_deadline = if (self.timers.peekMin()) |t|
             epollState(t).deadline_ns
@@ -289,7 +305,7 @@ pub const EpollIO = struct {
         return @intCast(@min(ms_remaining, @as(u64, std.math.maxInt(i32))));
     }
 
-    fn updateNow(self: *EpollIO) void {
+    fn updateNow(self: *EpollPosixIO) void {
         var ts: linux.timespec = .{ .sec = 0, .nsec = 0 };
         const rc = linux.clock_gettime(linux.CLOCK.MONOTONIC, &ts);
         if (linux.E.init(rc) == .SUCCESS) {
@@ -300,7 +316,7 @@ pub const EpollIO = struct {
         }
     }
 
-    fn fireExpiredTimers(self: *EpollIO, fired: *u32) !void {
+    fn fireExpiredTimers(self: *EpollPosixIO, fired: *u32) !void {
         while (self.timers.peekMin()) |c| {
             const st = epollState(c);
             if (st.deadline_ns > self.cached_now_ns) break;
@@ -328,7 +344,7 @@ pub const EpollIO = struct {
     /// the operation through the resubmit path. The submission method
     /// retries the syscall and either delivers the result inline or
     /// re-registers if EAGAIN comes back.
-    fn dispatchReady(self: *EpollIO, c: *Completion, events: u32) !void {
+    fn dispatchReady(self: *EpollPosixIO, c: *Completion, events: u32) !void {
         const st = epollState(c);
         const cb = c.callback orelse return;
 
@@ -354,7 +370,7 @@ pub const EpollIO = struct {
         }
     }
 
-    fn resubmit(self: *EpollIO, c: *Completion) !void {
+    fn resubmit(self: *EpollPosixIO, c: *Completion) !void {
         const userdata = c.userdata;
         const callback = c.callback orelse return;
         switch (c.op) {
@@ -389,7 +405,7 @@ pub const EpollIO = struct {
     // method.** That would create an inferred-error-set cycle in Zig 0.15.2
     // (recv → resubmit → recv).
 
-    pub fn socket(self: *EpollIO, op_in: ifc.SocketOp, c: *Completion, ud: ?*anyopaque, cb: Callback) !void {
+    pub fn socket(self: *EpollPosixIO, op_in: ifc.SocketOp, c: *Completion, ud: ?*anyopaque, cb: Callback) !void {
         var op = op_in;
         while (true) {
             try self.armCompletion(c, .{ .socket = op }, ud, cb);
@@ -416,7 +432,7 @@ pub const EpollIO = struct {
         }
     }
 
-    pub fn connect(self: *EpollIO, op: ifc.ConnectOp, c: *Completion, ud: ?*anyopaque, cb: Callback) !void {
+    pub fn connect(self: *EpollPosixIO, op: ifc.ConnectOp, c: *Completion, ud: ?*anyopaque, cb: Callback) !void {
         try self.armCompletion(c, .{ .connect = op }, ud, cb);
 
         const addrlen = op.addr.getOsSockLen();
@@ -453,7 +469,7 @@ pub const EpollIO = struct {
         _ = op.deadline_ns;
     }
 
-    pub fn accept(self: *EpollIO, op: ifc.AcceptOp, c: *Completion, ud: ?*anyopaque, cb: Callback) !void {
+    pub fn accept(self: *EpollPosixIO, op: ifc.AcceptOp, c: *Completion, ud: ?*anyopaque, cb: Callback) !void {
         try self.armCompletion(c, .{ .accept = op }, ud, cb);
         epollState(c).accept_multishot = op.multishot;
 
@@ -487,7 +503,7 @@ pub const EpollIO = struct {
         try self.registerFd(c, op.fd, linux.EPOLL.IN);
     }
 
-    pub fn recv(self: *EpollIO, op_in: ifc.RecvOp, c: *Completion, ud: ?*anyopaque, cb: Callback) !void {
+    pub fn recv(self: *EpollPosixIO, op_in: ifc.RecvOp, c: *Completion, ud: ?*anyopaque, cb: Callback) !void {
         var op = op_in;
         while (true) {
             try self.armCompletion(c, .{ .recv = op }, ud, cb);
@@ -517,7 +533,7 @@ pub const EpollIO = struct {
         }
     }
 
-    pub fn send(self: *EpollIO, op_in: ifc.SendOp, c: *Completion, ud: ?*anyopaque, cb: Callback) !void {
+    pub fn send(self: *EpollPosixIO, op_in: ifc.SendOp, c: *Completion, ud: ?*anyopaque, cb: Callback) !void {
         var op = op_in;
         while (true) {
             try self.armCompletion(c, .{ .send = op }, ud, cb);
@@ -547,7 +563,7 @@ pub const EpollIO = struct {
         }
     }
 
-    pub fn recvmsg(self: *EpollIO, op_in: ifc.RecvmsgOp, c: *Completion, ud: ?*anyopaque, cb: Callback) !void {
+    pub fn recvmsg(self: *EpollPosixIO, op_in: ifc.RecvmsgOp, c: *Completion, ud: ?*anyopaque, cb: Callback) !void {
         var op = op_in;
         while (true) {
             try self.armCompletion(c, .{ .recvmsg = op }, ud, cb);
@@ -578,7 +594,7 @@ pub const EpollIO = struct {
         }
     }
 
-    pub fn sendmsg(self: *EpollIO, op_in: ifc.SendmsgOp, c: *Completion, ud: ?*anyopaque, cb: Callback) !void {
+    pub fn sendmsg(self: *EpollPosixIO, op_in: ifc.SendmsgOp, c: *Completion, ud: ?*anyopaque, cb: Callback) !void {
         var op = op_in;
         while (true) {
             try self.armCompletion(c, .{ .sendmsg = op }, ud, cb);
@@ -609,7 +625,7 @@ pub const EpollIO = struct {
         }
     }
 
-    pub fn timeout(self: *EpollIO, op: ifc.TimeoutOp, c: *Completion, ud: ?*anyopaque, cb: Callback) !void {
+    pub fn timeout(self: *EpollPosixIO, op: ifc.TimeoutOp, c: *Completion, ud: ?*anyopaque, cb: Callback) !void {
         try self.armCompletion(c, .{ .timeout = op }, ud, cb);
 
         self.updateNow();
@@ -621,7 +637,7 @@ pub const EpollIO = struct {
         self.active += 1;
     }
 
-    pub fn poll(self: *EpollIO, op: ifc.PollOp, c: *Completion, ud: ?*anyopaque, cb: Callback) !void {
+    pub fn poll(self: *EpollPosixIO, op: ifc.PollOp, c: *Completion, ud: ?*anyopaque, cb: Callback) !void {
         try self.armCompletion(c, .{ .poll = op }, ud, cb);
 
         // Translate POLL_IN/POLL_OUT/etc. to EPOLLIN/EPOLLOUT/etc. The
@@ -631,7 +647,7 @@ pub const EpollIO = struct {
         try self.registerFd(c, op.fd, op.events);
     }
 
-    pub fn cancel(self: *EpollIO, op: ifc.CancelOp, c: *Completion, ud: ?*anyopaque, cb: Callback) !void {
+    pub fn cancel(self: *EpollPosixIO, op: ifc.CancelOp, c: *Completion, ud: ?*anyopaque, cb: Callback) !void {
         try self.armCompletion(c, .{ .cancel = op }, ud, cb);
 
         const target = op.target;
@@ -692,32 +708,32 @@ pub const EpollIO = struct {
     // files (they always poll ready). Daemon paths that depend on these
     // ops will not work under `-Dio=epoll` until the follow-up lands.
 
-    pub fn read(self: *EpollIO, op: ifc.ReadOp, c: *Completion, ud: ?*anyopaque, cb: Callback) !void {
+    pub fn read(self: *EpollPosixIO, op: ifc.ReadOp, c: *Completion, ud: ?*anyopaque, cb: Callback) !void {
         try self.armCompletion(c, .{ .read = op }, ud, cb);
         const action = try self.deliverInline(c, .{ .read = error.Unimplemented });
         // Unimplemented op rearm is a no-op; the caller can't make progress.
         _ = action;
     }
 
-    pub fn write(self: *EpollIO, op: ifc.WriteOp, c: *Completion, ud: ?*anyopaque, cb: Callback) !void {
+    pub fn write(self: *EpollPosixIO, op: ifc.WriteOp, c: *Completion, ud: ?*anyopaque, cb: Callback) !void {
         try self.armCompletion(c, .{ .write = op }, ud, cb);
         const action = try self.deliverInline(c, .{ .write = error.Unimplemented });
         _ = action;
     }
 
-    pub fn fsync(self: *EpollIO, op: ifc.FsyncOp, c: *Completion, ud: ?*anyopaque, cb: Callback) !void {
+    pub fn fsync(self: *EpollPosixIO, op: ifc.FsyncOp, c: *Completion, ud: ?*anyopaque, cb: Callback) !void {
         try self.armCompletion(c, .{ .fsync = op }, ud, cb);
         const action = try self.deliverInline(c, .{ .fsync = error.Unimplemented });
         _ = action;
     }
 
-    pub fn fallocate(self: *EpollIO, op: ifc.FallocateOp, c: *Completion, ud: ?*anyopaque, cb: Callback) !void {
+    pub fn fallocate(self: *EpollPosixIO, op: ifc.FallocateOp, c: *Completion, ud: ?*anyopaque, cb: Callback) !void {
         try self.armCompletion(c, .{ .fallocate = op }, ud, cb);
         const action = try self.deliverInline(c, .{ .fallocate = error.Unimplemented });
         _ = action;
     }
 
-    pub fn truncate(self: *EpollIO, op: ifc.TruncateOp, c: *Completion, ud: ?*anyopaque, cb: Callback) !void {
+    pub fn truncate(self: *EpollPosixIO, op: ifc.TruncateOp, c: *Completion, ud: ?*anyopaque, cb: Callback) !void {
         try self.armCompletion(c, .{ .truncate = op }, ud, cb);
         const action = try self.deliverInline(c, .{ .truncate = error.Unimplemented });
         _ = action;
@@ -725,7 +741,7 @@ pub const EpollIO = struct {
 
     // ── Internal helpers ──────────────────────────────────
 
-    fn armCompletion(self: *EpollIO, c: *Completion, op: Operation, ud: ?*anyopaque, cb: Callback) !void {
+    fn armCompletion(self: *EpollPosixIO, c: *Completion, op: Operation, ud: ?*anyopaque, cb: Callback) !void {
         _ = self;
         const st = epollState(c);
         if (st.in_flight) return error.AlreadyInFlight;
@@ -736,7 +752,7 @@ pub const EpollIO = struct {
         c.next = null;
     }
 
-    fn registerFd(self: *EpollIO, c: *Completion, fd: posix.fd_t, events: u32) !void {
+    fn registerFd(self: *EpollPosixIO, c: *Completion, fd: posix.fd_t, events: u32) !void {
         var ev: linux.epoll_event = .{
             .events = events | linux.EPOLL.ONESHOT | linux.EPOLL.RDHUP,
             .data = .{ .ptr = @intFromPtr(c) },
@@ -767,7 +783,7 @@ pub const EpollIO = struct {
     /// invoking the callback. Returns the callback's action so the caller
     /// can handle .rearm in its own loop. **Does not call `resubmit`** —
     /// that would create an inferred-error-set cycle.
-    fn deliverInline(self: *EpollIO, c: *Completion, result: Result) !CallbackAction {
+    fn deliverInline(self: *EpollPosixIO, c: *Completion, result: Result) !CallbackAction {
         _ = self;
         const st = epollState(c);
         st.in_flight = false;
@@ -855,8 +871,8 @@ fn performInline(c: *Completion, events: u32) Result {
 
 const testing = std.testing;
 
-fn skipIfUnavailable() !EpollIO {
-    return EpollIO.init(testing.allocator, .{}) catch return error.SkipZigTest;
+fn skipIfUnavailable() !EpollPosixIO {
+    return EpollPosixIO.init(testing.allocator, .{}) catch return error.SkipZigTest;
 }
 
 const TestCtx = struct {
@@ -875,14 +891,14 @@ fn testCallback(
     return .disarm;
 }
 
-test "EpollIO init / deinit succeeds" {
+test "EpollPosixIO init / deinit succeeds" {
     var io = try skipIfUnavailable();
     defer io.deinit();
     try testing.expect(io.epoll_fd >= 0);
     try testing.expect(io.wakeup_fd >= 0);
 }
 
-test "EpollIO timeout fires after deadline" {
+test "EpollPosixIO timeout fires after deadline" {
     var io = try skipIfUnavailable();
     defer io.deinit();
 
@@ -903,7 +919,7 @@ test "EpollIO timeout fires after deadline" {
     }
 }
 
-test "EpollIO socket creates non-blocking fd" {
+test "EpollPosixIO socket creates non-blocking fd" {
     var io = try skipIfUnavailable();
     defer io.deinit();
 
@@ -931,7 +947,7 @@ fn makeNonBlocking(fd: posix.fd_t) !void {
     _ = try posix.fcntl(fd, posix.F.SETFL, flags | @as(usize, @bitCast(@as(isize, posix.SOCK.NONBLOCK))));
 }
 
-test "EpollIO recv on socketpair returns bytes after send" {
+test "EpollPosixIO recv on socketpair returns bytes after send" {
     var io = try skipIfUnavailable();
     defer io.deinit();
 
@@ -971,7 +987,7 @@ test "EpollIO recv on socketpair returns bytes after send" {
     }
 }
 
-test "EpollIO send + recv round-trip on socketpair" {
+test "EpollPosixIO send + recv round-trip on socketpair" {
     var io = try skipIfUnavailable();
     defer io.deinit();
 
@@ -1031,7 +1047,7 @@ test "EpollIO send + recv round-trip on socketpair" {
     try testing.expectEqualStrings("varuna", both.recv_buf[0..6]);
 }
 
-test "EpollIO cancel on parked recv delivers OperationCanceled" {
+test "EpollPosixIO cancel on parked recv delivers OperationCanceled" {
     var io = try skipIfUnavailable();
     defer io.deinit();
 
@@ -1089,7 +1105,7 @@ test "EpollIO cancel on parked recv delivers OperationCanceled" {
     }
 }
 
-test "EpollIO file ops return Unimplemented (MVP scope marker)" {
+test "EpollPosixIO file ops return Unimplemented (MVP scope marker)" {
     // The MVP intentionally does not implement file ops. They require a
     // worker thread pool because epoll cannot signal regular-file readiness.
     // This test asserts the explicit UNIMPLEMENTED contract so the gap is
