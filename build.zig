@@ -1,4 +1,5 @@
 const std = @import("std");
+const builtin = @import("builtin");
 const boringssl = @import("build/boringssl.zig");
 const cares = @import("build/cares.zig");
 
@@ -41,11 +42,28 @@ pub fn build(b: *std.Build) void {
         @panic("-Dcrypto=boringssl requires -Dtls=boringssl (BoringSSL is not linked when -Dtls=none)");
     }
 
-    // ── Build options module (dns backend + tls backend + crypto backend) ─
+    // -Dio= selects the IO backend.
+    //
+    // Today the daemon hard-references RealIO (`src/io/real_io.zig`,
+    // io_uring), so under any non-io_uring backend the daemon install
+    // steps below are skipped — the build still produces the IO module
+    // + per-backend tests so cross-compile and bisectability pass.
+    //
+    // Note for merge: epoll-io-engineer adds `epoll` to this enum on a
+    // parallel branch. The conflict is intentionally trivial — extend
+    // the choice list.
+    const io_backend = b.option(
+        IoBackend,
+        "io",
+        "IO backend: 'io_uring' (Linux, default; full daemon), 'kqueue' (macOS/BSD developer build, MVP)",
+    ) orelse .io_uring;
+
+    // ── Build options module (dns backend + tls backend + crypto backend + io backend) ─
     const build_options = b.addOptions();
     build_options.addOption(DnsBackend, "dns_backend", dns_backend);
     build_options.addOption(TlsBackend, "tls_backend", tls_backend);
     build_options.addOption(CryptoBackend, "crypto_backend", crypto_backend);
+    build_options.addOption(IoBackend, "io_backend", io_backend);
 
     const toml_dep = b.dependency("toml", .{
         .target = target,
@@ -119,6 +137,12 @@ pub fn build(b: *std.Build) void {
         .{ .name = "varuna", .module = varuna_mod },
     };
 
+    // The daemon and its companion executables hard-reference `RealIO`
+    // (io_uring). Under any other backend (-Dio=kqueue, future -Dio=epoll)
+    // we skip these installs — the build still produces the varuna_mod
+    // module + IO backend tests, which is what cross-compilation validates.
+    const build_full_daemon = io_backend == .io_uring;
+
     // ── varuna (daemon) ───────────────────────────────────
     const daemon_exe = b.addExecutable(.{
         .name = "varuna",
@@ -135,7 +159,7 @@ pub fn build(b: *std.Build) void {
     // pending queries (~42 KB) = ~896 KB for DhtEngine alone.  Combined with other
     // stack frames (getaddrinfo in glibc can use 1-4 MB), 8 MB is insufficient.
     daemon_exe.stack_size = 32 * 1024 * 1024; // 32 MB
-    b.installArtifact(daemon_exe);
+    if (build_full_daemon) b.installArtifact(daemon_exe);
 
     // ── varuna-ctl (CLI client) ───────────────────────────
     const ctl_exe = b.addExecutable(.{
@@ -147,7 +171,7 @@ pub fn build(b: *std.Build) void {
             .imports = &varuna_import,
         }),
     });
-    b.installArtifact(ctl_exe);
+    if (build_full_daemon) b.installArtifact(ctl_exe);
 
     // ── varuna-tools (standalone utilities) ────────────────
     const tools_exe = b.addExecutable(.{
@@ -159,14 +183,17 @@ pub fn build(b: *std.Build) void {
             .imports = &varuna_import,
         }),
     });
-    b.installArtifact(tools_exe);
+    if (build_full_daemon) b.installArtifact(tools_exe);
 
     // ── Run targets ───────────────────────────────────────
-    const run_step = b.step("run", "Run the varuna daemon");
-    const run_cmd = b.addRunArtifact(daemon_exe);
-    run_cmd.step.dependOn(b.getInstallStep());
-    if (b.args) |args| run_cmd.addArgs(args);
-    run_step.dependOn(&run_cmd.step);
+    // The `run` step is only meaningful when the daemon is built.
+    if (build_full_daemon) {
+        const run_step = b.step("run", "Run the varuna daemon");
+        const run_cmd = b.addRunArtifact(daemon_exe);
+        run_cmd.step.dependOn(b.getInstallStep());
+        if (b.args) |args| run_cmd.addArgs(args);
+        run_step.dependOn(&run_cmd.step);
+    }
 
     // ── Tests ─────────────────────────────────────────────
     const mod_tests = b.addTest(.{ .root_module = varuna_mod });
@@ -303,6 +330,64 @@ pub fn build(b: *std.Build) void {
     const test_io_parity_step = b.step("test-io-parity", "Run IO backend parity tests (RealIO vs SimIO)");
     test_io_parity_step.dependOn(&run_io_parity.step);
     test_step.dependOn(&run_io_parity.step);
+
+    // ── KqueueIO MVP tests ─────────────────────────────────
+    // Standalone target: compiles `src/io/kqueue_io.zig` directly, with
+    // its `@import("io_interface.zig")` sibling resolving naturally. No
+    // dependency on `varuna_mod`, so this target cross-compiles cleanly
+    // for macOS even though the daemon does not.
+    //
+    // Inline tests in `src/io/kqueue_io.zig` cover both platform-portable
+    // (timer heap, errno mapping) and macOS-only (real kqueue syscalls)
+    // paths. The latter `return error.SkipZigTest` on non-darwin targets;
+    // the bodies are still semantically analysed which catches Zig API
+    // drift on cross-compilation.
+    const kqueue_io_inline_tests = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/io/kqueue_io.zig"),
+            .target = target,
+            .optimize = optimize,
+            .link_libc = true,
+        }),
+    });
+    const test_kqueue_io_step = b.step(
+        "test-kqueue-io",
+        "Run KqueueIO MVP tests (cross-compile-clean; mock-driven on Linux, full on macOS)",
+    );
+    // Cross-compiled binaries can't run on the host — depend only on
+    // the compile step in that case so `zig build test-kqueue-io
+    // -Dtarget=aarch64-macos` validates compilation without trying to
+    // exec a macOS test binary on Linux.
+    const can_exec_kqueue_io_tests =
+        target.result.os.tag == builtin.os.tag and
+        target.result.cpu.arch == builtin.cpu.arch;
+    if (can_exec_kqueue_io_tests) {
+        const run_kqueue_io_inline_tests = b.addRunArtifact(kqueue_io_inline_tests);
+        test_kqueue_io_step.dependOn(&run_kqueue_io_inline_tests.step);
+        test_step.dependOn(&run_kqueue_io_inline_tests.step);
+    } else {
+        test_kqueue_io_step.dependOn(&kqueue_io_inline_tests.step);
+    }
+
+    // Bridge tests via varuna_mod (Linux-only; pulls kqueue_io through
+    // `varuna.io.kqueue_io`). Cross-targets that skip varuna_mod also
+    // skip this; that's fine — the standalone target above keeps the
+    // cross-compile signal clean.
+    const kqueue_io_bridge_tests = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("tests/kqueue_io_test.zig"),
+            .target = target,
+            .optimize = optimize,
+            .imports = &varuna_import,
+        }),
+    });
+    const run_kqueue_io_bridge_tests = b.addRunArtifact(kqueue_io_bridge_tests);
+    const test_kqueue_io_bridge_step = b.step(
+        "test-kqueue-io-bridge",
+        "Run KqueueIO bridge tests via varuna_mod (Linux-only by construction)",
+    );
+    test_kqueue_io_bridge_step.dependOn(&run_kqueue_io_bridge_tests.step);
+    if (build_full_daemon) test_step.dependOn(&run_kqueue_io_bridge_tests.step);
 
     // ── SimIO socketpair / parking / fault-injection tests ────────
     //
@@ -836,7 +921,7 @@ pub fn build(b: *std.Build) void {
             .imports = &varuna_import,
         }),
     });
-    b.installArtifact(perf_workload_exe);
+    if (build_full_daemon) b.installArtifact(perf_workload_exe);
 
     const perf_workload_step = b.step("perf-workload", "Run synthetic allocation and cache workload scenarios");
     const perf_workload_run = b.addRunArtifact(perf_workload_exe);
@@ -1020,6 +1105,20 @@ pub const TlsBackend = enum {
     boringssl,
     /// No TLS — HTTPS tracker URLs will return error.HttpsNotSupported.
     none,
+};
+
+/// IO backend selection.
+///
+/// The daemon today is hard-wired to `io_uring` (Linux). The other backends
+/// exist as MVPs that compile their respective IO modules (and tests)
+/// cleanly, so cross-compilation can be validated even though the daemon
+/// itself does not yet run on those backends.
+pub const IoBackend = enum {
+    /// Default: Linux io_uring. Full daemon supported.
+    io_uring,
+    /// macOS / BSD kqueue. MVP — sockets + timers only; file ops deferred
+    /// to a thread-pool follow-up. Daemon is not built under this flag.
+    kqueue,
 };
 
 /// Cryptographic algorithm backend selection.
