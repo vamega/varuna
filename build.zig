@@ -329,6 +329,27 @@ pub fn build(b: *std.Build) void {
     test_io_parity_step.dependOn(&run_io_parity.step);
     test_step.dependOn(&run_io_parity.step);
 
+    // ── EpollIO smoke tests (real socketpair, real epoll fd) ────────
+    //
+    // Backend-specific coverage for `src/io/epoll_io.zig`. Only meaningful
+    // on Linux (skipped at runtime on other platforms via the test's
+    // `skipIfUnavailable`). The bulk of the EpollIO inline tests are pulled
+    // in via `src/io/root.zig` → `_ = epoll_io;`; this addTest target
+    // exists so engineers can iterate on a focused build step
+    // (`zig build test-epoll-io`) instead of running the full suite.
+    const epoll_io_tests = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("tests/epoll_io_test.zig"),
+            .target = target,
+            .optimize = optimize,
+            .imports = &varuna_import,
+        }),
+    });
+    const run_epoll_io_tests = b.addRunArtifact(epoll_io_tests);
+    const test_epoll_io_step = b.step("test-epoll-io", "Run EpollIO smoke tests (real socketpair + real epoll)");
+    test_epoll_io_step.dependOn(&run_epoll_io_tests.step);
+    test_step.dependOn(&run_epoll_io_tests.step);
+
     // ── SimIO socketpair / parking / fault-injection tests ────────
     //
     // `tests/sim_socketpair_test.zig` is itself a top-level test file
