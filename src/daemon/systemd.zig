@@ -93,6 +93,12 @@ var listen_fds_buf: [max_listen_fds]std.posix.fd_t = undefined;
 /// on the given port. Useful when systemd passes multiple sockets and the
 /// daemon needs to identify which one is the API server vs peer listener.
 pub fn isListenSocketOnPort(fd: std.posix.fd_t, expected_port: u16) bool {
+    // Zig 0.15.2's `std.posix.getsockname` treats EBADF as `unreachable`
+    // (a race / programmer-error contract). Defend against negative
+    // sentinel fds so callers that already lost track of which slot a
+    // listen socket was passed in don't trip the panic.
+    if (fd < 0) return false;
+
     var addr: std.posix.sockaddr = undefined;
     var addr_len: std.posix.socklen_t = @sizeOf(std.posix.sockaddr);
     std.posix.getsockname(fd, &addr, &addr_len) catch return false;
