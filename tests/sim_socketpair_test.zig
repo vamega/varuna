@@ -762,3 +762,48 @@ test "SimIO fallocate result is mutated by injectRandomFault (BUGGIFY)" {
         else => try testing.expect(false),
     }
 }
+
+test "SimIO truncate completes successfully by default" {
+    var io = try SimIO.init(testing.allocator, .{});
+    defer io.deinit();
+
+    var c = Completion{};
+    var ctx = TestCtx{};
+    try io.truncate(
+        .{ .fd = 42, .length = 4 * 1024 },
+        &c,
+        &ctx,
+        testCallback,
+    );
+    try io.tick(0);
+
+    try testing.expectEqual(@as(u32, 1), ctx.calls);
+    switch (ctx.last_result.?) {
+        .truncate => |r| try r,
+        else => try testing.expect(false),
+    }
+}
+
+test "SimIO truncate with fault probability 1.0 always returns InputOutput" {
+    var io = try SimIO.init(testing.allocator, .{
+        .seed = 0xc0ffee,
+        .faults = .{ .truncate_error_probability = 1.0 },
+    });
+    defer io.deinit();
+
+    var c = Completion{};
+    var ctx = TestCtx{};
+    try io.truncate(
+        .{ .fd = 42, .length = 1024 },
+        &c,
+        &ctx,
+        testCallback,
+    );
+    try io.tick(0);
+
+    try testing.expectEqual(@as(u32, 1), ctx.calls);
+    switch (ctx.last_result.?) {
+        .truncate => |r| try testing.expectError(error.InputOutput, r),
+        else => try testing.expect(false),
+    }
+}

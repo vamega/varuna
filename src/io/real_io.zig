@@ -170,6 +170,7 @@ pub const RealIO = struct {
             .write => |op| try self.write(op, c, userdata, callback),
             .fsync => |op| try self.fsync(op, c, userdata, callback),
             .fallocate => |op| try self.fallocate(op, c, userdata, callback),
+            .truncate => |op| try self.truncate(op, c, userdata, callback),
             .socket => |op| try self.socket(op, c, userdata, callback),
             .connect => |op| try self.connect(op, c, userdata, callback),
             .accept => |op| try self.accept(op, c, userdata, callback),
@@ -233,6 +234,55 @@ pub const RealIO = struct {
         try self.armCompletion(c, .{ .fallocate = op }, ud, cb);
         const sqe = try self.ring.fallocate(@intFromPtr(c), op.fd, op.mode, op.offset, op.len);
         _ = sqe;
+    }
+
+    /// `truncate` is synchronous on RealIO: `IORING_OP_FTRUNCATE` was
+    /// added in Linux 6.9, while varuna's kernel floor (per
+    /// `src/runtime/requirements.zig`) is 6.6 minimum / 6.8 preferred.
+    /// Until the floor bumps to 6.9+ we fall back to a direct
+    /// `posix.ftruncate(2)` and fire the completion's callback inline.
+    ///
+    /// The only daemon caller is the `PieceStore.init` filesystem-
+    /// portability fallback (when fallocate returns
+    /// `error.OperationNotSupported` on tmpfs <5.10, FAT32, certain FUSE
+    /// FSes). That path runs on a background thread (see
+    /// `doStartBackground` in `src/daemon/torrent_session.zig`), so a
+    /// synchronous syscall has zero event-loop-thread impact.
+    ///
+    /// Mirrors the contract's "callback fires before submission returns"
+    /// shape used by SimIO-style synchronous completion: in_flight is
+    /// cleared before invoking the callback so a callback that
+    /// re-submits a new op on the same completion doesn't trip
+    /// `error.AlreadyInFlight` against itself. Match `dispatchCqe`.
+    ///
+    /// `.rearm` is iterated as a loop rather than via recursion through
+    /// `resubmit` to avoid an inferred-error-set cycle (truncate →
+    /// resubmit → truncate). Truncate is one-shot in practice; this
+    /// matches the contract's semantics without the recursion footgun.
+    pub fn truncate(self: *RealIO, op_in: ifc.TruncateOp, c: *Completion, ud: ?*anyopaque, cb: Callback) !void {
+        var op = op_in;
+        while (true) {
+            try self.armCompletion(c, .{ .truncate = op }, ud, cb);
+
+            const result: Result = if (posix.ftruncate(op.fd, op.length)) |_|
+                .{ .truncate = {} }
+            else |err|
+                .{ .truncate = err };
+
+            // Clear in_flight before invoking the callback (mirrors
+            // dispatchCqe — see the Operation doc-comment in
+            // io_interface.zig).
+            realState(c).in_flight = false;
+
+            const action = cb(ud, c, result);
+            switch (action) {
+                .disarm => return,
+                .rearm => switch (c.op) {
+                    .truncate => |new_op| op = new_op,
+                    else => return, // callback overwrote c.op with a different op (illegal under the contract)
+                },
+            }
+        }
     }
 
     pub fn socket(self: *RealIO, op: ifc.SocketOp, c: *Completion, ud: ?*anyopaque, cb: Callback) !void {
@@ -329,6 +379,10 @@ fn buildResult(op: Operation, cqe: linux.io_uring_cqe) Result {
         .write => .{ .write = countOrError(cqe) },
         .fsync => .{ .fsync = voidOrError(cqe) },
         .fallocate => .{ .fallocate = voidOrError(cqe) },
+        // truncate completes synchronously inside `RealIO.truncate`; if
+        // it ever reaches the CQE dispatch path that's a bug. Surface as
+        // a loud error so it doesn't silently masquerade as success.
+        .truncate => .{ .truncate = error.UnknownOperation },
         .socket => .{ .socket = fdOrError(cqe) },
         .connect => .{ .connect = voidOrError(cqe) },
         .accept => .{ .accept = acceptResult(cqe) },
@@ -624,4 +678,35 @@ test "RealIO fsync on tempfile succeeds" {
         .fsync => |r| try r,
         else => try testing.expect(false),
     }
+}
+
+test "RealIO truncate extends a tempfile synchronously" {
+    // Truncate is the one synchronous-completion op in the contract:
+    // IORING_OP_FTRUNCATE requires kernel ≥6.9, above varuna's floor
+    // (6.6 minimum / 6.8 preferred). Until the floor bumps it falls
+    // back to `posix.ftruncate(2)` and fires the callback inline. This
+    // test exercises that path and confirms the fd's size matches.
+    var io = try skipIfUnavailable();
+    defer io.deinit();
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const file = try tmp.dir.createFile("truncate_test", .{ .truncate = true });
+    defer file.close();
+
+    var c = Completion{};
+    var ctx = TestCtx{};
+    try io.truncate(.{ .fd = file.handle, .length = 4096 }, &c, &ctx, testCallback);
+    // No tick required — truncate completes inline.
+
+    try testing.expectEqual(@as(u32, 1), ctx.calls);
+    switch (ctx.last_result.?) {
+        .truncate => |r| try r,
+        else => try testing.expect(false),
+    }
+
+    // Verify the file actually grew to 4 KiB.
+    const stat = try posix.fstat(file.handle);
+    try testing.expectEqual(@as(@TypeOf(stat.size), 4096), stat.size);
 }
