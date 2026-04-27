@@ -29,6 +29,8 @@ test {
     _ = crypto;
     _ = dht;
     _ = io;
+    _ = runtime;
+    _ = sim;
     _ = storage;
     _ = torrent;
 }
