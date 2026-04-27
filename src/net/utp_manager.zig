@@ -82,7 +82,20 @@ pub const UtpManager = struct {
     /// Returns an optional response packet and the associated slot.
     pub fn processPacket(self: *UtpManager, data: []const u8, remote: std.net.Address, now_us: u32) ?PacketResult {
         const hdr = Header.decode(data) orelse return null;
-        const payload = if (data.len > Header.size) data[Header.size..] else &[_]u8{};
+        const raw_payload = if (data.len > Header.size) data[Header.size..] else &[_]u8{};
+
+        // Walk and strip any uTP extension headers. BEP 29's extension
+        // chain is `(next_ext: u8, len: u8, ext_data: [len]u8)*` placed
+        // immediately after the main header; the BT framing layer must
+        // see only what follows the last extension. Skipping the chain
+        // also means a peer that sets `hdr.extension = selective_ack`
+        // with a chunk of BT keepalive bytes after the SACK bitmask gets
+        // its BT bytes interpreted correctly instead of fed through with
+        // SACK header bytes mixed in.
+        //
+        // Truncated chains (ext_len > remaining bytes) are rejected by
+        // returning null — the daemon drops the malformed datagram.
+        const payload = stripExtensions(hdr.extension, raw_payload) orelse return null;
 
         // Route by connection_id.
         if (hdr.packet_type == .st_syn) {
@@ -281,6 +294,38 @@ pub const UtpManager = struct {
             .remote = remote,
             .new_connection = false,
         };
+    }
+
+    /// Walk a uTP extension chain starting from `initial_ext`, consuming
+    /// each `(next_ext: u8, len: u8, [len]u8)` header in turn. Returns
+    /// the trailing slice (the BT framing layer's payload) once a
+    /// `next_ext == .none` terminator is reached, or null if the chain
+    /// is truncated relative to the datagram length.
+    ///
+    /// Each iteration consumes at least 2 bytes (the per-extension
+    /// header), so the loop is bounded by `payload.len / 2` — no
+    /// explicit iteration cap is needed.
+    fn stripExtensions(initial_ext: utp.Extension, payload: []const u8) ?[]const u8 {
+        var current_ext = initial_ext;
+        var remaining = payload;
+        while (current_ext != .none) {
+            if (remaining.len < 2) return null;
+            const next_ext: utp.Extension = @enumFromInt(remaining[0]);
+            const ext_len: usize = remaining[1];
+            // Bound the per-extension length by the SACK cap so a
+            // peer-controlled `len` of 36/.../252 (multiple of 4, > 32)
+            // can't sneak past as an unknown-extension skip — keeps the
+            // wire-side bound consistent with `SelectiveAck.decode`.
+            // For truly unknown extensions (`_`), still trust the
+            // declared length since we don't know its semantics —
+            // the truncation check on `remaining.len < 2 + ext_len`
+            // is the only safety net there.
+            if (current_ext == .selective_ack and ext_len > utp.sack_bitmask_max) return null;
+            if (remaining.len < 2 + ext_len) return null;
+            remaining = remaining[2 + ext_len ..];
+            current_ext = next_ext;
+        }
+        return remaining;
     }
 
     fn allocSlot(self: *UtpManager) ?u16 {
@@ -575,4 +620,195 @@ test "manager freeSlot cleans up outbound buffers" {
     // Reset frees the slot and the outbound buffers.
     _ = mgr.reset(conn.slot, 2_000_000);
     try std.testing.expectEqual(@as(u16, 0), mgr.connectionCount());
+}
+
+// ── Extension chain regression tests ──────────────────────
+//
+// Background: src/net/utp_manager.zig:processPacket previously treated
+// `data[Header.size..]` as the entire BT payload regardless of
+// `hdr.extension`. When a peer set extension == selective_ack the
+// SACK header bytes were fed into the BT framing layer as if they
+// were BT message bytes — protocol-correctness, not memory-safety
+// (filed in progress-reports/2026-04-26-audit-hunt-round3.md).
+//
+// `stripExtensions` walks the chain. These tests pin its behavior on
+// the wire shapes the brief called out: single SACK extension before
+// BT bytes, multi-hop chain, and truncated chain.
+
+test "stripExtensions: no extension passes payload through" {
+    const payload = [_]u8{ 0xDE, 0xAD, 0xBE, 0xEF };
+    const out = UtpManager.stripExtensions(.none, &payload).?;
+    try std.testing.expectEqualSlices(u8, &payload, out);
+}
+
+test "stripExtensions: SACK extension is consumed before BT bytes" {
+    // Layout: ext_chain = (next_ext=none, len=4, [4]u8 SACK bitmask)
+    // followed by 4 zero bytes (a BT keepalive: u32 length prefix = 0).
+    const datagram = [_]u8{
+        0, // next_ext = .none (terminates chain)
+        4, // len = 4 bytes of SACK bitmask
+        0xAA, 0xBB, 0xCC, 0xDD, // SACK bitmask
+        0, 0, 0, 0, // BT keepalive (length prefix = 0)
+    };
+    const out = UtpManager.stripExtensions(.selective_ack, &datagram).?;
+    try std.testing.expectEqualSlices(u8, &[_]u8{ 0, 0, 0, 0 }, out);
+}
+
+test "stripExtensions: multi-hop chain consumes every extension" {
+    // Two chained extensions: first selective_ack, then an unknown
+    // type (value 7), then terminator. BT bytes follow.
+    const datagram = [_]u8{
+        7, // next_ext = unknown type 7
+        4, // len = 4 (SACK bitmask)
+        0x11, 0x22, 0x33, 0x44, // SACK bitmask
+        0, // next_ext = .none
+        2, // len = 2
+        0x55, 0x66, // unknown extension data
+        0xAB, 0xCD, // BT bytes
+    };
+    const out = UtpManager.stripExtensions(.selective_ack, &datagram).?;
+    try std.testing.expectEqualSlices(u8, &[_]u8{ 0xAB, 0xCD }, out);
+}
+
+test "stripExtensions: truncated extension is rejected" {
+    // ext_len claims 16 bytes but only 4 are present after the
+    // 2-byte extension header.
+    const datagram = [_]u8{
+        0, // next_ext = .none
+        16, // len = 16 (lie)
+        0x01, 0x02, 0x03, 0x04, // only 4 bytes of "data"
+    };
+    try std.testing.expect(UtpManager.stripExtensions(.selective_ack, &datagram) == null);
+}
+
+test "stripExtensions: missing per-extension header is rejected" {
+    // hdr says there's a SACK extension but the datagram has zero
+    // bytes after the main header.
+    const datagram = [_]u8{};
+    try std.testing.expect(UtpManager.stripExtensions(.selective_ack, &datagram) == null);
+    // Single byte (less than 2-byte ext header) is also rejected.
+    const one_byte = [_]u8{0xAA};
+    try std.testing.expect(UtpManager.stripExtensions(.selective_ack, &one_byte) == null);
+}
+
+test "stripExtensions: SACK len > sack_bitmask_max is rejected" {
+    // The decoder's bound (sack_bitmask_max = 32) is enforced here
+    // too, so a peer can't sneak a 252-byte SACK past as a generic
+    // "skip 252 bytes" extension and confuse downstream framing.
+    var datagram: [256]u8 = undefined;
+    datagram[0] = 0; // next_ext = .none
+    datagram[1] = 36; // len = 36 (multiple of 4, > 32)
+    @memset(datagram[2..38], 0);
+    try std.testing.expect(UtpManager.stripExtensions(.selective_ack, datagram[0..38]) == null);
+}
+
+test "stripExtensions: chain bounded by datagram length" {
+    // A chain that never terminates within the datagram is
+    // rejected. Each hop here advertises another hop forever.
+    const datagram = [_]u8{ 1, 0 } ** 8; // 8 chained empty extensions, never terminating
+    try std.testing.expect(UtpManager.stripExtensions(.selective_ack, &datagram) == null);
+}
+
+test "manager processes SACK + BT keepalive correctly through full pipeline" {
+    // End-to-end: build a uTP DATA packet with a SACK extension and
+    // 4 zero BT keepalive bytes after it. The manager's processPacket
+    // must surface a 4-byte payload (the keepalive) — not 6 bytes
+    // (SACK header + keepalive intermixed).
+    var mgr = UtpManager.init(std.testing.allocator);
+    defer mgr.deinit();
+    const remote = std.net.Address.initIp4(.{ 10, 0, 0, 1 }, 6881);
+
+    // Establish a connection: SYN + SYN-ACK.
+    const syn_hdr = Header{
+        .packet_type = .st_syn,
+        .extension = .none,
+        .connection_id = 500,
+        .timestamp_us = 1_000_000,
+        .timestamp_diff_us = 0,
+        .wnd_size = 65536,
+        .seq_nr = 1,
+        .ack_nr = 0,
+    };
+    const syn_buf = syn_hdr.encode();
+    const syn_result = mgr.processPacket(&syn_buf, remote, 1_000_000).?;
+    const slot = mgr.accept().?;
+    _ = syn_result;
+
+    // Build a DATA packet (seq 2) with hdr.extension = selective_ack
+    // followed by a SACK chain (ext header + 4 bytes) + 4 BT keepalive.
+    const data_hdr = Header{
+        .packet_type = .st_data,
+        .extension = .selective_ack,
+        .connection_id = mgr.getSocket(slot).?.recv_id, // recv on responder side
+        .timestamp_us = 2_000_000,
+        .timestamp_diff_us = 0,
+        .wnd_size = 65536,
+        .seq_nr = 2, // ack_nr was set to 1 by acceptSyn, so next is 2
+        .ack_nr = 0,
+    };
+    var pkt: [Header.size + 2 + 4 + 4]u8 = undefined;
+    @memcpy(pkt[0..Header.size], &data_hdr.encode());
+    // Ext chain: next_ext=none, len=4, 4 SACK bytes
+    pkt[Header.size + 0] = 0;
+    pkt[Header.size + 1] = 4;
+    pkt[Header.size + 2] = 0xAA;
+    pkt[Header.size + 3] = 0xBB;
+    pkt[Header.size + 4] = 0xCC;
+    pkt[Header.size + 5] = 0xDD;
+    // BT keepalive: 4 zero bytes
+    pkt[Header.size + 6] = 0;
+    pkt[Header.size + 7] = 0;
+    pkt[Header.size + 8] = 0;
+    pkt[Header.size + 9] = 0;
+
+    const result = mgr.processPacket(&pkt, remote, 2_000_000).?;
+    try std.testing.expect(result.data != null);
+    // The BT layer should see only the 4 keepalive bytes.
+    try std.testing.expectEqualSlices(u8, &[_]u8{ 0, 0, 0, 0 }, result.data.?);
+}
+
+test "manager rejects datagram with truncated extension chain" {
+    var mgr = UtpManager.init(std.testing.allocator);
+    defer mgr.deinit();
+    const remote = std.net.Address.initIp4(.{ 10, 0, 0, 1 }, 6881);
+
+    // Establish a connection.
+    const syn_hdr = Header{
+        .packet_type = .st_syn,
+        .extension = .none,
+        .connection_id = 600,
+        .timestamp_us = 1_000_000,
+        .timestamp_diff_us = 0,
+        .wnd_size = 65536,
+        .seq_nr = 1,
+        .ack_nr = 0,
+    };
+    const syn_buf = syn_hdr.encode();
+    _ = mgr.processPacket(&syn_buf, remote, 1_000_000).?;
+    const slot = mgr.accept().?;
+
+    // DATA packet with a SACK extension claiming 16 bytes but only
+    // 4 trailing bytes are present.
+    const data_hdr = Header{
+        .packet_type = .st_data,
+        .extension = .selective_ack,
+        .connection_id = mgr.getSocket(slot).?.recv_id,
+        .timestamp_us = 2_000_000,
+        .timestamp_diff_us = 0,
+        .wnd_size = 65536,
+        .seq_nr = 2,
+        .ack_nr = 0,
+    };
+    var pkt: [Header.size + 2 + 4]u8 = undefined;
+    @memcpy(pkt[0..Header.size], &data_hdr.encode());
+    pkt[Header.size + 0] = 0;
+    pkt[Header.size + 1] = 16; // lie — 16 bytes claimed, 4 present
+    pkt[Header.size + 2] = 0x01;
+    pkt[Header.size + 3] = 0x02;
+    pkt[Header.size + 4] = 0x03;
+    pkt[Header.size + 5] = 0x04;
+
+    // Manager should drop the malformed datagram cleanly (no crash).
+    const result = mgr.processPacket(&pkt, remote, 2_000_000);
+    try std.testing.expect(result == null);
 }
