@@ -360,63 +360,63 @@ pub fn build(b: *std.Build) void {
     test_epoll_io_step.dependOn(&run_epoll_io_tests.step);
     test_step.dependOn(&run_epoll_io_tests.step);
 
-    // ── KqueueIO MVP tests ─────────────────────────────────
-    // Standalone target: compiles `src/io/kqueue_io.zig` directly, with
-    // its `@import("io_interface.zig")` sibling resolving naturally. No
-    // dependency on `varuna_mod`, so this target cross-compiles cleanly
+    // ── KqueuePosixIO MVP tests ────────────────────────────
+    // Standalone target: compiles `src/io/kqueue_posix_io.zig` directly,
+    // with its `@import("io_interface.zig")` sibling resolving naturally.
+    // No dependency on `varuna_mod`, so this target cross-compiles cleanly
     // for macOS even though the daemon does not.
     //
-    // Inline tests in `src/io/kqueue_io.zig` cover both platform-portable
-    // (timer heap, errno mapping) and macOS-only (real kqueue syscalls)
-    // paths. The latter `return error.SkipZigTest` on non-darwin targets;
-    // the bodies are still semantically analysed which catches Zig API
-    // drift on cross-compilation.
-    const kqueue_io_inline_tests = b.addTest(.{
+    // Inline tests in `src/io/kqueue_posix_io.zig` cover both platform-
+    // portable (timer heap, errno mapping) and macOS-only (real kqueue
+    // syscalls) paths. The latter `return error.SkipZigTest` on non-darwin
+    // targets; the bodies are still semantically analysed which catches
+    // Zig API drift on cross-compilation.
+    const kqueue_posix_io_inline_tests = b.addTest(.{
         .root_module = b.createModule(.{
-            .root_source_file = b.path("src/io/kqueue_io.zig"),
+            .root_source_file = b.path("src/io/kqueue_posix_io.zig"),
             .target = target,
             .optimize = optimize,
             .link_libc = true,
         }),
     });
-    const test_kqueue_io_step = b.step(
-        "test-kqueue-io",
-        "Run KqueueIO MVP tests (cross-compile-clean; mock-driven on Linux, full on macOS)",
+    const test_kqueue_posix_io_step = b.step(
+        "test-kqueue-posix-io",
+        "Run KqueuePosixIO MVP tests (cross-compile-clean; mock-driven on Linux, full on macOS)",
     );
     // Cross-compiled binaries can't run on the host — depend only on
-    // the compile step in that case so `zig build test-kqueue-io
+    // the compile step in that case so `zig build test-kqueue-posix-io
     // -Dtarget=aarch64-macos` validates compilation without trying to
     // exec a macOS test binary on Linux.
-    const can_exec_kqueue_io_tests =
+    const can_exec_kqueue_posix_io_tests =
         target.result.os.tag == builtin.os.tag and
         target.result.cpu.arch == builtin.cpu.arch;
-    if (can_exec_kqueue_io_tests) {
-        const run_kqueue_io_inline_tests = b.addRunArtifact(kqueue_io_inline_tests);
-        test_kqueue_io_step.dependOn(&run_kqueue_io_inline_tests.step);
-        test_step.dependOn(&run_kqueue_io_inline_tests.step);
+    if (can_exec_kqueue_posix_io_tests) {
+        const run_kqueue_posix_io_inline_tests = b.addRunArtifact(kqueue_posix_io_inline_tests);
+        test_kqueue_posix_io_step.dependOn(&run_kqueue_posix_io_inline_tests.step);
+        test_step.dependOn(&run_kqueue_posix_io_inline_tests.step);
     } else {
-        test_kqueue_io_step.dependOn(&kqueue_io_inline_tests.step);
+        test_kqueue_posix_io_step.dependOn(&kqueue_posix_io_inline_tests.step);
     }
 
-    // Bridge tests via varuna_mod (Linux-only; pulls kqueue_io through
-    // `varuna.io.kqueue_io`). Cross-targets that skip varuna_mod also
-    // skip this; that's fine — the standalone target above keeps the
-    // cross-compile signal clean.
-    const kqueue_io_bridge_tests = b.addTest(.{
+    // Bridge tests via varuna_mod (Linux-only; pulls kqueue_posix_io
+    // through `varuna.io.kqueue_posix_io`). Cross-targets that skip
+    // varuna_mod also skip this; that's fine — the standalone target
+    // above keeps the cross-compile signal clean.
+    const kqueue_posix_io_bridge_tests = b.addTest(.{
         .root_module = b.createModule(.{
-            .root_source_file = b.path("tests/kqueue_io_test.zig"),
+            .root_source_file = b.path("tests/kqueue_posix_io_test.zig"),
             .target = target,
             .optimize = optimize,
             .imports = &varuna_import,
         }),
     });
-    const run_kqueue_io_bridge_tests = b.addRunArtifact(kqueue_io_bridge_tests);
-    const test_kqueue_io_bridge_step = b.step(
-        "test-kqueue-io-bridge",
-        "Run KqueueIO bridge tests via varuna_mod (Linux-only by construction)",
+    const run_kqueue_posix_io_bridge_tests = b.addRunArtifact(kqueue_posix_io_bridge_tests);
+    const test_kqueue_posix_io_bridge_step = b.step(
+        "test-kqueue-posix-io-bridge",
+        "Run KqueuePosixIO bridge tests via varuna_mod (Linux-only by construction)",
     );
-    test_kqueue_io_bridge_step.dependOn(&run_kqueue_io_bridge_tests.step);
-    if (build_full_daemon) test_step.dependOn(&run_kqueue_io_bridge_tests.step);
+    test_kqueue_posix_io_bridge_step.dependOn(&run_kqueue_posix_io_bridge_tests.step);
+    if (build_full_daemon) test_step.dependOn(&run_kqueue_posix_io_bridge_tests.step);
 
     // ── SimIO socketpair / parking / fault-injection tests ────────
     //
@@ -1149,9 +1149,12 @@ pub const IoBackend = enum {
     /// sandboxes or seccomp policies that block io_uring. MVP is sockets +
     /// timers + cancel; file ops require a worker thread pool follow-up.
     epoll,
-    /// macOS / BSD kqueue developer backend via `src/io/kqueue_io.zig`.
-    /// MVP — sockets + timers only; file ops deferred to a thread-pool
-    /// follow-up. Daemon is not built under this flag.
+    /// macOS / BSD kqueue developer backend. Resolves to
+    /// `src/io/kqueue_posix_io.zig` (KqueuePosixIO) — the file-op POSIX
+    /// strategy. MVP — sockets + timers only; file ops deferred to a
+    /// thread-pool follow-up. Daemon is not built under this flag.
+    /// Will be retired by `worktree-epoll-bifurcation`'s 6-way IoBackend
+    /// split (`kqueue_posix` / `kqueue_mmap`).
     kqueue,
 };
 

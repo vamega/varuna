@@ -1,10 +1,29 @@
-//! KqueueIO — kqueue(2)-based backend implementing the public `io_interface`.
+//! KqueuePosixIO — kqueue(2)-based backend with POSIX file-op strategy.
 //!
-//! KqueueIO targets macOS (and, by extension, the BSDs). It exists so that
+//! KqueuePosixIO targets macOS (and, by extension, the BSDs). It exists so that
 //! varuna can be developed on a macOS laptop; production stays on Linux /
 //! io_uring. See `docs/epoll-kqueue-design.md` for the full survey and
-//! per-op mapping; `progress-reports/2026-04-29-kqueue-io-mvp.md` for what's
-//! implemented today vs. deferred.
+//! per-op mapping; `progress-reports/2026-04-29-kqueue-io-mvp.md` for what
+//! the original `KqueueIO` MVP shipped, and
+//! `progress-reports/2026-04-30-kqueue-bifurcation.md` for the rename and
+//! split into `KqueuePosixIO` (this file) + `KqueueMmapIO` (sibling).
+//!
+//! ## File-op strategy axis
+//!
+//! kqueue is a readiness API for *fds*; for regular files it always reports
+//! readiness immediately, and the actual `read`/`write` syscall blocks the
+//! caller. There are two valid file-op strategies on top of this:
+//!
+//!   * **POSIX (this file)** — `pread`/`pwrite`/`fsync`/`fcntl(F_PREALLOCATE)`
+//!     syscalls offloaded to a thread pool. Predictable, matches io_uring's
+//!     completion semantics, no implicit pagecache assumptions.
+//!   * **mmap (`kqueue_mmap_io.zig`)** — file mapped into the address space
+//!     at first access; reads/writes become `memcpy` against the mapping;
+//!     durability via `msync(MS_SYNC)`. Zero-copy at the cost of page-fault
+//!     latency on the EL thread.
+//!
+//! The readiness layer (sockets, timers, cancel) is identical between the
+//! two; only the file-op submission methods diverge.
 //!
 //! ## Architecture
 //!
@@ -35,7 +54,7 @@
 //! reference `system.kqueue` / `system.kevent`, which only exist when
 //! targeting one of those OSes. We exploit Zig's lazy semantic analysis:
 //! function bodies that touch those symbols are only analyzed if
-//! reachable. As long as nothing on Linux instantiates KqueueIO's
+//! reachable. As long as nothing on Linux instantiates KqueuePosixIO's
 //! lifecycle methods (init/tick/etc.), the file compiles cleanly there.
 //! Tests that invoke real kqueue syscalls comptime-skip on non-darwin.
 //!
@@ -170,9 +189,9 @@ fn timerLess(a: TimerEntry, b: TimerEntry) bool {
     return a.seq < b.seq;
 }
 
-// ── KqueueIO ──────────────────────────────────────────────
+// ── KqueuePosixIO ──────────────────────────────────────────────
 
-pub const KqueueIO = struct {
+pub const KqueuePosixIO = struct {
     kq: posix.fd_t,
 
     /// Monotonically increasing sequence counter, used as a tiebreaker
@@ -197,13 +216,13 @@ pub const KqueueIO = struct {
     cfg: Config,
     allocator: std.mem.Allocator,
 
-    pub fn init(allocator: std.mem.Allocator, cfg: Config) !KqueueIO {
+    pub fn init(allocator: std.mem.Allocator, cfg: Config) !KqueuePosixIO {
         if (comptime !is_kqueue_platform) return error.UnsupportedPlatform;
 
         const kq = try posix.kqueue();
         errdefer posix.close(kq);
 
-        var self = KqueueIO{
+        var self = KqueuePosixIO{
             .kq = kq,
             .cfg = cfg,
             .allocator = allocator,
@@ -218,7 +237,7 @@ pub const KqueueIO = struct {
         return self;
     }
 
-    pub fn deinit(self: *KqueueIO) void {
+    pub fn deinit(self: *KqueuePosixIO) void {
         if (comptime is_kqueue_platform) {
             if (self.kq >= 0) posix.close(self.kq);
         }
@@ -230,7 +249,7 @@ pub const KqueueIO = struct {
 
     /// Synchronous fd close. Symmetric with `RealIO.closeSocket` so
     /// `EventLoop.deinit` can call it uniformly.
-    pub fn closeSocket(_: *KqueueIO, fd: posix.fd_t) void {
+    pub fn closeSocket(_: *KqueuePosixIO, fd: posix.fd_t) void {
         posix.close(fd);
     }
 
@@ -244,7 +263,7 @@ pub const KqueueIO = struct {
     /// timespec; otherwise we wait until either a kevent fires or the
     /// next timer deadline passes. Mirrors RealIO's submit_and_wait
     /// semantics.
-    pub fn tick(self: *KqueueIO, wait_at_least: u32) !void {
+    pub fn tick(self: *KqueuePosixIO, wait_at_least: u32) !void {
         if (comptime !is_kqueue_platform) return error.UnsupportedPlatform;
 
         const now = monotonicNs();
@@ -322,7 +341,7 @@ pub const KqueueIO = struct {
 
     // ── Internal: completed queue + dispatch ───────────────
 
-    fn drainCompleted(self: *KqueueIO) void {
+    fn drainCompleted(self: *KqueuePosixIO) void {
         // Walk the queue. Callbacks may submit follow-on ops that push
         // *more* entries onto `completed`; we capture the current length
         // first, dispatch those, then loop. This avoids an unbounded
@@ -334,12 +353,12 @@ pub const KqueueIO = struct {
         }
     }
 
-    fn pushCompleted(self: *KqueueIO, c: *Completion, result: Result) void {
+    fn pushCompleted(self: *KqueuePosixIO, c: *Completion, result: Result) void {
         // Cap-bound; we ensured capacity in init.
         self.completed.appendAssumeCapacity(.{ .completion = c, .result = result });
     }
 
-    fn dispatch(self: *KqueueIO, entry: CompletedEntry) void {
+    fn dispatch(self: *KqueuePosixIO, entry: CompletedEntry) void {
         const c = entry.completion;
         const callback = c.callback orelse return;
         // Clear in_flight before invoking — see `io_interface.zig` for
@@ -361,7 +380,7 @@ pub const KqueueIO = struct {
         }
     }
 
-    fn resubmit(self: *KqueueIO, c: *Completion) !void {
+    fn resubmit(self: *KqueuePosixIO, c: *Completion) !void {
         const ud = c.userdata;
         const cb = c.callback orelse return;
         switch (c.op) {
@@ -384,7 +403,7 @@ pub const KqueueIO = struct {
         }
     }
 
-    fn armCompletion(self: *KqueueIO, c: *Completion, op: Operation, ud: ?*anyopaque, cb: Callback) !void {
+    fn armCompletion(self: *KqueuePosixIO, c: *Completion, op: Operation, ud: ?*anyopaque, cb: Callback) !void {
         _ = self;
         const st = kqueueState(c);
         if (st.in_flight) return error.AlreadyInFlight;
@@ -397,7 +416,7 @@ pub const KqueueIO = struct {
 
     // ── Internal: kevent helpers ──────────────────────────
 
-    fn parkOnFilter(self: *KqueueIO, c: *Completion, fd: posix.fd_t, filter: i16) !void {
+    fn parkOnFilter(self: *KqueuePosixIO, c: *Completion, fd: posix.fd_t, filter: i16) !void {
         if (self.pending_changes.items.len >= self.cfg.pending_capacity) {
             return error.PendingQueueFull;
         }
@@ -409,7 +428,7 @@ pub const KqueueIO = struct {
         });
     }
 
-    fn retrySyscall(self: *KqueueIO, c: *Completion, ev: posix.Kevent) !void {
+    fn retrySyscall(self: *KqueuePosixIO, c: *Completion, ev: posix.Kevent) !void {
         // The op tag tells us how to retry. EOF / error info comes via
         // ev.flags / ev.fflags.
         const got_eof = if (comptime is_kqueue_platform)
@@ -497,12 +516,12 @@ pub const KqueueIO = struct {
 
     // ── Timer heap ────────────────────────────────────────
 
-    fn peekNextDeadline(self: *KqueueIO) ?u64 {
+    fn peekNextDeadline(self: *KqueuePosixIO) ?u64 {
         if (self.timers.items.len == 0) return null;
         return self.timers.items[0].deadline_ns;
     }
 
-    fn expireTimers(self: *KqueueIO, now_ns: u64) !void {
+    fn expireTimers(self: *KqueuePosixIO, now_ns: u64) !void {
         while (self.timers.items.len > 0 and self.timers.items[0].deadline_ns <= now_ns) {
             const entry = self.popMinTimer();
             const c = entry.completion;
@@ -524,7 +543,7 @@ pub const KqueueIO = struct {
         }
     }
 
-    fn pushTimer(self: *KqueueIO, deadline_ns: u64, c: *Completion) !void {
+    fn pushTimer(self: *KqueuePosixIO, deadline_ns: u64, c: *Completion) !void {
         if (self.timers.items.len >= self.cfg.timer_capacity) {
             return error.PendingQueueFull;
         }
@@ -546,7 +565,7 @@ pub const KqueueIO = struct {
         }
     }
 
-    fn popMinTimer(self: *KqueueIO) TimerEntry {
+    fn popMinTimer(self: *KqueuePosixIO) TimerEntry {
         const entry = self.timers.items[0];
         const last = self.timers.pop().?;
         if (self.timers.items.len > 0) {
@@ -557,7 +576,7 @@ pub const KqueueIO = struct {
         return entry;
     }
 
-    fn removeTimerAt(self: *KqueueIO, idx: u32) void {
+    fn removeTimerAt(self: *KqueuePosixIO, idx: u32) void {
         const last = self.timers.pop().?;
         if (idx == self.timers.items.len) return; // popped tail
         self.timers.items[idx] = last;
@@ -574,7 +593,7 @@ pub const KqueueIO = struct {
         }
     }
 
-    fn siftDown(self: *KqueueIO, start_idx: u32) void {
+    fn siftDown(self: *KqueuePosixIO, start_idx: u32) void {
         var idx: u32 = start_idx;
         const n: u32 = @intCast(self.timers.items.len);
         while (true) {
@@ -593,7 +612,7 @@ pub const KqueueIO = struct {
         }
     }
 
-    fn swapTimers(self: *KqueueIO, a: u32, b: u32) void {
+    fn swapTimers(self: *KqueuePosixIO, a: u32, b: u32) void {
         const tmp = self.timers.items[a];
         self.timers.items[a] = self.timers.items[b];
         self.timers.items[b] = tmp;
@@ -603,13 +622,13 @@ pub const KqueueIO = struct {
 
     // ── Submission methods ────────────────────────────────
 
-    pub fn timeout(self: *KqueueIO, op: ifc.TimeoutOp, c: *Completion, ud: ?*anyopaque, cb: Callback) !void {
+    pub fn timeout(self: *KqueuePosixIO, op: ifc.TimeoutOp, c: *Completion, ud: ?*anyopaque, cb: Callback) !void {
         try self.armCompletion(c, .{ .timeout = op }, ud, cb);
         const deadline = monotonicNs() +| op.ns;
         try self.pushTimer(deadline, c);
     }
 
-    pub fn socket(self: *KqueueIO, op: ifc.SocketOp, c: *Completion, ud: ?*anyopaque, cb: Callback) !void {
+    pub fn socket(self: *KqueuePosixIO, op: ifc.SocketOp, c: *Completion, ud: ?*anyopaque, cb: Callback) !void {
         try self.armCompletion(c, .{ .socket = op }, ud, cb);
         // macOS lacks SOCK_NONBLOCK / SOCK_CLOEXEC flags. Open the socket
         // first, then fcntl.
@@ -626,7 +645,7 @@ pub const KqueueIO = struct {
         self.pushCompleted(c, result);
     }
 
-    pub fn connect(self: *KqueueIO, op: ifc.ConnectOp, c: *Completion, ud: ?*anyopaque, cb: Callback) !void {
+    pub fn connect(self: *KqueuePosixIO, op: ifc.ConnectOp, c: *Completion, ud: ?*anyopaque, cb: Callback) !void {
         try self.armCompletion(c, .{ .connect = op }, ud, cb);
 
         const addrlen = op.addr.getOsSockLen();
@@ -648,13 +667,13 @@ pub const KqueueIO = struct {
         }
     }
 
-    pub fn accept(self: *KqueueIO, op: ifc.AcceptOp, c: *Completion, ud: ?*anyopaque, cb: Callback) !void {
+    pub fn accept(self: *KqueuePosixIO, op: ifc.AcceptOp, c: *Completion, ud: ?*anyopaque, cb: Callback) !void {
         try self.armCompletion(c, .{ .accept = op }, ud, cb);
         kqueueState(c).multishot = op.multishot;
         try self.tryAccept(op, c);
     }
 
-    fn tryAccept(self: *KqueueIO, op: ifc.AcceptOp, c: *Completion) !void {
+    fn tryAccept(self: *KqueuePosixIO, op: ifc.AcceptOp, c: *Completion) !void {
         var addr: posix.sockaddr.storage = undefined;
         var addrlen: posix.socklen_t = @sizeOf(posix.sockaddr.storage);
         const accepted = posix.accept(op.fd, @ptrCast(&addr), &addrlen, 0);
@@ -676,12 +695,12 @@ pub const KqueueIO = struct {
         }
     }
 
-    pub fn recv(self: *KqueueIO, op: ifc.RecvOp, c: *Completion, ud: ?*anyopaque, cb: Callback) !void {
+    pub fn recv(self: *KqueuePosixIO, op: ifc.RecvOp, c: *Completion, ud: ?*anyopaque, cb: Callback) !void {
         try self.armCompletion(c, .{ .recv = op }, ud, cb);
         try self.tryRecv(op, c);
     }
 
-    fn tryRecv(self: *KqueueIO, op: ifc.RecvOp, c: *Completion) !void {
+    fn tryRecv(self: *KqueuePosixIO, op: ifc.RecvOp, c: *Completion) !void {
         const r = posix.recv(op.fd, op.buf, op.flags);
         if (r) |n| {
             self.pushCompleted(c, .{ .recv = n });
@@ -691,12 +710,12 @@ pub const KqueueIO = struct {
         }
     }
 
-    pub fn send(self: *KqueueIO, op: ifc.SendOp, c: *Completion, ud: ?*anyopaque, cb: Callback) !void {
+    pub fn send(self: *KqueuePosixIO, op: ifc.SendOp, c: *Completion, ud: ?*anyopaque, cb: Callback) !void {
         try self.armCompletion(c, .{ .send = op }, ud, cb);
         try self.trySend(op, c);
     }
 
-    fn trySend(self: *KqueueIO, op: ifc.SendOp, c: *Completion) !void {
+    fn trySend(self: *KqueuePosixIO, op: ifc.SendOp, c: *Completion) !void {
         const r = posix.send(op.fd, op.buf, op.flags);
         if (r) |n| {
             self.pushCompleted(c, .{ .send = n });
@@ -706,12 +725,12 @@ pub const KqueueIO = struct {
         }
     }
 
-    pub fn recvmsg(self: *KqueueIO, op: ifc.RecvmsgOp, c: *Completion, ud: ?*anyopaque, cb: Callback) !void {
+    pub fn recvmsg(self: *KqueuePosixIO, op: ifc.RecvmsgOp, c: *Completion, ud: ?*anyopaque, cb: Callback) !void {
         try self.armCompletion(c, .{ .recvmsg = op }, ud, cb);
         try self.tryRecvmsg(op, c);
     }
 
-    fn tryRecvmsg(self: *KqueueIO, op: ifc.RecvmsgOp, c: *Completion) !void {
+    fn tryRecvmsg(self: *KqueuePosixIO, op: ifc.RecvmsgOp, c: *Completion) !void {
         const rc = if (comptime is_kqueue_platform)
             std.c.recvmsg(op.fd, op.msg, @intCast(op.flags))
         else
@@ -727,12 +746,12 @@ pub const KqueueIO = struct {
         }
     }
 
-    pub fn sendmsg(self: *KqueueIO, op: ifc.SendmsgOp, c: *Completion, ud: ?*anyopaque, cb: Callback) !void {
+    pub fn sendmsg(self: *KqueuePosixIO, op: ifc.SendmsgOp, c: *Completion, ud: ?*anyopaque, cb: Callback) !void {
         try self.armCompletion(c, .{ .sendmsg = op }, ud, cb);
         try self.trySendmsg(op, c);
     }
 
-    fn trySendmsg(self: *KqueueIO, op: ifc.SendmsgOp, c: *Completion) !void {
+    fn trySendmsg(self: *KqueuePosixIO, op: ifc.SendmsgOp, c: *Completion) !void {
         const rc = if (comptime is_kqueue_platform)
             std.c.sendmsg(op.fd, op.msg, @intCast(op.flags))
         else
@@ -748,7 +767,7 @@ pub const KqueueIO = struct {
         }
     }
 
-    pub fn poll(self: *KqueueIO, op: ifc.PollOp, c: *Completion, ud: ?*anyopaque, cb: Callback) !void {
+    pub fn poll(self: *KqueuePosixIO, op: ifc.PollOp, c: *Completion, ud: ?*anyopaque, cb: Callback) !void {
         try self.armCompletion(c, .{ .poll = op }, ud, cb);
         // Map POLL_IN→EVFILT_READ, POLL_OUT→EVFILT_WRITE. If both are set
         // we currently only register the first; full multi-filter support
@@ -763,7 +782,7 @@ pub const KqueueIO = struct {
         try self.parkOnFilter(c, op.fd, filter);
     }
 
-    pub fn cancel(self: *KqueueIO, op: ifc.CancelOp, c: *Completion, ud: ?*anyopaque, cb: Callback) !void {
+    pub fn cancel(self: *KqueuePosixIO, op: ifc.CancelOp, c: *Completion, ud: ?*anyopaque, cb: Callback) !void {
         try self.armCompletion(c, .{ .cancel = op }, ud, cb);
         const target = op.target;
         const tst = kqueueState(target);
@@ -795,29 +814,29 @@ pub const KqueueIO = struct {
 
     // ── File ops (deferred — see module docstring) ────────
 
-    pub fn read(self: *KqueueIO, op: ifc.ReadOp, c: *Completion, ud: ?*anyopaque, cb: Callback) !void {
+    pub fn read(self: *KqueuePosixIO, op: ifc.ReadOp, c: *Completion, ud: ?*anyopaque, cb: Callback) !void {
         try self.armCompletion(c, .{ .read = op }, ud, cb);
         self.pushCompleted(c, .{ .read = error.OperationNotSupported });
     }
 
-    pub fn write(self: *KqueueIO, op: ifc.WriteOp, c: *Completion, ud: ?*anyopaque, cb: Callback) !void {
+    pub fn write(self: *KqueuePosixIO, op: ifc.WriteOp, c: *Completion, ud: ?*anyopaque, cb: Callback) !void {
         try self.armCompletion(c, .{ .write = op }, ud, cb);
         self.pushCompleted(c, .{ .write = error.OperationNotSupported });
     }
 
-    pub fn fsync(self: *KqueueIO, op: ifc.FsyncOp, c: *Completion, ud: ?*anyopaque, cb: Callback) !void {
+    pub fn fsync(self: *KqueuePosixIO, op: ifc.FsyncOp, c: *Completion, ud: ?*anyopaque, cb: Callback) !void {
         try self.armCompletion(c, .{ .fsync = op }, ud, cb);
         self.pushCompleted(c, .{ .fsync = error.OperationNotSupported });
     }
 
-    pub fn fallocate(self: *KqueueIO, op: ifc.FallocateOp, c: *Completion, ud: ?*anyopaque, cb: Callback) !void {
+    pub fn fallocate(self: *KqueuePosixIO, op: ifc.FallocateOp, c: *Completion, ud: ?*anyopaque, cb: Callback) !void {
         try self.armCompletion(c, .{ .fallocate = op }, ud, cb);
         // Matches Linux behavior on rejecting filesystems — the daemon
         // already has fallback paths keyed on this errno.
         self.pushCompleted(c, .{ .fallocate = error.OperationNotSupported });
     }
 
-    pub fn truncate(self: *KqueueIO, op: ifc.TruncateOp, c: *Completion, ud: ?*anyopaque, cb: Callback) !void {
+    pub fn truncate(self: *KqueuePosixIO, op: ifc.TruncateOp, c: *Completion, ud: ?*anyopaque, cb: Callback) !void {
         try self.armCompletion(c, .{ .truncate = op }, ud, cb);
         // ftruncate(2) is synchronous on macOS; running it here on the
         // event-loop thread mirrors RealIO's truncate path (which also
@@ -918,12 +937,12 @@ fn opFilterIsWrite(op: ifc.PollOp) bool {
 
 const testing = std.testing;
 
-test "KqueueIO: state size and alignment fit the contract budget" {
+test "KqueuePosixIO: state size and alignment fit the contract budget" {
     try testing.expect(@sizeOf(KqueueState) <= ifc.backend_state_size);
     try testing.expect(@alignOf(KqueueState) <= ifc.backend_state_align);
 }
 
-test "KqueueIO: timer heap orders by deadline then sequence" {
+test "KqueuePosixIO: timer heap orders by deadline then sequence" {
     var entries = [_]TimerEntry{
         .{ .deadline_ns = 30, .seq = 1, .completion = undefined },
         .{ .deadline_ns = 10, .seq = 0, .completion = undefined },
@@ -945,7 +964,7 @@ test "KqueueIO: timer heap orders by deadline then sequence" {
     try testing.expectEqual(@as(u64, 30), entries[4].deadline_ns);
 }
 
-test "KqueueIO: makeCancelledResult preserves op tag" {
+test "KqueuePosixIO: makeCancelledResult preserves op tag" {
     const tags = .{
         .{ Operation{ .recv = .{ .fd = 0, .buf = &[_]u8{} } }, "recv" },
         .{ Operation{ .send = .{ .fd = 0, .buf = &[_]u8{} } }, "send" },
@@ -960,22 +979,22 @@ test "KqueueIO: makeCancelledResult preserves op tag" {
     }
 }
 
-test "KqueueIO: errnoFromCInt maps common errnos" {
+test "KqueuePosixIO: errnoFromCInt maps common errnos" {
     try testing.expectEqual(error.ConnectionRefused, errnoFromCInt(@intFromEnum(posix.E.CONNREFUSED)));
     try testing.expectEqual(error.WouldBlock, errnoFromCInt(@intFromEnum(posix.E.AGAIN)));
     try testing.expectEqual(error.Unexpected, errnoFromCInt(99999));
 }
 
-test "KqueueIO: init succeeds and deinit closes kq (skipped on non-kqueue platforms)" {
+test "KqueuePosixIO: init succeeds and deinit closes kq (skipped on non-kqueue platforms)" {
     if (comptime !is_kqueue_platform) return error.SkipZigTest;
-    var io = try KqueueIO.init(testing.allocator, .{});
+    var io = try KqueuePosixIO.init(testing.allocator, .{});
     defer io.deinit();
     try testing.expect(io.kq >= 0);
 }
 
-test "KqueueIO: timeout fires after the deadline (real syscall path; skipped on non-kqueue)" {
+test "KqueuePosixIO: timeout fires after the deadline (real syscall path; skipped on non-kqueue)" {
     if (comptime !is_kqueue_platform) return error.SkipZigTest;
-    var io = try KqueueIO.init(testing.allocator, .{});
+    var io = try KqueuePosixIO.init(testing.allocator, .{});
     defer io.deinit();
 
     const Ctx = struct {

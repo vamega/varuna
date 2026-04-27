@@ -35,7 +35,14 @@
 const build_options = @import("build_options");
 const real_io_mod = @import("real_io.zig");
 const epoll_io_mod = @import("epoll_io.zig");
-const kqueue_io_mod = @import("kqueue_io.zig");
+// NOTE (transitional): the kqueue file is being bifurcated into POSIX vs.
+// mmap variants on `worktree-kqueue-bifurcation`. Until the parallel
+// `worktree-epoll-bifurcation` engineer's full IoBackend split lands,
+// the existing `-Dio=kqueue` flag continues to resolve to KqueuePosixIO
+// (the rename target of the original `KqueueIO`). Sibling will retire
+// `-Dio=kqueue` in favour of the explicit `-Dio={kqueue_posix,kqueue_mmap}`
+// flags on merge.
+const kqueue_posix_io_mod = @import("kqueue_posix_io.zig");
 
 /// The daemon's selected primary IO backend. Aliased through this name so
 /// callers can transparently switch between io_uring, epoll, and kqueue
@@ -47,13 +54,13 @@ const kqueue_io_mod = @import("kqueue_io.zig");
 pub const RealIO = switch (build_options.io_backend) {
     .io_uring => real_io_mod.RealIO,
     .epoll => epoll_io_mod.EpollIO,
-    .kqueue => kqueue_io_mod.KqueueIO,
+    .kqueue => kqueue_posix_io_mod.KqueuePosixIO,
 };
 
 /// Re-exports for direct callers who want to spell out the chosen backend.
 pub const IoUringBackend = real_io_mod.RealIO;
 pub const EpollBackend = epoll_io_mod.EpollIO;
-pub const KqueueBackend = kqueue_io_mod.KqueueIO;
+pub const KqueueBackend = kqueue_posix_io_mod.KqueuePosixIO;
 
 /// Build-time identity of the selected backend. Useful for runtime
 /// logging and conditional code paths (e.g. "skip the file-op test under
