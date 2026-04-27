@@ -1732,6 +1732,34 @@ pub const SessionManager = struct {
             std.net.Address.parseIp6(ip_str, port) catch return null;
     }
 
+    /// Format the IP portion of a peer address as a heap-allocated string,
+    /// without the trailing port and (for IPv6) without surrounding brackets.
+    /// Caller owns the returned slice.
+    ///
+    /// The qBittorrent peer-list JSON `ip` field expects just the address;
+    /// the port is reported separately. The previous implementation used
+    /// `"{any}"` which under Zig 0.15.2 falls back to a generic struct
+    /// dump (~640 bytes per address) instead of invoking
+    /// `std.net.Address.format`, breaking the web UI peer table.
+    pub fn formatPeerIp(allocator: std.mem.Allocator, addr: std.net.Address) ![]const u8 {
+        // `{f}` invokes `Address.format` which emits `IP:port` for IPv4
+        // and `[IP]:port` for IPv6. The longest plausible output is an
+        // IPv6 form with full hex groups and a 5-digit port, well under 80
+        // bytes. Format into a stack buffer, then strip brackets/port.
+        var stack_buf: [80]u8 = undefined;
+        const full = std.fmt.bufPrint(&stack_buf, "{f}", .{addr}) catch
+            return error.OutOfMemory;
+
+        if (full.len > 0 and full[0] == '[') {
+            const close = std.mem.lastIndexOfScalar(u8, full, ']') orelse
+                return allocator.dupe(u8, full);
+            return allocator.dupe(u8, full[1..close]);
+        }
+        const colon = std.mem.lastIndexOfScalar(u8, full, ':') orelse
+            return allocator.dupe(u8, full);
+        return allocator.dupe(u8, full[0..colon]);
+    }
+
     /// Peer information returned by getTorrentPeers().
     pub const PeerInfo = struct {
         /// IP:port string, owned by caller.
@@ -1787,8 +1815,9 @@ pub const SessionManager = struct {
             if (peer.state == .free) continue;
             if (peer.torrent_id != tid) continue;
 
-            // Format IP address
-            const ip_str = try std.fmt.allocPrint(allocator, "{any}", .{peer.address});
+            // Format IP address (just the IP, no port). See `formatPeerIp`
+            // for why this used to be a `{any}` struct-dump bug.
+            const ip_str = try formatPeerIp(allocator, peer.address);
             errdefer allocator.free(ip_str);
 
             const port: u16 = peer.address.getPort();
@@ -1864,6 +1893,41 @@ test "session manager add and list" {
     // This test needs io_uring for PieceStore, so skip if unavailable
     var ring = std.os.linux.IoUring.init(4, 0) catch return error.SkipZigTest;
     ring.deinit();
+}
+
+test "formatPeerIp emits bare IPv4 with no port" {
+    const allocator = std.testing.allocator;
+    const addr = std.net.Address.initIp4(.{ 192, 168, 1, 100 }, 6881);
+    const out = try SessionManager.formatPeerIp(allocator, addr);
+    defer allocator.free(out);
+    try std.testing.expectEqualStrings("192.168.1.100", out);
+}
+
+test "formatPeerIp emits bare IPv6 with no brackets or port" {
+    const allocator = std.testing.allocator;
+    const addr = std.net.Address.initIp6(
+        .{ 0x20, 0x01, 0x0d, 0xb8 } ++ ([_]u8{0} ** 11) ++ [_]u8{0x01},
+        6881,
+        0,
+        0,
+    );
+    const out = try SessionManager.formatPeerIp(allocator, addr);
+    defer allocator.free(out);
+    try std.testing.expectEqualStrings("2001:db8::1", out);
+}
+
+test "formatPeerIp does not emit a struct dump for IPv4 (regression: {any} on Address)" {
+    const allocator = std.testing.allocator;
+    const addr = std.net.Address.initIp4(.{ 127, 0, 0, 1 }, 8080);
+    const out = try SessionManager.formatPeerIp(allocator, addr);
+    defer allocator.free(out);
+    // Regression: `{any}` on `std.net.Address` (an extern union) under
+    // Zig 0.15.2 produces a 600+ byte struct dump containing literal
+    // `.{`, `.family`, etc. The fixed implementation must not.
+    try std.testing.expect(out.len < 64);
+    try std.testing.expect(std.mem.indexOf(u8, out, ".{") == null);
+    try std.testing.expect(std.mem.indexOf(u8, out, ".family") == null);
+    try std.testing.expectEqualStrings("127.0.0.1", out);
 }
 
 test "checkTorrentShareLimit ratio enforcement" {
