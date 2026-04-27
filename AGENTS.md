@@ -47,6 +47,16 @@ Required local setup:
 - git submodules initialized with `git submodule update --init`
 - `vendor/boringssl` initialized or `zig build` will fail
 
+### Worktree setup
+
+`git worktree add` does NOT auto-populate submodules — they start empty in the new tree. After creating a worktree, run:
+
+```
+scripts/setup-worktree.sh <worktree-path>
+```
+
+That initializes `vendor/boringssl` + `vendor/c-ares` (build deps) and symlinks `reference-codebases/` from the main checkout (read-only — never modify reference codebases inside a worktree, the symlink reaches main's submodule pointers).
+
 Reference repos under `reference-codebases/`:
 - `libtorrent` - arvidn/libtorrent
 - `libtorrent-rakshasa` - rakshasa/libtorrent
@@ -54,6 +64,9 @@ Reference repos under `reference-codebases/`:
 - `rtorrent` - rakshasa/rtorrent
 - `vortex` - Nehliin/vortex
 - `qui` - autobrr/qui
+- `tigerbeetle` - tigerbeetle/tigerbeetle
+- `libxev` - mitchellh/libxev
+- `zio` - lalinsky/zio
 
 Core commands:
 - `zig build`
