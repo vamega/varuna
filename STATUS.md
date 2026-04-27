@@ -416,6 +416,45 @@ deeply-nested / runs-too-large + 2 protocol regression).
 
 Branch: `worktree-quick-wins`. See `progress-reports/2026-04-27-quick-wins.md`.
 
+## Last Verified Milestone (2026-04-27 — EpollIO / KqueueIO design survey, research-only)
+
+Read-only research round: produced `docs/epoll-kqueue-design.md`, a survey of
+what an `EpollIO` (Linux fallback under seccomp) and `KqueueIO` (macOS
+developer build) backend would look like against the existing IO contract
+(`src/io/io_interface.zig`). No source code modified.
+
+Survey methodology:
+- Read each contract op against libxev's `epoll.zig` / `kqueue.zig`, ZIO's
+  `ev/backends/{epoll,kqueue}.zig` + `ev/loop.zig`, and tigerbeetle's
+  `io/{linux,darwin}.zig`.
+- Mapped each op to readiness-syscall, native-primitive, or thread-pool
+  fallback, with semantic-gap callouts.
+- Cross-checked DNS, SQLite, `PieceStore.init`, and background-thread
+  ownership against the `AGENTS.md` io_uring policy to confirm no policy
+  changes needed.
+
+Headline recommendations:
+- Heap-of-deadlines for `timeout` on both backends — copy libxev's
+  no-EVFILT_TIMER / no-timerfd choice to avoid per-timer syscalls.
+- Unconditional thread-pool offload for `read`/`write`/`fsync`/`fallocate`
+  on both backends — readiness APIs cannot deliver completions for regular
+  files (always-ready). Confirmed by ZIO's identical design.
+- Build-time backend selection: `-Dio=io_uring|epoll|kqueue` with per-OS
+  defaults. Daemon callers stay on `XOf(RealIO)` aliases unchanged.
+- Effort estimate: ~1 work-week for minimum-viable EpollIO; ~1.5 for
+  minimum-viable KqueueIO; ~1 calendar month to bring both to production
+  parity (BUGGIFY-style fault tests, perf baselining).
+- No contract signature changes required. `cancel` weakens to best-effort
+  for thread-pool ops — already documented as best-effort.
+
+`zig build`: not run (research-only, no source modified).
+`zig fmt .`: clean (no Zig changed).
+
+Branch: `worktree-epoll-research`. Document at `docs/epoll-kqueue-design.md`
+(~3.1k words across 5 sections + open-questions appendix). Closes the queued
+EpollIO/KqueueIO research task referenced from the 2026-04-27 storage-IO
+follow-ups.
+
 ## Previously Verified Milestone (2026-04-27 — Dark inline test audit, round 1: io / storage / dht)
 
 Wired previously-dark inline `test "..."` blocks across the three
