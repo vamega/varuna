@@ -29,6 +29,7 @@ test {
     _ = crypto;
     _ = dht;
     _ = io;
+    _ = net;
     _ = runtime;
     _ = sim;
     _ = storage;

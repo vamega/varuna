@@ -15,3 +15,29 @@ pub const utp = @import("utp.zig");
 pub const ledbat = @import("ledbat.zig");
 pub const utp_manager = @import("utp_manager.zig");
 pub const web_seed = @import("web_seed.zig");
+
+// Pull subsystem source-side `test "..."` blocks into the test runner.
+// Mirrors the pattern in `src/io/root.zig` and `src/dht/root.zig`. Wired
+// into `mod_tests` via `_ = net;` in `src/root.zig`'s test block.
+//
+// `address.zig` has no inline tests today.
+//
+// `bencode_scanner.zig` and `web_seed.zig` are owned by the
+// quick-wins-engineer this round (skipValue rewrite + MultiPieceRange
+// fix); their inline tests will be added once those land.
+test {
+    _ = ban_list;
+    _ = extensions;
+    _ = hash_exchange;
+    _ = ipfilter_parser;
+    _ = ledbat;
+    _ = metadata_fetch;
+    _ = peer_id;
+    _ = peer_wire;
+    _ = pex;
+    _ = smart_ban;
+    _ = socket;
+    _ = ut_metadata;
+    _ = utp;
+    _ = utp_manager;
+}
