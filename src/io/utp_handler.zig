@@ -242,7 +242,7 @@ fn checkOutboundUtpConnect(self: anytype, utp_slot: u16, mgr: *utp_mgr.UtpManage
     peer.state = .handshake_send;
     peer.last_activity = self.clock.now();
 
-    log.info("outbound uTP connection established to {any}", .{peer.address});
+    log.info("outbound uTP connection established to {f}", .{peer.address});
 
     // Build and send BitTorrent handshake over uTP.
     const tc = self.getTorrentContext(peer.torrent_id) orelse {
@@ -330,7 +330,7 @@ fn acceptUtpConnection(self: anytype, mgr: *utp_mgr.UtpManager) void {
         self.peer_count += 1;
         self.markActivePeer(peer_slot);
 
-        log.info("accepted inbound uTP connection from {any}", .{remote_addr});
+        log.info("accepted inbound uTP connection from {f}", .{remote_addr});
 
         // For uTP peers, data arrives via the UtpSocket ordered byte stream.
         // We don't submit io_uring recv -- data is delivered via deliverUtpData.

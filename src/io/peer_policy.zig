@@ -1077,7 +1077,7 @@ pub fn processHashResults(self: anytype) void {
                 if (contributor.state != .free and contributor.torrent_id == torrent_id) {
                     const should_ban = penalizePeerTrust(contributor);
                     if (should_ban) {
-                        log.warn("banning peer {any} (slot {d}): trust_points={d}, hashfails={d}", .{
+                        log.warn("banning peer {f} (slot {d}): trust_points={d}, hashfails={d}", .{
                             contributor.address, result.slot, contributor.trust_points, contributor.hashfails,
                         });
                         if (self.ban_list) |bl| {
@@ -1674,7 +1674,7 @@ pub fn smartBanCorruptPeers(self: anytype, bad_peers: []const std.net.Address) v
 
     for (bad_peers) |addr| {
         _ = bl.banIp(addr, "smart ban: sent corrupt block in failed piece", .manual) catch {};
-        log.warn("smart ban: banned {any} for sending corrupt blocks", .{addr});
+        log.warn("smart ban: banned {f} for sending corrupt blocks", .{addr});
 
         // Disconnect any currently-connected peer with this address.
         for (self.peers, 0..) |*p, i| {

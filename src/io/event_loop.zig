@@ -1348,7 +1348,7 @@ pub fn EventLoopOf(comptime IO: type) type {
             // Send the SYN packet via the UDP socket.
             utp_handler.utpSendPacket(self, &conn.syn_packet, address);
 
-            log.info("initiating outbound uTP connection to {any}", .{address});
+            log.info("initiating outbound uTP connection to {f}", .{address});
             return peer_slot;
         }
 
@@ -1947,7 +1947,7 @@ pub fn EventLoopOf(comptime IO: type) type {
             for (self.peers, 0..) |*peer, i| {
                 if (peer.state == .free) continue;
                 if (bl.isBanned(peer.address)) {
-                    log.info("disconnecting banned peer: {any}", .{peer.address});
+                    log.info("disconnecting banned peer: {f}", .{peer.address});
                     self.removePeer(@intCast(i));
                 }
             }
