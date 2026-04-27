@@ -195,7 +195,8 @@ pub fn processMessage(self: anytype, slot: u16) void {
                 if (peer.current_piece != null and peer.current_piece.? == piece_index) {
                     if (peer.downloading_piece) |dp| {
                         // Multi-source path: write through DownloadingPiece
-                        if (dp.markBlockReceived(block_index, slot, peer.address, block_offset, block_data)) {
+                        const delivered_now = dp.markBlockReceived(block_index, slot, peer.address, block_offset, block_data);
+                        if (delivered_now) {
                             peer.blocks_received += 1;
                             peer.bytes_downloaded_from += block_data.len;
                             self.accountTorrentBytes(peer.torrent_id, block_data.len, 0);
@@ -207,6 +208,20 @@ pub fn processMessage(self: anytype, slot: u16) void {
                                     log.debug("pipeline refill failed for slot {d}: {s}", .{ slot, @errorName(err) });
                                 };
                             }
+                        } else if (peer.inflight_requests == 0 and !dp.isComplete()) {
+                            // Duplicate block (block-stealing race loser) AND
+                            // the peer's pipeline has fully drained. Without
+                            // this refill the peer stalls — no further CQEs
+                            // are queued and nothing else will trigger a
+                            // REQUEST. Gated on inflight==0 so we don't
+                            // disturb multi-source fair-share when other
+                            // inflight requests will re-enter the
+                            // success-path tryFillPipeline soon. Mirrors the
+                            // spirit of windesk 2c3fb95 without breaking the
+                            // sim_multi_source_eventloop fairness assertions.
+                            policy.tryFillPipeline(self, slot) catch |err| {
+                                log.debug("pipeline refill failed after dup-drain for slot {d}: {s}", .{ slot, @errorName(err) });
+                            };
                         }
                     } else if (peer.piece_buf) |pbuf| {
                         // Legacy path (no DownloadingPiece)
