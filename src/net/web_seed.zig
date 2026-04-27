@@ -248,6 +248,17 @@ pub const WebSeedManager = struct {
     /// `first_piece` with `piece_count` pieces. For single-file torrents this
     /// produces a single range. For multi-file torrents it produces one range
     /// per file that the run spans.
+    ///
+    /// The returned `MultiPieceRange.length` and `buf_offset` are u32 to match
+    /// the rest of the web-seed handler pipeline (the `run_buf` allocation is
+    /// u32, `WebSeedSlot.total_bytes` is u32, `target_offset` is u32). The
+    /// production caller bounds the run via the `web_seed_max_request_bytes`
+    /// config (default 4 MB), so the u32 width is plenty in practice — but a
+    /// misconfigured bound (e.g. > 4 GB) would previously panic the
+    /// `@intCast(u64 -> u32)` here and crash the daemon on the first
+    /// multi-piece request. The check below rejects with `error.RunTooLarge`
+    /// instead, leaving the caller to retry with a smaller `count` or to
+    /// surface a config error to the operator.
     pub fn computeMultiPieceRanges(
         self: *const WebSeedManager,
         first_piece: u32,
@@ -261,6 +272,13 @@ pub const WebSeedManager = struct {
         // Byte range of the entire run within the torrent
         const run_start = @as(u64, first_piece) * self.piece_length;
         const run_end = @min(@as(u64, last_piece + 1) * self.piece_length, self.total_size);
+
+        // Reject runs whose total byte span exceeds u32 — the rest of the
+        // pipeline (run_buf alloc, WebSeedSlot.total_bytes, MultiPieceRange
+        // .buf_offset / .length) is u32-bounded. Without this guard, a
+        // misconfigured `web_seed_max_request_bytes` (e.g. 8 GB) would
+        // panic the `@intCast` below on the first call.
+        if (run_end - run_start > std.math.maxInt(u32)) return error.RunTooLarge;
 
         if (!self.is_multi_file) {
             // Single-file: one range covering all pieces
@@ -294,6 +312,8 @@ pub const WebSeedManager = struct {
 
             if (next >= buffer.len) return error.BufferTooSmall;
 
+            // overlap_end - overlap_start <= run_end - run_start <= maxInt(u32)
+            // by the upfront check, so this @intCast cannot panic.
             const length: u32 = @intCast(overlap_end - overlap_start);
             buffer[next] = .{
                 .file_index = @intCast(file_idx),

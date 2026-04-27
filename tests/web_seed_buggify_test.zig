@@ -367,3 +367,54 @@ test "BUGGIFY: appendUrlEncoded is panic-free over random bytes" {
         }
     }
 }
+
+// ── Regression: misconfigured `web_seed_max_request_bytes` ──────────
+//
+// Closes Task #5 (round-2 audit follow-up): `computeMultiPieceRanges`
+// used to write a u64 byte span into a u32 length via `@intCast`,
+// panicking on runs > maxInt(u32). Production today is bounded by
+// the TOML config knob `web_seed_max_request_bytes` (default 4 MB)
+// which keeps the run well under 4 GB, but a misconfigured value
+// (e.g. 8 GB) would crash the daemon on the first multi-piece request.
+// The fix: the function now rejects with `error.RunTooLarge` upfront
+// rather than panic in the inner cast. This pins the regression.
+
+test "computeMultiPieceRanges rejects runs > maxInt(u32) bytes (misconfigured cap)" {
+    // Build a torrent whose piece_count × piece_length exceeds 4 GB.
+    // 64 pieces × 64 MB each = 4 GiB exactly — the run-end byte is at
+    // 4 GiB which equals maxInt(u32) + 1, so the span exceeds u32.
+    const piece_length: u32 = 64 * 1024 * 1024; // 64 MB
+    const piece_count: u32 = 65; // 65 × 64 MB = 4.0625 GiB — exceeds u32
+    const total_size: u64 = @as(u64, piece_count) * piece_length;
+
+    const path0 = [_][]const u8{"big.bin"};
+    const files = [_]metainfo.Metainfo.File{
+        .{ .length = total_size, .path = &path0 },
+    };
+    const urls = [_][]const u8{"http://example.com/big.bin"};
+
+    var mgr = try web_seed.WebSeedManager.init(
+        testing.allocator,
+        &urls,
+        "big.bin",
+        false,
+        &files,
+        piece_length,
+        total_size,
+    );
+    defer mgr.deinit();
+
+    // Asking for the entire 65-piece run produces a 4.0625 GiB span
+    // which overflows u32; the function must reject without panicking
+    // on the inner @intCast.
+    var buf: [1]web_seed.MultiPieceRange = undefined;
+    const r = mgr.computeMultiPieceRanges(0, piece_count, piece_count, &buf);
+    try testing.expectError(error.RunTooLarge, r);
+
+    // Smaller runs (within u32) still succeed — verifies we didn't
+    // break the happy path.
+    const ok_count: u32 = 16; // 16 × 64 MB = 1 GiB — fits in u32
+    const ok_r = try mgr.computeMultiPieceRanges(0, ok_count, piece_count, &buf);
+    try testing.expectEqual(@as(usize, 1), ok_r.len);
+    try testing.expectEqual(@as(u32, ok_count * piece_length), ok_r[0].length);
+}
