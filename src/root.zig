@@ -33,4 +33,5 @@ test {
     _ = sim;
     _ = storage;
     _ = torrent;
+    _ = tracker;
 }
