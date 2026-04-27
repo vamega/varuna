@@ -509,8 +509,16 @@ fn handleSendResult(self: anytype, slot: u16, send_id: u32, send_res: i32) void 
             };
         },
         .extension_handshake_send => {
-            // BEP 10: extension handshake sent (outbound peer).
-            // Now send interested and go active.
+            // BEP 10: extension handshake sent (outbound peer). Advertise our
+            // pieces (BITFIELD) before declaring interest, so the remote side
+            // knows what we have. This matters when a seeder opens the
+            // outbound side of a connection (e.g. via a tracker peer list):
+            // without this, the remote never learns we have pieces and the
+            // transfer stalls.
+            protocol.sendOutboundBitfieldThenInterested(self, slot);
+        },
+        .outbound_bitfield_send => {
+            // BITFIELD sent (outbound peer) — now send interested and go active.
             protocol.sendInterestedAndGoActive(self, slot);
         },
         .inbound_handshake_send => {
@@ -701,17 +709,17 @@ fn handleRecvResult(self: anytype, slot: u16, recv_res: i32) void {
             peer.extensions_supported = ext.supportsExtensions(recv_reserved[0..8].*);
 
             if (peer.extensions_supported) {
-                // Send extension handshake first, then interested on send completion
+                // Send extension handshake first, then bitfield/interested on send completion
                 protocol.submitExtensionHandshake(self, slot) catch {
-                    // Extension handshake failed; fall through to send interested anyway
-                    protocol.sendInterestedAndGoActive(self, slot);
+                    // Extension handshake failed; fall through to bitfield+interested
+                    protocol.sendOutboundBitfieldThenInterested(self, slot);
                     return;
                 };
                 peer.state = .extension_handshake_send;
-                // Don't start header recv yet -- sendInterestedAndGoActive will do it
-                // after the extension handshake send completes.
+                // Don't start header recv yet — sendOutboundBitfieldThenInterested
+                // (via the .extension_handshake_send send completion) will do it.
             } else {
-                protocol.sendInterestedAndGoActive(self, slot);
+                protocol.sendOutboundBitfieldThenInterested(self, slot);
             }
         },
         .inbound_handshake_recv => {

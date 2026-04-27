@@ -78,9 +78,12 @@ pub fn processMessage(self: anytype, slot: u16) void {
         },
         2 => { // interested
             peer.peer_interested = true;
-            // For seed mode, unchoking is now handled by recalculateUnchokes
-            // But for immediate responsiveness, unchoke if under the limit
-            if (peer.mode == .inbound and peer.am_choking) {
+            // For seed mode, unchoking is mostly handled by recalculateUnchokes,
+            // but doing an immediate unchoke here makes the first piece fly out
+            // in a sub-tick rather than waiting up to unchoke_interval_secs for
+            // the next recalc. peer.mode records who dialed, not who serves —
+            // both orientations should auto-unchoke on interest.
+            if (peer.am_choking) {
                 peer.am_choking = false;
                 submitMessage(self, slot, 1, &.{}) catch {};
             }
@@ -115,6 +118,7 @@ pub fn processMessage(self: anytype, slot: u16) void {
                             submitMessage(self, slot, 4, &have_payload) catch {};
                         }
                     }
+                    maybeSendInterested(self, slot, tc);
                 }
                 self.markIdle(slot);
             }
@@ -148,10 +152,17 @@ pub fn processMessage(self: anytype, slot: u16) void {
             if (peer.availability) |*bf| {
                 if (tc_bf.piece_tracker) |pt| pt.addBitfieldAvailability(bf);
             }
+            maybeSendInterested(self, slot, tc_bf);
             self.markIdle(slot);
         },
         6 => { // request
-            if (peer.mode == .inbound and !peer.am_choking and payload.len >= 12) {
+            // Serve any peer we've unchoked. peer.mode records who opened the
+            // TCP connection (outbound = we connected; inbound = they did) —
+            // it does not indicate the role in the swarm. When a seeder dials
+            // out (e.g. after the tracker hands it our address), our peer
+            // record for the leecher has mode=outbound but we are still the
+            // one with pieces to serve.
+            if (!peer.am_choking and payload.len >= 12) {
                 seed_handler.servePieceRequest(self, slot, payload);
             }
         },
@@ -647,6 +658,51 @@ pub fn submitPexMessage(self: anytype, slot: u16) !void {
     log.debug("slot {d}: sent PEX message", .{slot});
 }
 
+/// Helper: if we aren't already interested and the peer advertises at least one
+/// piece we don't yet have, send INTERESTED and record it. Must not fire during
+/// the handshake phase — it's only safe once we've reached active_recv_* states.
+///
+/// This is the counterpart to the outbound peer's sendInterestedAndGoActive:
+/// outbound peers declare interest up-front after their handshake, but inbound
+/// peers only learn the remote's availability by reading its BITFIELD/HAVE
+/// later, and must react then. Without this, an inbound-mode peer that happens
+/// to be the leecher side of the connection (e.g. when a seeder initiates the
+/// TCP connection) never declares interest, the remote never unchokes it, and
+/// the download stalls.
+fn maybeSendInterested(self: anytype, slot: u16, tc: *const TorrentContext) void {
+    const peer = &self.peers[slot];
+    if (peer.am_interested) return;
+    // Only send in active states; earlier the send pipeline is not ready.
+    switch (peer.state) {
+        .active_recv_header, .active_recv_body => {},
+        else => return,
+    }
+    const avail = peer.availability orelse return;
+    // If peer has nothing we don't, no reason to express interest.
+    const our = tc.complete_pieces orelse self.complete_pieces;
+    const has_useful = blk: {
+        if (our) |cp| {
+            // Any bit set in peer.availability that is not set in cp.
+            const n = @min(avail.bits.len, cp.bits.len);
+            var i: usize = 0;
+            while (i < n) : (i += 1) {
+                if (avail.bits[i] & ~cp.bits[i] != 0) break :blk true;
+            }
+            // Trailing peer bytes beyond cp: any set bit is useful.
+            while (i < avail.bits.len) : (i += 1) {
+                if (avail.bits[i] != 0) break :blk true;
+            }
+            break :blk false;
+        }
+        // No local bitfield context: assume any availability is useful.
+        for (avail.bits) |b| if (b != 0) break :blk true;
+        break :blk false;
+    };
+    if (!has_useful) return;
+    submitMessage(self, slot, 2, &.{}) catch return;
+    peer.am_interested = true;
+}
+
 /// Helper: send interested and transition to active recv (outbound download peer).
 pub fn sendInterestedAndGoActive(self: anytype, slot: u16) void {
     const peer = &self.peers[slot];
@@ -660,6 +716,29 @@ pub fn sendInterestedAndGoActive(self: anytype, slot: u16) void {
     submitHeaderRecv(self, slot) catch {
         self.removePeer(slot);
     };
+}
+
+/// Helper: send BITFIELD (if any pieces complete) then INTERESTED for an
+/// outbound peer. Without this, an outbound-mode peer (e.g. a seeder that
+/// initiated the connection after finding us via the tracker) never advertises
+/// its pieces, stranding the remote side — which receives no BITFIELD and
+/// therefore never becomes interested. Mirrors the inbound bitfield/unchoke
+/// flow but omits the unchoke (outbound peers are the "leecher side" by role).
+pub fn sendOutboundBitfieldThenInterested(self: anytype, slot: u16) void {
+    const peer = &self.peers[slot];
+    const tc_bp = self.getTorrentContext(peer.torrent_id);
+
+    const cp_opt = (if (tc_bp) |t| t.complete_pieces else null) orelse self.complete_pieces;
+    if (cp_opt) |cp| {
+        if (cp.count > 0) {
+            peer.state = .outbound_bitfield_send;
+            submitMessage(self, slot, 5, cp.bits) catch {
+                self.removePeer(slot);
+            };
+            return;
+        }
+    }
+    sendInterestedAndGoActive(self, slot);
 }
 
 /// Helper: send bitfield (if available) then unchoke for an inbound seed peer.
