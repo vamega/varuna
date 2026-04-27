@@ -20,6 +20,8 @@ pub const http_executor = @import("http_executor.zig");
 pub const metadata_handler = @import("metadata_handler.zig");
 pub const rate_limiter = @import("rate_limiter.zig");
 pub const recheck = @import("recheck.zig");
+pub const backend = @import("backend.zig");
+pub const epoll_io = @import("epoll_io.zig");
 pub const real_io = @import("real_io.zig");
 pub const ring = @import("ring.zig");
 pub const sim_io = @import("sim_io.zig");
@@ -65,6 +67,8 @@ test {
     _ = peer_policy;
     _ = protocol;
     _ = rate_limiter;
+    _ = backend;
+    _ = epoll_io;
     _ = real_io;
     _ = recheck;
     _ = ring;
