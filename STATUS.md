@@ -284,8 +284,8 @@ See `progress-reports/2026-04-25-stage2-event-loop-migration.md` for the Stage 2
 - ~~**BT PIECE block_index regression test**~~: (DONE 2026-04-27) inline tests in `src/io/protocol.zig` covering `block_offset = 1 GiB` (the exact pre-fix panic value) and `block_offset = maxInt(u32)` (the absolute upper bound of the wire field). Now visible because round-1 dark-test audit landed `src/io/root.zig`'s `test {}` block.
 - **Happy-path `AsyncMetadataFetchOf(SimIO)` integration test.** The Track 3 refactor landed `AsyncMetadataFetchOf(IO)` plus three foundation error-path tests (`tests/metadata_fetch_test.zig`), but the happy-path test (peer scripts a valid info dictionary; assembler completes; `verifyAndComplete` fires; `result_bytes != null`) is deferred. Two design options: (a) refactor `connectPeer`'s `posix.socket()` call to route through `self.io.socket()` so SimIO returns a synthetic fd that's tied to a SimIO socket-pool slot — this requires an async chain (`socket → connect → send`) instead of the current sync `socket()` + async `connect()`; (b) extend SimIO with `setSocketRecvScript(fd, bytes)` that overrides recv for arbitrary fds (mirrors `setFileBytes` shape) plus a "swallow sends to scripted fds" path. Option (a) is cleaner architecturally; option (b) is closer to the recheck pattern. Either approach also unlocks a live-pipeline BUGGIFY harness for `AsyncMetadataFetchOf(SimIO)` (per-tick `injectRandomFault` + per-op `FaultConfig` × 32 seeds), which would catch state-machine recovery paths the foundation tests can't see. Estimated 1-2 days for happy-path + BUGGIFY combined.
 - **Live-pipeline BUGGIFY harness for AsyncMetadataFetchOf(SimIO).** Same shape as the AsyncRecheck follow-up (per-tick `injectRandomFault` + per-op `FaultConfig` over 32 deterministic seeds), gated on the happy-path integration test above. Catches handshake-recovery races, partial-send retries, slot cleanup under recv-error injection, and assembler-reset paths that the algorithm-level `tests/ut_metadata_buggify_test.zig` and the foundation error-path tests can't see together. Estimated 0.5-1 day once the happy-path is in place.
-- **uTP extension chain not consumed in production.** `src/net/utp_manager.zig:85` treats `data[Header.size..]` as the entire payload regardless of `hdr.extension`, so when a peer sets `extension == selective_ack` the SACK header bytes are fed into the BT framing layer as if they were BT message bytes. Cosmetic / protocol-correctness — a malicious peer can desync their own BT stream but cannot crash the daemon. Fix shape: walk the extension chain (uTP allows next-hop chaining via `SelectiveAck.next_extension`), strip extensions from the front of `payload`, then hand the trailing bytes to the BT layer. Estimated 1-2 hours. Surfaced by the round-3 audit (`progress-reports/2026-04-26-audit-hunt-round3.md`).
-- **uTP reorder buffer indexing mismatch + dangling-slice UAF.** `bufferReorder` indexes by *offset from `ack_nr+1`* (`src/net/utp.zig:670`); `deliverReordered` indexes by *absolute `seq_nr % 64`* (`src/net/utp.zig:682`). Stored entries are unreachable by the deliverer, so out-of-order packets are silently dropped today. Compounding bug: the stored `data: []const u8` slice points into `event_loop.utp_recv_buf`, which is reused on the next datagram — fixing the indexing bug without addressing slice ownership would convert a silent drop into a UAF. Fix shape: index by `seq_nr % 64` consistently *and* copy the payload into per-slot owned storage. Estimated 1-2 hours. Surfaced by the round-3 audit.
+- ~~**uTP extension chain not consumed in production.**~~ (DONE 2026-04-28) `src/net/utp_manager.zig` now walks the BEP 29 extension chain via `stripExtensions` and hands the trailing bytes to the BT framing layer. Truncated chains and over-cap SACK lengths (> `sack_bitmask_max`) are rejected with `null` — manager drops the malformed datagram cleanly. 9 inline regression tests (single SACK, multi-hop, truncated, missing per-extension header, oversized SACK, non-terminating chain, plus full-pipeline tests). See `progress-reports/2026-04-28-utp-fixes-and-net-wiring.md`.
+- ~~**uTP reorder buffer indexing mismatch + dangling-slice UAF.**~~ (DONE 2026-04-28) Both `bufferReorder` and `deliverReordered` now index by absolute `seq_nr % max_reorder_buf`, so out-of-order packets are reachable. `ReorderEntry.data` is `?[]u8` (owned heap copy) instead of a borrowed slice into the shared `utp_recv_buf` — fixes the latent UAF. Slot eviction frees the prior occupant; `UtpSocket.delivered_payloads` keeps slices alive across the result-handling window then frees on the next `processPacket`/`deinit`. 8 inline regression tests including the exact UAF scenario. Production wiring: `PacketResult` now carries `reorder_data`/`reorder_delivered` and `src/io/utp_handler.zig` drains the buffered payloads into `deliverUtpData`. See `progress-reports/2026-04-28-utp-fixes-and-net-wiring.md`.
 - **`writePiece` / `readPiece` migration to the IO contract.** PieceStore's per-piece read/write paths still use blocking `posix.pwrite` / `posix.pread`. The 2026-04-27 storage-IO refactor routed `init` (fallocate) and `sync` (fsync) through the contract; the per-piece I/O is the bigger remaining migration. Adjacent to but not blocking the EpollIO/KqueueIO research round. Estimated 1-2 days. Reference: `src/storage/writer.zig` `pwriteAll` / `preadAll`.
 - **`truncate` op on the IO contract.** PieceStore's filesystem-portability fallback (when fallocate returns `error.OperationNotSupported` on tmpfs <5.10 / FAT32 / certain FUSE FSes) calls `file.setEndPos(...)` synchronously rather than through the contract. Adding `TruncateOp` + `RealIO.truncate` (via `IORING_OP_FTRUNCATE`, kernel ≥6.9 — likely above varuna's floor) + `SimIO.truncate` would close the asymmetry. Not urgent: rare defensive path. EpollIO/KqueueIO porting will need it (or a thread-pool bridge). Estimated 1-2 hours.
 - **Live-pipeline BUGGIFY harness for `PieceStoreOf(SimIO)`.** Wrap the integration tests in `tests/storage_writer_test.zig` with the canonical BUGGIFY shape — per-tick `injectRandomFault` + per-op `FaultConfig` × 32 seeds. Catches recovery paths the foundation tests can't see (errdefer cleanup of partially-opened files when the 2nd of 5 fallocates fails; sync's pending-counter under fsync error storms). Reference shape: `tests/recheck_live_buggify_test.zig`. Estimated 0.5 day.
@@ -294,7 +294,7 @@ See `progress-reports/2026-04-25-stage2-event-loop-migration.md` for the Stage 2
 - ~~**Dark inline test audit, round 2: net / tracker / rpc.**~~ Closed 2026-04-27. `src/net/root.zig` (14 files wired; bencode_scanner / web_seed deferred to quick-wins-engineer), `src/tracker/root.zig` (3 files), `src/rpc/root.zig` (8 files) all wired. Surfaced two production bugs and one bit-rotted test. See `progress-reports/2026-04-27-dark-test-audit-r2r3.md`.
 - ~~**Dark inline test audit, round 3: runtime / sim / daemon.**~~ Closed 2026-04-27. `src/runtime/root.zig` (3 files), `src/sim/root.zig` (1 file), `src/daemon/root.zig` (5 files) wired through `mod_tests` (`src/root.zig`'s `_ = daemon;` reaches `daemon/root.zig` directly — round 1's note about needing a separate `daemon_exe.root_module` opt-in turned out to be unnecessary in practice). Surfaced one production safety fix (`isListenSocketOnPort` panic on negative fd). See `progress-reports/2026-04-27-dark-test-audit-r2r3.md`.
 - ~~**Wider `{any}` formatter audit.**~~ Closed 2026-04-27. 23 sites audited; one production bug surfaced (`session_manager.formatPeerIp` was emitting ~640-byte struct dumps as the qBittorrent peer-list JSON `ip` field), 10 log-verbosity sites (uTP, event_loop, dht, peer_policy) shrunk from 700-byte multi-line dumps to plain `IP:port`, 12 test-diagnostic sites kept (benign — `{any}` on `anyerror` prints the error name). Regression test asserts `{f}` form for IPv4 and IPv6, and explicitly that the output contains no struct-dump tokens. See `progress-reports/2026-04-27-any-formatter-audit.md`.
-- **Wire `src/net/bencode_scanner.zig` + `src/net/web_seed.zig`.** Excluded from the round-2 dark-test commit `cad9c53` because they were owned by quick-wins-engineer this round (skipValue rewrite + `MultiPieceRange.length` fix). Quick-wins did not modify `src/net/root.zig`, so these two files remain unwired. ~30 minutes mechanical fix.
+- ~~**Wire `src/net/bencode_scanner.zig` + `src/net/web_seed.zig`.**~~ (DONE 2026-04-28) Both files added to `src/net/root.zig`'s `test {}` block; ~25 inline tests now reachable through `mod_tests`. Verification per the standard protocol: intentional `try testing.expect(false)` break in one test in each file caught by the runner with the correct test name; reverted. See `progress-reports/2026-04-28-utp-fixes-and-net-wiring.md`.
 
 ## Known Issues
 
@@ -305,6 +305,50 @@ See `progress-reports/2026-04-25-stage2-event-loop-migration.md` for the Stage 2
 - **MSE handshake failures in mixed encryption mode**: `vc_not_found` and `req1_not_found` errors occur during simultaneous inbound+outbound MSE handshakes. Timing-dependent, disappears under GDB. `demo_swarm.sh` runs with `encryption = "disabled"` as workaround.
 - ~~**Daemon graceful shutdown**~~: Fixed. In-flight transfer draining with configurable timeout now ensures clean exit on SIGTERM/SIGINT.
 - `IORING_OP_SETSOCKOPT` (kernel 6.7+), `IORING_OP_BIND`/`LISTEN` (kernel 6.11+) not available on current kernel 6.6. Per-peer setsockopt (TCP_NODELAY, buffer sizes) remains synchronous.
+
+## Last Verified Milestone (2026-04-28 — uTP correctness fixes + net test wiring)
+
+Closed three round-3-audit follow-ups on `worktree-utp-fixes`. Four
+bisectable commits, all green at HEAD.
+
+- `9ed7200 net/utp: fix reorder buffer indexing + slice ownership` —
+  two coupled bugs from the round-3 audit. The indexing bug
+  (`bufferReorder` indexed by offset, `deliverReordered` by absolute
+  `seq_nr % 64`) silently dropped every out-of-order packet. The
+  slice-ownership bug (`ReorderEntry.data` was borrowed into the
+  shared `utp_recv_buf`) would have become a UAF the moment the
+  indexing bug was fixed. Both fixed together: indexing aligned on
+  absolute `seq_nr % max_reorder_buf` in both methods; payload copied
+  into per-slot owned storage at `bufferReorder`; `delivered_payloads`
+  on `UtpSocket` keeps slices alive across the result-handling
+  window and frees on the next `processPacket` or `deinit`.
+  Production caller (`src/io/utp_handler.zig`) now drains the
+  buffered payloads into `deliverUtpData` after the in-order packet,
+  so out-of-order delivery actually works end-to-end. 8 inline
+  regression tests — including the exact UAF scenario where the
+  source buffer is mutated between buffering and delivery.
+- `873ff44 net/utp_manager: walk and strip extension chain before BT
+  framing` — `processPacket` now walks `(next_ext, len, [len]u8)*`
+  via `stripExtensions` and hands the trailing slice to the BT
+  layer. Truncated chains and SACK extensions exceeding
+  `sack_bitmask_max = 32` are rejected with `null` (manager drops
+  the malformed datagram). 9 inline regression tests including a
+  full-pipeline test that constructs a DATA packet with
+  `hdr.extension = selective_ack` and 4 BT keepalive bytes after the
+  bitmask, asserting the BT layer receives only the keepalive.
+- `1b6cfd1 net: wire bencode_scanner + web_seed into net/root.zig
+  test discovery` — closes the round-2 dark-test follow-up that was
+  blocked on parallel quick-wins work. ~25 inline tests now
+  reachable. Verification: `try testing.expect(false)` in one test
+  per file caught by the runner with the correct names; reverted.
+
+`zig build`: clean. `zig fmt .`: clean. `zig build test`: green
+(after one self-resolving flake of the pre-existing
+`sim_smart_ban_phase12_eventloop_test` retry-on-second-run pattern,
+also seen in the round-2/3 dark-test report). See
+`progress-reports/2026-04-28-utp-fixes-and-net-wiring.md`.
+
+Branch: `worktree-utp-fixes`.
 
 ## Last Verified Milestone (2026-04-27 — `{any}` formatter audit)
 
