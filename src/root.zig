@@ -30,6 +30,7 @@ test {
     _ = dht;
     _ = io;
     _ = net;
+    _ = rpc;
     _ = runtime;
     _ = sim;
     _ = storage;

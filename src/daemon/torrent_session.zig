@@ -2563,8 +2563,9 @@ test "unpause preserves shared event loop mode" {
 }
 
 test "buildTrackerUrls includes effective tracker set with overrides" {
+    // Each `http://...test` URL is 19 bytes — bencode lengths must match.
     const torrent_bytes =
-        "d8:announce18:http://primary.test13:announce-listll20:http://backup1.testel20:http://backup2.testee4:infod6:lengthi4e4:name8:test.bin12:piece lengthi4e6:pieces20:abcdefghijklmnopqrstee";
+        "d8:announce19:http://primary.test13:announce-listll19:http://backup1.testel19:http://backup2.testee4:infod6:lengthi4e4:name8:test.bin12:piece lengthi4e6:pieces20:abcdefghijklmnopqrstee";
 
     var loaded = try session_mod.Session.load(std.testing.allocator, torrent_bytes, "/tmp");
     defer loaded.deinit(std.testing.allocator);
