@@ -830,7 +830,7 @@ fn doAccept(listen_fd: posix.fd_t) anyerror!ifc.Accepted {
     var addr_len: posix.socklen_t = @sizeOf(posix.sockaddr.storage);
     const flags: u32 = posix.SOCK.CLOEXEC | posix.SOCK.NONBLOCK;
     const fd = try posix.accept(listen_fd, @ptrCast(&addr_storage), &addr_len, flags);
-    const addr = std.net.Address.initPosix(@alignCast(@ptrCast(&addr_storage)));
+    const addr = std.net.Address.initPosix(@ptrCast(@alignCast(&addr_storage)));
     return .{ .fd = fd, .addr = addr };
 }
 
