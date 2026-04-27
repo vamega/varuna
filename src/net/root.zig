@@ -21,12 +21,9 @@ pub const web_seed = @import("web_seed.zig");
 // into `mod_tests` via `_ = net;` in `src/root.zig`'s test block.
 //
 // `address.zig` has no inline tests today.
-//
-// `bencode_scanner.zig` and `web_seed.zig` are owned by the
-// quick-wins-engineer this round (skipValue rewrite + MultiPieceRange
-// fix); their inline tests will be added once those land.
 test {
     _ = ban_list;
+    _ = bencode_scanner;
     _ = extensions;
     _ = hash_exchange;
     _ = ipfilter_parser;
@@ -40,4 +37,5 @@ test {
     _ = ut_metadata;
     _ = utp;
     _ = utp_manager;
+    _ = web_seed;
 }
