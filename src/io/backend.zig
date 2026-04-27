@@ -35,22 +35,25 @@
 const build_options = @import("build_options");
 const real_io_mod = @import("real_io.zig");
 const epoll_io_mod = @import("epoll_io.zig");
+const kqueue_io_mod = @import("kqueue_io.zig");
 
 /// The daemon's selected primary IO backend. Aliased through this name so
-/// callers can transparently switch between io_uring and epoll based on
-/// `-Dio=`. Note: `init` signatures differ between backends — RealIO takes
-/// a `Config{ .entries = ..., .flags = ... }`; EpollIO takes
+/// callers can transparently switch between io_uring, epoll, and kqueue
+/// based on `-Dio=`. Note: `init` signatures differ between backends —
+/// RealIO takes a `Config{ .entries = ..., .flags = ... }`; EpollIO takes
 /// `(allocator, Config{ .max_completions = ... })`. Callers that want to
 /// switch dynamically need to handle this at the call site (or use
 /// `init_default` below).
 pub const RealIO = switch (build_options.io_backend) {
     .io_uring => real_io_mod.RealIO,
     .epoll => epoll_io_mod.EpollIO,
+    .kqueue => kqueue_io_mod.KqueueIO,
 };
 
 /// Re-exports for direct callers who want to spell out the chosen backend.
 pub const IoUringBackend = real_io_mod.RealIO;
 pub const EpollBackend = epoll_io_mod.EpollIO;
+pub const KqueueBackend = kqueue_io_mod.KqueueIO;
 
 /// Build-time identity of the selected backend. Useful for runtime
 /// logging and conditional code paths (e.g. "skip the file-op test under
@@ -58,12 +61,13 @@ pub const EpollBackend = epoll_io_mod.EpollIO;
 pub const selected: SelectedBackend = switch (build_options.io_backend) {
     .io_uring => .io_uring,
     .epoll => .epoll,
+    .kqueue => .kqueue,
 };
 
 pub const SelectedBackend = enum {
     io_uring,
     epoll,
-    // kqueue, // reserved for parallel macOS engineer
+    kqueue,
 };
 
 test "backend selector resolves to a real type" {

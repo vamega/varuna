@@ -23,6 +23,7 @@ pub const recheck = @import("recheck.zig");
 pub const backend = @import("backend.zig");
 pub const epoll_io = @import("epoll_io.zig");
 pub const real_io = @import("real_io.zig");
+pub const kqueue_io = @import("kqueue_io.zig");
 pub const ring = @import("ring.zig");
 pub const sim_io = @import("sim_io.zig");
 pub const signal = @import("signal.zig");

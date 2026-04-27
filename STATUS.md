@@ -345,6 +345,59 @@ Dev-machine probe result (kernel 7.0.1): `supports_ftruncate = true`. The async 
 
 Branch: `worktree-runtime-detect`.
 
+## Last Verified Milestone (2026-04-29 — KqueueIO MVP: macOS / BSD developer backend)
+
+Lands a minimum-viable kqueue(2) backend (`src/io/kqueue_io.zig`) plus the
+`-Dio={io_uring,kqueue}` build flag. Production stays Linux/io_uring; this
+exists so varuna can be developed (and cross-compile-validated) on macOS.
+Per the strategy in `docs/epoll-kqueue-design.md` and the survey in
+`progress-reports/2026-04-27-epoll-kqueue-research.md`.
+
+One bisectable commit on `worktree-kqueue-io` (skeleton + impl together —
+splitting at op-family granularity would have added throwaway intermediate
+states for ~zero bisectability gain on a brand-new file).
+
+- `8384b6a` — `io: add KqueueIO MVP backend + -Dio= build flag`. Implements
+  lifecycle (init/deinit/tick/closeSocket), timer heap + `timeout` op,
+  socket lifecycle (`socket` with macOS fcntl O_NONBLOCK / FD_CLOEXEC,
+  `connect` with deadline via timer heap, `accept` single-shot + multishot
+  via re-register), stream IO (`recv`/`send`), datagram IO
+  (`recvmsg`/`sendmsg`), `poll`, best-effort `cancel`, synchronous
+  `truncate` (mirrors RealIO's pattern). File ops (`read`/`write`/`fsync`/
+  `fallocate`) stubbed to deliver `error.OperationNotSupported`
+  synchronously — the thread-pool-offload follow-up is the next milestone.
+
+  `build.zig` gates the daemon install steps on `io_backend == .io_uring`
+  (the daemon graph hard-references RealIO; under any other backend
+  `zig build` succeeds without producing the daemon, which is what
+  cross-compile validation needs). New `test-kqueue-io` step compiles
+  `src/io/kqueue_io.zig` directly — independent of `varuna_mod` — so
+  `-Dtarget=aarch64-macos -Dio=kqueue` cross-compiles cleanly. Bridge
+  step `test-kqueue-io-bridge` runs varuna_mod-side tests on Linux.
+
+Validation:
+- `zig build` (Linux io_uring): clean
+- `zig build test`: clean (1418/1418 inherited + KqueueIO inline tests
+  on the platform-portable subset)
+- `zig build test-kqueue-io`: clean
+- `zig build -Dtarget=aarch64-macos -Dio=kqueue`: clean cross-compile
+- `zig build test-kqueue-io -Dtarget=aarch64-macos -Dio=kqueue`: clean
+  cross-compile (run step skipped — host can't exec macOS binaries)
+- `zig fmt .`: clean
+
+What needs real-macOS validation (cross-compile validates types, not
+runtime semantics): the `EVFILT.READ` / `EV.ADD|ENABLE|ONESHOT` mask
+values, `posix.recv`/`send`/`accept` errno mapping on darwin's BSD
+errno layout, `std.c.recvmsg`/`sendmsg` signature compatibility,
+connect-with-deadline race ordering, `posix.SOCK.NONBLOCK` value match.
+See `progress-reports/2026-04-29-kqueue-io-mvp.md`.
+
+Coordination: `epoll-io-engineer` is adding `-Dio=epoll` to the same
+`IoBackend` enum on a parallel branch. The merge conflict is intentionally
+trivial — extend the choice list.
+
+Branch: `worktree-kqueue-io`.
+
 ## Last Verified Milestone (2026-04-28 — `truncate` op on the IO contract: storage fallback async)
 
 Closed the last synchronous disk-syscall holdout in `src/storage/writer.zig`. PieceStore's filesystem-portability fallback (when fallocate returns `error.OperationNotSupported` on tmpfs <5.10 / FAT32 / certain FUSE FSes) was the only `setEndPos` left after the 2026-04-27 fallocate/fsync routing and the 2026-04-28 writePiece/readPiece migration. Now routes through `self.io.truncate`, BUGGIFY-injectable from SimIO and forward-compatible with the queued EpollIO/KqueueIO research round.
