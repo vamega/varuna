@@ -128,10 +128,53 @@ fn parseDatLine(line: []const u8) ?DatEntry {
     // Parse access level
     const access_level = std.fmt.parseInt(u32, access_part, 10) catch return null;
 
-    // Parse range: "startIP - endIP"
-    const range = BanList.parseRange(range_part) orelse return null;
+    // Parse range: "startIP - endIP". eMule writes zero-padded octets
+    // ("001.009.096.105"), which `std.net.Address.parseIp4` rejects with
+    // `error.NonCanonical`. Use a DAT-aware parser that strips leading
+    // zeros per octet before delegating.
+    const range = parseDatRange(range_part) orelse return null;
 
     return .{ .range = range, .access_level = access_level };
+}
+
+/// Parse an eMule DAT IPv4 range ("startIP - endIP"). The DAT format
+/// uses zero-padded octets that Zig stdlib rejects; strip them per
+/// segment, parse manually, and fall through to `BanList.parseRange`
+/// for IPv6 / non-padded inputs.
+fn parseDatRange(s: []const u8) ?BanList.CidrRange {
+    const sep = std.mem.indexOf(u8, s, "-") orelse return null;
+    const start_str = std.mem.trim(u8, s[0..sep], " \t");
+    const end_str = std.mem.trim(u8, s[sep + 1 ..], " \t");
+
+    if (parseDatIp4(start_str)) |start_v4| {
+        if (parseDatIp4(end_str)) |end_v4| {
+            return .{ .v4 = .{ .start = start_v4, .end = end_v4 } };
+        }
+    }
+
+    // Not a v4 (zero-padded or otherwise) — try BanList.parseRange for
+    // IPv6 / non-padded canonical strings.
+    return BanList.parseRange(s);
+}
+
+/// Parse a possibly-zero-padded IPv4 dotted-quad ("001.009.096.105")
+/// into a host-order `u32`.
+fn parseDatIp4(s: []const u8) ?u32 {
+    var octets: [4]u8 = undefined;
+    var iter = std.mem.splitScalar(u8, s, '.');
+    var i: usize = 0;
+    while (iter.next()) |seg| {
+        if (i >= 4) return null;
+        if (seg.len == 0) return null;
+        // Strip leading zeros, keeping at least one digit (so "000" -> "0").
+        var j: usize = 0;
+        while (j < seg.len - 1 and seg[j] == '0') : (j += 1) {}
+        const trimmed = seg[j..];
+        octets[i] = std.fmt.parseInt(u8, trimmed, 10) catch return null;
+        i += 1;
+    }
+    if (i != 4) return null;
+    return std.mem.readInt(u32, &octets, .big);
 }
 
 /// Parse P2P plaintext format.

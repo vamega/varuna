@@ -291,9 +291,10 @@ See `progress-reports/2026-04-25-stage2-event-loop-migration.md` for the Stage 2
 - **Live-pipeline BUGGIFY harness for `PieceStoreOf(SimIO)`.** Wrap the integration tests in `tests/storage_writer_test.zig` with the canonical BUGGIFY shape — per-tick `injectRandomFault` + per-op `FaultConfig` × 32 seeds. Catches recovery paths the foundation tests can't see (errdefer cleanup of partially-opened files when the 2nd of 5 fallocates fails; sync's pending-counter under fsync error storms). Reference shape: `tests/recheck_live_buggify_test.zig`. Estimated 0.5 day.
 
 ### Testing
-- **Dark inline test audit, round 2: net / tracker / rpc.** The 2026-04-27 round-1 audit covered io / storage / dht (mandatory) and surfaced two real production bugs (PEX port byte order, DHT IPv6 formatter). Round 2 should explicitly wire `src/net/root.zig`, `src/tracker/root.zig`, `src/rpc/root.zig` test blocks. ~404 dark inline tests across 29 files. Same recipe as round 1; ~30 min per subsystem after wiring. Some tests in those subsystems already run *transitively* through the io import chain (utp, peer_wire, ban_list, auth, server, udp), but explicit wiring adds robustness against import refactors and reaches files like address.zig, peer_id.zig, hash_exchange.zig, ipfilter_parser.zig, smart_ban.zig, bencode_scanner.zig, pex.zig, handlers.zig, sync.zig, json.zig, multipart.zig, compat.zig, announce.zig, scrape.zig that nothing in the io chain reaches. See `progress-reports/2026-04-27-dark-test-audit.md` for the recipe and table.
-- **Dark inline test audit, round 3: runtime / sim / daemon.** ~44 dark inline tests across 12 files. `src/daemon/` differs — `daemon_tests` is rooted at `daemon_exe.root_module` per `build.zig`, so wiring via `src/root.zig` doesn't reach it; needs a separate opt-in block in the daemon's root module file. Lower priority than round 2.
+- ~~**Dark inline test audit, round 2: net / tracker / rpc.**~~ Closed 2026-04-27. `src/net/root.zig` (14 files wired; bencode_scanner / web_seed deferred to quick-wins-engineer), `src/tracker/root.zig` (3 files), `src/rpc/root.zig` (8 files) all wired. Surfaced two production bugs and one bit-rotted test. See `progress-reports/2026-04-27-dark-test-audit-r2r3.md`.
+- ~~**Dark inline test audit, round 3: runtime / sim / daemon.**~~ Closed 2026-04-27. `src/runtime/root.zig` (3 files), `src/sim/root.zig` (1 file), `src/daemon/root.zig` (5 files) wired through `mod_tests` (`src/root.zig`'s `_ = daemon;` reaches `daemon/root.zig` directly — round 1's note about needing a separate `daemon_exe.root_module` opt-in turned out to be unnecessary in practice). Surfaced one production safety fix (`isListenSocketOnPort` panic on negative fd). See `progress-reports/2026-04-27-dark-test-audit-r2r3.md`.
 - **Wider `{any}` formatter audit.** The DHT IPv6 bug exposed a Zig 0.15.2 stdlib semantic shift (`{any}` is now generic struct-dump, not the type's `format` method). Other paths that print addresses or embedded structs likely have the same drift. One-line grep audit (`grep -rn '"{any}"' src/ --include='*.zig'`) deferred from round 1.
+- **Wire `src/net/bencode_scanner.zig` + `src/net/web_seed.zig`.** Owned by quick-wins-engineer this round (skipValue rewrite + `MultiPieceRange.length` u64 fix). Wire the inline tests after those land; the round 2 commit `cad9c53` lists every other net/ file but skips these two.
 
 ## Known Issues
 
@@ -305,7 +306,68 @@ See `progress-reports/2026-04-25-stage2-event-loop-migration.md` for the Stage 2
 - ~~**Daemon graceful shutdown**~~: Fixed. In-flight transfer draining with configurable timeout now ensures clean exit on SIGTERM/SIGINT.
 - `IORING_OP_SETSOCKOPT` (kernel 6.7+), `IORING_OP_BIND`/`LISTEN` (kernel 6.11+) not available on current kernel 6.6. Per-peer setsockopt (TCP_NODELAY, buffer sizes) remains synchronous.
 
-## Last Verified Milestone (2026-04-27 — Dark inline test audit, round 1: io / storage / dht)
+## Last Verified Milestone (2026-04-27 — Dark inline test audit, rounds 2 + 3: net / tracker / rpc / runtime / sim / daemon)
+
+Wired previously-dark inline `test "..."` blocks across the six
+remaining subsystems (net, tracker, rpc, runtime, sim, daemon) into
+`mod_tests` discovery. Surfaced two production bugs / safety fixes
+plus one bit-rotted test, fixed under separately-labelled commits.
+
+Eight bisectable commits, all green at HEAD. Test count:
+**~1200 → 1385** (+185 inline tests now reachable; mix of net-new
+discovery and previously-transitive coverage now pinned by explicit
+`_ = file;` references).
+
+- `c4aeb99 runtime/sim: wire dark inline tests through root.zig` —
+  runtime (kernel/probe/requirements, 8 tests), sim (simulator,
+  8 tests). All passed unmodified.
+- `44dd55e tracker: wire dark inline tests through tracker/root.zig` —
+  announce / scrape / udp (63 tests). One bit-rotted bencode length
+  fixed (`scrape.zig` test had `7:denied` for the 6-byte string).
+- `62730f0 net/ipfilter_parser: parse zero-padded eMule DAT IPv4
+  octets` — **production bug**. `std.net.Address.parseIp4` rejects
+  zero-padded segments (`001.009.096.105`) with `error.NonCanonical`,
+  so every line of every real eMule DAT file silently failed to
+  parse. ipfilter import was broken for the canonical eMule format
+  the feature exists to consume. Added `parseDatIp4` that strips
+  leading zeros per octet.
+- `cad9c53 net: wire dark inline tests through net/root.zig` —
+  14 files (ban_list, extensions, hash_exchange, ipfilter_parser,
+  ledbat, metadata_fetch, peer_id, peer_wire, pex, smart_ban,
+  socket, ut_metadata, utp, utp_manager). Excluded
+  `bencode_scanner.zig` + `web_seed.zig` (owned by quick-wins-
+  engineer this round). `address.zig` has no inline tests today.
+- `a0bc7aa rpc: wire dark inline tests through rpc/root.zig` —
+  8 files (auth, compat, handlers, json, multipart, scratch, server,
+  sync; ~122 tests). One daemon test bit-rot fixed
+  (`buildTrackerUrls includes effective tracker set with overrides`
+  declared bencode lengths `18:`/`20:` for 19-byte URLs; the test
+  was newly visible through rpc's transitive cascade and corrupted
+  the test stack on iteration of the malformed announce_list).
+- `0a57ab0 daemon/systemd: defend isListenSocketOnPort against
+  negative fd` — **production safety fix**. Zig 0.15.2's
+  `std.posix.getsockname` treats `EBADF` as `unreachable`, so
+  `isListenSocketOnPort(-1, ...)` aborted with SIGABRT instead of
+  returning false. A future caller that mishandled an empty
+  socket-activation slot would have crashed the daemon at startup.
+  Short-circuit on `fd < 0`.
+- `43f4b91 daemon: wire dark inline tests through daemon/root.zig` —
+  5 files (categories, queue_manager, session_manager, systemd,
+  torrent_session; 28 tests). Round 1 noted daemon needed a
+  separate opt-in via `daemon_exe.root_module`; in practice
+  `mod_tests` reaches `daemon/root.zig` through the same import
+  graph, so the standard `_ = daemon;` recipe works.
+
+`zig build` (daemon): clean. `zig fmt .`: clean. `zig build test`:
+green (1385/1385 with 1 deterministic skip;
+`tests/sim_multi_source_eventloop_test.zig` `multi-source: 3 peers
+all hold full piece, picker spreads load (8 seeds)` is flaky and
+passes on rerun — pre-existing, not caused by this round). See
+`progress-reports/2026-04-27-dark-test-audit-r2r3.md`.
+
+Branch: `worktree-dark-test-r2r3`.
+
+## Previously Verified Milestone (2026-04-27 — Dark inline test audit, round 1: io / storage / dht)
 
 Wired previously-dark inline `test "..."` blocks across the three
 mandatory subsystems (io, storage, dht) into `mod_tests` discovery.
@@ -350,7 +412,7 @@ Mandatory subsystems complete. ~448 dark inline tests across 41 files
 remain across `src/net/`, `src/tracker/`, `src/rpc/`, `src/runtime/`,
 `src/sim/`, `src/daemon/` — see "Next > Testing" follow-ups below.
 
-## Previously Verified Milestone (2026-04-27 — Storage IO contract: fallocate + fsync via the contract)
+## Earlier Verified Milestone (2026-04-27 — Storage IO contract: fallocate + fsync via the contract)
 
 Routed `src/storage/writer.zig`'s direct syscall paths through the IO
 contract. `PieceStore.init`'s three `linux.fallocate` call sites and

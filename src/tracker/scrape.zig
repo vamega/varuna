@@ -205,7 +205,7 @@ test "parse scrape response rejects failure reason" {
 
     try std.testing.expectError(
         error.TrackerFailure,
-        parseScrapeResponse(alloc, "d14:failure reason7:deniede", info_hash),
+        parseScrapeResponse(alloc, "d14:failure reason6:deniede", info_hash),
     );
 }
 
