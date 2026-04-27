@@ -170,7 +170,7 @@ pub const State = enum {
 };
 
 /// Maximum number of out-of-order packets we buffer.
-const max_reorder_buf = 64;
+pub const max_reorder_buf = 64;
 
 /// Maximum number of unacknowledged outbound packets.
 const max_outbuf = 128;
@@ -211,9 +211,16 @@ pub const OutPacket = struct {
 };
 
 /// An entry in the receive reorder buffer.
+///
+/// `data` is an owned heap-allocated copy of the payload — the source
+/// buffer (`event_loop.utp_recv_buf`) is reused on every datagram, so a
+/// borrowed slice would be a use-after-free by the time the gap is
+/// filled and the deliverer reads it back. `bufferReorder` allocates,
+/// `deliverReordered` transfers ownership to `UtpSocket.delivered_payloads`,
+/// and `deinit` cleans up any leftover slots.
 pub const ReorderEntry = struct {
     seq_nr: u16,
-    data: []const u8,
+    data: ?[]u8 = null,
     present: bool = false,
 };
 
@@ -261,7 +268,15 @@ pub const UtpSocket = struct {
     out_seq_start: u16 = 1,
 
     /// Receive reorder buffer.
-    reorder_buf: [max_reorder_buf]ReorderEntry = [_]ReorderEntry{.{ .seq_nr = 0, .data = &.{}, .present = false }} ** max_reorder_buf,
+    reorder_buf: [max_reorder_buf]ReorderEntry = [_]ReorderEntry{.{ .seq_nr = 0, .data = null, .present = false }} ** max_reorder_buf,
+
+    /// Owned copies of the most recent batch of reorder-buffered payloads
+    /// flushed by `deliverReordered`. The slices in `ProcessResult.reorder_data`
+    /// reference these. Freed at the start of the next `deliverReordered`
+    /// call (so the caller can read them during result handling) and on
+    /// `deinit`.
+    delivered_payloads: [max_reorder_buf]?[]u8 = [_]?[]u8{null} ** max_reorder_buf,
+    delivered_count: u16 = 0,
 
     /// Duplicate ACK counter for fast retransmit.
     dup_ack_count: u8 = 0,
@@ -277,12 +292,24 @@ pub const UtpSocket = struct {
 
     // ── Public API ───────────────────────────────────────
 
-    /// Free all owned outbound packet buffers. Call on socket teardown.
+    /// Free all owned outbound packet buffers and any in-flight reorder
+    /// buffer storage. Call on socket teardown.
     pub fn deinit(self: *UtpSocket) void {
         const alloc = self.allocator orelse return;
         for (&self.out_buf) |*pkt| {
             pkt.deinit(alloc);
         }
+        for (&self.reorder_buf) |*entry| {
+            if (entry.data) |buf| {
+                alloc.free(buf);
+                entry.data = null;
+            }
+            entry.present = false;
+        }
+        for (self.delivered_payloads[0..self.delivered_count]) |maybe| {
+            if (maybe) |buf| alloc.free(buf);
+        }
+        self.delivered_count = 0;
     }
 
     /// Begin an outbound connection. Generates a SYN packet and stores
@@ -398,7 +425,7 @@ pub const UtpSocket = struct {
                     result.data_len = @intCast(payload.len);
 
                     // Deliver any buffered out-of-order packets.
-                    result.reorder_delivered = self.deliverReordered();
+                    result.reorder_delivered = self.deliverReordered(&result);
                 } else if (seqLessThan(self.ack_nr +% 1, hdr.seq_nr)) {
                     // Future packet -- buffer for reordering.
                     self.bufferReorder(hdr.seq_nr, payload);
@@ -680,26 +707,73 @@ pub const UtpSocket = struct {
     }
 
     fn bufferReorder(self: *UtpSocket, seq: u16, data: []const u8) void {
+        // Reject too-far-future packets (outside the 64-slot window).
         const offset = seqDiff(seq, self.ack_nr +% 1);
         if (offset <= 0 or offset >= max_reorder_buf) return;
-        const idx: usize = @intCast(@as(u16, @intCast(offset)) % max_reorder_buf);
+        // Must index by absolute `seq % max_reorder_buf` so `deliverReordered`
+        // can find the slot when the gap is filled. Indexing by `offset`
+        // (the prior bug) hides entries from the deliverer because
+        // `next_seq % max_reorder_buf` does not equal
+        // `(next_seq - ack_nr - 1) % max_reorder_buf` in the general case.
+        const idx: usize = seq % max_reorder_buf;
+
+        const alloc = self.allocator orelse return;
+
+        // Free any prior occupant of this slot. A duplicate retransmit at
+        // the same sequence number, or a stale entry left over after a
+        // delivery cycle that didn't visit this slot, would otherwise leak.
+        if (self.reorder_buf[idx].data) |old| {
+            alloc.free(old);
+            self.reorder_buf[idx].data = null;
+        }
+
+        // Copy the payload into per-slot owned storage. The source slice
+        // points into `event_loop.utp_recv_buf`, which is reused on every
+        // datagram — a borrowed slice would be a use-after-free by the
+        // time the gap is filled and the deliverer reads it.
+        const owned = alloc.alloc(u8, data.len) catch {
+            self.reorder_buf[idx].present = false;
+            return;
+        };
+        @memcpy(owned, data);
+
         self.reorder_buf[idx] = .{
             .seq_nr = seq,
-            .data = data,
+            .data = owned,
             .present = true,
         };
     }
 
-    fn deliverReordered(self: *UtpSocket) u16 {
+    fn deliverReordered(self: *UtpSocket, result: *ProcessResult) u16 {
+        // Free the previous batch's delivered payloads. Slices the caller
+        // received via `ProcessResult.reorder_data` are valid up to (but
+        // not including) the next `deliverReordered` call on the same
+        // socket — that's the contract documented on `ProcessResult`.
+        if (self.allocator) |alloc| {
+            for (self.delivered_payloads[0..self.delivered_count]) |maybe| {
+                if (maybe) |buf| alloc.free(buf);
+            }
+        }
+        @memset(self.delivered_payloads[0..self.delivered_count], null);
+        self.delivered_count = 0;
+
         var count: u16 = 0;
         while (count < max_reorder_buf) {
             const next_seq = self.ack_nr +% 1;
-            const idx: usize = @intCast(next_seq % max_reorder_buf);
+            const idx: usize = next_seq % max_reorder_buf;
             if (!self.reorder_buf[idx].present or self.reorder_buf[idx].seq_nr != next_seq) break;
             self.ack_nr = next_seq;
+            // Transfer ownership: the slice stays alive in
+            // `delivered_payloads` so the caller can read it through
+            // `result.reorder_data` for the duration of result handling.
+            const owned = self.reorder_buf[idx].data;
+            self.delivered_payloads[count] = owned;
+            result.reorder_data[count] = owned;
+            self.reorder_buf[idx].data = null;
             self.reorder_buf[idx].present = false;
             count += 1;
         }
+        self.delivered_count = count;
         return count;
     }
 };
@@ -714,6 +788,14 @@ pub const ProcessResult = struct {
     data_len: u16 = 0,
     /// Number of additional packets delivered from the reorder buffer.
     reorder_delivered: u16 = 0,
+    /// Slices to the payloads delivered from the reorder buffer.
+    /// Indexed `[0, reorder_delivered)`, in ascending sequence order.
+    /// Each slice references socket-owned storage (`UtpSocket.delivered_payloads`)
+    /// and remains valid until the next call to `processPacket` on the
+    /// same socket, after which the storage may be freed and reused.
+    /// The caller must consume (or copy) these payloads before the next
+    /// processPacket invocation.
+    reorder_data: [max_reorder_buf]?[]const u8 = [_]?[]const u8{null} ** max_reorder_buf,
 };
 
 /// An entry returned by collectRetransmits -- a packet that needs resending.
@@ -967,47 +1049,267 @@ test "out-of-order packet is buffered" {
     try std.testing.expectEqual(@as(u16, 5), sock.ack_nr);
 }
 
-// ── Reorder buffer regression test (failing-first) ─────────
+// ── Reorder buffer regression tests ────────────────────────
 //
-// The reorder buffer has an indexing mismatch (filed in
-// `progress-reports/2026-04-26-audit-hunt-round3.md`):
-// `bufferReorder` indexes by offset from `ack_nr+1` but
-// `deliverReordered` indexes by absolute `seq_nr % max_reorder_buf`.
-// Stored entries are unreachable, so out-of-order packets are silently
-// dropped today. This test should fail on the broken implementation and
-// pass once the indexing is consistent.
+// The reorder buffer historically had two bugs (filed in
+// `progress-reports/2026-04-26-audit-hunt-round3.md` and fixed
+// alongside this test surface):
+//
+//   1. Indexing mismatch — `bufferReorder` indexed by offset from
+//      `ack_nr+1` but `deliverReordered` indexed by absolute
+//      `seq_nr % max_reorder_buf`. Stored entries were unreachable, so
+//      out-of-order packets were silently dropped.
+//   2. Slice ownership — `data` was a borrowed slice into the shared
+//      `event_loop.utp_recv_buf`. After the next datagram arrived the
+//      deliverer would have read whatever happened to be there last —
+//      a use-after-free that the indexing bug masked.
+
+fn makeReorderHdr(seq: u16) Header {
+    return .{
+        .packet_type = .st_data,
+        .extension = .none,
+        .connection_id = 10,
+        .timestamp_us = 100,
+        .timestamp_diff_us = 0,
+        .wnd_size = 65536,
+        .seq_nr = seq,
+        .ack_nr = 0,
+    };
+}
 
 test "reorder buffer delivers buffered packets when gap is filled" {
+    const allocator = std.testing.allocator;
     var sock = UtpSocket{};
+    sock.allocator = allocator;
     sock.state = .connected;
     sock.send_id = 10;
     sock.ack_nr = 5;
-
-    const make_pkt = struct {
-        fn f(seq: u16) Header {
-            return .{
-                .packet_type = .st_data,
-                .extension = .none,
-                .connection_id = 10,
-                .timestamp_us = 100,
-                .timestamp_diff_us = 0,
-                .wnd_size = 65536,
-                .seq_nr = seq,
-                .ack_nr = 0,
-            };
-        }
-    }.f;
+    defer sock.deinit();
 
     // Buffer seq 8 and seq 7 out of order (gap at seq 6).
-    _ = sock.processPacket(make_pkt(8), "eight", 200);
-    _ = sock.processPacket(make_pkt(7), "seven", 200);
+    _ = sock.processPacket(makeReorderHdr(8), "eight", 200);
+    _ = sock.processPacket(makeReorderHdr(7), "seven", 200);
     try std.testing.expectEqual(@as(u16, 5), sock.ack_nr);
 
     // Seq 6 fills the gap. Reorder delivery should drain seq 7 and 8.
-    const result = sock.processPacket(make_pkt(6), "six", 200);
+    const result = sock.processPacket(makeReorderHdr(6), "six", 200);
     try std.testing.expectEqualStrings("six", result.data.?);
     try std.testing.expectEqual(@as(u16, 2), result.reorder_delivered);
     try std.testing.expectEqual(@as(u16, 8), sock.ack_nr);
+    try std.testing.expectEqualStrings("seven", result.reorder_data[0].?);
+    try std.testing.expectEqualStrings("eight", result.reorder_data[1].?);
+}
+
+test "reorder buffer delivers reverse-ordered burst with correct content" {
+    const allocator = std.testing.allocator;
+    var sock = UtpSocket{};
+    sock.allocator = allocator;
+    sock.state = .connected;
+    sock.send_id = 10;
+    sock.ack_nr = 0;
+    defer sock.deinit();
+
+    // Receive seq 5, 4, 3, 2 (out of order); then seq 1 fills the gap.
+    _ = sock.processPacket(makeReorderHdr(5), "PKT5", 200);
+    _ = sock.processPacket(makeReorderHdr(4), "PKT4", 200);
+    _ = sock.processPacket(makeReorderHdr(3), "PKT3", 200);
+    _ = sock.processPacket(makeReorderHdr(2), "PKT2", 200);
+    try std.testing.expectEqual(@as(u16, 0), sock.ack_nr);
+
+    const result = sock.processPacket(makeReorderHdr(1), "PKT1", 200);
+    try std.testing.expectEqualStrings("PKT1", result.data.?);
+    try std.testing.expectEqual(@as(u16, 4), result.reorder_delivered);
+    try std.testing.expectEqual(@as(u16, 5), sock.ack_nr);
+
+    // Verify the buffered payloads were delivered in correct order with
+    // correct content.
+    try std.testing.expectEqualStrings("PKT2", result.reorder_data[0].?);
+    try std.testing.expectEqualStrings("PKT3", result.reorder_data[1].?);
+    try std.testing.expectEqualStrings("PKT4", result.reorder_data[2].?);
+    try std.testing.expectEqualStrings("PKT5", result.reorder_data[3].?);
+}
+
+test "reorder buffer survives utp_recv_buf reuse (UAF regression)" {
+    // The exact UAF scenario the round-3 audit flagged: bufferReorder
+    // historically stored a borrowed slice into a shared recv buffer.
+    // After the next datagram arrived and overwrote the buffer, the
+    // deliverer would have read whatever happened to be there last,
+    // not the original payload. This test reproduces the scenario by
+    // mutating the source buffer between buffering and delivery and
+    // asserting the delivered content matches what was originally
+    // received.
+    const allocator = std.testing.allocator;
+    var sock = UtpSocket{};
+    sock.allocator = allocator;
+    sock.state = .connected;
+    sock.send_id = 10;
+    sock.ack_nr = 0;
+    defer sock.deinit();
+
+    var shared_recv_buf: [16]u8 = undefined;
+
+    // First datagram: seq 2 (out of order). Payload "ORIGINAL".
+    @memcpy(shared_recv_buf[0..8], "ORIGINAL");
+    _ = sock.processPacket(makeReorderHdr(2), shared_recv_buf[0..8], 200);
+
+    // Reuse the recv buffer with garbage — this is what would happen
+    // when the next UDP datagram arrives. A borrowed-slice implementation
+    // would now have its reorder entry pointing at "GARBAGE!".
+    @memcpy(shared_recv_buf[0..8], "GARBAGE!");
+
+    // Now seq 1 arrives in-order, also reusing the same buffer. The
+    // reorder delivery must surface the ORIGINAL bytes, not GARBAGE.
+    @memcpy(shared_recv_buf[0..6], "FIRST!");
+    const result = sock.processPacket(makeReorderHdr(1), shared_recv_buf[0..6], 300);
+    try std.testing.expectEqualStrings("FIRST!", result.data.?);
+    try std.testing.expectEqual(@as(u16, 1), result.reorder_delivered);
+    try std.testing.expectEqualStrings("ORIGINAL", result.reorder_data[0].?);
+}
+
+test "reorder buffer delivers across multiple bursts without slot collision" {
+    // Sequence numbers reuse the 64-slot index space. After delivering
+    // one batch, buffer the next one and assert no collision with
+    // leftover state and no leak (testing.allocator catches leaks).
+    const allocator = std.testing.allocator;
+    var sock = UtpSocket{};
+    sock.allocator = allocator;
+    sock.state = .connected;
+    sock.send_id = 10;
+    sock.ack_nr = 0;
+    defer sock.deinit();
+
+    // Burst 1: buffer seq 3, 2 with ack_nr=0; deliver via seq 1.
+    _ = sock.processPacket(makeReorderHdr(3), "AAA", 200);
+    _ = sock.processPacket(makeReorderHdr(2), "BBB", 200);
+    const r1 = sock.processPacket(makeReorderHdr(1), "CCC", 200);
+    try std.testing.expectEqual(@as(u16, 2), r1.reorder_delivered);
+    try std.testing.expectEqual(@as(u16, 3), sock.ack_nr);
+
+    // Burst 2: buffer seq 6, 5 with ack_nr=3; deliver via seq 4.
+    _ = sock.processPacket(makeReorderHdr(6), "DDD", 300);
+    _ = sock.processPacket(makeReorderHdr(5), "EEE", 300);
+    const r2 = sock.processPacket(makeReorderHdr(4), "FFF", 300);
+    try std.testing.expectEqualStrings("FFF", r2.data.?);
+    try std.testing.expectEqual(@as(u16, 2), r2.reorder_delivered);
+    try std.testing.expectEqualStrings("EEE", r2.reorder_data[0].?);
+    try std.testing.expectEqualStrings("DDD", r2.reorder_data[1].?);
+    try std.testing.expectEqual(@as(u16, 6), sock.ack_nr);
+}
+
+test "reorder buffer slot eviction frees prior occupant" {
+    // If a peer (re)transmits a duplicate out-of-order packet to the
+    // same slot, bufferReorder must free the previous occupant before
+    // writing the new copy. testing.allocator catches leaks. This also
+    // exercises the slot-eviction path: 64 slots filled with full-sized
+    // payloads, then re-filled with new payloads after the first batch
+    // is delivered.
+    const allocator = std.testing.allocator;
+    var sock = UtpSocket{};
+    sock.allocator = allocator;
+    sock.state = .connected;
+    sock.send_id = 10;
+    sock.ack_nr = 0;
+    defer sock.deinit();
+
+    // Buffer seq 3 once; then again with different content (eviction).
+    _ = sock.processPacket(makeReorderHdr(3), "FIRST", 200);
+    _ = sock.processPacket(makeReorderHdr(3), "SECOND", 200);
+
+    // Buffer seq 2 and deliver via seq 1.
+    _ = sock.processPacket(makeReorderHdr(2), "TWO", 200);
+    const r = sock.processPacket(makeReorderHdr(1), "ONE", 200);
+    try std.testing.expectEqual(@as(u16, 2), r.reorder_delivered);
+    // The latest copy of seq 3 should have won; SECOND, not FIRST.
+    try std.testing.expectEqualStrings("TWO", r.reorder_data[0].?);
+    try std.testing.expectEqualStrings("SECOND", r.reorder_data[1].?);
+}
+
+test "reorder buffer fills 63 slots and delivers cleanly" {
+    // The window allows offsets in (0, 64) — i.e. up to 63 buffered
+    // packets ahead of the gap. Fill all 63 slots, then deliver via
+    // the gap-filler. testing.allocator catches leaks across the
+    // full-buffer path.
+    const allocator = std.testing.allocator;
+    var sock = UtpSocket{};
+    sock.allocator = allocator;
+    sock.state = .connected;
+    sock.send_id = 10;
+    sock.ack_nr = 0;
+    defer sock.deinit();
+
+    // Buffer seq 64..2 (63 packets, all out of order). The gap is at 1.
+    var seq: u16 = 64;
+    while (seq >= 2) : (seq -= 1) {
+        var payload_buf: [4]u8 = undefined;
+        std.mem.writeInt(u16, payload_buf[0..2], seq, .big);
+        payload_buf[2] = 0xCC;
+        payload_buf[3] = 0xDD;
+        _ = sock.processPacket(makeReorderHdr(seq), &payload_buf, 200);
+    }
+    try std.testing.expectEqual(@as(u16, 0), sock.ack_nr);
+
+    // Fill the gap with seq 1. All 63 buffered packets should drain.
+    const r = sock.processPacket(makeReorderHdr(1), "GAP!", 200);
+    try std.testing.expectEqual(@as(u16, 63), r.reorder_delivered);
+    try std.testing.expectEqual(@as(u16, 64), sock.ack_nr);
+    // Spot-check the first and last payloads in delivery order.
+    var expected_first: [4]u8 = undefined;
+    std.mem.writeInt(u16, expected_first[0..2], 2, .big);
+    expected_first[2] = 0xCC;
+    expected_first[3] = 0xDD;
+    try std.testing.expectEqualSlices(u8, &expected_first, r.reorder_data[0].?);
+    var expected_last: [4]u8 = undefined;
+    std.mem.writeInt(u16, expected_last[0..2], 64, .big);
+    expected_last[2] = 0xCC;
+    expected_last[3] = 0xDD;
+    try std.testing.expectEqualSlices(u8, &expected_last, r.reorder_data[62].?);
+}
+
+test "reorder buffer deinit frees pending slots without leak" {
+    // If a socket is destroyed with reorder slots still occupied
+    // (e.g. peer aborted before the gap filled), deinit must free
+    // every owned payload. testing.allocator catches leaks.
+    const allocator = std.testing.allocator;
+    var sock = UtpSocket{};
+    sock.allocator = allocator;
+    sock.state = .connected;
+    sock.send_id = 10;
+    sock.ack_nr = 0;
+
+    // Buffer several out-of-order packets and never deliver them.
+    _ = sock.processPacket(makeReorderHdr(5), "x", 200);
+    _ = sock.processPacket(makeReorderHdr(7), "yy", 200);
+    _ = sock.processPacket(makeReorderHdr(9), "zzz", 200);
+
+    sock.deinit();
+    // No leak = pass.
+}
+
+test "reorder buffer rejects out-of-window seq numbers" {
+    // The 64-slot window only accepts offsets in (0, 64). A peer
+    // sending seq=ack_nr+>=64 must be silently dropped, not buffered
+    // (otherwise it could overwrite an in-window slot because of the
+    // modular indexing).
+    const allocator = std.testing.allocator;
+    var sock = UtpSocket{};
+    sock.allocator = allocator;
+    sock.state = .connected;
+    sock.send_id = 10;
+    sock.ack_nr = 0;
+    defer sock.deinit();
+
+    // Buffer a legitimate seq 5.
+    _ = sock.processPacket(makeReorderHdr(5), "legit", 200);
+    try std.testing.expect(sock.reorder_buf[5].present);
+    try std.testing.expectEqualStrings("legit", sock.reorder_buf[5].data.?);
+
+    // Send seq 69 (offset = 69, beyond the 64-slot window). This must
+    // not displace the legitimate seq 5 entry (idx = 5 % 64 = 5, shared
+    // with seq 5 + 64 = 69 — the window check is what stops the imposter).
+    _ = sock.processPacket(makeReorderHdr(69), "evilevil", 200);
+    try std.testing.expect(sock.reorder_buf[5].present);
+    try std.testing.expectEqualStrings("legit", sock.reorder_buf[5].data.?);
+    try std.testing.expectEqual(@as(u16, 5), sock.reorder_buf[5].seq_nr);
 }
 
 test "FIN transitions to closed" {

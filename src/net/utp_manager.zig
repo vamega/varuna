@@ -98,19 +98,31 @@ pub const UtpManager = struct {
         const sock = self.connections[slot].?;
         const result = sock.processPacket(hdr, payload, now_us);
 
-        // Check for connection close.
-        if (sock.state == .closed or sock.state == .reset) {
-            self.freeSlot(slot);
-        }
-
-        return .{
+        var packet_result = PacketResult{
             .slot = slot,
             .response = result.response,
             .data = result.data,
             .data_len = result.data_len,
+            .reorder_delivered = result.reorder_delivered,
+            .reorder_data = result.reorder_data,
             .remote = remote,
             .new_connection = false,
         };
+
+        // Check for connection close. Note: freeSlot destroys the
+        // socket and frees `sock.delivered_payloads`, so any slices
+        // we copied into `packet_result.reorder_data` would dangle.
+        // The protocol guarantees no data is delivered for a closed/
+        // reset socket — `processPacket` short-circuits in `.st_fin`
+        // and `.st_reset` before reaching the data path — so an
+        // empty `reorder_data` is the only safe outcome here.
+        if (sock.state == .closed or sock.state == .reset) {
+            packet_result.reorder_delivered = 0;
+            packet_result.reorder_data = [_]?[]const u8{null} ** utp.max_reorder_buf;
+            self.freeSlot(slot);
+        }
+
+        return packet_result;
     }
 
     /// Close a connection gracefully by sending FIN.
@@ -318,6 +330,14 @@ pub const PacketResult = struct {
     response: ?[Header.size]u8,
     data: ?[]const u8,
     data_len: u16,
+    /// Number of additional payloads drained from the reorder buffer.
+    /// The slices are in `reorder_data[0..reorder_delivered]`.
+    reorder_delivered: u16 = 0,
+    /// Slices to payloads delivered from the reorder buffer (in
+    /// ascending sequence order). Each slice points into per-socket
+    /// owned storage and is only valid until the next call to
+    /// `UtpManager.processPacket` on the same connection.
+    reorder_data: [utp.max_reorder_buf]?[]const u8 = [_]?[]const u8{null} ** utp.max_reorder_buf,
     remote: std.net.Address,
     new_connection: bool,
 };

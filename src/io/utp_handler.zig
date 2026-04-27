@@ -208,9 +208,18 @@ fn handleUtpRecvResult(self: anytype, recv_res: i32) void {
         checkOutboundUtpConnect(self, result.slot, mgr);
     }
 
-    // Handle delivered data for existing connections
+    // Handle delivered data for existing connections.
     if (result.data) |utp_data| {
         deliverUtpData(self, result.slot, utp_data);
+    }
+    // Drain any payloads that the reorder buffer flushed in this call
+    // (out-of-order packets whose gap was just filled). Slices reference
+    // socket-owned storage that's freed on the next processPacket call;
+    // deliverUtpData copies into the peer's body buffer immediately.
+    for (0..result.reorder_delivered) |i| {
+        if (result.reorder_data[i]) |buf| {
+            deliverUtpData(self, result.slot, buf);
+        }
     }
 }
 
