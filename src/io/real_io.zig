@@ -24,6 +24,7 @@ const Operation = ifc.Operation;
 const Result = ifc.Result;
 const Callback = ifc.Callback;
 const CallbackAction = ifc.CallbackAction;
+const ring_mod = @import("ring.zig");
 
 // ── Backend state ─────────────────────────────────────────
 //
@@ -79,14 +80,21 @@ pub const Config = struct {
 
 pub const RealIO = struct {
     ring: linux.IoUring,
+    /// Per-op feature flags determined once via `IORING_REGISTER_PROBE`
+    /// at init. Branch points consult this instead of doing version
+    /// arithmetic on `uname(2)` so we pick up backports / custom
+    /// kernels that compiled in newer ops without bumping their
+    /// reported version.
+    feature_support: ring_mod.FeatureSupport,
 
     pub fn init(config: Config) !RealIO {
         // Fall back to plain init if the kernel doesn't accept the requested
         // flags (e.g. COOP_TASKRUN / SINGLE_ISSUER on older kernels). Mirrors
         // the policy in `ring.zig:initIoUring`.
-        const ring = linux.IoUring.init(config.entries, config.flags) catch
+        var ring = linux.IoUring.init(config.entries, config.flags) catch
             try linux.IoUring.init(config.entries, 0);
-        return .{ .ring = ring };
+        const features = ring_mod.probeFeatures(&ring);
+        return .{ .ring = ring, .feature_support = features };
     }
 
     pub fn deinit(self: *RealIO) void {
@@ -236,30 +244,46 @@ pub const RealIO = struct {
         _ = sqe;
     }
 
-    /// `truncate` is synchronous on RealIO: `IORING_OP_FTRUNCATE` was
-    /// added in Linux 6.9, while varuna's kernel floor (per
-    /// `src/runtime/requirements.zig`) is 6.6 minimum / 6.8 preferred.
-    /// Until the floor bumps to 6.9+ we fall back to a direct
-    /// `posix.ftruncate(2)` and fire the completion's callback inline.
+    /// `truncate` dispatches based on the kernel's `IORING_OP_FTRUNCATE`
+    /// support, probed once at `init` via `IORING_REGISTER_PROBE`:
     ///
-    /// The only daemon caller is the `PieceStore.init` filesystem-
+    ///   * **Async path** (kernel ≥6.9, `feature_support.supports_ftruncate
+    ///     == true`): submit `IORING_OP_FTRUNCATE` like any other ring op.
+    ///     The CQE flows through `dispatchCqe` and `buildResult` returns
+    ///     `voidOrError(cqe)` for `.truncate`. Matches the existing
+    ///     `IORING_OP_FALLOCATE` shape exactly.
+    ///
+    ///   * **Sync path** (kernel <6.9, or any kernel where the probe
+    ///     register itself is unsupported): fall back to a direct
+    ///     `posix.ftruncate(2)` and fire the completion's callback
+    ///     inline. In_flight is cleared before invoking the callback so
+    ///     a callback that re-submits a new op on the same completion
+    ///     doesn't trip `error.AlreadyInFlight` against itself
+    ///     (mirrors `dispatchCqe`). `.rearm` is iterated via an inner
+    ///     loop rather than recursing through `resubmit` to dodge the
+    ///     inferred-error-set cycle that truncate→resubmit→truncate
+    ///     would create.
+    ///
+    /// The only daemon caller is `PieceStore.init`'s filesystem-
     /// portability fallback (when fallocate returns
     /// `error.OperationNotSupported` on tmpfs <5.10, FAT32, certain FUSE
-    /// FSes). That path runs on a background thread (see
-    /// `doStartBackground` in `src/daemon/torrent_session.zig`), so a
-    /// synchronous syscall has zero event-loop-thread impact.
-    ///
-    /// Mirrors the contract's "callback fires before submission returns"
-    /// shape used by SimIO-style synchronous completion: in_flight is
-    /// cleared before invoking the callback so a callback that
-    /// re-submits a new op on the same completion doesn't trip
-    /// `error.AlreadyInFlight` against itself. Match `dispatchCqe`.
-    ///
-    /// `.rearm` is iterated as a loop rather than via recursion through
-    /// `resubmit` to avoid an inferred-error-set cycle (truncate →
-    /// resubmit → truncate). Truncate is one-shot in practice; this
-    /// matches the contract's semantics without the recursion footgun.
+    /// FSes). That path already runs on a background thread (see
+    /// `doStartBackground` in `src/daemon/torrent_session.zig`), so the
+    /// sync fallback has zero event-loop-thread impact when it fires.
     pub fn truncate(self: *RealIO, op_in: ifc.TruncateOp, c: *Completion, ud: ?*anyopaque, cb: Callback) !void {
+        if (self.feature_support.supports_ftruncate) {
+            try self.armCompletion(c, .{ .truncate = op_in }, ud, cb);
+            const sqe = try self.ring.get_sqe();
+            // `IORING_OP_FTRUNCATE` (kernel 6.9+) takes the new file
+            // length in `sqe->off`; addr/len/rw_flags/buf_index/
+            // splice_fd_in must all be zero or the kernel returns
+            // EINVAL. `prep_rw(.FTRUNCATE, fd, addr=0, len=0,
+            // offset=length)` produces exactly that shape.
+            sqe.prep_rw(.FTRUNCATE, op_in.fd, 0, 0, op_in.length);
+            sqe.user_data = @intFromPtr(c);
+            return;
+        }
+
         var op = op_in;
         while (true) {
             try self.armCompletion(c, .{ .truncate = op }, ud, cb);
@@ -379,10 +403,14 @@ fn buildResult(op: Operation, cqe: linux.io_uring_cqe) Result {
         .write => .{ .write = countOrError(cqe) },
         .fsync => .{ .fsync = voidOrError(cqe) },
         .fallocate => .{ .fallocate = voidOrError(cqe) },
-        // truncate completes synchronously inside `RealIO.truncate`; if
-        // it ever reaches the CQE dispatch path that's a bug. Surface as
-        // a loud error so it doesn't silently masquerade as success.
-        .truncate => .{ .truncate = error.UnknownOperation },
+        // On kernels with `IORING_OP_FTRUNCATE` support
+        // (`feature_support.supports_ftruncate == true`), truncate flows
+        // through the ring exactly like fallocate/fsync — the CQE
+        // carries either 0 (success) or a negative errno. On older
+        // kernels truncate completes synchronously inside
+        // `RealIO.truncate` and never reaches `dispatchCqe`, so this
+        // branch is unreachable in that case.
+        .truncate => .{ .truncate = voidOrError(cqe) },
         .socket => .{ .socket = fdOrError(cqe) },
         .connect => .{ .connect = voidOrError(cqe) },
         .accept => .{ .accept = acceptResult(cqe) },
@@ -680,12 +708,15 @@ test "RealIO fsync on tempfile succeeds" {
     }
 }
 
-test "RealIO truncate extends a tempfile synchronously" {
-    // Truncate is the one synchronous-completion op in the contract:
-    // IORING_OP_FTRUNCATE requires kernel ≥6.9, above varuna's floor
-    // (6.6 minimum / 6.8 preferred). Until the floor bumps it falls
-    // back to `posix.ftruncate(2)` and fires the callback inline. This
-    // test exercises that path and confirms the fd's size matches.
+test "RealIO truncate extends a tempfile via the runtime-detected path" {
+    // Truncate dispatches at runtime based on
+    // `feature_support.supports_ftruncate` (probed at init via
+    // IORING_REGISTER_PROBE). On kernel ≥6.9 it submits
+    // `IORING_OP_FTRUNCATE` and the CQE flows through dispatchCqe
+    // (test must `tick(1)`). On older kernels it falls back to a
+    // synchronous `posix.ftruncate(2)` and fires the callback inline
+    // (no tick needed). This test handles both paths and confirms the
+    // fd's size matches the requested length either way.
     var io = try skipIfUnavailable();
     defer io.deinit();
 
@@ -698,7 +729,11 @@ test "RealIO truncate extends a tempfile synchronously" {
     var c = Completion{};
     var ctx = TestCtx{};
     try io.truncate(.{ .fd = file.handle, .length = 4096 }, &c, &ctx, testCallback);
-    // No tick required — truncate completes inline.
+
+    if (ctx.calls == 0) {
+        // Async path: callback fires from the CQE, drive one tick.
+        try io.tick(1);
+    }
 
     try testing.expectEqual(@as(u32, 1), ctx.calls);
     switch (ctx.last_result.?) {
@@ -709,4 +744,65 @@ test "RealIO truncate extends a tempfile synchronously" {
     // Verify the file actually grew to 4 KiB.
     const stat = try posix.fstat(file.handle);
     try testing.expectEqual(@as(@TypeOf(stat.size), 4096), stat.size);
+}
+
+test "RealIO truncate via async path (kernel ≥6.9 only)" {
+    // Skip when the running kernel doesn't support IORING_OP_FTRUNCATE.
+    // Otherwise force-confirm the SQE-submission path: the callback
+    // must NOT have fired before `tick(1)` because the async path
+    // delegates completion to the kernel.
+    var io = try skipIfUnavailable();
+    defer io.deinit();
+
+    if (!io.feature_support.supports_ftruncate) return error.SkipZigTest;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const file = try tmp.dir.createFile("truncate_async_test", .{ .truncate = true });
+    defer file.close();
+
+    var c = Completion{};
+    var ctx = TestCtx{};
+    try io.truncate(.{ .fd = file.handle, .length = 8192 }, &c, &ctx, testCallback);
+
+    // Async submission must NOT have completed yet.
+    try testing.expectEqual(@as(u32, 0), ctx.calls);
+
+    try io.tick(1);
+
+    try testing.expectEqual(@as(u32, 1), ctx.calls);
+    switch (ctx.last_result.?) {
+        .truncate => |r| try r,
+        else => try testing.expect(false),
+    }
+
+    const stat = try posix.fstat(file.handle);
+    try testing.expectEqual(@as(@TypeOf(stat.size), 8192), stat.size);
+}
+
+test "RealIO truncate shrinks file via async path" {
+    var io = try skipIfUnavailable();
+    defer io.deinit();
+    if (!io.feature_support.supports_ftruncate) return error.SkipZigTest;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const file = try tmp.dir.createFile("truncate_shrink", .{ .truncate = true });
+    defer file.close();
+    _ = try posix.write(file.handle, "0123456789"); // 10 bytes
+
+    var c = Completion{};
+    var ctx = TestCtx{};
+    try io.truncate(.{ .fd = file.handle, .length = 4 }, &c, &ctx, testCallback);
+    try io.tick(1);
+
+    try testing.expectEqual(@as(u32, 1), ctx.calls);
+    switch (ctx.last_result.?) {
+        .truncate => |r| try r,
+        else => try testing.expect(false),
+    }
+    const stat = try posix.fstat(file.handle);
+    try testing.expectEqual(@as(@TypeOf(stat.size), 4), stat.size);
 }

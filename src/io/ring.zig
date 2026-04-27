@@ -102,6 +102,42 @@ pub fn probe() bool {
     return true;
 }
 
+/// Per-op feature flags determined at ring init via
+/// `IORING_REGISTER_PROBE`. Add fields here as new ops need runtime
+/// detection (e.g. `IORING_OP_BIND`/`LISTEN` at 6.11+,
+/// `IORING_OP_SETSOCKOPT` at 6.7+). The probe runs once per ring; the
+/// result is cached on the backend.
+///
+/// Default-initialized values are all `false` — i.e. the safe answer
+/// when we cannot determine support, which is what we want every caller
+/// to fall back on.
+pub const FeatureSupport = struct {
+    /// `IORING_OP_FTRUNCATE`, kernel ≥6.9. Below that, RealIO falls
+    /// back to a synchronous `posix.ftruncate(2)` (the only daemon
+    /// caller is `PieceStore.init`'s filesystem-portability fallback,
+    /// which already runs on a background thread).
+    supports_ftruncate: bool = false,
+
+    /// All-false sentinel used when the probe register itself isn't
+    /// supported (kernel <5.6) or fails for any other reason. Every op
+    /// gated on this struct must already have a synchronous fallback.
+    pub const none: FeatureSupport = .{};
+};
+
+/// Probe the running kernel's per-op io_uring support via
+/// `IORING_REGISTER_PROBE`. Caller owns `ring`; this function only
+/// reads from it. On kernels that don't support the probe register
+/// itself (kernel <5.6, returns `EINVAL`) we fall back to all-false —
+/// every op gated on `FeatureSupport` must have a synchronous fallback,
+/// so a failed probe is observably equivalent to "nothing extra is
+/// supported".
+pub fn probeFeatures(ring: *linux.IoUring) FeatureSupport {
+    const p = ring.get_probe() catch return FeatureSupport.none;
+    return .{
+        .supports_ftruncate = p.is_supported(.FTRUNCATE),
+    };
+}
+
 // ── Tests ─────────────────────────────────────────────────
 
 fn skipIfUnavailable() !linux.IoUring {
@@ -110,6 +146,22 @@ fn skipIfUnavailable() !linux.IoUring {
 
 test "probe detects io_uring availability" {
     _ = probe();
+}
+
+test "probeFeatures runs without panic and returns a FeatureSupport" {
+    var ring = skipIfUnavailable() catch return;
+    defer ring.deinit();
+
+    const features = probeFeatures(&ring);
+    // We can't assert a specific value without pinning to a kernel
+    // version: a 6.6 kernel reports `supports_ftruncate = false`, a
+    // 6.9+ kernel reports `true`. Either is acceptable.
+    _ = features;
+}
+
+test "probeFeatures FeatureSupport.none has every flag false" {
+    const none = FeatureSupport.none;
+    try std.testing.expectEqual(false, none.supports_ftruncate);
 }
 
 test "init and deinit ring" {
