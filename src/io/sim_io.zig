@@ -832,7 +832,13 @@ pub const SimIO = struct {
         if (r.float(f32) < self.config.faults.write_error_probability) {
             return self.schedule(c, .{ .write = error.NoSpaceLeft }, self.config.faults.write_latency_ns);
         }
-        return self.schedule(c, .{ .write = @as(usize, 0) }, self.config.faults.write_latency_ns);
+        // Real `write(2)` / `IORING_OP_WRITE` returns the number of bytes
+        // accepted, normally the full buffer length on regular files.
+        // Returning the full length lets `PieceStoreOf(SimIO).writePiece`
+        // (which loops on short writes the same way `pwriteAll` did) treat
+        // a successful write as "span done" instead of looping forever on
+        // a 0-byte response.
+        return self.schedule(c, .{ .write = op.buf.len }, self.config.faults.write_latency_ns);
     }
 
     pub fn fsync(self: *SimIO, op: ifc.FsyncOp, c: *Completion, ud: ?*anyopaque, cb: Callback) !void {

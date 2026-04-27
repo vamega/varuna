@@ -14,7 +14,7 @@ const io_interface = @import("../io/io_interface.zig");
 /// `PieceStoreOf(SimIO)` directly so the same init / sync paths drive
 /// against `EventLoopOf(SimIO)` for fault-injection harnesses.
 ///
-/// `init` and `sync` route their disk syscalls through `self.io`:
+/// All disk syscalls route through `self.io`:
 ///   * `init` submits one `fallocate` per non-skipped file and drains
 ///     the ring with `io.tick(1)` until every completion lands. This
 ///     is the one-time pre-allocation per torrent — AGENTS.md flags
@@ -22,10 +22,21 @@ const io_interface = @import("../io/io_interface.zig");
 ///     is what makes ENOSPC / EIO injection possible from BUGGIFY.
 ///   * `sync` submits one `fsync(datasync=true)` per open file, same
 ///     drain pattern. Replaces the previous `posix.fdatasync` loop.
+///   * `writePiece` submits one `io.write` per span (one span per file
+///     the piece touches) and drains until every completion lands. The
+///     callback handles short writes by re-submitting the remainder.
+///   * `readPiece` submits one `io.read` per span with the same drain
+///     pattern; short reads are looped, and a 0-byte completion before
+///     the span is satisfied surfaces as `error.UnexpectedEndOfFile`.
 ///
-/// `writePiece` and `readPiece` still use blocking `posix.pread` /
-/// `posix.pwrite` — their migration to async IO contract calls is a
-/// separate (larger) refactor tracked in STATUS.md.
+/// Note: the daemon's hot piece-write path (peer wire → disk) does NOT
+/// go through `PieceStore.writePiece` — `peer_policy` submits its own
+/// `self.io.write` calls per span using the shared fds from
+/// `PieceStore.fileHandles(...)`. `writePiece`/`readPiece` are reached
+/// only from the `varuna verify` CLI command (`recheckExistingData`)
+/// and tests that drive the store directly. Both contexts spin up
+/// their own io ring and block on `io.tick` until our completions
+/// land, so the "submit + drain" shape is the correct semantic.
 pub fn PieceStoreOf(comptime IO: type) type {
     return struct {
         const Self = @This();
@@ -128,31 +139,265 @@ pub fn PieceStoreOf(comptime IO: type) type {
             return file;
         }
 
+        /// Tracking state shared across the spans of a single
+        /// `writePiece` / `readPiece` call. Updated by each span's
+        /// completion callback; the caller polls `pending` and surfaces
+        /// `first_error` once all completions have landed.
+        const PieceIoCtx = struct {
+            pending: usize,
+            first_error: ?anyerror = null,
+        };
+
+        /// Per-span tracking for an in-flight `writePiece`. Heap-located
+        /// inside the caller's `states` slice so each span carries its
+        /// own `Completion` and the (possibly shrinking) `remaining` /
+        /// `offset` pair the short-write loop advances.
+        const WriteSpanState = struct {
+            parent: *Self,
+            ctx: *PieceIoCtx,
+            fd: posix.fd_t,
+            /// Buffer remaining to write; advances on short writes.
+            remaining: []const u8,
+            /// File offset for the next chunk; advances on short writes.
+            offset: u64,
+            completion: io_interface.Completion = .{},
+        };
+
+        /// Per-span tracking for an in-flight `readPiece`. Same shape
+        /// as `WriteSpanState` but with a mutable destination slice.
+        const ReadSpanState = struct {
+            parent: *Self,
+            ctx: *PieceIoCtx,
+            fd: posix.fd_t,
+            /// Destination remaining to fill; shrinks on short reads.
+            remaining: []u8,
+            /// File offset for the next chunk; advances on short reads.
+            offset: u64,
+            completion: io_interface.Completion = .{},
+        };
+
+        fn writeSpanCallback(
+            userdata: ?*anyopaque,
+            _: *io_interface.Completion,
+            result: io_interface.Result,
+        ) io_interface.CallbackAction {
+            const state: *WriteSpanState = @ptrCast(@alignCast(userdata.?));
+            const ctx = state.ctx;
+            switch (result) {
+                .write => |r| {
+                    if (r) |n| {
+                        if (n == 0) {
+                            // No progress and no error — treat as
+                            // unexpected end-of-file, matching the
+                            // pre-refactor `pwriteAll` semantics.
+                            if (ctx.first_error == null) ctx.first_error = error.UnexpectedEndOfFile;
+                            ctx.pending -= 1;
+                            return .disarm;
+                        }
+                        if (n >= state.remaining.len) {
+                            // Span fully written.
+                            ctx.pending -= 1;
+                            return .disarm;
+                        }
+                        // Short write — re-submit the remainder. The
+                        // backend has already cleared `in_flight` on
+                        // the completion before invoking the callback,
+                        // so `armCompletion` re-arms cleanly.
+                        state.remaining = state.remaining[n..];
+                        state.offset += n;
+                        state.parent.io.write(
+                            .{ .fd = state.fd, .buf = state.remaining, .offset = state.offset },
+                            &state.completion,
+                            state,
+                            writeSpanCallback,
+                        ) catch |err| {
+                            if (ctx.first_error == null) ctx.first_error = err;
+                            ctx.pending -= 1;
+                            return .disarm;
+                        };
+                        // We re-submitted: must NOT return .rearm (would
+                        // double-arm the completion). Backend now owns
+                        // it again until the next CQE.
+                        return .disarm;
+                    } else |err| {
+                        if (ctx.first_error == null) ctx.first_error = err;
+                        ctx.pending -= 1;
+                        return .disarm;
+                    }
+                },
+                else => unreachable,
+            }
+        }
+
+        fn readSpanCallback(
+            userdata: ?*anyopaque,
+            _: *io_interface.Completion,
+            result: io_interface.Result,
+        ) io_interface.CallbackAction {
+            const state: *ReadSpanState = @ptrCast(@alignCast(userdata.?));
+            const ctx = state.ctx;
+            switch (result) {
+                .read => |r| {
+                    if (r) |n| {
+                        if (n == 0) {
+                            // Premature EOF — file shorter than the span
+                            // requested. Matches the pre-refactor
+                            // `preadAll`-loop + length-check behaviour
+                            // that returned `error.UnexpectedEndOfFile`.
+                            if (ctx.first_error == null) ctx.first_error = error.UnexpectedEndOfFile;
+                            ctx.pending -= 1;
+                            return .disarm;
+                        }
+                        if (n >= state.remaining.len) {
+                            ctx.pending -= 1;
+                            return .disarm;
+                        }
+                        // Short read — re-submit for the remainder.
+                        state.remaining = state.remaining[n..];
+                        state.offset += n;
+                        state.parent.io.read(
+                            .{ .fd = state.fd, .buf = state.remaining, .offset = state.offset },
+                            &state.completion,
+                            state,
+                            readSpanCallback,
+                        ) catch |err| {
+                            if (ctx.first_error == null) ctx.first_error = err;
+                            ctx.pending -= 1;
+                            return .disarm;
+                        };
+                        return .disarm;
+                    } else |err| {
+                        if (ctx.first_error == null) ctx.first_error = err;
+                        ctx.pending -= 1;
+                        return .disarm;
+                    }
+                },
+                else => unreachable,
+            }
+        }
+
+        /// Write a piece to disk via async `io.write`. Submits one write
+        /// per span (one per file the piece touches) and blocks the
+        /// calling thread on `io.tick` until every completion lands.
+        /// Replaces the pre-2026-04-28 synchronous `pwriteAll` loop.
+        ///
+        /// Daemon hot path: peer wire → disk does NOT call this — see
+        /// `peer_policy.zig`'s direct `self.io.write` calls. Used by
+        /// the `varuna verify` CLI seed-file fixture, the recheck
+        /// integration tests, and the inline RealIO round-trip tests
+        /// below.
         pub fn writePiece(
             self: *Self,
             spans: []const torrent.layout.Layout.Span,
             piece_data: []const u8,
         ) !void {
+            if (spans.len == 0) return;
+
+            // Phase 1: ensure every span's file is open. `ensureFileOpen`
+            // may submit its own fallocate (and tick the ring); doing it
+            // up front keeps the per-span states stable for phase 3.
             for (spans) |span| {
-                const file = try self.ensureFileOpen(span.file_index);
-                const block = piece_data[span.piece_offset .. span.piece_offset + span.length];
-                try pwriteAll(file.handle, block, span.file_offset);
+                _ = try self.ensureFileOpen(span.file_index);
             }
+
+            // Phase 2: allocate per-span tracking state. Heap-allocated
+            // because each `WriteSpanState` carries its own `Completion`
+            // and the backend may write `_backend_state` until the
+            // callback fires.
+            const states = try self.allocator.alloc(WriteSpanState, spans.len);
+            defer self.allocator.free(states);
+            var ctx = PieceIoCtx{ .pending = spans.len };
+            for (spans, 0..) |span, i| {
+                const file = self.files[span.file_index].?;
+                const block = piece_data[span.piece_offset .. span.piece_offset + span.length];
+                states[i] = .{
+                    .parent = self,
+                    .ctx = &ctx,
+                    .fd = file.handle,
+                    .remaining = block,
+                    .offset = span.file_offset,
+                    .completion = .{},
+                };
+            }
+
+            // Phase 3: submit, then drain. Submission failures bubble
+            // up directly; if any submit succeeded earlier we'd leak
+            // pending counters — but `io.write` only fails before
+            // arming the completion, so `pending` doesn't include the
+            // failing submit. We need to fix `ctx.pending` in that
+            // case before returning.
+            var submitted: usize = 0;
+            for (states) |*state| {
+                self.io.write(
+                    .{ .fd = state.fd, .buf = state.remaining, .offset = state.offset },
+                    &state.completion,
+                    state,
+                    writeSpanCallback,
+                ) catch |err| {
+                    // Adjust pending to match what we actually submitted
+                    // so the drain loop terminates cleanly.
+                    ctx.pending -= (spans.len - submitted);
+                    while (ctx.pending > 0) try self.io.tick(1);
+                    if (ctx.first_error) |first| return first;
+                    return err;
+                };
+                submitted += 1;
+            }
+
+            while (ctx.pending > 0) try self.io.tick(1);
+            if (ctx.first_error) |err| return err;
         }
 
+        /// Read a piece from disk via async `io.read`. Submits one read
+        /// per span and blocks on `io.tick` until every completion
+        /// lands. Short reads are looped just like `preadAll` did; a
+        /// 0-byte completion before the span is satisfied surfaces as
+        /// `error.UnexpectedEndOfFile`.
+        ///
+        /// Used by the `varuna verify` CLI command via
+        /// `recheckExistingData` / `recheckV2`, and by tests that drive
+        /// the store directly. Not on the daemon hot path.
         pub fn readPiece(
             self: *Self,
             spans: []const torrent.layout.Layout.Span,
             piece_data: []u8,
         ) !void {
-            for (spans) |span| {
+            if (spans.len == 0) return;
+
+            const states = try self.allocator.alloc(ReadSpanState, spans.len);
+            defer self.allocator.free(states);
+            var ctx = PieceIoCtx{ .pending = spans.len };
+            for (spans, 0..) |span, i| {
                 const file = self.files[span.file_index] orelse return error.FileNotOpen;
                 const block = piece_data[span.piece_offset .. span.piece_offset + span.length];
-                const read_count = try preadAll(file.handle, block, span.file_offset);
-                if (read_count != block.len) {
-                    return error.UnexpectedEndOfFile;
-                }
+                states[i] = .{
+                    .parent = self,
+                    .ctx = &ctx,
+                    .fd = file.handle,
+                    .remaining = block,
+                    .offset = span.file_offset,
+                    .completion = .{},
+                };
             }
+
+            var submitted: usize = 0;
+            for (states) |*state| {
+                self.io.read(
+                    .{ .fd = state.fd, .buf = state.remaining, .offset = state.offset },
+                    &state.completion,
+                    state,
+                    readSpanCallback,
+                ) catch |err| {
+                    ctx.pending -= (spans.len - submitted);
+                    while (ctx.pending > 0) try self.io.tick(1);
+                    if (ctx.first_error) |first| return first;
+                    return err;
+                };
+                submitted += 1;
+            }
+
+            while (ctx.pending > 0) try self.io.tick(1);
+            if (ctx.first_error) |err| return err;
         }
 
         /// Flush all open files via async `io.fsync` (datasync). Submits one
@@ -214,59 +459,6 @@ pub fn PieceStoreOf(comptime IO: type) type {
 /// `PieceStore` and `PieceStore.method(...)`; tests that instantiate
 /// against SimIO write `PieceStoreOf(SimIO)` directly.
 pub const PieceStore = PieceStoreOf(RealIO);
-
-/// Lightweight piece I/O using pre-opened file descriptors.
-/// Does not own the fds -- the originating PieceStore must outlive this.
-pub const PieceIO = struct {
-    fds: []const posix.fd_t,
-
-    pub fn writePiece(
-        self: *PieceIO,
-        spans: []const torrent.layout.Layout.Span,
-        piece_data: []const u8,
-    ) !void {
-        for (spans) |span| {
-            const block = piece_data[span.piece_offset .. span.piece_offset + span.length];
-            try pwriteAll(self.fds[span.file_index], block, span.file_offset);
-        }
-    }
-
-    pub fn readPiece(
-        self: *PieceIO,
-        spans: []const torrent.layout.Layout.Span,
-        piece_data: []u8,
-    ) !void {
-        for (spans) |span| {
-            const block = piece_data[span.piece_offset .. span.piece_offset + span.length];
-            const read_count = try preadAll(self.fds[span.file_index], block, span.file_offset);
-            if (read_count != block.len) {
-                return error.UnexpectedEndOfFile;
-            }
-        }
-    }
-};
-
-/// Write all bytes via blocking pwrite, looping on short writes.
-fn pwriteAll(fd: posix.fd_t, buf: []const u8, offset: u64) !void {
-    var written: usize = 0;
-    while (written < buf.len) {
-        const n = try posix.pwrite(fd, buf[written..], offset + written);
-        if (n == 0) return error.UnexpectedEndOfFile;
-        written += n;
-    }
-}
-
-/// Read all bytes via blocking pread, looping on short reads.
-/// Returns the total number of bytes read.
-fn preadAll(fd: posix.fd_t, buf: []u8, offset: u64) !usize {
-    var total: usize = 0;
-    while (total < buf.len) {
-        const n = try posix.pread(fd, buf[total..], offset + total);
-        if (n == 0) break; // EOF
-        total += n;
-    }
-    return total;
-}
 
 /// Per-fallocate completion ticket: tracks pending count + first error,
 /// shared across the batch by &PreallocCtx in `userdata`. The fallback
