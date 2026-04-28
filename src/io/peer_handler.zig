@@ -933,12 +933,22 @@ fn handleDiskWriteResult(self: anytype, write_id: u32, res: i32) void {
                         const piece_length = sess.layout.pieceSize(piece_index) catch 0;
                         if (tc.piece_tracker) |pt| {
                             const first_completion = pt.completePiece(piece_index, piece_length);
-                            // Phase 1 of the piece-hash lifecycle: free the
-                            // SHA-1 hash now that the piece is verified-and-
-                            // persisted. Skip duplicate completions (endgame
-                            // races) since the first completion already
-                            // handled the lifecycle hook.
+                            // Mark the torrent as having un-fsync'd writes.
+                            // The pagecache holds this piece until either the
+                            // periodic sync timer, completion hook, or
+                            // shutdown drain submits an fsync sweep — see
+                            // `EventLoop.submitTorrentSync`. Bumped only on
+                            // the first completion to keep the counter aligned
+                            // with distinct verified-and-persisted pieces;
+                            // duplicate completions (endgame races) wrote the
+                            // same data so don't add new dirty state.
                             if (first_completion) {
+                                tc.dirty_writes_since_sync +|= 1;
+                                // Phase 1 of the piece-hash lifecycle: free the
+                                // SHA-1 hash now that the piece is verified-and-
+                                // persisted. Skip duplicate completions (endgame
+                                // races) since the first completion already
+                                // handled the lifecycle hook.
                                 peer_policy.onPieceVerifiedAndPersisted(self, pending_w.torrent_id, piece_index);
                             }
                         }

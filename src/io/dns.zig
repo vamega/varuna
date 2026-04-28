@@ -40,6 +40,68 @@ pub const DnsResolver = backend.DnsResolver;
 /// prefer DnsResolver.resolve().
 pub const resolveOnce = backend.resolveOnce;
 
+// ── Process-wide bind_device default ────────────────────────────
+//
+// Module-level so the daemon's main.zig can publish `network.bind_device`
+// before any `DnsResolver` is constructed, and every backend can read
+// it from inside its own constructor without rewiring the executor
+// create-sites (HttpExecutor / UdpTrackerExecutor) the way an init-
+// parameter would. The data-race shape: `setDefaultBindDevice` is
+// called once at daemon startup; every `DnsResolver.init` after that
+// reads it. No mutex needed because the read-only invariant holds for
+// the daemon lifetime — tests reset it to `null` in their setup if
+// they need to.
+//
+// Why the indirection at all: the threadpool backend sits behind
+// `getaddrinfo`, which owns its own UDP socket internally and gives
+// the application no opportunity to apply `SO_BINDTODEVICE`. The
+// c-ares backend, by contrast, exposes
+// `ares_set_socket_callback` — we register a callback that calls
+// `applyBindDevice(fd, device)` on every UDP/TCP socket c-ares creates,
+// closing the privacy gap that the threadpool backend cannot.
+//
+// See:
+//   - `docs/custom-dns-design-round2.md` §1 (the original audit
+//     finding).
+//   - STATUS.md "Known Issues" (the threadpool limitation entry).
+
+var module_default_bind_device: ?[]const u8 = null;
+
+/// Set the process-wide default `bind_device` (e.g. "wg0") applied to
+/// every newly-created `DnsResolver`. The daemon calls this from
+/// startup once `network.bind_device` is known. Pass `null` to clear.
+///
+/// **Lifetime contract**: the slice must outlive every `DnsResolver`
+/// that observes it (i.e. the entire daemon lifetime). The daemon
+/// borrows `cfg.network.bind_device`, which lives in the config arena
+/// for the daemon's lifetime, so this is naturally satisfied.
+///
+/// **Backend behavior**:
+///   - c-ares: `DnsResolver.init` registers an
+///     `ares_set_socket_callback` that calls `applyBindDevice(fd, device)`
+///     on every socket the channel creates. Result: c-ares DNS queries
+///     egress through the configured interface like every other socket.
+///   - threadpool: stored but cannot be applied. `getaddrinfo` owns
+///     its own UDP socket and does not honor `SO_BINDTODEVICE` from
+///     the caller. A privacy / correctness gap remains for the
+///     threadpool path; see STATUS.md "Known Issues" for the
+///     follow-up tied to the custom DNS library work.
+///
+/// Calling this with a different value at runtime affects only
+/// `DnsResolver` instances created *after* the call — existing
+/// resolvers retain whatever default they captured at init.
+pub fn setDefaultBindDevice(device: ?[]const u8) void {
+    module_default_bind_device = device;
+}
+
+/// Read the process-wide default `bind_device`. Backend constructors
+/// call this from inside their `init` to capture the device into a
+/// per-resolver field. Returns `null` if `setDefaultBindDevice` has
+/// not been called or was last called with `null`.
+pub fn defaultBindDevice() ?[]const u8 {
+    return module_default_bind_device;
+}
+
 /// Cache TTL bounds applied to every backend.
 ///
 /// Backends that can extract the authoritative DNS TTL from the response

@@ -105,7 +105,7 @@ Daemon paths that must use `io_uring`:
 `varuna-ctl` and `varuna-tools` are different: standard library I/O is acceptable there.
 
 Allowed daemon exceptions (background threads only):
-- SQLite operations -- must run on a dedicated background thread, never on the event-loop thread
+- SQLite operations -- the resume database (`src/storage/state_db.zig`) is opened with `SQLITE_OPEN_FULLMUTEX`, so SQLite's own internal mutex serialises concurrent access. The shared `ResumeDb` connection (held in `SessionManager.resume_db`) is intentionally accessed concurrently from worker threads (`TorrentSession.startWorker` background init), RPC handlers (settings / tracker-overrides loads), and the `QueueManager` (queue position persistence). The single hard invariant: never call SQLite from the event-loop thread, since SQLite syscalls block.
 - CPU-bound piece hashing -- the hasher thread pool in `src/io/hasher.zig`
 - one-time file creation, directory setup, and truncation during `PieceStore.init`
 - stdout logging

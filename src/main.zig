@@ -102,6 +102,16 @@ pub fn main() !void {
     shared_el.bind_device = cfg.network.bind_device;
     shared_el.bind_address = cfg.network.bind_address;
 
+    // Publish bind_device to the DNS module so newly-created
+    // DnsResolvers (HttpExecutor, UdpTrackerExecutor, etc.) can apply
+    // it. The c-ares backend honors it via ares_set_socket_callback;
+    // the threadpool backend (default) cannot — see STATUS.md "Known
+    // Issues" and `src/io/dns_threadpool.zig` for the limitation.
+    // Must be called BEFORE any DnsResolver is constructed; the DHT
+    // bootstrap path below resolves hostnames lazily, so we set this
+    // up first.
+    varuna.io.dns.setDefaultBindDevice(cfg.network.bind_device);
+
     // Apply MSE/PE encryption mode from config
     shared_el.encryption_mode = try varuna.config.parseEncryptionMode(cfg.network.encryption);
 
@@ -207,6 +217,13 @@ pub fn main() !void {
 
     // Submit timeout for shared event loop
     shared_el.submitTimeout(100 * std.time.ns_per_ms) catch {};
+
+    // Start the periodic torrent-durability sync sweep. Every
+    // `sync_timer_interval_ms` (30 s by default), every torrent with
+    // un-fsync'd writes gets one fsync per open file. Closes the gap
+    // where the OS pagecache controlled durability — see
+    // `docs/mmap-durability-audit.md` §R6.
+    shared_el.startPeriodicSync();
 
     // Listen socket for accepting inbound peer connections (created once, shared across torrents).
     // Created at startup so both downloading and seeding torrents can receive inbound connections.

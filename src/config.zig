@@ -184,6 +184,19 @@ pub const Config = struct {
         /// Global upload speed limit in bytes/sec. 0 = unlimited.
         ul_limit: u64 = 0,
         /// Network interface to bind to (e.g. "wg0"). Requires CAP_NET_RAW or root.
+        ///
+        /// **Coverage**: applied to peer connections (TCP listen + connect),
+        /// uTP / DHT UDP listener, RPC server accept, HTTP tracker client,
+        /// UDP tracker client, and (with `-Ddns=c_ares`) c-ares DNS sockets.
+        ///
+        /// **Known gap**: under the default `-Ddns=threadpool` backend,
+        /// DNS queries via `getaddrinfo` are NOT bound to this device —
+        /// `getaddrinfo` owns its UDP socket internally and offers no
+        /// hook for the application to apply `SO_BINDTODEVICE`. Switch
+        /// to `-Ddns=c_ares` if DNS-egress binding is required, or
+        /// see `docs/custom-dns-design-round2.md` §1 for the queued
+        /// custom-DNS-library follow-up. Recorded in STATUS.md
+        /// "Known Issues".
         bind_device: ?[]const u8 = null,
         /// Local IP address to bind to (e.g. "10.0.0.1").
         bind_address: ?[]const u8 = null,

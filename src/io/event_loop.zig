@@ -391,6 +391,17 @@ pub fn EventLoopOf(comptime IO: type) type {
         // Key = (torrent_id, piece_index), Value = heap-allocated DownloadingPiece.
         downloading_pieces: DownloadingPieceMap = .empty,
 
+        // ── Periodic durability sync ──────────────────────────
+        // Interval (ms) between periodic `submitTorrentSync` sweeps for
+        // every torrent with `dirty_writes_since_sync > 0`. 30 s matches
+        // the OS dirty-writeback default (`vm.dirty_expire_centisecs` =
+        // 3000 by default on Linux) — close enough that we're not adding
+        // material write amplification, but tight enough that a
+        // SIGKILL'd daemon loses at most ~30 s of pending pieces from
+        // pagecache rather than relying on the OS's eventual writeback.
+        sync_timer_interval_ms: u64 = 30_000,
+        sync_timer_armed: bool = false,
+
         // ── Lifecycle ──────────────────────────────────────────
 
         /// Create a bare event loop with no initial torrent (for daemon mode).
@@ -562,6 +573,22 @@ pub fn EventLoopOf(comptime IO: type) type {
             {
                 var flush_rounds: u32 = 0;
                 while (self.pending_writes.count() > 0 and flush_rounds < 100) : (flush_rounds += 1) {
+                    self.io.tick(1) catch break;
+                }
+            }
+
+            // ── Phase 0.5: Sync dirty torrents to disk ────────────────
+            // After every pending write has landed (Phase -1 / Phase 0
+            // drained them), submit one fsync sweep per torrent that
+            // has un-fsync'd writes. Then tick until those fsyncs
+            // complete. Without this the OS pagecache controls
+            // durability: a SIGKILL or power loss seconds after
+            // shutdown can lose recently-completed pieces. See
+            // `submitTorrentSync` for the per-fd mechanics.
+            {
+                _ = self.submitShutdownSync();
+                var sync_rounds: u32 = 0;
+                while (self.anySyncInFlight() and sync_rounds < 100) : (sync_rounds += 1) {
                     self.io.tick(1) catch break;
                 }
             }
@@ -1810,6 +1837,230 @@ pub fn EventLoopOf(comptime IO: type) type {
 
         pub fn stop(self: *Self) void {
             self.running = false;
+        }
+
+        // ── Per-torrent durability sync ──────────────────────────
+
+        /// Per-submission tracking for an in-flight `submitTorrentSync`.
+        /// Heap-allocated when the sweep starts; freed when the last
+        /// fsync CQE lands. The completions slab lives alongside so a
+        /// single allocation pair drops at the end.
+        ///
+        /// Why a heap-allocated context instead of a stack one: the
+        /// callback can fire long after the submitter returns (we don't
+        /// block on `io.tick` like `PieceStore.sync` does), so the ctx
+        /// must outlive the call frame.
+        const TorrentSyncCtx = struct {
+            el: *Self,
+            torrent_id: TorrentId,
+            pending: u32,
+            /// Snapshot of `dirty_writes_since_sync` at submit time. On
+            /// successful drain we subtract this (saturating at 0)
+            /// rather than zeroing — writes that completed *during*
+            /// the fsync sweep are still un-fsync'd and should remain
+            /// dirty for the next sync sweep to flush.
+            dirty_snapshot: u32,
+            /// First fsync error seen across the sweep, surfaced via
+            /// log only — the daemon has no good recovery path beyond
+            /// "try again next sync interval".
+            first_error: ?anyerror = null,
+            completions: []io_interface.Completion,
+        };
+
+        /// Submit one async fsync per open file in `tc.shared_fds` for
+        /// the given torrent, datasync mode (skip metadata, like the
+        /// existing `PieceStore.sync` shape). The sweep is fire-and-
+        /// forget at the call-site level: the per-fsync CQEs land later
+        /// and the last one frees the heap-allocated context, clears
+        /// `tc.sync_in_flight`, and decrements `dirty_writes_since_sync`
+        /// by the snapshotted count.
+        ///
+        /// Idempotent: if a sweep is already in flight for this torrent
+        /// (`tc.sync_in_flight`), returns immediately so periodic timer
+        /// + completion-hook + shutdown drain don't pile parallel
+        /// fsyncs on the same fds. Also returns if `dirty_writes_since_sync`
+        /// is zero (nothing to flush).
+        ///
+        /// Caller may pass `force_even_if_clean = true` to fsync regardless
+        /// of dirty count — used by the shutdown drain so a clean torrent
+        /// still flushes any earlier-session pagecache before exit.
+        pub fn submitTorrentSync(
+            self: *Self,
+            torrent_id: TorrentId,
+            force_even_if_clean: bool,
+        ) void {
+            const tc = self.getTorrentContext(torrent_id) orelse return;
+            if (tc.sync_in_flight) return;
+            if (!force_even_if_clean and tc.dirty_writes_since_sync == 0) return;
+
+            // Count non-skipped fds (do_not_download files have fd == -1).
+            var open_count: u32 = 0;
+            for (tc.shared_fds) |fd| {
+                if (fd >= 0) open_count += 1;
+            }
+            if (open_count == 0) return;
+
+            const completions = self.allocator.alignedAlloc(
+                io_interface.Completion,
+                .of(io_interface.Completion),
+                open_count,
+            ) catch |err| {
+                log.warn("torrent {d} sync alloc completions: {s}", .{ torrent_id, @errorName(err) });
+                return;
+            };
+            @memset(completions, .{});
+
+            const ctx = self.allocator.create(TorrentSyncCtx) catch |err| {
+                log.warn("torrent {d} sync alloc ctx: {s}", .{ torrent_id, @errorName(err) });
+                self.allocator.free(completions);
+                return;
+            };
+            ctx.* = .{
+                .el = self,
+                .torrent_id = torrent_id,
+                .pending = open_count,
+                .dirty_snapshot = tc.dirty_writes_since_sync,
+                .completions = completions,
+            };
+            tc.sync_in_flight = true;
+
+            var i: usize = 0;
+            for (tc.shared_fds) |fd| {
+                if (fd < 0) continue;
+                self.io.fsync(
+                    .{ .fd = fd, .datasync = true },
+                    &completions[i],
+                    ctx,
+                    torrentSyncCallback,
+                ) catch |err| {
+                    log.warn("torrent {d} fsync submit fd={d}: {s}", .{ torrent_id, fd, @errorName(err) });
+                    if (ctx.first_error == null) ctx.first_error = err;
+                    ctx.pending -= 1;
+                };
+                i += 1;
+            }
+
+            // If every submit failed before arming any completion, the
+            // pending counter is already at 0 — clean up here since the
+            // callback will never fire.
+            if (ctx.pending == 0) {
+                tc.sync_in_flight = false;
+                self.allocator.free(ctx.completions);
+                self.allocator.destroy(ctx);
+            }
+        }
+
+        fn torrentSyncCallback(
+            userdata: ?*anyopaque,
+            _: *io_interface.Completion,
+            result: io_interface.Result,
+        ) io_interface.CallbackAction {
+            const ctx: *TorrentSyncCtx = @ptrCast(@alignCast(userdata.?));
+            std.debug.assert(ctx.pending > 0);
+            ctx.pending -= 1;
+            switch (result) {
+                .fsync => |r| _ = r catch |err| {
+                    if (ctx.first_error == null) ctx.first_error = err;
+                    log.warn("torrent {d} fsync CQE: {s}", .{ ctx.torrent_id, @errorName(err) });
+                },
+                else => {
+                    // Defensive: an unexpected result variant means a
+                    // backend mis-routed our completion. Log and
+                    // continue draining so we don't deadlock the ctx
+                    // refcount.
+                    log.warn("torrent {d} sync: unexpected result variant", .{ctx.torrent_id});
+                },
+            }
+
+            if (ctx.pending == 0) {
+                if (ctx.el.getTorrentContext(ctx.torrent_id)) |tc| {
+                    tc.sync_in_flight = false;
+                    if (ctx.first_error == null) {
+                        // Saturating subtract: any writes that completed
+                        // during the sweep stay dirty for the next pass.
+                        tc.dirty_writes_since_sync -|= ctx.dirty_snapshot;
+                    }
+                    // On error: leave dirty count untouched so the next
+                    // periodic sync retries.
+                }
+                ctx.el.allocator.free(ctx.completions);
+                ctx.el.allocator.destroy(ctx);
+            }
+            return .disarm;
+        }
+
+        /// Schedule the periodic torrent-sync sweep. Self-rescheduling:
+        /// each fire iterates every torrent and submits a sync sweep
+        /// for those with `dirty_writes_since_sync > 0`, then re-arms
+        /// the timer. Idempotent — repeated calls don't stack timers
+        /// thanks to the `sync_timer_armed` flag.
+        ///
+        /// Called once from the daemon's startup path after the
+        /// EventLoop is fully wired. Stops re-arming itself when the
+        /// loop enters drain (`self.draining = true`); the shutdown
+        /// path runs its own final sync sweep through `submitTorrentSync`.
+        pub fn startPeriodicSync(self: *Self) void {
+            if (self.sync_timer_armed) return;
+            self.armPeriodicSync();
+        }
+
+        fn armPeriodicSync(self: *Self) void {
+            if (self.draining) return;
+            self.scheduleTimer(self.sync_timer_interval_ms, self, periodicSyncFire) catch |err| {
+                log.warn("periodic sync arm failed: {s}", .{@errorName(err)});
+                self.sync_timer_armed = false;
+                return;
+            };
+            self.sync_timer_armed = true;
+        }
+
+        fn periodicSyncFire(ctx: *anyopaque) void {
+            const self: *Self = @ptrCast(@alignCast(ctx));
+            self.sync_timer_armed = false;
+
+            // Stop self-rearming once we're draining — the shutdown path
+            // submits its own sync sweep that includes every dirty torrent.
+            if (self.draining) return;
+
+            for (self.torrents.items, 0..) |maybe_tc, idx| {
+                if (maybe_tc) |tc| {
+                    if (tc.active and tc.dirty_writes_since_sync > 0 and !tc.sync_in_flight) {
+                        self.submitTorrentSync(@intCast(idx), false);
+                    }
+                }
+            }
+
+            // Re-arm for the next interval.
+            self.armPeriodicSync();
+        }
+
+        /// Submit a sync sweep for every torrent. Used by the shutdown
+        /// drain path so any pieces that landed in the pagecache during
+        /// the session reach disk before fds close. Returns the number
+        /// of sweeps submitted so the caller can decide whether to tick
+        /// the ring waiting for completions.
+        pub fn submitShutdownSync(self: *Self) u32 {
+            var submitted: u32 = 0;
+            for (self.torrents.items, 0..) |maybe_tc, idx| {
+                if (maybe_tc) |tc| {
+                    if (tc.dirty_writes_since_sync > 0 and !tc.sync_in_flight) {
+                        self.submitTorrentSync(@intCast(idx), false);
+                        submitted += 1;
+                    }
+                }
+            }
+            return submitted;
+        }
+
+        /// True iff any torrent has an in-flight sync sweep. Used by
+        /// `deinit` to drain shutdown syncs before closing fds.
+        pub fn anySyncInFlight(self: *const Self) bool {
+            for (self.torrents.items) |maybe_tc| {
+                if (maybe_tc) |tc| {
+                    if (tc.sync_in_flight) return true;
+                }
+            }
+            return false;
         }
 
         /// Process completed hash results from the background hasher.
