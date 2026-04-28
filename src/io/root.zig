@@ -23,6 +23,7 @@ pub const recheck = @import("recheck.zig");
 pub const backend = @import("backend.zig");
 pub const epoll_posix_io = @import("epoll_posix_io.zig");
 pub const epoll_mmap_io = @import("epoll_mmap_io.zig");
+pub const posix_file_pool = @import("posix_file_pool.zig");
 pub const real_io = @import("real_io.zig");
 pub const kqueue_posix_io = @import("kqueue_posix_io.zig");
 pub const kqueue_mmap_io = @import("kqueue_mmap_io.zig");
@@ -73,6 +74,7 @@ test {
     _ = backend;
     _ = epoll_posix_io;
     _ = epoll_mmap_io;
+    _ = posix_file_pool;
     _ = kqueue_posix_io;
     _ = kqueue_mmap_io;
     _ = real_io;
