@@ -157,11 +157,15 @@ pub fn build(b: *std.Build) void {
 
     // The daemon (varuna) and the thin RPC client (varuna-ctl) now route
     // through `src/io/backend.zig`, which dispatches on `-Dio=`. They
-    // build under any of the five production backends (`io_uring`,
-    // `epoll_posix`, `epoll_mmap`, `kqueue_posix`, `kqueue_mmap`). Only
-    // `-Dio=sim` skips them — the daemon cannot meaningfully run against
-    // the in-process simulator (sim is for tests, not production).
-    const build_daemon = io_backend != .sim;
+    // build under Linux-targeting production backends (`io_uring`,
+    // `epoll_posix`, `epoll_mmap`). The kqueue variants compile the IO
+    // module + tests for cross-compile validation but the daemon source
+    // still has Linux-specific deps (IoUring imports, SQLite, etc.) that
+    // need a separate macOS-port round before the daemon binary can build
+    // under kqueue. `-Dio=sim` always skips — the daemon doesn't
+    // meaningfully run against the in-process simulator (sim is for tests).
+    const build_daemon = target.result.os.tag == .linux and
+        (io_backend == .io_uring or io_backend == .epoll_posix or io_backend == .epoll_mmap);
 
     // varuna-tools and varuna-perf are CLI / benchmark binaries that
     // stay hard-coded to io_uring (`src/app.zig`, `src/storage/verify.zig`,
