@@ -1,9 +1,11 @@
 const std = @import("std");
 const posix = std.posix;
 const linux = std.os.linux;
+const TtlBounds = @import("dns.zig").TtlBounds;
 
 const c = @cImport({
     @cInclude("netdb.h");
+    @cInclude("sys/socket.h");
     @cInclude("ares.h");
 });
 
@@ -18,6 +20,13 @@ const c = @cImport({
 /// many concurrent DNS lookups (e.g., DHT scenarios with hundreds of nodes),
 /// because it avoids thread-per-lookup overhead.
 ///
+/// TTL handling: this backend uses `ares_getaddrinfo`, whose
+/// `ares_addrinfo_node.ai_ttl` exposes the authoritative DNS TTL. The
+/// answer's TTL is clamped into `ttl_bounds.[floor_s, cap_s]` (default
+/// 30 s - 1 h) before being applied to the cache entry. The threadpool
+/// backend (`-Ddns=threadpool`, default) cannot see TTL because
+/// getaddrinfo doesn't expose it; it uses the cap as a fixed lifetime.
+///
 /// Thread safety: all public methods are safe to call from any thread.
 /// The internal cache and c-ares channel are protected by a mutex.
 pub const DnsResolver = struct {
@@ -25,9 +34,7 @@ pub const DnsResolver = struct {
     mutex: std.Thread.Mutex = .{},
     channel: ?*c.ares_channel_t = null,
     allocator: std.mem.Allocator,
-
-    /// Default TTL for cached entries: 5 minutes.
-    const default_ttl_s: i64 = 5 * 60;
+    ttl_bounds: TtlBounds = TtlBounds.default,
 
     /// Maximum number of cached entries.
     const max_entries = 64;
@@ -49,6 +56,10 @@ pub const DnsResolver = struct {
     /// Result passed between the c-ares callback and the waiting caller.
     const QueryResult = struct {
         address: ?std.net.Address = null,
+        /// Authoritative DNS TTL from `ares_addrinfo_node.ai_ttl`,
+        /// pre-clamping. Negative or zero means "fall back to floor."
+        /// `null` means the callback didn't run (timeout).
+        answer_ttl_s: ?i32 = null,
         err: ?anyerror = null,
         done: bool = false,
     };
@@ -123,11 +134,14 @@ pub const DnsResolver = struct {
             }
         }
 
-        // Cache miss: resolve via c-ares
-        const address = try self.resolveWithCares(host, port);
+        // Cache miss: resolve via c-ares. The query result includes the
+        // authoritative DNS TTL via `ares_addrinfo_node.ai_ttl`.
+        var answer_ttl_s: u32 = self.ttl_bounds.floor_s;
+        const address = try self.resolveWithCares(host, port, &answer_ttl_s);
 
-        // Store in cache
-        self.put(allocator, host, address, now + default_ttl_s);
+        // Apply floor/cap to the authoritative TTL before caching.
+        const ttl_s: u32 = self.ttl_bounds.clamp(answer_ttl_s);
+        self.put(allocator, host, address, now + @as(i64, ttl_s));
 
         return address;
     }
@@ -202,7 +216,10 @@ pub const DnsResolver = struct {
     /// bounded by c-ares's own timeout (5 seconds). For integration with
     /// the daemon's main event loop, a future enhancement could use
     /// IORING_OP_POLL_ADD on the c-ares fds directly.
-    fn resolveWithCares(self: *DnsResolver, host: []const u8, port: u16) !std.net.Address {
+    ///
+    /// On success, writes the authoritative DNS TTL (from
+    /// `ares_addrinfo_node.ai_ttl`, before clamping) to `out_ttl_s`.
+    fn resolveWithCares(self: *DnsResolver, host: []const u8, port: u16, out_ttl_s: *u32) !std.net.Address {
         const ch = self.channel orelse return error.CaresNotInitialized;
 
         var result = QueryResult{};
@@ -213,13 +230,20 @@ pub const DnsResolver = struct {
         @memcpy(host_buf[0..host.len], host);
         host_buf[host.len] = 0;
 
+        // ares_getaddrinfo wants a hints struct; AF_UNSPEC + flags = 0
+        // matches the prior ares_gethostbyname behavior (whichever family
+        // the resolver returns first).
+        var hints: c.ares_addrinfo_hints = std.mem.zeroes(c.ares_addrinfo_hints);
+        hints.ai_family = c.AF_UNSPEC;
+
         // Start the async query
         self.mutex.lock();
-        c.ares_gethostbyname(
+        c.ares_getaddrinfo(
             ch,
             @ptrCast(&host_buf),
-            c.AF_UNSPEC,
-            caresCallback,
+            null, // service: not needed; we set the port on the returned address
+            &hints,
+            caresAddrInfoCallback,
             @ptrCast(&result),
         );
         self.mutex.unlock();
@@ -323,20 +347,29 @@ pub const DnsResolver = struct {
         if (result.address) |addr| {
             var resolved = addr;
             resolved.setPort(port);
+            // Hand the authoritative TTL up to the caller. ai_ttl can be
+            // <= 0 if c-ares didn't see a usable record (e.g. a synthetic
+            // /etc/hosts answer); fall back to the floor in that case so
+            // the cache still does something useful.
+            const raw_ttl = result.answer_ttl_s orelse 0;
+            out_ttl_s.* = if (raw_ttl > 0) @intCast(raw_ttl) else self.ttl_bounds.floor_s;
             return resolved;
         }
         return error.DnsResolutionFailed;
     }
 
-    /// c-ares host callback. Called by c-ares when a query completes.
-    fn caresCallback(
+    /// c-ares ares_getaddrinfo callback. Pulls the first address from
+    /// the linked list of `ares_addrinfo_node` entries and stashes the
+    /// node's `ai_ttl` for the resolver to clamp against its bounds.
+    fn caresAddrInfoCallback(
         arg: ?*anyopaque,
         status: c_int,
         _timeouts: c_int,
-        hostent: ?*const c.struct_hostent,
+        ai: ?*c.struct_ares_addrinfo,
     ) callconv(.c) void {
         _ = _timeouts;
         const result: *QueryResult = @ptrCast(@alignCast(arg));
+        defer if (ai) |p| c.ares_freeaddrinfo(p);
 
         if (status != c.ARES_SUCCESS) {
             result.err = switch (status) {
@@ -351,25 +384,32 @@ pub const DnsResolver = struct {
             return;
         }
 
-        const host = hostent orelse {
+        const info = ai orelse {
+            result.err = error.DnsResolutionFailed;
+            result.done = true;
+            return;
+        };
+        const node = info.nodes orelse {
             result.err = error.DnsResolutionFailed;
             result.done = true;
             return;
         };
 
-        // Get the first address from the hostent
-        const addr_list: [*]?[*]u8 = @ptrCast(host.h_addr_list);
-        const first_addr = addr_list[0] orelse {
+        result.answer_ttl_s = node.ai_ttl;
+
+        const sa = node.ai_addr orelse {
             result.err = error.DnsResolutionFailed;
             result.done = true;
             return;
         };
 
-        if (host.h_addrtype == c.AF_INET and host.h_length == 4) {
-            const bytes: *const [4]u8 = @ptrCast(first_addr);
+        if (node.ai_family == c.AF_INET) {
+            const sin: *const c.struct_sockaddr_in = @ptrCast(@alignCast(sa));
+            const bytes: *const [4]u8 = @ptrCast(&sin.sin_addr);
             result.address = std.net.Address.initIp4(bytes.*, 0);
-        } else if (host.h_addrtype == c.AF_INET6 and host.h_length == 16) {
-            const bytes: *const [16]u8 = @ptrCast(first_addr);
+        } else if (node.ai_family == c.AF_INET6) {
+            const sin6: *const c.struct_sockaddr_in6 = @ptrCast(@alignCast(sa));
+            const bytes: *const [16]u8 = @ptrCast(&sin6.sin6_addr);
             result.address = std.net.Address.initIp6(bytes.*, 0, 0, 0);
         } else {
             result.err = error.DnsResolutionFailed;
@@ -416,7 +456,8 @@ pub fn resolveOnce(allocator: std.mem.Allocator, host: []const u8, port: u16) !s
     var resolver = try DnsResolver.init(allocator);
     defer resolver.deinit(allocator);
 
-    return resolver.resolveWithCares(host, port);
+    var ttl_unused: u32 = 0;
+    return resolver.resolveWithCares(host, port, &ttl_unused);
 }
 
 // ── Tests ────────────────────────────────────────────────
@@ -558,6 +599,14 @@ test "c-ares cache respects port override on hit" {
 
     const resolved = try resolver.resolve(std.testing.allocator, "porttest.local", 6969);
     try std.testing.expectEqual(@as(u16, 6969), resolved.getPort());
+}
+
+test "c-ares ttl_bounds defaults are 30s floor / 1h cap" {
+    var resolver = try DnsResolver.init(std.testing.allocator);
+    defer resolver.deinit(std.testing.allocator);
+
+    try std.testing.expectEqual(@as(u32, 30), resolver.ttl_bounds.floor_s);
+    try std.testing.expectEqual(@as(u32, 3600), resolver.ttl_bounds.cap_s);
 }
 
 test "c-ares resolve localhost via real DNS" {

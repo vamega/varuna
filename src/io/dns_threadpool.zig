@@ -1,4 +1,5 @@
 const std = @import("std");
+const TtlBounds = @import("dns.zig").TtlBounds;
 
 /// Thread-safe DNS resolver with TTL-based caching and a real thread pool.
 ///
@@ -7,18 +8,23 @@ const std = @import("std");
 /// threads. The thread pool avoids the overhead of spawning and joining an
 /// OS thread per cache miss.
 ///
+/// TTL handling: `getaddrinfo` does not expose the authoritative DNS TTL,
+/// so this backend cannot honor it per-record. Instead, every cached
+/// entry uses a fixed lifetime of `ttl_bounds.cap_s` (default: 1 hour).
+/// This is a deliberate compromise: 1 hour matches the upper end of
+/// typical tracker announce intervals, so a steady-state re-announce
+/// hits the cache once per cycle. Recovery from a tracker IP migration
+/// is bounded by either (a) a connect-failure invalidation hook firing
+/// (see `shouldInvalidateOnConnectError`) or (b) the 1-hour cap. The
+/// c-ares backend (`-Ddns=c_ares`) honors authoritative TTLs.
+///
 /// Thread safety: all public methods are safe to call from any thread.
 /// The internal cache is protected by a mutex; the job queue has its own lock.
 pub const DnsResolver = struct {
     cache: Cache,
     cache_mutex: std.Thread.Mutex = .{},
     pool: *ThreadPool,
-
-    /// Default TTL for cached entries: 5 minutes.
-    /// Tracker hostnames rarely change, and re-announces happen every
-    /// 30-60 minutes, so 5 minutes provides freshness without excessive
-    /// DNS traffic.
-    const default_ttl_s: i64 = 5 * 60;
+    ttl_bounds: TtlBounds = TtlBounds.default,
 
     /// Maximum number of cached entries. Small because a typical torrent
     /// client talks to only a handful of tracker hostnames.
@@ -87,8 +93,9 @@ pub const DnsResolver = struct {
         // Cache miss: resolve via thread pool
         const address = try self.pool.resolve(host, port);
 
-        // Store in cache
-        self.put(allocator, host, address, now + default_ttl_s);
+        // Store in cache. getaddrinfo can't expose the authoritative
+        // TTL, so use the cap as a fixed lifetime.
+        self.put(allocator, host, address, now + @as(i64, self.ttl_bounds.cap_s));
 
         return address;
     }
@@ -157,9 +164,11 @@ pub const DnsResolver = struct {
 
     /// Cache a resolved address from an async DNS job that completed.
     /// Call this after resolveAsync returns .pending and the job completes.
+    /// getaddrinfo doesn't expose the authoritative TTL, so the entry
+    /// is cached for the configured cap (default 1 h).
     pub fn cacheResult(self: *DnsResolver, allocator: std.mem.Allocator, host: []const u8, address: std.net.Address) void {
         const now = std.time.timestamp();
-        self.put(allocator, host, address, now + default_ttl_s);
+        self.put(allocator, host, address, now + @as(i64, self.ttl_bounds.cap_s));
     }
 
     /// Invalidate a specific host entry from the cache.
@@ -656,4 +665,85 @@ test "threadpool cache respects port override on hit" {
     // Resolve with different port
     const resolved = try resolver.resolve(std.testing.allocator, "porttest.local", 6969);
     try std.testing.expectEqual(@as(u16, 6969), resolved.getPort());
+}
+
+test "threadpool cacheResult uses configured TTL cap (1 hour default)" {
+    // The threadpool backend can't see authoritative DNS TTLs because
+    // getaddrinfo doesn't expose them, so cached entries should expire
+    // after the configured cap (default 1 h, up from the previous fixed
+    // 5 min). This is the central behavior change in commit 2.
+    var resolver = try DnsResolver.init(std.testing.allocator);
+    defer resolver.deinit(std.testing.allocator);
+
+    const before = std.time.timestamp();
+    const addr = std.net.Address.initIp4(.{ 1, 2, 3, 4 }, 80);
+    resolver.cacheResult(std.testing.allocator, "ttl-cap.test", addr);
+    const after = std.time.timestamp();
+
+    const entry = resolver.cache.get("ttl-cap.test").?;
+    // Entry expires roughly `cap_s` after now (allow ±1 s for the
+    // timestamp call between before/after).
+    try std.testing.expect(entry.expires_at >= before + 3600);
+    try std.testing.expect(entry.expires_at <= after + 3600);
+}
+
+test "threadpool ttl_bounds.cap_s is configurable" {
+    var resolver = try DnsResolver.init(std.testing.allocator);
+    defer resolver.deinit(std.testing.allocator);
+    // Tighten the cap to 60 seconds for this test.
+    resolver.ttl_bounds = .{ .floor_s = 30, .cap_s = 60 };
+
+    const before = std.time.timestamp();
+    const addr = std.net.Address.initIp4(.{ 1, 2, 3, 4 }, 80);
+    resolver.cacheResult(std.testing.allocator, "tight-cap.test", addr);
+
+    const entry = resolver.cache.get("tight-cap.test").?;
+    try std.testing.expect(entry.expires_at >= before + 60);
+    try std.testing.expect(entry.expires_at <= before + 62);
+}
+
+test "threadpool: HttpClient invalidates DNS on connect refusal (regression)" {
+    // Regression for the 2026-04-30 DNS gap: a connect failure to a
+    // resolved IP must drop the cached entry so the next attempt
+    // re-resolves. Without the invalidate hook we'd burn the full TTL
+    // window on the same dead IP.
+    const HttpClient = @import("http_blocking.zig").HttpClient;
+    var resolver = try DnsResolver.init(std.testing.allocator);
+    defer resolver.deinit(std.testing.allocator);
+
+    // Pre-seed the cache so resolve() short-circuits to 127.0.0.1.
+    const cached_addr = std.net.Address.initIp4(.{ 127, 0, 0, 1 }, 80);
+    resolver.put(
+        std.testing.allocator,
+        "varuna-dns-fixes-regression.test",
+        cached_addr,
+        std.time.timestamp() + 3600,
+    );
+    try std.testing.expectEqual(@as(u32, 1), resolver.cache.count());
+
+    // Connect to a loopback port that nothing is listening on. Linux
+    // loopback returns ECONNREFUSED for closed ports, which is in our
+    // shouldInvalidateOnConnectError set.
+    var client = HttpClient.initWithDns(std.testing.allocator, &resolver);
+    defer client.deinit();
+
+    var url_buf = std.ArrayList(u8).empty;
+    defer url_buf.deinit(std.testing.allocator);
+    try url_buf.print(
+        std.testing.allocator,
+        "http://varuna-dns-fixes-regression.test:1/",
+        .{},
+    );
+
+    const result = client.get(url_buf.items);
+    if (result) |resp| {
+        var r = resp;
+        r.deinit();
+        return error.UnexpectedSuccess;
+    } else |_| {
+        // Any connect-side error is acceptable — what matters is that
+        // the invalidate hook fired.
+    }
+
+    try std.testing.expectEqual(@as(u32, 0), resolver.cache.count());
 }

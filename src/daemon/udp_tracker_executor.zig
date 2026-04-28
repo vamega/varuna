@@ -2,7 +2,8 @@ const std = @import("std");
 const posix = std.posix;
 const linux = std.os.linux;
 const udp = @import("../tracker/udp.zig");
-const DnsResolver = @import("../io/dns.zig").DnsResolver;
+const dns_mod = @import("../io/dns.zig");
+const DnsResolver = dns_mod.DnsResolver;
 const DnsJob = @import("../io/dns_threadpool.zig").DnsJob;
 
 const io_interface = @import("../io/io_interface.zig");
@@ -658,6 +659,12 @@ pub const UdpTrackerExecutor = struct {
 
             // Check overall deadline
             if (now >= slot.deadline) {
+                // Tracker did not respond within the overall deadline:
+                // BEP 15 has no separate "connect error" surface, so the
+                // analog of TCP's ConnectionTimedOut is "we sent
+                // datagrams to the resolved IP and nothing came back."
+                // Drop the cache entry so the next announce re-resolves.
+                self.dns_resolver.invalidate(self.allocator, slot.job.hostSlice());
                 self.completeSlot(@intCast(i), .{ .err = error.TrackerTimeout });
                 continue;
             }
@@ -667,6 +674,10 @@ pub const UdpTrackerExecutor = struct {
             if (now - slot.last_send_time >= timeout_secs) {
                 slot.attempt += 1;
                 if (slot.attempt > udp.max_retries) {
+                    // Same rationale as the deadline branch above: full
+                    // BEP 15 exponential backoff exhausted with no
+                    // response — the IP looks dead.
+                    self.dns_resolver.invalidate(self.allocator, slot.job.hostSlice());
                     self.completeSlot(@intCast(i), .{ .err = error.TrackerTimeout });
                     continue;
                 }

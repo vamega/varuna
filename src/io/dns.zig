@@ -40,6 +40,82 @@ pub const DnsResolver = backend.DnsResolver;
 /// prefer DnsResolver.resolve().
 pub const resolveOnce = backend.resolveOnce;
 
+/// Cache TTL bounds applied to every backend.
+///
+/// Backends that can extract the authoritative DNS TTL from the response
+/// (currently c-ares via `ai_ttl`) clamp the answer's TTL into
+/// `[cache_min_ttl_s, cache_max_ttl_s]`. Backends that cannot
+/// (`getaddrinfo` via the threadpool) use `cache_max_ttl_s` as a fixed
+/// cache lifetime.
+pub const TtlBounds = struct {
+    /// Floor (seconds). Bounds the case where an authoritative server
+    /// returns TTL=0 or a very low TTL during e.g. an infrastructure
+    /// migration; without this floor the cache would be defeated.
+    floor_s: u32 = 30,
+    /// Cap (seconds). Bounds the worst-case stale-IP window. Matches
+    /// the upper end of typical tracker announce intervals (30-60 min)
+    /// so a steady-state announce can hit the cache once per cycle and
+    /// re-resolve once the tracker's authoritative TTL allows.
+    cap_s: u32 = 60 * 60,
+
+    /// Default bounds: floor 30 s, cap 1 h. Tuned for tracker hostnames.
+    pub const default: TtlBounds = .{};
+
+    /// Clamp an authoritative TTL into the [floor, cap] window.
+    pub fn clamp(self: TtlBounds, answer_ttl_s: u32) u32 {
+        return std.math.clamp(answer_ttl_s, self.floor_s, self.cap_s);
+    }
+};
+
+/// Classify a connect-failure error to decide whether the cached DNS
+/// answer for the destination host should be invalidated.
+///
+/// Rationale: the goal is to invalidate only on errors that suggest the
+/// resolved IP itself is wrong (host has migrated, infrastructure moved,
+/// the DNS answer is stale). Errors that mean "the IP is fine but
+/// something else went wrong" (HTTP parse error, TLS handshake failure,
+/// 4xx tracker response, our own submit-side bug) must NOT invalidate
+/// the cache, or a single misbehaving tracker would cause us to thrash
+/// DNS on every announce.
+///
+/// Invalidate on:
+///   - error.ConnectionRefused      — peer rejected SYN; nothing live
+///                                    listens at that address
+///   - error.ConnectionTimedOut     — no SYN-ACK within deadline; covers
+///                                    both kernel ETIMEDOUT and the
+///                                    io_uring `link_timeout` case
+///   - error.NetworkUnreachable     — no route to that address family /
+///                                    network
+///   - error.HostUnreachable        — ICMP host unreachable
+///
+/// Do NOT invalidate on:
+///   - error.ConnectionResetByPeer  — connection was established, then
+///                                    reset by the peer mid-stream; the
+///                                    IP is reachable
+///   - error.BrokenPipe             — same: established connection
+///   - error.ConnectionAborted      — local-side abort, not a routing
+///                                    or address problem
+///   - error.OperationCanceled      — varuna initiated the cancel; tells
+///                                    us nothing about the IP
+///   - error.SubmitFailed/SocketCreateFailed — local-side resource
+///                                    failure, not an IP problem
+///   - error.RequestTimedOut        — overall request budget hit;
+///                                    distinct from connect-level
+///                                    ConnectionTimedOut and could fire
+///                                    after a successful connect
+///   - error.HttpProtocolError, parse errors, 4xx/5xx tracker responses
+///     — by definition the IP was reachable enough to talk back
+pub fn shouldInvalidateOnConnectError(err: anyerror) bool {
+    return switch (err) {
+        error.ConnectionRefused,
+        error.ConnectionTimedOut,
+        error.NetworkUnreachable,
+        error.HostUnreachable,
+        => true,
+        else => false,
+    };
+}
+
 // Re-export tests from the active backend so `zig build test` picks them up.
 comptime {
     _ = backend;
@@ -70,4 +146,50 @@ test "resolveOnce parses numeric addresses" {
 
     const addr6 = try resolveOnce(std.testing.allocator, "::1", 6881);
     try std.testing.expectEqual(@as(u16, 6881), addr6.getPort());
+}
+
+test "shouldInvalidateOnConnectError invalidates on routing/refusal errors" {
+    try std.testing.expect(shouldInvalidateOnConnectError(error.ConnectionRefused));
+    try std.testing.expect(shouldInvalidateOnConnectError(error.ConnectionTimedOut));
+    try std.testing.expect(shouldInvalidateOnConnectError(error.NetworkUnreachable));
+    try std.testing.expect(shouldInvalidateOnConnectError(error.HostUnreachable));
+}
+
+test "shouldInvalidateOnConnectError preserves cache on non-routing errors" {
+    try std.testing.expect(!shouldInvalidateOnConnectError(error.ConnectionResetByPeer));
+    try std.testing.expect(!shouldInvalidateOnConnectError(error.BrokenPipe));
+    try std.testing.expect(!shouldInvalidateOnConnectError(error.ConnectionAborted));
+    try std.testing.expect(!shouldInvalidateOnConnectError(error.OperationCanceled));
+    try std.testing.expect(!shouldInvalidateOnConnectError(error.SubmitFailed));
+    try std.testing.expect(!shouldInvalidateOnConnectError(error.SocketCreateFailed));
+    try std.testing.expect(!shouldInvalidateOnConnectError(error.RequestTimedOut));
+    try std.testing.expect(!shouldInvalidateOnConnectError(error.OutOfMemory));
+}
+
+test "TtlBounds.clamp floors low TTLs and caps high TTLs" {
+    const bounds = TtlBounds.default;
+
+    // TTL=0 (e.g. authoritative migration in progress) clamps to floor
+    try std.testing.expectEqual(@as(u32, 30), bounds.clamp(0));
+    try std.testing.expectEqual(@as(u32, 30), bounds.clamp(15));
+    // Boundary
+    try std.testing.expectEqual(@as(u32, 30), bounds.clamp(30));
+    try std.testing.expectEqual(@as(u32, 60), bounds.clamp(60));
+    // Within range passes through
+    try std.testing.expectEqual(@as(u32, 600), bounds.clamp(600));
+    try std.testing.expectEqual(@as(u32, 1800), bounds.clamp(1800));
+    // Boundary at cap
+    try std.testing.expectEqual(@as(u32, 3600), bounds.clamp(3600));
+    // Above cap clamps down
+    try std.testing.expectEqual(@as(u32, 3600), bounds.clamp(86400));
+    try std.testing.expectEqual(@as(u32, 3600), bounds.clamp(std.math.maxInt(u32)));
+}
+
+test "TtlBounds.clamp honors custom floor/cap" {
+    const tight: TtlBounds = .{ .floor_s = 60, .cap_s = 120 };
+    try std.testing.expectEqual(@as(u32, 60), tight.clamp(0));
+    try std.testing.expectEqual(@as(u32, 60), tight.clamp(30));
+    try std.testing.expectEqual(@as(u32, 90), tight.clamp(90));
+    try std.testing.expectEqual(@as(u32, 120), tight.clamp(120));
+    try std.testing.expectEqual(@as(u32, 120), tight.clamp(3600));
 }

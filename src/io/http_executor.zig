@@ -2,7 +2,8 @@ const std = @import("std");
 const posix = std.posix;
 const linux = std.os.linux;
 const ring_mod = @import("ring.zig");
-const DnsResolver = @import("dns.zig").DnsResolver;
+const dns_mod = @import("dns.zig");
+const DnsResolver = dns_mod.DnsResolver;
 const DnsJob = @import("../io/dns_threadpool.zig").DnsJob;
 const http = @import("http_parse.zig");
 const TlsStream = @import("tls.zig").TlsStream;
@@ -554,6 +555,14 @@ pub const HttpExecutor = struct {
 
         switch (result) {
             .connect => |r| r catch |err| {
+                // The resolved IP appears wrong/dead. Drop the cache entry
+                // so the next attempt re-resolves through DNS instead of
+                // burning the full TTL window on the same broken IP. See
+                // dns.shouldInvalidateOnConnectError for the variant
+                // classification.
+                if (dns_mod.shouldInvalidateOnConnectError(err)) {
+                    self.dns_resolver.invalidate(self.allocator, slot.job.hostSlice());
+                }
                 self.completeSlot(slot_idx, .{ .err = err });
                 return .disarm;
             },

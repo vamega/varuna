@@ -308,6 +308,68 @@ See `progress-reports/2026-04-25-stage2-event-loop-migration.md` for the Stage 2
 - ~~**Daemon graceful shutdown**~~: Fixed. In-flight transfer draining with configurable timeout now ensures clean exit on SIGTERM/SIGINT.
 - `IORING_OP_SETSOCKOPT` (kernel 6.7+), `IORING_OP_BIND`/`LISTEN` (kernel 6.11+) not available on current kernel 6.6. Per-peer setsockopt (TCP_NODELAY, buffer sizes) remains synchronous.
 
+## Last Verified Milestone (2026-04-30 — DNS resolver: connect-failure invalidate + bounded TTL honoring)
+
+Closes Open Question #1 from `docs/custom-dns-design.md` (the just-merged
+research round, commit `5c866e5`). Two contained correctness fixes to the
+existing `DnsResolver` cache, independent of the larger custom-DNS
+question.
+
+**Fix 1 — connect-failure invalidation (`698871c`)**: `DnsResolver.invalidate()`
+was exported but never called. When a tracker IP migrated or a CDN
+repointed, every subsequent announce would burn the full TTL window
+(then 5 min, now 1 h — see Fix 2) on the same dead IP. Now the four DNS
+consumers (HttpExecutor, HttpClient, UdpTrackerExecutor, plus
+`tracker/announce.zig` via HttpClient) call `invalidate(host)` on
+connect-failure variants that imply a stale resolved IP. Classification
+helper `dns.shouldInvalidateOnConnectError(err) -> bool`:
+
+  - **Invalidate**: `ConnectionRefused`, `ConnectionTimedOut` (covers
+    both kernel ETIMEDOUT and the io_uring `link_timeout` deadline),
+    `NetworkUnreachable`, `HostUnreachable`.
+  - **Keep cache**: `ConnectionResetByPeer`, `BrokenPipe`,
+    `ConnectionAborted`, `OperationCanceled`, `SubmitFailed`,
+    `SocketCreateFailed`, `RequestTimedOut`, parse / 4xx / 5xx errors.
+
+UDP-specific: BEP 15 has no separate connect surface, so `UdpTrackerExecutor`
+invalidates when either the overall 2-min deadline expires or the
+exponential-backoff retransmit schedule runs out — both mean "we sent
+datagrams to the resolved IP and nothing came back," the moral analog
+of TCP's `ConnectionTimedOut`.
+
+**Fix 2 — bounded TTL honoring (`5fe7e25`)**: the cache previously
+applied a fixed 5-minute TTL regardless of the authoritative response.
+Tracker announce intervals are typically 30-60 min, so steady-state
+re-announces re-resolved before nearly every request. New shared
+`TtlBounds` config (`floor_s = 30`, `cap_s = 3600`):
+
+  - **Floor (30 s)**: bounds the case where an authoritative server
+    publishes TTL=0 / a very low TTL (e.g. during a planned
+    migration). Without it, the cache would be defeated.
+  - **Cap (1 h)**: matches the upper end of typical announce
+    intervals; bounds the worst-case stale-IP window when a server
+    publishes very long TTLs. Recovery from a real IP migration is
+    bounded by this cap OR the Fix 1 invalidate hook, whichever
+    fires first.
+
+Backend behavior:
+
+  - `dns_threadpool` (default, `-Ddns=threadpool`): `getaddrinfo`
+    cannot expose the authoritative TTL, so this backend uses
+    `cap_s` as a fixed cache lifetime. Old default 5 min → new
+    default 1 h: ~12× reduction in steady-state lookups.
+  - `dns_cares` (`-Ddns=c_ares`): switches from the deprecated
+    `ares_gethostbyname` to `ares_getaddrinfo`, whose
+    `ares_addrinfo_node.ai_ttl` exposes the authoritative TTL.
+    Each cached entry's lifetime is `clamp(ai_ttl, floor_s, cap_s)`.
+    A TTL ≤ 0 (synthetic /etc/hosts records, etc.) falls back
+    to the floor.
+
+`ttl_bounds` is a public field on each backend's `DnsResolver` so
+callers / future config wiring can override per-instance.
+
+Branch: `worktree-dns-fixes`.
+
 ## Last Verified Milestone (2026-04-30 — POSIX file-op thread pool: EpollPosixIO + KqueuePosixIO)
 
 Wires `EpollPosixIO` and `KqueuePosixIO` file ops (read/write/fsync/

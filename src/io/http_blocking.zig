@@ -20,7 +20,8 @@
 const std = @import("std");
 const posix = std.posix;
 const linux = std.os.linux;
-const DnsResolver = @import("dns.zig").DnsResolver;
+const dns_mod = @import("dns.zig");
+const DnsResolver = dns_mod.DnsResolver;
 const build_options = @import("build_options");
 const TlsStream = @import("tls.zig").TlsStream;
 
@@ -187,6 +188,15 @@ pub const HttpClient = struct {
         posix.setsockopt(fd, posix.SOL.SOCKET, posix.SO.SNDTIMEO, std.mem.asBytes(&timeout_val)) catch {};
 
         posix.connect(fd, &address.any, address.getOsSockLen()) catch |err| {
+            // The resolved IP appears wrong/dead — drop it from the cache
+            // so the next attempt re-resolves. Only on errors that imply
+            // the IP itself is the problem; see
+            // dns.shouldInvalidateOnConnectError for the classification.
+            if (self.dns_resolver) |r| {
+                if (dns_mod.shouldInvalidateOnConnectError(err)) {
+                    r.invalidate(self.allocator, parsed.host);
+                }
+            }
             return switch (err) {
                 error.ConnectionTimedOut => error.ConnectionTimedOut,
                 error.ConnectionRefused => error.ConnectionRefused,
@@ -338,6 +348,13 @@ pub const HttpClient = struct {
         posix.setsockopt(fd, posix.SOL.SOCKET, posix.SO.SNDTIMEO, std.mem.asBytes(&timeout_val)) catch {};
 
         posix.connect(fd, &address.any, address.getOsSockLen()) catch |err| {
+            // Same invalidation rule as the plain-HTTP path; see
+            // openHttpConnection above.
+            if (self.dns_resolver) |r| {
+                if (dns_mod.shouldInvalidateOnConnectError(err)) {
+                    r.invalidate(self.allocator, parsed.host);
+                }
+            }
             return switch (err) {
                 error.ConnectionTimedOut => error.ConnectionTimedOut,
                 error.ConnectionRefused => error.ConnectionRefused,
