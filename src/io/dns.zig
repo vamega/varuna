@@ -40,67 +40,32 @@ pub const DnsResolver = backend.DnsResolver;
 /// prefer DnsResolver.resolve().
 pub const resolveOnce = backend.resolveOnce;
 
-// ── Process-wide bind_device default ────────────────────────────
-//
-// Module-level so the daemon's main.zig can publish `network.bind_device`
-// before any `DnsResolver` is constructed, and every backend can read
-// it from inside its own constructor without rewiring the executor
-// create-sites (HttpExecutor / UdpTrackerExecutor) the way an init-
-// parameter would. The data-race shape: `setDefaultBindDevice` is
-// called once at daemon startup; every `DnsResolver.init` after that
-// reads it. No mutex needed because the read-only invariant holds for
-// the daemon lifetime — tests reset it to `null` in their setup if
-// they need to.
-//
-// Why the indirection at all: the threadpool backend sits behind
-// `getaddrinfo`, which owns its own UDP socket internally and gives
-// the application no opportunity to apply `SO_BINDTODEVICE`. The
-// c-ares backend, by contrast, exposes
-// `ares_set_socket_callback` — we register a callback that calls
-// `applyBindDevice(fd, device)` on every UDP/TCP socket c-ares creates,
-// closing the privacy gap that the threadpool backend cannot.
-//
-// See:
-//   - `docs/custom-dns-design-round2.md` §1 (the original audit
-//     finding).
-//   - STATUS.md "Known Issues" (the threadpool limitation entry).
-
-var module_default_bind_device: ?[]const u8 = null;
-
-/// Set the process-wide default `bind_device` (e.g. "wg0") applied to
-/// every newly-created `DnsResolver`. The daemon calls this from
-/// startup once `network.bind_device` is known. Pass `null` to clear.
+/// Per-resolver init configuration. Plumbed explicitly through every
+/// caller that constructs a `DnsResolver` (HttpExecutor / TrackerExecutor
+/// / UdpTrackerExecutor → SessionManager → main).
 ///
-/// **Lifetime contract**: the slice must outlive every `DnsResolver`
-/// that observes it (i.e. the entire daemon lifetime). The daemon
-/// borrows `cfg.network.bind_device`, which lives in the config arena
-/// for the daemon's lifetime, so this is naturally satisfied.
+/// **`bind_device`**: when non-null (e.g. "wg0"), the c-ares backend
+/// registers an `ares_set_socket_callback` that applies `SO_BINDTODEVICE`
+/// to every UDP/TCP socket the channel creates, so DNS queries egress
+/// through the configured interface like peer / tracker / RPC traffic.
+/// The threadpool backend (`-Ddns=threadpool`, the build default)
+/// stores the value but cannot apply it — `getaddrinfo` owns its own
+/// UDP socket internally with no caller hook. See `docs/custom-dns-
+/// design-round2.md` §1 and STATUS.md "Known Issues" for the gap and
+/// the queued custom-DNS-library follow-up.
 ///
-/// **Backend behavior**:
-///   - c-ares: `DnsResolver.init` registers an
-///     `ares_set_socket_callback` that calls `applyBindDevice(fd, device)`
-///     on every socket the channel creates. Result: c-ares DNS queries
-///     egress through the configured interface like every other socket.
-///   - threadpool: stored but cannot be applied. `getaddrinfo` owns
-///     its own UDP socket and does not honor `SO_BINDTODEVICE` from
-///     the caller. A privacy / correctness gap remains for the
-///     threadpool path; see STATUS.md "Known Issues" for the
-///     follow-up tied to the custom DNS library work.
+/// **Lifetime contract**: when set, the slice must outlive the
+/// `DnsResolver`. The daemon's caller chain borrows it from
+/// `cfg.network.bind_device`, which lives in the config arena for the
+/// daemon's lifetime, so this is naturally satisfied.
 ///
-/// Calling this with a different value at runtime affects only
-/// `DnsResolver` instances created *after* the call — existing
-/// resolvers retain whatever default they captured at init.
-pub fn setDefaultBindDevice(device: ?[]const u8) void {
-    module_default_bind_device = device;
-}
-
-/// Read the process-wide default `bind_device`. Backend constructors
-/// call this from inside their `init` to capture the device into a
-/// per-resolver field. Returns `null` if `setDefaultBindDevice` has
-/// not been called or was last called with `null`.
-pub fn defaultBindDevice() ?[]const u8 {
-    return module_default_bind_device;
-}
+/// **`ttl_bounds`**: floor/cap applied to authoritative DNS TTLs (c-ares
+/// only — the threadpool backend uses `cap_s` as a fixed lifetime since
+/// `getaddrinfo` doesn't expose TTL).
+pub const Config = struct {
+    bind_device: ?[]const u8 = null,
+    ttl_bounds: TtlBounds = TtlBounds.default,
+};
 
 /// Cache TTL bounds applied to every backend.
 ///
@@ -187,7 +152,7 @@ comptime {
 // These tests verify the public API contract regardless of backend.
 
 test "DnsResolver resolves numeric ipv4 without caching" {
-    var resolver = try DnsResolver.init(std.testing.allocator);
+    var resolver = try DnsResolver.init(std.testing.allocator, .{});
     defer resolver.deinit(std.testing.allocator);
 
     const addr = try resolver.resolve(std.testing.allocator, "127.0.0.1", 8080);
@@ -195,11 +160,26 @@ test "DnsResolver resolves numeric ipv4 without caching" {
 }
 
 test "DnsResolver resolves numeric ipv6 without caching" {
-    var resolver = try DnsResolver.init(std.testing.allocator);
+    var resolver = try DnsResolver.init(std.testing.allocator, .{});
     defer resolver.deinit(std.testing.allocator);
 
     const addr = try resolver.resolve(std.testing.allocator, "::1", 9090);
     try std.testing.expectEqual(@as(u16, 9090), addr.getPort());
+}
+
+test "DnsResolver captures bind_device from Config" {
+    var resolver = try DnsResolver.init(std.testing.allocator, .{ .bind_device = "wg0" });
+    defer resolver.deinit(std.testing.allocator);
+
+    try std.testing.expect(resolver.bind_device != null);
+    try std.testing.expectEqualStrings("wg0", resolver.bind_device.?);
+}
+
+test "DnsResolver default Config has null bind_device" {
+    var resolver = try DnsResolver.init(std.testing.allocator, .{});
+    defer resolver.deinit(std.testing.allocator);
+
+    try std.testing.expect(resolver.bind_device == null);
 }
 
 test "resolveOnce parses numeric addresses" {

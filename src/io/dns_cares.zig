@@ -3,6 +3,7 @@ const posix = std.posix;
 const linux = std.os.linux;
 const dns = @import("dns.zig");
 const TtlBounds = dns.TtlBounds;
+const Config = dns.Config;
 const applyBindDevice = @import("../net/socket.zig").applyBindDevice;
 
 const c = @cImport({
@@ -37,16 +38,20 @@ pub const DnsResolver = struct {
     channel: ?*c.ares_channel_t = null,
     allocator: std.mem.Allocator,
     ttl_bounds: TtlBounds = TtlBounds.default,
-    /// Captured from `dns.defaultBindDevice()` at init time. When non-
-    /// null, the c-ares socket callback applies `SO_BINDTODEVICE` to
-    /// every UDP/TCP socket the channel opens so DNS queries egress
-    /// through the configured interface. Closes the privacy gap
-    /// described in `docs/custom-dns-design-round2.md` §1 for the
-    /// c-ares backend; the threadpool backend remains a Known Issue.
-    /// The slice lifetime is owned by the daemon's config (lives the
-    /// whole daemon lifetime), per the contract on
-    /// `dns.setDefaultBindDevice`.
+    /// Captured from `Config.bind_device` at init time. When non-null,
+    /// the c-ares socket callback applies `SO_BINDTODEVICE` to every
+    /// UDP/TCP socket the channel opens so DNS queries egress through
+    /// the configured interface. Closes the privacy gap described in
+    /// `docs/custom-dns-design-round2.md` §1 for the c-ares backend;
+    /// the threadpool backend remains a Known Issue. The slice
+    /// lifetime is owned by the caller (typically the daemon config
+    /// arena, alive for the whole daemon lifetime).
     bind_device: ?[]const u8 = null,
+    /// Heap-allocated stable cell registered as c-ares user_data. Owns
+    /// nothing but the indirection — the slice it points at is
+    /// caller-owned. Allocated only when `bind_device` is non-null;
+    /// freed in `deinit`.
+    bind_device_cell: ?*BindDeviceCell = null,
 
     /// Maximum number of cached entries.
     const max_entries = 64;
@@ -76,7 +81,7 @@ pub const DnsResolver = struct {
         done: bool = false,
     };
 
-    pub fn init(allocator: std.mem.Allocator) !DnsResolver {
+    pub fn init(allocator: std.mem.Allocator, config: Config) !DnsResolver {
         // Initialize the c-ares library (once globally is fine, but
         // ares_library_init is ref-counted and idempotent).
         const lib_rc = c.ares_library_init(c.ARES_LIB_INIT_ALL);
@@ -94,27 +99,25 @@ pub const DnsResolver = struct {
         );
         if (rc != c.ARES_SUCCESS) return error.CaresInitFailed;
 
-        const bind_device = dns.defaultBindDevice();
-
-        // When the daemon configured a bind_device, install a c-ares
+        // When the caller configured a bind_device, install a c-ares
         // socket-create callback that applies `SO_BINDTODEVICE` to
         // every UDP/TCP socket c-ares opens. Fires once per socket,
-        // before c-ares uses it for the query. Returning non-zero
-        // would fail the socket creation, so we tolerate
-        // `applyBindDevice` errors by logging and proceeding (so a
-        // misconfigured device name doesn't take down DNS entirely).
-        if (bind_device != null) {
-            // user_data is a stable pointer-width container holding
-            // the slice. The simplest stable cell is the
-            // `module_default_bind_device` global that
-            // `dns.defaultBindDevice` already returns; since the
-            // contract on `setDefaultBindDevice` is "set once, lives
-            // for the daemon's life," we re-read it inside the
-            // callback rather than capturing into a heap cell here.
+        // before c-ares uses it for the query. The user_data argument
+        // is a stable, heap-allocated `BindDeviceCell` whose lifetime
+        // is the resolver's: it owns the slice pointer and length,
+        // and the callback re-reads them on every invocation. We
+        // tolerate `applyBindDevice` errors by logging and returning
+        // 0 (so a misconfigured device name doesn't take down DNS
+        // entirely).
+        var device_cell: ?*BindDeviceCell = null;
+        if (config.bind_device) |device| {
+            const cell = try allocator.create(BindDeviceCell);
+            cell.* = .{ .device = device };
+            device_cell = cell;
             c.ares_set_socket_callback(
                 channel,
                 caresSocketCreateCallback,
-                null,
+                @ptrCast(cell),
             );
         }
 
@@ -122,9 +125,20 @@ pub const DnsResolver = struct {
             .cache = .{},
             .channel = channel,
             .allocator = allocator,
-            .bind_device = bind_device,
+            .ttl_bounds = config.ttl_bounds,
+            .bind_device = config.bind_device,
+            .bind_device_cell = device_cell,
         };
     }
+
+    /// Stable user_data cell for the c-ares socket callback. Heap-
+    /// allocated (lifetime tied to the resolver) so the callback can
+    /// always dereference a valid pointer regardless of where the
+    /// `DnsResolver` itself lives. Holds the bind_device slice the
+    /// caller passed into `init`.
+    const BindDeviceCell = struct {
+        device: []const u8,
+    };
 
     /// c-ares socket-create callback. Fires once per socket the channel
     /// opens (UDP for queries, TCP for retries when UDP truncates).
@@ -132,14 +146,8 @@ pub const DnsResolver = struct {
     /// interface so DNS queries egress through the same device as
     /// peer / tracker traffic.
     ///
-    /// Reads `dns.defaultBindDevice()` rather than the per-resolver
-    /// field because c-ares's callback signature does not give us a
-    /// safe way to recover the owning `DnsResolver*` from the
-    /// channel-level callback (the user_data slot would need a stable
-    /// heap cell, but the resolver itself moves between init's
-    /// stack-allocated return value and the caller's storage). Since
-    /// the bind_device default is process-wide and write-once, reading
-    /// the global directly is sound.
+    /// Reads the bind_device slice from the heap-allocated user_data
+    /// `BindDeviceCell` registered alongside the callback.
     ///
     /// Returns 0 on success (c-ares proceeds); a non-zero return
     /// would fail the socket creation, which in turn fails the DNS
@@ -148,13 +156,13 @@ pub const DnsResolver = struct {
     fn caresSocketCreateCallback(
         socket_fd: c.ares_socket_t,
         _: c_int, // type: SOCK_STREAM or SOCK_DGRAM (unused)
-        _: ?*anyopaque, // user_data (unused — see comment above)
+        user_data: ?*anyopaque,
     ) callconv(.c) c_int {
-        const device = dns.defaultBindDevice() orelse return 0;
-        applyBindDevice(@intCast(socket_fd), device) catch |err| {
+        const cell: *BindDeviceCell = @ptrCast(@alignCast(user_data orelse return 0));
+        applyBindDevice(@intCast(socket_fd), cell.device) catch |err| {
             std.log.scoped(.dns_cares).warn(
                 "c-ares socket bind_device='{s}' failed: {s} (DNS query proceeds without bind)",
-                .{ device, @errorName(err) },
+                .{ cell.device, @errorName(err) },
             );
             return 0;
         };
@@ -170,6 +178,11 @@ pub const DnsResolver = struct {
             self.channel = null;
         }
         c.ares_library_cleanup();
+
+        if (self.bind_device_cell) |cell| {
+            self.allocator.destroy(cell);
+            self.bind_device_cell = null;
+        }
 
         var iter = self.cache.keyIterator();
         while (iter.next()) |key| {
@@ -525,7 +538,7 @@ pub fn resolveOnce(allocator: std.mem.Allocator, host: []const u8, port: u16) !s
     if (std.net.Address.parseIp4(host, port)) |addr| return addr else |_| {}
     if (std.net.Address.parseIp6(host, port)) |addr| return addr else |_| {}
 
-    var resolver = try DnsResolver.init(allocator);
+    var resolver = try DnsResolver.init(allocator, .{});
     defer resolver.deinit(allocator);
 
     var ttl_unused: u32 = 0;
@@ -535,7 +548,7 @@ pub fn resolveOnce(allocator: std.mem.Allocator, host: []const u8, port: u16) !s
 // ── Tests ────────────────────────────────────────────────
 
 test "c-ares resolve numeric ipv4 does not use cache" {
-    var resolver = try DnsResolver.init(std.testing.allocator);
+    var resolver = try DnsResolver.init(std.testing.allocator, .{});
     defer resolver.deinit(std.testing.allocator);
 
     const addr = try resolver.resolve(std.testing.allocator, "127.0.0.1", 8080);
@@ -544,7 +557,7 @@ test "c-ares resolve numeric ipv4 does not use cache" {
 }
 
 test "c-ares resolve numeric ipv6 does not use cache" {
-    var resolver = try DnsResolver.init(std.testing.allocator);
+    var resolver = try DnsResolver.init(std.testing.allocator, .{});
     defer resolver.deinit(std.testing.allocator);
 
     const addr = try resolver.resolve(std.testing.allocator, "::1", 9090);
@@ -563,7 +576,7 @@ test "c-ares resolveOnce parses numeric ipv6" {
 }
 
 test "c-ares cache stores and retrieves entries" {
-    var resolver = try DnsResolver.init(std.testing.allocator);
+    var resolver = try DnsResolver.init(std.testing.allocator, .{});
     defer resolver.deinit(std.testing.allocator);
 
     const addr = std.net.Address.initIp4(.{ 1, 2, 3, 4 }, 80);
@@ -577,7 +590,7 @@ test "c-ares cache stores and retrieves entries" {
 }
 
 test "c-ares cache expires entries" {
-    var resolver = try DnsResolver.init(std.testing.allocator);
+    var resolver = try DnsResolver.init(std.testing.allocator, .{});
     defer resolver.deinit(std.testing.allocator);
 
     const addr = std.net.Address.initIp4(.{ 1, 2, 3, 4 }, 80);
@@ -591,7 +604,7 @@ test "c-ares cache expires entries" {
 }
 
 test "c-ares invalidate removes entry" {
-    var resolver = try DnsResolver.init(std.testing.allocator);
+    var resolver = try DnsResolver.init(std.testing.allocator, .{});
     defer resolver.deinit(std.testing.allocator);
 
     const addr = std.net.Address.initIp4(.{ 1, 2, 3, 4 }, 80);
@@ -603,7 +616,7 @@ test "c-ares invalidate removes entry" {
 }
 
 test "c-ares invalidate nonexistent key is no-op" {
-    var resolver = try DnsResolver.init(std.testing.allocator);
+    var resolver = try DnsResolver.init(std.testing.allocator, .{});
     defer resolver.deinit(std.testing.allocator);
 
     resolver.invalidate(std.testing.allocator, "nonexistent");
@@ -611,7 +624,7 @@ test "c-ares invalidate nonexistent key is no-op" {
 }
 
 test "c-ares clearAll empties cache" {
-    var resolver = try DnsResolver.init(std.testing.allocator);
+    var resolver = try DnsResolver.init(std.testing.allocator, .{});
     defer resolver.deinit(std.testing.allocator);
 
     const addr = std.net.Address.initIp4(.{ 1, 2, 3, 4 }, 80);
@@ -624,7 +637,7 @@ test "c-ares clearAll empties cache" {
 }
 
 test "c-ares cache evicts oldest when full" {
-    var resolver = try DnsResolver.init(std.testing.allocator);
+    var resolver = try DnsResolver.init(std.testing.allocator, .{});
     defer resolver.deinit(std.testing.allocator);
 
     const addr = std.net.Address.initIp4(.{ 1, 2, 3, 4 }, 80);
@@ -645,7 +658,7 @@ test "c-ares cache evicts oldest when full" {
 }
 
 test "c-ares cache updates existing entry without duplication" {
-    var resolver = try DnsResolver.init(std.testing.allocator);
+    var resolver = try DnsResolver.init(std.testing.allocator, .{});
     defer resolver.deinit(std.testing.allocator);
 
     const addr1 = std.net.Address.initIp4(.{ 1, 2, 3, 4 }, 80);
@@ -663,7 +676,7 @@ test "c-ares cache updates existing entry without duplication" {
 }
 
 test "c-ares cache respects port override on hit" {
-    var resolver = try DnsResolver.init(std.testing.allocator);
+    var resolver = try DnsResolver.init(std.testing.allocator, .{});
     defer resolver.deinit(std.testing.allocator);
 
     const addr = std.net.Address.initIp4(.{ 10, 0, 0, 1 }, 80);
@@ -674,7 +687,7 @@ test "c-ares cache respects port override on hit" {
 }
 
 test "c-ares ttl_bounds defaults are 30s floor / 1h cap" {
-    var resolver = try DnsResolver.init(std.testing.allocator);
+    var resolver = try DnsResolver.init(std.testing.allocator, .{});
     defer resolver.deinit(std.testing.allocator);
 
     try std.testing.expectEqual(@as(u32, 30), resolver.ttl_bounds.floor_s);
@@ -682,7 +695,7 @@ test "c-ares ttl_bounds defaults are 30s floor / 1h cap" {
 }
 
 test "c-ares resolve localhost via real DNS" {
-    var resolver = try DnsResolver.init(std.testing.allocator);
+    var resolver = try DnsResolver.init(std.testing.allocator, .{});
     defer resolver.deinit(std.testing.allocator);
 
     const addr = resolver.resolve(std.testing.allocator, "localhost", 80) catch |err| {
@@ -701,4 +714,54 @@ test "c-ares resolve localhost via real DNS" {
     const addr2 = try resolver.resolve(std.testing.allocator, "localhost", 9999);
     try std.testing.expectEqual(@as(u16, 9999), addr2.getPort());
     try std.testing.expectEqual(@as(u32, 1), resolver.cache.count());
+}
+
+test "c-ares Config.bind_device captured to per-resolver field and cell" {
+    var resolver = try DnsResolver.init(std.testing.allocator, .{ .bind_device = "wg0" });
+    defer resolver.deinit(std.testing.allocator);
+
+    try std.testing.expect(resolver.bind_device != null);
+    try std.testing.expectEqualStrings("wg0", resolver.bind_device.?);
+
+    // The user_data cell must exist when bind_device is set, because
+    // the c-ares socket callback dereferences it.
+    try std.testing.expect(resolver.bind_device_cell != null);
+    try std.testing.expectEqualStrings("wg0", resolver.bind_device_cell.?.device);
+}
+
+test "c-ares Config without bind_device leaves cell null" {
+    var resolver = try DnsResolver.init(std.testing.allocator, .{});
+    defer resolver.deinit(std.testing.allocator);
+
+    try std.testing.expect(resolver.bind_device == null);
+    try std.testing.expect(resolver.bind_device_cell == null);
+}
+
+test "c-ares socket callback applies bind_device to a real fd" {
+    // Drive caresSocketCreateCallback directly with a real socket fd
+    // and verify SO_BINDTODEVICE is applied (or, on permission-denied
+    // hosts, that the callback still returns 0 to keep DNS working).
+    const fd = try std.posix.socket(
+        std.posix.AF.INET,
+        std.posix.SOCK.DGRAM | std.posix.SOCK.CLOEXEC,
+        std.posix.IPPROTO.UDP,
+    );
+    defer std.posix.close(fd);
+
+    // The callback reads the slice from a heap cell — synthesise one
+    // with a device name unlikely to exist, so the inner
+    // `applyBindDevice` returns ENODEV / EPERM. The callback must
+    // still return 0 (we tolerate misconfiguration).
+    var cell = DnsResolver.BindDeviceCell{ .device = "varuna-doesnotexist0" };
+    const rc = DnsResolver.caresSocketCreateCallback(@intCast(fd), 0, @ptrCast(&cell));
+    try std.testing.expectEqual(@as(c_int, 0), rc);
+}
+
+test "c-ares socket callback with null user_data is a no-op" {
+    // When init was called with bind_device=null, no callback is
+    // registered so the user_data slot is never read in practice.
+    // But defend against the API edge case: invoking the callback
+    // with null user_data must be a clean no-op.
+    const rc = DnsResolver.caresSocketCreateCallback(@intCast(@as(c_int, -1)), 0, null);
+    try std.testing.expectEqual(@as(c_int, 0), rc);
 }

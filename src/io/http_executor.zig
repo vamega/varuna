@@ -132,6 +132,12 @@ pub const HttpExecutor = struct {
     pub const Config = struct {
         max_concurrent: u16 = 8,
         max_per_host: u16 = 3,
+        /// Optional `SO_BINDTODEVICE` interface name applied to DNS
+        /// sockets created by the underlying `DnsResolver` (c-ares
+        /// backend only — the threadpool backend stores it but cannot
+        /// apply it; see `src/io/dns_threadpool.zig`). The slice
+        /// lifetime must outlive the executor.
+        bind_device: ?[]const u8 = null,
     };
 
     const RequestSlot = struct {
@@ -276,7 +282,7 @@ pub const HttpExecutor = struct {
             .deferred_jobs = std.ArrayList(Job).empty,
             .max_concurrent = config.max_concurrent,
             .max_per_host = config.max_per_host,
-            .dns_resolver = try DnsResolver.init(allocator),
+            .dns_resolver = try DnsResolver.init(allocator, .{ .bind_device = config.bind_device }),
             .slots = undefined,
             .free_slot_count = config.max_concurrent,
         };

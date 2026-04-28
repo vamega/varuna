@@ -32,6 +32,15 @@ pub const SessionManager = struct {
     masquerade_as: ?[]const u8 = null,
     /// Disable tracker announces; rely on DHT/PEX for peer discovery.
     disable_trackers: bool = false,
+    /// `SO_BINDTODEVICE` interface name (e.g. "wg0"). Forwarded to the
+    /// HTTP and UDP tracker executors' DNS resolvers so DNS queries
+    /// egress through the configured interface alongside peer /
+    /// tracker / RPC traffic. Borrowed from `cfg.network.bind_device`
+    /// in main.zig; lifetime is the daemon's. The c-ares DNS backend
+    /// honors it via `ares_set_socket_callback`; the threadpool
+    /// backend stores it but cannot apply it (see
+    /// `src/io/dns_threadpool.zig` and STATUS.md "Known Issues").
+    bind_device: ?[]const u8 = null,
 
     // ── Global share ratio / seeding time limits ──────────
     /// Whether global ratio limit enforcement is enabled.
@@ -698,7 +707,9 @@ pub const SessionManager = struct {
     fn ensureTrackerExecutor(self: *SessionManager) !*TrackerExecutor {
         if (self.tracker_executor == null) {
             const el = self.shared_event_loop orelse return error.SharedEventLoopNotConfigured;
-            self.tracker_executor = try TrackerExecutor.create(self.allocator, &el.io, .{});
+            self.tracker_executor = try TrackerExecutor.create(self.allocator, &el.io, .{
+                .bind_device = self.bind_device,
+            });
             // Wire the underlying HttpExecutor into event loop for tick().
             el.http_executor = self.tracker_executor.?.http;
             el.tracker_executor = self.tracker_executor;
@@ -709,7 +720,9 @@ pub const SessionManager = struct {
     fn ensureUdpTrackerExecutor(self: *SessionManager) !*UdpTrackerExecutor {
         if (self.udp_tracker_executor == null) {
             const el = self.shared_event_loop orelse return error.SharedEventLoopNotConfigured;
-            self.udp_tracker_executor = try UdpTrackerExecutor.create(self.allocator, &el.io, .{});
+            self.udp_tracker_executor = try UdpTrackerExecutor.create(self.allocator, &el.io, .{
+                .bind_device = self.bind_device,
+            });
             // Wire into event loop for CQE dispatch
             el.udp_tracker_executor = self.udp_tracker_executor;
         }
