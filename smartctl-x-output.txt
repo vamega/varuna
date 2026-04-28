@@ -1,0 +1,214 @@
+smartctl 7.5 (build date Jan  1 1980) [x86_64-linux-7.0.1] (local build)
+Copyright (C) 2002-25, Bruce Allen, Christian Franke, www.smartmontools.org
+
+=== START OF INFORMATION SECTION ===
+Model Family:     Western Digital Red Plus
+Device Model:     WDC WD80EFAX-68LHPN0
+Serial Number:    7SGM4L6C
+LU WWN Device Id: 5 000cca 252c8b445
+Firmware Version: 83.H0A83
+User Capacity:    8,001,563,222,016 bytes [8.00 TB]
+Sector Sizes:     512 bytes logical, 4096 bytes physical
+Rotation Rate:    5400 rpm
+Form Factor:      3.5 inches
+Device is:        In smartctl database 7.5/6061
+ATA Version is:   ACS-2, ATA8-ACS T13/1699-D revision 4
+SATA Version is:  SATA 3.2, 6.0 Gb/s (current: 6.0 Gb/s)
+Local Time is:    Sat Apr 25 12:26:57 2026 EDT
+SMART support is: Available - device has SMART capability.
+SMART support is: Enabled
+AAM feature is:   Unavailable
+APM level is:     164 (intermediate level without standby)
+Rd look-ahead is: Enabled
+Write cache is:   Enabled
+DSN feature is:   Unavailable
+ATA Security is:  Disabled, NOT FROZEN [SEC1]
+
+Read SMART Data failed: Input/output error
+
+=== START OF READ SMART DATA SECTION ===
+SMART overall-health self-assessment test result: PASSED
+
+Read SMART Log Directory failed: Input/output error
+
+General Purpose Log Directory Version 1
+Address    Access  R/W   Size  Description
+0x00       GPL     R/O      1  Log Directory
+0x03       GPL     R/O      1  Ext. Comprehensive SMART error log
+0x04       GPL     R/O    256  Device Statistics log
+0x07       GPL     R/O      1  Extended self-test log
+0x08       GPL     R/O      2  Power Conditions log
+0x0c       GPL     R/O   5501  Pending Defects log
+0x10       GPL     R/O      1  NCQ Command Error log
+0x11       GPL     R/O      1  SATA Phy Event Counters log
+0x12       GPL     R/O      1  SATA NCQ Non-Data log
+0x13       GPL     R/O      1  SATA NCQ Send and Receive log
+0x15       GPL     R/W      1  Rebuild Assist log
+0x21       GPL     R/O      1  Write stream error log
+0x22       GPL     R/O      1  Read stream error log
+0x24       GPL     R/O    256  Current Device Internal Status Data log
+0x25       GPL     R/O    256  Saved Device Internal Status Data log
+0x30       GPL     R/O      9  IDENTIFY DEVICE data log
+0x80-0x9f  GPL     R/W     16  Host vendor specific log
+0xe0       GPL     R/W      1  SCT Command/Status
+0xe1       GPL     R/W      1  SCT Data Transfer
+
+SMART Extended Comprehensive Error Log Version: 1 (1 sectors)
+Device Error Count: 351 (device log contains only the most recent 4 errors)
+	CR     = Command Register
+	FEATR  = Features Register
+	COUNT  = Count (was: Sector Count) Register
+	LBA_48 = Upper bytes of LBA High/Mid/Low Registers ]  ATA-8
+	LH     = LBA High (was: Cylinder High) Register    ]   LBA
+	LM     = LBA Mid (was: Cylinder Low) Register      ] Register
+	LL     = LBA Low (was: Sector Number) Register     ]
+	DV     = Device (was: Device/Head) Register
+	DC     = Device Control Register
+	ER     = Error register
+	ST     = Status register
+Powered_Up_Time is measured from power on, and printed as
+DDd+hh:mm:SS.sss where DD=days, hh=hours, mm=minutes,
+SS=sec, and sss=millisec. It "wraps" after 49.710 days.
+
+Error 351 [2] occurred at disk power-on lifetime: 64264 hours (2677 days + 16 hours)
+  When the command that caused the error occurred, the device was active or idle.
+
+  After command completion occurred, registers were:
+  ER -- ST COUNT  LBA_48  LH LM LL DV DC
+  -- -- -- == -- == == == -- -- -- -- --
+  40 -- 43 00 00 00 00 00 00 00 00 00 00  Error: UNC at LBA = 0x00000000 = 0
+
+  Commands leading to the command that caused the error were:
+  CR FEATR COUNT  LBA_48  LH LM LL DV DC  Powered_Up_Time  Command/Feature_Name
+  -- == -- == -- == == == -- -- -- -- --  ---------------  --------------------
+  60 00 20 00 90 00 02 04 91 81 80 40 08 34d+18:34:06.875  READ FPDMA QUEUED
+  b0 00 da 00 00 00 00 00 c2 4f 00 00 08 34d+18:34:04.331  SMART RETURN STATUS
+  47 00 00 00 01 00 00 00 00 08 30 a0 08 34d+18:34:04.329  READ LOG DMA EXT
+  47 00 00 00 01 00 00 00 00 00 30 a0 08 34d+18:34:04.328  READ LOG DMA EXT
+  47 00 00 00 01 00 00 00 00 00 12 a0 08 34d+18:34:04.327  READ LOG DMA EXT
+
+Error 350 [1] occurred at disk power-on lifetime: 64264 hours (2677 days + 16 hours)
+  When the command that caused the error occurred, the device was active or idle.
+
+  After command completion occurred, registers were:
+  ER -- ST COUNT  LBA_48  LH LM LL DV DC
+  -- -- -- == -- == == == -- -- -- -- --
+  40 -- 43 00 00 00 00 00 00 00 00 00 00  Error: UNC at LBA = 0x00000000 = 0
+
+  Commands leading to the command that caused the error were:
+  CR FEATR COUNT  LBA_48  LH LM LL DV DC  Powered_Up_Time  Command/Feature_Name
+  -- == -- == -- == == == -- -- -- -- --  ---------------  --------------------
+  60 00 20 00 a0 00 02 04 91 81 80 40 08 34d+18:34:04.292  READ FPDMA QUEUED
+  ec 00 00 00 01 00 00 00 00 00 00 00 08 34d+18:34:01.779  IDENTIFY DEVICE
+  47 00 00 00 01 00 00 00 00 08 30 a0 08 34d+18:34:01.775  READ LOG DMA EXT
+  47 00 00 00 01 00 00 00 00 00 30 a0 08 34d+18:34:01.774  READ LOG DMA EXT
+  47 00 00 00 01 00 00 00 00 00 12 a0 08 34d+18:34:01.773  READ LOG DMA EXT
+
+Error 349 [0] occurred at disk power-on lifetime: 64264 hours (2677 days + 16 hours)
+  When the command that caused the error occurred, the device was active or idle.
+
+  After command completion occurred, registers were:
+  ER -- ST COUNT  LBA_48  LH LM LL DV DC
+  -- -- -- == -- == == == -- -- -- -- --
+  40 -- 43 00 00 00 00 00 00 00 00 00 00  Error: UNC at LBA = 0x00000000 = 0
+
+  Commands leading to the command that caused the error were:
+  CR FEATR COUNT  LBA_48  LH LM LL DV DC  Powered_Up_Time  Command/Feature_Name
+  -- == -- == -- == == == -- -- -- -- --  ---------------  --------------------
+  60 00 20 00 30 00 02 04 91 81 80 40 08 34d+18:34:01.725  READ FPDMA QUEUED
+  47 00 00 00 01 00 00 00 00 08 30 a0 08 34d+18:33:59.212  READ LOG DMA EXT
+  47 00 00 00 01 00 00 00 00 00 30 a0 08 34d+18:33:59.211  READ LOG DMA EXT
+  47 00 00 00 01 00 00 00 00 00 12 a0 08 34d+18:33:59.210  READ LOG DMA EXT
+  47 00 00 00 01 00 00 00 00 00 13 a0 08 34d+18:33:59.209  READ LOG DMA EXT
+
+Error 348 [3] occurred at disk power-on lifetime: 64264 hours (2677 days + 16 hours)
+  When the command that caused the error occurred, the device was active or idle.
+
+  After command completion occurred, registers were:
+  ER -- ST COUNT  LBA_48  LH LM LL DV DC
+  -- -- -- == -- == == == -- -- -- -- --
+  40 -- 43 00 00 00 00 00 00 00 00 00 00  Error: UNC at LBA = 0x00000000 = 0
+
+  Commands leading to the command that caused the error were:
+  CR FEATR COUNT  LBA_48  LH LM LL DV DC  Powered_Up_Time  Command/Feature_Name
+  -- == -- == -- == == == -- -- -- -- --  ---------------  --------------------
+  60 00 20 00 a8 00 02 04 91 81 80 40 08 34d+18:33:59.042  READ FPDMA QUEUED
+  47 00 00 00 01 00 00 00 00 08 30 a0 08 34d+18:33:56.513  READ LOG DMA EXT
+  47 00 00 00 01 00 00 00 00 00 30 a0 08 34d+18:33:56.512  READ LOG DMA EXT
+  47 00 00 00 01 00 00 00 00 00 12 a0 08 34d+18:33:56.511  READ LOG DMA EXT
+  47 00 00 00 01 00 00 00 00 00 13 a0 08 34d+18:33:56.510  READ LOG DMA EXT
+
+ATA_READ_LOG_EXT (addr=0x07:0x00, page=0, n=1) failed: Input/output error
+Read SMART Extended Self-test Log failed
+
+SMART Self-test log structure revision number 1
+Num  Test_Description    Status                  Remaining  LifeTime(hours)  LBA_of_first_error
+# 1  Short offline       Completed without error       00%     48563         -
+
+Selective Self-tests/Logging not supported
+
+SCT Status Version:                  3
+SCT Version (vendor specific):       256 (0x0100)
+Device State:                        Active (0)
+Current Temperature:                    51 Celsius
+Power Cycle Min/Max Temperature:     46/56 Celsius
+Lifetime    Min/Max Temperature:     19/59 Celsius
+Under/Over Temperature Limit Count:   0/0
+
+Write SCT Data Table failed: Input/output error
+Read SCT Temperature History failed
+
+Write SCT (Get) Error Recovery Control Command failed: Input/output error
+SCT (Get) Error Recovery Control command failed
+
+Device Statistics (GP Log 0x04)
+Page  Offset Size        Value Flags Description
+0x01  =====  =               =  ===  == General Statistics (rev 1) ==
+0x01  0x008  4             163  ---  Lifetime Power-On Resets
+0x01  0x010  4           64264  ---  Power-on Hours
+0x01  0x018  6     96423620016  ---  Logical Sectors Written
+0x01  0x020  6       149586937  ---  Number of Write Commands
+0x01  0x028  6    738694402914  ---  Logical Sectors Read
+0x01  0x030  6      1845810717  ---  Number of Read Commands
+0x01  0x038  6    231352935300  ---  Date and Time TimeStamp
+ATA_READ_LOG_EXT (addr=0x04:0x00, page=3, n=1) failed: Input/output error
+Read Device Statistics page 0x03 failed
+
+Pending Defects log (GP Log 0x0c)
+Index                LBA    Hours
+    0           12409568        -
+    1           12409569        -
+    2           12409570        -
+    3           12409571        -
+    4           12409572        -
+    5           12409573        -
+    6           12409574        -
+    7           12409575        -
+    8           12409576        -
+    9           12409577        -
+   10           12409578        -
+   11           12409579        -
+   12           12409580        -
+   13           12409581        -
+   14           12409582        -
+   15           12409583        -
+   16           12409584        -
+   17           12409585        -
+   18           12409586        -
+   19           12409587        -
+   20           12409588        -
+   21           12409589        -
+   22           12409590        -
+   23           12409591        -
+   24           12410192        -
+   25           12410193        -
+   26           12410194        -
+   27           12410195        -
+   28           12410196        -
+   29           12410197        -
+   30           12410198        -
+... (689 entries not shown)
+
+ATA_READ_LOG_EXT (addr=0x11:0x00, page=0, n=1) failed: Input/output error
+Read SATA Phy Event Counters failed
+

@@ -389,6 +389,36 @@ Follow-ups:
 
 Branch: `worktree-epoll-bifurcation`.
 
+## Last Verified Milestone (2026-04-30 — Kqueue file-op bifurcation: `KqueuePosixIO` + `KqueueMmapIO`)
+
+Splits the 2026-04-29 `KqueueIO` MVP into two file-op-strategy variants. The readiness layer (sockets, timers, cancel) is identical; only the file-op submission methods diverge. Mirrors the parallel `worktree-epoll-bifurcation` engineer's `EpollPosixIO` / `EpollMmapIO` split on the Linux side. See `progress-reports/2026-04-30-kqueue-bifurcation.md` for the round-by-round rationale and `docs/epoll-kqueue-design.md` for the file-op strategy survey.
+
+Two impl + one docs commit on `worktree-kqueue-bifurcation`, all green at HEAD. Test count: **+8 inline** in `src/io/kqueue_mmap_io.zig` (state size, timer-heap ordering, errno mapping, fstore_t layout drift detection, makeCancelledResult tag preservation), **+3 platform-only** (init/deinit, real timeout-via-kevent, full mmap round-trip fallocate→write→fsync→read; skip on Linux), **+2 Linux bridge** in `tests/kqueue_mmap_io_test.zig`. Daemon binary still builds under `-Dio=io_uring` (default); the existing `-Dio=kqueue` flag continues to resolve to `KqueuePosixIO` until the sibling's 6-way IoBackend split lands.
+
+- `a15c9de` — `io: rename KqueueIO → KqueuePosixIO (file-op strategy bifurcation)`. Mechanical: `git mv src/io/kqueue_io.zig src/io/kqueue_posix_io.zig`; 52 occurrences of `KqueueIO` → `KqueuePosixIO`; `git mv tests/kqueue_io_test.zig tests/kqueue_posix_io_test.zig`; build steps `test-kqueue-io` → `test-kqueue-posix-io` and `test-kqueue-io-bridge` → `test-kqueue-posix-io-bridge`. `src/io/backend.zig` updated transitionally (sibling will overwrite at merge time); IoBackend enum docstring notes the rename and the upcoming 6-way split.
+- `d5d170e` — `io: add KqueueMmapIO MVP — mmap-based file ops for the macOS dev backend`. New `src/io/kqueue_mmap_io.zig` (~960 LOC). File-op strategy:
+  - **read/write** → bounds-checked memcpy against an mmap'd region. First access fstats the fd and mmaps PROT_READ\|PROT_WRITE / MAP_SHARED; optional `MADV.WILLNEED` (closest macOS equivalent of Linux's MAP_POPULATE).
+  - **fsync** → `msync(MS_SYNC)` over the mapping; falls back to plain `fsync(2)` for unmapped fds. Darwin's msync has no datasync-only mode; both `op.datasync = true/false` map to MSF.SYNC. F_FULLFSYNC is out of scope for a dev backend.
+  - **fallocate** → `fcntl(F_PREALLOCATE)` + `ftruncate`. Pattern from `tigerbeetle/src/io/darwin.zig:fs_allocate`. Tries ALLOCATECONTIG\|ALLOCATEALL first, falls back to ALLOCATEALL. Maps EOPNOTSUPP → `error.OperationNotSupported`.
+  - **truncate** → unmap-if-mapped + `ftruncate`. Darwin lacks `mremap`, so a resize must drop the mapping; the next access remaps at the new size.
+  Per-completion `KqueueState`, timer heap, kevent dispatch, errno-mapping helpers all mirror KqueuePosixIO. `fstore_t` extern struct inlined locally with size+alignment drift-detection assert. Build wiring: `test-kqueue-mmap-io` (standalone, cross-compile-clean) and `test-kqueue-mmap-io-bridge` (varuna_mod-side, Linux-only).
+- (commit 3) — `docs: progress report + STATUS milestone for kqueue bifurcation`. This entry plus `progress-reports/2026-04-30-kqueue-bifurcation.md`.
+
+Validation:
+- `zig build` (Linux io_uring): clean
+- `zig build test`: green (full daemon suite still passes)
+- `zig build test-kqueue-posix-io` / `test-kqueue-mmap-io`: green (native inline)
+- `zig build -Dtarget=aarch64-macos -Dio=kqueue`: clean cross-compile
+- `zig build test-kqueue-posix-io -Dtarget=aarch64-macos -Dio=kqueue`: clean
+- `zig build test-kqueue-mmap-io -Dtarget=aarch64-macos -Dio=kqueue`: clean
+- `zig fmt .`: clean
+
+What needs real-macOS validation (cross-compile validates types, not runtime semantics): the mmap round-trip on a real darwin filesystem (PROT_READ\|PROT_WRITE acceptance, F_PREALLOCATE error mapping, msync(MS_SYNC) timing); page-fault latency on the EL thread under workloads with working-set > RAM (the whole point of bifurcating from POSIX is comparability); F_PREALLOCATE error mapping confirmation; plus all KqueuePosixIO concerns inherited (EVFILT mask values, BSD errno mapping, std.c.recvmsg/sendmsg compatibility, connect-with-deadline race, posix.SOCK.NONBLOCK value match).
+
+Coordination: `worktree-epoll-bifurcation` engineer owns the IoBackend enum split (3-way → 6-way: `io_uring`, `epoll_posix`, `epoll_mmap`, `kqueue_posix`, `kqueue_mmap`, `sim`) and the dispatch in `src/io/backend.zig`. Expected merge conflicts in `build.zig` (test wiring lines), `src/io/root.zig` (module references), and `src/io/backend.zig` (sibling's 6-way dispatch supersedes my transitional 1-line import-rename). The contract (`src/io/io_interface.zig`) is unchanged.
+
+Branch: `worktree-kqueue-bifurcation`.
+
 ## Last Verified Milestone (2026-04-29 — EpollIO MVP: socket + timer + cancel surface)
 
 Implements a minimum-viable `EpollIO` Linux readiness backend behind a new `-Dio=` build flag. `EpollIO` is the fallback for environments where `io_uring` is forbidden (seccomp policies, ancient kernels, hostile sandboxes); see `docs/epoll-kqueue-design.md` for the full design and `progress-reports/2026-04-29-epoll-io-mvp.md` for the round-by-round rationale.
