@@ -300,7 +300,7 @@ See `progress-reports/2026-04-25-stage2-event-loop-migration.md` for the Stage 2
 
 ## Known Issues
 
-- **`bind_device` is silently bypassed by the threadpool DNS backend (the build default).** `network.bind_device = "wg0"` is correctly applied to peer connections (TCP listen + connect), uTP / DHT UDP listener, RPC server accept, HTTP tracker client, and UDP tracker client — but DNS queries via the default `-Ddns=threadpool` backend leak out the default route. `getaddrinfo` owns its own UDP socket internally and offers no hook for the application to apply `SO_BINDTODEVICE`. Workaround: build with `-Ddns=c_ares`, which registers an `ares_set_socket_callback` on the c-ares channel that calls `applyBindDevice` for every UDP/TCP socket the channel opens — closes the gap fully on that backend. Full fix queued behind the custom-DNS-library work in `docs/custom-dns-design-round2.md` §1; the custom resolver controls its own sockets and applies `SO_BINDTODEVICE` natively. (2026-04-28)
+- **`bind_device` is silently bypassed by the threadpool DNS backend (the build default).** `network.bind_device = "wg0"` is correctly applied to peer connections (TCP listen + connect), uTP / DHT UDP listener, RPC server accept, HTTP tracker client, and UDP tracker client — but DNS queries via the default `-Ddns=threadpool` backend leak out the default route. `getaddrinfo` owns its own UDP socket internally and offers no hook for the application to apply `SO_BINDTODEVICE`. Workaround: build with `-Ddns=c_ares`, which registers an `ares_set_socket_callback` on the c-ares channel that calls `applyBindDevice` for every UDP/TCP socket the channel opens — closes the gap fully on that backend. The plumbing is now an explicit `bind_device` field on `dns.Config`, threaded from `cfg.network.bind_device` through `SessionManager.bind_device` → `HttpExecutor.Config.bind_device` / `UdpTrackerExecutor.Config.bind_device` → `DnsResolver.init`. Full fix queued behind the custom-DNS-library work in `docs/custom-dns-design-round2.md` §1; the custom resolver controls its own sockets and applies `SO_BINDTODEVICE` natively. (2026-04-28)
 - The packaged Ubuntu `opentracker` build requires explicit info-hash whitelisting (`--whitelist-hash`).
 - On WSL2, `perf stat`/`perf record` require kernel-matched `linux-tools` package; many hardware counters report `<not supported>`.
 - `zig build test-torrent-session` intermittently hits Zig cache/toolchain failures (`manifest_create Unexpected`).
@@ -308,6 +308,82 @@ See `progress-reports/2026-04-25-stage2-event-loop-migration.md` for the Stage 2
 - **MSE handshake failures in mixed encryption mode**: `vc_not_found` and `req1_not_found` errors occur during simultaneous inbound+outbound MSE handshakes. Timing-dependent, disappears under GDB. `demo_swarm.sh` runs with `encryption = "disabled"` as workaround.
 - ~~**Daemon graceful shutdown**~~: Fixed. In-flight transfer draining with configurable timeout now ensures clean exit on SIGTERM/SIGINT.
 - `IORING_OP_SETSOCKOPT` (kernel 6.7+), `IORING_OP_BIND`/`LISTEN` (kernel 6.11+) not available on current kernel 6.6. Per-peer setsockopt (TCP_NODELAY, buffer sizes) remains synchronous.
+
+## Last Verified Milestone (2026-04-28 — DNS bind_device cleanup: module-global → explicit Config plumbing)
+
+Closes the "module-level global is a wart" follow-up filed by the
+2026-04-28 correctness-fixes round (commit `955ce61`). That round
+shipped the c-ares `bind_device` fix as `dns.setDefaultBindDevice` /
+`dns.defaultBindDevice` — a process-wide write-once global the
+engineer themselves described as "gross-but-contained" and queued for
+revisit. The merge-conflict constraint that drove that workaround
+(parallel work in `HttpExecutor` / `UdpTrackerExecutor` /
+`SessionManager`) is now gone, so this milestone does the clean
+refactor.
+
+**What landed**
+
+- `src/io/dns.zig` — new `pub const Config = struct { bind_device:
+  ?[]const u8 = null, ttl_bounds: TtlBounds = TtlBounds.default }`.
+  Replaces `setDefaultBindDevice` / `defaultBindDevice` /
+  `module_default_bind_device`. `DnsResolver.init` now takes
+  `(allocator, Config)` on both backends.
+- `src/io/dns_cares.zig` — c-ares socket-callback wiring sources
+  `bind_device` from `Config.bind_device` instead of the global.
+  Heap-allocated `BindDeviceCell` (lifetime tied to the resolver) is
+  registered as `user_data` on the callback so the callback
+  dereferences a stable pointer, not a global. Existing socket
+  callback semantics preserved (apply errors logged + return 0).
+- `src/io/dns_threadpool.zig` — threadpool backend stores
+  `Config.bind_device` for API parity (the existing "Known
+  limitation" docstring is preserved verbatim — `getaddrinfo` still
+  can't honour it, custom-DNS-library is the queued fix).
+- `src/io/http_executor.zig`, `src/io/http_blocking.zig` — `HttpExecutor.Config`
+  gains `bind_device: ?[]const u8 = null`, forwarded into
+  `DnsResolver.init`. (`http_blocking.zig` only owns parse/blocking
+  helpers used by varuna-ctl/varuna-tools per AGENTS.md, no daemon I/O.)
+- `src/daemon/tracker_executor.zig` — `TrackerExecutor.Config.bind_device`
+  forwards into `HttpExecutor.Config.bind_device`.
+- `src/daemon/udp_tracker_executor.zig` — `UdpTrackerExecutor.Config.bind_device`
+  forwards into `DnsResolver.init`.
+- `src/daemon/session_manager.zig` — new `SessionManager.bind_device`
+  field. Both `ensureTrackerExecutor` and `ensureUdpTrackerExecutor`
+  pass it through.
+- `src/main.zig` — sets `sm.bind_device = cfg.network.bind_device`
+  (the daemon-lifetime config-arena slice). The
+  `varuna.io.dns.setDefaultBindDevice(...)` call is gone; the
+  module-level `module_default_bind_device` global is gone.
+- Tests — new c-ares coverage exercises the Config path: `Config.bind_device`
+  captured to `resolver.bind_device` and `resolver.bind_device_cell`,
+  default config leaves both null, the socket-callback applies
+  bind_device to a real fd (tolerating
+  `BindDevicePermissionDenied` / `BindDeviceNotFound`), and the
+  callback is a no-op when invoked with null user_data. Two
+  cross-backend tests in `dns.zig` exercise the field through
+  whichever backend is active.
+
+**Verification**
+
+- `grep -rn 'defaultBindDevice\|setDefaultBindDevice\|module_default_bind_device' src/`
+  returns zero hits.
+- `nix develop --command zig build` (default `-Dio=io_uring -Ddns=threadpool`) green.
+- `nix develop --command zig build test` exit 0; test count 1525 → 1531
+  (+6 new c-ares + cross-backend tests).
+- `-Ddns=c_ares` build still hits the pre-existing `ares_build.h not
+  found` issue documented in `progress-reports/2026-04-28-correctness-fixes.md`,
+  unrelated to this milestone.
+
+**What was deliberately not changed**
+
+- The threadpool backend's "Known limitation" docstring stayed
+  verbatim. The bind_device gap on that backend is queued behind the
+  custom-DNS-library work in `docs/custom-dns-design-round2.md` §1.
+- The c-ares socket-callback registration logic itself is unchanged;
+  only its `bind_device` source moved from a module global to a
+  `BindDeviceCell` user_data heap cell.
+
+See `progress-reports/2026-04-28-dns-bind-device-cleanup.md` for the
+full arc.
 
 ## Last Verified Milestone (2026-04-28 — Resume DB simulation: `ResumeDbOf(Backend)` + `SimResumeBackend`)
 
