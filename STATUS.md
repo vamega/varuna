@@ -308,6 +308,63 @@ See `progress-reports/2026-04-25-stage2-event-loop-migration.md` for the Stage 2
 - ~~**Daemon graceful shutdown**~~: Fixed. In-flight transfer draining with configurable timeout now ensures clean exit on SIGTERM/SIGINT.
 - `IORING_OP_SETSOCKOPT` (kernel 6.7+), `IORING_OP_BIND`/`LISTEN` (kernel 6.11+) not available on current kernel 6.6. Per-peer setsockopt (TCP_NODELAY, buffer sizes) remains synchronous.
 
+## Last Verified Milestone (2026-04-28 — Resume DB simulation: `ResumeDbOf(Backend)` + `SimResumeBackend`)
+
+Lands Path A from `docs/sqlite-simulation-and-replacement.md` (storage
+research round, commit `17157ac`). Defers Path B (custom storage engine)
+indefinitely, contingent on profiling evidence or operational surprises.
+The recommendation in §5 of that doc explicitly favored A-only — this
+milestone closes that loop.
+
+**What landed**
+
+- `src/storage/state_db.zig` — types (`TransferStats`, `RateLimits`,
+  `ShareLimits`, `IpFilterConfig`, `TrackerOverride`, `SavedCategory`,
+  `SavedBannedIp`, `SavedBannedRange`, `QueuePosition`) lifted to
+  file-level so both backends share identical signatures. `ResumeDb`
+  struct renamed to `SqliteBackend`. New identity functor
+  `pub fn ResumeDbOf(comptime Backend: type) type { return Backend; }`
+  parallels `EventLoopOf(IO)` / `AsyncRecheckOf(IO)`. Daemon alias
+  `pub const ResumeDb = ResumeDbOf(SqliteBackend)` keeps every existing
+  consumer compiling unchanged.
+
+- `src/storage/sim_resume_backend.zig` — new in-memory drop-in
+  implementation of the same 49-method public surface. Per-table
+  `std.AutoHashMapUnmanaged` / `std.ArrayListUnmanaged` (slice-bearing
+  rows can't go through `AutoHashMap` cleanly, so tags + tracker
+  overrides are unsorted lists; per-torrent N is bounded). Explicit
+  `std.Thread.Mutex` mirrors `SQLITE_OPEN_FULLMUTEX`'s multi-thread
+  invariant. Four FaultConfig knobs:
+  - `commit_failure_probability` — random write returns `error.SqliteCommitFailed`
+  - `read_failure_probability` — random read returns "no rows"
+  - `read_corruption_probability` — `loadCompletePieces` returns wrong bits
+  - `silent_drop_probability` — write reports success but isn't applied
+  Each knob mirrors the per-op-probability shape of
+  `src/io/sim_io.zig`'s `FaultConfig`.
+
+- `tests/sim_resume_backend_test.zig` — 22 algorithm-level tests
+  covering load/store roundtrip on every table, atomic-swap semantics
+  for `replaceCompletePieces`, `clearTorrent` cascade across all
+  torrent-keyed tables, and each fault knob at probability 1.0.
+
+- `tests/recheck_buggify_test.zig` — rewired from
+  `ResumeDb.open(":memory:")` (real SQLite) to
+  `SimResumeBackend.init(allocator, seed)` (in-memory, deterministic).
+  Existing 32-seed cross-product harness keeps the same assertions but
+  drops the SQLite link dependency. Adds a new BUGGIFY pass that
+  injects 50% commit failure on `replaceCompletePieces` and asserts
+  the in-memory `PieceTracker` state stays consistent even when the
+  resume DB write fails — the testability win that wasn't previously
+  reachable.
+
+**Test delta**: 1494 → 1525 (+31). New runners:
+`zig build test-sim-resume-backend`.
+
+**Out of scope**: Path B (custom storage engine, append-log shape).
+The research doc deferred it indefinitely; this milestone does not
+revisit the decision. SQLite remains the production path with no
+behaviour change.
+
 ## Last Verified Milestone (2026-04-30 — DNS resolver: connect-failure invalidate + bounded TTL honoring)
 
 Closes Open Question #1 from `docs/custom-dns-design.md` (the just-merged
