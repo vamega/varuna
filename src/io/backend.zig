@@ -33,17 +33,22 @@
 //! — a profiling regression in one strategy doesn't hide a regression in the
 //! other.
 //!
-//! ## Today's daemon callers
+//! ## Daemon callers
 //!
-//! Today's daemon callers (`src/storage/writer.zig`, `src/io/recheck.zig`,
-//! `src/rpc/server.zig`, `src/app.zig`, `src/perf/workloads.zig`,
-//! `src/storage/verify.zig`) still `@import("real_io.zig").RealIO`
-//! directly. They keep working because that's still the production path.
-//! To rewire a caller onto the comptime-selected backend, change its import
-//! to `@import("backend.zig").RealIO`. That migration is a follow-up — the
-//! non-`io_uring` backends are MVPs that don't yet implement every op the
-//! daemon exercises, so wiring them through would produce a daemon that
-//! runs but couldn't do real work.
+//! Daemon callers (`src/storage/writer.zig`, `src/io/event_loop.zig`,
+//! `src/io/recheck.zig`, `src/io/metadata_handler.zig`,
+//! `src/io/http_executor.zig`, `src/rpc/server.zig`,
+//! `src/daemon/tracker_executor.zig`, `src/daemon/udp_tracker_executor.zig`,
+//! `src/daemon/torrent_session.zig`) reach the chosen backend through
+//! the `RealIO` alias here. Standalone CLI tools (`src/app.zig`,
+//! `src/storage/verify.zig`) and benchmarks (`src/perf/workloads.zig`)
+//! still hard-import `real_io.zig` per the AGENTS.md exemption — those
+//! are out-of-scope for the io_uring policy.
+//!
+//! Sites that need a one-shot ring (e.g. `PieceStore.init`'s per-torrent
+//! fallocate drain) call `initOneshot(allocator)` instead of branching
+//! on the build flag at every call site, since each backend's `init`
+//! signature differs.
 //!
 //! All backends provide the contract surface in `io_interface.zig`:
 //!
@@ -58,6 +63,7 @@
 //! The readiness backends and SimIO take `(allocator, Config)`. Callers that
 //! want to switch backends dynamically need to handle this at the call site.
 
+const std = @import("std");
 const build_options = @import("build_options");
 const real_io_mod = @import("real_io.zig");
 const epoll_posix_io_mod = @import("epoll_posix_io.zig");
@@ -108,8 +114,39 @@ pub const SelectedBackend = enum {
     sim,
 };
 
+/// Construct a small, short-lived instance of the selected backend.
+///
+/// Daemon code paths that need a one-shot ring (e.g. `PieceStore.init`'s
+/// per-torrent fallocate drain in `torrent_session.zig`) and tests that
+/// stand up an IO instance for a single-purpose probe both call this
+/// helper instead of branching on the build flag at every call site. The
+/// `init` signatures across the six backends are not uniform — RealIO
+/// takes only `Config{ .entries, .flags }`, the readiness backends take
+/// `(allocator, Config)` with backend-specific Config fields — so a
+/// helper is the only way to keep callers backend-agnostic.
+///
+/// Sizing: each branch picks a small capacity (16 ring entries / 16
+/// timer slots) appropriate for one-shot init work. Hot daemon I/O does
+/// NOT route through this helper — it goes through the long-lived
+/// `EventLoopOf(IO)` ring sized at startup.
+///
+/// `.sim` is a `@compileError` deliberately. The daemon binary does not
+/// run under `-Dio=sim` (sim is for tests, not production), and tests
+/// that want a SimIO construct it directly with their own seeded fault
+/// config. There's no sensible default `SimIO.init` shape we could pick
+/// here that would match what tests actually want.
+pub fn initOneshot(allocator: std.mem.Allocator) !RealIO {
+    return switch (selected) {
+        .io_uring => RealIO.init(.{ .entries = 16 }),
+        .epoll_posix => RealIO.init(allocator, .{ .max_completions = 16, .file_pool_workers = 4 }),
+        .epoll_mmap => RealIO.init(allocator, .{ .max_completions = 16 }),
+        .kqueue_posix => RealIO.init(allocator, .{ .timer_capacity = 16, .file_pool_workers = 4 }),
+        .kqueue_mmap => RealIO.init(allocator, .{ .timer_capacity = 16 }),
+        .sim => @compileError("backend.initOneshot is not available under -Dio=sim; sim instances are caller-constructed for tests"),
+    };
+}
+
 test "backend selector resolves to a real type" {
-    const std = @import("std");
     // Sanity check: the selected type has the contract methods.
     try std.testing.expect(@hasDecl(RealIO, "init"));
     try std.testing.expect(@hasDecl(RealIO, "deinit"));
@@ -117,4 +154,14 @@ test "backend selector resolves to a real type" {
     try std.testing.expect(@hasDecl(RealIO, "closeSocket"));
     try std.testing.expect(@hasDecl(RealIO, "recv"));
     try std.testing.expect(@hasDecl(RealIO, "send"));
+}
+
+test "initOneshot succeeds under default backend" {
+    // Under the default `-Dio=io_uring` build, the helper must hand back
+    // a working RealIO. Other backends are exercised through the full
+    // daemon build under their respective `-Dio=` flags.
+    if (selected != .io_uring) return;
+    var io = try initOneshot(std.testing.allocator);
+    defer io.deinit();
+    try std.testing.expect(@hasDecl(@TypeOf(io), "tick"));
 }
