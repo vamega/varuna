@@ -81,34 +81,35 @@ pub const SimResumeBackend = struct {
     transfer_stats: std.AutoHashMapUnmanaged([20]u8, TransferStats) = .{},
     categories: std.StringHashMapUnmanaged([]const u8) = .{}, // name -> save_path
     torrent_categories: std.AutoHashMapUnmanaged([20]u8, []const u8) = .{},
-    torrent_tags: std.AutoHashMapUnmanaged(TorrentTagKey, void) = .{},
+    /// `(info_hash, tag)` is small enough to keep in an unsorted list —
+    /// keys with slice fields can't go through `std.AutoHashMap`, and the
+    /// per-torrent tag count is bounded by user-supplied tag config (~10s).
+    torrent_tags: std.ArrayListUnmanaged(TorrentTagRow) = .{},
     global_tags: std.StringHashMapUnmanaged(void) = .{},
     rate_limits: std.AutoHashMapUnmanaged([20]u8, RateLimits) = .{},
     share_limits: std.AutoHashMapUnmanaged([20]u8, ShareLimits) = .{},
     info_hash_v2: std.AutoHashMapUnmanaged([20]u8, [32]u8) = .{},
-    tracker_overrides: std.AutoHashMapUnmanaged(TrackerOverrideKey, TrackerOverrideValue) = .{},
+    /// Same reason as `torrent_tags` — `(info_hash, url)` keys with a
+    /// slice field can't use `std.AutoHashMap`, and per-torrent override
+    /// counts are bounded by user input (~ tens).
+    tracker_overrides: std.ArrayListUnmanaged(TrackerOverrideRow) = .{},
     banned_ips: std.StringHashMapUnmanaged(BannedIpRow) = .{},
     banned_ranges: std.ArrayListUnmanaged(BannedRangeRow) = .{},
     next_banned_range_id: u64 = 1,
     ipfilter_config: ?IpFilterConfigRow = null,
     queue_positions: std.AutoHashMapUnmanaged([40]u8, u32) = .{},
 
-    // ── Composite-key types ───────────────────────────────
+    // ── Row types ──────────────────────────────────────────
 
     pub const PieceKey = struct { info_hash: [20]u8, piece_index: u32 };
 
-    pub const TorrentTagKey = struct {
+    pub const TorrentTagRow = struct {
         info_hash: [20]u8,
-        tag_hash: u64, // FNV-64 of the tag string — full text stored in `tag_text`
         tag_text: []const u8, // owned
     };
 
-    pub const TrackerOverrideKey = struct {
+    pub const TrackerOverrideRow = struct {
         info_hash: [20]u8,
-        url_hash: u64, // FNV-64 of the URL — full text stored in value
-    };
-
-    pub const TrackerOverrideValue = struct {
         url: []const u8, // owned
         tier: u32,
         action: []const u8, // owned, "add"/"remove"/"edit"
@@ -178,9 +179,8 @@ pub const SimResumeBackend = struct {
         }
         self.torrent_categories.deinit(self.allocator);
 
-        var tt_it = self.torrent_tags.iterator();
-        while (tt_it.next()) |entry| {
-            self.allocator.free(entry.key_ptr.tag_text);
+        for (self.torrent_tags.items) |row| {
+            self.allocator.free(row.tag_text);
         }
         self.torrent_tags.deinit(self.allocator);
 
@@ -194,11 +194,10 @@ pub const SimResumeBackend = struct {
         self.share_limits.deinit(self.allocator);
         self.info_hash_v2.deinit(self.allocator);
 
-        var to_it = self.tracker_overrides.iterator();
-        while (to_it.next()) |entry| {
-            self.allocator.free(entry.value_ptr.url);
-            self.allocator.free(entry.value_ptr.action);
-            if (entry.value_ptr.orig_url) |ou| self.allocator.free(ou);
+        for (self.tracker_overrides.items) |row| {
+            self.allocator.free(row.url);
+            self.allocator.free(row.action);
+            if (row.orig_url) |ou| self.allocator.free(ou);
         }
         self.tracker_overrides.deinit(self.allocator);
 
@@ -306,7 +305,7 @@ pub const SimResumeBackend = struct {
                 // Corrupt by flipping to a different (random) piece index in
                 // the valid range. Models a SQLite that returned the wrong
                 // row. The caller (recheck pipeline) must handle this.
-                _ = bitfield.set(self.rng.random().uintLessThan(u32, bitfield.bit_count)) catch continue;
+                _ = bitfield.set(self.rng.random().uintLessThan(u32, bitfield.piece_count)) catch continue;
             } else {
                 bitfield.set(piece_index) catch continue;
             }
@@ -342,17 +341,13 @@ pub const SimResumeBackend = struct {
 
         // torrent_tags
         {
-            var to_remove = std.ArrayList(TorrentTagKey).empty;
-            defer to_remove.deinit(self.allocator);
-            var it = self.torrent_tags.iterator();
-            while (it.next()) |entry| {
-                if (std.mem.eql(u8, &entry.key_ptr.info_hash, &info_hash)) {
-                    try to_remove.append(self.allocator, entry.key_ptr.*);
-                }
-            }
-            for (to_remove.items) |key| {
-                if (self.torrent_tags.fetchRemove(key)) |kv| {
-                    self.allocator.free(kv.key.tag_text);
+            var i: usize = 0;
+            while (i < self.torrent_tags.items.len) {
+                if (std.mem.eql(u8, &self.torrent_tags.items[i].info_hash, &info_hash)) {
+                    const removed = self.torrent_tags.swapRemove(i);
+                    self.allocator.free(removed.tag_text);
+                } else {
+                    i += 1;
                 }
             }
         }
@@ -363,19 +358,15 @@ pub const SimResumeBackend = struct {
 
         // tracker_overrides
         {
-            var to_remove = std.ArrayList(TrackerOverrideKey).empty;
-            defer to_remove.deinit(self.allocator);
-            var it = self.tracker_overrides.iterator();
-            while (it.next()) |entry| {
-                if (std.mem.eql(u8, &entry.key_ptr.info_hash, &info_hash)) {
-                    try to_remove.append(self.allocator, entry.key_ptr.*);
-                }
-            }
-            for (to_remove.items) |key| {
-                if (self.tracker_overrides.fetchRemove(key)) |kv| {
-                    self.allocator.free(kv.value.url);
-                    self.allocator.free(kv.value.action);
-                    if (kv.value.orig_url) |ou| self.allocator.free(ou);
+            var i: usize = 0;
+            while (i < self.tracker_overrides.items.len) {
+                if (std.mem.eql(u8, &self.tracker_overrides.items[i].info_hash, &info_hash)) {
+                    const removed = self.tracker_overrides.swapRemove(i);
+                    self.allocator.free(removed.url);
+                    self.allocator.free(removed.action);
+                    if (removed.orig_url) |ou| self.allocator.free(ou);
+                } else {
+                    i += 1;
                 }
             }
         }
@@ -508,38 +499,26 @@ pub const SimResumeBackend = struct {
 
     // ── Torrent tags ──────────────────────────────────────
 
-    fn fnvTag(s: []const u8) u64 {
-        var h: u64 = 0xcbf29ce484222325;
-        for (s) |b| {
-            h ^= b;
-            h *%= 0x100000001b3;
-        }
-        return h;
-    }
-
     pub fn saveTorrentTag(self: *SimResumeBackend, info_hash: [20]u8, tag: []const u8) !void {
         self.mutex.lock();
         defer self.mutex.unlock();
         if (self.shouldCommitFault()) return error.SqliteCommitFailed;
         if (self.shouldSilentDrop()) return;
 
-        // Insert-or-ignore semantics. Find existing by info_hash + tag string.
-        var it = self.torrent_tags.iterator();
-        while (it.next()) |entry| {
-            if (std.mem.eql(u8, &entry.key_ptr.info_hash, &info_hash) and
-                std.mem.eql(u8, entry.key_ptr.tag_text, tag))
+        // Insert-or-ignore semantics. Linear scan over (info_hash, tag).
+        for (self.torrent_tags.items) |row| {
+            if (std.mem.eql(u8, &row.info_hash, &info_hash) and
+                std.mem.eql(u8, row.tag_text, tag))
             {
                 return;
             }
         }
         const owned = try self.allocator.dupe(u8, tag);
         errdefer self.allocator.free(owned);
-        const key: TorrentTagKey = .{
+        try self.torrent_tags.append(self.allocator, .{
             .info_hash = info_hash,
-            .tag_hash = fnvTag(tag),
             .tag_text = owned,
-        };
-        try self.torrent_tags.put(self.allocator, key, {});
+        });
     }
 
     pub fn removeTorrentTag(self: *SimResumeBackend, info_hash: [20]u8, tag: []const u8) !void {
@@ -548,20 +527,17 @@ pub const SimResumeBackend = struct {
         if (self.shouldCommitFault()) return error.SqliteCommitFailed;
         if (self.shouldSilentDrop()) return;
 
-        var match: ?TorrentTagKey = null;
-        var it = self.torrent_tags.iterator();
-        while (it.next()) |entry| {
-            if (std.mem.eql(u8, &entry.key_ptr.info_hash, &info_hash) and
-                std.mem.eql(u8, entry.key_ptr.tag_text, tag))
+        var i: usize = 0;
+        while (i < self.torrent_tags.items.len) {
+            const row = self.torrent_tags.items[i];
+            if (std.mem.eql(u8, &row.info_hash, &info_hash) and
+                std.mem.eql(u8, row.tag_text, tag))
             {
-                match = entry.key_ptr.*;
-                break;
+                const removed = self.torrent_tags.swapRemove(i);
+                self.allocator.free(removed.tag_text);
+                return;
             }
-        }
-        if (match) |k| {
-            if (self.torrent_tags.fetchRemove(k)) |kv| {
-                self.allocator.free(kv.key.tag_text);
-            }
+            i += 1;
         }
     }
 
@@ -571,17 +547,13 @@ pub const SimResumeBackend = struct {
         if (self.shouldCommitFault()) return error.SqliteCommitFailed;
         if (self.shouldSilentDrop()) return;
 
-        var to_remove = std.ArrayList(TorrentTagKey).empty;
-        defer to_remove.deinit(self.allocator);
-        var it = self.torrent_tags.iterator();
-        while (it.next()) |entry| {
-            if (std.mem.eql(u8, &entry.key_ptr.info_hash, &info_hash)) {
-                try to_remove.append(self.allocator, entry.key_ptr.*);
-            }
-        }
-        for (to_remove.items) |k| {
-            if (self.torrent_tags.fetchRemove(k)) |kv| {
-                self.allocator.free(kv.key.tag_text);
+        var i: usize = 0;
+        while (i < self.torrent_tags.items.len) {
+            if (std.mem.eql(u8, &self.torrent_tags.items[i].info_hash, &info_hash)) {
+                const removed = self.torrent_tags.swapRemove(i);
+                self.allocator.free(removed.tag_text);
+            } else {
+                i += 1;
             }
         }
     }
@@ -595,13 +567,11 @@ pub const SimResumeBackend = struct {
             for (result.items) |tag| allocator.free(tag);
             result.deinit(allocator);
         }
-
         if (self.shouldReadFault()) return result.toOwnedSlice(allocator);
 
-        var it = self.torrent_tags.iterator();
-        while (it.next()) |entry| {
-            if (std.mem.eql(u8, &entry.key_ptr.info_hash, &info_hash)) {
-                const owned = try allocator.dupe(u8, entry.key_ptr.tag_text);
+        for (self.torrent_tags.items) |row| {
+            if (std.mem.eql(u8, &row.info_hash, &info_hash)) {
+                const owned = try allocator.dupe(u8, row.tag_text);
                 try result.append(allocator, owned);
             }
         }
@@ -614,17 +584,13 @@ pub const SimResumeBackend = struct {
         if (self.shouldCommitFault()) return error.SqliteCommitFailed;
         if (self.shouldSilentDrop()) return;
 
-        var to_remove = std.ArrayList(TorrentTagKey).empty;
-        defer to_remove.deinit(self.allocator);
-        var it = self.torrent_tags.iterator();
-        while (it.next()) |entry| {
-            if (std.mem.eql(u8, entry.key_ptr.tag_text, tag)) {
-                try to_remove.append(self.allocator, entry.key_ptr.*);
-            }
-        }
-        for (to_remove.items) |k| {
-            if (self.torrent_tags.fetchRemove(k)) |kv| {
-                self.allocator.free(kv.key.tag_text);
+        var i: usize = 0;
+        while (i < self.torrent_tags.items.len) {
+            if (std.mem.eql(u8, self.torrent_tags.items[i].tag_text, tag)) {
+                const removed = self.torrent_tags.swapRemove(i);
+                self.allocator.free(removed.tag_text);
+            } else {
+                i += 1;
             }
         }
     }
@@ -900,46 +866,32 @@ pub const SimResumeBackend = struct {
 
     // ── Tracker overrides ─────────────────────────────────
 
-    fn fnvUrl(s: []const u8) u64 {
-        return fnvTag(s);
-    }
-
     pub fn saveTrackerOverride(self: *SimResumeBackend, info_hash: [20]u8, url: []const u8, tier: u32, action: []const u8, orig_url: ?[]const u8) !void {
         self.mutex.lock();
         defer self.mutex.unlock();
         if (self.shouldCommitFault()) return error.SqliteCommitFailed;
         if (self.shouldSilentDrop()) return;
 
-        // Find existing by info_hash + url string. Iterate (small N).
-        var existing_key: ?TrackerOverrideKey = null;
-        var it = self.tracker_overrides.iterator();
-        while (it.next()) |entry| {
-            if (std.mem.eql(u8, &entry.key_ptr.info_hash, &info_hash) and
-                std.mem.eql(u8, entry.value_ptr.url, url))
+        // Upsert by (info_hash, url).
+        for (self.tracker_overrides.items) |*row| {
+            if (std.mem.eql(u8, &row.info_hash, &info_hash) and
+                std.mem.eql(u8, row.url, url))
             {
-                existing_key = entry.key_ptr.*;
-                break;
+                self.allocator.free(row.action);
+                row.action = try self.allocator.dupe(u8, action);
+                if (row.orig_url) |old| self.allocator.free(old);
+                row.orig_url = if (orig_url) |o| try self.allocator.dupe(u8, o) else null;
+                row.tier = tier;
+                return;
             }
-        }
-        if (existing_key) |k| {
-            const v = self.tracker_overrides.getPtr(k).?;
-            // Replace tier/action/orig_url. Keep stored url (= input url, same string).
-            self.allocator.free(v.action);
-            v.action = try self.allocator.dupe(u8, action);
-            if (v.orig_url) |old| self.allocator.free(old);
-            v.orig_url = if (orig_url) |o| try self.allocator.dupe(u8, o) else null;
-            v.tier = tier;
-            return;
         }
         const owned_url = try self.allocator.dupe(u8, url);
         errdefer self.allocator.free(owned_url);
         const owned_action = try self.allocator.dupe(u8, action);
         errdefer self.allocator.free(owned_action);
         const owned_orig: ?[]const u8 = if (orig_url) |o| try self.allocator.dupe(u8, o) else null;
-        try self.tracker_overrides.put(self.allocator, .{
+        try self.tracker_overrides.append(self.allocator, .{
             .info_hash = info_hash,
-            .url_hash = fnvUrl(url),
-        }, .{
             .url = owned_url,
             .tier = tier,
             .action = owned_action,
@@ -953,22 +905,19 @@ pub const SimResumeBackend = struct {
         if (self.shouldCommitFault()) return error.SqliteCommitFailed;
         if (self.shouldSilentDrop()) return;
 
-        var match: ?TrackerOverrideKey = null;
-        var it = self.tracker_overrides.iterator();
-        while (it.next()) |entry| {
-            if (std.mem.eql(u8, &entry.key_ptr.info_hash, &info_hash) and
-                std.mem.eql(u8, entry.value_ptr.url, url))
+        var i: usize = 0;
+        while (i < self.tracker_overrides.items.len) {
+            const row = self.tracker_overrides.items[i];
+            if (std.mem.eql(u8, &row.info_hash, &info_hash) and
+                std.mem.eql(u8, row.url, url))
             {
-                match = entry.key_ptr.*;
-                break;
+                const removed = self.tracker_overrides.swapRemove(i);
+                self.allocator.free(removed.url);
+                self.allocator.free(removed.action);
+                if (removed.orig_url) |ou| self.allocator.free(ou);
+                return;
             }
-        }
-        if (match) |k| {
-            if (self.tracker_overrides.fetchRemove(k)) |kv| {
-                self.allocator.free(kv.value.url);
-                self.allocator.free(kv.value.action);
-                if (kv.value.orig_url) |ou| self.allocator.free(ou);
-            }
+            i += 1;
         }
     }
 
@@ -978,24 +927,21 @@ pub const SimResumeBackend = struct {
         if (self.shouldCommitFault()) return error.SqliteCommitFailed;
         if (self.shouldSilentDrop()) return;
 
-        var to_remove = std.ArrayList(TrackerOverrideKey).empty;
-        defer to_remove.deinit(self.allocator);
-        var it = self.tracker_overrides.iterator();
-        while (it.next()) |entry| {
-            if (std.mem.eql(u8, &entry.key_ptr.info_hash, &info_hash)) {
-                if (entry.value_ptr.orig_url) |ou| {
+        var i: usize = 0;
+        while (i < self.tracker_overrides.items.len) {
+            const row = self.tracker_overrides.items[i];
+            if (std.mem.eql(u8, &row.info_hash, &info_hash)) {
+                if (row.orig_url) |ou| {
                     if (std.mem.eql(u8, ou, orig_url)) {
-                        try to_remove.append(self.allocator, entry.key_ptr.*);
+                        const removed = self.tracker_overrides.swapRemove(i);
+                        self.allocator.free(removed.url);
+                        self.allocator.free(removed.action);
+                        if (removed.orig_url) |o| self.allocator.free(o);
+                        continue;
                     }
                 }
             }
-        }
-        for (to_remove.items) |k| {
-            if (self.tracker_overrides.fetchRemove(k)) |kv| {
-                self.allocator.free(kv.value.url);
-                self.allocator.free(kv.value.action);
-                if (kv.value.orig_url) |ou| self.allocator.free(ou);
-            }
+            i += 1;
         }
     }
 
@@ -1005,19 +951,15 @@ pub const SimResumeBackend = struct {
         if (self.shouldCommitFault()) return error.SqliteCommitFailed;
         if (self.shouldSilentDrop()) return;
 
-        var to_remove = std.ArrayList(TrackerOverrideKey).empty;
-        defer to_remove.deinit(self.allocator);
-        var it = self.tracker_overrides.iterator();
-        while (it.next()) |entry| {
-            if (std.mem.eql(u8, &entry.key_ptr.info_hash, &info_hash)) {
-                try to_remove.append(self.allocator, entry.key_ptr.*);
-            }
-        }
-        for (to_remove.items) |k| {
-            if (self.tracker_overrides.fetchRemove(k)) |kv| {
-                self.allocator.free(kv.value.url);
-                self.allocator.free(kv.value.action);
-                if (kv.value.orig_url) |ou| self.allocator.free(ou);
+        var i: usize = 0;
+        while (i < self.tracker_overrides.items.len) {
+            if (std.mem.eql(u8, &self.tracker_overrides.items[i].info_hash, &info_hash)) {
+                const removed = self.tracker_overrides.swapRemove(i);
+                self.allocator.free(removed.url);
+                self.allocator.free(removed.action);
+                if (removed.orig_url) |ou| self.allocator.free(ou);
+            } else {
+                i += 1;
             }
         }
     }
@@ -1037,17 +979,16 @@ pub const SimResumeBackend = struct {
         }
         if (self.shouldReadFault()) return result.toOwnedSlice(allocator);
 
-        var it = self.tracker_overrides.iterator();
-        while (it.next()) |entry| {
-            if (!std.mem.eql(u8, &entry.key_ptr.info_hash, &info_hash)) continue;
-            const url = try allocator.dupe(u8, entry.value_ptr.url);
+        for (self.tracker_overrides.items) |row| {
+            if (!std.mem.eql(u8, &row.info_hash, &info_hash)) continue;
+            const url = try allocator.dupe(u8, row.url);
             errdefer allocator.free(url);
-            const action = try allocator.dupe(u8, entry.value_ptr.action);
+            const action = try allocator.dupe(u8, row.action);
             errdefer allocator.free(action);
-            const orig: ?[]const u8 = if (entry.value_ptr.orig_url) |o| try allocator.dupe(u8, o) else null;
+            const orig: ?[]const u8 = if (row.orig_url) |o| try allocator.dupe(u8, o) else null;
             try result.append(allocator, .{
                 .url = url,
-                .tier = entry.value_ptr.tier,
+                .tier = row.tier,
                 .action = action,
                 .orig_url = orig,
             });
