@@ -9,9 +9,9 @@
 //!   under a non-blocking socket.
 //! - Multiple concurrent timers ordered by deadline.
 //! - Cancel of a registered fd before any data arrives.
-//! - Negative coverage: file ops return `error.Unimplemented` so daemon
-//!   callers know to gate their PieceStore wiring on the file-op
-//!   follow-up.
+//! - File ops via `PosixFilePool`: fsync/truncate/fallocate completion,
+//!   write→read round-trip, concurrent submission, and bad-fd fault
+//!   propagation through the worker thread.
 //!
 //! These run via `zig build test-epoll-posix-io` (focused) or as part of
 //! `zig build test` (full suite).
@@ -177,14 +177,24 @@ test "EpollPosixIO cancel on registered recv before data delivers OperationCance
     try testing.expectEqual(@as(?anyerror, error.OperationCanceled), counter.last_recv_err);
 }
 
-test "EpollPosixIO file ops return Unimplemented (MVP scope marker)" {
+test "EpollPosixIO file ops complete asynchronously via PosixFilePool" {
+    // The five file-op methods (fsync, truncate, fallocate, read, write)
+    // route through the pool. Workers run the syscall, push the result,
+    // and signal `wakeup_fd`; `tick` drains the queue and fires
+    // callbacks. Asserts each op delivers a successful result against a
+    // real tmpfile.
     var io = try skipIfUnavailable();
     defer io.deinit();
+    io.bindWakeup();
 
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
-    const file = try tmp.dir.createFile("epoll_unimpl_test", .{ .truncate = true });
+    const file = try tmp.dir.createFile(
+        "epoll_file_ops_test",
+        .{ .read = true, .truncate = true },
+    );
     defer file.close();
+    try file.writeAll("varuna_initial");
 
     const Box = struct {
         fsync_calls: u32 = 0,
@@ -243,12 +253,172 @@ test "EpollPosixIO file ops return Unimplemented (MVP scope marker)" {
     try io.truncate(.{ .fd = file.handle, .length = 4096 }, &truncate_c, &box, truncate_cb);
     try io.fallocate(.{ .fd = file.handle, .offset = 0, .len = 4096 }, &fallocate_c, &box, fallocate_cb);
 
+    var attempts: u32 = 0;
+    while ((box.fsync_calls < 1 or
+        box.truncate_calls < 1 or
+        box.fallocate_calls < 1) and attempts < 200) : (attempts += 1)
+    {
+        try io.tick(1);
+    }
+
     try testing.expectEqual(@as(u32, 1), box.fsync_calls);
     try testing.expectEqual(@as(u32, 1), box.truncate_calls);
     try testing.expectEqual(@as(u32, 1), box.fallocate_calls);
-    try testing.expectEqual(@as(?anyerror, error.Unimplemented), box.fsync_err);
-    try testing.expectEqual(@as(?anyerror, error.Unimplemented), box.truncate_err);
-    try testing.expectEqual(@as(?anyerror, error.Unimplemented), box.fallocate_err);
+    try testing.expectEqual(@as(?anyerror, null), box.fsync_err);
+    try testing.expectEqual(@as(?anyerror, null), box.truncate_err);
+    // tmpfs may reject fallocate with OperationNotSupported on
+    // pre-5.10 kernels; that's the daemon's documented fallback path
+    // and counts as a clean delivery.
+    try testing.expect(box.fallocate_err == null or box.fallocate_err.? == error.OperationNotSupported);
+}
+
+test "EpollPosixIO write-then-read round-trips through the pool" {
+    var io = try skipIfUnavailable();
+    defer io.deinit();
+    io.bindWakeup();
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const file = try tmp.dir.createFile(
+        "epoll_rw_round_trip",
+        .{ .read = true, .truncate = true },
+    );
+    defer file.close();
+
+    const Box = struct {
+        write_n: ?usize = null,
+        read_n: ?usize = null,
+        read_buf: [16]u8 = undefined,
+        done: u32 = 0,
+    };
+    var box = Box{};
+
+    const write_cb = struct {
+        fn cb(ud: ?*anyopaque, _: *Completion, result: Result) CallbackAction {
+            const b: *Box = @ptrCast(@alignCast(ud.?));
+            switch (result) {
+                .write => |r| b.write_n = r catch null,
+                else => {},
+            }
+            b.done += 1;
+            return .disarm;
+        }
+    }.cb;
+    const read_cb = struct {
+        fn cb(ud: ?*anyopaque, _: *Completion, result: Result) CallbackAction {
+            const b: *Box = @ptrCast(@alignCast(ud.?));
+            switch (result) {
+                .read => |r| b.read_n = r catch null,
+                else => {},
+            }
+            b.done += 1;
+            return .disarm;
+        }
+    }.cb;
+
+    var write_c = Completion{};
+    try io.write(.{ .fd = file.handle, .buf = "varuna", .offset = 0 }, &write_c, &box, write_cb);
+
+    var attempts: u32 = 0;
+    while (box.done < 1 and attempts < 200) : (attempts += 1) try io.tick(1);
+    try testing.expectEqual(@as(usize, 6), box.write_n.?);
+
+    var read_c = Completion{};
+    try io.read(.{ .fd = file.handle, .buf = &box.read_buf, .offset = 0 }, &read_c, &box, read_cb);
+
+    attempts = 0;
+    while (box.done < 2 and attempts < 200) : (attempts += 1) try io.tick(1);
+    try testing.expectEqual(@as(usize, 6), box.read_n.?);
+    try testing.expectEqualStrings("varuna", box.read_buf[0..6]);
+}
+
+test "EpollPosixIO concurrent file ops all complete" {
+    var io = try skipIfUnavailable();
+    defer io.deinit();
+    io.bindWakeup();
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const file = try tmp.dir.createFile(
+        "epoll_concurrent_writes",
+        .{ .read = true, .truncate = true },
+    );
+    defer file.close();
+    try posix.ftruncate(file.handle, 64 * 16);
+
+    const op_count: u32 = 64;
+    const Box = struct {
+        completed: u32 = 0,
+        errs: u32 = 0,
+    };
+    var box = Box{};
+
+    const write_cb = struct {
+        fn cb(ud: ?*anyopaque, _: *Completion, result: Result) CallbackAction {
+            const b: *Box = @ptrCast(@alignCast(ud.?));
+            b.completed += 1;
+            switch (result) {
+                .write => |r| if (r) |_| {} else |_| {
+                    b.errs += 1;
+                },
+                else => b.errs += 1,
+            }
+            return .disarm;
+        }
+    }.cb;
+
+    const completions = try testing.allocator.alloc(Completion, op_count);
+    defer testing.allocator.free(completions);
+    @memset(completions, Completion{});
+
+    for (0..op_count) |i| {
+        try io.write(.{
+            .fd = file.handle,
+            .buf = "varuna_test_op_!",
+            .offset = i * 16,
+        }, &completions[i], &box, write_cb);
+    }
+
+    var attempts: u32 = 0;
+    while (box.completed < op_count and attempts < 1000) : (attempts += 1) {
+        try io.tick(1);
+    }
+    try testing.expectEqual(op_count, box.completed);
+    try testing.expectEqual(@as(u32, 0), box.errs);
+}
+
+test "EpollPosixIO file op against a closed fd surfaces an error" {
+    var io = try skipIfUnavailable();
+    defer io.deinit();
+    io.bindWakeup();
+
+    const Box = struct {
+        called: u32 = 0,
+        err: ?anyerror = null,
+    };
+    var box = Box{};
+
+    const write_cb = struct {
+        fn cb(ud: ?*anyopaque, _: *Completion, result: Result) CallbackAction {
+            const b: *Box = @ptrCast(@alignCast(ud.?));
+            b.called += 1;
+            switch (result) {
+                .write => |r| if (r) |_| {} else |err| {
+                    b.err = err;
+                },
+                else => {},
+            }
+            return .disarm;
+        }
+    }.cb;
+
+    var c = Completion{};
+    try io.write(.{ .fd = -1, .buf = "boom", .offset = 0 }, &c, &box, write_cb);
+
+    var attempts: u32 = 0;
+    while (box.called == 0 and attempts < 200) : (attempts += 1) try io.tick(1);
+    try testing.expectEqual(@as(u32, 1), box.called);
+    try testing.expect(box.err != null);
 }
 
 test "EpollPosixIO socket op produces a non-blocking fd" {
