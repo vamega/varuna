@@ -21,26 +21,35 @@ pub fn build(b: *std.Build) void {
 
     // ── IO backend selection ──────────────────────────────────
     //
-    // Picks the kernel IO primitive for the daemon's event loop.
+    // Picks the kernel IO primitive (readiness layer) AND the file-I/O
+    // strategy for the daemon's event loop. The two are independent axes:
+    // for each readiness backend we have a POSIX (`pread`/`pwrite` on a
+    // thread pool) and an mmap (memcpy + msync) variant, plus the in-process
+    // SimIO simulator promoted to a top-level option for test builds.
     //
-    // - `io_uring` (default on Linux ≥5.10): production backend. Real CQE
-    //   plumbing through `src/io/real_io.zig`.
-    // - `epoll`: Linux fallback for sandboxes / seccomp policies that block
-    //   io_uring. Implemented in `src/io/epoll_io.zig`. Socket ops use the
-    //   epoll readiness model; file ops (when implemented) offload to a
-    //   thread pool because epoll cannot deliver readiness for regular
-    //   files.
-    // - kqueue slot: reserved for the parallel KqueueIO engineer's macOS
-    //   developer backend. Will be added as a third choice in their branch.
+    // - `io_uring` (default on Linux ≥5.10): production proactor via
+    //   `src/io/real_io.zig`.
+    // - `epoll_posix`: Linux epoll readiness + POSIX file ops via
+    //   `src/io/epoll_posix_io.zig`. Sockets + timers + cancel implemented;
+    //   file ops require the worker thread pool follow-up.
+    // - `epoll_mmap`: Linux epoll readiness + mmap-backed file I/O via
+    //   `src/io/epoll_mmap_io.zig`. Scaffold today (see commit 2 of the
+    //   bifurcation work for the full implementation).
+    // - `kqueue_posix` / `kqueue_mmap`: macOS / BSD analogues, owned by the
+    //   parallel kqueue-bifurcation engineer. Stubs land on this branch so
+    //   the 6-way backend selector compiles; the engineer replaces them.
+    // - `sim`: in-process SimIO simulator. Resolves `RealIO` to `SimIO` for
+    //   tests that exercise the comptime selector itself.
     //
-    // Daemon callers reach the chosen backend through `src/io/backend.zig`
-    // which resolves `RealIO` to either the io_uring or epoll type at
-    // comptime. The MVP EpollIO is socket + timer + cancel only (no file
-    // ops); see `progress-reports/2026-04-29-epoll-io-mvp.md`.
+    // Daemon callers reach the chosen backend through `src/io/backend.zig`.
+    // The non-`io_uring` MVPs do not yet implement every op the daemon needs,
+    // so under those flags the daemon install steps are skipped and the
+    // build produces only the IO module + per-backend tests. See
+    // `progress-reports/2026-04-30-epoll-bifurcation.md`.
     const io_backend = b.option(
         IoBackend,
         "io",
-        "IO backend: 'io_uring' (Linux, default; full daemon), 'epoll' (Linux readiness fallback for seccomp-restricted sandboxes; MVP — sockets+timers only), 'kqueue' (macOS/BSD developer build; MVP — sockets+timers only). Under any non-io_uring backend the daemon install steps are skipped; the build still produces the IO module + per-backend tests so cross-compile and bisectability pass.",
+        "IO backend: 'io_uring' (Linux, default; full daemon), 'epoll_posix' (Linux readiness + POSIX file ops thread pool; sockets+timers only today), 'epoll_mmap' (Linux readiness + mmap file I/O; scaffold), 'kqueue_posix' / 'kqueue_mmap' (macOS/BSD; stubs until kqueue engineer replaces), 'sim' (in-process SimIO for test builds). Non-io_uring backends skip the daemon install; the build still produces the IO module + per-backend tests so cross-compile and bisectability pass.",
     ) orelse .io_uring;
 
     const cares_mode = b.option(
@@ -339,26 +348,48 @@ pub fn build(b: *std.Build) void {
     test_io_parity_step.dependOn(&run_io_parity.step);
     test_step.dependOn(&run_io_parity.step);
 
-    // ── EpollIO smoke tests (real socketpair, real epoll fd) ────────
+    // ── EpollPosixIO smoke tests (real socketpair, real epoll fd) ───
     //
-    // Backend-specific coverage for `src/io/epoll_io.zig`. Only meaningful
-    // on Linux (skipped at runtime on other platforms via the test's
-    // `skipIfUnavailable`). The bulk of the EpollIO inline tests are pulled
-    // in via `src/io/root.zig` → `_ = epoll_io;`; this addTest target
-    // exists so engineers can iterate on a focused build step
-    // (`zig build test-epoll-io`) instead of running the full suite.
-    const epoll_io_tests = b.addTest(.{
+    // Backend-specific coverage for `src/io/epoll_posix_io.zig`. Only
+    // meaningful on Linux (skipped at runtime on other platforms via the
+    // test's `skipIfUnavailable`). The bulk of the EpollPosixIO inline
+    // tests are pulled in via `src/io/root.zig` → `_ = epoll_posix_io;`;
+    // this addTest target exists so engineers can iterate on a focused
+    // build step (`zig build test-epoll-posix-io`) instead of running the
+    // full suite.
+    const epoll_posix_io_tests = b.addTest(.{
         .root_module = b.createModule(.{
-            .root_source_file = b.path("tests/epoll_io_test.zig"),
+            .root_source_file = b.path("tests/epoll_posix_io_test.zig"),
             .target = target,
             .optimize = optimize,
             .imports = &varuna_import,
         }),
     });
-    const run_epoll_io_tests = b.addRunArtifact(epoll_io_tests);
-    const test_epoll_io_step = b.step("test-epoll-io", "Run EpollIO smoke tests (real socketpair + real epoll)");
-    test_epoll_io_step.dependOn(&run_epoll_io_tests.step);
-    test_step.dependOn(&run_epoll_io_tests.step);
+    const run_epoll_posix_io_tests = b.addRunArtifact(epoll_posix_io_tests);
+    const test_epoll_posix_io_step = b.step("test-epoll-posix-io", "Run EpollPosixIO smoke tests (real socketpair + real epoll)");
+    test_epoll_posix_io_step.dependOn(&run_epoll_posix_io_tests.step);
+    test_step.dependOn(&run_epoll_posix_io_tests.step);
+
+    // ── EpollMmapIO smoke tests (mmap-backed file ops) ──────────────
+    //
+    // Backend-specific coverage for `src/io/epoll_mmap_io.zig`. Linux-only
+    // (skipped at runtime on other platforms via `skipIfUnavailable`). The
+    // inline tests in `epoll_mmap_io.zig` are pulled in via
+    // `src/io/root.zig` -> `_ = epoll_mmap_io;`; this addTest target adds
+    // integration coverage focused on the mmap remap / truncate /
+    // msync paths.
+    const epoll_mmap_io_tests = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("tests/epoll_mmap_io_test.zig"),
+            .target = target,
+            .optimize = optimize,
+            .imports = &varuna_import,
+        }),
+    });
+    const run_epoll_mmap_io_tests = b.addRunArtifact(epoll_mmap_io_tests);
+    const test_epoll_mmap_io_step = b.step("test-epoll-mmap-io", "Run EpollMmapIO smoke tests (mmap remap + msync coverage)");
+    test_epoll_mmap_io_step.dependOn(&run_epoll_mmap_io_tests.step);
+    test_step.dependOn(&run_epoll_mmap_io_tests.step);
 
     // ── KqueueIO MVP tests ─────────────────────────────────
     // Standalone target: compiles `src/io/kqueue_io.zig` directly, with
@@ -1142,17 +1173,41 @@ pub const TlsBackend = enum {
 /// exist as MVPs that compile their respective IO modules (and tests)
 /// cleanly, so cross-compilation can be validated even though the daemon
 /// itself does not yet run on those backends.
+///
+/// File-I/O strategy is a separate axis from the readiness layer. POSIX
+/// (`pread`/`pwrite` on a thread pool) and mmap (memcpy + msync) trade off
+/// against each other; each readiness backend has both variants so that
+/// neither tradeoff is hidden inside the other.
 pub const IoBackend = enum {
-    /// Default: Linux io_uring via `src/io/real_io.zig`. Production backend.
+    /// Default: Linux io_uring via `src/io/real_io.zig`. Production
+    /// backend. The only flag under which the full daemon is installed.
     io_uring,
-    /// Linux epoll readiness fallback via `src/io/epoll_io.zig`. Used in
-    /// sandboxes or seccomp policies that block io_uring. MVP is sockets +
-    /// timers + cancel; file ops require a worker thread pool follow-up.
-    epoll,
-    /// macOS / BSD kqueue developer backend via `src/io/kqueue_io.zig`.
-    /// MVP — sockets + timers only; file ops deferred to a thread-pool
-    /// follow-up. Daemon is not built under this flag.
-    kqueue,
+    /// Linux epoll readiness + POSIX file-op thread pool via
+    /// `src/io/epoll_posix_io.zig`. Used in sandboxes or seccomp policies
+    /// that block io_uring. Sockets + timers + cancel today; file-op
+    /// pool is a follow-up.
+    epoll_posix,
+    /// Linux epoll readiness + mmap-backed file I/O via
+    /// `src/io/epoll_mmap_io.zig`. Same readiness layer as `epoll_posix`;
+    /// file ops are `memcpy` against a per-fd `mmap` mapping with
+    /// `msync(MS_SYNC)` durability. Scaffold today; see commit 2 of the
+    /// bifurcation work for the implementation.
+    epoll_mmap,
+    /// macOS / BSD kqueue readiness + POSIX file-op thread pool via
+    /// `src/io/kqueue_posix_io.zig`. Owned by the parallel
+    /// kqueue-bifurcation engineer; this branch carries a stub that
+    /// returns `error.Unimplemented` from every op so the 6-way selector
+    /// compiles.
+    kqueue_posix,
+    /// macOS / BSD kqueue readiness + mmap-backed file I/O via
+    /// `src/io/kqueue_mmap_io.zig`. Owned by the parallel
+    /// kqueue-bifurcation engineer; stub on this branch.
+    kqueue_mmap,
+    /// In-process SimIO simulator promoted to a top-level option so test
+    /// builds can drop the simulator into code currently hard-wired to
+    /// io_uring's `RealIO`. Resolves `backend.RealIO` to `sim_io.SimIO`.
+    /// Daemon install is skipped; only the IO module + tests are built.
+    sim,
 };
 
 /// Cryptographic algorithm backend selection.

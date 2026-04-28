@@ -1,50 +1,52 @@
-//! EpollIO — Linux epoll readiness backend implementing the public
-//! `io_interface`.
+//! EpollMmapIO — Linux epoll readiness backend with mmap-based file I/O.
 //!
-//! `EpollIO` is the fallback for environments where `io_uring` is forbidden
-//! (seccomp policies that block `io_uring_setup`, ancient kernels, hostile
-//! sandboxes). The contract is identical to `RealIO`: each method submits
-//! an asynchronous operation and a CQE-equivalent fires the
-//! `Completion.callback` from `tick`.
+//! Companion to `epoll_posix_io.zig`. The readiness layer (epoll) is
+//! identical — sockets, timers, and cancel are mechanically the same. The
+//! axis that differs is file I/O:
 //!
-//! Design follows `docs/epoll-kqueue-design.md`:
+//!   * `epoll_posix_io.zig`: `pread`/`pwrite`/`fsync`/`fallocate` syscalls
+//!     offloaded to a thread pool.
+//!   * `epoll_mmap_io.zig` (this file): file is `mmap`'d at first access;
+//!     reads/writes are `memcpy`s; `fsync` is `msync(MS_SYNC)`. Zero-copy,
+//!     OS pagecache implicit. Page faults block the calling thread today
+//!     (mitigation: `madvise(MADV_WILLNEED)` ahead of time when feasible);
+//!     promote to a thread-pool memcpy if profiling shows it matters.
 //!
-//!   * Sockets use the standard non-blocking + EAGAIN → register → retry
-//!     pattern. We register interest with `epoll_ctl(EPOLL_CTL_ADD)` using
-//!     `EPOLLONESHOT` (level-triggered, one-shot), retry the syscall when
-//!     `epoll_wait` reports readiness, and deliver the result.
-//!   * Timers use a flat array of pending timers (peek-min via linear
-//!     scan; libxev pattern). Number of concurrent timers in varuna's hot
-//!     path is small (~hundreds), so O(n) peek is fine. The next deadline
-//!     drives the `epoll_wait` timeout argument.
-//!   * File ops (`read`, `write`, `pread`, `pwrite`, `fallocate`, `fsync`,
-//!     `truncate`) MUST be offloaded to a thread pool because epoll cannot
-//!     deliver readiness for regular files. **MVP STATUS: file ops are not
-//!     implemented yet — they return `error.Unimplemented`.** Track:
-//!     `progress-reports/2026-04-29-epoll-io-mvp.md`.
-//!   * Cancel is best-effort: for socket ops we `epoll_ctl(EPOLL_CTL_DEL)`
-//!     the fd and complete the cancelled op with `error.OperationCanceled`.
-//!     For timers we remove from the heap and deliver cancellation. Already
-//!     dispatched ops cannot be cancelled.
-//!   * `accept` with `multishot=true` honours the contract semantically;
-//!     native multishot doesn't exist on epoll, so the caller's `.rearm`
-//!     return drives re-submission.
+//! ## Mapping lifecycle
 //!
-//! ## Architecture choices
+//!   1. First file op against `fd` runs `fstat(fd)` to get the file size,
+//!      then `mmap(fd, 0..size, PROT_READ | PROT_WRITE, MAP_SHARED)` and
+//!      records `(ptr, size)` in `file_mappings`.
+//!   2. Subsequent reads/writes do `@memcpy` against the recorded mapping.
+//!      If a write would extend past `size` we tear down the mapping and
+//!      remap (the file should already have been `fallocate`d / `ftruncate`d
+//!      to the necessary size; otherwise the write returns
+//!      `error.AccessDenied` for SIGBUS-equivalent semantics).
+//!   3. `fsync` runs `msync(ptr, size, MS_SYNC)` — stronger than
+//!      `fdatasync` since `msync` flushes both data and any metadata
+//!      changes accumulated against the mapping.
+//!   4. `fallocate` calls `posix.fallocate` synchronously; if the file's
+//!      mapping is now stale (size grew) the next access remaps.
+//!   5. `truncate` calls `posix.ftruncate` synchronously; the existing
+//!      mapping is unmapped so the next access remaps.
+//!   6. `closeSocket` (used for files too — naming is historical) tears
+//!      down any mapping for `fd` before `posix.close`.
 //!
-//! Each submission method is **self-contained** — it loops internally for
-//! the synchronous-completion rearm path, and it never calls back into the
-//! re-dispatch helper. The async path runs through `tick → dispatchReady
-//! → resubmit → submission method`, where `resubmit` is the only place
-//! that re-invokes a submission method by tag. This keeps Zig 0.15.2's
-//! inferred error sets acyclic (mutual recursion through callbacks would
-//! otherwise be unresolvable).
+//! ## Page-fault discussion (deliberate MVP limitation)
+//!
+//! In the MVP, page faults block the EL thread. For varuna's workload
+//! (large piece reads/writes from a small set of files) this is rarely a
+//! problem if `madvise(MADV_WILLNEED)` is used proactively to warm the
+//! pagecache before the read fires. None of varuna's reference codebases
+//! (libxev, tigerbeetle, ZIO) use mmap for data-path file I/O — that's a
+//! signal worth respecting. If profiling shows page-fault stalls matter,
+//! the mitigation is to run the `memcpy` itself on a thread pool so the
+//! EL keeps making progress while a fault resolves. Tracked under
+//! "EpollMmapIO file-op page-fault mitigation" in
+//! `progress-reports/2026-04-30-epoll-bifurcation.md`.
 //!
 //! See `reference-codebases/libxev/src/backend/epoll.zig` for the canonical
-//! reference implementation; libxev's epoll backend is structurally
-//! similar but its author flagged it as "in much poorer quality" than the
-//! kqueue one. Pattern adapted from there + ZIO + tigerbeetle survey in
-//! the design doc.
+//! readiness-loop reference; the file-op story is novel to varuna.
 
 const std = @import("std");
 const builtin = @import("builtin");
@@ -61,17 +63,8 @@ const CallbackAction = ifc.CallbackAction;
 
 // ── Backend state ─────────────────────────────────────────
 //
-// EpollIO stores per-completion bookkeeping in `Completion._backend_state`.
-// State must fit in `ifc.backend_state_size` (64 bytes). Required slots:
-//
-//   * `in_flight`         — guards against double-submission.
-//   * `epoll_registered`  — whether the fd is currently in our epoll set.
-//   * `registered_fd`     — fd to remove from epoll on disarm/cancel; we
-//                           store it explicitly because the op union may be
-//                           rewritten by a callback before we read it.
-//   * `accept_multishot`  — sticky flag for multishot-accept drain-loop.
-//   * `deadline_ns`       — absolute monotonic nanoseconds for timers.
-//   * `timer_heap_index`  — sentinel-tagged index into the timer heap.
+// Shared layout with EpollPosixIO. Fits in `ifc.backend_state_size = 64`
+// bytes.
 
 const sentinel_index: u32 = std.math.maxInt(u32);
 
@@ -79,14 +72,8 @@ pub const EpollState = struct {
     in_flight: bool = false,
     epoll_registered: bool = false,
     accept_multishot: bool = false,
-    /// fd we registered in the epoll set, if any. Stored separately from
-    /// `c.op` because the callback may rearm with a different op; we still
-    /// need to know which fd to `EPOLL_CTL_DEL` on disarm.
     registered_fd: posix.fd_t = -1,
-    /// Absolute monotonic deadline for `timeout` ops, in nanoseconds since
-    /// the monotonic clock epoch.
     deadline_ns: u64 = 0,
-    /// Position in the timer heap; `sentinel_index` means "not in heap".
     timer_heap_index: u32 = sentinel_index,
 };
 
@@ -102,16 +89,23 @@ inline fn epollState(c: *Completion) *EpollState {
 // ── Configuration ─────────────────────────────────────────
 
 pub const Config = struct {
-    /// Initial capacity for the timer heap. Grows on demand if needed.
-    /// Mirrors RealIO's `entries` knob in spirit.
+    /// Initial capacity for the timer heap. Mirrors EpollPosixIO.Config.
     max_completions: u32 = 1024,
+};
+
+// ── Mmap bookkeeping ──────────────────────────────────────
+
+const MmapEntry = struct {
+    /// Base pointer of the mapping. Points into the virtual address space.
+    ptr: [*]u8,
+    /// Size of the mapping in bytes.
+    size: usize,
 };
 
 // ── Timer heap ────────────────────────────────────────────
 //
-// MVP uses a flat array. `peekMin` does a linear scan but for varuna's
-// timer counts (low-hundreds in the hot path) this is fine. Replace with
-// a true binary heap when profiling shows it's a bottleneck.
+// Same shape as EpollPosixIO. O(n) peek-min is fine for varuna's
+// timer counts.
 
 const TimerHeap = struct {
     entries: std.array_list.Managed(*Completion),
@@ -158,28 +152,23 @@ const TimerHeap = struct {
         }
         return false;
     }
-
-    fn count(self: *const TimerHeap) usize {
-        return self.entries.items.len;
-    }
 };
 
-// ── EpollIO ───────────────────────────────────────────────
+// ── EpollMmapIO ───────────────────────────────────────────
 
-pub const EpollIO = struct {
+pub const EpollMmapIO = struct {
     allocator: std.mem.Allocator,
     epoll_fd: posix.fd_t,
-    /// Cross-thread wakeup primitive. Background workers (file-op thread
-    /// pool, when implemented) write to this fd; we read it inside `tick`
-    /// to drain spurious wakes.
+    /// Cross-thread wakeup primitive (mirrors EpollPosixIO).
     wakeup_fd: posix.fd_t,
     /// Active in-flight count (for `tick(wait_at_least)` semantics).
     active: u32 = 0,
     timers: TimerHeap,
-    /// Cached monotonic-clock reading, refreshed in `tick`.
     cached_now_ns: u64 = 0,
+    /// Per-fd mmap state. Populated lazily on first file op against `fd`.
+    file_mappings: std.AutoHashMap(posix.fd_t, MmapEntry),
 
-    pub fn init(allocator: std.mem.Allocator, config: Config) !EpollIO {
+    pub fn init(allocator: std.mem.Allocator, config: Config) !EpollMmapIO {
         const epoll_rc = linux.epoll_create1(linux.EPOLL.CLOEXEC);
         switch (linux.E.init(epoll_rc)) {
             .SUCCESS => {},
@@ -218,32 +207,35 @@ pub const EpollIO = struct {
             .epoll_fd = epoll_fd,
             .wakeup_fd = wakeup_fd,
             .timers = try TimerHeap.init(allocator, config.max_completions),
+            .file_mappings = std.AutoHashMap(posix.fd_t, MmapEntry).init(allocator),
         };
     }
 
-    pub fn deinit(self: *EpollIO) void {
+    pub fn deinit(self: *EpollMmapIO) void {
+        // Tear down any remaining mappings before freeing the map itself.
+        var it = self.file_mappings.valueIterator();
+        while (it.next()) |entry| {
+            posix.munmap(@alignCast(entry.ptr[0..entry.size]));
+        }
+        self.file_mappings.deinit();
         self.timers.deinit();
         posix.close(self.wakeup_fd);
         posix.close(self.epoll_fd);
         self.* = undefined;
     }
 
-    /// Synchronously close a file descriptor. Mirrors `RealIO.closeSocket`.
-    /// Best-effort removes the fd from epoll first to avoid the
-    /// "closed-fd-still-in-epoll-set" footgun called out in
-    /// `docs/epoll-kqueue-design.md`. ENOENT is fine — fd was never
-    /// registered.
-    pub fn closeSocket(self: *EpollIO, fd: posix.fd_t) void {
+    /// Synchronously close a file descriptor. Used for both sockets and
+    /// regular files (the contract method is named `closeSocket` for
+    /// historical reasons). Tears down any mmap mapping for `fd` first.
+    pub fn closeSocket(self: *EpollMmapIO, fd: posix.fd_t) void {
+        self.unmapFile(fd);
         _ = linux.epoll_ctl(self.epoll_fd, linux.EPOLL.CTL_DEL, fd, null);
         posix.close(fd);
     }
 
     // ── Main loop ─────────────────────────────────────────
 
-    /// Drain expired timers, `epoll_wait` for the next event, dispatch
-    /// ready fds, drain any timers that became due during the wait.
-    /// Mirrors the contract's `tick` semantics.
-    pub fn tick(self: *EpollIO, wait_at_least: u32) !void {
+    pub fn tick(self: *EpollMmapIO, wait_at_least: u32) !void {
         self.updateNow();
 
         var fired: u32 = 0;
@@ -257,7 +249,7 @@ pub const EpollIO = struct {
         const n_rc = linux.epoll_pwait(self.epoll_fd, &events, events.len, timeout_ms, null);
         const n: usize = switch (linux.E.init(n_rc)) {
             .SUCCESS => @intCast(n_rc),
-            .INTR => 0, // signal interrupt — caller can re-tick
+            .INTR => 0,
             else => |e| return posix.unexpectedErrno(e),
         };
 
@@ -276,7 +268,7 @@ pub const EpollIO = struct {
         try self.fireExpiredTimers(&fired);
     }
 
-    fn computeEpollTimeout(self: *EpollIO, wait_at_least: u32, fired: u32) i32 {
+    fn computeEpollTimeout(self: *EpollMmapIO, wait_at_least: u32, fired: u32) i32 {
         if (fired >= wait_at_least and wait_at_least > 0) return 0;
         const next_deadline = if (self.timers.peekMin()) |t|
             epollState(t).deadline_ns
@@ -289,7 +281,7 @@ pub const EpollIO = struct {
         return @intCast(@min(ms_remaining, @as(u64, std.math.maxInt(i32))));
     }
 
-    fn updateNow(self: *EpollIO) void {
+    fn updateNow(self: *EpollMmapIO) void {
         var ts: linux.timespec = .{ .sec = 0, .nsec = 0 };
         const rc = linux.clock_gettime(linux.CLOCK.MONOTONIC, &ts);
         if (linux.E.init(rc) == .SUCCESS) {
@@ -300,7 +292,7 @@ pub const EpollIO = struct {
         }
     }
 
-    fn fireExpiredTimers(self: *EpollIO, fired: *u32) !void {
+    fn fireExpiredTimers(self: *EpollMmapIO, fired: *u32) !void {
         while (self.timers.peekMin()) |c| {
             const st = epollState(c);
             if (st.deadline_ns > self.cached_now_ns) break;
@@ -316,25 +308,16 @@ pub const EpollIO = struct {
                 .disarm => {},
                 .rearm => switch (c.op) {
                     .timeout => |t_op| try self.timeout(t_op, c, c.userdata, cb),
-                    else => {}, // illegal under the contract — ignore
+                    else => {},
                 },
             }
         }
     }
 
-    /// Dispatch a ready fd from the epoll wait loop. Clears the
-    /// completion's epoll registration (EPOLLONESHOT is already
-    /// auto-disabled by the kernel; we just clean up state) and re-runs
-    /// the operation through the resubmit path. The submission method
-    /// retries the syscall and either delivers the result inline or
-    /// re-registers if EAGAIN comes back.
-    fn dispatchReady(self: *EpollIO, c: *Completion, events: u32) !void {
+    fn dispatchReady(self: *EpollMmapIO, c: *Completion, events: u32) !void {
         const st = epollState(c);
         const cb = c.callback orelse return;
 
-        // Clean up the epoll registration. EPOLLONESHOT means the kernel
-        // has already disabled this fd's interest — but we still need to
-        // EPOLL_CTL_DEL to tear down state for re-add later.
         if (st.epoll_registered) {
             _ = linux.epoll_ctl(self.epoll_fd, linux.EPOLL.CTL_DEL, st.registered_fd, null);
             st.epoll_registered = false;
@@ -342,10 +325,6 @@ pub const EpollIO = struct {
         st.in_flight = false;
         self.active -|= 1;
 
-        // Build the result by retrying the operation. If retry returns
-        // EAGAIN (rare under EPOLLONESHOT), we'll re-register via the
-        // submission method's own path — but for our common case the retry
-        // succeeds.
         const result = performInline(c, events);
         const action = cb(c.userdata, c, result);
         switch (action) {
@@ -354,7 +333,7 @@ pub const EpollIO = struct {
         }
     }
 
-    fn resubmit(self: *EpollIO, c: *Completion) !void {
+    fn resubmit(self: *EpollMmapIO, c: *Completion) !void {
         const userdata = c.userdata;
         const callback = c.callback orelse return;
         switch (c.op) {
@@ -377,32 +356,17 @@ pub const EpollIO = struct {
         }
     }
 
-    // ── Submission methods ────────────────────────────────
-    //
-    // Each method is self-contained: it runs the syscall once, and if it
-    // succeeded synchronously, fires the callback in a loop that handles
-    // .rearm. If the syscall returns EAGAIN, the method registers fd
-    // interest with epoll and returns; the async path picks up via
-    // `tick → dispatchReady → resubmit → submission method`.
-    //
-    // **Intentionally no calls to `resubmit` from inside a submission
-    // method.** That would create an inferred-error-set cycle in Zig 0.15.2
-    // (recv → resubmit → recv).
+    // ── Submission methods (sockets, mirrored from EpollPosixIO) ──
 
-    pub fn socket(self: *EpollIO, op_in: ifc.SocketOp, c: *Completion, ud: ?*anyopaque, cb: Callback) !void {
+    pub fn socket(self: *EpollMmapIO, op_in: ifc.SocketOp, c: *Completion, ud: ?*anyopaque, cb: Callback) !void {
         var op = op_in;
         while (true) {
             try self.armCompletion(c, .{ .socket = op }, ud, cb);
-
-            // Always-non-blocking + cloexec. Daemon callers expect fds
-            // that don't block in non-uring code paths and the EAGAIN
-            // pattern requires it.
             const sock_type = op.sock_type | posix.SOCK.NONBLOCK | posix.SOCK.CLOEXEC;
             const result: Result = if (posix.socket(@intCast(op.domain), sock_type, op.protocol)) |fd|
                 .{ .socket = fd }
             else |err|
                 .{ .socket = err };
-
             switch (try self.deliverInline(c, result)) {
                 .disarm => return,
                 .rearm => switch (c.op) {
@@ -416,12 +380,10 @@ pub const EpollIO = struct {
         }
     }
 
-    pub fn connect(self: *EpollIO, op: ifc.ConnectOp, c: *Completion, ud: ?*anyopaque, cb: Callback) !void {
+    pub fn connect(self: *EpollMmapIO, op: ifc.ConnectOp, c: *Completion, ud: ?*anyopaque, cb: Callback) !void {
         try self.armCompletion(c, .{ .connect = op }, ud, cb);
-
         const addrlen = op.addr.getOsSockLen();
         if (posix.connect(op.fd, &op.addr.any, addrlen)) {
-            // Connect completed synchronously (e.g. AF_UNIX).
             const action = try self.deliverInline(c, .{ .connect = {} });
             switch (action) {
                 .disarm => return,
@@ -445,20 +407,13 @@ pub const EpollIO = struct {
                 return;
             },
         }
-
         try self.registerFd(c, op.fd, linux.EPOLL.OUT);
-        // MVP: deadline_ns is honoured only via explicit `cancel` from a
-        // separate timeout completion. Native deadline-bounded connect
-        // belongs to a follow-up.
         _ = op.deadline_ns;
     }
 
-    pub fn accept(self: *EpollIO, op: ifc.AcceptOp, c: *Completion, ud: ?*anyopaque, cb: Callback) !void {
+    pub fn accept(self: *EpollMmapIO, op: ifc.AcceptOp, c: *Completion, ud: ?*anyopaque, cb: Callback) !void {
         try self.armCompletion(c, .{ .accept = op }, ud, cb);
         epollState(c).accept_multishot = op.multishot;
-
-        // Try once before parking — there may already be a pending
-        // connection. If accept returns EAGAIN we register and wait.
         if (doAccept(op.fd)) |accepted| {
             const action = try self.deliverInline(c, .{ .accept = accepted });
             switch (action) {
@@ -483,15 +438,13 @@ pub const EpollIO = struct {
                 return;
             },
         }
-
         try self.registerFd(c, op.fd, linux.EPOLL.IN);
     }
 
-    pub fn recv(self: *EpollIO, op_in: ifc.RecvOp, c: *Completion, ud: ?*anyopaque, cb: Callback) !void {
+    pub fn recv(self: *EpollMmapIO, op_in: ifc.RecvOp, c: *Completion, ud: ?*anyopaque, cb: Callback) !void {
         var op = op_in;
         while (true) {
             try self.armCompletion(c, .{ .recv = op }, ud, cb);
-
             const result: Result = res: {
                 if (posix.recv(op.fd, op.buf, op.flags)) |n| {
                     break :res .{ .recv = n };
@@ -503,7 +456,6 @@ pub const EpollIO = struct {
                     break :res .{ .recv = err };
                 }
             };
-
             switch (try self.deliverInline(c, result)) {
                 .disarm => return,
                 .rearm => switch (c.op) {
@@ -517,11 +469,10 @@ pub const EpollIO = struct {
         }
     }
 
-    pub fn send(self: *EpollIO, op_in: ifc.SendOp, c: *Completion, ud: ?*anyopaque, cb: Callback) !void {
+    pub fn send(self: *EpollMmapIO, op_in: ifc.SendOp, c: *Completion, ud: ?*anyopaque, cb: Callback) !void {
         var op = op_in;
         while (true) {
             try self.armCompletion(c, .{ .send = op }, ud, cb);
-
             const result: Result = res: {
                 if (posix.send(op.fd, op.buf, op.flags)) |n| {
                     break :res .{ .send = n };
@@ -533,7 +484,6 @@ pub const EpollIO = struct {
                     break :res .{ .send = err };
                 }
             };
-
             switch (try self.deliverInline(c, result)) {
                 .disarm => return,
                 .rearm => switch (c.op) {
@@ -547,11 +497,10 @@ pub const EpollIO = struct {
         }
     }
 
-    pub fn recvmsg(self: *EpollIO, op_in: ifc.RecvmsgOp, c: *Completion, ud: ?*anyopaque, cb: Callback) !void {
+    pub fn recvmsg(self: *EpollMmapIO, op_in: ifc.RecvmsgOp, c: *Completion, ud: ?*anyopaque, cb: Callback) !void {
         var op = op_in;
         while (true) {
             try self.armCompletion(c, .{ .recvmsg = op }, ud, cb);
-
             const result: Result = res: {
                 const n = doRecvmsg(op);
                 if (n) |bytes| {
@@ -564,7 +513,6 @@ pub const EpollIO = struct {
                     break :res .{ .recvmsg = err };
                 }
             };
-
             switch (try self.deliverInline(c, result)) {
                 .disarm => return,
                 .rearm => switch (c.op) {
@@ -578,11 +526,10 @@ pub const EpollIO = struct {
         }
     }
 
-    pub fn sendmsg(self: *EpollIO, op_in: ifc.SendmsgOp, c: *Completion, ud: ?*anyopaque, cb: Callback) !void {
+    pub fn sendmsg(self: *EpollMmapIO, op_in: ifc.SendmsgOp, c: *Completion, ud: ?*anyopaque, cb: Callback) !void {
         var op = op_in;
         while (true) {
             try self.armCompletion(c, .{ .sendmsg = op }, ud, cb);
-
             const result: Result = res: {
                 const n = doSendmsg(op);
                 if (n) |bytes| {
@@ -595,7 +542,6 @@ pub const EpollIO = struct {
                     break :res .{ .sendmsg = err };
                 }
             };
-
             switch (try self.deliverInline(c, result)) {
                 .disarm => return,
                 .rearm => switch (c.op) {
@@ -609,36 +555,28 @@ pub const EpollIO = struct {
         }
     }
 
-    pub fn timeout(self: *EpollIO, op: ifc.TimeoutOp, c: *Completion, ud: ?*anyopaque, cb: Callback) !void {
+    pub fn timeout(self: *EpollMmapIO, op: ifc.TimeoutOp, c: *Completion, ud: ?*anyopaque, cb: Callback) !void {
         try self.armCompletion(c, .{ .timeout = op }, ud, cb);
-
         self.updateNow();
         const deadline = std.math.add(u64, self.cached_now_ns, op.ns) catch
             std.math.maxInt(u64);
         epollState(c).deadline_ns = deadline;
-
         try self.timers.push(c);
         self.active += 1;
     }
 
-    pub fn poll(self: *EpollIO, op: ifc.PollOp, c: *Completion, ud: ?*anyopaque, cb: Callback) !void {
+    pub fn poll(self: *EpollMmapIO, op: ifc.PollOp, c: *Completion, ud: ?*anyopaque, cb: Callback) !void {
         try self.armCompletion(c, .{ .poll = op }, ud, cb);
-
-        // Translate POLL_IN/POLL_OUT/etc. to EPOLLIN/EPOLLOUT/etc. The
-        // bitmask values match between `linux.POLL.*` and `linux.EPOLL.*`
-        // for the common cases (IN=1, OUT=4, ERR=8, HUP=16), so a direct
-        // copy is sufficient.
         try self.registerFd(c, op.fd, op.events);
     }
 
-    pub fn cancel(self: *EpollIO, op: ifc.CancelOp, c: *Completion, ud: ?*anyopaque, cb: Callback) !void {
+    pub fn cancel(self: *EpollMmapIO, op: ifc.CancelOp, c: *Completion, ud: ?*anyopaque, cb: Callback) !void {
         try self.armCompletion(c, .{ .cancel = op }, ud, cb);
 
         const target = op.target;
         const tst = epollState(target);
         var found = false;
 
-        // Timer in heap?
         if (tst.timer_heap_index != sentinel_index) {
             if (self.timers.remove(target)) {
                 found = true;
@@ -650,7 +588,6 @@ pub const EpollIO = struct {
             }
         }
 
-        // Registered with epoll?
         if (!found and tst.epoll_registered) {
             _ = linux.epoll_ctl(self.epoll_fd, linux.EPOLL.CTL_DEL, tst.registered_fd, null);
             tst.epoll_registered = false;
@@ -685,47 +622,168 @@ pub const EpollIO = struct {
         }
     }
 
-    // ── File ops (UNIMPLEMENTED in MVP) ───────────────────
+    // ── File ops (mmap-backed) ────────────────────────────
     //
-    // The MVP scope intentionally excludes file ops. They MUST run on a
-    // worker thread pool because epoll cannot deliver readiness for regular
-    // files (they always poll ready). Daemon paths that depend on these
-    // ops will not work under `-Dio=epoll` until the follow-up lands.
+    // Read / write are synchronous from the EL's POV — they `memcpy`
+    // against the per-fd mapping. Page faults block this thread; see the
+    // file header for the mitigation discussion.
+    //
+    // The mapping is established lazily on first access (`fstat` to size
+    // the mapping; `mmap` PROT_READ | PROT_WRITE). A subsequent `pwrite`
+    // that needs to extend past the current mapping triggers a remap if
+    // the file has already been resized via `fallocate` / `truncate`.
 
-    pub fn read(self: *EpollIO, op: ifc.ReadOp, c: *Completion, ud: ?*anyopaque, cb: Callback) !void {
+    pub fn read(self: *EpollMmapIO, op: ifc.ReadOp, c: *Completion, ud: ?*anyopaque, cb: Callback) !void {
         try self.armCompletion(c, .{ .read = op }, ud, cb);
-        const action = try self.deliverInline(c, .{ .read = error.Unimplemented });
-        // Unimplemented op rearm is a no-op; the caller can't make progress.
-        _ = action;
+        const result: Result = blk: {
+            const entry = self.ensureMapping(op.fd) catch |err| break :blk .{ .read = err };
+            const offset_us: usize = @intCast(op.offset);
+            if (offset_us >= entry.size) break :blk .{ .read = @as(usize, 0) };
+            const available = entry.size - offset_us;
+            const n = @min(op.buf.len, available);
+            @memcpy(op.buf[0..n], entry.ptr[offset_us..][0..n]);
+            break :blk .{ .read = n };
+        };
+        _ = try self.deliverInline(c, result);
     }
 
-    pub fn write(self: *EpollIO, op: ifc.WriteOp, c: *Completion, ud: ?*anyopaque, cb: Callback) !void {
+    pub fn write(self: *EpollMmapIO, op: ifc.WriteOp, c: *Completion, ud: ?*anyopaque, cb: Callback) !void {
         try self.armCompletion(c, .{ .write = op }, ud, cb);
-        const action = try self.deliverInline(c, .{ .write = error.Unimplemented });
-        _ = action;
+        const result: Result = blk: {
+            const offset_us: usize = @intCast(op.offset);
+            const required = offset_us + op.buf.len;
+
+            // Refresh mapping; if the file has grown beyond the current
+            // mapping we remap to pick up the new size.
+            var entry = self.ensureMapping(op.fd) catch |err| break :blk .{ .write = err };
+            if (required > entry.size) {
+                self.unmapFile(op.fd);
+                entry = self.ensureMapping(op.fd) catch |err| break :blk .{ .write = err };
+            }
+            if (required > entry.size) {
+                // File still too small; caller must `fallocate` /
+                // `truncate` first. Surface ENOSPC-equivalent so callers'
+                // existing fallocate-fallback paths can react.
+                break :blk .{ .write = error.NoSpaceLeft };
+            }
+            @memcpy(entry.ptr[offset_us..][0..op.buf.len], op.buf);
+            break :blk .{ .write = op.buf.len };
+        };
+        _ = try self.deliverInline(c, result);
     }
 
-    pub fn fsync(self: *EpollIO, op: ifc.FsyncOp, c: *Completion, ud: ?*anyopaque, cb: Callback) !void {
+    pub fn fsync(self: *EpollMmapIO, op: ifc.FsyncOp, c: *Completion, ud: ?*anyopaque, cb: Callback) !void {
         try self.armCompletion(c, .{ .fsync = op }, ud, cb);
-        const action = try self.deliverInline(c, .{ .fsync = error.Unimplemented });
-        _ = action;
+        const result: Result = blk: {
+            // If we have a mapping, msync flushes both data and metadata
+            // changes accumulated against the mapping (stronger than
+            // fdatasync — `op.datasync` is honoured semantically by virtue
+            // of the call still flushing dirty pages).
+            if (self.file_mappings.get(op.fd)) |entry| {
+                const slice: []align(std.heap.page_size_min) u8 = @alignCast(entry.ptr[0..entry.size]);
+                posix.msync(slice, posix.MSF.SYNC) catch |err| break :blk .{ .fsync = err };
+                break :blk .{ .fsync = {} };
+            }
+            // Fall back to plain fsync/fdatasync if no mapping established
+            // yet (e.g. a freshly-truncated file with no reads/writes
+            // pending).
+            const rc = if (op.datasync) linux.fdatasync(op.fd) else linux.fsync(op.fd);
+            switch (linux.E.init(rc)) {
+                .SUCCESS => break :blk .{ .fsync = {} },
+                .IO => break :blk .{ .fsync = error.InputOutput },
+                .NOSPC => break :blk .{ .fsync = error.NoSpaceLeft },
+                else => |e| break :blk .{ .fsync = posix.unexpectedErrno(e) },
+            }
+        };
+        _ = try self.deliverInline(c, result);
     }
 
-    pub fn fallocate(self: *EpollIO, op: ifc.FallocateOp, c: *Completion, ud: ?*anyopaque, cb: Callback) !void {
+    pub fn fallocate(self: *EpollMmapIO, op: ifc.FallocateOp, c: *Completion, ud: ?*anyopaque, cb: Callback) !void {
         try self.armCompletion(c, .{ .fallocate = op }, ud, cb);
-        const action = try self.deliverInline(c, .{ .fallocate = error.Unimplemented });
-        _ = action;
+        const result: Result = blk: {
+            // Drop any stale mapping; the next access remaps to the new
+            // size.
+            self.unmapFile(op.fd);
+            const rc = linux.fallocate(
+                op.fd,
+                op.mode,
+                @intCast(op.offset),
+                @intCast(op.len),
+            );
+            switch (linux.E.init(rc)) {
+                .SUCCESS => break :blk .{ .fallocate = {} },
+                .NOSPC => break :blk .{ .fallocate = error.NoSpaceLeft },
+                .OPNOTSUPP => break :blk .{ .fallocate = error.OperationNotSupported },
+                .IO => break :blk .{ .fallocate = error.InputOutput },
+                else => |e| break :blk .{ .fallocate = posix.unexpectedErrno(e) },
+            }
+        };
+        _ = try self.deliverInline(c, result);
     }
 
-    pub fn truncate(self: *EpollIO, op: ifc.TruncateOp, c: *Completion, ud: ?*anyopaque, cb: Callback) !void {
+    pub fn truncate(self: *EpollMmapIO, op: ifc.TruncateOp, c: *Completion, ud: ?*anyopaque, cb: Callback) !void {
         try self.armCompletion(c, .{ .truncate = op }, ud, cb);
-        const action = try self.deliverInline(c, .{ .truncate = error.Unimplemented });
-        _ = action;
+        const result: Result = blk: {
+            self.unmapFile(op.fd);
+            posix.ftruncate(op.fd, op.length) catch |err| break :blk .{ .truncate = err };
+            break :blk .{ .truncate = {} };
+        };
+        _ = try self.deliverInline(c, result);
     }
 
-    // ── Internal helpers ──────────────────────────────────
+    // ── Mmap helpers ──────────────────────────────────────
 
-    fn armCompletion(self: *EpollIO, c: *Completion, op: Operation, ud: ?*anyopaque, cb: Callback) !void {
+    fn ensureMapping(self: *EpollMmapIO, fd: posix.fd_t) !MmapEntry {
+        if (self.file_mappings.get(fd)) |entry| return entry;
+
+        // `fstat` to size the mapping. A zero-byte file produces a
+        // zero-byte mapping; mmap rejects that, so we treat it as a
+        // valid empty mapping (no allocation; reads/writes against the
+        // zero region naturally return zero / NoSpaceLeft).
+        var st: linux.Stat = undefined;
+        const rc = linux.fstat(fd, &st);
+        switch (linux.E.init(rc)) {
+            .SUCCESS => {},
+            .BADF => return error.BadFileDescriptor,
+            else => |e| return posix.unexpectedErrno(e),
+        }
+        const size: usize = @intCast(st.size);
+        if (size == 0) {
+            const entry: MmapEntry = .{ .ptr = @ptrFromInt(@alignOf(usize)), .size = 0 };
+            try self.file_mappings.put(fd, entry);
+            return entry;
+        }
+
+        const slice = try posix.mmap(
+            null,
+            size,
+            posix.PROT.READ | posix.PROT.WRITE,
+            .{ .TYPE = .SHARED },
+            fd,
+            0,
+        );
+        // `madvise(MADV_WILLNEED)` warms the pagecache so the first
+        // memcpy doesn't stall on a synchronous page fault. Best-effort
+        // — failure is fine.
+        _ = posix.madvise(slice.ptr, slice.len, posix.MADV.WILLNEED) catch {};
+
+        const entry: MmapEntry = .{ .ptr = slice.ptr, .size = slice.len };
+        try self.file_mappings.put(fd, entry);
+        return entry;
+    }
+
+    fn unmapFile(self: *EpollMmapIO, fd: posix.fd_t) void {
+        if (self.file_mappings.fetchRemove(fd)) |kv| {
+            if (kv.value.size > 0) {
+                const slice: []align(std.heap.page_size_min) u8 = @alignCast(kv.value.ptr[0..kv.value.size]);
+                posix.munmap(slice);
+            }
+        }
+    }
+
+    // ── Internal helpers (mirrored from EpollPosixIO) ─────
+
+    fn armCompletion(self: *EpollMmapIO, c: *Completion, op: Operation, ud: ?*anyopaque, cb: Callback) !void {
         _ = self;
         const st = epollState(c);
         if (st.in_flight) return error.AlreadyInFlight;
@@ -736,7 +794,7 @@ pub const EpollIO = struct {
         c.next = null;
     }
 
-    fn registerFd(self: *EpollIO, c: *Completion, fd: posix.fd_t, events: u32) !void {
+    fn registerFd(self: *EpollMmapIO, c: *Completion, fd: posix.fd_t, events: u32) !void {
         var ev: linux.epoll_event = .{
             .events = events | linux.EPOLL.ONESHOT | linux.EPOLL.RDHUP,
             .data = .{ .ptr = @intFromPtr(c) },
@@ -745,8 +803,6 @@ pub const EpollIO = struct {
         switch (linux.E.init(rc)) {
             .SUCCESS => {},
             .EXIST => {
-                // Already registered (e.g. previous EPOLLONESHOT armed but
-                // not yet fired) — modify instead.
                 const mod_rc = linux.epoll_ctl(self.epoll_fd, linux.EPOLL.CTL_MOD, fd, &ev);
                 switch (linux.E.init(mod_rc)) {
                     .SUCCESS => {},
@@ -763,11 +819,7 @@ pub const EpollIO = struct {
         self.active += 1;
     }
 
-    /// Deliver a synchronous-completion result by clearing in_flight and
-    /// invoking the callback. Returns the callback's action so the caller
-    /// can handle .rearm in its own loop. **Does not call `resubmit`** —
-    /// that would create an inferred-error-set cycle.
-    fn deliverInline(self: *EpollIO, c: *Completion, result: Result) !CallbackAction {
+    fn deliverInline(self: *EpollMmapIO, c: *Completion, result: Result) !CallbackAction {
         _ = self;
         const st = epollState(c);
         st.in_flight = false;
@@ -778,7 +830,6 @@ pub const EpollIO = struct {
 
 // ── Per-op syscall helpers ────────────────────────────────
 
-/// `linux.recvmsg` returns a usize rc; convert to anyerror!usize.
 fn doRecvmsg(op: ifc.RecvmsgOp) anyerror!usize {
     const rc = linux.recvmsg(op.fd, op.msg, op.flags);
     switch (linux.E.init(rc)) {
@@ -834,10 +885,6 @@ fn doAccept(listen_fd: posix.fd_t) anyerror!ifc.Accepted {
     return .{ .fd = fd, .addr = addr };
 }
 
-/// Retry the operation associated with `c` on its ready fd. Called from
-/// `dispatchReady` after `epoll_wait` reports readiness; the syscall
-/// should generally succeed at this point (unless multiple readers
-/// raced).
 fn performInline(c: *Completion, events: u32) Result {
     return switch (c.op) {
         .recv => |op| .{ .recv = posix.recv(op.fd, op.buf, op.flags) },
@@ -855,8 +902,8 @@ fn performInline(c: *Completion, events: u32) Result {
 
 const testing = std.testing;
 
-fn skipIfUnavailable() !EpollIO {
-    return EpollIO.init(testing.allocator, .{}) catch return error.SkipZigTest;
+fn skipIfUnavailable() !EpollMmapIO {
+    return EpollMmapIO.init(testing.allocator, .{}) catch return error.SkipZigTest;
 }
 
 const TestCtx = struct {
@@ -875,25 +922,25 @@ fn testCallback(
     return .disarm;
 }
 
-test "EpollIO init / deinit succeeds" {
+test "EpollMmapIO init / deinit succeeds" {
     var io = try skipIfUnavailable();
     defer io.deinit();
     try testing.expect(io.epoll_fd >= 0);
     try testing.expect(io.wakeup_fd >= 0);
 }
 
-test "EpollIO timeout fires after deadline" {
+test "EpollMmapIO timeout fires after deadline" {
     var io = try skipIfUnavailable();
     defer io.deinit();
 
     var c = Completion{};
     var ctx = TestCtx{};
-    try io.timeout(.{ .ns = 1_000_000 }, &c, &ctx, testCallback); // 1ms
+    try io.timeout(.{ .ns = 1_000_000 }, &c, &ctx, testCallback);
 
     var attempts: u32 = 0;
     while (ctx.calls == 0 and attempts < 200) : (attempts += 1) {
         try io.tick(0);
-        std.Thread.sleep(1_000_000); // 1ms
+        std.Thread.sleep(1_000_000);
     }
 
     try testing.expectEqual(@as(u32, 1), ctx.calls);
@@ -903,7 +950,7 @@ test "EpollIO timeout fires after deadline" {
     }
 }
 
-test "EpollIO socket creates non-blocking fd" {
+test "EpollMmapIO socket creates non-blocking fd" {
     var io = try skipIfUnavailable();
     defer io.deinit();
 
@@ -931,7 +978,7 @@ fn makeNonBlocking(fd: posix.fd_t) !void {
     _ = try posix.fcntl(fd, posix.F.SETFL, flags | @as(usize, @bitCast(@as(isize, posix.SOCK.NONBLOCK))));
 }
 
-test "EpollIO recv on socketpair returns bytes after send" {
+test "EpollMmapIO recv on socketpair returns bytes after send" {
     var io = try skipIfUnavailable();
     defer io.deinit();
 
@@ -948,12 +995,10 @@ test "EpollIO recv on socketpair returns bytes after send" {
     var ctx = TestCtx{};
     try io.recv(.{ .fd = fds[0], .buf = &buf }, &c, &ctx, testCallback);
 
-    // Recv should have parked (no data available).
     try testing.expectEqual(@as(u32, 0), ctx.calls);
 
-    // Now write — recv should fire on the next tick.
-    const n = try posix.write(fds[1], "hello");
-    try testing.expectEqual(@as(usize, 5), n);
+    const n = try posix.write(fds[1], "mmap-hello");
+    try testing.expectEqual(@as(usize, 10), n);
 
     var attempts: u32 = 0;
     while (ctx.calls == 0 and attempts < 100) : (attempts += 1) {
@@ -964,74 +1009,14 @@ test "EpollIO recv on socketpair returns bytes after send" {
     switch (ctx.last_result.?) {
         .recv => |r| {
             const got = try r;
-            try testing.expectEqual(@as(usize, 5), got);
-            try testing.expectEqualStrings("hello", buf[0..5]);
+            try testing.expectEqual(@as(usize, 10), got);
+            try testing.expectEqualStrings("mmap-hello", buf[0..10]);
         },
         else => try testing.expect(false),
     }
 }
 
-test "EpollIO send + recv round-trip on socketpair" {
-    var io = try skipIfUnavailable();
-    defer io.deinit();
-
-    var fds: [2]i32 = undefined;
-    const rc = linux.socketpair(posix.AF.UNIX, posix.SOCK.STREAM, 0, &fds);
-    if (linux.E.init(rc) != .SUCCESS) return error.SkipZigTest;
-    defer posix.close(fds[0]);
-    defer posix.close(fds[1]);
-
-    try makeNonBlocking(fds[0]);
-    try makeNonBlocking(fds[1]);
-
-    const Both = struct {
-        sent: u32 = 0,
-        received: u32 = 0,
-        bytes_sent: usize = 0,
-        bytes_received: usize = 0,
-        recv_buf: [32]u8 = undefined,
-    };
-    var both = Both{};
-
-    const send_cb = struct {
-        fn cb(ud: ?*anyopaque, _: *Completion, result: Result) CallbackAction {
-            const s: *Both = @ptrCast(@alignCast(ud.?));
-            s.sent += 1;
-            switch (result) {
-                .send => |r| s.bytes_sent = r catch 0,
-                else => {},
-            }
-            return .disarm;
-        }
-    }.cb;
-    const recv_cb = struct {
-        fn cb(ud: ?*anyopaque, _: *Completion, result: Result) CallbackAction {
-            const s: *Both = @ptrCast(@alignCast(ud.?));
-            s.received += 1;
-            switch (result) {
-                .recv => |r| s.bytes_received = r catch 0,
-                else => {},
-            }
-            return .disarm;
-        }
-    }.cb;
-
-    var send_c = Completion{};
-    var recv_c = Completion{};
-    try io.recv(.{ .fd = fds[1], .buf = &both.recv_buf }, &recv_c, &both, recv_cb);
-    try io.send(.{ .fd = fds[0], .buf = "varuna" }, &send_c, &both, send_cb);
-
-    var attempts: u32 = 0;
-    while ((both.sent < 1 or both.received < 1) and attempts < 100) : (attempts += 1) {
-        try io.tick(1);
-    }
-
-    try testing.expectEqual(@as(usize, 6), both.bytes_sent);
-    try testing.expectEqual(@as(usize, 6), both.bytes_received);
-    try testing.expectEqualStrings("varuna", both.recv_buf[0..6]);
-}
-
-test "EpollIO cancel on parked recv delivers OperationCanceled" {
+test "EpollMmapIO cancel on parked recv delivers OperationCanceled" {
     var io = try skipIfUnavailable();
     defer io.deinit();
 
@@ -1043,27 +1028,27 @@ test "EpollIO cancel on parked recv delivers OperationCanceled" {
 
     try makeNonBlocking(fds[0]);
 
-    const Both = struct {
+    const Box = struct {
         recv_calls: u32 = 0,
         cancel_calls: u32 = 0,
         recv_result: ?Result = null,
         cancel_result: ?Result = null,
     };
-    var st = Both{};
+    var box = Box{};
 
     const recv_cb = struct {
         fn cb(ud: ?*anyopaque, _: *Completion, result: Result) CallbackAction {
-            const s: *Both = @ptrCast(@alignCast(ud.?));
-            s.recv_calls += 1;
-            s.recv_result = result;
+            const b: *Box = @ptrCast(@alignCast(ud.?));
+            b.recv_calls += 1;
+            b.recv_result = result;
             return .disarm;
         }
     }.cb;
     const cancel_cb = struct {
         fn cb(ud: ?*anyopaque, _: *Completion, result: Result) CallbackAction {
-            const s: *Both = @ptrCast(@alignCast(ud.?));
-            s.cancel_calls += 1;
-            s.cancel_result = result;
+            const b: *Box = @ptrCast(@alignCast(ud.?));
+            b.cancel_calls += 1;
+            b.cancel_result = result;
             return .disarm;
         }
     }.cb;
@@ -1072,44 +1057,107 @@ test "EpollIO cancel on parked recv delivers OperationCanceled" {
     var recv_c = Completion{};
     var cancel_c = Completion{};
 
-    try io.recv(.{ .fd = fds[0], .buf = &recv_buf }, &recv_c, &st, recv_cb);
-    try testing.expectEqual(@as(u32, 0), st.recv_calls);
+    try io.recv(.{ .fd = fds[0], .buf = &recv_buf }, &recv_c, &box, recv_cb);
+    try testing.expectEqual(@as(u32, 0), box.recv_calls);
 
-    try io.cancel(.{ .target = &recv_c }, &cancel_c, &st, cancel_cb);
+    try io.cancel(.{ .target = &recv_c }, &cancel_c, &box, cancel_cb);
 
-    try testing.expectEqual(@as(u32, 1), st.recv_calls);
-    try testing.expectEqual(@as(u32, 1), st.cancel_calls);
-    switch (st.recv_result.?) {
+    try testing.expectEqual(@as(u32, 1), box.recv_calls);
+    try testing.expectEqual(@as(u32, 1), box.cancel_calls);
+    switch (box.recv_result.?) {
         .recv => |r| try testing.expectError(error.OperationCanceled, r),
         else => try testing.expect(false),
     }
-    switch (st.cancel_result.?) {
+    switch (box.cancel_result.?) {
         .cancel => |r| try r,
         else => try testing.expect(false),
     }
 }
 
-test "EpollIO file ops return Unimplemented (MVP scope marker)" {
-    // The MVP intentionally does not implement file ops. They require a
-    // worker thread pool because epoll cannot signal regular-file readiness.
-    // This test asserts the explicit UNIMPLEMENTED contract so the gap is
-    // discoverable. When the file-op follow-up lands, this test should be
-    // replaced with proper read/write/fallocate/fsync/truncate coverage.
+test "EpollMmapIO mmap-backed pwrite + pread round-trip" {
     var io = try skipIfUnavailable();
     defer io.deinit();
 
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
-    const file = try tmp.dir.createFile("epoll_unimpl", .{ .truncate = true });
+    // O_RDWR — `mmap PROT_READ | PROT_WRITE` against a `MAP_SHARED`
+    // mapping requires the underlying fd to allow both. `createFile`
+    // defaults to O_WRONLY which would surface as `error.AccessDenied`.
+    const file = try tmp.dir.createFile("mmap_rw", .{ .truncate = true, .read = true });
     defer file.close();
 
-    var c = Completion{};
-    var ctx = TestCtx{};
-    try io.fsync(.{ .fd = file.handle, .datasync = true }, &c, &ctx, testCallback);
+    // Pre-size the file via fallocate so the mmap region is non-empty.
+    var fa_c = Completion{};
+    var fa_ctx = TestCtx{};
+    try io.fallocate(.{ .fd = file.handle, .offset = 0, .len = 4096 }, &fa_c, &fa_ctx, testCallback);
+    try testing.expectEqual(@as(u32, 1), fa_ctx.calls);
+    switch (fa_ctx.last_result.?) {
+        .fallocate => |r| try r,
+        else => try testing.expect(false),
+    }
 
-    try testing.expectEqual(@as(u32, 1), ctx.calls);
-    switch (ctx.last_result.?) {
-        .fsync => |r| try testing.expectError(error.Unimplemented, r),
+    // Write some bytes at offset 100.
+    var w_c = Completion{};
+    var w_ctx = TestCtx{};
+    try io.write(.{ .fd = file.handle, .buf = "varuna-mmap", .offset = 100 }, &w_c, &w_ctx, testCallback);
+    try testing.expectEqual(@as(u32, 1), w_ctx.calls);
+    switch (w_ctx.last_result.?) {
+        .write => |r| try testing.expectEqual(@as(usize, 11), try r),
+        else => try testing.expect(false),
+    }
+
+    // Read them back.
+    var read_buf: [11]u8 = undefined;
+    var r_c = Completion{};
+    var r_ctx = TestCtx{};
+    try io.read(.{ .fd = file.handle, .buf = &read_buf, .offset = 100 }, &r_c, &r_ctx, testCallback);
+    try testing.expectEqual(@as(u32, 1), r_ctx.calls);
+    switch (r_ctx.last_result.?) {
+        .read => |r| {
+            const n = try r;
+            try testing.expectEqual(@as(usize, 11), n);
+            try testing.expectEqualStrings("varuna-mmap", read_buf[0..n]);
+        },
+        else => try testing.expect(false),
+    }
+
+    // fsync should succeed (msync(MS_SYNC) on the mapping).
+    var s_c = Completion{};
+    var s_ctx = TestCtx{};
+    try io.fsync(.{ .fd = file.handle, .datasync = true }, &s_c, &s_ctx, testCallback);
+    try testing.expectEqual(@as(u32, 1), s_ctx.calls);
+    switch (s_ctx.last_result.?) {
+        .fsync => |r| try r,
+        else => try testing.expect(false),
+    }
+}
+
+test "EpollMmapIO read past EOF returns zero bytes" {
+    var io = try skipIfUnavailable();
+    defer io.deinit();
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    // O_RDWR — required by mmap on the post-truncate read path.
+    const file = try tmp.dir.createFile("mmap_eof", .{ .truncate = true, .read = true });
+    defer file.close();
+
+    // Truncate to 64 bytes via the contract.
+    var t_c = Completion{};
+    var t_ctx = TestCtx{};
+    try io.truncate(.{ .fd = file.handle, .length = 64 }, &t_c, &t_ctx, testCallback);
+    switch (t_ctx.last_result.?) {
+        .truncate => |r| try r,
+        else => try testing.expect(false),
+    }
+
+    // Read at offset 1000 — past EOF — should return zero bytes.
+    var buf: [16]u8 = undefined;
+    var r_c = Completion{};
+    var r_ctx = TestCtx{};
+    try io.read(.{ .fd = file.handle, .buf = &buf, .offset = 1000 }, &r_c, &r_ctx, testCallback);
+    switch (r_ctx.last_result.?) {
+        .read => |r| try testing.expectEqual(@as(usize, 0), try r),
         else => try testing.expect(false),
     }
 }

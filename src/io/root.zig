@@ -21,9 +21,18 @@ pub const metadata_handler = @import("metadata_handler.zig");
 pub const rate_limiter = @import("rate_limiter.zig");
 pub const recheck = @import("recheck.zig");
 pub const backend = @import("backend.zig");
-pub const epoll_io = @import("epoll_io.zig");
+pub const epoll_posix_io = @import("epoll_posix_io.zig");
+pub const epoll_mmap_io = @import("epoll_mmap_io.zig");
 pub const real_io = @import("real_io.zig");
+// Sibling kqueue-bifurcation engineer renames `kqueue_io.zig` →
+// `kqueue_posix_io.zig` and creates `kqueue_mmap_io.zig` for real. Until
+// that lands the epoll-bifurcation worktree carries stub implementations
+// of `kqueue_posix_io.zig` and `kqueue_mmap_io.zig` so the 6-way backend
+// selector compiles, and keeps the legacy `kqueue_io` re-export alive so
+// `tests/kqueue_io_test.zig` still resolves on this branch.
 pub const kqueue_io = @import("kqueue_io.zig");
+pub const kqueue_posix_io = @import("kqueue_posix_io.zig");
+pub const kqueue_mmap_io = @import("kqueue_mmap_io.zig");
 pub const ring = @import("ring.zig");
 pub const sim_io = @import("sim_io.zig");
 pub const signal = @import("signal.zig");
@@ -69,7 +78,10 @@ test {
     _ = protocol;
     _ = rate_limiter;
     _ = backend;
-    _ = epoll_io;
+    _ = epoll_posix_io;
+    _ = epoll_mmap_io;
+    _ = kqueue_posix_io;
+    _ = kqueue_mmap_io;
     _ = real_io;
     _ = recheck;
     _ = ring;

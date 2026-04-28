@@ -1,7 +1,8 @@
-//! EpollIO smoke tests. Mirrors the shape of `tests/sim_socketpair_test.zig`
-//! but exercises real Linux socketpairs through the epoll readiness
-//! backend (`src/io/epoll_io.zig`). Provides backend-specific coverage
-//! beyond the inline tests in `epoll_io.zig`:
+//! EpollPosixIO smoke tests. Mirrors the shape of
+//! `tests/sim_socketpair_test.zig` but exercises real Linux socketpairs
+//! through the epoll readiness backend (`src/io/epoll_posix_io.zig`).
+//! Provides backend-specific coverage beyond the inline tests in
+//! `epoll_posix_io.zig`:
 //!
 //! - Multi-tick socketpair round-trip with both ends parked.
 //! - Larger-buffer transfer to exercise `posix.send` / `posix.recv`
@@ -12,7 +13,7 @@
 //!   callers know to gate their PieceStore wiring on the file-op
 //!   follow-up.
 //!
-//! These run via `zig build test-epoll-io` (focused) or as part of
+//! These run via `zig build test-epoll-posix-io` (focused) or as part of
 //! `zig build test` (full suite).
 
 const std = @import("std");
@@ -22,8 +23,8 @@ const linux = std.os.linux;
 
 const varuna = @import("varuna");
 const ifc = varuna.io.io_interface;
-const epoll_io = varuna.io.epoll_io;
-const EpollIO = epoll_io.EpollIO;
+const epoll_posix_io = varuna.io.epoll_posix_io;
+const EpollPosixIO = epoll_posix_io.EpollPosixIO;
 
 const Completion = ifc.Completion;
 const Result = ifc.Result;
@@ -31,8 +32,8 @@ const CallbackAction = ifc.CallbackAction;
 
 // ── Fixtures ──────────────────────────────────────────────
 
-fn skipIfUnavailable() !EpollIO {
-    return EpollIO.init(testing.allocator, .{}) catch return error.SkipZigTest;
+fn skipIfUnavailable() !EpollPosixIO {
+    return EpollPosixIO.init(testing.allocator, .{}) catch return error.SkipZigTest;
 }
 
 fn makeSocketpairNonBlocking() !?[2]i32 {
@@ -97,7 +98,7 @@ fn timerCb(ud: ?*anyopaque, _: *Completion, _: Result) CallbackAction {
 
 // ── Tests ─────────────────────────────────────────────────
 
-test "EpollIO multi-tick send/recv round-trip on real socketpair" {
+test "EpollPosixIO multi-tick send/recv round-trip on real socketpair" {
     var io = try skipIfUnavailable();
     defer io.deinit();
 
@@ -129,7 +130,7 @@ test "EpollIO multi-tick send/recv round-trip on real socketpair" {
     try testing.expectEqualStrings("epoll-mvp", counter.recv_buf[0..9]);
 }
 
-test "EpollIO multiple timers fire in deadline order" {
+test "EpollPosixIO multiple timers fire in deadline order" {
     var io = try skipIfUnavailable();
     defer io.deinit();
 
@@ -153,7 +154,7 @@ test "EpollIO multiple timers fire in deadline order" {
     try testing.expectEqual(@as(u32, 3), counter.timer_count);
 }
 
-test "EpollIO cancel on registered recv before data delivers OperationCanceled" {
+test "EpollPosixIO cancel on registered recv before data delivers OperationCanceled" {
     var io = try skipIfUnavailable();
     defer io.deinit();
 
@@ -176,7 +177,7 @@ test "EpollIO cancel on registered recv before data delivers OperationCanceled" 
     try testing.expectEqual(@as(?anyerror, error.OperationCanceled), counter.last_recv_err);
 }
 
-test "EpollIO file ops return Unimplemented (MVP scope marker)" {
+test "EpollPosixIO file ops return Unimplemented (MVP scope marker)" {
     var io = try skipIfUnavailable();
     defer io.deinit();
 
@@ -250,7 +251,7 @@ test "EpollIO file ops return Unimplemented (MVP scope marker)" {
     try testing.expectEqual(@as(?anyerror, error.Unimplemented), box.fallocate_err);
 }
 
-test "EpollIO socket op produces a non-blocking fd" {
+test "EpollPosixIO socket op produces a non-blocking fd" {
     var io = try skipIfUnavailable();
     defer io.deinit();
 

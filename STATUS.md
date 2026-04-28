@@ -308,6 +308,87 @@ See `progress-reports/2026-04-25-stage2-event-loop-migration.md` for the Stage 2
 - ~~**Daemon graceful shutdown**~~: Fixed. In-flight transfer draining with configurable timeout now ensures clean exit on SIGTERM/SIGINT.
 - `IORING_OP_SETSOCKOPT` (kernel 6.7+), `IORING_OP_BIND`/`LISTEN` (kernel 6.11+) not available on current kernel 6.6. Per-peer setsockopt (TCP_NODELAY, buffer sizes) remains synchronous.
 
+## Last Verified Milestone (2026-04-30 — EpollIO bifurcation + 6-way IoBackend selector)
+
+Bifurcates the previous `EpollIO` MVP into two backends along the
+file-I/O strategy axis (POSIX `pread`/`pwrite`-on-thread-pool vs
+mmap-backed `memcpy`/`msync`), and extends `IoBackend` to a 6-way
+selector that lines up with the parallel `KqueueIO` engineer's
+matching split:
+
+  - `io_uring` — production proactor (unchanged; only flag that
+    installs the daemon binary).
+  - `epoll_posix` — rename target for the previous `EpollIO` MVP
+    (`src/io/epoll_io.zig` → `src/io/epoll_posix_io.zig`,
+    `EpollIO` → `EpollPosixIO`). Sockets + timers + cancel real;
+    file ops still `error.Unimplemented` pending the POSIX
+    file-op thread pool.
+  - `epoll_mmap` — new backend (`src/io/epoll_mmap_io.zig`).
+    Readiness layer mirrors `EpollPosixIO`. File ops use a per-fd
+    lazy `mmap(PROT_READ | PROT_WRITE, MAP_SHARED)` plus
+    `madvise(MADV_WILLNEED)` for prefetch; `pread`/`pwrite` are
+    `memcpy` against the mapping; `fsync` is `msync(MS_SYNC)`;
+    `fallocate` calls `posix.fallocate` and drops the stale
+    mapping; `truncate` calls `posix.ftruncate` and drops the
+    mapping. Page-fault stalls on the EL thread are documented as
+    the deliberate MVP limitation; the mitigation is to run
+    `memcpy` on a thread pool if profiling shows it matters.
+  - `kqueue_posix`, `kqueue_mmap` — STUB files on this branch
+    (`src/io/kqueue_posix_io.zig`, `src/io/kqueue_mmap_io.zig`)
+    that return `error.Unimplemented` from every op so the 6-way
+    selector compiles. The parallel kqueue-bifurcation engineer
+    replaces both with real implementations on their branch.
+  - `sim` — promotes `SimIO` to a top-level option. `RealIO`
+    resolves to `sim_io.SimIO` for test builds that want to exercise
+    the comptime selector itself. `build_full_daemon` stays gated
+    to `.io_uring`.
+
+Three bisectable commits on `worktree-epoll-bifurcation`:
+
+  - `774a7d4` — `io: bifurcate EpollIO scaffold + extend IoBackend
+    to 6-way`. File renames + scaffolding; SimIO wiring; stub
+    kqueue files; updated `IoBackend` enum and `-Dio=` flag help.
+  - `de100f2` — `io: build out EpollMmapIO MVP — sockets/timers/
+    cancel + mmap file ops`. Mirrors readiness-layer code from
+    `EpollPosixIO` and adds the mmap-backed file ops with
+    integration coverage in 7 inline tests (init/deinit, timeout,
+    socket, recv-on-socketpair, cancel-on-parked-recv,
+    pwrite/pread/fsync round-trip, read-past-EOF returns zero).
+  - `<commit 3>` — `docs/tests: progress report + STATUS
+    milestone for epoll bifurcation`. Adds
+    `tests/epoll_mmap_io_test.zig` (4 tests covering remap on
+    file growth, msync round-trip, truncate-invalidates-mapping)
+    plus `progress-reports/2026-04-30-epoll-bifurcation.md` and
+    this STATUS entry.
+
+`zig fmt .`: clean. `zig build`, `zig build -Dio=epoll_posix`,
+`zig build -Dio=epoll_mmap`, `zig build -Dio=kqueue_posix`,
+`zig build -Dio=kqueue_mmap`, `zig build -Dio=sim`: all clean.
+`zig build test` (default `-Dio=io_uring`): green;
+`zig build test -Dio=epoll_posix`: green; `zig build test
+-Dio=epoll_mmap`: green; `zig build test-epoll-mmap-io`: green.
+
+Test step rename: `test-epoll-io` → `test-epoll-posix-io`. New
+focused step: `test-epoll-mmap-io`.
+
+Expected merge conflicts with the parallel kqueue-bifurcation
+engineer: `build.zig` and `src/io/backend.zig` (both engineers
+extend the IoBackend enum); `src/io/kqueue_posix_io.zig` and
+`src/io/kqueue_mmap_io.zig` (my stubs vs. their real
+implementations — take theirs); `src/io/root.zig` (kqueue
+imports). All trivial.
+
+Follow-ups:
+- POSIX file-op thread pool for `EpollPosixIO` (the original
+  `EpollIO` MVP follow-up, unchanged).
+- Page-fault thread-pool memcpy for `EpollMmapIO` if profiling
+  shows page faults stalling the EL.
+- Daemon-side: rewire `src/storage/writer.zig`, `src/io/recheck.zig`
+  et al. onto `backend.RealIO` once the file-op coverage is
+  complete in at least one non-`io_uring` backend.
+
+Branch: `worktree-epoll-bifurcation`.
+
 ## Last Verified Milestone (2026-04-29 — EpollIO MVP: socket + timer + cancel surface)
 
 Implements a minimum-viable `EpollIO` Linux readiness backend behind a new `-Dio=` build flag. `EpollIO` is the fallback for environments where `io_uring` is forbidden (seccomp policies, ancient kernels, hostile sandboxes); see `docs/epoll-kqueue-design.md` for the full design and `progress-reports/2026-04-29-epoll-io-mvp.md` for the round-by-round rationale.
