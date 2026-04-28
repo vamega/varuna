@@ -10,8 +10,8 @@ const TlsStream = @import("tls.zig").TlsStream;
 const build_options = @import("build_options");
 
 const io_interface = @import("io_interface.zig");
-const real_io_mod = @import("real_io.zig");
-const RealIO = real_io_mod.RealIO;
+const backend = @import("backend.zig");
+const RealIO = backend.RealIO;
 
 const log = std.log.scoped(.http_executor);
 

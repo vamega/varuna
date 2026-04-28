@@ -4,7 +4,8 @@ const linux = std.os.linux;
 const torrent = @import("../torrent/root.zig");
 const FilePriority = torrent.file_priority.FilePriority;
 const real_io = @import("../io/real_io.zig");
-const RealIO = real_io.RealIO;
+const backend = @import("../io/backend.zig");
+const RealIO = backend.RealIO;
 const io_interface = @import("../io/io_interface.zig");
 
 /// Piece storage state machine, parameterised over the IO backend.

@@ -9,8 +9,8 @@ const session_mod = @import("../torrent/session.zig");
 const Layout = @import("../torrent/layout.zig").Layout;
 const Hasher = @import("hasher.zig").Hasher;
 const types = @import("types.zig");
-const real_io_mod = @import("real_io.zig");
-const RealIO = real_io_mod.RealIO;
+const backend = @import("backend.zig");
+const RealIO = backend.RealIO;
 const io_interface = @import("io_interface.zig");
 
 /// Asynchronous piece recheck state machine, parameterised over the IO
