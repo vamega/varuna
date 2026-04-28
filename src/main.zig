@@ -102,16 +102,6 @@ pub fn main() !void {
     shared_el.bind_device = cfg.network.bind_device;
     shared_el.bind_address = cfg.network.bind_address;
 
-    // Publish bind_device to the DNS module so newly-created
-    // DnsResolvers (HttpExecutor, UdpTrackerExecutor, etc.) can apply
-    // it. The c-ares backend honors it via ares_set_socket_callback;
-    // the threadpool backend (default) cannot — see STATUS.md "Known
-    // Issues" and `src/io/dns_threadpool.zig` for the limitation.
-    // Must be called BEFORE any DnsResolver is constructed; the DHT
-    // bootstrap path below resolves hostnames lazily, so we set this
-    // up first.
-    varuna.io.dns.setDefaultBindDevice(cfg.network.bind_device);
-
     // Apply MSE/PE encryption mode from config
     shared_el.encryption_mode = try varuna.config.parseEncryptionMode(cfg.network.encryption);
 
@@ -561,6 +551,15 @@ fn initSessionManager(
     sm.resume_db_path = resume_db_path;
     sm.masquerade_as = cfg.network.masquerade_as;
     sm.disable_trackers = cfg.network.disable_trackers;
+    // Borrow the daemon-lifetime bind_device slice from the config
+    // arena. The HTTP and UDP tracker executors created lazily via
+    // `ensureTrackerExecutor` / `ensureUdpTrackerExecutor` forward
+    // this into their `DnsResolver`, so DNS queries egress through
+    // the configured interface alongside peer / tracker / RPC
+    // traffic. The c-ares DNS backend honors it via a socket
+    // callback; the threadpool backend stores it but cannot apply
+    // it (see `src/io/dns_threadpool.zig` "Known limitation").
+    sm.bind_device = cfg.network.bind_device;
     if (cfg.storage.data_dir) |dir| sm.default_save_path = dir;
     // Apply queue config from TOML
     sm.queue_manager.config = .{

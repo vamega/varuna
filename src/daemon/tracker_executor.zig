@@ -42,6 +42,10 @@ pub const TrackerExecutor = struct {
     pub const Config = struct {
         max_concurrent: u16 = 8,
         max_per_host: u16 = 3,
+        /// Optional `SO_BINDTODEVICE` interface name forwarded to the
+        /// inner `HttpExecutor`'s `DnsResolver`. The slice lifetime
+        /// must outlive the executor.
+        bind_device: ?[]const u8 = null,
     };
 
     // ── Public API ───────────────────────────────────────────
@@ -55,6 +59,7 @@ pub const TrackerExecutor = struct {
             .http = try HttpExecutor.create(allocator, io, .{
                 .max_concurrent = config.max_concurrent,
                 .max_per_host = config.max_per_host,
+                .bind_device = config.bind_device,
             }),
         };
 

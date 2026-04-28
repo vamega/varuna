@@ -1,5 +1,7 @@
 const std = @import("std");
-const TtlBounds = @import("dns.zig").TtlBounds;
+const dns = @import("dns.zig");
+const TtlBounds = dns.TtlBounds;
+const Config = dns.Config;
 
 /// Thread-safe DNS resolver with TTL-based caching and a real thread pool.
 ///
@@ -38,6 +40,13 @@ pub const DnsResolver = struct {
     cache_mutex: std.Thread.Mutex = .{},
     pool: *ThreadPool,
     ttl_bounds: TtlBounds = TtlBounds.default,
+    /// Stored from `Config.bind_device` for parity with the c-ares
+    /// backend's API. The threadpool backend cannot apply it because
+    /// `getaddrinfo` owns its own UDP socket — see the "Known
+    /// limitation" paragraph in this module's top docstring. Kept
+    /// here so future custom-DNS-library work can read it without
+    /// further API churn.
+    bind_device: ?[]const u8 = null,
 
     /// Maximum number of cached entries. Small because a typical torrent
     /// client talks to only a handful of tracker hostnames.
@@ -51,10 +60,12 @@ pub const DnsResolver = struct {
         expires_at: i64,
     };
 
-    pub fn init(allocator: std.mem.Allocator) !DnsResolver {
+    pub fn init(allocator: std.mem.Allocator, config: Config) !DnsResolver {
         return .{
             .cache = .{},
             .pool = try ThreadPool.create(allocator),
+            .ttl_bounds = config.ttl_bounds,
+            .bind_device = config.bind_device,
         };
     }
 
@@ -503,7 +514,7 @@ fn resolveBlocking(allocator: std.mem.Allocator, host: []const u8, port: u16) !s
 // ── Tests ────────────────────────────────────────────────
 
 test "threadpool resolve numeric ipv4 does not use cache" {
-    var resolver = try DnsResolver.init(std.testing.allocator);
+    var resolver = try DnsResolver.init(std.testing.allocator, .{});
     defer resolver.deinit(std.testing.allocator);
 
     const addr = try resolver.resolve(std.testing.allocator, "127.0.0.1", 8080);
@@ -513,7 +524,7 @@ test "threadpool resolve numeric ipv4 does not use cache" {
 }
 
 test "threadpool resolve numeric ipv6 does not use cache" {
-    var resolver = try DnsResolver.init(std.testing.allocator);
+    var resolver = try DnsResolver.init(std.testing.allocator, .{});
     defer resolver.deinit(std.testing.allocator);
 
     const addr = try resolver.resolve(std.testing.allocator, "::1", 9090);
@@ -532,7 +543,7 @@ test "threadpool resolveOnce parses numeric ipv6" {
 }
 
 test "threadpool cache stores and retrieves entries" {
-    var resolver = try DnsResolver.init(std.testing.allocator);
+    var resolver = try DnsResolver.init(std.testing.allocator, .{});
     defer resolver.deinit(std.testing.allocator);
 
     // Manually insert a cache entry
@@ -549,7 +560,7 @@ test "threadpool cache stores and retrieves entries" {
 }
 
 test "threadpool cache expires entries" {
-    var resolver = try DnsResolver.init(std.testing.allocator);
+    var resolver = try DnsResolver.init(std.testing.allocator, .{});
     defer resolver.deinit(std.testing.allocator);
 
     // Insert an already-expired entry
@@ -565,7 +576,7 @@ test "threadpool cache expires entries" {
 }
 
 test "threadpool invalidate removes entry" {
-    var resolver = try DnsResolver.init(std.testing.allocator);
+    var resolver = try DnsResolver.init(std.testing.allocator, .{});
     defer resolver.deinit(std.testing.allocator);
 
     const addr = std.net.Address.initIp4(.{ 1, 2, 3, 4 }, 80);
@@ -577,7 +588,7 @@ test "threadpool invalidate removes entry" {
 }
 
 test "threadpool invalidate nonexistent key is no-op" {
-    var resolver = try DnsResolver.init(std.testing.allocator);
+    var resolver = try DnsResolver.init(std.testing.allocator, .{});
     defer resolver.deinit(std.testing.allocator);
 
     resolver.invalidate(std.testing.allocator, "nonexistent");
@@ -585,7 +596,7 @@ test "threadpool invalidate nonexistent key is no-op" {
 }
 
 test "threadpool clearAll empties cache" {
-    var resolver = try DnsResolver.init(std.testing.allocator);
+    var resolver = try DnsResolver.init(std.testing.allocator, .{});
     defer resolver.deinit(std.testing.allocator);
 
     const addr = std.net.Address.initIp4(.{ 1, 2, 3, 4 }, 80);
@@ -598,7 +609,7 @@ test "threadpool clearAll empties cache" {
 }
 
 test "threadpool cache evicts oldest when full" {
-    var resolver = try DnsResolver.init(std.testing.allocator);
+    var resolver = try DnsResolver.init(std.testing.allocator, .{});
     defer resolver.deinit(std.testing.allocator);
 
     const addr = std.net.Address.initIp4(.{ 1, 2, 3, 4 }, 80);
@@ -624,7 +635,7 @@ test "threadpool cache evicts oldest when full" {
 }
 
 test "threadpool cache updates existing entry without duplication" {
-    var resolver = try DnsResolver.init(std.testing.allocator);
+    var resolver = try DnsResolver.init(std.testing.allocator, .{});
     defer resolver.deinit(std.testing.allocator);
 
     const addr1 = std.net.Address.initIp4(.{ 1, 2, 3, 4 }, 80);
@@ -645,7 +656,7 @@ test "threadpool cache updates existing entry without duplication" {
 test "threadpool resolve localhost via real DNS" {
     // This test requires a working DNS resolver on the system.
     // "localhost" should always resolve.
-    var resolver = try DnsResolver.init(std.testing.allocator);
+    var resolver = try DnsResolver.init(std.testing.allocator, .{});
     defer resolver.deinit(std.testing.allocator);
 
     const addr = resolver.resolve(std.testing.allocator, "localhost", 80) catch |err| {
@@ -668,7 +679,7 @@ test "threadpool resolve localhost via real DNS" {
 }
 
 test "threadpool cache respects port override on hit" {
-    var resolver = try DnsResolver.init(std.testing.allocator);
+    var resolver = try DnsResolver.init(std.testing.allocator, .{});
     defer resolver.deinit(std.testing.allocator);
 
     // Cache an entry with port 80
@@ -685,7 +696,7 @@ test "threadpool cacheResult uses configured TTL cap (1 hour default)" {
     // getaddrinfo doesn't expose them, so cached entries should expire
     // after the configured cap (default 1 h, up from the previous fixed
     // 5 min). This is the central behavior change in commit 2.
-    var resolver = try DnsResolver.init(std.testing.allocator);
+    var resolver = try DnsResolver.init(std.testing.allocator, .{});
     defer resolver.deinit(std.testing.allocator);
 
     const before = std.time.timestamp();
@@ -701,7 +712,7 @@ test "threadpool cacheResult uses configured TTL cap (1 hour default)" {
 }
 
 test "threadpool ttl_bounds.cap_s is configurable" {
-    var resolver = try DnsResolver.init(std.testing.allocator);
+    var resolver = try DnsResolver.init(std.testing.allocator, .{});
     defer resolver.deinit(std.testing.allocator);
     // Tighten the cap to 60 seconds for this test.
     resolver.ttl_bounds = .{ .floor_s = 30, .cap_s = 60 };
@@ -721,7 +732,7 @@ test "threadpool: HttpClient invalidates DNS on connect refusal (regression)" {
     // re-resolves. Without the invalidate hook we'd burn the full TTL
     // window on the same dead IP.
     const HttpClient = @import("http_blocking.zig").HttpClient;
-    var resolver = try DnsResolver.init(std.testing.allocator);
+    var resolver = try DnsResolver.init(std.testing.allocator, .{});
     defer resolver.deinit(std.testing.allocator);
 
     // Pre-seed the cache so resolve() short-circuits to 127.0.0.1.

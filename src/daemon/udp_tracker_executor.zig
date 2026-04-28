@@ -87,6 +87,12 @@ pub const UdpTrackerExecutor = struct {
 
     pub const Config = struct {
         max_slots: u16 = 8,
+        /// Optional `SO_BINDTODEVICE` interface name applied to DNS
+        /// sockets created by the underlying `DnsResolver` (c-ares
+        /// backend only — the threadpool backend stores it but cannot
+        /// apply it; see `src/io/dns_threadpool.zig`). The slice
+        /// lifetime must outlive the executor.
+        bind_device: ?[]const u8 = null,
     };
 
     const RequestSlot = struct {
@@ -164,7 +170,7 @@ pub const UdpTrackerExecutor = struct {
             .dns_event_fd = dns_event_fd,
             .pending_jobs = std.ArrayList(Job).empty,
             .max_slots = config.max_slots,
-            .dns_resolver = try DnsResolver.init(allocator),
+            .dns_resolver = try DnsResolver.init(allocator, .{ .bind_device = config.bind_device }),
             .slots = undefined,
         };
         errdefer self.dns_resolver.deinit(allocator);
