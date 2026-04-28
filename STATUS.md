@@ -309,6 +309,70 @@ See `progress-reports/2026-04-25-stage2-event-loop-migration.md` for the Stage 2
 - ~~**Daemon graceful shutdown**~~: Fixed. In-flight transfer draining with configurable timeout now ensures clean exit on SIGTERM/SIGINT.
 - `IORING_OP_SETSOCKOPT` (kernel 6.7+), `IORING_OP_BIND`/`LISTEN` (kernel 6.11+) not available on current kernel 6.6. Per-peer setsockopt (TCP_NODELAY, buffer sizes) remains synchronous.
 
+## Last Verified Milestone (2026-04-28 — Correctness fixes: PieceStore.sync wiring, c-ares bind_device, SQLite policy)
+
+Three contained correctness gaps from recent research rounds, batched
+into one milestone. Branch: `worktree-correctness-fixes`. See
+`progress-reports/2026-04-28-correctness-fixes.md` for the full arc.
+
+**Fix 1 — `PieceStore.sync` was only called from a test (R6 from
+`docs/mmap-durability-audit.md`)**: the daemon never called fsync on
+completed pieces, so the OS pagecache controlled durability under
+whatever dirty-writeback policy the kernel chose. A SIGKILL or power
+loss seconds after a piece verified-and-persisted could lose it from
+disk. New `EventLoop.submitTorrentSync` submits one async fsync per
+non-skipped fd in `tc.shared_fds`; bookkeeping lives on
+`TorrentContext.dirty_writes_since_sync` (a plain u32 — EL-thread-only,
+no atomics). Wired at three points: a periodic 30 s timer (matches
+Linux's `vm.dirty_expire_centisecs = 3000` so we don't add write
+amplification, while bounding worst-case post-crash data loss); the
+torrent-completion lifecycle hook (forced fsync regardless of dirty
+count, so completion is a stable on-disk milestone); and the
+graceful-shutdown drain (Phase 0.5 — submit fsync sweeps for every
+dirty torrent then tick until they drain). Idempotent under
+`tc.sync_in_flight` so the three triggers don't pile parallel sweeps
+on the same fds. Test coverage: 9 inline tests in
+`tests/torrent_sync_test.zig` driving `EventLoopOf(SimIO)` end-to-end.
+
+**Fix 2 — `bind_device` silently bypassed by every DNS path
+(`docs/custom-dns-design-round2.md` §1)**: `network.bind_device =
+"wg0"` correctly applied to peer / tracker / RPC traffic, but DNS
+queries leaked out the default route. Investigation found c-ares
+exposes `ares_set_socket_callback(channel, fn(fd, type, ud))` that
+fires once per UDP/TCP socket the channel opens — sufficient to apply
+`SO_BINDTODEVICE` via the existing `applyBindDevice` helper.
+`getaddrinfo` (the threadpool backend, build default) has no
+equivalent hook, so it remains a Known Issue tied to the
+custom-DNS-library follow-up. New `dns.setDefaultBindDevice` /
+`dns.defaultBindDevice` module-level API publishes the value once at
+daemon startup; `dns_cares.zig` reads it from `init` and registers the
+socket callback. Workaround for users who need bound DNS: build with
+`-Ddns=c_ares`. Documented in `STATUS.md` "Known Issues",
+`src/io/dns_threadpool.zig` top docstring, and the `bind_device`
+config field's docstring.
+
+**Fix 3 — AGENTS.md SQLite-threading policy was stale
+(`docs/sqlite-simulation-and-replacement.md` finding)**: the policy
+section said "SQLite operations -- must run on a dedicated background
+thread, never on the event-loop thread." The production reality is
+multi-threaded access via `SQLITE_OPEN_FULLMUTEX`
+(`src/storage/state_db.zig:31`); the shared `ResumeDb` connection is
+intentionally accessed from worker threads, RPC handlers, and the
+queue manager via SQLite's own mutex. Updated AGENTS.md to describe
+the actual design accurately. The single hard invariant (never call
+SQLite from the event-loop thread, since SQLite syscalls block) is
+unchanged.
+
+Commits:
+
+  - `280e159` — `io: per-torrent durability sync via submitTorrentSync + periodic timer`
+  - `955ce61` — `io/dns: bind_device wiring for c-ares; document threadpool gap`
+  - `5f546c1` — `docs/AGENTS: correct SQLite-threading policy to match reality`
+
+Test count delta: 1509 → 1518 (9 new tests in `torrent_sync_test.zig`).
+Build green at HEAD on the default backend; c-ares backend has a
+pre-existing `ares_build.h` build issue unrelated to this change.
+
 ## Last Verified Milestone (2026-04-30 — DNS resolver: connect-failure invalidate + bounded TTL honoring)
 
 Closes Open Question #1 from `docs/custom-dns-design.md` (the just-merged
