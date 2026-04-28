@@ -418,6 +418,60 @@ pub fn build(b: *std.Build) void {
     test_kqueue_posix_io_bridge_step.dependOn(&run_kqueue_posix_io_bridge_tests.step);
     if (build_full_daemon) test_step.dependOn(&run_kqueue_posix_io_bridge_tests.step);
 
+    // ── KqueueMmapIO MVP tests ─────────────────────────────
+    // Standalone target: compiles `src/io/kqueue_mmap_io.zig` directly.
+    // Same model as the POSIX variant — the readiness layer (sockets,
+    // timers, cancel) is identical; the file-op submission methods
+    // diverge to use mmap + msync + F_PREALLOCATE on macOS.
+    //
+    // Inline tests in `src/io/kqueue_mmap_io.zig` cover both platform-
+    // portable (timer heap, errno mapping, fstore_t layout) and macOS-
+    // only (init, real timeout-via-kevent, mmap round-trip) paths. The
+    // latter `return error.SkipZigTest` on non-darwin targets; the
+    // bodies are still semantically analysed under cross-compile.
+    const kqueue_mmap_io_inline_tests = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/io/kqueue_mmap_io.zig"),
+            .target = target,
+            .optimize = optimize,
+            .link_libc = true,
+        }),
+    });
+    const test_kqueue_mmap_io_step = b.step(
+        "test-kqueue-mmap-io",
+        "Run KqueueMmapIO MVP tests (cross-compile-clean; mock-driven on Linux, full on macOS)",
+    );
+    const can_exec_kqueue_mmap_io_tests =
+        target.result.os.tag == builtin.os.tag and
+        target.result.cpu.arch == builtin.cpu.arch;
+    if (can_exec_kqueue_mmap_io_tests) {
+        const run_kqueue_mmap_io_inline_tests = b.addRunArtifact(kqueue_mmap_io_inline_tests);
+        test_kqueue_mmap_io_step.dependOn(&run_kqueue_mmap_io_inline_tests.step);
+        test_step.dependOn(&run_kqueue_mmap_io_inline_tests.step);
+    } else {
+        test_kqueue_mmap_io_step.dependOn(&kqueue_mmap_io_inline_tests.step);
+    }
+
+    // Bridge tests via varuna_mod (Linux-only; pulls kqueue_mmap_io
+    // through `varuna.io.kqueue_mmap_io`). Reuses the shared
+    // `tests/kqueue_mmap_io_test.zig` file for fixtures that prefer
+    // the varuna_mod surface over the standalone file.
+    const kqueue_mmap_io_bridge_tests = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("tests/kqueue_mmap_io_test.zig"),
+            .target = target,
+            .optimize = optimize,
+            .imports = &varuna_import,
+        }),
+    });
+    const run_kqueue_mmap_io_bridge_tests = b.addRunArtifact(kqueue_mmap_io_bridge_tests);
+    const test_kqueue_mmap_io_bridge_step = b.step(
+        "test-kqueue-mmap-io-bridge",
+        "Run KqueueMmapIO bridge tests via varuna_mod (Linux-only by construction)",
+    );
+    test_kqueue_mmap_io_bridge_step.dependOn(&run_kqueue_mmap_io_bridge_tests.step);
+    if (build_full_daemon) test_step.dependOn(&run_kqueue_mmap_io_bridge_tests.step);
+
     // ── SimIO socketpair / parking / fault-injection tests ────────
     //
     // `tests/sim_socketpair_test.zig` is itself a top-level test file

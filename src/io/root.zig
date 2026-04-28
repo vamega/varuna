@@ -24,6 +24,7 @@ pub const backend = @import("backend.zig");
 pub const epoll_io = @import("epoll_io.zig");
 pub const real_io = @import("real_io.zig");
 pub const kqueue_posix_io = @import("kqueue_posix_io.zig");
+pub const kqueue_mmap_io = @import("kqueue_mmap_io.zig");
 pub const ring = @import("ring.zig");
 pub const sim_io = @import("sim_io.zig");
 pub const signal = @import("signal.zig");
@@ -71,6 +72,8 @@ test {
     _ = backend;
     _ = epoll_io;
     _ = real_io;
+    _ = kqueue_posix_io;
+    _ = kqueue_mmap_io;
     _ = recheck;
     _ = ring;
     _ = seed_handler;
