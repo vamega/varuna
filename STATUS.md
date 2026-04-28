@@ -308,6 +308,89 @@ See `progress-reports/2026-04-25-stage2-event-loop-migration.md` for the Stage 2
 - ~~**Daemon graceful shutdown**~~: Fixed. In-flight transfer draining with configurable timeout now ensures clean exit on SIGTERM/SIGINT.
 - `IORING_OP_SETSOCKOPT` (kernel 6.7+), `IORING_OP_BIND`/`LISTEN` (kernel 6.11+) not available on current kernel 6.6. Per-peer setsockopt (TCP_NODELAY, buffer sizes) remains synchronous.
 
+## Last Verified Milestone (2026-04-30 — POSIX file-op thread pool: EpollPosixIO + KqueuePosixIO)
+
+Wires `EpollPosixIO` and `KqueuePosixIO` file ops (read/write/fsync/
+fallocate/truncate) through a shared `PosixFilePool`. Closes the
+"file ops return Unimplemented / OperationNotSupported" gap left by
+the 2026-04-30 epoll + kqueue bifurcations. See
+`progress-reports/2026-04-30-posix-file-thread-pool.md` for the
+round-by-round rationale and `docs/epoll-kqueue-design.md` §4.2 for
+the unconditional-thread-pool-offload pattern (zio).
+
+Three commits on `worktree-posix-thread-pool`, all green at HEAD:
+
+- `e791960` — `io: add PosixFilePool for EpollPosixIO/KqueuePosixIO file ops`.
+  New `src/io/posix_file_pool.zig` (~480 LOC, 9 inline tests).
+  Worker thread pool: bounded mutex+condvar pending queue, bounded
+  completed queue, callback-shaped `setWakeup` hook so each backend
+  wires its own readiness primitive's wake mechanism. Worker loop
+  mirrors `hasher.zig` (Pattern #15 — read existing invariants);
+  per-op syscall execution branches Linux/Darwin for fallocate
+  (Linux `posix.fallocate` vs. macOS `fcntl(F_PREALLOCATE)` +
+  `ftruncate`, copying the `fstore_t` layout from
+  `src/io/kqueue_mmap_io.zig`). Tests cover create/deinit, queue-full
+  backpressure, write+read round-trip, bad-fd fault, hasPendingWork,
+  wakeup callback firing, deinit cancels still-pending, and a
+  256-op stress run across 4 workers.
+- `c004d6a` — `io/epoll_posix: wire file ops through PosixFilePool`.
+  Replaces the five `error.Unimplemented` stubs with submissions to
+  the pool. Workers signal via the existing `wakeup_fd` eventfd;
+  `tick` drains the pool both before and after `epoll_pwait`.
+  Cancel grew a fourth best-effort branch for pool-pending file
+  ops. New `bindWakeup` post-init helper (the pool's wake fn
+  needs a stable `*EpollPosixIO`, which init's return-by-value
+  can't supply directly). Inline + bridge tests now exercise:
+  fsync/truncate/fallocate completion, write→read round-trip,
+  64-op concurrency, and a closed-fd fault. The MVP-scope-marker
+  test was rewritten from "asserts Unimplemented" to "asserts real
+  fsync via pool".
+- `747b9df` — `io/kqueue_posix: wire file ops through PosixFilePool`.
+  Same shape, with the wake primitive swapped from eventfd to
+  `EVFILT_USER` + `NOTE_TRIGGER`. Init registers a single user
+  event at fixed ident `0xFADEFADE` with `EV_CLEAR`; workers issue
+  `NOTE_TRIGGER` on completion; `tick` recognises the user-event
+  filter and skips the per-event dispatch (drainPool picks up the
+  result). `evfilt_user` constant carries a NetBSD-binding-bug
+  workaround mirrored from zio. Bridge tests gained 2 new
+  platform-gated round-trip tests; cross-compile clean for
+  `aarch64-macos`.
+
+Test count delta: **+9 inline (pool) + 4 bridge (epoll) + 2 bridge
+(kqueue) = +15 tests**. Daemon binary still builds under
+`-Dio=io_uring` (default).
+
+Validation:
+- `zig build` (default io_uring): clean
+- `zig build -Dio=epoll_posix`: clean
+- `zig build -Dio=kqueue_posix`: clean
+- `zig build -Dtarget=aarch64-macos -Dio=kqueue_posix`: clean
+- `zig build test`: green (~1502 tests; sporadic flakes in
+  `recheck_test.zig` are pre-existing SimIO-driven and unrelated)
+- `zig build test-epoll-posix-io`: green
+- `zig build test-kqueue-posix-io-bridge`: green
+- `zig build test-kqueue-posix-io`: green (Linux runs the
+  platform-portable subset; macOS-gated tests SkipZigTest)
+- `zig fmt .`: clean
+
+What needs real-host validation (cross-compile validates types, not
+runtime semantics): `EVFILT_USER` + `NOTE_TRIGGER` actually breaks
+`kevent()` on darwin; `fcntl(F_PREALLOCATE)` error mapping under
+APFS / FAT32 / FUSE; worker contention under heavy fsync load on
+macOS (we use `fsync(2)`, not `F_FULLFSYNC`).
+
+Follow-ups (not in scope here):
+- Daemon-side rewire (`src/storage/writer.zig`, `src/io/recheck.zig`,
+  …) onto `backend.RealIO` once the file-op coverage is mature in at
+  least one non-`io_uring` backend.
+- Page-fault mitigation for `EpollMmapIO` / `KqueueMmapIO` — those
+  backends deliberately don't use this pool. If profiling shows
+  page-fault stalls, repurpose the same pool to run the memcpy.
+- BUGGIFY-style fault tests for the pool (random worker delays,
+  queue full at random ticks).
+
+Branch: `worktree-posix-thread-pool`.
+
 ## Last Verified Milestone (2026-04-30 — EpollIO bifurcation + 6-way IoBackend selector)
 
 Bifurcates the previous `EpollIO` MVP into two backends along the
@@ -379,8 +462,9 @@ implementations — take theirs); `src/io/root.zig` (kqueue
 imports). All trivial.
 
 Follow-ups:
-- POSIX file-op thread pool for `EpollPosixIO` (the original
-  `EpollIO` MVP follow-up, unchanged).
+- ~~POSIX file-op thread pool for `EpollPosixIO`~~: closed
+  2026-04-30 by the `worktree-posix-thread-pool` engineer (see
+  the milestone immediately below).
 - Page-fault thread-pool memcpy for `EpollMmapIO` if profiling
   shows page faults stalling the EL.
 - Daemon-side: rewire `src/storage/writer.zig`, `src/io/recheck.zig`
