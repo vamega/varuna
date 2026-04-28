@@ -1648,6 +1648,14 @@ pub fn onPieceVerifiedAndPersisted(
     if (pt.isComplete() and sess.hasPieceHashes()) {
         sess.freePieces();
         log.info("piece-hash lifecycle: freed pieces table for torrent {d} (Phase 1 endgame)", .{torrent_id});
+
+        // Torrent completion sync: flush every dirty piece to disk so a
+        // post-completion crash doesn't leave the torrent half-on-disk.
+        // Force the sweep regardless of dirty count — the periodic timer
+        // may have already flushed the bulk of the pieces, but we want
+        // the completion event itself to be a stable on-disk milestone.
+        // See `EventLoop.submitTorrentSync` for the per-fsync mechanics.
+        self.submitTorrentSync(torrent_id, true);
     }
 }
 

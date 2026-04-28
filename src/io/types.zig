@@ -225,4 +225,19 @@ pub const TorrentContext = struct {
     // Slots of peers currently attached to this torrent.
     peer_slots: std.ArrayList(u16) = std.ArrayList(u16).empty,
     torrent_peer_list_index: ?u32 = null,
+
+    // ── Durability tracking ───────────────────────────────────
+    // Number of piece writes that have completed but not yet been
+    // fsync'd. Bumped by `peer_handler.handleDiskWriteResult` when a
+    // piece's spans land on disk; cleared by
+    // `EventLoop.submitTorrentSync` once every fsync CQE returns.
+    // Periodic sync timer skips torrents whose count is zero.
+    //
+    // Mutated only on the event-loop thread (write completions and
+    // sync submission) so a plain u32 is sufficient — no atomics.
+    dirty_writes_since_sync: u32 = 0,
+    /// Set while a `submitTorrentSync` is in flight against this
+    /// torrent so the periodic timer / completion hook don't pile
+    /// duplicate fsync sweeps on top of one another.
+    sync_in_flight: bool = false,
 };

@@ -978,6 +978,26 @@ pub fn build(b: *std.Build) void {
     test_storage_writer_step.dependOn(&run_storage_writer_tests.step);
     test_step.dependOn(&run_storage_writer_tests.step);
 
+    // ── Per-torrent durability sync tests (R6 fix) ──
+    // Drives `EventLoopOf(SimIO).submitTorrentSync` and the periodic
+    // sync timer. See `progress-reports/2026-04-28-correctness-fixes.md`
+    // for the audit-finding chain.
+    const torrent_sync_tests = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("tests/torrent_sync_test.zig"),
+            .target = target,
+            .optimize = optimize,
+            .imports = &varuna_import,
+        }),
+    });
+    const run_torrent_sync_tests = b.addRunArtifact(torrent_sync_tests);
+    const test_torrent_sync_step = b.step(
+        "test-torrent-sync",
+        "Run per-torrent durability sync wiring tests (submitTorrentSync, periodic timer, shutdown drain)",
+    );
+    test_torrent_sync_step.dependOn(&run_torrent_sync_tests.step);
+    test_step.dependOn(&run_torrent_sync_tests.step);
+
     // ── RPC server stress test (Track C: connect/disconnect churn) ──
     const rpc_server_stress_tests = b.addTest(.{
         .root_module = b.createModule(.{

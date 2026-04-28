@@ -208,6 +208,13 @@ pub fn main() !void {
     // Submit timeout for shared event loop
     shared_el.submitTimeout(100 * std.time.ns_per_ms) catch {};
 
+    // Start the periodic torrent-durability sync sweep. Every
+    // `sync_timer_interval_ms` (30 s by default), every torrent with
+    // un-fsync'd writes gets one fsync per open file. Closes the gap
+    // where the OS pagecache controlled durability — see
+    // `docs/mmap-durability-audit.md` §R6.
+    shared_el.startPeriodicSync();
+
     // Listen socket for accepting inbound peer connections (created once, shared across torrents).
     // Created at startup so both downloading and seeding torrents can receive inbound connections.
     var listen_fd: std.posix.fd_t = -1;
