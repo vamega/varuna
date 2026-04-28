@@ -657,3 +657,49 @@ test "threadpool cache respects port override on hit" {
     const resolved = try resolver.resolve(std.testing.allocator, "porttest.local", 6969);
     try std.testing.expectEqual(@as(u16, 6969), resolved.getPort());
 }
+
+test "threadpool: HttpClient invalidates DNS on connect refusal (regression)" {
+    // Regression for the 2026-04-30 DNS gap: a connect failure to a
+    // resolved IP must drop the cached entry so the next attempt
+    // re-resolves. Without the invalidate hook we'd burn the full TTL
+    // window on the same dead IP.
+    const HttpClient = @import("http_blocking.zig").HttpClient;
+    var resolver = try DnsResolver.init(std.testing.allocator);
+    defer resolver.deinit(std.testing.allocator);
+
+    // Pre-seed the cache so resolve() short-circuits to 127.0.0.1.
+    const cached_addr = std.net.Address.initIp4(.{ 127, 0, 0, 1 }, 80);
+    resolver.put(
+        std.testing.allocator,
+        "varuna-dns-fixes-regression.test",
+        cached_addr,
+        std.time.timestamp() + 3600,
+    );
+    try std.testing.expectEqual(@as(u32, 1), resolver.cache.count());
+
+    // Connect to a loopback port that nothing is listening on. Linux
+    // loopback returns ECONNREFUSED for closed ports, which is in our
+    // shouldInvalidateOnConnectError set.
+    var client = HttpClient.initWithDns(std.testing.allocator, &resolver);
+    defer client.deinit();
+
+    var url_buf = std.ArrayList(u8).empty;
+    defer url_buf.deinit(std.testing.allocator);
+    try url_buf.print(
+        std.testing.allocator,
+        "http://varuna-dns-fixes-regression.test:1/",
+        .{},
+    );
+
+    const result = client.get(url_buf.items);
+    if (result) |resp| {
+        var r = resp;
+        r.deinit();
+        return error.UnexpectedSuccess;
+    } else |_| {
+        // Any connect-side error is acceptable — what matters is that
+        // the invalidate hook fired.
+    }
+
+    try std.testing.expectEqual(@as(u32, 0), resolver.cache.count());
+}
