@@ -61,23 +61,19 @@
 //! ## Scope of this MVP
 //!
 //! Implemented today:
-//!   - Lifecycle: init / deinit / tick / closeSocket
+//!   - Lifecycle: init / deinit / tick / closeSocket / bindWakeup
 //!   - Timers: heap-of-deadlines + `timeout` op
-//!   - Cancellation: best-effort `cancel` op
+//!   - Cancellation: best-effort `cancel` op (timer / kevent / pool)
 //!   - Socket lifecycle: `socket` (sync), `connect` (with deadline),
 //!     `accept` (single-shot + multishot emulation)
 //!   - Stream IO: `recv`, `send`
 //!   - Datagram IO: `recvmsg`, `sendmsg`
 //!   - Readiness: `poll`
-//!
-//! Deferred to a follow-up (the file-op thread pool):
-//!   - `read`, `write`, `pread`, `pwrite`, `fsync`, `fallocate`, `truncate`
-//!
-//! Today the file-op submission methods deliver `error.OperationNotSupported`
-//! synchronously — that's the same errno semantics Linux returns for
-//! filesystems that reject `fallocate`, so callers' existing fallback
-//! paths (`PieceStore.init` → `truncate`) light up uniformly. Both paths
-//! still need the thread pool to actually do work.
+//!   - File ops: `read`, `write`, `fsync`, `fallocate`, `truncate`
+//!     routed through `PosixFilePool`. Workers signal back via
+//!     `EVFILT_USER` + `NOTE_TRIGGER` so `kevent()` returns. See
+//!     `src/io/posix_file_pool.zig` for the pool itself; `EpollPosixIO`
+//!     uses the same pool with eventfd as the wake primitive.
 //!
 //! ## Per-completion state
 //!
@@ -101,6 +97,28 @@ const Operation = ifc.Operation;
 const Result = ifc.Result;
 const Callback = ifc.Callback;
 const CallbackAction = ifc.CallbackAction;
+const posix_file_pool = @import("posix_file_pool.zig");
+const PosixFilePool = posix_file_pool.PosixFilePool;
+const FileOp = posix_file_pool.FileOp;
+const PoolCompleted = posix_file_pool.Completed;
+
+// EVFILT_USER + NOTE_TRIGGER constants used to wake `kevent()` from
+// background pool workers. `std.c.EVFILT.USER` is normally correct but
+// libxev / zio note that NetBSD's binding is wrong upstream; we mirror
+// zio's switch for safety. NOTE_TRIGGER is platform-uniform per macOS /
+// BSD docs.
+const evfilt_user: i16 = switch (builtin.target.os.tag) {
+    .netbsd => 8,
+    else => if (@hasDecl(std.c, "EVFILT")) std.c.EVFILT.USER else 0,
+};
+const note_trigger: u32 = 0x01000000;
+
+/// Stable identifier for our cross-thread user event. Chosen so it
+/// doesn't collide with any fd we'd register on EVFILT_READ /
+/// EVFILT_WRITE (those use the fd number as `ident`; EVFILT_USER lives
+/// in a disjoint ident namespace per kqueue, but using a non-fd value
+/// keeps debugging easier).
+const waker_ident: usize = 0xFADEFADE;
 
 /// True when the current target supports kqueue. Used to gate hot syscall
 /// bodies; helpers and types are platform-agnostic so the file itself
@@ -156,6 +174,14 @@ pub const Config = struct {
     /// kevent change-list batch size — how many submissions we hand to
     /// `kevent()` in a single call. Mirrors tigerbeetle's 256.
     change_batch: u32 = 256,
+
+    /// Number of worker threads in the file-op pool. Default 4 mirrors
+    /// `hasher.zig`. Set to 0 only in tests that want inline-mode op
+    /// execution.
+    file_pool_workers: u32 = 4,
+    /// Bound on outstanding file ops awaiting worker pickup. `submit`
+    /// returns `error.PendingQueueFull` past this.
+    file_pool_pending_capacity: u32 = 256,
 };
 
 // ── Pending change / completed entries ────────────────────
@@ -216,16 +242,47 @@ pub const KqueuePosixIO = struct {
     cfg: Config,
     allocator: std.mem.Allocator,
 
+    /// File-op worker thread pool. read/write/fsync/fallocate/truncate
+    /// route here; workers signal via NOTE_TRIGGER on the registered
+    /// EVFILT_USER kevent.
+    pool: *PosixFilePool,
+    /// Scratch buffer reused across ticks for `pool.drainCompletedInto`.
+    pool_swap: std.ArrayListUnmanaged(PoolCompleted) = .{},
+    /// Counts file ops in flight on the pool. Used by the kevent
+    /// timeout calc so we wait for the EVFILT_USER wake when the
+    /// readiness side has nothing else to do.
+    pool_in_flight: u32 = 0,
+
     pub fn init(allocator: std.mem.Allocator, cfg: Config) !KqueuePosixIO {
         if (comptime !is_kqueue_platform) return error.UnsupportedPlatform;
 
         const kq = try posix.kqueue();
         errdefer posix.close(kq);
 
+        const pool = try PosixFilePool.create(allocator, .{
+            .worker_count = cfg.file_pool_workers,
+            .pending_capacity = cfg.file_pool_pending_capacity,
+        });
+        errdefer pool.deinit();
+
+        // Register the cross-thread user event. EV_CLEAR makes it
+        // edge-triggered: each NOTE_TRIGGER fires exactly one wake; the
+        // kernel resets the trigger bit when the event is delivered.
+        var change: [1]posix.Kevent = .{.{
+            .ident = waker_ident,
+            .filter = evfilt_user,
+            .flags = std.c.EV.ADD | std.c.EV.ENABLE | std.c.EV.CLEAR,
+            .fflags = 0,
+            .data = 0,
+            .udata = 0,
+        }};
+        _ = try posix.kevent(kq, &change, &.{}, null);
+
         var self = KqueuePosixIO{
             .kq = kq,
             .cfg = cfg,
             .allocator = allocator,
+            .pool = pool,
         };
 
         try self.pending_changes.ensureTotalCapacity(allocator, cfg.pending_capacity);
@@ -237,7 +294,38 @@ pub const KqueuePosixIO = struct {
         return self;
     }
 
+    /// Bind the file-op pool's wakeup callback to this kqueue. Must be
+    /// called after `init` (which returns by value, so we need a stable
+    /// `*KqueuePosixIO` for the wake closure to address).
+    pub fn bindWakeup(self: *KqueuePosixIO) void {
+        self.pool.setWakeup(self, wakeFromPool);
+    }
+
+    /// Wakeup hook handed to the file-op pool. Workers invoke this
+    /// after pushing a result; a NOTE_TRIGGER on the registered
+    /// EVFILT_USER ident makes `kevent()` return so `tick` drains the
+    /// pool's completed queue.
+    fn wakeFromPool(ctx: ?*anyopaque) void {
+        if (comptime !is_kqueue_platform) return;
+        const self: *KqueuePosixIO = @ptrCast(@alignCast(ctx.?));
+        var change: [1]posix.Kevent = .{.{
+            .ident = waker_ident,
+            .filter = evfilt_user,
+            .flags = 0,
+            .fflags = note_trigger,
+            .data = 0,
+            .udata = 0,
+        }};
+        // kevent(2) is thread-safe against concurrent EL `kevent()`
+        // calls on the same kq; the trigger is delivered atomically.
+        _ = posix.kevent(self.kq, &change, &.{}, null) catch {};
+    }
+
     pub fn deinit(self: *KqueuePosixIO) void {
+        // Pool deinit joins workers BEFORE we close kq, so a
+        // worker-issued NOTE_TRIGGER racing with shutdown is safe.
+        self.pool.deinit();
+        self.pool_swap.deinit(self.allocator);
         if (comptime is_kqueue_platform) {
             if (self.kq >= 0) posix.close(self.kq);
         }
@@ -269,6 +357,14 @@ pub const KqueuePosixIO = struct {
         const now = monotonicNs();
         // Expire any timers whose deadline has passed.
         try self.expireTimers(now);
+
+        // Drain the file-op pool first so any callbacks they fire land
+        // alongside synchronous completions in a single tick. Pool
+        // completions go through `dispatchPoolEntry` (separate from
+        // `drainCompleted` because pool entries already carry a
+        // pre-resolved Result and are tracked in `pool_in_flight`, not
+        // `pending_changes`).
+        try self.drainPool();
 
         // First drain pass — synchronous successes/failures.
         self.drainCompleted();
@@ -324,6 +420,10 @@ pub const KqueuePosixIO = struct {
 
         // Process ready events.
         for (event_buf[0..got]) |ev| {
+            // Cross-thread wake from the file-op pool. The pool's
+            // workers have pushed results onto `pool.completed`; the
+            // post-loop `drainPool` call below picks them up.
+            if (ev.filter == evfilt_user and ev.ident == waker_ident) continue;
             const c: *Completion = @ptrFromInt(ev.udata);
             const st = kqueueState(c);
             st.parked_filter = 0;
@@ -335,8 +435,44 @@ pub const KqueuePosixIO = struct {
             try self.retrySyscall(c, ev);
         }
 
+        // Drain the pool again — workers may have pushed between the
+        // pre-tick drain and now.
+        try self.drainPool();
+
         // Final drain of any newly-completed callbacks.
         self.drainCompleted();
+    }
+
+    fn drainPool(self: *KqueuePosixIO) !void {
+        try self.pool.drainCompletedInto(&self.pool_swap);
+        defer self.pool_swap.clearRetainingCapacity();
+        for (self.pool_swap.items) |entry| {
+            self.dispatchPoolEntry(entry);
+        }
+    }
+
+    /// Fire the user callback for one pool completion. Mirrors
+    /// `dispatch` (the readiness-side equivalent) — clears in_flight
+    /// before invoking the callback so a callback that resubmits a
+    /// follow-on op on the same completion doesn't trip
+    /// `AlreadyInFlight` against itself.
+    fn dispatchPoolEntry(self: *KqueuePosixIO, entry: PoolCompleted) void {
+        const c = entry.completion;
+        const cb = c.callback orelse return;
+        kqueueState(c).in_flight = false;
+        self.pool_in_flight -|= 1;
+        const action = cb(c.userdata, c, entry.result);
+        switch (action) {
+            .disarm => {},
+            .rearm => switch (c.op) {
+                .read => |op| self.read(op, c, c.userdata, cb) catch {},
+                .write => |op| self.write(op, c, c.userdata, cb) catch {},
+                .fsync => |op| self.fsync(op, c, c.userdata, cb) catch {},
+                .fallocate => |op| self.fallocate(op, c, c.userdata, cb) catch {},
+                .truncate => |op| self.truncate(op, c, c.userdata, cb) catch {},
+                else => {}, // callback overwrote c.op with a non-file op
+            },
+        }
     }
 
     // ── Internal: completed queue + dispatch ───────────────
@@ -787,11 +923,14 @@ pub const KqueuePosixIO = struct {
         const target = op.target;
         const tst = kqueueState(target);
 
-        // Best-effort. Three parking states to handle:
+        // Best-effort. Four parking states to handle:
         //   * In timer heap → remove, deliver OperationCanceled.
         //   * Parked on kevent → mark cancelled; tick will deliver
         //     OperationCanceled when the filter fires (or never, if it
         //     doesn't — this is the "best-effort" gap from the design doc).
+        //   * Pending on the file-op pool → tryCancelPending pulls it
+        //     off the queue and pushes Cancelled. Workers that have
+        //     already picked up the op cannot be interrupted.
         //   * Already completed / not in flight → OperationNotFound.
         var found = false;
         if (tst.timer_index != sentinel_index) {
@@ -806,47 +945,65 @@ pub const KqueuePosixIO = struct {
             // shape used by RealIO.
             self.pushCompleted(target, makeCancelledResult(target.op));
             found = true;
+        } else {
+            const target_is_file = switch (target.op) {
+                .read, .write, .fsync, .fallocate, .truncate => true,
+                else => false,
+            };
+            if (target_is_file and self.pool.tryCancelPending(target)) {
+                // Pool pushed Cancelled onto its completed queue;
+                // `dispatchPoolEntry` will fire the target's callback on
+                // the next `drainPool` (and decrement `pool_in_flight`
+                // there).
+                found = true;
+            }
         }
 
         const result: anyerror!void = if (found) {} else error.OperationNotFound;
         self.pushCompleted(c, .{ .cancel = result });
     }
 
-    // ── File ops (deferred — see module docstring) ────────
+    // ── File ops (PosixFilePool-routed) ───────────────────
+    //
+    // kevent reports regular files as always-ready; the actual
+    // `pread`/`pwrite`/`fsync`/etc. syscall blocks on page faults. We
+    // offload to a worker thread; the worker pushes the result onto
+    // `pool.completed` and signals `EVFILT_USER` so `kevent()` returns.
+    // The next `tick` drains via `drainPool`. Same shape as
+    // `EpollPosixIO`'s file-op path, with the wake primitive swapped.
 
     pub fn read(self: *KqueuePosixIO, op: ifc.ReadOp, c: *Completion, ud: ?*anyopaque, cb: Callback) !void {
         try self.armCompletion(c, .{ .read = op }, ud, cb);
-        self.pushCompleted(c, .{ .read = error.OperationNotSupported });
+        try self.submitFileOp(.{ .read = op }, c);
     }
 
     pub fn write(self: *KqueuePosixIO, op: ifc.WriteOp, c: *Completion, ud: ?*anyopaque, cb: Callback) !void {
         try self.armCompletion(c, .{ .write = op }, ud, cb);
-        self.pushCompleted(c, .{ .write = error.OperationNotSupported });
+        try self.submitFileOp(.{ .write = op }, c);
     }
 
     pub fn fsync(self: *KqueuePosixIO, op: ifc.FsyncOp, c: *Completion, ud: ?*anyopaque, cb: Callback) !void {
         try self.armCompletion(c, .{ .fsync = op }, ud, cb);
-        self.pushCompleted(c, .{ .fsync = error.OperationNotSupported });
+        try self.submitFileOp(.{ .fsync = op }, c);
     }
 
     pub fn fallocate(self: *KqueuePosixIO, op: ifc.FallocateOp, c: *Completion, ud: ?*anyopaque, cb: Callback) !void {
         try self.armCompletion(c, .{ .fallocate = op }, ud, cb);
-        // Matches Linux behavior on rejecting filesystems — the daemon
-        // already has fallback paths keyed on this errno.
-        self.pushCompleted(c, .{ .fallocate = error.OperationNotSupported });
+        try self.submitFileOp(.{ .fallocate = op }, c);
     }
 
     pub fn truncate(self: *KqueuePosixIO, op: ifc.TruncateOp, c: *Completion, ud: ?*anyopaque, cb: Callback) !void {
         try self.armCompletion(c, .{ .truncate = op }, ud, cb);
-        // ftruncate(2) is synchronous on macOS; running it here on the
-        // event-loop thread mirrors RealIO's truncate path (which also
-        // calls posix.ftruncate inline). Acceptable until the file-op
-        // thread pool lands.
-        const r: Result = if (posix.ftruncate(op.fd, op.length)) |_|
-            .{ .truncate = {} }
-        else |err|
-            .{ .truncate = err };
-        self.pushCompleted(c, r);
+        try self.submitFileOp(.{ .truncate = op }, c);
+    }
+
+    fn submitFileOp(self: *KqueuePosixIO, op: FileOp, c: *Completion) !void {
+        self.pool_in_flight += 1;
+        self.pool.submit(op, c) catch |err| {
+            self.pool_in_flight -|= 1;
+            kqueueState(c).in_flight = false;
+            return err;
+        };
     }
 };
 
