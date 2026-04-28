@@ -370,6 +370,27 @@ pub fn build(b: *std.Build) void {
     test_epoll_posix_io_step.dependOn(&run_epoll_posix_io_tests.step);
     test_step.dependOn(&run_epoll_posix_io_tests.step);
 
+    // ── EpollMmapIO smoke tests (mmap-backed file ops) ──────────────
+    //
+    // Backend-specific coverage for `src/io/epoll_mmap_io.zig`. Linux-only
+    // (skipped at runtime on other platforms via `skipIfUnavailable`). The
+    // inline tests in `epoll_mmap_io.zig` are pulled in via
+    // `src/io/root.zig` -> `_ = epoll_mmap_io;`; this addTest target adds
+    // integration coverage focused on the mmap remap / truncate /
+    // msync paths.
+    const epoll_mmap_io_tests = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("tests/epoll_mmap_io_test.zig"),
+            .target = target,
+            .optimize = optimize,
+            .imports = &varuna_import,
+        }),
+    });
+    const run_epoll_mmap_io_tests = b.addRunArtifact(epoll_mmap_io_tests);
+    const test_epoll_mmap_io_step = b.step("test-epoll-mmap-io", "Run EpollMmapIO smoke tests (mmap remap + msync coverage)");
+    test_epoll_mmap_io_step.dependOn(&run_epoll_mmap_io_tests.step);
+    test_step.dependOn(&run_epoll_mmap_io_tests.step);
+
     // ── KqueueIO MVP tests ─────────────────────────────────
     // Standalone target: compiles `src/io/kqueue_io.zig` directly, with
     // its `@import("io_interface.zig")` sibling resolving naturally. No
