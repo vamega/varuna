@@ -33,11 +33,13 @@
 //!     scan; libxev pattern). Number of concurrent timers in varuna's hot
 //!     path is small (~hundreds), so O(n) peek is fine. The next deadline
 //!     drives the `epoll_wait` timeout argument.
-//!   * File ops (`read`, `write`, `pread`, `pwrite`, `fallocate`, `fsync`,
-//!     `truncate`) MUST be offloaded to a thread pool because epoll cannot
-//!     deliver readiness for regular files. **MVP STATUS: file ops are not
-//!     implemented yet — they return `error.Unimplemented`.** Track:
-//!     `progress-reports/2026-04-30-epoll-bifurcation.md`.
+//!   * File ops (`read`, `write`, `fsync`, `fallocate`, `truncate`) run on
+//!     a `PosixFilePool` worker thread. Workers execute the syscall and
+//!     push the result onto the pool's completed queue; the worker then
+//!     writes a byte to `wakeup_fd` to break `epoll_pwait`. The next
+//!     `tick` drains the pool via `drainPool` and fires the user's
+//!     callback. See `src/io/posix_file_pool.zig`. KqueuePosixIO uses the
+//!     same pool with EVFILT_USER as the wake primitive.
 //!   * Cancel is best-effort: for socket ops we `epoll_ctl(EPOLL_CTL_DEL)`
 //!     the fd and complete the cancelled op with `error.OperationCanceled`.
 //!     For timers we remove from the heap and deliver cancellation. Already
@@ -74,6 +76,10 @@ const Operation = ifc.Operation;
 const Result = ifc.Result;
 const Callback = ifc.Callback;
 const CallbackAction = ifc.CallbackAction;
+const posix_file_pool = @import("posix_file_pool.zig");
+const PosixFilePool = posix_file_pool.PosixFilePool;
+const FileOp = posix_file_pool.FileOp;
+const PoolCompleted = posix_file_pool.Completed;
 
 // ── Backend state ─────────────────────────────────────────
 //
@@ -121,6 +127,19 @@ pub const Config = struct {
     /// Initial capacity for the timer heap. Grows on demand if needed.
     /// Mirrors RealIO's `entries` knob in spirit.
     max_completions: u32 = 1024,
+
+    /// Number of worker threads in the file-op pool. epoll cannot deliver
+    /// readiness for regular files; every `read`/`write`/`fsync`/
+    /// `fallocate`/`truncate` runs on this pool. Default 4 mirrors
+    /// `hasher.zig`. Set to 0 only in tests that want inline-mode op
+    /// execution (file ops will then never complete asynchronously —
+    /// most tests should leave it at the default).
+    file_pool_workers: u32 = 4,
+
+    /// Bound on outstanding file ops awaiting worker pickup. `submit`
+    /// returns `error.PendingQueueFull` past this. 256 matches kqueue's
+    /// kevent change-batch sizing.
+    file_pool_pending_capacity: u32 = 256,
 };
 
 // ── Timer heap ────────────────────────────────────────────
@@ -185,15 +204,28 @@ const TimerHeap = struct {
 pub const EpollPosixIO = struct {
     allocator: std.mem.Allocator,
     epoll_fd: posix.fd_t,
-    /// Cross-thread wakeup primitive. Background workers (file-op thread
-    /// pool, when implemented) write to this fd; we read it inside `tick`
-    /// to drain spurious wakes.
+    /// Cross-thread wakeup primitive. The file-op thread pool writes a
+    /// `u64` to this fd whenever a worker pushes a result; we read it
+    /// inside `tick` to drain accumulated wake counts (eventfd semantics
+    /// collapse multiple writes into one read).
     wakeup_fd: posix.fd_t,
     /// Active in-flight count (for `tick(wait_at_least)` semantics).
+    /// Counts both registered fds (sockets, timers) AND outstanding pool
+    /// submissions, so `tick` knows to block on `epoll_pwait` while a
+    /// worker has work in flight.
     active: u32 = 0,
     timers: TimerHeap,
     /// Cached monotonic-clock reading, refreshed in `tick`.
     cached_now_ns: u64 = 0,
+    /// File-op worker thread pool. Read/write/fsync/fallocate/truncate
+    /// all run here because epoll cannot deliver readiness for regular
+    /// files. Workers signal completion via `wakeup_fd` (see
+    /// `wakeFromPool`).
+    pool: *PosixFilePool,
+    /// Scratch buffer for `pool.drainCompletedInto`. Reused across
+    /// ticks; sized lazily as the pool grows. Owned by EpollPosixIO so
+    /// no allocation churn on hot ticks.
+    pool_swap: std.ArrayListUnmanaged(PoolCompleted) = .{},
 
     pub fn init(allocator: std.mem.Allocator, config: Config) !EpollPosixIO {
         const epoll_rc = linux.epoll_create1(linux.EPOLL.CLOEXEC);
@@ -229,19 +261,61 @@ pub const EpollPosixIO = struct {
             else => |e| return posix.unexpectedErrno(e),
         }
 
+        var timers = try TimerHeap.init(allocator, config.max_completions);
+        errdefer timers.deinit();
+
+        const pool = try PosixFilePool.create(allocator, .{
+            .worker_count = config.file_pool_workers,
+            .pending_capacity = config.file_pool_pending_capacity,
+        });
+        errdefer pool.deinit();
+
+        // Stash `wakeup_fd` on the pool's wake context. We can't use
+        // `&self` here (init returns the value), so the wake hook
+        // resolves the fd via the EpollPosixIO pointer wired up after
+        // the struct is constructed below.
+        // (We complete the wiring before returning.)
+
         return .{
             .allocator = allocator,
             .epoll_fd = epoll_fd,
             .wakeup_fd = wakeup_fd,
-            .timers = try TimerHeap.init(allocator, config.max_completions),
+            .timers = timers,
+            .pool = pool,
         };
     }
 
+    /// Finishes init by binding the pool's wakeup callback to this
+    /// EpollPosixIO. Call right after `init` returns, before submitting
+    /// any file ops. Separated from `init` because the wake function
+    /// needs a stable `*EpollPosixIO` and `init` returns a value (not a
+    /// pointer).
+    pub fn bindWakeup(self: *EpollPosixIO) void {
+        self.pool.setWakeup(self, wakeFromPool);
+    }
+
     pub fn deinit(self: *EpollPosixIO) void {
+        // Pool deinit joins workers BEFORE we touch wakeup_fd, so a
+        // worker pushing a final result + signalling wake is fine — the
+        // eventfd stays open until we close it below.
+        self.pool.deinit();
+        self.pool_swap.deinit(self.allocator);
         self.timers.deinit();
         posix.close(self.wakeup_fd);
         posix.close(self.epoll_fd);
         self.* = undefined;
+    }
+
+    /// Wakeup hook handed to the file-op pool. Workers invoke this
+    /// after pushing a result; the eventfd write makes
+    /// `epoll_pwait` return so `tick` drains the pool's completed
+    /// queue. Best-effort — a write failure (eventfd full at u64::max,
+    /// effectively impossible) means the next tick will pick the
+    /// result up via `pool.drainCompletedInto` regardless.
+    fn wakeFromPool(ctx: ?*anyopaque) void {
+        const self: *EpollPosixIO = @ptrCast(@alignCast(ctx.?));
+        const val: u64 = 1;
+        _ = posix.write(self.wakeup_fd, std.mem.asBytes(&val)) catch {};
     }
 
     /// Synchronously close a file descriptor. Mirrors `RealIO.closeSocket`.
@@ -264,6 +338,7 @@ pub const EpollPosixIO = struct {
 
         var fired: u32 = 0;
         try self.fireExpiredTimers(&fired);
+        try self.drainPool(&fired);
 
         if (self.active == 0 and (wait_at_least == 0 or fired >= wait_at_least)) return;
 
@@ -290,6 +365,44 @@ pub const EpollPosixIO = struct {
         }
 
         try self.fireExpiredTimers(&fired);
+        try self.drainPool(&fired);
+    }
+
+    /// Drain the file-op pool's completed queue and dispatch each
+    /// callback. Called from `tick` before and after `epoll_pwait` so
+    /// callbacks land on the same EL pass as the wake fd's read.
+    fn drainPool(self: *EpollPosixIO, fired: *u32) !void {
+        try self.pool.drainCompletedInto(&self.pool_swap);
+        defer self.pool_swap.clearRetainingCapacity();
+        for (self.pool_swap.items) |entry| {
+            try self.dispatchPoolEntry(entry, fired);
+        }
+    }
+
+    /// Fire the user callback for one pool completion. Mirrors
+    /// `dispatchCqe` in RealIO: clear in_flight before invoking the
+    /// callback so a callback that resubmits a follow-on op on the same
+    /// completion doesn't trip `AlreadyInFlight` against itself.
+    fn dispatchPoolEntry(self: *EpollPosixIO, entry: PoolCompleted, fired: *u32) !void {
+        const c = entry.completion;
+        const cb = c.callback orelse return;
+        const st = epollState(c);
+        st.in_flight = false;
+        self.active -|= 1;
+        fired.* += 1;
+
+        const action = cb(c.userdata, c, entry.result);
+        switch (action) {
+            .disarm => {},
+            .rearm => switch (c.op) {
+                .read => |op| try self.read(op, c, c.userdata, cb),
+                .write => |op| try self.write(op, c, c.userdata, cb),
+                .fsync => |op| try self.fsync(op, c, c.userdata, cb),
+                .fallocate => |op| try self.fallocate(op, c, c.userdata, cb),
+                .truncate => |op| try self.truncate(op, c, c.userdata, cb),
+                else => {}, // callback overwrote c.op with a non-file op; that path is its own armCompletion
+            },
+        }
     }
 
     fn computeEpollTimeout(self: *EpollPosixIO, wait_at_least: u32, fired: u32) i32 {
@@ -690,6 +803,23 @@ pub const EpollPosixIO = struct {
             }
         }
 
+        // Pool-pending file op? Best-effort: if a worker has already
+        // picked it up, we cannot interrupt the syscall, and the op
+        // delivers normally.
+        if (!found) {
+            const target_is_file = switch (target.op) {
+                .read, .write, .fsync, .fallocate, .truncate => true,
+                else => false,
+            };
+            if (target_is_file and self.pool.tryCancelPending(target)) {
+                found = true;
+                // Pool pushed an OperationCanceled result onto its
+                // completed queue; the next `drainPool` (in tick()) will
+                // fire the target's callback. We don't decrement `active`
+                // here — `dispatchPoolEntry` does that when it fires.
+            }
+        }
+
         const result: Result = if (found) .{ .cancel = {} } else .{ .cancel = error.OperationNotFound };
         const action = try self.deliverInline(c, result);
         switch (action) {
@@ -701,42 +831,51 @@ pub const EpollPosixIO = struct {
         }
     }
 
-    // ── File ops (UNIMPLEMENTED in MVP) ───────────────────
+    // ── File ops ──────────────────────────────────────────
     //
-    // The MVP scope intentionally excludes file ops. They MUST run on a
-    // worker thread pool because epoll cannot deliver readiness for regular
-    // files (they always poll ready). Daemon paths that depend on these
-    // ops will not work under `-Dio=epoll` until the follow-up lands.
+    // epoll cannot deliver readiness for regular files (the kernel
+    // reports them as always-ready and the actual syscall blocks on a
+    // page fault). Every file op runs on the `PosixFilePool` worker
+    // thread; the worker pushes the result onto the pool's completed
+    // queue and signals `wakeup_fd`. The next `tick` drains the queue
+    // and fires the user's callback.
 
     pub fn read(self: *EpollPosixIO, op: ifc.ReadOp, c: *Completion, ud: ?*anyopaque, cb: Callback) !void {
         try self.armCompletion(c, .{ .read = op }, ud, cb);
-        const action = try self.deliverInline(c, .{ .read = error.Unimplemented });
-        // Unimplemented op rearm is a no-op; the caller can't make progress.
-        _ = action;
+        try self.submitFileOp(.{ .read = op }, c);
     }
 
     pub fn write(self: *EpollPosixIO, op: ifc.WriteOp, c: *Completion, ud: ?*anyopaque, cb: Callback) !void {
         try self.armCompletion(c, .{ .write = op }, ud, cb);
-        const action = try self.deliverInline(c, .{ .write = error.Unimplemented });
-        _ = action;
+        try self.submitFileOp(.{ .write = op }, c);
     }
 
     pub fn fsync(self: *EpollPosixIO, op: ifc.FsyncOp, c: *Completion, ud: ?*anyopaque, cb: Callback) !void {
         try self.armCompletion(c, .{ .fsync = op }, ud, cb);
-        const action = try self.deliverInline(c, .{ .fsync = error.Unimplemented });
-        _ = action;
+        try self.submitFileOp(.{ .fsync = op }, c);
     }
 
     pub fn fallocate(self: *EpollPosixIO, op: ifc.FallocateOp, c: *Completion, ud: ?*anyopaque, cb: Callback) !void {
         try self.armCompletion(c, .{ .fallocate = op }, ud, cb);
-        const action = try self.deliverInline(c, .{ .fallocate = error.Unimplemented });
-        _ = action;
+        try self.submitFileOp(.{ .fallocate = op }, c);
     }
 
     pub fn truncate(self: *EpollPosixIO, op: ifc.TruncateOp, c: *Completion, ud: ?*anyopaque, cb: Callback) !void {
         try self.armCompletion(c, .{ .truncate = op }, ud, cb);
-        const action = try self.deliverInline(c, .{ .truncate = error.Unimplemented });
-        _ = action;
+        try self.submitFileOp(.{ .truncate = op }, c);
+    }
+
+    fn submitFileOp(self: *EpollPosixIO, op: FileOp, c: *Completion) !void {
+        // Bump active so `tick`'s early-return guard knows we have
+        // outstanding work; matches the timer / registered-fd path.
+        // Decremented when `dispatchPoolEntry` fires the callback.
+        self.active += 1;
+        self.pool.submit(op, c) catch |err| {
+            // Roll back the bookkeeping we just touched.
+            self.active -|= 1;
+            epollState(c).in_flight = false;
+            return err;
+        };
     }
 
     // ── Internal helpers ──────────────────────────────────
@@ -1105,27 +1244,31 @@ test "EpollPosixIO cancel on parked recv delivers OperationCanceled" {
     }
 }
 
-test "EpollPosixIO file ops return Unimplemented (MVP scope marker)" {
-    // The MVP intentionally does not implement file ops. They require a
-    // worker thread pool because epoll cannot signal regular-file readiness.
-    // This test asserts the explicit UNIMPLEMENTED contract so the gap is
-    // discoverable. When the file-op follow-up lands, this test should be
-    // replaced with proper read/write/fallocate/fsync/truncate coverage.
+test "EpollPosixIO fsync round-trips through the file-op pool" {
+    // File ops route through `PosixFilePool`. Worker calls `fdatasync`,
+    // pushes the result, signals the eventfd; the next `tick` drains
+    // the pool's completed queue and fires this callback.
     var io = try skipIfUnavailable();
     defer io.deinit();
+    io.bindWakeup();
 
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
-    const file = try tmp.dir.createFile("epoll_unimpl", .{ .truncate = true });
+    const file = try tmp.dir.createFile("epoll_fsync", .{ .read = true, .truncate = true });
     defer file.close();
+    try file.writeAll("ok");
 
     var c = Completion{};
     var ctx = TestCtx{};
     try io.fsync(.{ .fd = file.handle, .datasync = true }, &c, &ctx, testCallback);
 
+    var attempts: u32 = 0;
+    while (ctx.calls == 0 and attempts < 200) : (attempts += 1) {
+        try io.tick(1);
+    }
     try testing.expectEqual(@as(u32, 1), ctx.calls);
     switch (ctx.last_result.?) {
-        .fsync => |r| try testing.expectError(error.Unimplemented, r),
+        .fsync => |r| try r,
         else => try testing.expect(false),
     }
 }
