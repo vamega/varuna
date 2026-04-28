@@ -1,10 +1,20 @@
 //! Recheck safety-under-randomized-inputs harness.
 //!
-//! A1 (`ResumeDb.replaceCompletePieces`) + A2 (`PieceTracker.applyRecheckResult`'s
+//! A1 (`replaceCompletePieces`) + A2 (`PieceTracker.applyRecheckResult`'s
 //! surgical `in_progress` preservation) both fire from the post-recheck
 //! callback (`onRecheckComplete` for stop+start, `onLiveRecheckComplete`
 //! for live force-recheck). This file is the layered-testing-strategy
 //! "safety-under-faults" layer for those two surfaces.
+//!
+//! Backend: uses `SimResumeBackend` (in-memory, deterministic) rather
+//! than a real SQLite `ResumeDb`. The harness's correctness assertions
+//! depend only on the public method shape — same as the production code
+//! path — so swapping backends is invisible to the assertions, while
+//! removing the SQLite link dependency for this test file. A second
+//! `commit_failure_probability` BUGGIFY pass runs the same cross-product
+//! through SimResumeBackend with random commit failures injected on
+//! `replaceCompletePieces` to verify the in-memory PieceTracker state
+//! survives a resume DB write failure.
 //!
 //! ## What this harness does
 //!
@@ -62,7 +72,7 @@ const testing = std.testing;
 const varuna = @import("varuna");
 const Bitfield = varuna.bitfield.Bitfield;
 const PieceTracker = varuna.torrent.piece_tracker.PieceTracker;
-const ResumeDb = varuna.storage.resume_state.ResumeDb;
+const SimResumeBackend = varuna.storage.resume_state.SimResumeBackend;
 
 const min_piece_count: u32 = 4;
 const max_piece_count: u32 = 256;
@@ -96,9 +106,9 @@ fn runOneSeed(seed: u64) !SeedOutcome {
         r.uintLessThan(u32, max_piece_count - min_piece_count + 1);
     const total_size: u64 = @as(u64, piece_count) * piece_size;
 
-    // ── Resume DB: pre-recheck state ─────────────────────────
-    var db = ResumeDb.open(":memory:") catch return error.SkipZigTest;
-    defer db.close();
+    // ── Resume DB: pre-recheck state (SimResumeBackend) ──────
+    var db = SimResumeBackend.init(allocator, seed);
+    defer db.deinit();
 
     var info_hash: [20]u8 = undefined;
     for (&info_hash) |*b| b.* = r.int(u8);
@@ -362,4 +372,109 @@ test "edge case: piece_count=1 single-piece torrent (boundary)" {
         const expected_ip = cell.pre_ip and !cell.recheck;
         try testing.expectEqual(expected_ip, pt.in_progress.has(0));
     }
+}
+
+// ── BUGGIFY pass: SimResumeBackend commit_failure_probability ────
+//
+// Path A (the SimResumeBackend) unlocks fault injection on the resume
+// DB layer. This test variant injects a 50% commit failure probability
+// on `replaceCompletePieces` and asserts the in-memory `PieceTracker`
+// state stays consistent even when the resume DB write fails — i.e. a
+// crash or disk error after `applyRecheckResult` mutates the tracker
+// must not leave the tracker in a broken state. The recheck pipeline
+// recovers by re-running on the next start: the tracker's in-memory
+// state is correct, the DB just lacks the latest snapshot.
+
+test "BUGGIFY: replaceCompletePieces commit failures don't corrupt PieceTracker state" {
+    const allocator = testing.allocator;
+    const seeds = [_]u64{
+        0x0000_0001, 0xDEAD_BEEF, 0xFEED_FACE, 0xCAFE_BABE,
+        0x1234_5678, 0xABCD_EF01, 0xA1B2_C3D4, 0xDEAD_DEAD,
+    };
+
+    var commit_failures_seen: u32 = 0;
+
+    for (seeds) |seed| {
+        var rng = std.Random.DefaultPrng.init(seed);
+        const r = rng.random();
+        const piece_count: u32 = 32 + r.uintLessThan(u32, 64);
+        const total_size: u64 = @as(u64, piece_count) * piece_size;
+
+        var db = SimResumeBackend.init(allocator, seed);
+        defer db.deinit();
+        // 50% commit failure rate — half of replaceCompletePieces calls fail.
+        db.fault_config = .{ .commit_failure_probability = 0.5 };
+
+        var info_hash: [20]u8 = undefined;
+        for (&info_hash) |*b| b.* = r.int(u8);
+
+        var initial_complete = try Bitfield.init(allocator, piece_count);
+        defer initial_complete.deinit(allocator);
+        var i: u32 = 0;
+        while (i < piece_count) : (i += 1) {
+            if (r.boolean()) try initial_complete.set(i);
+        }
+        const initial_bytes: u64 = @as(u64, initial_complete.count) * piece_size;
+
+        var pt = try PieceTracker.init(
+            allocator,
+            piece_count,
+            piece_size,
+            total_size,
+            &initial_complete,
+            initial_bytes,
+        );
+        defer pt.deinit(allocator);
+
+        // Recheck result.
+        var recheck_result = try Bitfield.init(allocator, piece_count);
+        defer recheck_result.deinit(allocator);
+        i = 0;
+        while (i < piece_count) : (i += 1) {
+            if (r.boolean()) try recheck_result.set(i);
+        }
+        const recheck_bytes: u64 = @as(u64, recheck_result.count) * piece_size;
+
+        const original_complete_ptr = pt.complete.bits.ptr;
+
+        // The production callback ordering: tracker first, DB second.
+        // Mutate the tracker in memory (cannot fail).
+        pt.applyRecheckResult(&recheck_result, recheck_bytes);
+
+        // DB write may fail under the BUGGIFY knob.
+        var post_pieces = std.ArrayList(u32).empty;
+        defer post_pieces.deinit(allocator);
+        i = 0;
+        while (i < piece_count) : (i += 1) {
+            if (recheck_result.has(i)) try post_pieces.append(allocator, i);
+        }
+        if (db.replaceCompletePieces(info_hash, post_pieces.items)) |_| {
+            // Success path — DB matches tracker.
+            var verify_bf = try Bitfield.init(allocator, piece_count);
+            defer verify_bf.deinit(allocator);
+            const dbc = try db.loadCompletePieces(info_hash, &verify_bf);
+            try testing.expectEqual(recheck_result.count, dbc);
+        } else |_| {
+            commit_failures_seen += 1;
+            // Failure path — DB write lost, but tracker state must still
+            // reflect the recheck. This is the recovery assertion the
+            // SQLite-only test couldn't make: tracker doesn't depend on
+            // DB success to be consistent. Next daemon start will run
+            // recheck again because the DB is stale, and the same
+            // outcome will be re-derived.
+        }
+
+        // Tracker invariants must hold regardless of DB outcome.
+        try testing.expectEqual(original_complete_ptr, pt.complete.bits.ptr);
+        try testing.expect(std.mem.eql(u8, pt.complete.bits, recheck_result.bits));
+        try testing.expectEqual(recheck_bytes, pt.bytes_complete);
+    }
+
+    // We expect *some* commit failures across 8 seeds at 50% rate;
+    // pin at >= 1 to detect a knob that's secretly silent.
+    std.debug.print(
+        "\n  RECHECK BUGGIFY (commit fail) summary: {d}/{d} seeds saw a commit failure (knob fired)\n",
+        .{ commit_failures_seen, seeds.len },
+    );
+    try testing.expect(commit_failures_seen >= 1);
 }
