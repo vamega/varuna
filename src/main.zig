@@ -102,6 +102,16 @@ pub fn main() !void {
     shared_el.bind_device = cfg.network.bind_device;
     shared_el.bind_address = cfg.network.bind_address;
 
+    // Publish bind_device to the DNS module so newly-created
+    // DnsResolvers (HttpExecutor, UdpTrackerExecutor, etc.) can apply
+    // it. The c-ares backend honors it via ares_set_socket_callback;
+    // the threadpool backend (default) cannot — see STATUS.md "Known
+    // Issues" and `src/io/dns_threadpool.zig` for the limitation.
+    // Must be called BEFORE any DnsResolver is constructed; the DHT
+    // bootstrap path below resolves hostnames lazily, so we set this
+    // up first.
+    varuna.io.dns.setDefaultBindDevice(cfg.network.bind_device);
+
     // Apply MSE/PE encryption mode from config
     shared_el.encryption_mode = try varuna.config.parseEncryptionMode(cfg.network.encryption);
 

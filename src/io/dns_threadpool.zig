@@ -18,6 +18,19 @@ const TtlBounds = @import("dns.zig").TtlBounds;
 /// (see `shouldInvalidateOnConnectError`) or (b) the 1-hour cap. The
 /// c-ares backend (`-Ddns=c_ares`) honors authoritative TTLs.
 ///
+/// **Known limitation: `bind_device` (SO_BINDTODEVICE) is silently
+/// bypassed by this backend.** `getaddrinfo` owns its own UDP socket
+/// internally and gives the application no opportunity to apply
+/// `SO_BINDTODEVICE` before the query goes out. A user with
+/// `network.bind_device = "wg0"` will see peer / tracker / RPC
+/// traffic bound to the configured interface, but DNS queries leak
+/// out the default route. This is a privacy / correctness gap
+/// recorded in STATUS.md "Known Issues" — the fix is queued behind
+/// the custom DNS library work (see `docs/custom-dns-design-round2.md`
+/// §1). The c-ares backend (`-Ddns=c_ares`) does not have this
+/// limitation: it registers an `ares_set_socket_callback` that
+/// applies `applyBindDevice` to every socket the channel opens.
+///
 /// Thread safety: all public methods are safe to call from any thread.
 /// The internal cache is protected by a mutex; the job queue has its own lock.
 pub const DnsResolver = struct {

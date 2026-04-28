@@ -300,6 +300,7 @@ See `progress-reports/2026-04-25-stage2-event-loop-migration.md` for the Stage 2
 
 ## Known Issues
 
+- **`bind_device` is silently bypassed by the threadpool DNS backend (the build default).** `network.bind_device = "wg0"` is correctly applied to peer connections (TCP listen + connect), uTP / DHT UDP listener, RPC server accept, HTTP tracker client, and UDP tracker client — but DNS queries via the default `-Ddns=threadpool` backend leak out the default route. `getaddrinfo` owns its own UDP socket internally and offers no hook for the application to apply `SO_BINDTODEVICE`. Workaround: build with `-Ddns=c_ares`, which registers an `ares_set_socket_callback` on the c-ares channel that calls `applyBindDevice` for every UDP/TCP socket the channel opens — closes the gap fully on that backend. Full fix queued behind the custom-DNS-library work in `docs/custom-dns-design-round2.md` §1; the custom resolver controls its own sockets and applies `SO_BINDTODEVICE` natively. (2026-04-28)
 - The packaged Ubuntu `opentracker` build requires explicit info-hash whitelisting (`--whitelist-hash`).
 - On WSL2, `perf stat`/`perf record` require kernel-matched `linux-tools` package; many hardware counters report `<not supported>`.
 - `zig build test-torrent-session` intermittently hits Zig cache/toolchain failures (`manifest_create Unexpected`).

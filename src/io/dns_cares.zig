@@ -1,7 +1,9 @@
 const std = @import("std");
 const posix = std.posix;
 const linux = std.os.linux;
-const TtlBounds = @import("dns.zig").TtlBounds;
+const dns = @import("dns.zig");
+const TtlBounds = dns.TtlBounds;
+const applyBindDevice = @import("../net/socket.zig").applyBindDevice;
 
 const c = @cImport({
     @cInclude("netdb.h");
@@ -35,6 +37,16 @@ pub const DnsResolver = struct {
     channel: ?*c.ares_channel_t = null,
     allocator: std.mem.Allocator,
     ttl_bounds: TtlBounds = TtlBounds.default,
+    /// Captured from `dns.defaultBindDevice()` at init time. When non-
+    /// null, the c-ares socket callback applies `SO_BINDTODEVICE` to
+    /// every UDP/TCP socket the channel opens so DNS queries egress
+    /// through the configured interface. Closes the privacy gap
+    /// described in `docs/custom-dns-design-round2.md` §1 for the
+    /// c-ares backend; the threadpool backend remains a Known Issue.
+    /// The slice lifetime is owned by the daemon's config (lives the
+    /// whole daemon lifetime), per the contract on
+    /// `dns.setDefaultBindDevice`.
+    bind_device: ?[]const u8 = null,
 
     /// Maximum number of cached entries.
     const max_entries = 64;
@@ -82,11 +94,71 @@ pub const DnsResolver = struct {
         );
         if (rc != c.ARES_SUCCESS) return error.CaresInitFailed;
 
+        const bind_device = dns.defaultBindDevice();
+
+        // When the daemon configured a bind_device, install a c-ares
+        // socket-create callback that applies `SO_BINDTODEVICE` to
+        // every UDP/TCP socket c-ares opens. Fires once per socket,
+        // before c-ares uses it for the query. Returning non-zero
+        // would fail the socket creation, so we tolerate
+        // `applyBindDevice` errors by logging and proceeding (so a
+        // misconfigured device name doesn't take down DNS entirely).
+        if (bind_device != null) {
+            // user_data is a stable pointer-width container holding
+            // the slice. The simplest stable cell is the
+            // `module_default_bind_device` global that
+            // `dns.defaultBindDevice` already returns; since the
+            // contract on `setDefaultBindDevice` is "set once, lives
+            // for the daemon's life," we re-read it inside the
+            // callback rather than capturing into a heap cell here.
+            c.ares_set_socket_callback(
+                channel,
+                caresSocketCreateCallback,
+                null,
+            );
+        }
+
         return .{
             .cache = .{},
             .channel = channel,
             .allocator = allocator,
+            .bind_device = bind_device,
         };
+    }
+
+    /// c-ares socket-create callback. Fires once per socket the channel
+    /// opens (UDP for queries, TCP for retries when UDP truncates).
+    /// Applies `SO_BINDTODEVICE` to bind the socket to the configured
+    /// interface so DNS queries egress through the same device as
+    /// peer / tracker traffic.
+    ///
+    /// Reads `dns.defaultBindDevice()` rather than the per-resolver
+    /// field because c-ares's callback signature does not give us a
+    /// safe way to recover the owning `DnsResolver*` from the
+    /// channel-level callback (the user_data slot would need a stable
+    /// heap cell, but the resolver itself moves between init's
+    /// stack-allocated return value and the caller's storage). Since
+    /// the bind_device default is process-wide and write-once, reading
+    /// the global directly is sound.
+    ///
+    /// Returns 0 on success (c-ares proceeds); a non-zero return
+    /// would fail the socket creation, which in turn fails the DNS
+    /// query. We swallow `applyBindDevice` errors (log + return 0) so
+    /// a misconfigured interface name doesn't take down DNS entirely.
+    fn caresSocketCreateCallback(
+        socket_fd: c.ares_socket_t,
+        _: c_int, // type: SOCK_STREAM or SOCK_DGRAM (unused)
+        _: ?*anyopaque, // user_data (unused — see comment above)
+    ) callconv(.c) c_int {
+        const device = dns.defaultBindDevice() orelse return 0;
+        applyBindDevice(@intCast(socket_fd), device) catch |err| {
+            std.log.scoped(.dns_cares).warn(
+                "c-ares socket bind_device='{s}' failed: {s} (DNS query proceeds without bind)",
+                .{ device, @errorName(err) },
+            );
+            return 0;
+        };
+        return 0;
     }
 
     pub fn deinit(self: *DnsResolver, allocator: std.mem.Allocator) void {
