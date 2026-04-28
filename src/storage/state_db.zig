@@ -2,23 +2,105 @@ const std = @import("std");
 const sqlite = @import("sqlite3.zig");
 const Bitfield = @import("../bitfield.zig").Bitfield;
 
-/// Persistent resume state backed by SQLite.
-/// Tracks which pieces are complete across restarts, avoiding
-/// expensive full-disk recheck for large torrents.
+/// Persistent resume state. The daemon uses `ResumeDb`, which is
+/// `ResumeDbOf(SqliteBackend)` — backed by SQLite (see `SqliteBackend`).
+/// Sim tests use `ResumeDbOf(SimResumeBackend)` for in-memory,
+/// fault-injectable resume state without touching real SQLite.
 ///
-/// Runs on a dedicated background thread -- SQLite operations
-/// block and must NOT run on the io_uring event loop thread.
+/// The `ResumeDbOf` functor is the comptime-trait that pins both
+/// backends to the same public surface (49 methods + helper types).
+/// Mirrors the `EventLoopOf(IO)` / `AsyncRecheckOf(IO)` pattern.
+///
+/// Production note: SQLite is opened with `SQLITE_OPEN_FULLMUTEX`,
+/// so the connection is touched from many threads (worker threads,
+/// RPC handlers, queue manager). Any future `SimResumeBackend`-shaped
+/// alternative needs the same multi-thread invariant.
+pub fn ResumeDbOf(comptime Backend: type) type {
+    // Identity functor: each backend is itself the resume DB type.
+    // Both backends expose the same public method set; using the same
+    // backend value here gives consumers one canonical type alias for
+    // the production path while keeping `SimResumeBackend` callable as
+    // its own type for sim tests.
+    return Backend;
+}
+
+/// Daemon-side concrete instantiation. Daemon callers continue to write
+/// `ResumeDb`; tests that want the in-memory backend use
+/// `SimResumeBackend` directly or via `ResumeDbOf(SimResumeBackend)`.
+pub const ResumeDb = ResumeDbOf(SqliteBackend);
+
+/// In-memory, fault-injectable resume DB backend for `EventLoopOf(SimIO)`
+/// tests. See `src/storage/sim_resume_backend.zig` for the implementation.
+pub const SimResumeBackend = @import("sim_resume_backend.zig").SimResumeBackend;
+
+/// Shared types — same shape for both backends so callers can swap
+/// `SqliteBackend` for `SimResumeBackend` without any signature change.
+pub const TransferStats = struct {
+    total_uploaded: u64 = 0,
+    total_downloaded: u64 = 0,
+};
+
+pub const RateLimits = struct {
+    dl_limit: u64 = 0,
+    ul_limit: u64 = 0,
+};
+
+pub const ShareLimits = struct {
+    /// -2 = use global, -1 = no limit, >=0 = specific ratio limit.
+    ratio_limit: f64 = -2.0,
+    /// -2 = use global, -1 = no limit, >=0 = specific minutes limit.
+    seeding_time_limit: i64 = -2,
+    /// Timestamp when the torrent completed downloading. 0 = not yet.
+    completion_on: i64 = 0,
+};
+
+pub const IpFilterConfig = struct {
+    path: ?[]const u8 = null,
+    enabled: bool = false,
+    rule_count: u32 = 0,
+};
+
+/// A tracker override record: 'add' means a user-added tracker URL,
+/// 'remove' means a metainfo tracker URL the user wants hidden,
+/// 'edit' means the user replaced orig_url with url.
+pub const TrackerOverride = struct {
+    url: []const u8,
+    tier: u32,
+    action: []const u8, // "add", "remove", or "edit"
+    orig_url: ?[]const u8, // non-null only for "edit" action
+};
+
+pub const SavedCategory = struct {
+    name: []const u8,
+    save_path: []const u8,
+};
+
+pub const SavedBannedIp = struct {
+    address: []const u8,
+    source: u8,
+    reason: ?[]const u8,
+    created_at: i64,
+};
+
+pub const SavedBannedRange = struct {
+    start_addr: []const u8,
+    end_addr: []const u8,
+    source: u8,
+    created_at: i64,
+};
+
 pub const QueuePosition = struct {
     info_hash_hex: [40]u8,
     position: u32,
 };
 
-pub const ResumeDb = struct {
-    pub const TransferStats = struct {
-        total_uploaded: u64 = 0,
-        total_downloaded: u64 = 0,
-    };
-
+/// SQLite-backed resume state.
+///
+/// Runs with `SQLITE_OPEN_FULLMUTEX`: any thread (worker threads,
+/// RPC handlers, queue manager) can touch the connection, with
+/// SQLite's own mutex serialising access. Must NOT run on the
+/// io_uring event loop thread (blocks).
+pub const SqliteBackend = struct {
     db: *sqlite.Db,
     insert_stmt: *sqlite.Stmt,
     query_stmt: *sqlite.Stmt,
@@ -557,12 +639,6 @@ pub const ResumeDb = struct {
         try stepAndFinalize(stmt);
     }
 
-    /// A category loaded from the DB.
-    pub const SavedCategory = struct {
-        name: []const u8,
-        save_path: []const u8,
-    };
-
     /// Load all categories. Caller owns the returned slices (allocated with `allocator`).
     pub fn loadCategories(self: *ResumeDb, allocator: std.mem.Allocator) ![]SavedCategory {
         const stmt = try self.execOneShot("SELECT name, save_path FROM categories");
@@ -730,11 +806,6 @@ pub const ResumeDb = struct {
     }
 
     /// Load per-torrent rate limits. Returns (dl_limit, ul_limit) or (0, 0) if not set.
-    pub const RateLimits = struct {
-        dl_limit: u64 = 0,
-        ul_limit: u64 = 0,
-    };
-
     pub fn loadRateLimits(self: *ResumeDb, info_hash: [20]u8) RateLimits {
         const stmt = self.execOneShot("SELECT dl_limit, ul_limit FROM rate_limits WHERE info_hash = ?1") catch return .{};
         defer _ = sqlite.sqlite3_finalize(stmt);
@@ -757,16 +828,6 @@ pub const ResumeDb = struct {
     }
 
     // ── Share limit persistence ────────────────────────────
-
-    /// Per-torrent share limits loaded from DB.
-    pub const ShareLimits = struct {
-        /// -2 = use global, -1 = no limit, >=0 = specific ratio limit.
-        ratio_limit: f64 = -2.0,
-        /// -2 = use global, -1 = no limit, >=0 = specific minutes limit.
-        seeding_time_limit: i64 = -2,
-        /// Timestamp when the torrent completed downloading. 0 = not yet.
-        completion_on: i64 = 0,
-    };
 
     /// Save per-torrent share limits (upsert).
     pub fn saveShareLimits(self: *ResumeDb, info_hash: [20]u8, ratio_limit: f64, seeding_time_limit: i64, completion_on: i64) !void {
@@ -879,14 +940,6 @@ pub const ResumeDb = struct {
         try stepAndFinalize(stmt2);
     }
 
-    /// A banned IP loaded from the DB.
-    pub const SavedBannedIp = struct {
-        address: []const u8,
-        source: u8,
-        reason: ?[]const u8,
-        created_at: i64,
-    };
-
     /// Load all individual banned IPs. Caller owns the returned slices.
     pub fn loadBannedIps(self: *ResumeDb, allocator: std.mem.Allocator) ![]SavedBannedIp {
         const stmt = try self.execOneShot("SELECT address, source, reason, created_at FROM banned_ips");
@@ -938,14 +991,6 @@ pub const ResumeDb = struct {
         try stepAndFinalize(stmt);
     }
 
-    /// A banned range loaded from the DB.
-    pub const SavedBannedRange = struct {
-        start_addr: []const u8,
-        end_addr: []const u8,
-        source: u8,
-        created_at: i64,
-    };
-
     /// Load all banned ranges. Caller owns the returned slices.
     pub fn loadBannedRanges(self: *ResumeDb, allocator: std.mem.Allocator) ![]SavedBannedRange {
         const stmt = try self.execOneShot("SELECT start_addr, end_addr, source, created_at FROM banned_ranges");
@@ -983,16 +1028,6 @@ pub const ResumeDb = struct {
     }
 
     // ── Tracker override persistence ──────────────────────────
-
-    /// A tracker override record: 'add' means a user-added tracker URL,
-    /// 'remove' means a metainfo tracker URL the user wants hidden,
-    /// 'edit' means the user replaced orig_url with url.
-    pub const TrackerOverride = struct {
-        url: []const u8,
-        tier: u32,
-        action: []const u8, // "add", "remove", or "edit"
-        orig_url: ?[]const u8, // non-null only for "edit" action
-    };
 
     /// Save a tracker override (upsert). For 'add' and 'remove', orig_url should be null.
     /// For 'edit', orig_url is the original URL that was replaced.
@@ -1089,13 +1124,6 @@ pub const ResumeDb = struct {
         }
         allocator.free(overrides);
     }
-
-    /// IP filter config loaded from the DB.
-    pub const IpFilterConfig = struct {
-        path: ?[]const u8 = null,
-        enabled: bool = false,
-        rule_count: u32 = 0,
-    };
 
     /// Load the ipfilter configuration (singleton).
     pub fn loadIpFilterConfig(self: *ResumeDb, allocator: std.mem.Allocator) !IpFilterConfig {
@@ -1243,14 +1271,14 @@ pub const ResumeWriter = struct {
     }
 
     /// Persist lifetime transfer stats. Thread-safe.
-    pub fn saveTransferStats(self: *ResumeWriter, stats: ResumeDb.TransferStats) void {
+    pub fn saveTransferStats(self: *ResumeWriter, stats: TransferStats) void {
         self.mutex.lock();
         defer self.mutex.unlock();
         self.db.saveTransferStats(self.info_hash, stats) catch {};
     }
 
     /// Load lifetime transfer stats. Thread-safe.
-    pub fn loadTransferStats(self: *ResumeWriter) ResumeDb.TransferStats {
+    pub fn loadTransferStats(self: *ResumeWriter) TransferStats {
         self.mutex.lock();
         defer self.mutex.unlock();
         return self.db.loadTransferStats(self.info_hash);

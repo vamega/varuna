@@ -740,6 +740,30 @@ pub fn build(b: *std.Build) void {
     test_recheck_buggify_step.dependOn(&run_recheck_buggify_tests.step);
     test_step.dependOn(&run_recheck_buggify_tests.step);
 
+    // ── SimResumeBackend tests ────────────────────────────
+    //
+    // Algorithm-level tests for the in-memory `SimResumeBackend` resume DB
+    // (Path A from `docs/sqlite-simulation-and-replacement.md`). Pins the
+    // public API surface against the `SqliteBackend` baseline and verifies
+    // the BUGGIFY-shaped fault knobs (`commit_failure_probability`,
+    // `read_failure_probability`, `read_corruption_probability`,
+    // `silent_drop_probability`) fire correctly under deterministic seeds.
+    const sim_resume_backend_tests = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("tests/sim_resume_backend_test.zig"),
+            .target = target,
+            .optimize = optimize,
+            .imports = &varuna_import,
+        }),
+    });
+    const run_sim_resume_backend_tests = b.addRunArtifact(sim_resume_backend_tests);
+    const test_sim_resume_backend_step = b.step(
+        "test-sim-resume-backend",
+        "Run SimResumeBackend algorithm + fault-injection tests",
+    );
+    test_sim_resume_backend_step.dependOn(&run_sim_resume_backend_tests.step);
+    test_step.dependOn(&run_sim_resume_backend_tests.step);
+
     // ── Recheck live-pipeline BUGGIFY harness (Track 2 #6) ─
     //
     // Wraps the `AsyncRecheckOf(SimIO)` integration tests in
