@@ -128,7 +128,7 @@ pub const SelectedBackend = enum {
 /// Sizing: each branch picks a small capacity (16 ring entries / 16
 /// timer slots) appropriate for one-shot init work. Hot daemon I/O does
 /// NOT route through this helper — it goes through the long-lived
-/// `EventLoopOf(IO)` ring sized at startup.
+/// instance from `initEventLoop`.
 ///
 /// `.sim` is a `@compileError` deliberately. The daemon binary does not
 /// run under `-Dio=sim` (sim is for tests, not production), and tests
@@ -143,6 +143,31 @@ pub fn initOneshot(allocator: std.mem.Allocator) !RealIO {
         .kqueue_posix => RealIO.init(allocator, .{ .timer_capacity = 16, .file_pool_workers = 4 }),
         .kqueue_mmap => RealIO.init(allocator, .{ .timer_capacity = 16 }),
         .sim => @compileError("backend.initOneshot is not available under -Dio=sim; sim instances are caller-constructed for tests"),
+    };
+}
+
+/// Construct a long-lived production-sized instance of the selected
+/// backend for the daemon's primary event loop.
+///
+/// Used by `EventLoopOf(IO).initBare`, which previously hard-coded the
+/// io_uring init shape (256 entries + COOP_TASKRUN/SINGLE_ISSUER flags).
+/// Each backend gets a sizing appropriate for production daemon
+/// throughput; the io_uring branch preserves the historical 256-entry
+/// shape with its kernel-aware flags so behavior is identical under
+/// `-Dio=io_uring`.
+///
+/// Same `@compileError` rationale as `initOneshot` for `.sim`.
+pub fn initEventLoop(allocator: std.mem.Allocator) !RealIO {
+    return switch (selected) {
+        .io_uring => RealIO.init(.{
+            .entries = 256,
+            .flags = std.os.linux.IORING_SETUP_COOP_TASKRUN | std.os.linux.IORING_SETUP_SINGLE_ISSUER,
+        }),
+        .epoll_posix => RealIO.init(allocator, .{ .max_completions = 1024, .file_pool_workers = 4 }),
+        .epoll_mmap => RealIO.init(allocator, .{ .max_completions = 1024 }),
+        .kqueue_posix => RealIO.init(allocator, .{ .timer_capacity = 256, .pending_capacity = 4096, .file_pool_workers = 4 }),
+        .kqueue_mmap => RealIO.init(allocator, .{ .timer_capacity = 256, .pending_capacity = 4096 }),
+        .sim => @compileError("backend.initEventLoop is not available under -Dio=sim; sim event loops are caller-constructed for tests"),
     };
 }
 
