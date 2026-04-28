@@ -4,7 +4,7 @@ const session_mod = @import("../torrent/session.zig");
 const storage = @import("../storage/root.zig");
 const tracker = @import("../tracker/root.zig");
 const EventLoop = @import("../io/event_loop.zig").EventLoop;
-const real_io = @import("../io/real_io.zig");
+const backend = @import("../io/backend.zig");
 const PieceTracker = @import("../torrent/piece_tracker.zig").PieceTracker;
 const file_priority = @import("../torrent/file_priority.zig");
 const FilePriority = file_priority.FilePriority;
@@ -1265,11 +1265,13 @@ pub const TorrentSession = struct {
         // PieceStore.init now routes its file pre-allocation (fallocate)
         // through the IO contract. The background worker has no
         // long-lived ring of its own, so we spin up a small one-shot
-        // RealIO instance just for the duration of init. Cost: one
-        // io_uring_setup + one teardown per torrent (~tens of µs);
+        // backend instance just for the duration of init via
+        // backend.initOneshot — that picks the right `init` shape for
+        // whichever -Dio= backend the build selected. Cost: one
+        // ring/epoll/kqueue setup + teardown per torrent (~tens of µs);
         // benefit: every disk I/O in the daemon is uniformly
-        // ring-routed and BUGGIFY-injectable from sim tests.
-        var init_io = try real_io.RealIO.init(.{ .entries = 16 });
+        // contract-routed and BUGGIFY-injectable from sim tests.
+        var init_io = try backend.initOneshot(self.allocator);
         defer init_io.deinit();
         const store = try storage.writer.PieceStore.init(self.allocator, &self.session.?, &init_io);
         self.store = store;
@@ -2018,9 +2020,9 @@ pub const TorrentSession = struct {
         };
         self.session = session;
 
-        // Same one-shot RealIO pattern as doStartBackground above —
+        // Same one-shot backend pattern as doStartBackground above —
         // PieceStore.init now routes fallocate through the contract.
-        var init_io_meta = real_io.RealIO.init(.{ .entries = 16 }) catch |err| {
+        var init_io_meta = backend.initOneshot(self.allocator) catch |err| {
             self.state = .@"error";
             self.error_message = std.fmt.allocPrint(self.allocator, "init_io setup failed: {s}", .{@errorName(err)}) catch null;
             return;

@@ -428,6 +428,61 @@ Commits:
 Test count delta: 1509 → 1518 (9 new tests in `torrent_sync_test.zig`).
 Build green at HEAD on the default backend; c-ares backend has a
 pre-existing `ares_build.h` build issue unrelated to this change.
+## Last Verified Milestone (2026-04-28 — Daemon rewired onto comptime IO backend selector)
+
+The daemon's hot callers were physically pinned to `io_uring` even after
+the `IoBackend` 6-way enum, the comptime selector at `src/io/backend.zig`,
+and all five non-`io_uring` backend MVPs landed. Rewires the production
+import path so `-Dio=epoll_posix` (and friends) actually produce a daemon
+binary backed by the chosen implementation.
+
+What changed:
+
+- **Category A** alias swaps in `event_loop`, `recheck`, `metadata_handler`,
+  `http_executor`, and `storage/writer`: `RealIO` now resolves through
+  `backend.RealIO` (which dispatches on `-Dio=`) instead of importing
+  `real_io.zig` directly.
+- **Category B** init call sites in `daemon/torrent_session.zig` (the two
+  `PieceStore.init` one-shot rings) and `storage/writer.zig` test fixtures
+  now go through a new `backend.initOneshot(allocator)` helper. The helper
+  branches on the comptime-selected backend and supplies the right
+  `init` signature for each (RealIO takes `Config{ .entries, .flags }`;
+  the readiness backends take `(allocator, Config)` with backend-specific
+  fields).
+- **Category C** type-import swaps in `rpc/server`, `daemon/tracker_executor`,
+  `daemon/udp_tracker_executor`: same alias rewire, plus the 3 `RealIO.init`
+  test fixtures in `rpc/server.zig`.
+- **`backend.initEventLoop`** new helper for the daemon's primary long-lived
+  ring. Replaces the hard-coded `RealIO.init(.{ entries=256, flags=COOP_TASKRUN|SINGLE_ISSUER })`
+  in `EventLoopOf(IO).initBare`. Under `-Dio=io_uring` (default) the
+  io_uring branch is byte-equivalent to the prior call; under
+  `epoll_posix`/`epoll_mmap` it picks per-backend production sizing.
+- **`build.zig`**: previous `build_full_daemon = io_backend == .io_uring`
+  splits into `build_daemon = io_backend != .sim` (gates `varuna` + `varuna-ctl`)
+  and `build_companion_tools = io_backend == .io_uring` (gates `varuna-tools`
+  + `varuna-perf`, which stay hard-coded to `io_uring` per the AGENTS.md
+  exemption — `app.zig`, `storage/verify.zig`, `perf/workloads.zig` are
+  CLI/benchmark code, not daemon paths).
+
+Validation matrix (Linux native):
+
+  | `-Dio=` flag    | daemon binary | tests             |
+  |-----------------|---------------|-------------------|
+  | `io_uring`      | PASS          | PASS (default)    |
+  | `epoll_posix`   | PASS (NEW)    | PASS (per-bridge) |
+  | `epoll_mmap`    | PASS (NEW)    | PASS (per-bridge) |
+  | `kqueue_posix`  | FAIL¹         | per-bridge only   |
+  | `kqueue_mmap`   | FAIL¹         | per-bridge only   |
+  | `sim`           | (skipped)     | sim suite         |
+
+  ¹ Pre-existing — `kqueue_*_io.zig` references `std.c.EVFILT.READ` which
+  is undefined on Linux (and the macOS cross-compile fails on unrelated
+  `huge_page_cache.zig` / `IoUring.zig` Linux/Darwin type mismatches).
+  Out of daemon-rewire scope.
+
+Branch: `worktree-daemon-rewire`. See
+`progress-reports/2026-04-28-daemon-rewire.md` for the full breakdown
+and surprise notes on `EventLoop.initBare` cascading into a second helper.
 
 ## Last Verified Milestone (2026-04-30 — DNS resolver: connect-failure invalidate + bounded TTL honoring)
 

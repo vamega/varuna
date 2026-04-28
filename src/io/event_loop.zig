@@ -17,8 +17,8 @@ const utp_mod = @import("../net/utp.zig");
 const utp_mgr = @import("../net/utp_manager.zig");
 const mse = @import("../crypto/mse.zig");
 const ring_mod = @import("ring.zig");
-const real_io_mod = @import("real_io.zig");
-pub const RealIO = real_io_mod.RealIO;
+const backend = @import("backend.zig");
+pub const RealIO = backend.RealIO;
 pub const io_interface = @import("io_interface.zig");
 const SuperSeedState = @import("super_seed.zig").SuperSeedState;
 const HugePageCache = @import("../storage/huge_page_cache.zig").HugePageCache;
@@ -406,15 +406,15 @@ pub fn EventLoopOf(comptime IO: type) type {
 
         /// Create a bare event loop with no initial torrent (for daemon mode).
         ///
-        /// Hardcodes `RealIO.init` and so only works on the
-        /// `EventLoopOf(RealIO)` instantiation. SimIO-backed callers
-        /// (sim tests) use `initBareWithIO` instead, passing a SimIO
-        /// instance configured with the test's socket pool capacity.
+        /// Constructs the backend-selected `RealIO` via
+        /// `backend.initEventLoop`, which dispatches on `-Dio=`. Under
+        /// the default `-Dio=io_uring` this preserves the historical
+        /// 256-entry ring + COOP_TASKRUN/SINGLE_ISSUER flags. SimIO-
+        /// backed callers (sim tests) bypass this path entirely via
+        /// `initBareWithIO`, passing a SimIO instance configured with
+        /// the test's socket pool capacity.
         pub fn initBare(allocator: std.mem.Allocator, hasher_threads: u32) !@This() {
-            const io = try RealIO.init(.{
-                .entries = 256,
-                .flags = linux.IORING_SETUP_COOP_TASKRUN | linux.IORING_SETUP_SINGLE_ISSUER,
-            });
+            const io = try backend.initEventLoop(allocator);
             return initBareWithIO(allocator, io, hasher_threads);
         }
 

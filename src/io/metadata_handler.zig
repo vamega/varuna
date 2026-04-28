@@ -11,8 +11,8 @@ const pw = @import("../net/peer_wire.zig");
 const socket_util = @import("../net/socket.zig");
 
 const io_interface = @import("io_interface.zig");
-const real_io_mod = @import("real_io.zig");
-const RealIO = real_io_mod.RealIO;
+const backend = @import("backend.zig");
+const RealIO = backend.RealIO;
 
 /// Async BEP 9 metadata fetch state machine, parameterised over the IO
 /// backend.

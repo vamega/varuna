@@ -7,8 +7,8 @@ const DnsResolver = dns_mod.DnsResolver;
 const DnsJob = @import("../io/dns_threadpool.zig").DnsJob;
 
 const io_interface = @import("../io/io_interface.zig");
-const real_io_mod = @import("../io/real_io.zig");
-const RealIO = real_io_mod.RealIO;
+const backend = @import("../io/backend.zig");
+const RealIO = backend.RealIO;
 
 const log = std.log.scoped(.udp_tracker_executor);
 

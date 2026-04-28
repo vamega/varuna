@@ -5,8 +5,8 @@ const ring_mod = @import("../io/ring.zig");
 const socket_util = @import("../net/socket.zig");
 const auth = @import("auth.zig");
 const io_interface = @import("../io/io_interface.zig");
-const real_io_mod = @import("../io/real_io.zig");
-const RealIO = real_io_mod.RealIO;
+const backend = @import("../io/backend.zig");
+const RealIO = backend.RealIO;
 const scratch = @import("scratch.zig");
 
 const max_api_clients = 64;
@@ -859,14 +859,14 @@ test "parseContentLength returns null when missing" {
 }
 
 test "api server init and deinit" {
-    var test_io = RealIO.init(.{ .entries = 64 }) catch return error.SkipZigTest;
+    var test_io = backend.initOneshot(std.testing.allocator) catch return error.SkipZigTest;
     defer test_io.deinit();
     var server = ApiServer.init(std.testing.allocator, &test_io, "127.0.0.1", 0) catch return error.SkipZigTest;
     defer server.deinit();
 }
 
 test "api server handles request via io_uring" {
-    var test_io = RealIO.init(.{ .entries = 64 }) catch return error.SkipZigTest;
+    var test_io = backend.initOneshot(std.testing.allocator) catch return error.SkipZigTest;
     defer test_io.deinit();
     var server = ApiServer.init(std.testing.allocator, &test_io, "127.0.0.1", 0) catch return error.SkipZigTest;
     defer server.deinit();
@@ -918,7 +918,7 @@ test "api server handles request via io_uring" {
 }
 
 test "api server keeps HTTP/1.1 connection alive for sequential requests" {
-    var test_io = RealIO.init(.{ .entries = 64 }) catch return error.SkipZigTest;
+    var test_io = backend.initOneshot(std.testing.allocator) catch return error.SkipZigTest;
     defer test_io.deinit();
     var server = ApiServer.init(std.testing.allocator, &test_io, "127.0.0.1", 0) catch return error.SkipZigTest;
     defer server.deinit();

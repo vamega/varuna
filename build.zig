@@ -42,14 +42,15 @@ pub fn build(b: *std.Build) void {
     //   tests that exercise the comptime selector itself.
     //
     // Daemon callers reach the chosen backend through `src/io/backend.zig`.
-    // The non-`io_uring` MVPs do not yet implement every op the daemon needs,
-    // so under those flags the daemon install steps are skipped and the
-    // build produces only the IO module + per-backend tests. See
-    // `progress-reports/2026-04-30-epoll-bifurcation.md`.
+    // After the daemon-rewire on 2026-04-28, the daemon binary now compiles
+    // under all five production backends — the previous gating that produced
+    // only the IO module + tests under non-io_uring flags is gone. Only
+    // `-Dio=sim` still skips the daemon install, since the simulator is for
+    // tests and isn't a meaningful production target.
     const io_backend = b.option(
         IoBackend,
         "io",
-        "IO backend: 'io_uring' (Linux, default; full daemon), 'epoll_posix' (Linux readiness + POSIX file ops thread pool; sockets+timers only today), 'epoll_mmap' (Linux readiness + mmap file I/O; scaffold), 'kqueue_posix' / 'kqueue_mmap' (macOS/BSD; stubs until kqueue engineer replaces), 'sim' (in-process SimIO for test builds). Non-io_uring backends skip the daemon install; the build still produces the IO module + per-backend tests so cross-compile and bisectability pass.",
+        "IO backend: 'io_uring' (Linux, default; full daemon), 'epoll_posix' (Linux readiness + POSIX file ops thread pool), 'epoll_mmap' (Linux readiness + mmap file I/O), 'kqueue_posix' / 'kqueue_mmap' (macOS/BSD), 'sim' (in-process SimIO for test builds — daemon install skipped). All non-sim backends produce a working daemon binary backed by the chosen IO implementation.",
     ) orelse .io_uring;
 
     const cares_mode = b.option(
@@ -154,11 +155,22 @@ pub fn build(b: *std.Build) void {
         .{ .name = "varuna", .module = varuna_mod },
     };
 
-    // The daemon and its companion executables hard-reference `RealIO`
-    // (io_uring). Under any other backend (-Dio=kqueue, future -Dio=epoll)
-    // we skip these installs — the build still produces the varuna_mod
-    // module + IO backend tests, which is what cross-compilation validates.
-    const build_full_daemon = io_backend == .io_uring;
+    // The daemon (varuna) and the thin RPC client (varuna-ctl) now route
+    // through `src/io/backend.zig`, which dispatches on `-Dio=`. They
+    // build under any of the five production backends (`io_uring`,
+    // `epoll_posix`, `epoll_mmap`, `kqueue_posix`, `kqueue_mmap`). Only
+    // `-Dio=sim` skips them — the daemon cannot meaningfully run against
+    // the in-process simulator (sim is for tests, not production).
+    const build_daemon = io_backend != .sim;
+
+    // varuna-tools and varuna-perf are CLI / benchmark binaries that
+    // stay hard-coded to io_uring (`src/app.zig`, `src/storage/verify.zig`,
+    // `src/perf/workloads.zig`). AGENTS.md exempts them from the io_uring
+    // policy — they're allowed std-lib I/O and are not on the hot daemon
+    // path. They build only under `-Dio=io_uring` to preserve that
+    // exemption boundary; rewiring them would force backend cascades into
+    // code that has no production motivation to abstract over IO backends.
+    const build_companion_tools = io_backend == .io_uring;
 
     // ── varuna (daemon) ───────────────────────────────────
     const daemon_exe = b.addExecutable(.{
@@ -176,7 +188,7 @@ pub fn build(b: *std.Build) void {
     // pending queries (~42 KB) = ~896 KB for DhtEngine alone.  Combined with other
     // stack frames (getaddrinfo in glibc can use 1-4 MB), 8 MB is insufficient.
     daemon_exe.stack_size = 32 * 1024 * 1024; // 32 MB
-    if (build_full_daemon) b.installArtifact(daemon_exe);
+    if (build_daemon) b.installArtifact(daemon_exe);
 
     // ── varuna-ctl (CLI client) ───────────────────────────
     const ctl_exe = b.addExecutable(.{
@@ -188,7 +200,7 @@ pub fn build(b: *std.Build) void {
             .imports = &varuna_import,
         }),
     });
-    if (build_full_daemon) b.installArtifact(ctl_exe);
+    if (build_daemon) b.installArtifact(ctl_exe);
 
     // ── varuna-tools (standalone utilities) ────────────────
     const tools_exe = b.addExecutable(.{
@@ -200,11 +212,11 @@ pub fn build(b: *std.Build) void {
             .imports = &varuna_import,
         }),
     });
-    if (build_full_daemon) b.installArtifact(tools_exe);
+    if (build_companion_tools) b.installArtifact(tools_exe);
 
     // ── Run targets ───────────────────────────────────────
     // The `run` step is only meaningful when the daemon is built.
-    if (build_full_daemon) {
+    if (build_daemon) {
         const run_step = b.step("run", "Run the varuna daemon");
         const run_cmd = b.addRunArtifact(daemon_exe);
         run_cmd.step.dependOn(b.getInstallStep());
@@ -447,7 +459,7 @@ pub fn build(b: *std.Build) void {
         "Run KqueuePosixIO bridge tests via varuna_mod (Linux-only by construction)",
     );
     test_kqueue_posix_io_bridge_step.dependOn(&run_kqueue_posix_io_bridge_tests.step);
-    if (build_full_daemon) test_step.dependOn(&run_kqueue_posix_io_bridge_tests.step);
+    if (build_daemon) test_step.dependOn(&run_kqueue_posix_io_bridge_tests.step);
 
     // ── KqueueMmapIO MVP tests ─────────────────────────────
     // Standalone target: compiles `src/io/kqueue_mmap_io.zig` directly.
@@ -501,7 +513,7 @@ pub fn build(b: *std.Build) void {
         "Run KqueueMmapIO bridge tests via varuna_mod (Linux-only by construction)",
     );
     test_kqueue_mmap_io_bridge_step.dependOn(&run_kqueue_mmap_io_bridge_tests.step);
-    if (build_full_daemon) test_step.dependOn(&run_kqueue_mmap_io_bridge_tests.step);
+    if (build_daemon) test_step.dependOn(&run_kqueue_mmap_io_bridge_tests.step);
 
     // ── SimIO socketpair / parking / fault-injection tests ────────
     //
@@ -1079,7 +1091,7 @@ pub fn build(b: *std.Build) void {
             .imports = &varuna_import,
         }),
     });
-    if (build_full_daemon) b.installArtifact(perf_workload_exe);
+    if (build_companion_tools) b.installArtifact(perf_workload_exe);
 
     const perf_workload_step = b.step("perf-workload", "Run synthetic allocation and cache workload scenarios");
     const perf_workload_run = b.addRunArtifact(perf_workload_exe);

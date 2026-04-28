@@ -3,8 +3,8 @@ const posix = std.posix;
 const linux = std.os.linux;
 const torrent = @import("../torrent/root.zig");
 const FilePriority = torrent.file_priority.FilePriority;
-const real_io = @import("../io/real_io.zig");
-const RealIO = real_io.RealIO;
+const backend = @import("../io/backend.zig");
+const RealIO = backend.RealIO;
 const io_interface = @import("../io/io_interface.zig");
 
 /// Piece storage state machine, parameterised over the IO backend.
@@ -728,7 +728,7 @@ test "write piece data across multiple files" {
     const session = try torrent.session.Session.load(std.testing.allocator, input, target_root);
     defer session.deinit(std.testing.allocator);
 
-    var io = real_io.RealIO.init(.{ .entries = 16 }) catch return error.SkipZigTest;
+    var io = backend.initOneshot(std.testing.allocator) catch return error.SkipZigTest;
     defer io.deinit();
 
     var store = try PieceStore.init(std.testing.allocator, &session, &io);
@@ -767,7 +767,7 @@ test "read piece data across multiple files" {
     const session = try torrent.session.Session.load(std.testing.allocator, input, target_root);
     defer session.deinit(std.testing.allocator);
 
-    var io = real_io.RealIO.init(.{ .entries = 16 }) catch return error.SkipZigTest;
+    var io = backend.initOneshot(std.testing.allocator) catch return error.SkipZigTest;
     defer io.deinit();
 
     var store = try PieceStore.init(std.testing.allocator, &session, &io);
@@ -802,7 +802,7 @@ test "skip file with do_not_download priority" {
     const session = try torrent.session.Session.load(std.testing.allocator, input, target_root);
     defer session.deinit(std.testing.allocator);
 
-    var io = real_io.RealIO.init(.{ .entries = 16 }) catch return error.SkipZigTest;
+    var io = backend.initOneshot(std.testing.allocator) catch return error.SkipZigTest;
     defer io.deinit();
 
     // Skip the first file (alpha)
@@ -834,7 +834,7 @@ test "ensureFileOpen creates skipped file on demand" {
     const session = try torrent.session.Session.load(std.testing.allocator, input, target_root);
     defer session.deinit(std.testing.allocator);
 
-    var io = real_io.RealIO.init(.{ .entries = 16 }) catch return error.SkipZigTest;
+    var io = backend.initOneshot(std.testing.allocator) catch return error.SkipZigTest;
     defer io.deinit();
 
     // Skip the first file
