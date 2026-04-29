@@ -669,6 +669,20 @@ pub fn build(b: *std.Build) void {
     test_sim_smart_ban_phase12_step.dependOn(&run_sim_smart_ban_phase12_tests.step);
     test_step.dependOn(&run_sim_smart_ban_phase12_tests.step);
 
+    // ── MSE simultaneous-handshake regression (slot-reuse stale CQE) ─
+    const sim_mse_simul_tests = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("tests/sim_mse_simultaneous_handshake_test.zig"),
+            .target = target,
+            .optimize = optimize,
+            .imports = &varuna_import,
+        }),
+    });
+    const run_sim_mse_simul_tests = b.addRunArtifact(sim_mse_simul_tests);
+    const test_sim_mse_simul_step = b.step("test-sim-mse-simultaneous", "Run MSE simultaneous-handshake stale-CQE regression (32 seeds)");
+    test_sim_mse_simul_step.dependOn(&run_sim_mse_simul_tests.step);
+    test_step.dependOn(&run_sim_mse_simul_tests.step);
+
     // ── Event loop health tests ────────────────────────────
     const el_health_tests = b.addTest(.{
         .root_module = b.createModule(.{
