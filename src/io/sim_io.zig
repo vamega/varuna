@@ -119,6 +119,22 @@ pub const FaultConfig = struct {
     fsync_error_probability: f32 = 0.0,
     /// Probability that a connect completes with `error.ConnectionRefused`.
     connect_error_probability: f32 = 0.0,
+    /// Probability that a successful read completes with a *short* count
+    /// — the kernel returns fewer bytes than requested without an error.
+    /// `pread(2)` / `IORING_OP_READ` are allowed to do this in the real
+    /// world; storage-side code is supposed to loop on the remainder.
+    /// The simulated short count is a uniformly-random value in
+    /// `[1, op.buf.len)` (a strict short, never the full buffer and
+    /// never zero — zero is reserved for "premature EOF"). Independent
+    /// of `read_error_probability`; checked only on the success path
+    /// when no fault was injected.
+    short_read_probability: f32 = 0.0,
+    /// Probability that a successful write completes with a *short* count
+    /// — the kernel accepted only some of the requested bytes. Same
+    /// semantics as `short_read_probability` (uniformly-random in
+    /// `[1, op.buf.len)`, success-path only). Storage-side code loops
+    /// on the remainder; this knob exercises that loop under BUGGIFY.
+    short_write_probability: f32 = 0.0,
     /// Added to every recv delivery time (simulates network latency).
     recv_latency_ns: u64 = 0,
     /// Added to every send delivery time.
@@ -831,7 +847,21 @@ pub const SimIO = struct {
                 return self.schedule(c, .{ .read = @as(usize, 0) }, 0);
             }
             const available: usize = content.len - @as(usize, @intCast(off));
-            const n: usize = @min(op.buf.len, available);
+            var n: usize = @min(op.buf.len, available);
+            // Optionally truncate to a short read (success-path only).
+            // Kept in `[1, n)` so it's a strict short — zero is reserved
+            // for "premature EOF" and full-length is the unstressed path.
+            //
+            // Gate the RNG draw on `short_read_probability > 0` so the
+            // default-zero path doesn't consume extra random numbers
+            // (which would shift downstream BUGGIFY decisions and break
+            // determinism for callers that use seeded randomness without
+            // setting this knob — recheck_test, etc.).
+            if (self.config.faults.short_read_probability > 0.0 and n > 1) {
+                if (r.float(f32) < self.config.faults.short_read_probability) {
+                    n = 1 + r.uintLessThan(usize, n - 1);
+                }
+            }
             @memcpy(op.buf[0..n], content[@as(usize, @intCast(off))..][0..n]);
             return self.schedule(c, .{ .read = n }, 0);
         }
@@ -851,7 +881,21 @@ pub const SimIO = struct {
         // (which loops on short writes the same way `pwriteAll` did) treat
         // a successful write as "span done" instead of looping forever on
         // a 0-byte response.
-        return self.schedule(c, .{ .write = op.buf.len }, self.config.faults.write_latency_ns);
+        //
+        // Gate the short-write RNG draw on `short_write_probability > 0`
+        // so the default-zero path doesn't consume extra random numbers
+        // (preserves deterministic seeding for downstream BUGGIFY
+        // callers that don't set this knob).
+        var n: usize = op.buf.len;
+        if (self.config.faults.short_write_probability > 0.0 and n > 1) {
+            if (r.float(f32) < self.config.faults.short_write_probability) {
+                // Strict short — `[1, n)`. Zero is reserved for "no
+                // progress" (writePiece treats that as
+                // `error.UnexpectedEndOfFile`).
+                n = 1 + r.uintLessThan(usize, n - 1);
+            }
+        }
+        return self.schedule(c, .{ .write = n }, self.config.faults.write_latency_ns);
     }
 
     pub fn fsync(self: *SimIO, op: ifc.FsyncOp, c: *Completion, ud: ?*anyopaque, cb: Callback) !void {
