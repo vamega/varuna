@@ -1018,6 +1018,31 @@ pub fn build(b: *std.Build) void {
     test_storage_writer_step.dependOn(&run_storage_writer_tests.step);
     test_step.dependOn(&run_storage_writer_tests.step);
 
+    // ── PieceStoreOf(SimIO) live-pipeline BUGGIFY harness ──
+    //
+    // Wraps the `PieceStoreOf(SimIO)` integration tests with the
+    // canonical BUGGIFY shape: per-op `FaultConfig` (read EIO / write
+    // ENOSPC / fsync EIO / fallocate ENOSPC / short reads / short
+    // writes) over 32 deterministic seeds. Catches partial-init
+    // cleanup, sync's pending-counter under fsync error storms,
+    // per-span resubmit races, and the writePiece/readPiece
+    // short-write/short-read loops.
+    const storage_writer_buggify_tests = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("tests/storage_writer_buggify_test.zig"),
+            .target = target,
+            .optimize = optimize,
+            .imports = &varuna_import,
+        }),
+    });
+    const run_storage_writer_buggify_tests = b.addRunArtifact(storage_writer_buggify_tests);
+    const test_storage_writer_buggify_step = b.step(
+        "test-storage-writer-buggify",
+        "Run PieceStoreOf(SimIO) live-pipeline BUGGIFY harness (32 seeds × 4 recovery paths)",
+    );
+    test_storage_writer_buggify_step.dependOn(&run_storage_writer_buggify_tests.step);
+    test_step.dependOn(&run_storage_writer_buggify_tests.step);
+
     // ── Per-torrent durability sync tests (R6 fix) ──
     // Drives `EventLoopOf(SimIO).submitTorrentSync` and the periodic
     // sync timer. See `progress-reports/2026-04-28-correctness-fixes.md`
