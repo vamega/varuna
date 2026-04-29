@@ -259,6 +259,59 @@ Patterns that fell out of the Stage 2 migration (Apr 2026) and the bugs they cat
     `allocator.alloc` crash immediately and visibly. The invariant survives refactors
     that drop comments.*
 
+17. **Generation counter pattern — for slot-reuse stale-CQE protection.** When a
+    long-lived "slot" (peer, request slot, etc.) is reused across lifetime
+    boundaries and the same `Completion` address can host successive in-flight
+    ops, a CQE submitted under the OLD lifetime can fire its callback against
+    the NEW one — feeding stale bytes (or a stale error) into the new state
+    machine. This is exactly the race that drove the MSE simultaneous-handshake
+    crash (closed 2026-04-29).
+
+    **The invariant the pattern enforces:** *a CQE whose recorded generation
+    differs from the slot's current generation MUST be treated as stale and
+    must not act on freed state.*
+
+    Shape:
+
+    - A parallel `slot_generations: []u32` array on the owner (e.g.
+      `EventLoop.peer_generations`). Sized to the slot count, allocated at
+      init, freed at deinit. Lives *outside* the slot struct so it survives
+      slot reset.
+    - Bumped (`+%= 1`, wrapping) every time the slot's identity changes —
+      `removePeer`, `attemptMseFallback`, equivalent reuse paths. Bump
+      *before* `slot.* = Slot{}` so the next-up CQE dispatcher sees the
+      fresh value when the OLD CQE arrives.
+    - Heap-allocated wrapper struct per submission (e.g.
+      `MseHandshakeOpOf(EL)`) with `(slot, generation, completion)` fields.
+      The wrapper's `&completion` is what goes into the SQE's userdata, NOT
+      the slot's embedded completion. Wrapper is freed unconditionally in
+      the callback (so a stale CQE never leaks the tracking allocation).
+    - Callback compares `op.generation` against
+      `el.slot_generations[op.slot]`. If they differ: free wrapper, return
+      `.disarm`, drop the result silently. If they match: dispatch normally.
+
+    This trades a per-submission heap allocation for safety. Fine for cold
+    paths (handshakes, recheck reads) where a few extra alloc/frees are
+    invisible against the cost of the actual op. For hot paths (per-block
+    sends), the existing `PendingSendPool` + `(slot, send_id)` matching
+    already gives the same protection without the allocation; the
+    generation pattern is for paths where there is no natural pool.
+
+    The race the pattern closes is sneaky: it does **not** require a
+    use-after-free of the buffer pointer (the kernel cancels recv on close
+    so the buffer is rarely written), it requires only that the OLD CQE's
+    `userdata = &completion` survives slot reset and the NEW callback fires
+    with OLD result. Even an ECANCELED replay against a NEW
+    `.mse_handshake_recv` peer triggers an unintended `attemptMseFallback`,
+    so the fix is required even if no actual memory corruption is
+    observable.
+
+    *Worked example: `src/io/peer_handler.zig:MseHandshakeOpOf` plus the
+    `.recv` / `.send` / `attemptMseFallback` integration. The regression
+    test at `tests/sim_mse_simultaneous_handshake_test.zig` exercises the
+    race directly across 32 deterministic seeds; verified to fail when the
+    generation check is disabled.*
+
 ### Test-first coordination
 
 When a sim-side engineer drafts a test API spec for a new production feature, the

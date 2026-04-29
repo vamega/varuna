@@ -269,7 +269,7 @@ See `progress-reports/2026-04-25-stage2-event-loop-migration.md` for the Stage 2
 - ~~**Smart ban Phase 1-2 (per-block SHA-1 attribution + ban-targeting)**~~: (DONE) per-block peer attribution captured in `BlockInfo.delivered_address` at receive time (decoupled from peer-slot lifetime so attribution survives disconnect/IP churn — fixed a real production gap where corrupt-and-disconnect peers escaped attribution). `SmartBan.snapshotAttribution` records on piece complete; `onPieceFailed` stores per-block SHA-1 + peer-address records; `onPiecePassed` (after re-download) compares per-block hashes and bans only the peers whose blocks mismatched. `peer_policy.snapshotAttributionForSmartBan` and `smartBanCorruptPeers` bridge the EL. Phase 2's discriminating power (honest peer co-located on a corrupt piece is NOT banned) demonstrated end-to-end in `tests/sim_smart_ban_phase12_eventloop_test.zig`'s disconnect-rejoin scenario — 8 deterministic seeds, peer 0 banned via Phase 2 attribution-survives-disconnect, peers 1+2 acquitted despite contributing to the same failed piece. See `progress-reports/2026-04-26-phase-2-smart-ban.md` for the arc.
 - ~~**Multi-source piece assembly (transient correctness)**~~: (DONE) piece can now be assembled from multiple peers — disconnect-mid-piece releases blocks via `releaseBlocksForPeer` + `tryJoinExistingPiece`; survivors absorb and complete the piece. Picker fair-share + per-call cap (`peer_policy.tryFillPipeline`) provides steady-state correctness.
 - ~~**Late-peer block-stealing (Task #23)**~~: (DONE) `tryFillPipeline` issues duplicate REQUESTs for `.requested`-state blocks attributed to other peers once `nextUnrequestedBlock` returns null; `tryJoinExistingPiece` accepts fully-claimed DPs that have stealable blocks, gated by the existing bitfield check `peer_bf.has(dp.piece_index)`. Closes the "3 peers all hold full piece, peer A drains the entire piece in one tick before B+C handshake" race; the BUGGIFY safety invariant (no honest peer accumulates hashfails) holds because the bitfield gate prevents an honest peer from joining a corrupt-only DP. `tests/sim_multi_source_eventloop_test.zig` distribution-proportion assertions now live (`peers_with_uploads >= 2`, `max × 10 ≤ total × 9`).
-- **MSE simultaneous handshake robustness**: timing-dependent crash in `checkPeerTimeouts -> removePeer -> cleanupPeer` when both inbound and outbound MSE handshakes are in flight. Disappears under GDB. Needs generation counters or explicit handshake-in-progress guards.
+- ~~**MSE simultaneous handshake robustness**~~: (DONE 2026-04-29) Closed via the per-slot generation-counter pattern in `EventLoop.peer_generations[]` plus `MseHandshakeOpOf(EL)` — every MSE recv/send routes through a heap-allocated wrapper that captures `(slot, generation)` at submission time and the callback bails when `el.peer_generations[slot] != op.generation`. `removePeer` and `attemptMseFallback` bump the slot's counter so any in-flight CQE referencing the freed `mse_initiator`/`mse_responder` buffer is silently dropped. Belt-and-suspenders: `checkPeerTimeouts` now skips peers in `.mse_handshake_*` / `.mse_resp_*` states (the 60s timeout was tuned for active piece transfers, not handshake states; the kernel surfaces stuck handshakes through normal recv-error paths). Regression test `tests/sim_mse_simultaneous_handshake_test.zig` (32 deterministic seeds) reproduces the slot-reuse stale-CQE replay and asserts the new peer's MSE state stays intact across the race. See `progress-reports/2026-04-29-mse-simultaneous-handshake.md` and the new STYLE.md "Generation counter pattern" section.
 - **Peer hot/cold split / partial SoA**: the active-slot pass removes a lot of wasted scans, but the `Peer` struct is still wide. The next performance step is separating hot scheduling/state fields from cold crypto/buffering state.
 - **Torrent hot-summary registry**: cached cumulative byte totals now remove the hottest `/sync` stats scan, but a denser registry is still the next step if queue position, state derivation, or other per-torrent fields dominate at `10k+` torrents.
 - **Broader RPC arena coverage**: `/sync/maindata` now uses an arena for transient work; the other list-heavy endpoints still allocate temporary object graphs and strings.
@@ -305,9 +305,103 @@ See `progress-reports/2026-04-25-stage2-event-loop-migration.md` for the Stage 2
 - On WSL2, `perf stat`/`perf record` require kernel-matched `linux-tools` package; many hardware counters report `<not supported>`.
 - `zig build test-torrent-session` intermittently hits Zig cache/toolchain failures (`manifest_create Unexpected`).
 - ~~**Smart ban Phases 1-2 not yet implemented**~~: closed 2026-04-26. Phase 1 (per-block SHA-1 attribution on hash failure) and Phase 2 (ban-targeting on re-download pass) live in `src/net/smart_ban.zig` and `src/io/peer_policy.zig`; attribution survives peer-slot freeing via `BlockInfo.delivered_address`. End-to-end validation in `tests/sim_smart_ban_phase12_eventloop_test.zig`.
-- **MSE handshake failures in mixed encryption mode**: `vc_not_found` and `req1_not_found` errors occur during simultaneous inbound+outbound MSE handshakes. Timing-dependent, disappears under GDB. `demo_swarm.sh` runs with `encryption = "disabled"` as workaround.
+- ~~**MSE handshake failures in mixed encryption mode**~~: closed 2026-04-29. `vc_not_found` / `req1_not_found` errors during simultaneous inbound+outbound MSE handshakes were the same root cause as the cleanupPeer crash — a stale recv CQE for a freed `mse_initiator.scan_buf` / `mse_initiator.peer_public_key` buffer firing the `peerRecvComplete` callback against a reused slot. The fix landed alongside the cleanupPeer crash entry (per-slot generation counter + `MseHandshakeOpOf(EL)` wrapper). `demo_swarm.sh` was already on `encryption = "preferred"` as of commit `3284849`; this milestone re-validates: 5/5 consecutive demo_swarm runs clean post-fix.
 - ~~**Daemon graceful shutdown**~~: Fixed. In-flight transfer draining with configurable timeout now ensures clean exit on SIGTERM/SIGINT.
 - `IORING_OP_SETSOCKOPT` (kernel 6.7+), `IORING_OP_BIND`/`LISTEN` (kernel 6.11+) not available on current kernel 6.6. Per-peer setsockopt (TCP_NODELAY, buffer sizes) remains synchronous.
+
+## Last Verified Milestone (2026-04-29 — MSE simultaneous-handshake stale-CQE race + checkPeerTimeouts MSE-state skip)
+
+Closes the long-standing "MSE simultaneous handshake robustness" entry
+on the Done list and the related `vc_not_found` / `req1_not_found`
+Known Issue. Both were the same root cause: the stale-CQE replay
+race against a reused peer slot when an MSE recv/send was in flight
+through `peer.recv_completion` / `peer.send_completion` and
+`removePeer` (most commonly fired from `checkPeerTimeouts` on a
+60-second-stuck outbound MSE handshake) destroyed the
+`mse_initiator` / `mse_responder` and reset the slot before the CQE
+landed.
+
+**What landed**
+
+- `src/io/event_loop.zig` — new parallel `peer_generations: []u32`
+  array, sized to `max_peers`, allocated in `initBareWithIO`, freed
+  in `deinit`. `removePeer` bumps `peer_generations[slot]` *before*
+  `peer.* = Peer{}` so the wrapper's stale-CQE check sees the new
+  number on the very next CQE dispatch.
+- `src/io/peer_handler.zig` — new `MseHandshakeOpOf(comptime EL)`
+  wrapper plus `mseHandshakeRecvCompleteFor` /
+  `mseHandshakeSendCompleteFor` factories. Heap-allocated per
+  submission via `submitMseRecv` / `submitMseSend`, freed
+  unconditionally in the callback. The callback compares
+  `op.generation` against `el.peer_generations[op.slot]` and bails
+  before calling `handleRecvResult` / `handleSendResult` on a stale
+  match. `executeMseAction`, `startMseInitiator`, `startMseResponder`,
+  and the partial-send branches in `handleSendResult` now route
+  through the wrapper instead of `peer.recv_completion` /
+  `peer.send_completion`. `attemptMseFallback` also bumps the
+  generation before re-establishing the connection.
+- `src/io/peer_policy.zig` — `checkPeerTimeouts` now skips slots
+  in `.mse_handshake_send` / `.mse_handshake_recv` /
+  `.mse_resp_send` / `.mse_resp_recv`. The 60s timeout was sized
+  for stuck *active* piece transfers; MSE handshakes complete in
+  hundreds of milliseconds or fail through normal recv-error
+  paths, and using the same threshold for them was the most
+  common trigger for the slot-reuse race.
+- `tests/sim_mse_simultaneous_handshake_test.zig` — new
+  SimIO-driven regression test. Drives the slot-reuse race
+  directly: starts an MSE initiator on slot 0, calls `removePeer`
+  while the recv is parked, reuses slot 0 for a fresh MSE peer,
+  and asserts the new peer's state isn't perturbed by the OLD
+  CQE's replay. 32 deterministic seeds; vacuous-pass guard
+  pinned at all-32-of-32 (SimIO's deterministic ordering means
+  the race fires every seed). Verified to fail without the
+  generation check restored.
+- `STYLE.md` — new "Generation counter pattern" section documents
+  the invariant ("a CQE whose recorded generation differs from the
+  slot's current generation MUST be treated as stale and must not
+  act on freed state") so future reviewers understand the shape.
+- `scripts/demo_swarm.sh` — was already at `encryption =
+  "preferred"` (commit `3284849`); STATUS.md previously claimed
+  `"disabled"`. Re-validated: 5/5 consecutive runs clean post-fix.
+
+**Verification**
+
+- `zig build` clean.
+- `zig build test` clean across 5 consecutive runs.
+- `zig build test-sim-mse-simultaneous` — 3/3 tests pass; 32-seed
+  sweep all green.
+- Confirmed regression bite: temporarily disabling the generation
+  check in `mseHandshakeRecvCompleteFor` produces 32/32 seed
+  failures with `peer_b_state_intact == false` (the stale CQE
+  triggers an unintended `attemptMseFallback` on peer B).
+- `scripts/demo_swarm.sh` — 5/5 consecutive runs clean with
+  `encryption = "preferred"` and uTP enabled.
+
+**Hypothesis verdict**
+
+The investigation hypothesis-1 ("cleanupPeer frees MSE state while
+a CQE is still in flight against it") was correct in shape but the
+actual mechanism was subtler: the kernel doesn't necessarily UAF the
+freed buffer (closed fd → cancelled recv → no buffer write), but the
+OLD CQE's `userdata = &peer.recv_completion` / `&peer.send_completion`
+pointer survives `peer.* = Peer{}` and lands on the *new* armCompletion
+state — feeding the OLD result through the NEW callback. Hypothesis-2
+("vc_not_found / req1_not_found from four-state-machine confusion on
+loopback simultaneous-connect") turned out to be the *symptom* of the
+same race, not a separate bug: when the OLD recv CQE replayed against
+the new MSE state machine, partial bytes from the freed buffer (or an
+unintended `attemptMseFallback`) appeared as VC-scan / req1-scan
+failures. Per-slot generation tagging closes both.
+
+**Code references**
+
+- `src/io/event_loop.zig:177` — new `peer_generations: []u32` field.
+- `src/io/event_loop.zig:1631` — generation bump in `removePeer`.
+- `src/io/peer_handler.zig:992` — `MseHandshakeOpOf(EL)` wrapper.
+- `src/io/peer_handler.zig:1018` — `mseHandshakeRecvCompleteFor` callback factory with the generation-mismatch bail.
+- `src/io/peer_handler.zig:1158` — `attemptMseFallback` generation bump.
+- `src/io/peer_policy.zig:1182` — `checkPeerTimeouts` MSE-state skip.
+- `tests/sim_mse_simultaneous_handshake_test.zig` — full regression test.
 
 ## Last Verified Milestone (2026-04-28 — DNS bind_device cleanup: module-global → explicit Config plumbing)
 
