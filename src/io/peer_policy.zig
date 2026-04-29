@@ -1173,6 +1173,25 @@ pub fn checkPeerTimeouts(self: anytype) void {
         if (peer.last_activity == 0) continue;
         if (peer.mode == .inbound) continue; // don't timeout inbound peers
 
+        // Skip peers in the middle of an async MSE handshake. The 60s
+        // peer timeout exists for stuck active piece transfers; using
+        // the same threshold for handshake states would race the
+        // generation-tagged `MseHandshakeOp` cleanup against
+        // `removePeer`'s slot-reuse path. MSE handshakes either
+        // complete inside a few hundred milliseconds or fail (and
+        // `attemptMseFallback` / `handleMseFailure` tear them down
+        // explicitly). Stuck handshakes are still pruned: when the
+        // remote side eventually times out the TCP connection, the
+        // recv will fail and `handleMseFailure` runs.
+        switch (peer.state) {
+            .mse_handshake_send,
+            .mse_handshake_recv,
+            .mse_resp_send,
+            .mse_resp_recv,
+            => continue,
+            else => {},
+        }
+
         if (now - peer.last_activity > peer_timeout_secs) {
             to_remove.append(self.allocator, slot) catch break;
         }

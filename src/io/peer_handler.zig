@@ -264,7 +264,7 @@ fn handleConnectResult(self: anytype, slot: u16, res: i32) void {
 }
 
 /// Start the async MSE initiator handshake for an outbound peer.
-fn startMseInitiator(self: anytype, slot: u16) !void {
+pub fn startMseInitiator(self: anytype, slot: u16) !void {
     const peer = &self.peers[slot];
     const tc = self.getTorrentContext(peer.torrent_id) orelse return error.TorrentNotFound;
 
@@ -279,12 +279,7 @@ fn startMseInitiator(self: anytype, slot: u16) !void {
         .send => |data| {
             peer.state = .mse_handshake_send;
             peer.mse_send_remaining = data;
-            self.io.send(
-                .{ .fd = peer.fd, .buf = data },
-                &peer.send_completion,
-                self,
-                peerSendCompleteFor(@TypeOf(self.*)),
-            ) catch {
+            submitMseSend(self, slot, data) catch {
                 return error.SubmitFailed;
             };
             peer.send_pending = true;
@@ -458,14 +453,12 @@ fn handleSendResult(self: anytype, slot: u16, send_id: u32, send_res: i32) void 
             const bytes_sent: usize = @intCast(send_res);
             peer.mse_send_remaining = peer.mse_send_remaining[bytes_sent..];
             if (peer.mse_send_remaining.len > 0) {
-                // Partial send -- resubmit remaining bytes on the same untracked
-                // send_completion without advancing the state machine.
-                self.io.send(
-                    .{ .fd = peer.fd, .buf = peer.mse_send_remaining },
-                    &peer.send_completion,
-                    self,
-                    peerSendCompleteFor(@TypeOf(self.*)),
-                ) catch {
+                // Partial send -- resubmit remaining bytes through a fresh
+                // generation-tagged MseHandshakeOp wrapper. We cannot reuse
+                // `peer.send_completion` here because a stale CQE for it
+                // could land on a reused slot; the wrapper carries (slot,
+                // generation) so that path is safe.
+                submitMseSend(self, slot, peer.mse_send_remaining) catch {
                     self.removePeer(slot);
                 };
                 peer.send_pending = true;
@@ -482,12 +475,7 @@ fn handleSendResult(self: anytype, slot: u16, send_id: u32, send_res: i32) void 
             const bytes_sent: usize = @intCast(send_res);
             peer.mse_send_remaining = peer.mse_send_remaining[bytes_sent..];
             if (peer.mse_send_remaining.len > 0) {
-                self.io.send(
-                    .{ .fd = peer.fd, .buf = peer.mse_send_remaining },
-                    &peer.send_completion,
-                    self,
-                    peerSendCompleteFor(@TypeOf(self.*)),
-                ) catch {
+                submitMseSend(self, slot, peer.mse_send_remaining) catch {
                     self.removePeer(slot);
                 };
                 peer.send_pending = true;
@@ -963,6 +951,161 @@ fn handleDiskWriteResult(self: anytype, write_id: u32, res: i32) void {
 
 // ── MSE async handshake helpers ──────────────────────────
 
+/// Per-MSE-op tracking so callbacks can detect stale CQEs after slot
+/// reuse. Heap-allocated per submission, freed in the callback. Owns
+/// its own `Completion` so it's *not* affected by `peer.* = Peer{}`
+/// resetting `peer.recv_completion` / `peer.send_completion`.
+///
+/// The race we're closing: `removePeer` (e.g. via `checkPeerTimeouts`)
+/// destroys `peer.mse_initiator`, closes the fd, and resets the slot
+/// while a recv submitted against `mi.peer_public_key[..]` (or a send
+/// against `mi.send_buf[..]`) is still in flight in the kernel /
+/// SimIO heap. After the slot is reallocated to a fresh peer, the
+/// stale CQE arrives — the heap entry's `completion = c` pointer is
+/// now embedded in a *new* `MseHandshakeOpOf` (or worse, the new
+/// peer's `recv_completion` if we'd kept the old shape) and the
+/// callback dispatches with the wrong context.
+///
+/// The fix: every MSE recv/send carries the slot's generation at
+/// submission time. The callback compares against
+/// `el.peer_generations[slot]` — bumped by `removePeer` — and bails
+/// when they differ. The wrapper is freed unconditionally so a stale
+/// CQE never leaks the tracking allocation.
+///
+/// See STYLE.md "Generation counter pattern" + the
+/// `mse-simultaneous-handshake` progress report for why this is
+/// the right shape (vs. cancel-on-close, which is racier on real
+/// io_uring and needs an extra round-trip).
+pub fn MseHandshakeOpOf(comptime EL: type) type {
+    return struct {
+        completion: io_interface.Completion = .{},
+        el: *EL,
+        slot: u16,
+        generation: u32,
+        is_initiator: bool,
+        is_send: bool,
+    };
+}
+
+/// Factory: callback for an MSE recv. Recovers the wrapper via
+/// `userdata`, frees it, then validates the generation before
+/// dispatching the result through the existing recv pipeline.
+pub fn mseHandshakeRecvCompleteFor(comptime EL: type) io_interface.Callback {
+    return struct {
+        fn cb(
+            userdata: ?*anyopaque,
+            _: *io_interface.Completion,
+            result: io_interface.Result,
+        ) io_interface.CallbackAction {
+            const op: *MseHandshakeOpOf(EL) = @ptrCast(@alignCast(userdata.?));
+            const el = op.el;
+            const slot = op.slot;
+            const generation = op.generation;
+            el.allocator.destroy(op);
+
+            // Stale CQE for a slot that's been reused. Skip dispatch —
+            // the buffer pointer in the recv op pointed into the *old*
+            // mse_initiator/mse_responder which is already freed; acting
+            // on the byte count would mis-advance the new state machine.
+            if (slot >= el.peer_generations.len) return .disarm;
+            if (el.peer_generations[slot] != generation) return .disarm;
+
+            const res: i32 = switch (result) {
+                .recv => |r| if (r) |n|
+                    std.math.cast(i32, n) orelse std.math.maxInt(i32)
+                else |_|
+                    -1,
+                else => -1,
+            };
+            handleRecvResult(el, slot, res);
+            return .disarm;
+        }
+    }.cb;
+}
+
+/// Factory: callback for an MSE send. Same shape as the recv
+/// callback above — wrapper carries `(slot, generation)` so a stale
+/// CQE skips the dispatch instead of advancing a fresh peer's state.
+pub fn mseHandshakeSendCompleteFor(comptime EL: type) io_interface.Callback {
+    return struct {
+        fn cb(
+            userdata: ?*anyopaque,
+            _: *io_interface.Completion,
+            result: io_interface.Result,
+        ) io_interface.CallbackAction {
+            const op: *MseHandshakeOpOf(EL) = @ptrCast(@alignCast(userdata.?));
+            const el = op.el;
+            const slot = op.slot;
+            const generation = op.generation;
+            el.allocator.destroy(op);
+
+            if (slot >= el.peer_generations.len) return .disarm;
+            if (el.peer_generations[slot] != generation) return .disarm;
+
+            const res: i32 = switch (result) {
+                .send => |r| if (r) |n|
+                    std.math.cast(i32, n) orelse std.math.maxInt(i32)
+                else |_|
+                    -1,
+                else => -1,
+            };
+            handleSendResult(el, slot, 0, res);
+            return .disarm;
+        }
+    }.cb;
+}
+
+/// Allocate + submit an MSE recv through a generation-tagged wrapper.
+/// On failure the wrapper is destroyed and the error is propagated to
+/// the caller (which typically routes through `handleMseFailure`).
+fn submitMseRecv(self: anytype, slot: u16, buf: []u8) !void {
+    const EL = @TypeOf(self.*);
+    const peer = &self.peers[slot];
+    const op = try self.allocator.create(MseHandshakeOpOf(EL));
+    op.* = .{
+        .el = self,
+        .slot = slot,
+        .generation = self.peer_generations[slot],
+        .is_initiator = false,
+        .is_send = false,
+    };
+    self.io.recv(
+        .{ .fd = peer.fd, .buf = buf },
+        &op.completion,
+        op,
+        mseHandshakeRecvCompleteFor(EL),
+    ) catch |err| {
+        self.allocator.destroy(op);
+        return err;
+    };
+}
+
+/// Allocate + submit an MSE send through a generation-tagged wrapper.
+/// Same shape as `submitMseRecv`; the partial-send handling on the
+/// callback path uses `peer.mse_send_remaining` (which lives on the
+/// Peer, not the wrapper) so resubmissions allocate a fresh wrapper.
+fn submitMseSend(self: anytype, slot: u16, buf: []const u8) !void {
+    const EL = @TypeOf(self.*);
+    const peer = &self.peers[slot];
+    const op = try self.allocator.create(MseHandshakeOpOf(EL));
+    op.* = .{
+        .el = self,
+        .slot = slot,
+        .generation = self.peer_generations[slot],
+        .is_initiator = false,
+        .is_send = true,
+    };
+    self.io.send(
+        .{ .fd = peer.fd, .buf = buf },
+        &op.completion,
+        op,
+        mseHandshakeSendCompleteFor(EL),
+    ) catch |err| {
+        self.allocator.destroy(op);
+        return err;
+    };
+}
+
 /// Execute an MseAction returned by the async state machine.
 /// `is_initiator` controls which state (mse_handshake_* vs mse_resp_*) to use.
 fn executeMseAction(self: anytype, slot: u16, action: mse.MseAction, is_initiator: bool) void {
@@ -972,12 +1115,7 @@ fn executeMseAction(self: anytype, slot: u16, action: mse.MseAction, is_initiato
             const state: PeerState = if (is_initiator) .mse_handshake_send else .mse_resp_send;
             peer.state = state;
             peer.mse_send_remaining = data;
-            self.io.send(
-                .{ .fd = peer.fd, .buf = data },
-                &peer.send_completion,
-                self,
-                peerSendCompleteFor(@TypeOf(self.*)),
-            ) catch {
+            submitMseSend(self, slot, data) catch {
                 handleMseFailure(self, slot, is_initiator);
                 return;
             };
@@ -986,12 +1124,7 @@ fn executeMseAction(self: anytype, slot: u16, action: mse.MseAction, is_initiato
         .recv => |buf| {
             const state: PeerState = if (is_initiator) .mse_handshake_recv else .mse_resp_recv;
             peer.state = state;
-            self.io.recv(
-                .{ .fd = peer.fd, .buf = buf },
-                &peer.recv_completion,
-                self,
-                peerRecvCompleteFor(@TypeOf(self.*)),
-            ) catch {
+            submitMseRecv(self, slot, buf) catch {
                 handleMseFailure(self, slot, is_initiator);
                 return;
             };
@@ -1096,6 +1229,16 @@ fn attemptMseFallback(self: anytype, slot: u16) void {
     // We need to remember this across the reconnect
     peer.mse_rejected = true;
 
+    // Bump the slot's generation so any in-flight MseHandshakeOp
+    // wrapper (recv on the OLD fd's mse_initiator buffer, etc.)
+    // sees a stale generation when its CQE arrives and bails. Without
+    // this, an OLD recv that completes mid-fallback could try to feed
+    // bytes into the next handshake's state machine (or into a freed
+    // mse_initiator if the wrapper is the only tracking left). Same
+    // mechanism as removePeer; the slot stays allocated but the
+    // identity of any in-flight MSE op against it is invalidated.
+    self.peer_generations[slot] +%= 1;
+
     // Close the current connection
     if (peer.fd >= 0) {
         posix.close(peer.fd);
@@ -1165,12 +1308,7 @@ fn startMseResponder(self: anytype, slot: u16, bytes_received: usize) void {
     if (mr.recv_offset < mse.dh_key_size) {
         peer.state = .mse_resp_recv;
         const recv_buf = mr.peer_public_key[mr.recv_offset..];
-        self.io.recv(
-            .{ .fd = peer.fd, .buf = recv_buf },
-            &peer.recv_completion,
-            self,
-            peerRecvCompleteFor(@TypeOf(self.*)),
-        ) catch {
+        submitMseRecv(self, slot, recv_buf) catch {
             self.removePeer(slot);
             return;
         };

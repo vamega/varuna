@@ -175,6 +175,18 @@ pub fn EventLoopOf(comptime IO: type) type {
         io: IO,
         allocator: std.mem.Allocator,
         peers: []Peer,
+        /// Per-slot generation counter, parallel to `peers`. Bumped by
+        /// `removePeer` so heap-allocated callback wrappers (e.g.
+        /// `MseHandshakeOpOf`) can detect stale CQEs whose slot has been
+        /// reused. Survives `peer.* = Peer{}` because it lives outside the
+        /// Peer struct.
+        ///
+        /// See STYLE.md "Generation counter pattern" and
+        /// progress-reports/2026-04-29-mse-simultaneous-handshake.md for
+        /// the invariant: a CQE whose recorded generation differs from
+        /// the slot's current generation MUST be treated as stale and
+        /// must not act on freed state.
+        peer_generations: []u32,
         peer_count: u16 = 0,
         running: bool = true,
         clock: Clock = .real,
@@ -426,6 +438,9 @@ pub fn EventLoopOf(comptime IO: type) type {
             const peers = try allocator.alloc(Peer, max_peers);
             @memset(peers, Peer{});
 
+            const peer_generations = try allocator.alloc(u32, max_peers);
+            @memset(peer_generations, 0);
+
             const hasher = if (hasher_threads > 0)
                 Hasher.create(allocator, hasher_threads) catch null
             else
@@ -435,6 +450,7 @@ pub fn EventLoopOf(comptime IO: type) type {
                 .io = io,
                 .allocator = allocator,
                 .peers = peers,
+                .peer_generations = peer_generations,
                 .torrents = try std.ArrayList(?TorrentContext).initCapacity(allocator, default_torrent_capacity),
                 .free_torrent_ids = std.ArrayList(TorrentId).empty,
                 .active_torrent_ids = try std.ArrayList(TorrentId).initCapacity(allocator, default_torrent_capacity),
@@ -733,6 +749,7 @@ pub fn EventLoopOf(comptime IO: type) type {
                 if (peer.mse_responder) |mr| self.allocator.destroy(mr);
             }
             self.allocator.free(self.peers);
+            self.allocator.free(self.peer_generations);
             // Clean up torrent PEX state and web seed managers
             for (self.active_torrent_ids.items) |torrent_id| {
                 if (self.getTorrentContext(torrent_id)) |tc| {
@@ -1616,6 +1633,14 @@ pub fn EventLoopOf(comptime IO: type) type {
 
             const torrent_id = peer.torrent_id;
             self.cleanupPeer(peer);
+            // Bump generation BEFORE resetting the peer so any in-flight
+            // MSE handshake op (heap-allocated `MseHandshakeOpOf` wrapper
+            // referencing this slot) sees a fresh number when its CQE
+            // eventually fires. The wrapper checks
+            // `peer_generations[slot] == op.generation` and bails when the
+            // slot has been reused. See peer_handler.zig:MseHandshakeOpOf
+            // and STYLE.md "Generation counter pattern".
+            self.peer_generations[slot] +%= 1;
             peer.* = Peer{};
             if (self.peer_count > 0) self.peer_count -= 1;
 
