@@ -982,6 +982,8 @@ fn makeCancelledResult(op: Operation) Result {
         .fsync => .{ .fsync = error.OperationCanceled },
         .fallocate => .{ .fallocate = error.OperationCanceled },
         .truncate => .{ .truncate = error.OperationCanceled },
+        .splice => .{ .splice = error.OperationCanceled },
+        .copy_file_range => .{ .copy_file_range = error.OperationCanceled },
         .socket => .{ .socket = error.OperationCanceled },
         .connect => .{ .connect = error.OperationCanceled },
         .accept => .{ .accept = error.OperationCanceled },
