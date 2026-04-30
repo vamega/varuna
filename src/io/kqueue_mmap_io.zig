@@ -941,6 +941,36 @@ pub const KqueueMmapIO = struct {
             .{ .truncate = err };
         self.pushCompleted(c, r);
     }
+
+    /// `splice(2)` is Linux-only. Always returns `error.OperationNotSupported`
+    /// on macOS/BSD; callers fall back to `copy_file_range` (which we
+    /// emulate with read+write below) or to a plain read/write loop.
+    pub fn splice(self: *KqueueMmapIO, op: ifc.SpliceOp, c: *Completion, ud: ?*anyopaque, cb: Callback) !void {
+        _ = op;
+        try self.armCompletion(c, .{ .splice = .{ .in_fd = -1, .in_offset = 0, .out_fd = -1, .out_offset = 0, .len = 0 } }, ud, cb);
+        self.pushCompleted(c, .{ .splice = error.OperationNotSupported });
+    }
+
+    /// Emulate `copy_file_range` on Darwin via a positioned read+write
+    /// pair (the daemon's MoveJob caller chunks larger transfers, so a
+    /// single bounded transfer is sufficient).
+    pub fn copy_file_range(self: *KqueueMmapIO, op: ifc.CopyFileRangeOp, c: *Completion, ud: ?*anyopaque, cb: Callback) !void {
+        try self.armCompletion(c, .{ .copy_file_range = op }, ud, cb);
+        const result: Result = blk: {
+            var stack_buf: [128 * 1024]u8 = undefined;
+            const want = @min(op.len, stack_buf.len);
+            const n_read = posix.pread(op.in_fd, stack_buf[0..want], op.in_offset) catch |err| break :blk .{ .copy_file_range = err };
+            if (n_read == 0) break :blk .{ .copy_file_range = @as(usize, 0) };
+            var written: usize = 0;
+            while (written < n_read) {
+                const w = posix.pwrite(op.out_fd, stack_buf[written..n_read], op.out_offset + written) catch |err| break :blk .{ .copy_file_range = err };
+                if (w == 0) break :blk .{ .copy_file_range = error.WriteShort };
+                written += w;
+            }
+            break :blk .{ .copy_file_range = n_read };
+        };
+        self.pushCompleted(c, result);
+    }
 };
 
 // ── Helpers ───────────────────────────────────────────────
@@ -986,6 +1016,8 @@ fn makeCancelledResult(op: Operation) Result {
         .bind => .{ .bind = error.OperationCanceled },
         .listen => .{ .listen = error.OperationCanceled },
         .setsockopt => .{ .setsockopt = error.OperationCanceled },
+        .splice => .{ .splice = error.OperationCanceled },
+        .copy_file_range => .{ .copy_file_range = error.OperationCanceled },
         .socket => .{ .socket = error.OperationCanceled },
         .connect => .{ .connect = error.OperationCanceled },
         .accept => .{ .accept = error.OperationCanceled },

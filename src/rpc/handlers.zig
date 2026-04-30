@@ -134,6 +134,10 @@ pub const ApiHandler = struct {
             return withCors(self.handleImportBanList(allocator, request.body, request.content_type));
         }
 
+        if (std.mem.startsWith(u8, request.path, "/api/v2/varuna/torrents/move")) {
+            return withCors(self.handleVarunaMove(allocator, request.method, request.path, request.body));
+        }
+
         if (std.mem.startsWith(u8, request.path, "/api/v2/torrents/")) {
             const action = request.path["/api/v2/torrents/".len..];
             return withCors(self.handleTorrents(allocator, request.method, action, request.body, request.content_type));
@@ -1197,20 +1201,163 @@ pub const ApiHandler = struct {
         return .{ .body = "{\"status\":\"ok\"}" };
     }
 
+    /// **Deprecated.** The qBittorrent-compatible setLocation API
+    /// returns synchronously after the move completes — that contract
+    /// can hold the RPC handler thread for arbitrary time on
+    /// cross-filesystem moves of multi-GB torrent data. Varuna refuses
+    /// to honour it and points clients at the new async endpoint
+    /// (`POST /api/v2/varuna/torrents/move`) which returns a job id
+    /// immediately and exposes progress polling through
+    /// `GET /api/v2/varuna/torrents/move/<id>`. See
+    /// `docs/api-compatibility.md` for the full rationale.
     fn handleTorrentsSetLocation(self: *const ApiHandler, allocator: std.mem.Allocator, body: []const u8) server.Response {
+        _ = self;
+        _ = allocator;
+        _ = body;
+        return .{
+            .status = 400,
+            .body = "{\"error\":\"setLocation is synchronous in qBittorrent's API; varuna requires async. Use POST /api/v2/varuna/torrents/move instead.\",\"endpoint\":\"/api/v2/varuna/torrents/move\"}",
+        };
+    }
+
+    /// Varuna-native async move endpoint. Routes:
+    ///
+    ///   POST   /api/v2/varuna/torrents/move           — start a move
+    ///   GET    /api/v2/varuna/torrents/move/<id>      — poll progress
+    ///   POST   /api/v2/varuna/torrents/move/<id>/cancel  — request cancel
+    ///   POST   /api/v2/varuna/torrents/move/<id>/commit  — apply save_path
+    ///   DELETE /api/v2/varuna/torrents/move/<id>      — forget terminal job
+    ///
+    /// The path uses the `/varuna/` prefix to make it unambiguously
+    /// non-qBittorrent (clients reaching it have explicitly opted in).
+    fn handleVarunaMove(self: *const ApiHandler, allocator: std.mem.Allocator, method: []const u8, path: []const u8, body: []const u8) server.Response {
+        const prefix = "/api/v2/varuna/torrents/move";
+        const tail = path[prefix.len..];
+
+        // POST /move (no id) → start
+        if (tail.len == 0) {
+            if (!std.mem.eql(u8, method, "POST")) {
+                return .{ .status = 405, .body = "{\"error\":\"method not allowed\"}" };
+            }
+            return self.handleVarunaMoveStart(allocator, body);
+        }
+
+        // tail begins with `/<id>`. Strip the leading slash.
+        if (tail[0] != '/') {
+            return .{ .status = 404, .body = "{\"error\":\"not found\"}" };
+        }
+        const after_slash = tail[1..];
+
+        // Split into id and optional sub-action.
+        const sub_sep = std.mem.indexOfScalar(u8, after_slash, '/');
+        const id_str = if (sub_sep) |s| after_slash[0..s] else after_slash;
+        const sub = if (sub_sep) |s| after_slash[s + 1 ..] else "";
+
+        const id = std.fmt.parseInt(@import("../daemon/session_manager.zig").MoveJobId, id_str, 10) catch
+            return .{ .status = 400, .body = "{\"error\":\"invalid job id\"}" };
+
+        if (sub.len == 0) {
+            if (std.mem.eql(u8, method, "GET")) return self.handleVarunaMoveStatus(allocator, id);
+            if (std.mem.eql(u8, method, "DELETE")) return self.handleVarunaMoveForget(allocator, id);
+            return .{ .status = 405, .body = "{\"error\":\"method not allowed\"}" };
+        }
+
+        if (std.mem.eql(u8, sub, "cancel")) {
+            if (!std.mem.eql(u8, method, "POST")) {
+                return .{ .status = 405, .body = "{\"error\":\"method not allowed\"}" };
+            }
+            return self.handleVarunaMoveCancel(allocator, id);
+        }
+        if (std.mem.eql(u8, sub, "commit")) {
+            if (!std.mem.eql(u8, method, "POST")) {
+                return .{ .status = 405, .body = "{\"error\":\"method not allowed\"}" };
+            }
+            return self.handleVarunaMoveCommit(allocator, id);
+        }
+        return .{ .status = 404, .body = "{\"error\":\"not found\"}" };
+    }
+
+    fn handleVarunaMoveStart(self: *const ApiHandler, allocator: std.mem.Allocator, body: []const u8) server.Response {
         const hash = requireHashes(body) orelse
             return .{ .status = 400, .body = "{\"error\":\"missing hashes\"}" };
         const location = extractParamMut(body, "location") orelse
             return .{ .status = 400, .body = "{\"error\":\"missing location\"}" };
-
         if (location.len == 0) {
             return .{ .status = 400, .body = "{\"error\":\"empty location\"}" };
         }
 
-        self.session_manager.setLocation(hash, location) catch |err| {
-            return errorResponse(allocator, 409, err);
+        const id = self.session_manager.startMoveJob(hash, location) catch |err| {
+            // Map domain errors to specific status codes.
+            return switch (err) {
+                error.TorrentNotFound => .{ .status = 404, .body = "{\"error\":\"torrent not found\"}" },
+                error.TorrentBusy => .{ .status = 409, .body = "{\"error\":\"torrent already has a pending move\"}" },
+                error.SrcPathNotAbsolute, error.DstPathNotAbsolute => .{
+                    .status = 400,
+                    .body = "{\"error\":\"paths must be absolute\"}",
+                },
+                else => errorResponse(allocator, 500, err),
+            };
         };
 
+        const body_out = std.fmt.allocPrint(allocator, "{{\"id\":{}}}", .{id}) catch
+            return .{ .status = 500, .body = "{\"error\":\"internal\"}" };
+        return .{ .status = 202, .body = body_out, .owned_body = body_out };
+    }
+
+    fn handleVarunaMoveStatus(self: *const ApiHandler, allocator: std.mem.Allocator, id: @import("../daemon/session_manager.zig").MoveJobId) server.Response {
+        const p = self.session_manager.getMoveJobProgress(id) catch |err| {
+            return switch (err) {
+                error.JobNotFound => .{ .status = 404, .body = "{\"error\":\"job not found\"}" },
+            };
+        };
+
+        const state_str = switch (p.state) {
+            .created => "created",
+            .running => "running",
+            .succeeded => "succeeded",
+            .failed => "failed",
+            .canceled => "canceled",
+        };
+        const err_str: []const u8 = if (p.error_message) |m| m else "";
+
+        const body = std.fmt.allocPrint(
+            allocator,
+            "{{\"id\":{},\"state\":\"{s}\",\"bytes_copied\":{},\"total_bytes\":{},\"files_done\":{},\"total_files\":{},\"used_rename\":{},\"error\":\"{s}\"}}",
+            .{ id, state_str, p.bytes_copied, p.total_bytes, p.files_done, p.total_files, p.used_rename, err_str },
+        ) catch return .{ .status = 500, .body = "{\"error\":\"internal\"}" };
+        return .{ .body = body, .owned_body = body };
+    }
+
+    fn handleVarunaMoveCancel(self: *const ApiHandler, allocator: std.mem.Allocator, id: @import("../daemon/session_manager.zig").MoveJobId) server.Response {
+        _ = allocator;
+        self.session_manager.cancelMoveJob(id) catch |err| {
+            return switch (err) {
+                error.JobNotFound => .{ .status = 404, .body = "{\"error\":\"job not found\"}" },
+            };
+        };
+        return .{ .body = "{\"status\":\"ok\"}" };
+    }
+
+    fn handleVarunaMoveCommit(self: *const ApiHandler, allocator: std.mem.Allocator, id: @import("../daemon/session_manager.zig").MoveJobId) server.Response {
+        self.session_manager.commitMoveJob(id) catch |err| {
+            return switch (err) {
+                error.JobNotFound => .{ .status = 404, .body = "{\"error\":\"job not found\"}" },
+                error.JobNotFinished => .{ .status = 409, .body = "{\"error\":\"job not yet succeeded\"}" },
+                error.TorrentNotFound => .{ .status = 410, .body = "{\"error\":\"torrent removed before commit\"}" },
+                error.OutOfMemory => errorResponse(allocator, 500, err),
+            };
+        };
+        return .{ .body = "{\"status\":\"ok\"}" };
+    }
+
+    fn handleVarunaMoveForget(self: *const ApiHandler, allocator: std.mem.Allocator, id: @import("../daemon/session_manager.zig").MoveJobId) server.Response {
+        _ = allocator;
+        self.session_manager.forgetMoveJob(id) catch |err| {
+            return switch (err) {
+                error.JobNotFound => .{ .status = 404, .body = "{\"error\":\"job not found\"}" },
+                error.JobStillRunning => .{ .status = 409, .body = "{\"error\":\"cancel first; job is still running\"}" },
+            };
+        };
         return .{ .body = "{\"status\":\"ok\"}" };
     }
 

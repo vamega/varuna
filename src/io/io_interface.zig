@@ -79,6 +79,8 @@ pub const Operation = union(enum) {
     fsync: FsyncOp,
     fallocate: FallocateOp,
     truncate: TruncateOp,
+    splice: SpliceOp,
+    copy_file_range: CopyFileRangeOp,
 
     // Connection lifecycle.
     socket: SocketOp,
@@ -162,6 +164,47 @@ pub const TruncateOp = struct {
     /// per-piece writes against `offset+len` past the original EOF
     /// don't surprise the kernel.
     length: u64,
+};
+
+/// `splice(2)` — zero-copy move of up to `len` bytes between two fds.
+/// At least one of `in_fd` / `out_fd` must be a pipe. Used for the
+/// async file-move state machine (file → pipe → file copy).
+///
+/// `RealIO` submits this as `IORING_OP_SPLICE` (kernel ≥5.7; varuna's
+/// floor is 6.6). Posix backends route it through the worker thread
+/// pool — the worker calls `splice(2)` directly.
+///
+/// Offset semantics mirror `splice(2)`:
+///   * If the corresponding fd is a pipe, the offset must be
+///     `std.math.maxInt(u64)` (the kernel ignores it).
+///   * Otherwise, the offset selects the byte to start from; the file's
+///     offset is NOT advanced (this matches the io_uring helper's
+///     `pwrite`-style semantics).
+pub const SpliceOp = struct {
+    in_fd: posix.fd_t,
+    in_offset: u64,
+    out_fd: posix.fd_t,
+    out_offset: u64,
+    len: usize,
+    flags: u32 = 0,
+};
+
+/// `copy_file_range(2)` — kernel-side copy between two regular files.
+/// Same-fs copies on btrfs/xfs/etc. may use a reflink and complete in
+/// constant time; cross-fs copies (Linux ≥5.3) fall back to an
+/// in-kernel loop that avoids the userspace round-trip.
+///
+/// **No native io_uring op exists** as of kernel 6.x — every backend
+/// routes this through a worker thread (RealIO, Posix backends) or
+/// runs it inline on macOS/BSD where the syscall isn't available
+/// (those backends synthesise it via `read`+`write`).
+pub const CopyFileRangeOp = struct {
+    in_fd: posix.fd_t,
+    in_offset: u64,
+    out_fd: posix.fd_t,
+    out_offset: u64,
+    len: usize,
+    flags: u32 = 0,
 };
 
 pub const SocketOp = struct {
@@ -254,6 +297,10 @@ pub const Result = union(enum) {
     fsync: anyerror!void,
     fallocate: anyerror!void,
     truncate: anyerror!void,
+    /// Bytes spliced. `0` means EOF on the input side (mirrors `splice(2)`).
+    splice: anyerror!usize,
+    /// Bytes copied. `0` means EOF on the input side (mirrors `copy_file_range(2)`).
+    copy_file_range: anyerror!usize,
     socket: anyerror!posix.fd_t,
     connect: anyerror!void,
     accept: anyerror!Accepted,

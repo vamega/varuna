@@ -1030,6 +1030,16 @@ pub const KqueuePosixIO = struct {
         try self.submitFileOp(.{ .truncate = op }, c);
     }
 
+    pub fn splice(self: *KqueuePosixIO, op: ifc.SpliceOp, c: *Completion, ud: ?*anyopaque, cb: Callback) !void {
+        try self.armCompletion(c, .{ .splice = op }, ud, cb);
+        try self.submitFileOp(.{ .splice = op }, c);
+    }
+
+    pub fn copy_file_range(self: *KqueuePosixIO, op: ifc.CopyFileRangeOp, c: *Completion, ud: ?*anyopaque, cb: Callback) !void {
+        try self.armCompletion(c, .{ .copy_file_range = op }, ud, cb);
+        try self.submitFileOp(.{ .copy_file_range = op }, c);
+    }
+
     fn submitFileOp(self: *KqueuePosixIO, op: FileOp, c: *Completion) !void {
         self.pool_in_flight += 1;
         self.pool.submit(op, c) catch |err| {
@@ -1081,6 +1091,8 @@ fn makeCancelledResult(op: Operation) Result {
         .fsync => .{ .fsync = error.OperationCanceled },
         .fallocate => .{ .fallocate = error.OperationCanceled },
         .truncate => .{ .truncate = error.OperationCanceled },
+        .splice => .{ .splice = error.OperationCanceled },
+        .copy_file_range => .{ .copy_file_range = error.OperationCanceled },
         .socket => .{ .socket = error.OperationCanceled },
         .connect => .{ .connect = error.OperationCanceled },
         .accept => .{ .accept = error.OperationCanceled },

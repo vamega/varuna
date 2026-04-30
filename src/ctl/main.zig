@@ -256,13 +256,46 @@ pub fn main() !void {
             }
         }
     } else if (std.mem.eql(u8, command, "move")) {
+        // Routes through the varuna-native async move endpoint.
+        // Fire-and-forget: prints the assigned job id; the operator
+        // can poll progress via the GET endpoint listed in
+        // docs/api-compatibility.md. The qBittorrent-compatible
+        // /api/v2/torrents/setLocation path now returns 400 with a
+        // pointer to this endpoint.
         if (cmd_start + 2 >= args.len) {
             try stdout.print("usage: varuna-ctl move <hash> <new-path>\n", .{});
         } else {
             var body_buf = std.ArrayList(u8).empty;
             defer body_buf.deinit(allocator);
             try body_buf.print(allocator, "hashes={s}&location={s}", .{ args[cmd_start + 1], args[cmd_start + 2] });
-            try doPost(allocator, stdout, api_host, api_port, "/api/v2/torrents/setLocation", body_buf.items, sid);
+            try doPost(allocator, stdout, api_host, api_port, "/api/v2/varuna/torrents/move", body_buf.items, sid);
+        }
+    } else if (std.mem.eql(u8, command, "move-status")) {
+        if (cmd_start + 1 >= args.len) {
+            try stdout.print("usage: varuna-ctl move-status <job-id>\n", .{});
+        } else {
+            var path_buf = std.ArrayList(u8).empty;
+            defer path_buf.deinit(allocator);
+            try path_buf.print(allocator, "/api/v2/varuna/torrents/move/{s}", .{args[cmd_start + 1]});
+            try doGet(allocator, stdout, api_host, api_port, path_buf.items, sid);
+        }
+    } else if (std.mem.eql(u8, command, "move-cancel")) {
+        if (cmd_start + 1 >= args.len) {
+            try stdout.print("usage: varuna-ctl move-cancel <job-id>\n", .{});
+        } else {
+            var path_buf = std.ArrayList(u8).empty;
+            defer path_buf.deinit(allocator);
+            try path_buf.print(allocator, "/api/v2/varuna/torrents/move/{s}/cancel", .{args[cmd_start + 1]});
+            try doPost(allocator, stdout, api_host, api_port, path_buf.items, "", sid);
+        }
+    } else if (std.mem.eql(u8, command, "move-commit")) {
+        if (cmd_start + 1 >= args.len) {
+            try stdout.print("usage: varuna-ctl move-commit <job-id>\n", .{});
+        } else {
+            var path_buf = std.ArrayList(u8).empty;
+            defer path_buf.deinit(allocator);
+            try path_buf.print(allocator, "/api/v2/varuna/torrents/move/{s}/commit", .{args[cmd_start + 1]});
+            try doPost(allocator, stdout, api_host, api_port, path_buf.items, "", sid);
         }
     } else if (std.mem.eql(u8, command, "conn-diag")) {
         if (cmd_start + 1 >= args.len) {

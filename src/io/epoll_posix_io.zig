@@ -497,6 +497,8 @@ pub const EpollPosixIO = struct {
             .fsync => |op| try self.fsync(op, c, userdata, callback),
             .fallocate => |op| try self.fallocate(op, c, userdata, callback),
             .truncate => |op| try self.truncate(op, c, userdata, callback),
+            .splice => |op| try self.splice(op, c, userdata, callback),
+            .copy_file_range => |op| try self.copy_file_range(op, c, userdata, callback),
             .socket => |op| try self.socket(op, c, userdata, callback),
             .connect => |op| try self.connect(op, c, userdata, callback),
             .accept => |op| try self.accept(op, c, userdata, callback),
@@ -941,6 +943,16 @@ pub const EpollPosixIO = struct {
     pub fn truncate(self: *EpollPosixIO, op: ifc.TruncateOp, c: *Completion, ud: ?*anyopaque, cb: Callback) !void {
         try self.armCompletion(c, .{ .truncate = op }, ud, cb);
         try self.submitFileOp(.{ .truncate = op }, c);
+    }
+
+    pub fn splice(self: *EpollPosixIO, op: ifc.SpliceOp, c: *Completion, ud: ?*anyopaque, cb: Callback) !void {
+        try self.armCompletion(c, .{ .splice = op }, ud, cb);
+        try self.submitFileOp(.{ .splice = op }, c);
+    }
+
+    pub fn copy_file_range(self: *EpollPosixIO, op: ifc.CopyFileRangeOp, c: *Completion, ud: ?*anyopaque, cb: Callback) !void {
+        try self.armCompletion(c, .{ .copy_file_range = op }, ud, cb);
+        try self.submitFileOp(.{ .copy_file_range = op }, c);
     }
 
     fn submitFileOp(self: *EpollPosixIO, op: FileOp, c: *Completion) !void {

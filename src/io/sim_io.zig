@@ -113,6 +113,13 @@ pub const FaultConfig = struct {
     /// `PieceStore.init` fallback path that fires on filesystems
     /// rejecting fallocate (tmpfs <5.10, FAT32, certain FUSE FSes).
     truncate_error_probability: f32 = 0.0,
+    /// Probability that a splice completes with `error.InputOutput`.
+    /// Used by MoveJob fault tests to exercise the cross-fs copy
+    /// path's error handling.
+    splice_error_probability: f32 = 0.0,
+    /// Probability that a copy_file_range completes with
+    /// `error.InputOutput`. Used by MoveJob fault tests.
+    copy_file_range_error_probability: f32 = 0.0,
     /// Probability that an fsync completes with `error.InputOutput`
     /// (disk failure mid-flush). Distinct from
     /// `write_error_probability` so BUGGIFY can target sync-only paths.
@@ -536,6 +543,8 @@ pub const SimIO = struct {
             .fsync => |op| try self.fsync(op, c, ud, cb),
             .fallocate => |op| try self.fallocate(op, c, ud, cb),
             .truncate => |op| try self.truncate(op, c, ud, cb),
+            .splice => |op| try self.splice(op, c, ud, cb),
+            .copy_file_range => |op| try self.copy_file_range(op, c, ud, cb),
             .socket => |op| try self.socket(op, c, ud, cb),
             .connect => |op| try self.connect(op, c, ud, cb),
             .accept => |op| try self.accept(op, c, ud, cb),
@@ -979,6 +988,31 @@ pub const SimIO = struct {
         return self.schedule(c, .{ .truncate = {} }, 0);
     }
 
+    /// Sim splice models a successful "all bytes transferred" completion
+    /// (`op.len`). The fault knob delivers `error.InputOutput`. SimIO
+    /// doesn't model on-disk file content, so the actual data movement
+    /// is observably opaque — only the byte count and the error path
+    /// matter for state-machine tests.
+    pub fn splice(self: *SimIO, op: ifc.SpliceOp, c: *Completion, ud: ?*anyopaque, cb: Callback) !void {
+        try self.armCompletion(c, .{ .splice = op }, ud, cb);
+        const r = self.rng.random();
+        if (r.float(f32) < self.config.faults.splice_error_probability) {
+            return self.schedule(c, .{ .splice = error.InputOutput }, 0);
+        }
+        return self.schedule(c, .{ .splice = op.len }, 0);
+    }
+
+    /// Sim copy_file_range mirrors the splice variant: success = full
+    /// `op.len` transferred; fault = EIO. Used by MoveJob tests.
+    pub fn copy_file_range(self: *SimIO, op: ifc.CopyFileRangeOp, c: *Completion, ud: ?*anyopaque, cb: Callback) !void {
+        try self.armCompletion(c, .{ .copy_file_range = op }, ud, cb);
+        const r = self.rng.random();
+        if (r.float(f32) < self.config.faults.copy_file_range_error_probability) {
+            return self.schedule(c, .{ .copy_file_range = error.InputOutput }, 0);
+        }
+        return self.schedule(c, .{ .copy_file_range = op.len }, 0);
+    }
+
     pub fn socket(self: *SimIO, op: ifc.SocketOp, c: *Completion, ud: ?*anyopaque, cb: Callback) !void {
         try self.armCompletion(c, .{ .socket = op }, ud, cb);
         // Consume a pre-prepared fd if any, so tests can script which
@@ -1131,6 +1165,8 @@ fn cancelResultFor(op: Operation) Result {
         .fsync => .{ .fsync = error.OperationCanceled },
         .fallocate => .{ .fallocate = error.OperationCanceled },
         .truncate => .{ .truncate = error.OperationCanceled },
+        .splice => .{ .splice = error.OperationCanceled },
+        .copy_file_range => .{ .copy_file_range = error.OperationCanceled },
         .socket => .{ .socket = error.OperationCanceled },
         .connect => .{ .connect = error.OperationCanceled },
         .accept => .{ .accept = error.OperationCanceled },
@@ -1158,6 +1194,8 @@ fn buggifyResultFor(op: Operation) Result {
         .fsync => .{ .fsync = error.InputOutput },
         .fallocate => .{ .fallocate = error.NoSpaceLeft },
         .truncate => .{ .truncate = error.InputOutput },
+        .splice => .{ .splice = error.InputOutput },
+        .copy_file_range => .{ .copy_file_range = error.InputOutput },
         .socket => .{ .socket = error.ProcessFdQuotaExceeded },
         .connect => .{ .connect = error.ConnectionRefused },
         .accept => .{ .accept = error.ConnectionAborted },

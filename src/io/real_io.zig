@@ -179,6 +179,8 @@ pub const RealIO = struct {
             .fsync => |op| try self.fsync(op, c, userdata, callback),
             .fallocate => |op| try self.fallocate(op, c, userdata, callback),
             .truncate => |op| try self.truncate(op, c, userdata, callback),
+            .splice => |op| try self.splice(op, c, userdata, callback),
+            .copy_file_range => |op| try self.copy_file_range(op, c, userdata, callback),
             .socket => |op| try self.socket(op, c, userdata, callback),
             .connect => |op| try self.connect(op, c, userdata, callback),
             .accept => |op| try self.accept(op, c, userdata, callback),
@@ -309,6 +311,57 @@ pub const RealIO = struct {
                     else => return, // callback overwrote c.op with a different op (illegal under the contract)
                 },
             }
+        }
+    }
+
+    /// `IORING_OP_SPLICE` — kernel ≥5.7. Varuna's floor is 6.6 ⇒ always
+    /// available on supported kernels. The kernel signals the special
+    /// "fd is a pipe; ignore offset" sentinel via `std.math.maxInt(u64)`
+    /// in the offset field; that contract is what the io_uring helper
+    /// already expects so we pass through unchanged.
+    pub fn splice(self: *RealIO, op: ifc.SpliceOp, c: *Completion, ud: ?*anyopaque, cb: Callback) !void {
+        try self.armCompletion(c, .{ .splice = op }, ud, cb);
+        const sqe = try self.ring.splice(@intFromPtr(c), op.in_fd, op.in_offset, op.out_fd, op.out_offset, op.len);
+        if (op.flags != 0) sqe.rw_flags = @bitCast(op.flags);
+    }
+
+    /// `copy_file_range(2)` — no native io_uring op exists as of kernel
+    /// 6.x. Submitting a thread-pool offload from the EL is overkill
+    /// for the only daemon caller (the async MoveJob), which already
+    /// runs the syscall on its own worker thread. The contract op is
+    /// implemented for completeness with a synchronous-inline fallback;
+    /// callers that submit it from the EL thread accept the resulting
+    /// stall.
+    pub fn copy_file_range(self: *RealIO, op: ifc.CopyFileRangeOp, c: *Completion, ud: ?*anyopaque, cb: Callback) !void {
+        try self.armCompletion(c, .{ .copy_file_range = op }, ud, cb);
+        const result: Result = blk: {
+            var off_in: i64 = @bitCast(op.in_offset);
+            var off_out: i64 = @bitCast(op.out_offset);
+            const rc = linux.copy_file_range(op.in_fd, &off_in, op.out_fd, &off_out, op.len, op.flags);
+            switch (linux.E.init(rc)) {
+                .SUCCESS => break :blk .{ .copy_file_range = @as(usize, @intCast(rc)) },
+                .BADF => break :blk .{ .copy_file_range = error.BadFileDescriptor },
+                .INVAL => break :blk .{ .copy_file_range = error.InvalidArgument },
+                .XDEV, .NOSYS, .OPNOTSUPP => break :blk .{ .copy_file_range = error.OperationNotSupported },
+                .IO => break :blk .{ .copy_file_range = error.InputOutput },
+                .NOSPC => break :blk .{ .copy_file_range = error.NoSpaceLeft },
+                .ISDIR => break :blk .{ .copy_file_range = error.IsDir },
+                .OVERFLOW => break :blk .{ .copy_file_range = error.FileTooBig },
+                else => |e| break :blk .{ .copy_file_range = posix.unexpectedErrno(e) },
+            }
+        };
+        // Mirror the truncate sync-fallback shape — clear in_flight
+        // before invoking the callback so a callback that re-submits a
+        // new op on the same completion doesn't trip AlreadyInFlight.
+        realState(c).in_flight = false;
+        const action = cb(ud, c, result);
+        switch (action) {
+            .disarm => return,
+            // Honor .rearm only for the same op kind (mirrors truncate).
+            .rearm => switch (c.op) {
+                .copy_file_range => |new_op| try self.copy_file_range(new_op, c, ud, cb),
+                else => return,
+            },
         }
     }
 
@@ -561,6 +614,11 @@ fn buildResult(op: Operation, cqe: linux.io_uring_cqe) Result {
         // `RealIO.truncate` and never reaches `dispatchCqe`, so this
         // branch is unreachable in that case.
         .truncate => .{ .truncate = voidOrError(cqe) },
+        .splice => .{ .splice = countOrError(cqe) },
+        // copy_file_range completes synchronously inside `RealIO.copy_file_range`
+        // and never reaches `dispatchCqe`; keep a shaped variant for
+        // exhaustiveness so the union switch stays total.
+        .copy_file_range => .{ .copy_file_range = countOrError(cqe) },
         .socket => .{ .socket = fdOrError(cqe) },
         .connect => .{ .connect = voidOrError(cqe) },
         .accept => .{ .accept = acceptResult(cqe) },

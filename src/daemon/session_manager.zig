@@ -13,6 +13,11 @@ const SmartBan = @import("../net/smart_ban.zig").SmartBan;
 const HttpExecutor = @import("../io/http_executor.zig").HttpExecutor;
 const TrackerExecutor = @import("../tracker/executor.zig").TrackerExecutor;
 const UdpTrackerExecutor = @import("../tracker/udp_executor.zig").UdpTrackerExecutor;
+const move_job_mod = @import("../storage/move_job.zig");
+pub const MoveJob = move_job_mod.MoveJob;
+pub const MoveJobId = move_job_mod.JobId;
+pub const MoveJobState = move_job_mod.State;
+pub const MoveJobProgress = move_job_mod.Progress;
 
 /// Manages multiple torrent sessions for the daemon.
 /// Thread-safe: the API server and event loop can access concurrently.
@@ -63,6 +68,21 @@ pub const SessionManager = struct {
     /// Torrents currently being relocated by setLocation().
     relocating_torrents: std.AutoHashMap([40]u8, void),
 
+    /// Active and recently-completed async file-move jobs. The map is
+    /// keyed by `MoveJobId` (a monotonic counter assigned by
+    /// `startMoveJob`). Entries persist after completion so the client
+    /// can still poll the final status; the operator (or a periodic
+    /// cleanup) calls `forgetMoveJob(id)` to free a finished job.
+    move_jobs: std.AutoHashMap(MoveJobId, *MoveJob) = undefined,
+    /// Monotonic counter assigning the next `MoveJobId`. Starts at 1
+    /// so 0 is a valid sentinel ("no job").
+    next_move_job_id: MoveJobId = 1,
+    /// Maps `info_hash_hex` → currently-active `MoveJobId`. Prevents
+    /// concurrent moves of the same torrent (the relocating_torrents
+    /// guard catches this for the legacy path; this is the new
+    /// equivalent).
+    torrent_move_jobs: std.StringHashMap(MoveJobId) = undefined,
+
     /// Shared resume DB for category/tag persistence. Opened once, shared
     /// with all sessions. null if no resume_db_path is configured.
     resume_db: ?ResumeDb = null,
@@ -86,6 +106,8 @@ pub const SessionManager = struct {
             .tag_store = TagStore.init(allocator),
             .queue_manager = QueueManager.init(allocator),
             .relocating_torrents = std.AutoHashMap([40]u8, void).init(allocator),
+            .move_jobs = std.AutoHashMap(MoveJobId, *MoveJob).init(allocator),
+            .torrent_move_jobs = std.StringHashMap(MoveJobId).init(allocator),
         };
     }
 
@@ -154,6 +176,17 @@ pub const SessionManager = struct {
         self.tag_store.deinit();
         self.queue_manager.deinit();
         self.relocating_torrents.deinit();
+
+        // Move jobs: cancel any still-running jobs and join their
+        // worker threads before destroying them. The destroy() call
+        // already joins, so iterating is sufficient.
+        var jobs_it = self.move_jobs.iterator();
+        while (jobs_it.next()) |entry| {
+            entry.value_ptr.*.requestCancel();
+            entry.value_ptr.*.destroy();
+        }
+        self.move_jobs.deinit();
+        self.torrent_move_jobs.deinit();
         if (self.ban_list) |bl| {
             bl.deinit();
             self.allocator.destroy(bl);
@@ -948,120 +981,135 @@ pub const SessionManager = struct {
         session.rebuildTagsString();
     }
 
-    /// Relocate torrent data to a new path. Pauses the torrent, moves files,
-    /// and updates the save_path. The actual file move is done on the calling
-    /// thread (which is the RPC handler thread, not the event loop).
-    pub fn setLocation(self: *SessionManager, hash: []const u8, new_path: []const u8) !void {
+    /// Start an async file-move job. Returns the assigned job id
+    /// immediately; the caller polls `getMoveJobProgress(id)` until
+    /// the job is in a terminal state (`succeeded` / `failed` /
+    /// `canceled`) and then calls `commitMoveJob(id)` to update the
+    /// torrent's save_path and `forgetMoveJob(id)` to free the job
+    /// record.
+    ///
+    /// Pauses the torrent before starting the move (matching legacy
+    /// setLocation semantics) and unpauses it on terminal success.
+    /// On failure or cancel, the torrent stays paused so the operator
+    /// can investigate without spurious peer-wire activity.
+    pub fn startMoveJob(self: *SessionManager, hash: []const u8, new_path: []const u8) !MoveJobId {
         self.mutex.lock();
+        defer self.mutex.unlock();
 
         const session = self.sessions.get(hash) orelse return error.TorrentNotFound;
-        if (self.relocating_torrents.contains(session.info_hash_hex)) {
-            self.mutex.unlock();
+        if (self.torrent_move_jobs.contains(&session.info_hash_hex)) {
             return error.TorrentBusy;
         }
-        try self.relocating_torrents.put(session.info_hash_hex, {});
-        const was_active = session.state == .downloading or session.state == .seeding;
-        const info_hash_hex = session.info_hash_hex;
+        if (self.relocating_torrents.contains(session.info_hash_hex)) {
+            return error.TorrentBusy;
+        }
+
         const old_path = try self.allocator.dupe(u8, session.save_path);
         errdefer self.allocator.free(old_path);
 
-        // Pause if active (stop I/O to the files)
-        if (was_active) {
-            session.pause();
-        }
-        self.mutex.unlock();
-        defer self.allocator.free(old_path);
+        // Allocate the job. Pre-validate path arguments before we
+        // touch any session state so a bad request leaves no residue.
+        if (!std.fs.path.isAbsolute(old_path)) return error.SrcPathNotAbsolute;
+        if (!std.fs.path.isAbsolute(new_path)) return error.DstPathNotAbsolute;
 
-        // Move files from old save_path to new_path
-        moveDataFiles(old_path, new_path) catch |err| {
-            self.mutex.lock();
-            defer self.mutex.unlock();
-            _ = self.relocating_torrents.remove(info_hash_hex);
-            if (self.sessions.get(hash)) |live_session| {
-                if (was_active and live_session.state != .queued) {
-                    live_session.unpause();
-                }
-            }
-            return err;
-        };
+        const id = self.next_move_job_id;
+        self.next_move_job_id += 1;
 
-        self.mutex.lock();
-        defer self.mutex.unlock();
-        _ = self.relocating_torrents.remove(info_hash_hex);
-        const live_session = self.sessions.get(hash) orelse return error.TorrentNotFound;
+        const job = try MoveJob.create(self.allocator, id, old_path, new_path);
+        // After hand-off MoveJob owns its own copies of the paths.
+        errdefer job.destroy();
 
-        // Update save_path
-        const owned_new_path = try self.allocator.dupe(u8, new_path);
-        self.allocator.free(live_session.save_path);
-        live_session.save_path = owned_new_path;
+        try self.move_jobs.put(id, job);
+        errdefer _ = self.move_jobs.remove(id);
+        try self.torrent_move_jobs.put(&session.info_hash_hex, id);
+        errdefer _ = self.torrent_move_jobs.remove(&session.info_hash_hex);
 
-        // Resume if it was active
-        if (was_active) {
-            live_session.unpause();
-        }
+        // Pause the torrent so the move doesn't race ongoing writes.
+        const was_active = session.state == .downloading or session.state == .seeding;
+        if (was_active) session.pause();
+
+        // Spawn the worker. No completion callback — clients poll for
+        // the terminal state and then call commitMoveJob to apply the
+        // save-path update synchronously under the SessionManager mutex.
+        try job.start(null, null);
+
+        // The temporary `old_path` was duped into the job; free our copy.
+        self.allocator.free(old_path);
+        return id;
     }
 
-    /// Move all files and subdirectories from src to dst using standard fs ops.
-    /// This is a one-time operation, not hot-path -- standard I/O is acceptable.
-    fn moveDataFiles(src: []const u8, dst: []const u8) !void {
-        // Ensure destination directory exists
-        std.fs.makeDirAbsolute(dst) catch |err| switch (err) {
-            error.PathAlreadyExists => {},
-            else => return err,
-        };
+    /// Snapshot a job's current progress. Returns
+    /// `error.JobNotFound` if the id is unknown.
+    pub fn getMoveJobProgress(self: *SessionManager, id: MoveJobId) !MoveJobProgress {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        const job = self.move_jobs.get(id) orelse return error.JobNotFound;
+        return job.progress();
+    }
 
-        // Try rename first (fast path: same filesystem)
-        // We need to iterate src and rename each entry
-        var dir = std.fs.openDirAbsolute(src, .{ .iterate = true }) catch return error.SourceNotFound;
-        defer dir.close();
+    /// Request cancellation of a running job. Idempotent. Returns
+    /// `error.JobNotFound` if the id is unknown.
+    pub fn cancelMoveJob(self: *SessionManager, id: MoveJobId) !void {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        const job = self.move_jobs.get(id) orelse return error.JobNotFound;
+        job.requestCancel();
+    }
 
-        var iter = dir.iterate();
-        while (iter.next() catch return error.IterateFailed) |entry| {
-            // Build full paths
-            var src_buf: [4096]u8 = undefined;
-            var dst_buf: [4096]u8 = undefined;
+    /// Apply the destination path to the torrent's `save_path` and
+    /// unpause the session if it was previously active. Caller must
+    /// only invoke this after the job reaches `.succeeded`. Returns
+    /// `error.JobNotFound`, `error.JobNotFinished`, or
+    /// `error.TorrentNotFound`.
+    pub fn commitMoveJob(self: *SessionManager, id: MoveJobId) !void {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        const job = self.move_jobs.get(id) orelse return error.JobNotFound;
+        const p = job.progress();
+        if (p.state != .succeeded) return error.JobNotFinished;
 
-            const src_path = std.fmt.bufPrint(&src_buf, "{s}/{s}", .{ src, entry.name }) catch continue;
-            const dst_path = std.fmt.bufPrint(&dst_buf, "{s}/{s}", .{ dst, entry.name }) catch continue;
+        // Find the torrent that this job was for. We don't keep a
+        // direct back-pointer on the job (it's intentionally
+        // ignorant of session ownership); look it up by reverse-
+        // mapping torrent_move_jobs.
+        var iter = self.torrent_move_jobs.iterator();
+        while (iter.next()) |entry| {
+            if (entry.value_ptr.* == id) {
+                const hash = entry.key_ptr.*;
+                const session = self.sessions.get(hash) orelse return error.TorrentNotFound;
+                const was_active = session.state == .paused;
 
-            // Try rename (works if same filesystem)
-            std.fs.renameAbsolute(src_path, dst_path) catch {
-                // Cross-filesystem: copy + delete
-                if (entry.kind == .directory) {
-                    // Recursively move subdirectory
-                    moveDataFiles(src_path, dst_path) catch continue;
-                    std.fs.deleteDirAbsolute(src_path) catch {};
-                } else {
-                    // Copy file using read/write loop
-                    const src_file = std.fs.openFileAbsolute(src_path, .{}) catch continue;
-                    defer src_file.close();
-                    const dst_file = std.fs.createFileAbsolute(dst_path, .{}) catch continue;
-                    defer dst_file.close();
+                const owned_new_path = try self.allocator.dupe(u8, job.dst_root);
+                self.allocator.free(session.save_path);
+                session.save_path = owned_new_path;
 
-                    var copy_buf: [65536]u8 = undefined;
-                    var copy_ok = true;
-                    while (true) {
-                        const bytes_read = std.posix.read(src_file.handle, &copy_buf) catch {
-                            copy_ok = false;
-                            break;
-                        };
-                        if (bytes_read == 0) break;
-                        var written: usize = 0;
-                        while (written < bytes_read) {
-                            const w = std.posix.write(dst_file.handle, copy_buf[written..bytes_read]) catch {
-                                copy_ok = false;
-                                break;
-                            };
-                            written += w;
-                        }
-                        if (!copy_ok) break;
-                    }
-                    if (copy_ok) {
-                        std.fs.deleteFileAbsolute(src_path) catch {};
-                    }
-                }
-            };
+                _ = self.torrent_move_jobs.remove(hash);
+                if (was_active) session.unpause();
+                return;
+            }
         }
+        return error.TorrentNotFound;
+    }
+
+    /// Free a finished job's bookkeeping. Returns `error.JobNotFound`
+    /// if the id is unknown, or `error.JobStillRunning` if the worker
+    /// thread hasn't exited yet (caller should `cancelMoveJob` first).
+    pub fn forgetMoveJob(self: *SessionManager, id: MoveJobId) !void {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        const job = self.move_jobs.get(id) orelse return error.JobNotFound;
+        const p = job.progress();
+        if (p.state == .running or p.state == .created) return error.JobStillRunning;
+        // Drop the reverse mapping if it still points here.
+        var iter = self.torrent_move_jobs.iterator();
+        while (iter.next()) |entry| {
+            if (entry.value_ptr.* == id) {
+                _ = self.torrent_move_jobs.remove(entry.key_ptr.*);
+                break;
+            }
+        }
+        _ = self.move_jobs.remove(id);
+        job.destroy();
     }
 
     pub fn count(self: *SessionManager) usize {
