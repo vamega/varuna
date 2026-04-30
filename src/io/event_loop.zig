@@ -1424,11 +1424,27 @@ pub fn EventLoopOf(comptime IO: type) type {
             );
             errdefer posix.close(fd);
 
-            // Allow address reuse
-            posix.setsockopt(fd, posix.SOL.SOCKET, posix.SO.REUSEADDR, &std.mem.toBytes(@as(c_int, 1))) catch {};
+            // Allow address reuse. Routes through `IORING_OP_URING_CMD`
+            // + `SOCKET_URING_OP_SETSOCKOPT` on kernel ≥6.7
+            // (`feature_support.supports_setsockopt == true`); sync
+            // `posix.setsockopt(2)` fallback otherwise. Best-effort —
+            // log on failure but proceed (matching prior behaviour).
+            const reuse_one = std.mem.toBytes(@as(c_int, 1));
+            io_interface.setsockoptBlocking(&self.io, .{
+                .fd = fd,
+                .level = posix.SOL.SOCKET,
+                .optname = posix.SO.REUSEADDR,
+                .optval = &reuse_one,
+            }) catch {};
 
             // Disable IPV6_V6ONLY so IPv4 connections arrive as IPv4-mapped addresses.
-            posix.setsockopt(fd, linux.IPPROTO.IPV6, linux.IPV6.V6ONLY, &std.mem.toBytes(@as(c_int, 0))) catch {};
+            const v6only_zero = std.mem.toBytes(@as(c_int, 0));
+            io_interface.setsockoptBlocking(&self.io, .{
+                .fd = fd,
+                .level = linux.IPPROTO.IPV6,
+                .optname = linux.IPV6.V6ONLY,
+                .optval = &v6only_zero,
+            }) catch {};
 
             // Apply SO_BINDTODEVICE if configured (keeps traffic on a specific interface).
             if (self.bind_device) |device| {
@@ -1444,7 +1460,11 @@ pub fn EventLoopOf(comptime IO: type) type {
                 0, // flowinfo
                 0, // scope_id
             );
-            try posix.bind(fd, &bind_addr.any, bind_addr.getOsSockLen());
+            // Routes through `IORING_OP_BIND` on kernel ≥6.11
+            // (`feature_support.supports_bind == true`); on older
+            // kernels the contract method falls back to `posix.bind(2)`
+            // inline. See `io_interface.bindBlocking`.
+            try io_interface.bindBlocking(&self.io, .{ .fd = fd, .addr = bind_addr });
 
             self.udp_fd = fd;
 
@@ -1504,14 +1524,21 @@ pub fn EventLoopOf(comptime IO: type) type {
             errdefer posix.close(fd);
 
             const one: u32 = 1;
-            posix.setsockopt(fd, posix.SOL.SOCKET, posix.SO.REUSEADDR, std.mem.asBytes(&one)) catch {};
+            io_interface.setsockoptBlocking(&self.io, .{
+                .fd = fd,
+                .level = posix.SOL.SOCKET,
+                .optname = posix.SO.REUSEADDR,
+                .optval = std.mem.asBytes(&one),
+            }) catch {};
 
             if (self.bind_device) |device| {
                 try socket_util.applyBindDevice(fd, device);
             }
 
-            try posix.bind(fd, &addr.any, addr.getOsSockLen());
-            try posix.listen(fd, 128);
+            // Routes through io_uring on kernel ≥6.11; sync fallback
+            // otherwise. See `io_interface.bindBlocking`.
+            try io_interface.bindBlocking(&self.io, .{ .fd = fd, .addr = addr });
+            try io_interface.listenBlocking(&self.io, .{ .fd = fd, .backlog = 128 });
 
             self.listen_fd = fd;
             try self.submitAccept();

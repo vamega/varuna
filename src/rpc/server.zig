@@ -84,17 +84,25 @@ pub const ApiServer = struct {
         );
         errdefer posix.close(fd);
 
-        // SO_REUSEADDR
+        // SO_REUSEADDR. Routes through io_uring URING_CMD setsockopt on
+        // kernel ≥6.7 (`feature_support.supports_setsockopt == true`),
+        // sync `posix.setsockopt(2)` fallback otherwise.
         const enable: u32 = 1;
-        try posix.setsockopt(fd, posix.SOL.SOCKET, posix.SO.REUSEADDR, std.mem.asBytes(&enable));
+        try io_interface.setsockoptBlocking(io, .{
+            .fd = fd,
+            .level = posix.SOL.SOCKET,
+            .optname = posix.SO.REUSEADDR,
+            .optval = std.mem.asBytes(&enable),
+        });
 
         // SO_BINDTODEVICE if configured
         if (bind_device) |device| {
             try socket_util.applyBindDevice(fd, device);
         }
 
-        try posix.bind(fd, &addr.any, addr.getOsSockLen());
-        try posix.listen(fd, 128);
+        // Routes through io_uring on kernel ≥6.11; sync fallback otherwise.
+        try io_interface.bindBlocking(io, .{ .fd = fd, .addr = addr });
+        try io_interface.listenBlocking(io, .{ .fd = fd, .backlog = 128 });
 
         var server: ApiServer = .{
             .io = io,
