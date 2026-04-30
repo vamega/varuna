@@ -182,6 +182,9 @@ pub const RealIO = struct {
             .socket => |op| try self.socket(op, c, userdata, callback),
             .connect => |op| try self.connect(op, c, userdata, callback),
             .accept => |op| try self.accept(op, c, userdata, callback),
+            .bind => |op| try self.bind(op, c, userdata, callback),
+            .listen => |op| try self.listen(op, c, userdata, callback),
+            .setsockopt => |op| try self.setsockopt(op, c, userdata, callback),
             .timeout => |op| try self.timeout(op, c, userdata, callback),
             .poll => |op| try self.poll(op, c, userdata, callback),
             .cancel => |op| try self.cancel(op, c, userdata, callback),
@@ -351,6 +354,153 @@ pub const RealIO = struct {
         _ = sqe;
     }
 
+    /// `bind` dispatches based on the kernel's `IORING_OP_BIND` support,
+    /// probed at init via `IORING_REGISTER_PROBE`:
+    ///
+    ///   * **Async path** (kernel ≥6.11, `feature_support.supports_bind
+    ///     == true`): submit `IORING_OP_BIND`. The CQE flows through
+    ///     `dispatchCqe` and `buildResult` returns `voidOrError(cqe)`
+    ///     for `.bind`. The `BindOp.addr` value lives inside
+    ///     `Completion.op` (a tagged-union variant), so its address is
+    ///     stable while the SQE is in flight — the kernel reads
+    ///     `addr.any` asynchronously.
+    ///
+    ///   * **Sync path** (kernel <6.11): fall back to `posix.bind(2)`
+    ///     and fire the callback inline. Mirrors the `truncate`
+    ///     fallback shape — clears `in_flight` before invoking the
+    ///     callback so a callback that re-submits a new op on the same
+    ///     completion doesn't trip `error.AlreadyInFlight` against
+    ///     itself, and uses an inner loop rather than recursing through
+    ///     `resubmit` to dodge the inferred-error-set cycle.
+    ///
+    /// Daemon callers today are listen-socket bring-up paths
+    /// (`event_loop.zig` peer / uTP listeners, `rpc/server.zig` API
+    /// listener). Those run once at startup; the operational gain from
+    /// async dispatch is small (bind is a fast in-kernel op with no I/O
+    /// wait) but routing through the contract method gives uniform
+    /// FeatureSupport-gated behaviour and primes the path for any
+    /// future runtime rebind.
+    pub fn bind(self: *RealIO, op_in: ifc.BindOp, c: *Completion, ud: ?*anyopaque, cb: Callback) !void {
+        if (self.feature_support.supports_bind) {
+            try self.armCompletion(c, .{ .bind = op_in }, ud, cb);
+            // The op is now stored inside `c.op.bind`; read the addr
+            // from there so the pointer the kernel sees outlives this
+            // function. (Reading from `op_in` would be wrong: that's a
+            // by-value parameter on the stack.)
+            const stored = &c.op.bind;
+            const addrlen = stored.addr.getOsSockLen();
+            const sqe = try self.ring.bind(@intFromPtr(c), stored.fd, &stored.addr.any, addrlen, 0);
+            _ = sqe;
+            return;
+        }
+
+        var op = op_in;
+        while (true) {
+            try self.armCompletion(c, .{ .bind = op }, ud, cb);
+
+            const result: Result = if (posix.bind(op.fd, &op.addr.any, op.addr.getOsSockLen())) |_|
+                .{ .bind = {} }
+            else |err|
+                .{ .bind = err };
+
+            realState(c).in_flight = false;
+            const action = cb(ud, c, result);
+            switch (action) {
+                .disarm => return,
+                .rearm => switch (c.op) {
+                    .bind => |new_op| op = new_op,
+                    else => return,
+                },
+            }
+        }
+    }
+
+    /// `listen` mirrors `bind`: branches on
+    /// `feature_support.supports_listen` (kernel ≥6.11 →
+    /// `IORING_OP_LISTEN`, else `posix.listen(2)` inline).
+    pub fn listen(self: *RealIO, op_in: ifc.ListenOp, c: *Completion, ud: ?*anyopaque, cb: Callback) !void {
+        if (self.feature_support.supports_listen) {
+            try self.armCompletion(c, .{ .listen = op_in }, ud, cb);
+            const sqe = try self.ring.listen(@intFromPtr(c), op_in.fd, op_in.backlog, 0);
+            _ = sqe;
+            return;
+        }
+
+        var op = op_in;
+        while (true) {
+            try self.armCompletion(c, .{ .listen = op }, ud, cb);
+
+            const result: Result = if (posix.listen(op.fd, op.backlog)) |_|
+                .{ .listen = {} }
+            else |err|
+                .{ .listen = err };
+
+            realState(c).in_flight = false;
+            const action = cb(ud, c, result);
+            switch (action) {
+                .disarm => return,
+                .rearm => switch (c.op) {
+                    .listen => |new_op| op = new_op,
+                    else => return,
+                },
+            }
+        }
+    }
+
+    /// `setsockopt` dispatches based on `feature_support.supports_setsockopt`,
+    /// which corresponds to `IORING_OP_URING_CMD` support (the carrier
+    /// op for the `SOCKET_URING_OP_SETSOCKOPT` subcmd, kernel ≥6.7):
+    ///
+    ///   * **Async path** (URING_CMD supported): submit a `URING_CMD`
+    ///     SQE with the `SETSOCKOPT` subcmd via `IoUring.setsockopt`.
+    ///     The kernel reads the `optval` buffer asynchronously, so the
+    ///     caller MUST keep the slice alive until the callback fires.
+    ///     Storing it in `c.op.setsockopt.optval` (the tagged-union
+    ///     variant inside the completion) gives the right lifetime.
+    ///     Note: `supports_setsockopt = true` is a *necessary* condition
+    ///     for the SETSOCKOPT subcmd but not sufficient — the kernel may
+    ///     still return `ENOTSUP`/`EINVAL` for the subcmd itself if it
+    ///     pre-dates 6.7. Callers must handle that at completion time.
+    ///
+    ///   * **Sync path** (URING_CMD unsupported): fall back to
+    ///     `posix.setsockopt(2)` inline. Same loop+rearm shape as
+    ///     `bind`/`listen`/`truncate`.
+    pub fn setsockopt(self: *RealIO, op_in: ifc.SetsockoptOp, c: *Completion, ud: ?*anyopaque, cb: Callback) !void {
+        if (self.feature_support.supports_setsockopt) {
+            try self.armCompletion(c, .{ .setsockopt = op_in }, ud, cb);
+            const stored = &c.op.setsockopt;
+            const sqe = try self.ring.setsockopt(
+                @intFromPtr(c),
+                stored.fd,
+                stored.level,
+                stored.optname,
+                stored.optval,
+            );
+            _ = sqe;
+            return;
+        }
+
+        var op = op_in;
+        while (true) {
+            try self.armCompletion(c, .{ .setsockopt = op }, ud, cb);
+
+            const result: Result = if (posix.setsockopt(op.fd, @intCast(op.level), op.optname, op.optval)) |_|
+                .{ .setsockopt = {} }
+            else |err|
+                .{ .setsockopt = err };
+
+            realState(c).in_flight = false;
+            const action = cb(ud, c, result);
+            switch (action) {
+                .disarm => return,
+                .rearm => switch (c.op) {
+                    .setsockopt => |new_op| op = new_op,
+                    else => return,
+                },
+            }
+        }
+    }
+
     pub fn timeout(self: *RealIO, op: ifc.TimeoutOp, c: *Completion, ud: ?*anyopaque, cb: Callback) !void {
         try self.armCompletion(c, .{ .timeout = op }, ud, cb);
         const st = realState(c);
@@ -414,6 +564,15 @@ fn buildResult(op: Operation, cqe: linux.io_uring_cqe) Result {
         .socket => .{ .socket = fdOrError(cqe) },
         .connect => .{ .connect = voidOrError(cqe) },
         .accept => .{ .accept = acceptResult(cqe) },
+        // Bind / listen / setsockopt either come back from the async
+        // ring (kernel ≥6.11 for bind/listen, ≥6.7 for setsockopt) or
+        // never reach `dispatchCqe` because the sync fallback fired the
+        // callback inline. Either way, when the CQE *does* land we
+        // translate it the same way as fallocate / fsync — `0` on
+        // success, negative errno on failure.
+        .bind => .{ .bind = voidOrError(cqe) },
+        .listen => .{ .listen = voidOrError(cqe) },
+        .setsockopt => .{ .setsockopt = voidOrError(cqe) },
         .timeout => .{ .timeout = timeoutResult(cqe) },
         .poll => .{ .poll = pollResult(cqe) },
         .cancel => .{ .cancel = cancelResult(cqe) },
@@ -805,4 +964,138 @@ test "RealIO truncate shrinks file via async path" {
     }
     const stat = try posix.fstat(file.handle);
     try testing.expectEqual(@as(@TypeOf(stat.size), 4), stat.size);
+}
+
+test "RealIO bind on a fresh socket via the runtime-detected path" {
+    // Mirror of the truncate test: the bind path branches on
+    // `feature_support.supports_bind`. On 6.11+ kernels we submit
+    // IORING_OP_BIND; the CQE flows through dispatchCqe and the test
+    // must `tick(1)`. On older kernels the synchronous fallback fires
+    // the callback inline and no tick is needed. Either way the bind
+    // must succeed against an ephemeral 127.0.0.1:0 address.
+    var io = try skipIfUnavailable();
+    defer io.deinit();
+
+    const fd = try posix.socket(posix.AF.INET, posix.SOCK.STREAM | posix.SOCK.CLOEXEC, posix.IPPROTO.TCP);
+    defer posix.close(fd);
+    const addr = try std.net.Address.parseIp4("127.0.0.1", 0);
+
+    var c = Completion{};
+    var ctx = TestCtx{};
+    try io.bind(.{ .fd = fd, .addr = addr }, &c, &ctx, testCallback);
+    if (ctx.calls == 0) try io.tick(1);
+
+    try testing.expectEqual(@as(u32, 1), ctx.calls);
+    switch (ctx.last_result.?) {
+        .bind => |r| try r,
+        else => try testing.expect(false),
+    }
+}
+
+test "RealIO bind delivers EADDRINUSE for double-bind via async path" {
+    var io = try skipIfUnavailable();
+    defer io.deinit();
+    if (!io.feature_support.supports_bind) return error.SkipZigTest;
+
+    // Take an ephemeral port via a synchronous bind so we have a
+    // concrete `:port` address that's guaranteed in use, then try to
+    // bind a second socket to it via the async ring path.
+    const taker = try posix.socket(posix.AF.INET, posix.SOCK.STREAM | posix.SOCK.CLOEXEC, posix.IPPROTO.TCP);
+    defer posix.close(taker);
+    const ephemeral = try std.net.Address.parseIp4("127.0.0.1", 0);
+    try posix.bind(taker, &ephemeral.any, ephemeral.getOsSockLen());
+
+    var taken_addr: posix.sockaddr = undefined;
+    var taken_len: posix.socklen_t = @sizeOf(posix.sockaddr);
+    try posix.getsockname(taker, &taken_addr, &taken_len);
+    const concrete = std.net.Address{ .any = taken_addr };
+
+    const second = try posix.socket(posix.AF.INET, posix.SOCK.STREAM | posix.SOCK.CLOEXEC, posix.IPPROTO.TCP);
+    defer posix.close(second);
+    var c = Completion{};
+    var ctx = TestCtx{};
+    try io.bind(.{ .fd = second, .addr = concrete }, &c, &ctx, testCallback);
+    try testing.expectEqual(@as(u32, 0), ctx.calls); // async: no inline fire
+    try io.tick(1);
+
+    try testing.expectEqual(@as(u32, 1), ctx.calls);
+    switch (ctx.last_result.?) {
+        .bind => |r| try testing.expectError(error.AddressInUse, r),
+        else => try testing.expect(false),
+    }
+}
+
+test "RealIO listen on a bound socket via the runtime-detected path" {
+    var io = try skipIfUnavailable();
+    defer io.deinit();
+
+    const fd = try posix.socket(posix.AF.INET, posix.SOCK.STREAM | posix.SOCK.CLOEXEC, posix.IPPROTO.TCP);
+    defer posix.close(fd);
+    const addr = try std.net.Address.parseIp4("127.0.0.1", 0);
+    try posix.bind(fd, &addr.any, addr.getOsSockLen());
+
+    var c = Completion{};
+    var ctx = TestCtx{};
+    try io.listen(.{ .fd = fd, .backlog = 16 }, &c, &ctx, testCallback);
+    if (ctx.calls == 0) try io.tick(1);
+
+    try testing.expectEqual(@as(u32, 1), ctx.calls);
+    switch (ctx.last_result.?) {
+        .listen => |r| try r,
+        else => try testing.expect(false),
+    }
+}
+
+test "RealIO setsockopt SO_REUSEADDR via the runtime-detected path" {
+    var io = try skipIfUnavailable();
+    defer io.deinit();
+
+    const fd = try posix.socket(posix.AF.INET, posix.SOCK.STREAM | posix.SOCK.CLOEXEC, posix.IPPROTO.TCP);
+    defer posix.close(fd);
+
+    const enable = std.mem.toBytes(@as(c_int, 1));
+    var c = Completion{};
+    var ctx = TestCtx{};
+    try io.setsockopt(.{
+        .fd = fd,
+        .level = posix.SOL.SOCKET,
+        .optname = posix.SO.REUSEADDR,
+        .optval = &enable,
+    }, &c, &ctx, testCallback);
+    if (ctx.calls == 0) try io.tick(1);
+
+    try testing.expectEqual(@as(u32, 1), ctx.calls);
+    switch (ctx.last_result.?) {
+        // URING_CMD setsockopt may surface ENOTSUP / EINVAL when the
+        // kernel supports URING_CMD but not the SETSOCKOPT subcmd
+        // (probe gives a necessary but not sufficient signal — see
+        // FeatureSupport.supports_setsockopt). Accept either success
+        // or those two specific errors.
+        .setsockopt => |r| r catch |e| switch (e) {
+            error.OperationNotSupported, error.InvalidArgument => {},
+            else => return e,
+        },
+        else => try testing.expect(false),
+    }
+}
+
+test "bindBlocking helper round-trips on RealIO" {
+    var io = try skipIfUnavailable();
+    defer io.deinit();
+
+    const fd = try posix.socket(posix.AF.INET, posix.SOCK.STREAM | posix.SOCK.CLOEXEC, posix.IPPROTO.TCP);
+    defer posix.close(fd);
+    const addr = try std.net.Address.parseIp4("127.0.0.1", 0);
+
+    try ifc.bindBlocking(&io, .{ .fd = fd, .addr = addr });
+    try ifc.listenBlocking(&io, .{ .fd = fd, .backlog = 8 });
+
+    // Confirm the socket is in LISTEN by trying to connect from a
+    // sibling client socket.
+    var taken_addr: posix.sockaddr = undefined;
+    var taken_len: posix.socklen_t = @sizeOf(posix.sockaddr);
+    try posix.getsockname(fd, &taken_addr, &taken_len);
+    const client_fd = try posix.socket(posix.AF.INET, posix.SOCK.STREAM | posix.SOCK.CLOEXEC, posix.IPPROTO.TCP);
+    defer posix.close(client_fd);
+    try posix.connect(client_fd, &taken_addr, taken_len);
 }

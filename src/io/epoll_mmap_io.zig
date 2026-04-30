@@ -350,6 +350,9 @@ pub const EpollMmapIO = struct {
             .socket => |op| try self.socket(op, c, userdata, callback),
             .connect => |op| try self.connect(op, c, userdata, callback),
             .accept => |op| try self.accept(op, c, userdata, callback),
+            .bind => |op| try self.bind(op, c, userdata, callback),
+            .listen => |op| try self.listen(op, c, userdata, callback),
+            .setsockopt => |op| try self.setsockopt(op, c, userdata, callback),
             .timeout => |op| try self.timeout(op, c, userdata, callback),
             .poll => |op| try self.poll(op, c, userdata, callback),
             .cancel => |op| try self.cancel(op, c, userdata, callback),
@@ -546,6 +549,76 @@ pub const EpollMmapIO = struct {
                 .disarm => return,
                 .rearm => switch (c.op) {
                     .sendmsg => |new_op| {
+                        op = new_op;
+                        continue;
+                    },
+                    else => return,
+                },
+            }
+        }
+    }
+
+    /// Synchronous fallback. Same shape as `EpollPosixIO.bind`.
+    pub fn bind(self: *EpollMmapIO, op_in: ifc.BindOp, c: *Completion, ud: ?*anyopaque, cb: Callback) !void {
+        var op = op_in;
+        while (true) {
+            try self.armCompletion(c, .{ .bind = op }, ud, cb);
+
+            const result: Result = if (posix.bind(op.fd, &op.addr.any, op.addr.getOsSockLen())) |_|
+                .{ .bind = {} }
+            else |err|
+                .{ .bind = err };
+
+            switch (try self.deliverInline(c, result)) {
+                .disarm => return,
+                .rearm => switch (c.op) {
+                    .bind => |new_op| {
+                        op = new_op;
+                        continue;
+                    },
+                    else => return,
+                },
+            }
+        }
+    }
+
+    pub fn listen(self: *EpollMmapIO, op_in: ifc.ListenOp, c: *Completion, ud: ?*anyopaque, cb: Callback) !void {
+        var op = op_in;
+        while (true) {
+            try self.armCompletion(c, .{ .listen = op }, ud, cb);
+
+            const result: Result = if (posix.listen(op.fd, op.backlog)) |_|
+                .{ .listen = {} }
+            else |err|
+                .{ .listen = err };
+
+            switch (try self.deliverInline(c, result)) {
+                .disarm => return,
+                .rearm => switch (c.op) {
+                    .listen => |new_op| {
+                        op = new_op;
+                        continue;
+                    },
+                    else => return,
+                },
+            }
+        }
+    }
+
+    pub fn setsockopt(self: *EpollMmapIO, op_in: ifc.SetsockoptOp, c: *Completion, ud: ?*anyopaque, cb: Callback) !void {
+        var op = op_in;
+        while (true) {
+            try self.armCompletion(c, .{ .setsockopt = op }, ud, cb);
+
+            const result: Result = if (posix.setsockopt(op.fd, @intCast(op.level), op.optname, op.optval)) |_|
+                .{ .setsockopt = {} }
+            else |err|
+                .{ .setsockopt = err };
+
+            switch (try self.deliverInline(c, result)) {
+                .disarm => return,
+                .rearm => switch (c.op) {
+                    .setsockopt => |new_op| {
                         op = new_op;
                         continue;
                     },

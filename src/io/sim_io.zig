@@ -517,6 +517,9 @@ pub const SimIO = struct {
             .socket => |op| try self.socket(op, c, ud, cb),
             .connect => |op| try self.connect(op, c, ud, cb),
             .accept => |op| try self.accept(op, c, ud, cb),
+            .bind => |op| try self.bind(op, c, ud, cb),
+            .listen => |op| try self.listen(op, c, ud, cb),
+            .setsockopt => |op| try self.setsockopt(op, c, ud, cb),
             .timeout => |op| try self.timeout(op, c, ud, cb),
             .poll => |op| try self.poll(op, c, ud, cb),
             .cancel => |op| try self.cancel(op, c, ud, cb),
@@ -991,6 +994,28 @@ pub const SimIO = struct {
         });
     }
 
+    /// SimIO doesn't model real socket binding, so bind succeeds
+    /// inline. No fault knob today — listener bring-up paths exercise
+    /// this once at startup; the simulator's interesting failures
+    /// happen on the wire (recv/send/connect), not on local-only ops
+    /// like bind/listen/setsockopt.
+    pub fn bind(self: *SimIO, op: ifc.BindOp, c: *Completion, ud: ?*anyopaque, cb: Callback) !void {
+        try self.armCompletion(c, .{ .bind = op }, ud, cb);
+        return self.schedule(c, .{ .bind = {} }, 0);
+    }
+
+    /// Synchronous-success completion. See `bind`.
+    pub fn listen(self: *SimIO, op: ifc.ListenOp, c: *Completion, ud: ?*anyopaque, cb: Callback) !void {
+        try self.armCompletion(c, .{ .listen = op }, ud, cb);
+        return self.schedule(c, .{ .listen = {} }, 0);
+    }
+
+    /// Synchronous-success completion. See `bind`.
+    pub fn setsockopt(self: *SimIO, op: ifc.SetsockoptOp, c: *Completion, ud: ?*anyopaque, cb: Callback) !void {
+        try self.armCompletion(c, .{ .setsockopt = op }, ud, cb);
+        return self.schedule(c, .{ .setsockopt = {} }, 0);
+    }
+
     pub fn timeout(self: *SimIO, op: ifc.TimeoutOp, c: *Completion, ud: ?*anyopaque, cb: Callback) !void {
         try self.armCompletion(c, .{ .timeout = op }, ud, cb);
         return self.schedule(c, .{ .timeout = {} }, op.ns);
@@ -1087,6 +1112,9 @@ fn cancelResultFor(op: Operation) Result {
         .socket => .{ .socket = error.OperationCanceled },
         .connect => .{ .connect = error.OperationCanceled },
         .accept => .{ .accept = error.OperationCanceled },
+        .bind => .{ .bind = error.OperationCanceled },
+        .listen => .{ .listen = error.OperationCanceled },
+        .setsockopt => .{ .setsockopt = error.OperationCanceled },
         .timeout => .{ .timeout = error.OperationCanceled },
         .poll => .{ .poll = error.OperationCanceled },
         .cancel => .{ .cancel = error.OperationCanceled },
@@ -1111,6 +1139,13 @@ fn buggifyResultFor(op: Operation) Result {
         .socket => .{ .socket = error.ProcessFdQuotaExceeded },
         .connect => .{ .connect = error.ConnectionRefused },
         .accept => .{ .accept = error.ConnectionAborted },
+        // bind/listen/setsockopt aren't naturally fault-prone in the
+        // simulator (no I/O wait, no flaky-network surface). Pick
+        // plausible local-failure errnos so callers' switch arms
+        // exercise the error branch when BUGGIFY hits.
+        .bind => .{ .bind = error.AddressInUse },
+        .listen => .{ .listen = error.AddressInUse },
+        .setsockopt => .{ .setsockopt = error.InvalidArgument },
         .timeout => .{ .timeout = error.OperationCanceled },
         .poll => .{ .poll = error.OperationCanceled },
         .cancel => .{ .cancel = error.OperationCanceled },
@@ -1330,6 +1365,79 @@ test "SimIO cancel returns OperationNotFound for unsubmitted target" {
     try testing.expectEqual(@as(u32, 1), ctx.calls);
     switch (ctx.last_result.?) {
         .cancel => |r| try testing.expectError(error.OperationNotFound, r),
+        else => try testing.expect(false),
+    }
+}
+
+test "SimIO bind/listen/setsockopt deliver synchronous-success" {
+    // SimIO doesn't model real socket binding — bind/listen/setsockopt
+    // succeed inline through `schedule(.., 0)` and the result fires on
+    // the next `advance(1)`. This mirrors the truncate path: useful as a
+    // no-fault stub so listener bring-up code under test exercises the
+    // happy path without needing a real ring.
+    var io = try SimIO.init(testing.allocator, .{});
+    defer io.deinit();
+
+    const addr = try std.net.Address.parseIp4("127.0.0.1", 0);
+    var bind_c = Completion{};
+    var listen_c = Completion{};
+    var sso_c = Completion{};
+    var bind_ctx = TestCtx{};
+    var listen_ctx = TestCtx{};
+    var sso_ctx = TestCtx{};
+
+    try io.bind(.{ .fd = 7, .addr = addr }, &bind_c, &bind_ctx, testCallback);
+    try io.listen(.{ .fd = 7, .backlog = 8 }, &listen_c, &listen_ctx, testCallback);
+    const enable = std.mem.toBytes(@as(c_int, 1));
+    try io.setsockopt(.{
+        .fd = 7,
+        .level = 1, // SOL_SOCKET (Linux)
+        .optname = 2, // SO_REUSEADDR (Linux)
+        .optval = &enable,
+    }, &sso_c, &sso_ctx, testCallback);
+
+    try io.advance(1);
+    try testing.expect(bind_ctx.last_result != null);
+    try testing.expect(listen_ctx.last_result != null);
+    try testing.expect(sso_ctx.last_result != null);
+    switch (bind_ctx.last_result.?) {
+        .bind => |r| try r,
+        else => try testing.expect(false),
+    }
+    switch (listen_ctx.last_result.?) {
+        .listen => |r| try r,
+        else => try testing.expect(false),
+    }
+    switch (sso_ctx.last_result.?) {
+        .setsockopt => |r| r catch |e| return e,
+        else => try testing.expect(false),
+    }
+}
+
+test "SimIO bind cancellation delivers OperationCanceled" {
+    // Submit `bind` (deadline 0) and cancel it before `advance` runs.
+    // The cancel pulls the entry out of the heap and delivers
+    // OperationCanceled on the target completion via cancelResultFor —
+    // exercises the bind arm of that switch.
+    var io = try SimIO.init(testing.allocator, .{});
+    defer io.deinit();
+
+    const addr = try std.net.Address.parseIp4("127.0.0.1", 0);
+    var target_c = Completion{};
+    var cancel_c = Completion{};
+    var target_ctx = TestCtx{};
+    var cancel_ctx = TestCtx{};
+
+    try io.bind(.{ .fd = 9, .addr = addr }, &target_c, &target_ctx, testCallback);
+    try io.cancel(.{ .target = &target_c }, &cancel_c, &cancel_ctx, testCallback);
+    try io.advance(1);
+
+    switch (target_ctx.last_result.?) {
+        .bind => |r| try testing.expectError(error.OperationCanceled, r),
+        else => try testing.expect(false),
+    }
+    switch (cancel_ctx.last_result.?) {
+        .cancel => |r| try r,
         else => try testing.expect(false),
     }
 }
