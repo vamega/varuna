@@ -309,6 +309,108 @@ See `progress-reports/2026-04-25-stage2-event-loop-migration.md` for the Stage 2
 - ~~**Daemon graceful shutdown**~~: Fixed. In-flight transfer draining with configurable timeout now ensures clean exit on SIGTERM/SIGINT.
 - `IORING_OP_SETSOCKOPT` (kernel 6.7+), `IORING_OP_BIND`/`LISTEN` (kernel 6.11+) not available on current kernel 6.6. Per-peer setsockopt (TCP_NODELAY, buffer sizes) remains synchronous.
 
+## Last Verified Milestone (2026-04-29 — DHT correctness: KRPC sender_id required + IPv6 outbound + announce_peer storage)
+
+Closes three external-reviewer issues against the DHT subsystem (R1, R2,
+R3 in the parallel-engineer triage). All three were real correctness /
+spec-compliance gaps, not just feature stubs.
+
+**R1 — KRPC sender_id**
+
+`parseQuery` and `parseResponse` initialised `sender_id = undefined`
+and only assigned it when the `id` key was present in the bencoded
+body. Per BEP 5 every KRPC query and response MUST carry the sender's
+20-byte node id; an absent id field is malformed. Today's parser
+silently propagated the `undefined` into `RoutingTable.addNode` /
+`markResponded` — undefined behaviour, real security/correctness bug.
+
+- `src/dht/krpc.zig` — both parsers now track an `id_seen` flag and
+  reject the message with `error.InvalidKrpc` when the key is absent.
+  The single caller (`handleIncoming`) already catches and logs at
+  debug; malformed-but-not-actionable inputs are common in DHT swarms
+  and dropping them is correct.
+
+**R2 — IPv6 outbound (BEP 32 dual-stack)**
+
+`respondFindNode` and `respondGetPeers` previously dropped every IPv6
+node from the closest set with `if (family != AF.INET) continue;`,
+even though the parser already accepted inbound `nodes6`. Per BEP 32 a
+dual-stack DHT must echo IPv6 nodes in `nodes6` (38 bytes per entry:
+20-byte id + 16-byte v6 addr + 2-byte port) alongside `nodes` (26
+bytes per IPv4 entry).
+
+- `src/dht/krpc.zig` — extend the private `encodeResponse` to take
+  optional `nodes6` and `values6` parameters, emitted in lexicographic
+  dict order (id < nodes < nodes6 < token < values < values6) and
+  skipped when empty. Add `encodeFindNodeResponseDual` and a more
+  general `encodeGetPeersResponseFull` public helper. Existing
+  `encodeFindNodeResponse` / `encodeGetPeersResponseValues` /
+  `encodeGetPeersResponseNodes` keep their previous signatures for
+  back-compat.
+- `src/dht/dht.zig` — `respondFindNode` / `respondGetPeers` now split
+  closest-node packing by address family and pass both buffers to the
+  new dual-stack encoder. Send buffer raised from 1024 to 1500 (UDP
+  MTU) so a full v4+v6 set fits.
+
+**R3 — peer storage for announce_peer (BEP 5 §"Peers")**
+
+`respondAnnouncePeer` validated the token, queued a ping reply, and
+discarded the announce. `get_peers` therefore always fell through to
+closest-nodes only — varuna would tell peers "yes, I'll remember you
+announced" and never serve them back, lying to the swarm.
+
+- New `PeerStore` private struct in `src/dht/dht.zig`:
+  - `std.AutoHashMap([20]u8, ArrayListUnmanaged(Entry))`.
+  - 30-min TTL per BEP 5; 100 peers/hash cap; FIFO eviction at cap.
+  - `announce`, `encodeValues`, `sweep`, `peerCount`/`hashCount`
+    (the last two for tests).
+- `respondAnnouncePeer` — after token validation, honour BEP 5's
+  `implied_port` flag (use sender's UDP source port when set, else
+  the announced port), then `peer_store.announce(info_hash, peer_addr)`.
+- `respondGetPeers` — lazy-sweep + look up peers, emit them in
+  `values` (v4) / `values6` (v6), still always include the closest
+  `nodes` / `nodes6` fallback so well-behaved clients can keep
+  iterating.
+- `tick` — also calls `peer_store.sweep` so memory stays bounded
+  even when no `get_peers` query triggers the lazy path.
+
+**Tests**
+
+- `tests/dht_krpc_buggify_test.zig` — 4 R1 tests (query without id
+  rejected, response without id rejected, deterministic round-trip
+  for both), 2 R2 tests (find_node and get_peers responses both emit
+  nodes + nodes6 with correct wire-format byte counts), 6 R3 tests
+  (full announce → store → get_peers round-trip including wire-level
+  values decoding, invalid token does not store, implied_port=1 uses
+  source port, sweep removes expired entries, FIFO eviction at cap,
+  re-announce refreshes expiry without duplicating).
+
+**Verification**
+
+- `nix develop --command zig fmt .` clean.
+- `nix develop --command zig build` green.
+- `nix develop --command zig build test` exit 0. New tests:
+  +12 (4 R1 + 2 R2 + 6 R3) over the prior baseline.
+
+**Predictable conflict zones with parallel `bep52-dht-engineer`**
+
+- `src/dht/dht.zig` — both engineers edited this file. Our changes
+  are confined to the response handlers (`respondFindNode`,
+  `respondGetPeers`, `respondAnnouncePeer`) plus a new private
+  `PeerStore` struct and engine field. R4's changes are in the
+  client-side methods (`requestPeers`, `forceRequery`, `announcePeer`).
+  Different functions; expect trivial line-position conflicts only.
+- `src/dht/krpc.zig` — encoder helpers added (`encodeFindNodeResponseDual`,
+  `encodeGetPeersResponseFull`) and the private `encodeResponse`
+  signature changed from 6 args to 8. R4 work shouldn't touch this
+  surface, so conflicts unlikely.
+- `tests/dht_krpc_buggify_test.zig` — new tests appended at the end of
+  the file. R4 may add tests in a different file (`tests/dht_*_test.zig`).
+- `STATUS.md` — both engineers will add a milestone entry. Standard
+  pattern; R4's entry will appear above ours when they merge.
+
+See `progress-reports/2026-04-29-dht-correctness.md` for the full arc.
+
 ## Last Verified Milestone (2026-04-28 — DNS bind_device cleanup: module-global → explicit Config plumbing)
 
 Closes the "module-level global is a wart" follow-up filed by the
