@@ -333,6 +333,28 @@ pub fn build(b: *std.Build) void {
     );
     test_piece_hash_step.dependOn(&run_piece_hash_lifecycle_tests.step);
 
+    // ── Custom DNS library — Phase F integration tests ───────
+    //
+    // Drives `QueryOf(ScriptedIo)` end-to-end against scripted DNS
+    // server responses. See the test file's module docstring for the
+    // ScriptedIo design rationale (real `AF_UNIX` `SOCK_DGRAM` fds so
+    // `query.zig`'s `posix.close` on deliver doesn't EBADF).
+    const dns_custom_integration_tests = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("tests/dns_custom_integration_test.zig"),
+            .target = target,
+            .optimize = optimize,
+            .imports = &varuna_import,
+        }),
+    });
+    const run_dns_custom_integration_tests = b.addRunArtifact(dns_custom_integration_tests);
+    const test_dns_custom_integration_step = b.step(
+        "test-dns-custom",
+        "Run Phase F end-to-end integration tests for the custom DNS library",
+    );
+    test_dns_custom_integration_step.dependOn(&run_dns_custom_integration_tests.step);
+    test_step.dependOn(&run_dns_custom_integration_tests.step);
+
     // ── SO_BINDTODEVICE tests ────────────────────────────────
     const bind_device_tests = b.addTest(.{
         .root_module = b.createModule(.{
