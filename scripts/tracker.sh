@@ -31,10 +31,25 @@ done
 
 mkdir -p "$TOOLS_DIR" "$RUNTIME_DIR"
 
+# Resolve an opentracker binary. Two paths supported, in priority order:
+#
+#   1. Pre-staged Ubuntu .deb under .tools/opentracker/usr/bin/opentracker
+#      (the original packaging path; uses apt-get + dpkg-deb).
+#   2. `opentracker` on $PATH (covers nix-based environments where the
+#      `nix shell nixpkgs#opentracker` flake adds it directly).
+#
+# This keeps the script portable across both Ubuntu/Debian CI and the
+# nix-based dev shell used by the worktree harness, without forcing a
+# package mirror to be reachable at run time.
 ensure_package() {
   local package="$1"
   local marker="$TOOLS_DIR/.${package}.ready"
   if [[ -f "$marker" ]]; then
+    return
+  fi
+
+  if ! command -v apt-get >/dev/null 2>&1 || ! command -v dpkg-deb >/dev/null 2>&1; then
+    # apt-get path unavailable — fall through to PATH lookup.
     return
   fi
 
@@ -55,6 +70,19 @@ ensure_package() {
 
 ensure_package "libowfat0t64"
 ensure_package "opentracker"
+
+OPENTRACKER_BIN="$TOOLS_DIR/usr/bin/opentracker"
+OPENTRACKER_LIBPATH="$TOOLS_DIR/usr/lib"
+if [[ ! -x "$OPENTRACKER_BIN" ]]; then
+  # Fall back to a system / nix-installed opentracker.
+  if command -v opentracker >/dev/null 2>&1; then
+    OPENTRACKER_BIN="$(command -v opentracker)"
+    OPENTRACKER_LIBPATH=""
+  else
+    echo "tracker.sh: opentracker not found (no apt-get path, not on PATH); install via 'nix shell nixpkgs#opentracker' or apt" >&2
+    exit 1
+  fi
+fi
 
 WHITELIST_FILE="$RUNTIME_DIR/whitelist.txt"
 CONFIG_PATH="$RUNTIME_DIR/opentracker.conf"
@@ -80,7 +108,11 @@ if [[ "${#WHITELIST_HASHES[@]}" -gt 0 ]]; then
 else
   echo "warning: no whitelist hashes configured; this opentracker build will reject announces"
 fi
-exec env \
-  LD_LIBRARY_PATH="$TOOLS_DIR/usr/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}" \
-  "$TOOLS_DIR/usr/bin/opentracker" \
-  -f "$CONFIG_PATH"
+if [[ -n "$OPENTRACKER_LIBPATH" ]]; then
+  exec env \
+    LD_LIBRARY_PATH="$OPENTRACKER_LIBPATH${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}" \
+    "$OPENTRACKER_BIN" \
+    -f "$CONFIG_PATH"
+else
+  exec "$OPENTRACKER_BIN" -f "$CONFIG_PATH"
+fi
