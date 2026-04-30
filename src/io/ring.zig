@@ -103,20 +103,62 @@ pub fn probe() bool {
 }
 
 /// Per-op feature flags determined at ring init via
-/// `IORING_REGISTER_PROBE`. Add fields here as new ops need runtime
-/// detection (e.g. `IORING_OP_BIND`/`LISTEN` at 6.11+,
-/// `IORING_OP_SETSOCKOPT` at 6.7+). The probe runs once per ring; the
-/// result is cached on the backend.
+/// `IORING_REGISTER_PROBE`. The probe runs once per ring; the result
+/// is cached on the backend.
 ///
 /// Default-initialized values are all `false` — i.e. the safe answer
 /// when we cannot determine support, which is what we want every caller
 /// to fall back on.
+///
+/// Add fields here as new ops need runtime detection. Every flag has
+/// the same contract: dispatch the async io_uring SQE when true, fall
+/// back to a synchronous syscall when false. The synchronous fallback
+/// is mandatory — it's how we keep the kernel floor at 6.6/6.8 while
+/// taking advantage of newer ops on backports / custom / newer kernels
+/// without a separate kernel-version arithmetic dance.
 pub const FeatureSupport = struct {
     /// `IORING_OP_FTRUNCATE`, kernel ≥6.9. Below that, RealIO falls
     /// back to a synchronous `posix.ftruncate(2)` (the only daemon
     /// caller is `PieceStore.init`'s filesystem-portability fallback,
     /// which already runs on a background thread).
     supports_ftruncate: bool = false,
+
+    /// `IORING_OP_BIND`, kernel ≥6.11. Below that, daemon callers
+    /// fall back to synchronous `posix.bind(2)`. The relevant call
+    /// sites today live in the listen-socket bring-up paths
+    /// (`src/io/event_loop.zig` peer listener / uTP listener, RPC
+    /// server) — those are one-shot at startup or socket-rebinding
+    /// events, so the synchronous fallback is observably free.
+    supports_bind: bool = false,
+
+    /// `IORING_OP_LISTEN`, kernel ≥6.11. Below that, daemon callers
+    /// fall back to synchronous `posix.listen(2)`. Same call-site
+    /// shape as `supports_bind` — listen runs once per listener at
+    /// startup.
+    supports_listen: bool = false,
+
+    /// `IORING_OP_URING_CMD` with `SOCKET_URING_OP_SETSOCKOPT`
+    /// subcmd, kernel ≥6.7. The kernel exposes setsockopt via a
+    /// URING_CMD subcommand rather than a standalone op, so the
+    /// probe checks `IORING_OP_URING_CMD` support — that's a
+    /// *necessary* condition (URING_CMD itself shipped earlier than
+    /// 6.7) but not sufficient on its own to know whether the
+    /// SETSOCKOPT subcmd is recognised. To get an unambiguous answer
+    /// we'd need to attempt a real URING_CMD setsockopt and check
+    /// for `ENOTSUP` / `EINVAL`, which is overkill for an init-time
+    /// probe. Treat `supports_setsockopt = true` as "URING_CMD is
+    /// available; SETSOCKOPT subcmd may or may not be"; daemon
+    /// callers that submit an actual setsockopt URING_CMD must
+    /// handle the kernel rejecting the subcmd at completion time.
+    /// This is the same pragmatic approach as the truncate flag
+    /// (which trusts the probe absolutely because there's no subcmd
+    /// layer there).
+    ///
+    /// Today no daemon path submits setsockopt via the contract —
+    /// every per-peer setsockopt (TCP_NODELAY, buffer sizes,
+    /// SO_BINDTODEVICE) goes through `posix.setsockopt(2)`. This
+    /// flag is groundwork for the eventual contract op.
+    supports_setsockopt: bool = false,
 
     /// All-false sentinel used when the probe register itself isn't
     /// supported (kernel <5.6) or fails for any other reason. Every op
@@ -135,6 +177,13 @@ pub fn probeFeatures(ring: *linux.IoUring) FeatureSupport {
     const p = ring.get_probe() catch return FeatureSupport.none;
     return .{
         .supports_ftruncate = p.is_supported(.FTRUNCATE),
+        .supports_bind = p.is_supported(.BIND),
+        .supports_listen = p.is_supported(.LISTEN),
+        // URING_CMD is the carrier op for the SETSOCKOPT subcmd
+        // (SOCKET_URING_OP_SETSOCKOPT, kernel 6.7+). Probing
+        // URING_CMD itself is a *necessary* condition only — see
+        // FeatureSupport.supports_setsockopt for the caveat.
+        .supports_setsockopt = p.is_supported(.URING_CMD),
     };
 }
 
@@ -155,13 +204,37 @@ test "probeFeatures runs without panic and returns a FeatureSupport" {
     const features = probeFeatures(&ring);
     // We can't assert a specific value without pinning to a kernel
     // version: a 6.6 kernel reports `supports_ftruncate = false`, a
-    // 6.9+ kernel reports `true`. Either is acceptable.
+    // 6.9+ kernel reports `true`. 6.11+ kernels light up bind/listen
+    // too. Either is acceptable.
     _ = features;
 }
 
 test "probeFeatures FeatureSupport.none has every flag false" {
     const none = FeatureSupport.none;
     try std.testing.expectEqual(false, none.supports_ftruncate);
+    try std.testing.expectEqual(false, none.supports_bind);
+    try std.testing.expectEqual(false, none.supports_listen);
+    try std.testing.expectEqual(false, none.supports_setsockopt);
+}
+
+test "probeFeatures bind/listen/setsockopt are bool-typed and queryable" {
+    // Mirror of the supports_ftruncate runtime-detection test: assert
+    // the new fields exist and are reachable through the same
+    // `probeFeatures(&ring)` shape. Doesn't pin a specific value —
+    // 6.6 kernels report all three false, 6.11+ kernels report
+    // bind/listen true (and 6.7+ reports setsockopt true via the
+    // URING_CMD probe).
+    var ring = skipIfUnavailable() catch return;
+    defer ring.deinit();
+
+    const features = probeFeatures(&ring);
+    // Compile-time assertion that the field types are bool.
+    const _b: bool = features.supports_bind;
+    const _l: bool = features.supports_listen;
+    const _s: bool = features.supports_setsockopt;
+    _ = _b;
+    _ = _l;
+    _ = _s;
 }
 
 test "init and deinit ring" {
