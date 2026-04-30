@@ -235,10 +235,21 @@ fn runScenario(seed: u64, opts: ScenarioOpts) !void {
     }
 
     // ── 5. Drive ticks ─────────────────────────────────────────
+    //
+    // `posix.sched_yield()` after each tick gives the real
+    // hasher OS thread CPU time even under parallel-test-runner
+    // contention (`zig build test` running many test binaries
+    // concurrently). Without the yield, the main loop's tight
+    // iteration burns through `max_ticks` faster than the
+    // hasher's SHA-1 thread gets scheduled, and `isPieceComplete`
+    // never flips true. Once `SimHasher` lands (STATUS Next), this
+    // can drop the yield and the test becomes deterministic
+    // end-to-end.
     var ticks: u32 = 0;
     var disconnected: bool = false;
     while (ticks < max_ticks) : (ticks += 1) {
         try el.tick();
+        _ = std.os.linux.sched_yield(); // give the real hasher OS thread CPU time
 
         // Advance the SimIO clock so latency-throttled completions
         // (recv_latency_ns = 1ms) become eligible on the next tick.
@@ -262,13 +273,20 @@ fn runScenario(seed: u64, opts: ScenarioOpts) !void {
     }
 
     // ── 6. Drain phase (same pattern as Phase 0 EL test) ───────
+    //
+    // Drain budget bumped from 256 → 4096 ticks to absorb the
+    // tail end of in-flight piece-block recvs + hasher SHA work
+    // when the main loop reaches `isPieceComplete=true` while
+    // some blocks are still mid-flight; under load the residual
+    // work can take more than 256 real ticks to settle.
     for (&peers) |*peer| peer.disconnect();
     var drain_ticks: u32 = 0;
-    while (drain_ticks < 256) : (drain_ticks += 1) {
+    while (drain_ticks < 4096) : (drain_ticks += 1) {
         const hasher_busy = if (el.hasher) |h| h.hasPendingWork() else false;
         const writes_pending = el.pending_writes.count() > 0;
         if (!hasher_busy and !writes_pending) break;
         try el.tick();
+        _ = std.os.linux.sched_yield(); // give the real hasher OS thread CPU time
     }
 
     // ── 7. Liveness + safety assertions ────────────────────────
