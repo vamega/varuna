@@ -325,7 +325,10 @@ pub const TorrentSession = struct {
             .piece_count = 0, // unknown until metadata fetched
             .added_on = std.time.timestamp(),
             .peer_id = try peer_id_mod.generate(masquerade_as),
-            .tracker_key = tracker.announce.Request.generateKey(),
+            .tracker_key = blk: {
+                var rng = @import("../runtime/random.zig").Random.realRandom();
+                break :blk tracker.announce.Request.generateKey(&rng);
+            },
             .is_magnet = true,
             .magnet_trackers = if (trackers.len > 0) trackers else null,
         };
@@ -360,7 +363,10 @@ pub const TorrentSession = struct {
             .piece_count = try meta.pieceCount(),
             .added_on = std.time.timestamp(),
             .peer_id = try peer_id_mod.generate(masquerade_as),
-            .tracker_key = tracker.announce.Request.generateKey(),
+            .tracker_key = blk: {
+                var rng = @import("../runtime/random.zig").Random.realRandom();
+                break :blk tracker.announce.Request.generateKey(&rng);
+            },
             .is_private = meta.private,
             .info_hash_v2 = meta.info_hash_v2,
         };

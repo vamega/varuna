@@ -103,7 +103,8 @@ test "announce URL omits event when null (regular re-announce)" {
 // ── Per-session tracker key ─────────────────────────────────
 
 test "generateKey produces 8 hex characters" {
-    const key = announce.Request.generateKey();
+    var rng = varuna.runtime.Random.realRandom();
+    const key = announce.Request.generateKey(&rng);
     try std.testing.expectEqual(@as(usize, 8), key.len);
     for (key) |c| {
         try std.testing.expect((c >= '0' and c <= '9') or (c >= 'a' and c <= 'f'));
@@ -111,10 +112,19 @@ test "generateKey produces 8 hex characters" {
 }
 
 test "generateKey produces different keys on each call" {
-    const key1 = announce.Request.generateKey();
-    const key2 = announce.Request.generateKey();
+    var rng = varuna.runtime.Random.realRandom();
+    const key1 = announce.Request.generateKey(&rng);
+    const key2 = announce.Request.generateKey(&rng);
     // While theoretically they could be equal (1/2^32), it's astronomically unlikely
     try std.testing.expect(!std.mem.eql(u8, &key1, &key2));
+}
+
+test "generateKey is deterministic under sim Random" {
+    var r1 = varuna.runtime.Random.simRandom(0xfeedbeef);
+    var r2 = varuna.runtime.Random.simRandom(0xfeedbeef);
+    const k1 = announce.Request.generateKey(&r1);
+    const k2 = announce.Request.generateKey(&r2);
+    try std.testing.expectEqualSlices(u8, &k1, &k2);
 }
 
 // ── Private flag enforcement (no PEX, no DHT) ──────────────

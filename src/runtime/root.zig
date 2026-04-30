@@ -2,6 +2,8 @@ pub const clock = @import("clock.zig");
 pub const Clock = clock.Clock;
 pub const kernel = @import("kernel.zig");
 pub const probe = @import("probe.zig");
+pub const random = @import("random.zig");
+pub const Random = random.Random;
 pub const requirements = @import("requirements.zig");
 
 // Pull subsystem source-side `test "..."` blocks into the test runner.
@@ -11,5 +13,6 @@ test {
     _ = clock;
     _ = kernel;
     _ = probe;
+    _ = random;
     _ = requirements;
 }

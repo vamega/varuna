@@ -261,7 +261,8 @@ test "build url omits key when not provided" {
 }
 
 test "generate key produces 8 hex characters" {
-    const key = Request.generateKey();
+    var rng = @import("../runtime/random.zig").Random.realRandom();
+    const key = Request.generateKey(&rng);
     try std.testing.expectEqual(@as(usize, 8), key.len);
     for (key) |c| {
         try std.testing.expect((c >= '0' and c <= '9') or (c >= 'a' and c <= 'f'));

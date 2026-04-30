@@ -56,6 +56,8 @@ pub const TorrentContext = types.TorrentContext;
 
 const clock_mod = @import("clock.zig");
 pub const Clock = clock_mod.Clock;
+const random_mod = @import("../runtime/random.zig");
+pub const Random = random_mod.Random;
 
 const cqe_batch_size = 64;
 
@@ -178,6 +180,18 @@ pub fn EventLoopOf(comptime IO: type) type {
         peer_count: u16 = 0,
         running: bool = true,
         clock: Clock = .real,
+        /// Injected randomness for non-cryptographic call paths the
+        /// simulator wants to drive deterministically (UDP tracker
+        /// transaction IDs, smart-ban tie-breaks, jittered delays). The
+        /// default `.real` delegates to `std.crypto.random`. Tests
+        /// driving sim time should also assign a `Random.simRandom(seed)`
+        /// here so retries derived from this RNG are reproducible.
+        ///
+        /// NOT a substitute for `std.crypto.random` in
+        /// security-critical paths (MSE keys, peer ID, DHT node ID,
+        /// DHT tokens, RPC SID — see `runtime/random.zig` for the full
+        /// list).
+        random: Random = .real,
 
         /// Graceful shutdown: when true, the event loop stops accepting new work
         /// and waits for in-flight transfers to complete before setting running=false.

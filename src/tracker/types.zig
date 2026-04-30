@@ -1,4 +1,5 @@
 const std = @import("std");
+const Random = @import("../runtime/random.zig").Random;
 
 pub const Request = struct {
     announce_url: []const u8,
@@ -20,11 +21,15 @@ pub const Request = struct {
         stopped,
     };
 
-    pub fn generateKey() [8]u8 {
+    /// Generate the BEP 3 `key` parameter. The key is a stable
+    /// per-client identifier sent to trackers; predictability isn't a
+    /// security concern, so we route through the runtime `Random`
+    /// abstraction so tests/sim runs see a deterministic key.
+    pub fn generateKey(rng: *Random) [8]u8 {
         const hex = "0123456789abcdef";
         var buf: [8]u8 = undefined;
         var random_bytes: [8]u8 = undefined;
-        std.crypto.random.bytes(&random_bytes);
+        rng.bytes(&random_bytes);
         for (random_bytes, 0..) |byte, i| {
             buf[i] = hex[byte & 0x0f];
         }
