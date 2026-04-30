@@ -269,11 +269,19 @@ pub const EpollMmapIO = struct {
     }
 
     fn computeEpollTimeout(self: *EpollMmapIO, wait_at_least: u32, fired: u32) i32 {
-        if (fired >= wait_at_least and wait_at_least > 0) return 0;
+        // Non-blocking tick: caller wants epoll_pwait to return immediately
+        // regardless of how far away the next timer is. Without this guard,
+        // a future timer's deadline_ns would be returned even for tick(0),
+        // so the kernel would block for that duration (e.g. up to the 30 s
+        // periodic-sync interval) — turning what callers expect to be a
+        // non-blocking sweep into a multi-second hang. Mirrors RealIO's
+        // `submit_and_wait(0)` semantics.
+        if (wait_at_least == 0) return 0;
+        if (fired >= wait_at_least) return 0;
         const next_deadline = if (self.timers.peekMin()) |t|
             epollState(t).deadline_ns
         else
-            return if (wait_at_least == 0) 0 else -1;
+            return -1;
 
         if (next_deadline <= self.cached_now_ns) return 0;
         const ns_remaining = next_deadline - self.cached_now_ns;
