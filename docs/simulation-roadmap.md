@@ -100,13 +100,27 @@ remaining nondeterminism boundaries.
    affected test classes and the build-flag-gated escape hatch
    (option 2) reserved for the day a bug reproduces only under
    specific crypto bytes.
-3. **SimHasher** or hasher-pool refactor (~2-3 days). Today
-   `src/io/hasher.zig` spawns real OS threads via `std.Thread.spawn`.
-   Either make the pool deterministic (workers consume scheduled
-   tasks from the simulator's clock) OR explicitly accept that
-   hashing happens in real threads while the EL stays deterministic.
-   The choice depends on whether tests need to BUGGIFY the hash
-   pipeline.
+3. **SimHasher** — make the hasher deterministic (~2-3 days). Today
+   `src/io/hasher.zig` spawns real OS threads via `std.Thread.spawn`,
+   which is the last source of non-determinism the EL can't control.
+   Workers should consume scheduled tasks from the simulator's clock
+   in test builds, eliminating the thread-spawn boundary entirely. The
+   alternative ("accept real threads, EL stays deterministic") is
+   rejected — leaving real threads in the picture means hashing-
+   related races and re-orderings remain non-reproducible, defeating
+   the point of single-daemon-deterministic simulation.
+
+   Two implementation shapes to evaluate:
+   - **Tagged-union hasher** (mirrors Clock/Random): `Hasher` is a
+     union of `RealHasher` (existing thread pool) and `SimHasher`
+     (synchronous compute on the EL thread, scheduled via SimIO's
+     completion queue). Daemon callers stay on the alias.
+   - **Comptime-parameterized hasher**: `HasherOf(comptime Backend)`
+     (mirrors EventLoopOf, AsyncRecheckOf). Heavier cascade since
+     `AsyncRecheck` and other consumers hold a hasher pointer.
+
+   The tagged-union shape probably wins given the existing
+   Clock/Random precedent and the smaller call-site footprint.
 
 ## Phase 3 — Cluster simulation (future)
 
