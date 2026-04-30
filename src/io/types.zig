@@ -10,6 +10,7 @@ const mse = @import("../crypto/mse.zig");
 const RateLimiter = @import("rate_limiter.zig").RateLimiter;
 const SuperSeedState = @import("super_seed.zig").SuperSeedState;
 const MerkleCache = @import("../torrent/merkle_cache.zig").MerkleCache;
+const LeafHashStore = @import("../torrent/leaf_hashes.zig").LeafHashStore;
 const WebSeedManager = @import("../net/web_seed.zig").WebSeedManager;
 
 // ── Constants ────────────────────────────────────────────
@@ -218,6 +219,11 @@ pub const TorrentContext = struct {
 
     // BEP 52: per-file Merkle tree cache for hash serving
     merkle_cache: ?*MerkleCache = null,
+
+    // BEP 52: per-piece leaf hashes received from peers via the `hashes`
+    // message and verified against the file's pieces_root. Lazily allocated
+    // on first valid response. `null` for v1-only torrents.
+    leaf_hashes: ?*LeafHashStore = null,
 
     // BEP 19: web seed manager (GetRight-style HTTP seeding)
     web_seed_manager: ?*WebSeedManager = null,
