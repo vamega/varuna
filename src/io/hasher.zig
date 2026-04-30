@@ -821,11 +821,195 @@ pub const SimHasher = struct {
     }
 };
 
-/// Temporary backwards-compat alias. Consumer migration to the
-/// tagged-union `Hasher` happens in a follow-up commit; until then
-/// `Hasher` keeps resolving to the production `RealHasher` so the rest
-/// of the daemon compiles unchanged.
-pub const Hasher = RealHasher;
+/// Tagged-union dispatcher over `RealHasher` (production thread pool)
+/// and `SimHasher` (deterministic single-threaded compute for sim
+/// tests). Mirrors `runtime.Clock` / `runtime.Random`'s tagged-union
+/// shape (Real / Sim variants under one type; consumers stay on the
+/// alias and the simulator drives everything off a seed).
+///
+/// ## Why pointers in the variants
+///
+/// `RealHasher` workers hold a pointer to their parent struct, so the
+/// parent's address must be stable for the lifetime of the pool. A
+/// tagged union of values would put `RealHasher` inline inside the
+/// Hasher allocation — moving a `Hasher` value (an assignment, a
+/// return-by-value, even a defensive `var local = h.*`) would relocate
+/// the workers' parent. Pointers in each variant sidestep that
+/// entirely: the inner struct keeps the address it was created at,
+/// the union just discriminates between pool kinds. SimHasher carries
+/// the pointer for symmetry — the dispatch layer treats both backends
+/// the same.
+pub const Hasher = union(enum) {
+    real: *RealHasher,
+    sim: *SimHasher,
+
+    // ── Type re-exports ────────────────────────────────────
+    // Consumers continue to write `Hasher.Result` / `Hasher.MerkleResult`
+    // / `Hasher.VerifyOptions`; both backends share the same record
+    // shapes so we just hoist them up to the union.
+    pub const Result = RealHasher.Result;
+    pub const MerkleResult = RealHasher.MerkleResult;
+    pub const Job = RealHasher.Job;
+    pub const MerkleJob = RealHasher.MerkleJob;
+    pub const VerifyOptions = RealHasher.VerifyOptions;
+
+    // ── Lifecycle ──────────────────────────────────────────
+
+    /// Heap-allocate a Hasher backed by the production thread pool.
+    /// Match RealHasher.create's existing semantics — caller frees the
+    /// outer `*Hasher` with `allocator.destroy` after `deinit`.
+    pub fn realInit(allocator: std.mem.Allocator, thread_count: u32) !*Hasher {
+        const inner = try RealHasher.create(allocator, thread_count);
+        errdefer {
+            inner.deinit();
+            allocator.destroy(inner);
+        }
+        const self = try allocator.create(Hasher);
+        self.* = .{ .real = inner };
+        return self;
+    }
+
+    /// Heap-allocate a Hasher backed by the deterministic sim hasher.
+    /// `seed` drives the fault-injection PRNG — use the same seed your
+    /// sim test driver uses everywhere else for reproducibility.
+    pub fn simInit(allocator: std.mem.Allocator, seed: u64) !*Hasher {
+        const inner = try SimHasher.create(allocator, seed);
+        errdefer {
+            inner.deinit();
+            allocator.destroy(inner);
+        }
+        const self = try allocator.create(Hasher);
+        self.* = .{ .sim = inner };
+        return self;
+    }
+
+    /// Tear down the active variant and its inner allocation. The
+    /// caller must call `allocator.destroy(self)` after this returns
+    /// to free the outer union itself — same shape as the previous
+    /// `RealHasher.deinit + destroy` pattern.
+    pub fn deinit(self: *Hasher) void {
+        switch (self.*) {
+            .real => |h| {
+                const a = h.allocator;
+                h.deinit();
+                a.destroy(h);
+            },
+            .sim => |h| {
+                const a = h.allocator;
+                h.deinit();
+                a.destroy(h);
+            },
+        }
+    }
+
+    // ── Inner-pointer escape hatches ───────────────────────
+
+    /// Return the production hasher pointer if this Hasher is `.real`,
+    /// otherwise null. Reserved for sites that need production-only
+    /// APIs (e.g. eventfd integration with io_uring); the sim backend
+    /// never has an eventfd to register.
+    pub fn realInner(self: *Hasher) ?*RealHasher {
+        return switch (self.*) {
+            .real => |h| h,
+            .sim => null,
+        };
+    }
+
+    /// Return the sim hasher pointer if this Hasher is `.sim`,
+    /// otherwise null. Sim tests use this to reach `setFaults` /
+    /// `setSeed` without pattern-matching the union themselves.
+    pub fn simInner(self: *Hasher) ?*SimHasher {
+        return switch (self.*) {
+            .real => null,
+            .sim => |h| h,
+        };
+    }
+
+    // ── Submission ─────────────────────────────────────────
+
+    pub fn submitVerify(
+        self: *Hasher,
+        slot: u16,
+        piece_index: u32,
+        piece_buf: []u8,
+        expected_hash: [20]u8,
+        torrent_id: u32,
+    ) !void {
+        switch (self.*) {
+            .real => |h| return h.submitVerify(slot, piece_index, piece_buf, expected_hash, torrent_id),
+            .sim => |h| return h.submitVerify(slot, piece_index, piece_buf, expected_hash, torrent_id),
+        }
+    }
+
+    pub fn submitVerifyEx(
+        self: *Hasher,
+        slot: u16,
+        piece_index: u32,
+        piece_buf: []u8,
+        expected_hash: [20]u8,
+        torrent_id: u32,
+        opts: VerifyOptions,
+    ) !void {
+        switch (self.*) {
+            .real => |h| return h.submitVerifyEx(slot, piece_index, piece_buf, expected_hash, torrent_id, opts),
+            .sim => |h| return h.submitVerifyEx(slot, piece_index, piece_buf, expected_hash, torrent_id, opts),
+        }
+    }
+
+    pub fn submitMerkleJob(
+        self: *Hasher,
+        torrent_id: u32,
+        file_index: u32,
+        first_piece: u32,
+        piece_count: u32,
+        layout: *const Layout,
+        shared_fds: []const posix.fd_t,
+    ) !void {
+        switch (self.*) {
+            .real => |h| return h.submitMerkleJob(torrent_id, file_index, first_piece, piece_count, layout, shared_fds),
+            .sim => |h| return h.submitMerkleJob(torrent_id, file_index, first_piece, piece_count, layout, shared_fds),
+        }
+    }
+
+    // ── Drain ──────────────────────────────────────────────
+
+    pub fn drainResultsInto(self: *Hasher, swap_buf: *std.ArrayList(Result)) []const Result {
+        switch (self.*) {
+            .real => |h| return h.drainResultsInto(swap_buf),
+            .sim => |h| return h.drainResultsInto(swap_buf),
+        }
+    }
+
+    pub fn drainMerkleResultsInto(self: *Hasher, swap_buf: *std.ArrayList(MerkleResult)) []const MerkleResult {
+        switch (self.*) {
+            .real => |h| return h.drainMerkleResultsInto(swap_buf),
+            .sim => |h| return h.drainMerkleResultsInto(swap_buf),
+        }
+    }
+
+    // ── Probes ─────────────────────────────────────────────
+
+    pub fn hasPendingWork(self: *Hasher) bool {
+        switch (self.*) {
+            .real => |h| return h.hasPendingWork(),
+            .sim => |h| return h.hasPendingWork(),
+        }
+    }
+
+    pub fn getEventFd(self: *Hasher) posix.fd_t {
+        switch (self.*) {
+            .real => |h| return h.getEventFd(),
+            .sim => |h| return h.getEventFd(),
+        }
+    }
+
+    pub fn threadCount(self: *const Hasher) usize {
+        switch (self.*) {
+            .real => |h| return h.threadCount(),
+            .sim => |h| return h.threadCount(),
+        }
+    }
+};
 
 test "hasher pool verifies pieces correctly" {
     var hasher = RealHasher.create(std.testing.allocator, 2) catch return error.SkipZigTest;
