@@ -6,6 +6,7 @@ pub const file_priority = @import("file_priority.zig");
 pub const file_tree = @import("file_tree.zig");
 pub const info_hash = @import("info_hash.zig");
 pub const layout = @import("layout.zig");
+pub const leaf_hashes = @import("leaf_hashes.zig");
 pub const magnet = @import("magnet.zig");
 pub const merkle = @import("merkle.zig");
 pub const merkle_cache = @import("merkle_cache.zig");
@@ -29,6 +30,7 @@ test {
     _ = file_tree;
     _ = info_hash;
     _ = layout;
+    _ = leaf_hashes;
     _ = magnet;
     _ = merkle;
     _ = merkle_cache;

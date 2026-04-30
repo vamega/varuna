@@ -443,30 +443,57 @@ pub const DhtEngine = struct {
     /// Register an info_hash for peer search. The DHT engine will start
     /// get_peers lookups automatically once bootstrapped, and re-query
     /// periodically. Call this before or after the engine is bootstrapped.
+    ///
+    /// BEP 52: for hybrid torrents, pass the v2 info_hash truncated to its
+    /// first 20 bytes as `info_hash_v2_truncated`. Both hashes are
+    /// registered as independent searches so that v1-only and v2-only
+    /// peers both find us via the DHT. Pure-v1 callers pass `null`.
+    pub fn requestPeers(
+        self: *DhtEngine,
+        info_hash: [20]u8,
+        info_hash_v2_truncated: ?[20]u8,
+    ) void {
+        self.registerSearch(info_hash);
+        if (info_hash_v2_truncated) |v2| self.registerSearch(v2);
+    }
+
     /// Force an immediate requery for an already-registered info hash.
     /// Used when a torrent is integrated into the event loop after the
     /// initial get_peers results were dropped (torrent wasn't registered yet).
-    pub fn forceRequery(self: *DhtEngine, info_hash: [20]u8) void {
+    ///
+    /// BEP 52: pass the truncated v2 hash for hybrid torrents so both
+    /// hashes are requeried. See `requestPeers` for the v2 truncation rule.
+    pub fn forceRequery(
+        self: *DhtEngine,
+        info_hash: [20]u8,
+        info_hash_v2_truncated: ?[20]u8,
+    ) void {
+        self.requerySearch(info_hash);
+        if (info_hash_v2_truncated) |v2| self.requerySearch(v2);
+    }
+
+    /// Append a single hash to the pending-search slate. Idempotent.
+    fn registerSearch(self: *DhtEngine, hash: [20]u8) void {
         for (0..self.pending_search_count) |i| {
-            if (std.mem.eql(u8, &self.pending_searches[i], &info_hash)) {
+            if (std.mem.eql(u8, &self.pending_searches[i], &hash)) return;
+        }
+        if (self.pending_search_count >= self.pending_searches.len) return;
+        const idx = self.pending_search_count;
+        @memcpy(&self.pending_searches[idx], &hash);
+        self.pending_search_done[idx] = false; // new hash — search on next tick
+        self.pending_search_count += 1;
+    }
+
+    /// Mark a previously-registered hash as needing immediate requery, or
+    /// register it fresh if absent.
+    fn requerySearch(self: *DhtEngine, hash: [20]u8) void {
+        for (0..self.pending_search_count) |i| {
+            if (std.mem.eql(u8, &self.pending_searches[i], &hash)) {
                 self.pending_search_done[i] = false; // triggers immediate search on next tick
                 return;
             }
         }
-        // If not found, register it as new
-        self.requestPeers(info_hash);
-    }
-
-    pub fn requestPeers(self: *DhtEngine, info_hash: [20]u8) void {
-        // Check if already registered
-        for (0..self.pending_search_count) |i| {
-            if (std.mem.eql(u8, &self.pending_searches[i], &info_hash)) return;
-        }
-        if (self.pending_search_count >= self.pending_searches.len) return;
-        const idx = self.pending_search_count;
-        @memcpy(&self.pending_searches[idx], &info_hash);
-        self.pending_search_done[idx] = false; // new hash — search on next tick
-        self.pending_search_count += 1;
+        self.registerSearch(hash);
     }
 
     /// Start a get_peers lookup for a torrent info-hash.
@@ -498,14 +525,42 @@ pub const DhtEngine = struct {
     /// Announce to the DHT that we have a torrent on the given port.
     /// Performs a get_peers lookup first to collect tokens, then
     /// sends announce_peer to the K closest nodes.
-    pub fn announcePeer(self: *DhtEngine, info_hash: [20]u8, port: u16) !void {
+    ///
+    /// BEP 52: for hybrid torrents, pass the v2 info_hash truncated to its
+    /// first 20 bytes as `info_hash_v2_truncated`. Both hashes are
+    /// announced so v1-only and v2-only peers can find us. Pure-v1
+    /// callers pass `null`.
+    ///
+    /// If a v2 lookup cannot be started (e.g. no nodes for that hash yet),
+    /// we still try the v1 announce so the v1 swarm benefits — and vice
+    /// versa. The function only surfaces an error when both attempts fail.
+    pub fn announcePeer(
+        self: *DhtEngine,
+        info_hash: [20]u8,
+        info_hash_v2_truncated: ?[20]u8,
+        port: u16,
+    ) !void {
         if (!self.enabled) return error.DhtDisabled;
 
         // For now, just start a get_peers lookup. When it completes,
         // we'll send announce_peer messages using the collected tokens.
         // This is handled in completeLookup().
         self.listen_port = port;
-        try self.getPeers(info_hash);
+
+        const v1_err: ?anyerror = if (self.getPeers(info_hash)) |_| null else |e| e;
+        const v2_err: ?anyerror = if (info_hash_v2_truncated) |v2|
+            (if (self.getPeers(v2)) |_| null else |e| e)
+        else
+            null;
+
+        // If both attempts errored, surface one (prefer v1).
+        if (v1_err) |e1| {
+            if (info_hash_v2_truncated == null) return e1;
+            if (v2_err != null) return e1;
+        } else if (v2_err) |e2| {
+            // v1 succeeded, v2 failed — log but don't fail the call.
+            log.debug("DHT announce v2 failed: {s}", .{@errorName(e2)});
+        }
     }
 
     /// Drain the outbound send queue. Returns packets for the event loop to send.
@@ -1273,6 +1328,85 @@ test "DhtEngine tick rotates tokens" {
 
     // Token should still validate (within rotation window)
     try std.testing.expect(engine.tokens.validateToken(&token_before, &ip));
+}
+
+test "DhtEngine requestPeers registers both v1 and v2 hashes for hybrid torrents" {
+    const allocator = std.testing.allocator;
+    var engine = DhtEngine.init(allocator, node_id.generateRandom());
+    defer engine.deinit();
+
+    const v1_hash: [20]u8 = [_]u8{0xAA} ** 20;
+    const v2_truncated: [20]u8 = [_]u8{0xBB} ** 20;
+
+    engine.requestPeers(v1_hash, v2_truncated);
+    try std.testing.expectEqual(@as(u8, 2), engine.pending_search_count);
+    try std.testing.expectEqualSlices(u8, &v1_hash, &engine.pending_searches[0]);
+    try std.testing.expectEqualSlices(u8, &v2_truncated, &engine.pending_searches[1]);
+
+    // Re-registering is idempotent.
+    engine.requestPeers(v1_hash, v2_truncated);
+    try std.testing.expectEqual(@as(u8, 2), engine.pending_search_count);
+}
+
+test "DhtEngine requestPeers v1-only (null v2) registers only one hash" {
+    const allocator = std.testing.allocator;
+    var engine = DhtEngine.init(allocator, node_id.generateRandom());
+    defer engine.deinit();
+
+    const v1_hash: [20]u8 = [_]u8{0xAA} ** 20;
+    engine.requestPeers(v1_hash, null);
+    try std.testing.expectEqual(@as(u8, 1), engine.pending_search_count);
+    try std.testing.expectEqualSlices(u8, &v1_hash, &engine.pending_searches[0]);
+}
+
+test "DhtEngine forceRequery toggles search-done flag for both hashes" {
+    const allocator = std.testing.allocator;
+    var engine = DhtEngine.init(allocator, node_id.generateRandom());
+    defer engine.deinit();
+
+    const v1_hash: [20]u8 = [_]u8{0xAA} ** 20;
+    const v2_truncated: [20]u8 = [_]u8{0xBB} ** 20;
+
+    engine.requestPeers(v1_hash, v2_truncated);
+    // Pretend both have already been queried at least once.
+    engine.pending_search_done[0] = true;
+    engine.pending_search_done[1] = true;
+
+    engine.forceRequery(v1_hash, v2_truncated);
+    try std.testing.expect(!engine.pending_search_done[0]);
+    try std.testing.expect(!engine.pending_search_done[1]);
+}
+
+test "DhtEngine announcePeer fans out to v1 and v2 hashes" {
+    const allocator = std.testing.allocator;
+    var engine = DhtEngine.init(allocator, node_id.generateRandom());
+    defer engine.deinit();
+
+    // Seed routing table so both lookups have candidates.
+    const now: i64 = 1_000_000;
+    for (0..10) |i| {
+        _ = engine.table.addNode(.{
+            .id = node_id.generateRandom(),
+            .address = std.net.Address.initIp4(.{ 10, 0, 0, @intCast(i + 1) }, 6881),
+        }, now);
+    }
+
+    const v1_hash: [20]u8 = [_]u8{0xAA} ** 20;
+    const v2_truncated: [20]u8 = [_]u8{0xBB} ** 20;
+    try engine.announcePeer(v1_hash, v2_truncated, 6881);
+
+    // Two active lookups should now be running, one for each hash.
+    var v1_seen = false;
+    var v2_seen = false;
+    for (engine.active_lookups) |lk| {
+        if (lk) |l| {
+            if (std.mem.eql(u8, &l.target, &v1_hash)) v1_seen = true;
+            if (std.mem.eql(u8, &l.target, &v2_truncated)) v2_seen = true;
+        }
+    }
+    try std.testing.expect(v1_seen);
+    try std.testing.expect(v2_seen);
+    try std.testing.expectEqual(@as(u16, 6881), engine.listen_port);
 }
 
 test "DhtEngine get_peers starts lookup" {

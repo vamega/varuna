@@ -8,6 +8,7 @@ const ut_metadata = @import("../net/ut_metadata.zig");
 const hash_exchange = @import("../net/hash_exchange.zig");
 const merkle = @import("../torrent/merkle.zig");
 const merkle_cache = @import("../torrent/merkle_cache.zig");
+const leaf_hashes_mod = @import("../torrent/leaf_hashes.zig");
 const info_hash_mod = @import("../torrent/info_hash.zig");
 const Bitfield = @import("../bitfield.zig").Bitfield;
 const EventLoop = @import("event_loop.zig").EventLoop;
@@ -962,7 +963,14 @@ pub fn sendHashesFromTree(
 }
 
 /// Handle an incoming hashes response (msg_type 22).
-/// Verify the received hashes against the known Merkle root for the file.
+///
+/// Decode the BEP 52 `hashes` message, verify its Merkle proof chains up to
+/// the file's authoritative `pieces_root`, and store the verified leaf
+/// hashes per-piece in the torrent's `LeafHashStore`. Stored leaves can
+/// later be consulted to validate downloaded v2 pieces (follow-up: wire
+/// the stored leaves into the piece-completion hot path so multi-piece
+/// pure-v2 torrents can verify pieces as they arrive instead of having to
+/// wait for the whole file).
 fn handleHashesResponse(self: anytype, slot: u16, payload: []const u8) void {
     const peer = &self.peers[slot];
 
@@ -989,18 +997,61 @@ fn handleHashesResponse(self: anytype, slot: u16, payload: []const u8) void {
         return;
     }
 
-    // For base_layer 0 (leaf/piece hashes), we can verify individual hashes
-    // against the file's pieces_root using the proof. This validates that the
-    // peer's hashes are consistent with the torrent metadata.
-    // Full integration with piece downloading is deferred -- for now, we log
-    // and validate the proof structure.
-    if (resp.base_layer == 0 and resp.proof.len > 0) {
-        const expected_root = file_tree_v2[resp.file_index].pieces_root;
-        _ = expected_root;
-        log.debug("slot {d}: hashes for file {d}: {d} hashes, {d} proof layers received", .{
-            slot, resp.file_index, resp.hashes.len, resp.proof.len,
-        });
+    if (resp.base_layer != 0) {
+        // Higher layers (subtree roots, internal nodes) are decoded but
+        // not stored — only leaf-layer responses are useful for direct
+        // piece validation today. Treat as a no-op so the message is at
+        // least understood.
+        log.debug("slot {d}: ignoring non-leaf hashes (base_layer={d})", .{ slot, resp.base_layer });
+        return;
     }
+
+    const piece_count = session.metainfo.pieceCount() catch {
+        log.debug("slot {d}: cannot determine piece count for hash storage", .{slot});
+        return;
+    };
+
+    // Find the file's first piece in the global piece-index space.
+    if (resp.file_index >= session.layout.files.len) return;
+    const file = session.layout.files[resp.file_index];
+    if (file.length == 0) return;
+    const file_first_piece: u32 = file.first_piece;
+    const file_piece_count: u32 = file.end_piece_exclusive - file.first_piece;
+
+    // Lazily create the leaf-hash store for this torrent.
+    if (tc.leaf_hashes == null) {
+        const lh = self.allocator.create(leaf_hashes_mod.LeafHashStore) catch return;
+        lh.* = leaf_hashes_mod.LeafHashStore.init(self.allocator, piece_count) catch {
+            self.allocator.destroy(lh);
+            return;
+        };
+        tc.leaf_hashes = lh;
+    }
+    const store = tc.leaf_hashes.?;
+
+    const expected_root = file_tree_v2[resp.file_index].pieces_root;
+    const ok = leaf_hashes_mod.verifyAndStoreHashesResponse(
+        store,
+        file_first_piece,
+        file_piece_count,
+        expected_root,
+        resp.base_layer,
+        resp.index,
+        resp.hashes,
+        resp.proof,
+    );
+    if (!ok) {
+        log.debug("slot {d}: hashes file {d} failed proof verification", .{ slot, resp.file_index });
+        return;
+    }
+
+    log.debug("slot {d}: stored {d} leaf hashes for file {d} (range [{d},{d}))", .{
+        slot,
+        resp.hashes.len,
+        resp.file_index,
+        resp.index,
+        resp.index + resp.length,
+    });
 }
 
 /// Handle an incoming hash reject (msg_type 23).

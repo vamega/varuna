@@ -677,9 +677,12 @@ pub const TorrentSession = struct {
 
         // DHT peer discovery: force an immediate requery now that the torrent
         // is registered in the event loop (findTorrentIdByInfoHash will work).
+        // BEP 52: requery both the v1 and (truncated) v2 hashes for hybrid
+        // torrents so we discover peers that only know one of the hashes.
         if (!self.is_private) {
             if (sel.dht_engine) |engine| {
-                engine.forceRequery(self.info_hash);
+                const v2_truncated = self.dhtV2HashTruncated();
+                engine.forceRequery(self.info_hash, v2_truncated);
             }
         }
 
@@ -921,6 +924,17 @@ pub const TorrentSession = struct {
 
     /// Compute a deterministic jitter delay in milliseconds for the initial announce.
     /// Uses info_hash bytes for deterministic spread, capped at 5 seconds.
+    /// BEP 52: return the v2 info-hash truncated to its first 20 bytes for
+    /// use as a DHT key. Returns null for pure-v1 torrents. The DHT mainline
+    /// only supports 20-byte keys, so v2 hashes (32 bytes / SHA-256) are
+    /// truncated per BEP 52's DHT integration guidance.
+    fn dhtV2HashTruncated(self: *const TorrentSession) ?[20]u8 {
+        const full_v2 = self.info_hash_v2 orelse return null;
+        var truncated: [20]u8 = undefined;
+        @memcpy(&truncated, full_v2[0..20]);
+        return truncated;
+    }
+
     fn computeAnnounceJitterMs(self: *const TorrentSession) u64 {
         const base_interval: u64 = 1800; // default tracker interval in seconds
         const max_delay_ms = (base_interval / 4) * std.time.ms_per_s;
@@ -1432,9 +1446,12 @@ pub const TorrentSession = struct {
 
         // DHT announce: tell the network we are seeding this torrent.
         // Disabled for private torrents (BEP 27).
+        // BEP 52: announce against both v1 and (truncated) v2 hashes for
+        // hybrid torrents so v2-only searchers can find us.
         if (!self.is_private) {
             if (sel.dht_engine) |engine| {
-                engine.announcePeer(self.info_hash, self.port) catch {};
+                const v2_truncated = self.dhtV2HashTruncated();
+                engine.announcePeer(self.info_hash, v2_truncated, self.port) catch {};
             }
         }
 

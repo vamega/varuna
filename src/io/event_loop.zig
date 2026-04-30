@@ -978,6 +978,12 @@ pub fn EventLoopOf(comptime IO: type) type {
                     self.allocator.destroy(mc);
                     tc.merkle_cache = null;
                 }
+                // Clean up BEP 52 peer-provided leaf hash store.
+                if (tc.leaf_hashes) |lh| {
+                    lh.deinit();
+                    self.allocator.destroy(lh);
+                    tc.leaf_hashes = null;
+                }
                 self.unregisterTorrentHashes(tc.info_hash, tc.info_hash_v2);
             }
             self.torrents.items[torrent_id] = null;
