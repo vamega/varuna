@@ -649,3 +649,70 @@ test "MoveJob: requestCancel before start has no effect on a fresh job" {
     // Without a start() call, state stays `.created`.
     try testing.expectEqual(State.created, job.progress().state);
 }
+
+test "MoveJob: source files are unlinked after rename succeeds" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.makeDir("src");
+    {
+        const f = try tmp.dir.createFile("src/leaf.txt", .{});
+        defer f.close();
+        try f.writeAll("payload");
+    }
+
+    var src_buf: [4096]u8 = undefined;
+    var root_buf: [4096]u8 = undefined;
+    const src_abs = try tmp.dir.realpath("src", &src_buf);
+    const tmp_root = try tmp.dir.realpath(".", &root_buf);
+    const dst_abs = try std.fmt.allocPrint(testing.allocator, "{s}/dst", .{tmp_root});
+    defer testing.allocator.free(dst_abs);
+
+    var job = try MoveJob.create(testing.allocator, 6, src_abs, dst_abs);
+    defer job.destroy();
+    try job.start(null, null);
+    try expectEventuallyState(job, .succeeded, 5000);
+
+    // Source dir is gone after a same-fs rename.
+    try testing.expectError(error.FileNotFound, tmp.dir.openDir("src", .{}));
+    // Destination has the file.
+    const f = try tmp.dir.openFile("dst/leaf.txt", .{});
+    defer @constCast(&f).close();
+}
+
+test "MoveJob: completion callback fires with terminal state" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.makeDir("src");
+
+    var src_buf: [4096]u8 = undefined;
+    var root_buf: [4096]u8 = undefined;
+    const src_abs = try tmp.dir.realpath("src", &src_buf);
+    const tmp_root = try tmp.dir.realpath(".", &root_buf);
+    const dst_abs = try std.fmt.allocPrint(testing.allocator, "{s}/dst", .{tmp_root});
+    defer testing.allocator.free(dst_abs);
+
+    const Box = struct {
+        var fired: std.atomic.Value(u32) = std.atomic.Value(u32).init(0);
+        var observed_state: std.atomic.Value(u8) = std.atomic.Value(u8).init(0);
+        fn cb(_: ?*anyopaque, _: JobId, state: State) void {
+            _ = fired.fetchAdd(1, .acq_rel);
+            observed_state.store(@intFromEnum(state), .release);
+        }
+    };
+    Box.fired.store(0, .release);
+    Box.observed_state.store(0, .release);
+
+    var job = try MoveJob.create(testing.allocator, 7, src_abs, dst_abs);
+    defer job.destroy();
+    try job.start(null, Box.cb);
+    try expectEventuallyState(job, .succeeded, 5000);
+
+    // Wait for the callback to fire (it runs slightly after the
+    // worker thread sets the terminal state).
+    var attempts: u32 = 0;
+    while (Box.fired.load(.acquire) == 0 and attempts < 200) : (attempts += 1) {
+        std.Thread.sleep(5 * std.time.ns_per_ms);
+    }
+    try testing.expectEqual(@as(u32, 1), Box.fired.load(.acquire));
+    try testing.expectEqual(@intFromEnum(State.succeeded), Box.observed_state.load(.acquire));
+}

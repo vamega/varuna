@@ -212,6 +212,91 @@ test "parseIpPort returns null for garbage" {
     try std.testing.expect(SessionManager.parseIpPort(":1234") == null);
 }
 
+// ── Async file-move endpoint tests ──────────────────────────────
+
+test "deprecated setLocation returns 400 with pointer to async endpoint" {
+    var ctx = TestCtx.init();
+    defer ctx.deinit();
+    const resp = ctx.handle("POST", "/api/v2/torrents/setLocation", "hashes=0000000000000000000000000000000000000000&location=/tmp/foo");
+    defer if (resp.owned_body) |b| std.testing.allocator.free(b);
+    try std.testing.expectEqual(@as(u16, 400), resp.status);
+    // The body must mention the new endpoint so clients can pivot.
+    try std.testing.expect(std.mem.indexOf(u8, resp.body, "/api/v2/varuna/torrents/move") != null);
+}
+
+test "varuna/torrents/move requires hashes" {
+    var ctx = TestCtx.init();
+    defer ctx.deinit();
+    const resp = ctx.handle("POST", "/api/v2/varuna/torrents/move", "");
+    defer if (resp.owned_body) |b| std.testing.allocator.free(b);
+    try std.testing.expectEqual(@as(u16, 400), resp.status);
+}
+
+test "varuna/torrents/move requires location" {
+    var ctx = TestCtx.init();
+    defer ctx.deinit();
+    const resp = ctx.handle("POST", "/api/v2/varuna/torrents/move", "hashes=0000000000000000000000000000000000000000");
+    defer if (resp.owned_body) |b| std.testing.allocator.free(b);
+    try std.testing.expectEqual(@as(u16, 400), resp.status);
+}
+
+test "varuna/torrents/move with unknown hash returns 404" {
+    var ctx = TestCtx.init();
+    defer ctx.deinit();
+    const resp = ctx.handle("POST", "/api/v2/varuna/torrents/move", "hashes=0000000000000000000000000000000000000000&location=/tmp/foo");
+    defer if (resp.owned_body) |b| std.testing.allocator.free(b);
+    try std.testing.expectEqual(@as(u16, 404), resp.status);
+}
+
+test "varuna/torrents/move/<id> with unknown id returns 404" {
+    var ctx = TestCtx.init();
+    defer ctx.deinit();
+    const resp = ctx.handle("GET", "/api/v2/varuna/torrents/move/9999", "");
+    defer if (resp.owned_body) |b| std.testing.allocator.free(b);
+    try std.testing.expectEqual(@as(u16, 404), resp.status);
+}
+
+test "varuna/torrents/move/<id>/cancel with unknown id returns 404" {
+    var ctx = TestCtx.init();
+    defer ctx.deinit();
+    const resp = ctx.handle("POST", "/api/v2/varuna/torrents/move/9999/cancel", "");
+    defer if (resp.owned_body) |b| std.testing.allocator.free(b);
+    try std.testing.expectEqual(@as(u16, 404), resp.status);
+}
+
+test "varuna/torrents/move/<id>/commit with unknown id returns 404" {
+    var ctx = TestCtx.init();
+    defer ctx.deinit();
+    const resp = ctx.handle("POST", "/api/v2/varuna/torrents/move/9999/commit", "");
+    defer if (resp.owned_body) |b| std.testing.allocator.free(b);
+    try std.testing.expectEqual(@as(u16, 404), resp.status);
+}
+
+test "varuna/torrents/move/<id> with bad id returns 400" {
+    var ctx = TestCtx.init();
+    defer ctx.deinit();
+    const resp = ctx.handle("GET", "/api/v2/varuna/torrents/move/not-a-number", "");
+    defer if (resp.owned_body) |b| std.testing.allocator.free(b);
+    try std.testing.expectEqual(@as(u16, 400), resp.status);
+}
+
+test "varuna/torrents/move/<id> with wrong method returns 405" {
+    var ctx = TestCtx.init();
+    defer ctx.deinit();
+    // PATCH is not in our supported method list for the move endpoint.
+    const resp = ctx.handle("PATCH", "/api/v2/varuna/torrents/move/1", "");
+    defer if (resp.owned_body) |b| std.testing.allocator.free(b);
+    try std.testing.expectEqual(@as(u16, 405), resp.status);
+}
+
+test "varuna/torrents/move with PATCH returns 405" {
+    var ctx = TestCtx.init();
+    defer ctx.deinit();
+    const resp = ctx.handle("PATCH", "/api/v2/varuna/torrents/move", "hashes=x&location=/tmp/y");
+    defer if (resp.owned_body) |b| std.testing.allocator.free(b);
+    try std.testing.expectEqual(@as(u16, 405), resp.status);
+}
+
 // ── Unauthorized request tests ──────────────────────────────────
 
 test "new endpoints require authentication" {
