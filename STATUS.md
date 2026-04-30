@@ -273,7 +273,7 @@ See `progress-reports/2026-04-25-stage2-event-loop-migration.md` for the Stage 2
 - ~~**Smart ban Phase 1-2 (per-block SHA-1 attribution + ban-targeting)**~~: (DONE) per-block peer attribution captured in `BlockInfo.delivered_address` at receive time (decoupled from peer-slot lifetime so attribution survives disconnect/IP churn — fixed a real production gap where corrupt-and-disconnect peers escaped attribution). `SmartBan.snapshotAttribution` records on piece complete; `onPieceFailed` stores per-block SHA-1 + peer-address records; `onPiecePassed` (after re-download) compares per-block hashes and bans only the peers whose blocks mismatched. `peer_policy.snapshotAttributionForSmartBan` and `smartBanCorruptPeers` bridge the EL. Phase 2's discriminating power (honest peer co-located on a corrupt piece is NOT banned) demonstrated end-to-end in `tests/sim_smart_ban_phase12_eventloop_test.zig`'s disconnect-rejoin scenario — 8 deterministic seeds, peer 0 banned via Phase 2 attribution-survives-disconnect, peers 1+2 acquitted despite contributing to the same failed piece. See `progress-reports/2026-04-26-phase-2-smart-ban.md` for the arc.
 - ~~**Multi-source piece assembly (transient correctness)**~~: (DONE) piece can now be assembled from multiple peers — disconnect-mid-piece releases blocks via `releaseBlocksForPeer` + `tryJoinExistingPiece`; survivors absorb and complete the piece. Picker fair-share + per-call cap (`peer_policy.tryFillPipeline`) provides steady-state correctness.
 - ~~**Late-peer block-stealing (Task #23)**~~: (DONE) `tryFillPipeline` issues duplicate REQUESTs for `.requested`-state blocks attributed to other peers once `nextUnrequestedBlock` returns null; `tryJoinExistingPiece` accepts fully-claimed DPs that have stealable blocks, gated by the existing bitfield check `peer_bf.has(dp.piece_index)`. Closes the "3 peers all hold full piece, peer A drains the entire piece in one tick before B+C handshake" race; the BUGGIFY safety invariant (no honest peer accumulates hashfails) holds because the bitfield gate prevents an honest peer from joining a corrupt-only DP. `tests/sim_multi_source_eventloop_test.zig` distribution-proportion assertions now live (`peers_with_uploads >= 2`, `max × 10 ≤ total × 9`).
-- **MSE simultaneous handshake robustness**: timing-dependent crash in `checkPeerTimeouts -> removePeer -> cleanupPeer` when both inbound and outbound MSE handshakes are in flight. Disappears under GDB. Needs generation counters or explicit handshake-in-progress guards.
+- ~~**MSE simultaneous handshake robustness**~~: Closed 2026-04-30. The historical timing-dependent crash in `checkPeerTimeouts -> removePeer -> cleanupPeer` was structurally addressed by the stale-CQE / lifecycle guards already present in the production code (`peer.state == .free` early-return on recv/send/connect/socket CQEs; `closeSocket` precedes the heap free in `cleanupPeer`; `_backend_state` is zeroed by `peer.* = Peer{}` reset and re-armed on the next submission). The final `posix.close → self.io.closeSocket` cleanups landed in this round (`attemptMseFallback` and `handleSocketResult` stale-CQE branches in `src/io/peer_handler.zig`). New regression harness `tests/sim_mse_handshake_test.zig` drives an EL with two MSE handshakes in flight (slot A outbound initiator, slot B inbound responder) under SimIO + SimHasher + SimRandom; covers (i) 32 seeds clean simultaneous handshake, (ii) 8 seeds × 5% recv-error injection (asserts no `vc_not_found` / `req1_not_found` cross-handshake corruption), (iii) 8 seeds × `removePeer` mid-handshake + slot reuse for fresh inbound. See `progress-reports/2026-04-30-mse-handshake-race.md`.
 - **Peer hot/cold split / partial SoA**: the active-slot pass removes a lot of wasted scans, but the `Peer` struct is still wide. The next performance step is separating hot scheduling/state fields from cold crypto/buffering state.
 - **Torrent hot-summary registry**: cached cumulative byte totals now remove the hottest `/sync` stats scan, but a denser registry is still the next step if queue position, state derivation, or other per-torrent fields dominate at `10k+` torrents.
 - **Broader RPC arena coverage**: `/sync/maindata` now uses an arena for transient work; the other list-heavy endpoints still allocate temporary object graphs and strings.
@@ -313,9 +313,64 @@ See `progress-reports/2026-04-25-stage2-event-loop-migration.md` for the Stage 2
 - On WSL2, `perf stat`/`perf record` require kernel-matched `linux-tools` package; many hardware counters report `<not supported>`.
 - `zig build test-torrent-session` intermittently hits Zig cache/toolchain failures (`manifest_create Unexpected`).
 - ~~**Smart ban Phases 1-2 not yet implemented**~~: closed 2026-04-26. Phase 1 (per-block SHA-1 attribution on hash failure) and Phase 2 (ban-targeting on re-download pass) live in `src/net/smart_ban.zig` and `src/io/peer_policy.zig`; attribution survives peer-slot freeing via `BlockInfo.delivered_address`. End-to-end validation in `tests/sim_smart_ban_phase12_eventloop_test.zig`.
-- **MSE handshake failures in mixed encryption mode**: `vc_not_found` and `req1_not_found` errors occur during simultaneous inbound+outbound MSE handshakes. Timing-dependent, disappears under GDB. `demo_swarm.sh` runs with `encryption = "disabled"` as workaround.
+- ~~**MSE handshake failures in mixed encryption mode**~~: Closed 2026-04-30. Same surface as the "MSE simultaneous handshake robustness" entry above; the symptoms (`vc_not_found` / `req1_not_found` from cross-handshake state corruption) do not reproduce across 32 deterministic seeds + recv-error fault injection under SimIO + SimHasher + SimRandom. The `demo_swarm.sh runs with encryption = "disabled"` line was already stale: `scripts/demo_swarm.sh` uses `encryption = "preferred"` as of commit `3284849`. See `progress-reports/2026-04-30-mse-handshake-race.md`.
 - ~~**Daemon graceful shutdown**~~: Fixed. In-flight transfer draining with configurable timeout now ensures clean exit on SIGTERM/SIGINT.
 - `IORING_OP_SETSOCKOPT` (kernel 6.7+), `IORING_OP_BIND`/`LISTEN` (kernel 6.11+) not available on current kernel 6.6. Per-peer setsockopt (TCP_NODELAY, buffer sizes) remains synchronous. (`FeatureSupport` has detection flags as of 2026-04-30; daemon submission paths still pending — see "Daemon submission paths for bind / listen / setsockopt" follow-up above.)
+
+## Last Verified Milestone (2026-04-30 — MSE simultaneous-handshake reproduction harness + close-routing cleanup)
+
+The two long-standing STATUS.md "Known Issues" entries about MSE
+handshake failures during simultaneous inbound + outbound handshakes
+("MSE simultaneous handshake robustness" and "MSE handshake failures
+in mixed encryption mode") are closed.
+
+**Reproduction harness — `tests/sim_mse_handshake_test.zig` (4 new
+tests).** Drives one EventLoopOf(SimIO) with two MSE handshakes in
+flight: slot A is outbound (EL plays MSE initiator), slot B is
+inbound (EL plays MSE responder). The peer side of each handshake
+is driven by a `PeerMseDriver` helper (~150 lines) that wraps the
+existing `MseInitiatorHandshake` / `MseResponderHandshake` state
+machines and reads/writes bytes through a SimIO socketpair. With
+SimRandom seeding both EL.random and the peer-side `*Random`,
+DH keys / pad lengths / pad bytes are byte-deterministic per seed.
+Coverage: (i) 32-seed clean simultaneous-handshake sweep —
+32/32 complete with `crypto_method == crypto_rc4`; (ii) 8 seeds ×
+5 % recv-error fault injection — observed failures all
+`connection_closed`, **0 `vc_not_found` / `req1_not_found`
+state-corruption candidates**; (iii) 8 seeds × `removePeer`
+mid-handshake + slot reuse for fresh inbound — slot reuses
+cleanly, second handshake completes.
+
+**Production fixes — two raw `posix.close` callsites in
+`src/io/peer_handler.zig`.** `attemptMseFallback` (the MSE →
+plaintext fallback path on outbound preferred-mode handshake
+failure) and the two stale-CQE branches in `handleSocketResult`
+(slot freed before socket completed; slot reused for something
+else) were calling `posix.close(fd)` directly. On a SimIO
+synthetic fd that panics with `BADF` (`unreachable, // Always a
+race condition`); on RealIO it works but bypasses the IO contract
+(`AGENTS.md` "Daemon paths that must use `io_uring`"). Switched
+to `self.io.closeSocket(peer.fd)` uniformly. The
+`attemptMseFallback` panic was caught by the recv-error fault
+injection test — a real bug, not a sim-only artifact.
+
+**Why the historical bug doesn't reproduce here.** Most likely:
+the underlying defect was already addressed by the stale-CQE
+guards landed in earlier rounds (`peer.state == .free` /
+`.connecting` early-returns on recv/send/connect/socket CQEs;
+`closeSocket` precedes the heap free in `cleanupPeer`;
+`_backend_state` zero-on-`Peer{}`-reset + `armCompletion`
+re-init keep next submissions clean). STATUS.md just hadn't been
+updated to reflect the fix — note that `scripts/demo_swarm.sh`
+already uses `encryption = "preferred"` as of commit `3284849`
+("With the MSE stale-CQE fix and multi-source endgame
+double-free fix, MSE encryption works reliably end-to-end").
+
+Test count: 1731/1747 → 1735/1751 (+4 new tests, 0 regressions).
+Pre-existing intermittent flake in
+`sim_smart_ban_phase12_eventloop_test` is uncorrelated.
+
+See [progress-reports/2026-04-30-mse-handshake-race.md](progress-reports/2026-04-30-mse-handshake-race.md).
 
 ## Last Verified Milestone (2026-04-30 — close upward dependency: tracker executors moved from src/daemon/ to src/tracker/)
 

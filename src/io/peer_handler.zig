@@ -162,7 +162,10 @@ pub fn peerSocketCompleteFor(comptime EL: type) io_interface.Callback {
 fn handleSocketResult(self: anytype, slot: u16, res: i32) void {
     const peer = &self.peers[slot];
     if (peer.state == .free) {
-        if (res >= 0) posix.close(@intCast(res));
+        // Route through the IO contract (RealIO -> posix.close;
+        // SimIO -> mark synthetic slot closed). Raw posix.close on
+        // a SimIO synthetic fd panics with BADF.
+        if (res >= 0) self.io.closeSocket(@intCast(res));
         return;
     }
 
@@ -170,7 +173,7 @@ fn handleSocketResult(self: anytype, slot: u16, res: i32) void {
         log.debug("slot {d}: ignoring stale socket CQE (state={s})", .{
             slot, @tagName(peer.state),
         });
-        if (res >= 0) posix.close(@intCast(res));
+        if (res >= 0) self.io.closeSocket(@intCast(res));
         return;
     }
 
@@ -183,11 +186,21 @@ fn handleSocketResult(self: anytype, slot: u16, res: i32) void {
     const fd: posix.fd_t = @intCast(res);
     peer.fd = fd;
 
-    socket_util.configurePeerSocket(fd);
-    socket_util.applyBindConfig(fd, self.bind_device, self.bind_address, 0) catch {
-        self.removePeer(slot);
-        return;
-    };
+    // SimIO synthetic fds aren't real kernel fds — `setsockopt` panics
+    // on `BADF` (unreachable, not a returned error). Mirror the gate
+    // used by `metadata_handler.connectPeer`: only configure / bind on
+    // the real kernel path.
+    const sim_io_mod = @import("sim_io.zig");
+    const SelfTy = @TypeOf(self.*);
+    const is_sim_io = comptime @hasField(SelfTy, "io") and
+        @TypeOf(self.io) == sim_io_mod.SimIO;
+    if (comptime !is_sim_io) {
+        socket_util.configurePeerSocket(fd);
+        socket_util.applyBindConfig(fd, self.bind_device, self.bind_address, 0) catch {
+            self.removePeer(slot);
+            return;
+        };
+    }
 
     self.io.connect(
         .{ .fd = fd, .addr = peer.address },
@@ -1096,12 +1109,21 @@ fn attemptMseFallback(self: anytype, slot: u16) void {
     // We need to remember this across the reconnect
     peer.mse_rejected = true;
 
-    // Close the current connection
+    // Close the current connection. Route through `self.io.closeSocket`
+    // so SimIO's synthetic-fd path stays sound (raw `posix.close` panics
+    // with BADF — `unreachable, // Always a race condition` — on a SimIO
+    // synthetic fd) and the io_uring policy stays uniform across all
+    // daemon paths.
     if (peer.fd >= 0) {
-        posix.close(peer.fd);
+        self.io.closeSocket(peer.fd);
         peer.fd = -1;
     }
-    // Clean up MSE state
+    // Clean up MSE state. Safe here because attemptMseFallback is
+    // only entered from the recv/send error path: the failing op's
+    // CQE just fired, and the MSE state machine never has more than
+    // one op in flight at a time (it alternates send / recv per
+    // phase). So the kernel is no longer holding a pointer into
+    // the about-to-be-freed `mi` / `mr` buffers.
     if (peer.mse_initiator) |mi| {
         self.allocator.destroy(mi);
         peer.mse_initiator = null;

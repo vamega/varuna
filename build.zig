@@ -309,6 +309,17 @@ pub fn build(b: *std.Build) void {
     const run_csprng_determinism_tests = b.addRunArtifact(csprng_determinism_tests);
     test_step.dependOn(&run_csprng_determinism_tests.step);
 
+    const sim_mse_handshake_tests = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("tests/sim_mse_handshake_test.zig"),
+            .target = target,
+            .optimize = optimize,
+            .imports = &varuna_import,
+        }),
+    });
+    const run_sim_mse_handshake_tests = b.addRunArtifact(sim_mse_handshake_tests);
+    test_step.dependOn(&run_sim_mse_handshake_tests.step);
+
     const udp_tracker_tests = b.addTest(.{
         .root_module = b.createModule(.{
             .root_source_file = b.path("tests/udp_tracker_test.zig"),
