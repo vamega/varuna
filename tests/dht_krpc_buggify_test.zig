@@ -715,6 +715,78 @@ test "parser: 19/21-byte node id is rejected (sender_id, target, info_hash)" {
     }
 }
 
+test "parser: query missing required 'id' key is rejected" {
+    // BEP 5: every KRPC query MUST include the querier's node id in
+    // the `a` body. Without it, `sender_id` would propagate
+    // `undefined` into the routing table — a real correctness/UB bug.
+    // The parser must reject these cases instead of silently accepting.
+    const inputs = [_][]const u8{
+        // ping query with no id field at all
+        "d1:ade1:q4:ping1:t2:tt1:y1:qe",
+        // find_node with target but no id
+        "d1:ad6:target20:bbbbbbbbbbbbbbbbbbbbe1:q9:find_node1:t2:tt1:y1:qe",
+        // get_peers with info_hash but no id
+        "d1:ad9:info_hash20:cccccccccccccccccccce1:q9:get_peers1:t2:tt1:y1:qe",
+        // announce_peer with token+port+info_hash but no id
+        "d1:ad9:info_hash20:cccccccccccccccccccc4:porti6881e5:token4:tokne1:q13:announce_peer1:t2:tt1:y1:qe",
+        // 'id' present but with wrong key name (case-sensitive)
+        "d1:ad2:ID20:aaaaaaaaaaaaaaaaaaaae1:q4:ping1:t2:tt1:y1:qe",
+    };
+    for (inputs) |inp| {
+        const r = krpc.parse(inp);
+        try testing.expectError(error.InvalidKrpc, r);
+    }
+}
+
+test "parser: response missing required 'id' key is rejected" {
+    // BEP 5: every KRPC response MUST include the responder's node id
+    // in the `r` body. Without it, `sender_id` would propagate
+    // `undefined` into table.markResponded() / addNode() — UB.
+    const inputs = [_][]const u8{
+        // empty response body
+        "d1:rde1:t2:tt1:y1:re",
+        // response with nodes but no id (find_node response shape)
+        "d1:rd5:nodes0:e1:t2:tt1:y1:re",
+        // response with token+nodes but no id (get_peers response shape)
+        "d1:rd5:nodes0:5:token4:tokne1:t2:tt1:y1:re",
+        // 'id' present with empty string
+        "d1:rd2:id0:e1:t2:tt1:y1:re",
+        // 'id' present with 19-byte string (already covered upstream,
+        // but a stricter belt-and-braces line)
+        "d1:rd2:id19:aaaaaaaaaaaaaaaaaaae1:t2:tt1:y1:re",
+    };
+    for (inputs) |inp| {
+        const r = krpc.parse(inp);
+        try testing.expectError(error.InvalidKrpc, r);
+    }
+}
+
+test "parser: query with valid 'id' parses sender_id deterministically" {
+    // Belt-and-braces: parsing a well-formed query produces the exact
+    // sender_id from the wire — never a stale/undefined value.
+    var our_id: NodeId = undefined;
+    @memset(&our_id, 0xCD);
+    var buf: [256]u8 = undefined;
+    const len = try krpc.encodePingQuery(&buf, 0xAABB, our_id);
+    const m = try krpc.parse(buf[0..len]);
+    switch (m) {
+        .query => |q| try testing.expectEqualSlices(u8, &our_id, &q.sender_id),
+        else => try testing.expect(false),
+    }
+}
+
+test "parser: response with valid 'id' parses sender_id deterministically" {
+    var our_id: NodeId = undefined;
+    @memset(&our_id, 0xEF);
+    var buf: [256]u8 = undefined;
+    const len = try krpc.encodePingResponse(&buf, "tt", our_id);
+    const m = try krpc.parse(buf[0..len]);
+    switch (m) {
+        .response => |r| try testing.expectEqualSlices(u8, &our_id, &r.sender_id),
+        else => try testing.expect(false),
+    }
+}
+
 test "parser: round-trip after hardening (regression for valid inputs)" {
     // Belt-and-braces: confirm the hardened parser still accepts a
     // canonical ping query / response / error.
