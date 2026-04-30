@@ -316,6 +316,20 @@ pub const SimIO = struct {
     /// recv queue has been pre-loaded with scripted protocol responses.
     prepared_socket_fds: std.ArrayList(posix.fd_t) = .empty,
 
+    /// Optional pre-tick hook invoked at the top of every `tick` call
+    /// (after the re-entrancy guard, before any completions are
+    /// delivered). Lets BUGGIFY harnesses inject `injectRandomFault`
+    /// rolls into the same drain loops that the system-under-test
+    /// runs internally — `PieceStore.writePiece`, `sync`, `init` all
+    /// own their own `while (pending > 0) try io.tick(1)` loops, so
+    /// the only way to mutate an in-flight op's result mid-method is
+    /// from inside `tick` itself.
+    ///
+    /// The hook may call `injectRandomFault`, log, or examine
+    /// `self.pending_len`, but MUST NOT call `tick` recursively.
+    pre_tick_hook: ?*const fn (sim: *SimIO, ctx: ?*anyopaque) void = null,
+    pre_tick_ctx: ?*anyopaque = null,
+
     pub fn init(allocator: std.mem.Allocator, config: Config) !SimIO {
         const slots = try allocator.alloc(Pending, config.pending_capacity);
         errdefer allocator.free(slots);
@@ -463,6 +477,14 @@ pub const SimIO = struct {
     pub fn tick(self: *SimIO, wait_at_least: u32) !void {
         _ = wait_at_least;
         assert(!self.in_tick); // no recursive ticks
+
+        // Pre-tick hook (BUGGIFY harness entry-point). Fires before the
+        // `in_tick` flag is set so the hook may invoke any non-tick
+        // public method — `injectRandomFault` is the canonical use, but
+        // the hook is generic. Recursive `tick` is still rejected by the
+        // assertion above on re-entry.
+        if (self.pre_tick_hook) |hook| hook(self, self.pre_tick_ctx);
+
         self.in_tick = true;
         defer self.in_tick = false;
 
