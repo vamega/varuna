@@ -189,7 +189,8 @@ pub const SessionManager = struct {
         const session = try self.allocator.create(TorrentSession);
         errdefer self.allocator.destroy(session);
 
-        session.* = try TorrentSession.create(self.allocator, torrent_bytes, save_path, self.masquerade_as);
+        const el = self.shared_event_loop orelse return error.SharedEventLoopNotConfigured;
+        session.* = try TorrentSession.create(self.allocator, &el.random, torrent_bytes, save_path, self.masquerade_as);
         errdefer session.deinit();
 
         try self.configureManagedSession(session);
@@ -206,7 +207,8 @@ pub const SessionManager = struct {
         const session = try self.allocator.create(TorrentSession);
         errdefer self.allocator.destroy(session);
 
-        session.* = try TorrentSession.createFromMagnet(self.allocator, magnet_uri, save_path, self.masquerade_as);
+        const el = self.shared_event_loop orelse return error.SharedEventLoopNotConfigured;
+        session.* = try TorrentSession.createFromMagnet(self.allocator, &el.random, magnet_uri, save_path, self.masquerade_as);
         errdefer session.deinit();
 
         try self.configureManagedSession(session);

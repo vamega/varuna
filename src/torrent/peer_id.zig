@@ -1,4 +1,5 @@
 const std = @import("std");
+const Random = @import("../runtime/random.zig").Random;
 const log = std.log.scoped(.peer_id);
 
 pub const prefix = "-VR0001-";
@@ -25,23 +26,27 @@ pub const GenerateError = error{UnsupportedMasquerade};
 /// client prefix; otherwise use Varuna's default prefix.
 /// Returns error.UnsupportedMasquerade if the masquerade_as value names an
 /// unrecognized client — the daemon should refuse to start in this case.
-pub fn generate(masquerade: ?[]const u8) GenerateError![20]u8 {
+///
+/// `random` is the daemon-wide CSPRNG (`runtime.Random`). Tests inject a
+/// seeded sim variant for byte-deterministic peer IDs; production uses
+/// the OS-seeded ChaCha8 instance held on the event loop.
+pub fn generate(random: *Random, masquerade: ?[]const u8) GenerateError![20]u8 {
     const effective_prefix: [8]u8 = if (masquerade) |spec|
         (parseMasquerade(spec) orelse return error.UnsupportedMasquerade).prefix
     else
         prefix.*;
-    return generateWithPrefix(effective_prefix);
+    return generateWithPrefix(random, effective_prefix);
 }
 
 /// Generate a peer ID with a given 8-byte prefix and 12 random alphanumeric bytes.
-fn generateWithPrefix(pfx: [8]u8) [20]u8 {
+fn generateWithPrefix(random: *Random, pfx: [8]u8) [20]u8 {
     var value: [20]u8 = undefined;
     @memcpy(value[0..8], &pfx);
 
     const alphabet = "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz";
 
     var random_bytes: [12]u8 = undefined;
-    std.crypto.random.bytes(&random_bytes);
+    random.bytes(&random_bytes);
 
     for (random_bytes, 0..) |byte, index| {
         value[8 + index] = alphabet[byte % alphabet.len];
@@ -167,14 +172,16 @@ fn eqlIgnoreCase(a: []const u8, b: []const u8) bool {
 // ── Tests ──────────────────────────────────────────────────────────────
 
 test "default peer id keeps the Varuna prefix" {
-    const value = try generate(null);
+    var rng = Random.simRandom(0x1);
+    const value = try generate(&rng, null);
 
     try std.testing.expectEqual(@as(usize, 20), value.len);
     try std.testing.expectEqualStrings(prefix, value[0..prefix.len]);
 }
 
 test "qBittorrent 5.1.4 masquerade prefix" {
-    const value = try generate("qBittorrent 5.1.4");
+    var rng = Random.simRandom(0x2);
+    const value = try generate(&rng, "qBittorrent 5.1.4");
     try std.testing.expectEqualStrings("-qB5140-", value[0..8]);
     try std.testing.expectEqual(@as(usize, 20), value.len);
 }
@@ -186,7 +193,8 @@ test "qBittorrent 4.6.2.1 masquerade prefix" {
 }
 
 test "rTorrent 0.16 masquerade prefix" {
-    const value = try generate("rTorrent 0.16");
+    var rng = Random.simRandom(0x3);
+    const value = try generate(&rng, "rTorrent 0.16");
     // 0.16 -> -lt0G00- (0=0, G=16, 0=0, 0=0)
     try std.testing.expectEqualStrings("-lt0G00-", value[0..8]);
 }
@@ -204,7 +212,8 @@ test "rTorrent 0.13.8 masquerade prefix" {
 }
 
 test "uTorrent 3.5.6 masquerade prefix" {
-    const value = try generate("uTorrent 3.5.6");
+    var rng = Random.simRandom(0x4);
+    const value = try generate(&rng, "uTorrent 3.5.6");
     try std.testing.expectEqualStrings("-UT3560-", value[0..8]);
 }
 
@@ -215,7 +224,8 @@ test "uTorrent 3.5.6.0 masquerade prefix with four components" {
 }
 
 test "Deluge 2.1.1 masquerade prefix" {
-    const value = try generate("Deluge 2.1.1");
+    var rng = Random.simRandom(0x5);
+    const value = try generate(&rng, "Deluge 2.1.1");
     try std.testing.expectEqualStrings("-DE2110-", value[0..8]);
 }
 
@@ -226,7 +236,8 @@ test "Deluge 2.1.1.0 masquerade prefix with four components" {
 }
 
 test "Transmission 4.0.6 masquerade prefix" {
-    const value = try generate("Transmission 4.0.6");
+    var rng = Random.simRandom(0x6);
+    const value = try generate(&rng, "Transmission 4.0.6");
     try std.testing.expectEqualStrings("-TR4060-", value[0..8]);
 }
 
@@ -242,8 +253,9 @@ test "unsupported client returns null from parseMasquerade" {
 }
 
 test "unsupported client returns error" {
-    try std.testing.expectError(error.UnsupportedMasquerade, generate("Vuze 5.7.7.0"));
-    try std.testing.expectError(error.UnsupportedMasquerade, generate("UnknownClient 1.0"));
+    var rng = Random.simRandom(0x7);
+    try std.testing.expectError(error.UnsupportedMasquerade, generate(&rng, "Vuze 5.7.7.0"));
+    try std.testing.expectError(error.UnsupportedMasquerade, generate(&rng, "UnknownClient 1.0"));
 }
 
 test "malformed spec returns null" {
@@ -265,8 +277,17 @@ test "case insensitive client name matching" {
 }
 
 test "random suffix is alphanumeric and 12 bytes" {
-    const value = try generate("qBittorrent 5.1.4");
+    var rng = Random.simRandom(0x8);
+    const value = try generate(&rng, "qBittorrent 5.1.4");
     for (value[8..]) |c| {
         try std.testing.expect(std.ascii.isAlphanumeric(c));
     }
+}
+
+test "peer id suffix is byte-deterministic under SimRandom" {
+    var r1 = Random.simRandom(0xfeedbeef);
+    var r2 = Random.simRandom(0xfeedbeef);
+    const id1 = try generate(&r1, null);
+    const id2 = try generate(&r2, null);
+    try std.testing.expectEqualSlices(u8, &id1, &id2);
 }
