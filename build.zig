@@ -749,6 +749,32 @@ pub fn build(b: *std.Build) void {
     test_el_health_step.dependOn(&run_el_health.step);
     test_step.dependOn(&run_el_health.step);
 
+    // ── Cross-backend smoke: validates the daemon's selected `-Dio=` ─
+    // backend can construct an EventLoop, drain a timeout CQE, and tear
+    // down without leaking fds. Re-runs the focused subset of test
+    // targets that exercise the backend through the comptime selector.
+    // Intended invocation pattern:
+    //   zig build test-backends -Dio=epoll_posix
+    //   zig build test-backends -Dio=epoll_mmap
+    //   zig build test-backends                     # default io_uring
+    //
+    // Sim builds skip the daemon install entirely (`build_daemon == false`
+    // when -Dio=sim), so this step is meaningful only for the three
+    // production Linux backends.
+    const test_backends_step = b.step(
+        "test-backends",
+        "Run cross-backend boot/tick smoke (selected via -Dio=...)",
+    );
+    test_backends_step.dependOn(&run_el_health.step);
+    if (build_daemon) {
+        // The IO-parity test compiles only against `varuna.io.real_io.RealIO`
+        // (always io_uring) and `SimIO`, so re-running it under -Dio=epoll_*
+        // doesn't add coverage; the contract surface check is comptime
+        // anyway. We still include it under the default io_uring build so
+        // `zig build test-backends` (no -Dio=) covers the parity check.
+        test_backends_step.dependOn(&run_io_parity.step);
+    }
+
     // ── Transfer integration test (single-process piece transfer) ──
     const transfer_tests = b.addTest(.{
         .root_module = b.createModule(.{
