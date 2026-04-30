@@ -37,9 +37,8 @@ Pre-fix flake rates (measured across 10 `zig build test` runs):
 | Smart-ban Phase 2B | 2 |
 | **Combined** (any of the three) | 3 |
 
-Post-fix validation (in progress): 9/9 (and counting) of the
-20-run loop pass on the first sample. Final report expected at
-20/0 (or close to it).
+Post-fix validation: **20/20 pass** in the 20-run
+`zig build test` loop. None of the three flakes re-emerged.
 
 ### The fix shape
 
