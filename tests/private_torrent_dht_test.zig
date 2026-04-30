@@ -21,6 +21,11 @@ const varuna = @import("varuna");
 const TorrentSession = varuna.daemon.torrent_session.TorrentSession;
 const DhtEngine = varuna.dht.DhtEngine;
 const NodeId = varuna.dht.NodeId;
+const Random = varuna.runtime.random.Random;
+
+/// One Random instance shared across all the test sessions; deterministic
+/// seed so traces are reproducible.
+var test_random = Random.simRandom(0xCAFEBABE);
 
 // ── Fixture helpers ────────────────────────────────────────────
 
@@ -56,7 +61,7 @@ fn createSession(
 ) !*TorrentSession {
     const session = try allocator.create(TorrentSession);
     errdefer allocator.destroy(session);
-    session.* = try TorrentSession.create(allocator, metainfo_bytes, save_path, null);
+    session.* = try TorrentSession.create(allocator, &test_random, metainfo_bytes, save_path, null);
     return session;
 }
 
@@ -69,7 +74,7 @@ fn destroySession(allocator: std.mem.Allocator, session: *TorrentSession) void {
 /// so test seed snapshots are stable. Caller frees with `destroyEngine`.
 fn createEngine(allocator: std.mem.Allocator) !*DhtEngine {
     const node_id: NodeId = [_]u8{0xAB} ** 20;
-    return try DhtEngine.create(allocator, node_id);
+    return try DhtEngine.create(allocator, &test_random, node_id);
 }
 
 fn destroyEngine(allocator: std.mem.Allocator, engine: *DhtEngine) void {

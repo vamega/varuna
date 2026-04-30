@@ -18,11 +18,13 @@ const handlers_mod = varuna.rpc.handlers;
 const server_mod = varuna.rpc.server;
 const SessionManager = varuna.daemon.session_manager.SessionManager;
 const TorrentSession = varuna.daemon.torrent_session.TorrentSession;
+const Random = varuna.runtime.random.Random;
 
 const TestCtx = struct {
     handler: handlers_mod.ApiHandler,
     sm: *SessionManager,
     sid: [32]u8,
+    random: Random,
 
     fn init() TestCtx {
         const sm = std.testing.allocator.create(SessionManager) catch @panic("alloc");
@@ -33,8 +35,9 @@ const TestCtx = struct {
             .sync_state = .{ .allocator = std.testing.allocator },
             .peer_sync_state = .{ .allocator = std.testing.allocator },
         };
-        const sid = handler.session_store.createSession();
-        return .{ .handler = handler, .sm = sm, .sid = sid };
+        var random = Random.simRandom(0xDEADBEEF);
+        const sid = handler.session_store.createSession(&random);
+        return .{ .handler = handler, .sm = sm, .sid = sid, .random = random };
     }
 
     fn deinit(self: *TestCtx) void {
@@ -60,7 +63,7 @@ const TestCtx = struct {
 
         const session = try allocator.create(TorrentSession);
         errdefer allocator.destroy(session);
-        session.* = try TorrentSession.create(allocator, meta, "/tmp/varuna-tracker-edit-test", null);
+        session.* = try TorrentSession.create(allocator, &self.random, meta, "/tmp/varuna-tracker-edit-test", null);
 
         const hex = session.info_hash_hex;
         try self.sm.sessions.put(&session.info_hash_hex, session);
