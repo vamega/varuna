@@ -1,19 +1,30 @@
-// ── BLOCKING HTTP CLIENT ──────────────────────────────────────────
+// ── BLOCKING HTTP CLIENT — DO NOT USE FROM THE DAEMON EVENT LOOP ──
 //
-// This module contains a blocking HTTP client (HttpClient) that uses
-// direct posix syscalls (socket/connect/read/write). It is NOT used by
-// the varuna daemon — all daemon HTTP I/O goes through the non-blocking
-// io_uring-based HttpExecutor in http_executor.zig.
+// This module contains a blocking HTTP client (`HttpClient`) that uses
+// direct posix syscalls (socket/connect/read/write/setsockopt). It is
+// NOT used by the varuna daemon — all daemon HTTP I/O goes through the
+// non-blocking io_uring-based `HttpExecutor` in `http_executor.zig`.
 //
-// The blocking HttpClient is only used by:
-//   - varuna-ctl (CLI tool, blocking I/O is acceptable)
-//   - tracker/announce.zig:fetchViaHttp (library function for CLI tools)
-//   - perf/workloads.zig (benchmarking)
-//   - tests in this file
+// AGENTS.md io_uring policy explicitly bans `posix.connect` /
+// `posix.read` / `posix.write` for daemon HTTP work. Routing this
+// client into a daemon path would stall every torrent's progress for
+// the duration of the request — connect timeouts alone can be tens
+// of seconds, response reads can be longer.
 //
-// The pure parsing utilities at the bottom of this file (ParsedUrl,
-// parseUrl, findBodyStart, parseContentLength, parseStatusCode,
-// parseConnectionClose) ARE used by the daemon's HttpExecutor and
+// Allowed callers (each runs off the event-loop thread or is a non-
+// daemon binary):
+//   - `varuna-ctl` / `varuna-tools` CLI commands (blocking I/O OK)
+//   - `tracker/announce.zig:fetchViaHttp` (CLI tracker-announce
+//     helper; not on the daemon path)
+//   - `perf/workloads.zig` (benchmarking harness)
+//   - regression tests in this file and the threadpool DNS test
+//
+// If you are reaching for `HttpClient` from a new daemon code path,
+// stop — you almost certainly want `HttpExecutor` instead.
+//
+// The pure parsing utilities at the bottom of this file (`ParsedUrl`,
+// `parseUrl`, `findBodyStart`, `parseContentLength`, `parseStatusCode`,
+// `parseConnectionClose`) ARE used by the daemon's `HttpExecutor` and
 // must not be removed.
 // ──────────────────────────────────────────────────────────────────
 
@@ -26,8 +37,18 @@ const build_options = @import("build_options");
 const TlsStream = @import("tls.zig").TlsStream;
 
 /// Blocking HTTP/1.1 GET client using direct posix I/O.
-/// Only for varuna-ctl and CLI tools — the daemon uses HttpExecutor instead.
-/// Supports HTTP and HTTPS (when built with -Dtls=boringssl).
+///
+/// **AGENTS.md io_uring-policy violation by design.** Every method
+/// that names a remote endpoint (`get`, `getWithHeaders`, `getRange`)
+/// runs synchronous `posix.connect` / `posix.read` / `posix.write`
+/// (and TLS handshake for HTTPS) on the calling thread. Only
+/// `varuna-ctl` / `varuna-tools` / perf benchmarks / regression
+/// tests should reach for this struct. The daemon uses
+/// `HttpExecutor` (in `http_executor.zig`) — non-blocking io_uring
+/// SQEs throughout. See the file-header comment for the full caller
+/// allow-list.
+///
+/// Supports HTTP and HTTPS (when built with `-Dtls=boringssl`).
 pub const HttpClient = struct {
     allocator: std.mem.Allocator,
     dns_resolver: ?*DnsResolver = null,
@@ -89,12 +110,20 @@ pub const HttpClient = struct {
     /// DNS resolution runs on a background thread to avoid blocking the ring.
     /// When a DnsResolver is attached, results are cached across requests.
     /// Supports both http:// and https:// URLs.
+    ///
+    /// **Blocks on `posix.connect` / `posix.read` / `posix.write`.**
+    /// CLI / benchmark / test only — never call from the daemon
+    /// event-loop thread. See file-header comment.
     pub fn get(self: *HttpClient, url: []const u8) !HttpResponse {
         return self.getWithHeaders(url, &.{});
     }
 
     /// Perform an HTTP GET with additional headers (e.g. Range for BEP 19 web seeds).
     /// `extra_headers` is a slice of pre-formatted header lines (without trailing \r\n).
+    ///
+    /// **Blocks on `posix.connect` / `posix.read` / `posix.write`.**
+    /// CLI / benchmark / test only — never call from the daemon
+    /// event-loop thread. See file-header comment.
     pub fn getWithHeaders(self: *HttpClient, url: []const u8, extra_headers: []const []const u8) !HttpResponse {
         const parsed = try parseUrl(url);
 
@@ -107,6 +136,10 @@ pub const HttpClient = struct {
 
     /// Convenience: HTTP GET with a byte Range header (BEP 19 web seeding).
     /// Returns the response; caller should check status == 206 for partial content.
+    ///
+    /// **Blocks on `posix.connect` / `posix.read` / `posix.write`.**
+    /// CLI / benchmark / test only — never call from the daemon
+    /// event-loop thread. See file-header comment.
     pub fn getRange(self: *HttpClient, url: []const u8, range_start: u64, range_end: u64) !HttpResponse {
         var range_hdr_buf: [128]u8 = undefined;
         const range_hdr = std.fmt.bufPrint(&range_hdr_buf, "Range: bytes={}-{}", .{ range_start, range_end }) catch return error.RangeHeaderTooLong;
