@@ -290,6 +290,14 @@ fn runScenario(seed: u64, specs: [num_peers]PeerSpec) !ScenarioResult {
     }
 
     // ── 5. Drive ticks with staged connect/disconnect ──────────
+    //
+    // `posix.sched_yield()` after each tick gives the real
+    // hasher OS thread CPU time even under parallel-test-runner
+    // contention. Without the yield, the main loop's tight
+    // iteration outpaces the hasher's SHA-1 computation and the
+    // re-download → re-verify cycle that Phase 2B depends on
+    // doesn't complete in time. Once `SimHasher` lands (STATUS
+    // Next), the test becomes deterministic end-to-end.
     var ticks: u32 = 0;
     while (ticks < max_ticks) : (ticks += 1) {
         // Trigger pending connects.
@@ -304,6 +312,7 @@ fn runScenario(seed: u64, specs: [num_peers]PeerSpec) !ScenarioResult {
         }
 
         try el.tick();
+        _ = std.os.linux.sched_yield(); // give the real hasher OS thread CPU time
         el.io.now_ns += 1_000_000;
 
         for (&peers) |*peer| {
@@ -325,15 +334,21 @@ fn runScenario(seed: u64, specs: [num_peers]PeerSpec) !ScenarioResult {
     }
 
     // ── 6. Drain phase ─────────────────────────────────────────
+    //
+    // Drain budget bumped from 256 → 4096 ticks to absorb the tail
+    // end of in-flight piece-block recvs + hasher SHA work + the
+    // re-download cycle for Phase 2B's hash-fail → re-verify path
+    // when it lands close to the main-loop budget boundary.
     for (&peers, 0..) |*peer, idx| {
         if (!disconnected[idx]) peer.disconnect();
     }
     var drain_ticks: u32 = 0;
-    while (drain_ticks < 256) : (drain_ticks += 1) {
+    while (drain_ticks < 4096) : (drain_ticks += 1) {
         const hasher_busy = if (el.hasher) |h| h.hasPendingWork() else false;
         const writes_pending = el.pending_writes.count() > 0;
         if (!hasher_busy and !writes_pending) break;
         try el.tick();
+        _ = std.os.linux.sched_yield(); // give the real hasher OS thread CPU time
     }
 
     // ── 7. Collect outcomes ────────────────────────────────────
