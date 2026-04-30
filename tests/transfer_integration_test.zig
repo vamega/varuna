@@ -113,8 +113,8 @@ test "single-piece transfer between seeder and downloader on shared event loop" 
         &span_scratch,
     );
     defer plan.deinit(allocator);
-    try store.writePiece(plan.spans, &piece_data);
-    try store.sync();
+    try store.writePiece(&store_init_io, plan.spans, &piece_data);
+    try store.sync(&store_init_io);
 
     const shared_fds = try store.fileHandles(allocator);
     defer allocator.free(shared_fds);
@@ -201,7 +201,7 @@ test "single-piece transfer between seeder and downloader on shared event loop" 
     // `piece_hash` from before the EL was wired.
     var read_buf: [piece_data_len]u8 = undefined;
     const read_spans = try session.layout.mapPiece(0, &span_scratch);
-    try store.readPiece(read_spans, &read_buf);
+    try store.readPiece(&store_init_io, read_spans, &read_buf);
 
     var actual_hash: [20]u8 = undefined;
     Sha1.hash(&read_buf, &actual_hash, .{});

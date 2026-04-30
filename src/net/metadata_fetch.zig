@@ -7,11 +7,29 @@ const ext = @import("extensions.zig");
 const peer_wire = @import("peer_wire.zig");
 const Sha1 = @import("../crypto/root.zig").Sha1;
 
-/// BEP 9 resilient metadata fetcher.
+/// BEP 9 resilient metadata fetcher (blocking, background-thread-only).
 ///
 /// Downloads metadata from multiple peers in parallel, handles timeouts,
-/// retries, and provides progress reporting. Designed to be called from
-/// a background thread (not the io_uring event loop).
+/// retries, and provides progress reporting.
+///
+/// **AGENTS.md io_uring-policy violation by design.** Every per-peer
+/// connection runs through synchronous `posix.socket` / `posix.connect`
+/// / `posix.send` / `posix.recv` calls inside `fetchFromPeerBlocking`.
+/// The fetcher is intended to be invoked from a background thread —
+/// **never** from the event-loop thread, where each blocking syscall
+/// would stall every other torrent's progress.
+///
+/// The async io_uring replacement is `src/io/metadata_fetch.zig`'s
+/// `AsyncMetadataFetchOf(IO)` (the `EventLoopOf(SimIO)`-driven
+/// state machine). New magnet-link plumbing should target that
+/// path; this blocking fetcher remains for `varuna-tools` /
+/// historical CLI flows that genuinely run off-thread.
+///
+/// To reinforce that intent, the public entry point is `fetchBlocking`
+/// (a `Blocking`-named alias for the original `fetch`) — accidentally
+/// calling `fetcher.fetch()` from the event loop would defeat the
+/// io_uring contract. Per-peer driver was internal but renamed to
+/// `fetchFromPeerBlocking` for the same reason.
 
 // ── Configuration ──────────────────────────────────────────
 
@@ -125,6 +143,10 @@ const PeerResult = struct {
 
 /// Coordinates metadata download from multiple peers with parallel
 /// requests, timeout handling, and retry logic.
+///
+/// **Blocking, background-thread-only.** See module-level doc-comment
+/// for the AGENTS.md io_uring-policy rationale and the async
+/// replacement in `src/io/metadata_fetch.zig`.
 pub const MetadataFetcher = struct {
     allocator: std.mem.Allocator,
     info_hash: [20]u8,
@@ -196,13 +218,27 @@ pub const MetadataFetcher = struct {
         return self.progress;
     }
 
-    /// Run the metadata fetch. Blocks until metadata is complete, all
-    /// peers are exhausted, or the overall timeout expires.
+    /// Run the metadata fetch. **Blocks** until metadata is complete,
+    /// all peers are exhausted, or the overall timeout expires.
+    ///
+    /// **AGENTS.md io_uring-policy violation by design.** Per-peer
+    /// connections drive synchronous `posix.socket` / `posix.connect`
+    /// / `posix.send` / `posix.recv` syscalls. Call this only from a
+    /// background thread — never from the event-loop thread, where it
+    /// will stall every torrent's progress for the duration of the
+    /// fetch (up to `overall_timeout_secs = 300`).
+    ///
+    /// The async io_uring replacement is `AsyncMetadataFetchOf(IO)`
+    /// in `src/io/metadata_fetch.zig`. New code paths should target
+    /// that one. This entry point is named `fetchBlocking` to make
+    /// the call-site obvious; an `fetcher.fetchBlocking()` from the
+    /// event loop reads as a flagrant policy violation rather than a
+    /// neutral "fetch" verb.
     ///
     /// Returns the verified raw info dictionary bytes on success.
     /// The returned slice references the assembler's internal buffer
     /// and is valid until this fetcher is deinitialized.
-    pub fn fetch(self: *MetadataFetcher) FetchError![]const u8 {
+    pub fn fetchBlocking(self: *MetadataFetcher) FetchError![]const u8 {
         const log = std.log.scoped(.metadata_fetch);
 
         self.start_time = std.time.timestamp();
@@ -255,7 +291,7 @@ pub const MetadataFetcher = struct {
             self.peers.items[peer_idx].attempted = true;
             self.peers.items[peer_idx].active = true;
 
-            self.fetchFromPeer(peer_idx, log) catch |err| {
+            self.fetchFromPeerBlocking(peer_idx, log) catch |err| {
                 log.debug("metadata fetch from peer failed: {s}", .{@errorName(err)});
                 self.peers.items[peer_idx].failures += 1;
             };
@@ -298,7 +334,14 @@ pub const MetadataFetcher = struct {
     }
 
     /// Try to fetch metadata pieces from a single peer.
-    fn fetchFromPeer(self: *MetadataFetcher, peer_idx: usize, log: anytype) FetchError!void {
+    ///
+    /// **Blocking syscalls throughout.** This function uses
+    /// synchronous `posix.socket` / `posix.connect` / `posix.send`
+    /// / `posix.recv` / `setsockopt` and so violates the AGENTS.md
+    /// io_uring policy by design. It must only be invoked from a
+    /// background thread (see the `fetchBlocking` entry point's
+    /// doc-comment for the rationale and the async replacement).
+    fn fetchFromPeerBlocking(self: *MetadataFetcher, peer_idx: usize, log: anytype) FetchError!void {
         const peer = &self.peers.items[peer_idx];
         const addr = peer.address;
 
@@ -619,7 +662,7 @@ test "MetadataFetcher fetch fails with no peers" {
     );
     defer fetcher.deinit();
 
-    const result = fetcher.fetch();
+    const result = fetcher.fetchBlocking();
     try std.testing.expectError(error.NoPeers, result);
     try std.testing.expectEqual(FetchState.failed, fetcher.progress.state);
 }

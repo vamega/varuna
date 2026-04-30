@@ -14,36 +14,56 @@ const io_interface = @import("../io/io_interface.zig");
 /// `PieceStoreOf(SimIO)` directly so the same init / sync paths drive
 /// against `EventLoopOf(SimIO)` for fault-injection harnesses.
 ///
-/// All disk syscalls route through `self.io`:
-///   * `init` submits one `fallocate` per non-skipped file and drains
-///     the ring with `io.tick(1)` until every completion lands. This
-///     is the one-time pre-allocation per torrent — AGENTS.md flags
-///     it as an "allowed exception" but routing through the contract
-///     is what makes ENOSPC / EIO injection possible from BUGGIFY.
-///   * `sync` submits one `fsync(datasync=true)` per open file, same
-///     drain pattern. Replaces the previous `posix.fdatasync` loop.
-///   * `writePiece` submits one `io.write` per span (one span per file
-///     the piece touches) and drains until every completion lands. The
-///     callback handles short writes by re-submitting the remainder.
-///   * `readPiece` submits one `io.read` per span with the same drain
-///     pattern; short reads are looped, and a 0-byte completion before
-///     the span is satisfied surfaces as `error.UnexpectedEndOfFile`.
+/// All disk syscalls route through an `IO` passed in per call:
+///   * `init` takes `io` and submits one `fallocate` per non-skipped
+///     file, draining the ring with `io.tick(1)` until every
+///     completion lands. The store does NOT retain the pointer; `io`
+///     only needs to outlive the `init` call. This is the one-time
+///     pre-allocation per torrent — AGENTS.md flags it as an "allowed
+///     exception" but routing through the contract is what makes
+///     ENOSPC / EIO injection possible from BUGGIFY.
+///   * `sync` takes `io` and submits one `fsync(datasync=true)` per
+///     open file, same drain pattern. Replaces the previous
+///     `posix.fdatasync` loop. Daemon flushes go through the
+///     EL-level sync sweep on `EventLoop.submitTorrentSync` instead;
+///     this method is reached only from tests today.
+///   * `writePiece` takes `io` and submits one `io.write` per span
+///     (one span per file the piece touches) and drains until every
+///     completion lands. The callback handles short writes by re-
+///     submitting the remainder.
+///   * `readPiece` takes `io` and submits one `io.read` per span with
+///     the same drain pattern; short reads are looped, and a 0-byte
+///     completion before the span is satisfied surfaces as
+///     `error.UnexpectedEndOfFile`.
 ///
-/// Note: the daemon's hot piece-write path (peer wire → disk) does NOT
-/// go through `PieceStore.writePiece` — `peer_policy` submits its own
-/// `self.io.write` calls per span using the shared fds from
-/// `PieceStore.fileHandles(...)`. `writePiece`/`readPiece` are reached
-/// only from the `varuna verify` CLI command (`recheckExistingData`)
-/// and tests that drive the store directly. Both contexts spin up
-/// their own io ring and block on `io.tick` until our completions
-/// land, so the "submit + drain" shape is the correct semantic.
+/// `PieceStore` does not retain an `IO` pointer between calls. The
+/// previous `io: *IO` field was a footgun: the daemon constructs the
+/// store in a background worker against a one-shot `init_io` that
+/// went out of scope when the worker function returned, leaving any
+/// later `store.io.*` access dangling. The hot path (peer_policy
+/// submits its own `self.io.write` calls per span using the shared
+/// fds from `PieceStore.fileHandles(...)`) was never affected, but
+/// the field was a UAF waiting to happen for `sync` / `writePiece` /
+/// `readPiece`. Removing the field eliminates the latent bug; every
+/// caller that needs an op already owns the `IO` they constructed
+/// the store with (CLI verify, tests, recheck), so passing it back
+/// in is uniformly local.
+///
+/// Note: the daemon's hot piece-write path (peer wire → disk) does
+/// NOT go through `PieceStore.writePiece` — `peer_policy` submits
+/// its own `self.io.write` calls per span using the shared fds from
+/// `PieceStore.fileHandles(...)`. `writePiece`/`readPiece` are
+/// reached only from the `varuna verify` CLI command
+/// (`recheckExistingData`) and tests that drive the store directly.
+/// Both contexts spin up their own io ring and block on `io.tick`
+/// until our completions land, so the "submit + drain" shape is the
+/// correct semantic.
 pub fn PieceStoreOf(comptime IO: type) type {
     return struct {
         const Self = @This();
 
         allocator: std.mem.Allocator,
         session: *const torrent.session.Session,
-        io: *IO,
         /// File handles indexed by file_index.  A null entry means the file was
         /// skipped (do_not_download) and has not been created yet.
         files: []?std.fs.File,
@@ -58,6 +78,9 @@ pub fn PieceStoreOf(comptime IO: type) type {
 
         /// Initialise with optional per-file priorities. Files marked
         /// `do_not_download` are not pre-allocated or opened.
+        ///
+        /// `io` is used only for the one-time `fallocate` pass during
+        /// init; the returned `Self` does not retain the pointer.
         pub fn initWithPriorities(
             allocator: std.mem.Allocator,
             session: *const torrent.session.Session,
@@ -105,7 +128,6 @@ pub fn PieceStoreOf(comptime IO: type) type {
             return .{
                 .allocator = allocator,
                 .session = session,
-                .io = io,
                 .files = files,
             };
         }
@@ -120,7 +142,10 @@ pub fn PieceStoreOf(comptime IO: type) type {
 
         /// Ensure a file that was previously skipped is now open and allocated.
         /// Called lazily when a piece spanning a newly-wanted file needs writing.
-        pub fn ensureFileOpen(self: *Self, file_index: usize) !std.fs.File {
+        ///
+        /// `io` is used only for the one-time `fallocate` against the
+        /// newly-opened file; the store does not retain the pointer.
+        pub fn ensureFileOpen(self: *Self, io: *IO, file_index: usize) !std.fs.File {
             if (self.files[file_index]) |f| return f;
 
             const file_entry = self.session.manifest.files[file_index];
@@ -134,7 +159,7 @@ pub fn PieceStoreOf(comptime IO: type) type {
             });
             errdefer file.close();
 
-            try preallocateOne(self.io, file, file_entry.length);
+            try preallocateOne(io, file, file_entry.length);
             self.files[file_index] = file;
             return file;
         }
@@ -151,9 +176,12 @@ pub fn PieceStoreOf(comptime IO: type) type {
         /// Per-span tracking for an in-flight `writePiece`. Heap-located
         /// inside the caller's `states` slice so each span carries its
         /// own `Completion` and the (possibly shrinking) `remaining` /
-        /// `offset` pair the short-write loop advances.
+        /// `offset` pair the short-write loop advances. Carries `io`
+        /// directly so the short-write re-submit path doesn't need to
+        /// reach back through the store (which no longer keeps an `IO`
+        /// pointer).
         const WriteSpanState = struct {
-            parent: *Self,
+            io: *IO,
             ctx: *PieceIoCtx,
             fd: posix.fd_t,
             /// Buffer remaining to write; advances on short writes.
@@ -166,7 +194,7 @@ pub fn PieceStoreOf(comptime IO: type) type {
         /// Per-span tracking for an in-flight `readPiece`. Same shape
         /// as `WriteSpanState` but with a mutable destination slice.
         const ReadSpanState = struct {
-            parent: *Self,
+            io: *IO,
             ctx: *PieceIoCtx,
             fd: posix.fd_t,
             /// Destination remaining to fill; shrinks on short reads.
@@ -205,7 +233,7 @@ pub fn PieceStoreOf(comptime IO: type) type {
                         // so `armCompletion` re-arms cleanly.
                         state.remaining = state.remaining[n..];
                         state.offset += n;
-                        state.parent.io.write(
+                        state.io.write(
                             .{ .fd = state.fd, .buf = state.remaining, .offset = state.offset },
                             &state.completion,
                             state,
@@ -255,7 +283,7 @@ pub fn PieceStoreOf(comptime IO: type) type {
                         // Short read — re-submit for the remainder.
                         state.remaining = state.remaining[n..];
                         state.offset += n;
-                        state.parent.io.read(
+                        state.io.read(
                             .{ .fd = state.fd, .buf = state.remaining, .offset = state.offset },
                             &state.completion,
                             state,
@@ -288,6 +316,7 @@ pub fn PieceStoreOf(comptime IO: type) type {
         /// below.
         pub fn writePiece(
             self: *Self,
+            io: *IO,
             spans: []const torrent.layout.Layout.Span,
             piece_data: []const u8,
         ) !void {
@@ -297,7 +326,7 @@ pub fn PieceStoreOf(comptime IO: type) type {
             // may submit its own fallocate (and tick the ring); doing it
             // up front keeps the per-span states stable for phase 3.
             for (spans) |span| {
-                _ = try self.ensureFileOpen(span.file_index);
+                _ = try self.ensureFileOpen(io, span.file_index);
             }
 
             // Phase 2: allocate per-span tracking state. Heap-allocated
@@ -311,7 +340,7 @@ pub fn PieceStoreOf(comptime IO: type) type {
                 const file = self.files[span.file_index].?;
                 const block = piece_data[span.piece_offset .. span.piece_offset + span.length];
                 states[i] = .{
-                    .parent = self,
+                    .io = io,
                     .ctx = &ctx,
                     .fd = file.handle,
                     .remaining = block,
@@ -328,7 +357,7 @@ pub fn PieceStoreOf(comptime IO: type) type {
             // case before returning.
             var submitted: usize = 0;
             for (states) |*state| {
-                self.io.write(
+                io.write(
                     .{ .fd = state.fd, .buf = state.remaining, .offset = state.offset },
                     &state.completion,
                     state,
@@ -337,14 +366,14 @@ pub fn PieceStoreOf(comptime IO: type) type {
                     // Adjust pending to match what we actually submitted
                     // so the drain loop terminates cleanly.
                     ctx.pending -= (spans.len - submitted);
-                    while (ctx.pending > 0) try self.io.tick(1);
+                    while (ctx.pending > 0) try io.tick(1);
                     if (ctx.first_error) |first| return first;
                     return err;
                 };
                 submitted += 1;
             }
 
-            while (ctx.pending > 0) try self.io.tick(1);
+            while (ctx.pending > 0) try io.tick(1);
             if (ctx.first_error) |err| return err;
         }
 
@@ -359,6 +388,7 @@ pub fn PieceStoreOf(comptime IO: type) type {
         /// the store directly. Not on the daemon hot path.
         pub fn readPiece(
             self: *Self,
+            io: *IO,
             spans: []const torrent.layout.Layout.Span,
             piece_data: []u8,
         ) !void {
@@ -371,7 +401,7 @@ pub fn PieceStoreOf(comptime IO: type) type {
                 const file = self.files[span.file_index] orelse return error.FileNotOpen;
                 const block = piece_data[span.piece_offset .. span.piece_offset + span.length];
                 states[i] = .{
-                    .parent = self,
+                    .io = io,
                     .ctx = &ctx,
                     .fd = file.handle,
                     .remaining = block,
@@ -382,33 +412,38 @@ pub fn PieceStoreOf(comptime IO: type) type {
 
             var submitted: usize = 0;
             for (states) |*state| {
-                self.io.read(
+                io.read(
                     .{ .fd = state.fd, .buf = state.remaining, .offset = state.offset },
                     &state.completion,
                     state,
                     readSpanCallback,
                 ) catch |err| {
                     ctx.pending -= (spans.len - submitted);
-                    while (ctx.pending > 0) try self.io.tick(1);
+                    while (ctx.pending > 0) try io.tick(1);
                     if (ctx.first_error) |first| return first;
                     return err;
                 };
                 submitted += 1;
             }
 
-            while (ctx.pending > 0) try self.io.tick(1);
+            while (ctx.pending > 0) try io.tick(1);
             if (ctx.first_error) |err| return err;
         }
 
-        /// Flush all open files via async `io.fsync` (datasync). Submits one
-        /// fsync op per open file through `self.io` and blocks the calling
-        /// thread on `io.tick` until every fsync completes. Daemon callers
-        /// run this from the event-loop thread.
+        /// Flush all open files via async `io.fsync` (datasync). Submits
+        /// one fsync op per open file through the supplied `io` and
+        /// blocks the calling thread on `io.tick` until every fsync
+        /// completes.
         ///
         /// Replaces the previous synchronous `posix.fdatasync` loop. The
         /// async path lets the event loop interleave other CQEs (e.g. a
         /// peer recv) while the kernel walks the file's metadata.
-        pub fn sync(self: *Self) !void {
+        ///
+        /// Daemon flushes go through the EL-level sync sweep on
+        /// `EventLoop.submitTorrentSync` instead, which keeps the fsync
+        /// fan-out on the long-lived loop's `IO`. This method is reached
+        /// from CLI verify and tests today.
+        pub fn sync(self: *Self, io: *IO) !void {
             var open_count: usize = 0;
             for (self.files) |maybe_file| if (maybe_file != null) {
                 open_count += 1;
@@ -428,7 +463,7 @@ pub fn PieceStoreOf(comptime IO: type) type {
             var i: usize = 0;
             for (self.files) |maybe_file| {
                 if (maybe_file) |file| {
-                    try self.io.fsync(
+                    try io.fsync(
                         .{ .fd = file.handle, .datasync = true },
                         &completions[i],
                         &ctx,
@@ -438,7 +473,7 @@ pub fn PieceStoreOf(comptime IO: type) type {
                 }
             }
 
-            while (ctx.pending > 0) try self.io.tick(1);
+            while (ctx.pending > 0) try io.tick(1);
             if (ctx.first_error) |err| return err;
         }
 
@@ -737,8 +772,8 @@ test "write piece data across multiple files" {
     const plan = try @import("verify.zig").planPieceVerification(std.testing.allocator, &session, 0);
     defer plan.deinit(std.testing.allocator);
 
-    try store.writePiece(plan.spans, "spam");
-    try store.sync();
+    try store.writePiece(&io, plan.spans, "spam");
+    try store.sync(&io);
 
     const first = try tmp.dir.readFileAlloc(std.testing.allocator, "download/root/alpha", 16);
     defer std.testing.allocator.free(first);
@@ -776,10 +811,10 @@ test "read piece data across multiple files" {
     const plan = try @import("verify.zig").planPieceVerification(std.testing.allocator, &session, 0);
     defer plan.deinit(std.testing.allocator);
 
-    try store.writePiece(plan.spans, "spam");
+    try store.writePiece(&io, plan.spans, "spam");
 
     var piece_buffer: [4]u8 = undefined;
-    try store.readPiece(plan.spans, piece_buffer[0..]);
+    try store.readPiece(&io, plan.spans, piece_buffer[0..]);
 
     try std.testing.expectEqualStrings("spam", &piece_buffer);
 }
@@ -845,7 +880,7 @@ test "ensureFileOpen creates skipped file on demand" {
     try std.testing.expect(store.files[0] == null);
 
     // Now open it on demand
-    const file = try store.ensureFileOpen(0);
+    const file = try store.ensureFileOpen(&io, 0);
     try std.testing.expect(file.handle >= 0);
     try std.testing.expect(store.files[0] != null);
 }

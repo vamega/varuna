@@ -293,7 +293,8 @@ See `progress-reports/2026-04-25-stage2-event-loop-migration.md` for the Stage 2
 - ~~**`writePiece` / `readPiece` migration to the IO contract.**~~ Closed 2026-04-28. PieceStore's per-piece write and read paths now route through `self.io.write` / `self.io.read` with caller-owned per-span completions and a multi-completion drain loop (mirrors `sync`'s shape). Removes the last synchronous `posix.pwrite` / `posix.pread` in storage. See `progress-reports/2026-04-28-storage-rw-io-contract.md`.
 - ~~**`truncate` op on the IO contract.**~~ Closed 2026-04-28. New `TruncateOp` + `Result.truncate` variant on `io_interface.zig`. RealIO implementation is synchronous (`posix.ftruncate`) because `IORING_OP_FTRUNCATE` requires kernel 6.9, above varuna's floor (6.6 minimum / 6.8 preferred); the call site is `PieceStore.init`'s filesystem-portability fallback, which already runs on a background thread, so synchronous syscall has zero event-loop impact. SimIO implementation plus `truncate_error_probability` + `fallocate_unsupported_probability` fault knobs. Both `setEndPos` call sites in `src/storage/writer.zig` (`preallocateAll` and `preallocateOne`) now route through `self.io.truncate`. See `progress-reports/2026-04-28-truncate-op.md`.
 - ~~**Switch RealIO.truncate to `IORING_OP_FTRUNCATE` once kernel floor bumps to 6.9+.**~~ Closed 2026-04-29. Resolved as a runtime decision instead of a kernel-floor bump: `RealIO.init` now caches a `feature_support: FeatureSupport` field populated by `probeFeatures(&ring)` (issues `IORING_REGISTER_PROBE` once at init), and `RealIO.truncate` branches — async `IORING_OP_FTRUNCATE` SQE when supported (kernel ≥6.9 or any kernel with the op backported), synchronous `posix.ftruncate(2)` otherwise. Varuna's overall floor stays at 6.6 minimum / 6.8 preferred. The `FeatureSupport` struct is the seed for cleaning up the broader floor-blocked op set (filed below). See `progress-reports/2026-04-29-runtime-feature-probe.md`.
-- **Generalize `FeatureSupport` to cover other kernel-floor-blocked ops.** AGENTS.md tracks `IORING_OP_SETSOCKOPT` (6.7+) and `IORING_OP_BIND`/`LISTEN` (6.11+) as currently-synchronous ops gated on the overall kernel floor. Now that `src/io/ring.zig`'s `FeatureSupport` exists, those can drop their ad-hoc kernel-version arithmetic in favor of per-op probe flags (add `supports_setsockopt`, `supports_bind`, `supports_listen` to `FeatureSupport`, branch in the relevant submission methods, keep the synchronous fallback alongside). Same shape as the truncate landing. Estimated 0.5-1 day per op group once the day-one daemon paths are pinned down.
+- ~~**Generalize `FeatureSupport` to cover other kernel-floor-blocked ops.**~~ Probe flags landed 2026-04-30. `FeatureSupport` in `src/io/ring.zig` now exposes `supports_bind` (`IORING_OP_BIND`, kernel ≥6.11), `supports_listen` (`IORING_OP_LISTEN`, kernel ≥6.11), and `supports_setsockopt` (`IORING_OP_URING_CMD`, the carrier op for the `SOCKET_URING_OP_SETSOCKOPT` subcmd at kernel ≥6.7). `probeFeatures` lights the new flags via the existing `IORING_REGISTER_PROBE` wrapper; `FeatureSupport.none` extended; runtime-detection test mirroring `supports_ftruncate`. No daemon submission methods are gated on the new flags yet — the call-site work (per-peer setsockopt, listen-socket bring-up) is filed as a separate follow-up below. See `progress-reports/2026-04-30-misc-cleanup.md`.
+- **Daemon submission paths for bind / listen / setsockopt.** Now that the `FeatureSupport` flags exist, the daemon's listen-socket bring-up paths (`src/io/event_loop.zig` peer listener / uTP listener / RPC server) and the per-peer setsockopt calls (TCP_NODELAY, buffer sizes, BINDTODEVICE applied via `src/net/socket.zig`) can branch on `feature_support.supports_bind` / `supports_listen` / `supports_setsockopt` and dispatch async io_uring SQEs when supported, falling back to `posix.bind(2)` / `posix.listen(2)` / `posix.setsockopt(2)` otherwise. Estimated 0.5-1 day per call-site cluster.
 - **Live-pipeline BUGGIFY harness for `PieceStoreOf(SimIO)`.** Wrap the integration tests in `tests/storage_writer_test.zig` with the canonical BUGGIFY shape — per-tick `injectRandomFault` + per-op `FaultConfig` × 32 seeds. Catches recovery paths the foundation tests can't see (errdefer cleanup of partially-opened files when the 2nd of 5 fallocates fails; sync's pending-counter under fsync error storms; per-span resubmit racing with cancellation under read/write fault injection). Reference shape: `tests/recheck_live_buggify_test.zig`. Estimated 0.5-1 day. Now also covers writePiece/readPiece short-write/short-read loops.
 - ~~**SimHasher — make the hasher pool deterministic.**~~ Closed 2026-04-30. `src/io/hasher.zig` is now a tagged-union `Hasher = union(enum) { real: *RealHasher, sim: *SimHasher }` (mirrors `runtime.Clock` / `runtime.Random`). The production thread pool moved into `RealHasher` unchanged; `SimHasher` hashes synchronously on the EL thread and pushes results onto its queue, so the next `peer_policy.processHashResults` (called every tick) drains them deterministically. A `SimHasher.FaultConfig.merkle_pread_fault_prob` knob with a seeded `DefaultPrng` lets sim tests force pread failures reproducibly. Daemon construction `Hasher.realInit(allocator, threads)`; sim-test construction `Hasher.simInit(allocator, seed)`. Stretch: `tests/recheck_test.zig`'s three `AsyncRecheckOf(SimIO)` tests rewired to SimHasher — across 8 fresh runs the previously-flaky "all pieces verify" / "corrupt piece" assertions now pass 8/8 (vs. ~25 % flake rate on the real-thread shape). See `progress-reports/2026-04-30-simhasher.md`.
 - **Migrate `std.crypto.random` callers to a daemon-seeded CSPRNG.** The 2026-04-29 SimRandom round documented 5 callers (MSE keys, peer ID, DHT node ID, DHT tokens, RPC SID) as a "crypto-determinism boundary" deliberately left on `std.crypto.random` for production unpredictability — but that means sim tests touching those paths can't be byte-deterministic, defeating single-daemon full-determinism. Resolved direction: at daemon startup, seed a CSPRNG (e.g. `std.Random.ChaCha`) once from a real cryptographic source (`std.crypto.random.bytes(&seed)`), then route ALL random reads through that seeded CSPRNG. Production keeps cryptographic strength because a 256-bit seed from a real source plus a modern CSPRNG is computationally indistinguishable from a true random source for the lifetime of a single daemon process — standard "seed once, generate many" pattern. Sim builds inject a deterministic seed via the same surface; same CSPRNG implementation, same code paths, just a known seed. This closes the crypto-determinism boundary entirely. Implementation likely requires plumbing a `*Random` reference through to the 5 sensitive callers (injection rather than module global, so tests can vary the seed per test case). Estimated 3-4 days. The existing `runtime.Random` (currently `RealRandom = wraps std.crypto.random` vs `SimRandom = DefaultPrng`) gets retrofitted: both variants use the same ChaCha-based CSPRNG; only the seed source differs.
@@ -314,7 +315,123 @@ See `progress-reports/2026-04-25-stage2-event-loop-migration.md` for the Stage 2
 - ~~**Smart ban Phases 1-2 not yet implemented**~~: closed 2026-04-26. Phase 1 (per-block SHA-1 attribution on hash failure) and Phase 2 (ban-targeting on re-download pass) live in `src/net/smart_ban.zig` and `src/io/peer_policy.zig`; attribution survives peer-slot freeing via `BlockInfo.delivered_address`. End-to-end validation in `tests/sim_smart_ban_phase12_eventloop_test.zig`.
 - **MSE handshake failures in mixed encryption mode**: `vc_not_found` and `req1_not_found` errors occur during simultaneous inbound+outbound MSE handshakes. Timing-dependent, disappears under GDB. `demo_swarm.sh` runs with `encryption = "disabled"` as workaround.
 - ~~**Daemon graceful shutdown**~~: Fixed. In-flight transfer draining with configurable timeout now ensures clean exit on SIGTERM/SIGINT.
-- `IORING_OP_SETSOCKOPT` (kernel 6.7+), `IORING_OP_BIND`/`LISTEN` (kernel 6.11+) not available on current kernel 6.6. Per-peer setsockopt (TCP_NODELAY, buffer sizes) remains synchronous.
+- `IORING_OP_SETSOCKOPT` (kernel 6.7+), `IORING_OP_BIND`/`LISTEN` (kernel 6.11+) not available on current kernel 6.6. Per-peer setsockopt (TCP_NODELAY, buffer sizes) remains synchronous. (`FeatureSupport` has detection flags as of 2026-04-30; daemon submission paths still pending — see "Daemon submission paths for bind / listen / setsockopt" follow-up above.)
+
+## Last Verified Milestone (2026-04-30 — misc cleanup: PieceStore.io UAF + FeatureSupport extension + BEP 52 v2 piece validation + blocking-helper warnings)
+
+Four small contained cleanups consolidated into one engineer's session,
+each landed in its own bisectable commit. Every task was filed as a
+STATUS.md follow-up; together they're the next ~2 days of "small but
+real footguns" being closed before they bite.
+
+**Task 1 — `PieceStore.io` dangling-pointer fix.**
+`PieceStore` was constructed in the daemon's background-init thread
+(`doStartBackground` in `src/daemon/torrent_session.zig`) against a
+short-lived `init_io` that went out of scope at end-of-function. The
+hot path was unaffected (peer_policy submits its own `io.write` calls
+per span using the shared fds from `PieceStore.fileHandles`), but
+`store.sync` / `store.writePiece` / `store.readPiece` would have
+UAF'd if anyone called them. The Task 1 round-fix that landed
+`EventLoop.submitTorrentSync` deliberately routed around the
+dangling `store.io`; this commit kills the field outright. Each
+method that needs an `IO` op now takes it as an explicit per-call
+parameter. Every caller (CLI verify in `app.zig`,
+`recheckExistingData` / `recheckV2`, three test files) already owns
+the `IO` they constructed the store with, so the rewire was
+uniformly local. Lifts the latent UAF flagged in
+`progress-reports/2026-04-28-correctness-fixes.md` "Surprises" #1.
+
+Key files: `src/storage/writer.zig` (field removal + signature
+extension), `src/storage/verify.zig` (recheck call sites pass `io`
+through), `src/app.zig` (CLI verify), three test files updated.
+
+**Task 2 — `FeatureSupport` extension.**
+Added `supports_bind` / `supports_listen` / `supports_setsockopt`
+alongside the existing `supports_ftruncate` in
+`src/io/ring.zig`. `probeFeatures` populates each via the
+`IORING_REGISTER_PROBE` wrapper (`is_supported(.BIND)`,
+`is_supported(.LISTEN)`, `is_supported(.URING_CMD)` for
+`SETSOCKOPT`'s carrier op). `FeatureSupport.none` extended to keep
+the all-false sentinel correct. Three new inline tests including a
+runtime-detection mirror of the `supports_ftruncate` test.
+
+The setsockopt flag has a documented caveat: probing
+`IORING_OP_URING_CMD` is *necessary* (URING_CMD existed before the
+SETSOCKOPT subcmd shipped in 6.7) but not *sufficient* — the
+SETSOCKOPT subcmd may still be rejected at completion time on a
+URING_CMD-only kernel. Daemon callers that submit an actual
+setsockopt URING_CMD must handle that. No daemon submission methods
+are gated on the new flags yet; this is groundwork for the
+follow-up "Daemon submission paths for bind / listen / setsockopt"
+filed in Next.
+
+**Task 3 — BEP 52 v2 piece validation via `LeafHashStore`.**
+Pure-v2 torrents had no working piece-completion path:
+`layout.pieceHash` returns `error.UnsupportedForV2`, the SHA-1
+hasher pool can't accommodate SHA-256, and per-piece SHA-256-from-
+Merkle-root verification needs the whole file's pieces on disk
+first. The bep52-dht-engineer round (commit `4fe5160`) wired up
+`src/torrent/leaf_hashes.zig` — peer-provided BEP 52 leaves stored
+*after* the proof on the `hashes` message has chained up to the
+file's `pieces_root`. This commit consults that store from
+`peer_policy.completePieceDownload`: a new `completeV2PieceDownload`
+helper runs an inline SHA-256 verify against
+`tc.leaf_hashes.get(piece_index)` and submits the same per-span
+disk writes as the v1 inline-verify fallback.
+
+Inline SHA-256 (rather than hasher-pool dispatch) is justified by
+the hasher pool being SHA-1-only; threading SHA-256 through
+`hasher.zig` is the simhasher-engineer's territory and out of scope
+here. Smart-ban-on-failure is similarly deferred — the smart-ban
+infrastructure attaches to the SHA-1 hasher's Phase 1 attribution
+snapshot, and wiring that into the inline v2 path is
+non-trivial. Three inline tests cover the three early-return paths
+(`leaf_hashes == null`, leaf absent, SHA-256 mismatch) plus the
+verify-passes-then-skip-all-spans branch. Closes the explicit
+follow-up filed at the end of `progress-reports/2026-04-29-bep52-dht-and-hashes.md`.
+
+**Task 4 — Blocking helpers: rename + docstring warnings.**
+External-review C4: blocking HTTP / metadata-fetch helpers were
+public, neutrally-named, and easy to misuse from a daemon code
+path. Two paths landed:
+
+- `src/net/metadata_fetch.zig`: rename
+  `MetadataFetcher.fetch` → `fetchBlocking`, internal
+  `fetchFromPeer` → `fetchFromPeerBlocking`. File header doc opens
+  with "blocking, background-thread-only" and points at the async
+  `AsyncMetadataFetchOf(IO)` replacement. Per-method warnings cite
+  the AGENTS.md io_uring policy.
+
+- `src/io/http_blocking.zig`: docstring-only treatment (file
+  header expanded, per-method warnings on `get` /
+  `getWithHeaders` / `getRange`). Method renames would have
+  cascaded into `src/io/dns_threadpool.zig`, which is owned by the
+  dns-phase-f-and-flakes-engineer per the file-ownership split.
+
+`src/storage/writer.zig`'s submit-and-drain methods were already
+documented as "blocks the calling thread on `io.tick`" in the
+existing per-method doc-comments after the Task 1 round; no
+additional warning needed.
+
+**Test count delta**
+
+`zig build test` — six new tests added (3 in `tests/storage_*` and
+the inline writer.zig tests already covered by Task 1's call-site
+fan-out, 1 in `src/io/ring.zig` for the new probe flags, 3 in
+`src/io/peer_policy.zig` for v2 completion). 1183 passed before
+Task 4, 1183 after. Two pre-existing flakes (`recheck_test.zig` and
+`sim_multi_source_eventloop_test.zig`) reproduce on `main` without
+these changes — already on the team's flake-diagnosis list.
+
+**Commits**
+
+- `9b57254` — `storage: drop PieceStore.io field, take io per call`
+- `86d3676` — `io: extend FeatureSupport with bind/listen/setsockopt flags`
+- `2e4e8c0` — `peer_policy: BEP 52 v2 piece validation via LeafHashStore`
+- `d1dae57` — `io,net: rename + flag blocking helpers as policy violations`
+
+See `progress-reports/2026-04-30-misc-cleanup.md` for per-task
+detail.
 
 ## Last Verified Milestone (2026-04-29 — runtime Clock + Random abstractions for sim-time determinism)
 
