@@ -130,6 +130,14 @@ pub fn QueryOf(comptime IO: type) type {
         timeout_completion: io_interface.Completion = .{},
         /// Total-budget timeout, raced against the whole flow.
         total_timeout_completion: io_interface.Completion = .{},
+        /// Three side-channel completions used as the cancel ops'
+        /// own completion (the IO contract requires the cancel
+        /// submission to use a different completion from its
+        /// target). Cancel callbacks are no-ops; no in-flight
+        /// state is tracked here.
+        cancel_op_self: io_interface.Completion = .{},
+        cancel_timeout_self: io_interface.Completion = .{},
+        cancel_total_self: io_interface.Completion = .{},
 
         state: State = .idle,
         timeout_in_flight: bool = false,
@@ -546,7 +554,7 @@ pub fn QueryOf(comptime IO: type) type {
             // the cancel returns OperationNotFound, which is fine.
             self.io.cancel(
                 .{ .target = &self.op_completion },
-                &self.op_completion, // some backends overload onto target's completion
+                &self.cancel_op_self,
                 self,
                 noopCancel,
             ) catch {};
@@ -556,7 +564,7 @@ pub fn QueryOf(comptime IO: type) type {
             if (!self.timeout_in_flight) return;
             self.io.cancel(
                 .{ .target = &self.timeout_completion },
-                &self.timeout_completion,
+                &self.cancel_timeout_self,
                 self,
                 noopCancel,
             ) catch {};
@@ -566,7 +574,7 @@ pub fn QueryOf(comptime IO: type) type {
             if (!self.total_timeout_in_flight) return;
             self.io.cancel(
                 .{ .target = &self.total_timeout_completion },
-                &self.total_timeout_completion,
+                &self.cancel_total_self,
                 self,
                 noopCancel,
             ) catch {};
