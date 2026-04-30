@@ -6,6 +6,7 @@ pub const downloading_piece = @import("downloading_piece.zig");
 pub const dns = @import("dns.zig");
 pub const dns_custom = struct {
     pub const message = @import("dns_custom/message.zig");
+    pub const resolv_conf = @import("dns_custom/resolv_conf.zig");
 };
 pub const event_loop = @import("event_loop.zig");
 pub const io_interface = @import("io_interface.zig");
@@ -56,6 +57,7 @@ test {
     _ = buffer_pools;
     _ = dns;
     _ = dns_custom.message;
+    _ = dns_custom.resolv_conf;
     _ = @import("dns_threadpool.zig");
     // dns_cares.zig wraps `@cImport("ares.h")`. The header is only on
     // the include path when `-Ddns=c-ares`. Default build (threadpool)
