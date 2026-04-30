@@ -179,15 +179,34 @@ need to push subsequent piece responses incrementally during ticks.
 - **`src/io/metadata_handler.zig`** — sole owner; the `IO != SimIO`
   comptime guard is the only addition that touches the imports.
 
-## Out of scope
+### Commit 5 — Live BUGGIFY harness for `AsyncMetadataFetchOf(SimIO)` (commit `c491687`)
 
-- **Commit 5 — Live-pipeline BUGGIFY harness for
-  `AsyncMetadataFetchOf(SimIO)`.** Same 32-seed shape as
-  `tests/recheck_live_buggify_test.zig`. Filed as a follow-up because
-  the happy-path landing is the higher-value deliverable and the
-  BUGGIFY harness is mechanical to add once the foundation is in
-  place. The deferred-test note in `STATUS.md`'s "Next" section
-  remains for the BUGGIFY follow-up.
+`tests/metadata_fetch_live_buggify_test.zig` mirrors the recheck and
+smart-ban BUGGIFY harnesses: 32 deterministic seeds, per-tick
+`SimIO.injectRandomFault` (p=0.05), per-op `FaultConfig` (recv=0.05,
+send=0.05). Five scripted peers — strictly more than `max_slots = 3`
+— so the state machine refills slots after fault-induced failures.
+
+The harness asserts safety invariants only:
+- callback fires (no hung fetch)
+- if `result_bytes != null`, length and bookend bytes match the
+  original info dict (no torn copy, no false positive on the SHA-1
+  verify)
+- `peers_attempted` ∈ [1, num_peers]
+
+Anti-vacuous-pass guard: `seeds_with_metadata > 0` (otherwise the
+test isn't exercising the success path at all).
+
+Current run: 32/32 seeds complete, 32/32 deliver metadata, 124 total
+peers attempted across the 32 seeds (28 fault-induced retries — the
+slot-refill path is exercised). Deterministic across runs (verified
+3-of-3).
+
+Wired through new `zig build test-metadata-fetch-live-buggify` step
+and into the main `zig build test` aggregate. Test count delta:
+1568 → 1570.
+
+## Out of scope
 
 - **Other `posix.close` / `posix.setsockopt` sites.** HttpExecutor
   and UdpTrackerExecutor still call `posix.close` directly in their
