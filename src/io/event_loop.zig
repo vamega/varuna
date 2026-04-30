@@ -180,18 +180,19 @@ pub fn EventLoopOf(comptime IO: type) type {
         peer_count: u16 = 0,
         running: bool = true,
         clock: Clock = .real,
-        /// Injected randomness for non-cryptographic call paths the
-        /// simulator wants to drive deterministically (UDP tracker
-        /// transaction IDs, smart-ban tie-breaks, jittered delays). The
-        /// default `.real` delegates to `std.crypto.random`. Tests
-        /// driving sim time should also assign a `Random.simRandom(seed)`
-        /// here so retries derived from this RNG are reproducible.
-        ///
-        /// NOT a substitute for `std.crypto.random` in
-        /// security-critical paths (MSE keys, peer ID, DHT node ID,
-        /// DHT tokens, RPC SID — see `runtime/random.zig` for the full
-        /// list).
-        random: Random = .real,
+        /// Daemon-wide CSPRNG (`runtime.Random`). Both production and
+        /// simulation paths read here. Initialized once in `initBare`
+        /// from the OS CSPRNG (`Random.realRandom()` reads 32 bytes
+        /// from `getrandom(2)` and seeds ChaCha8). Tests driving sim
+        /// time should overwrite this field with a
+        /// `Random.simRandom(seed)` value before submitting any work
+        /// — both non-crypto paths (UDP tracker tx-ids, smart-ban
+        /// tie-breaks, jittered delays) and crypto-sensitive paths
+        /// (MSE handshake DH keys, peer IDs, DHT node IDs, DHT
+        /// tokens, RPC SID) draw from this single source. See
+        /// `runtime/random.zig` for the threat model and migration
+        /// history.
+        random: Random,
 
         /// Graceful shutdown: when true, the event loop stops accepting new work
         /// and waits for in-flight transfers to complete before setting running=false.
@@ -449,6 +450,7 @@ pub fn EventLoopOf(comptime IO: type) type {
                 .io = io,
                 .allocator = allocator,
                 .peers = peers,
+                .random = Random.realRandom(),
                 .torrents = try std.ArrayList(?TorrentContext).initCapacity(allocator, default_torrent_capacity),
                 .free_torrent_ids = std.ArrayList(TorrentId).empty,
                 .active_torrent_ids = try std.ArrayList(TorrentId).initCapacity(allocator, default_torrent_capacity),
