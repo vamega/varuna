@@ -2,6 +2,7 @@ const std = @import("std");
 const node_id = @import("node_id.zig");
 const NodeId = node_id.NodeId;
 const NodeInfo = node_id.NodeInfo;
+const Random = @import("../runtime/random.zig").Random;
 
 /// Maximum nodes per k-bucket (BEP 5).
 pub const K: usize = 8;
@@ -261,18 +262,20 @@ pub const RoutingTable = struct {
 // ── Tests ──────────────────────────────────────────────
 
 test "empty routing table has zero nodes" {
-    const own_id = node_id.generateRandom();
+    var rng = Random.simRandom(0x400);
+    const own_id = node_id.generateRandom(&rng);
     const table = RoutingTable.init(own_id);
     try std.testing.expectEqual(@as(usize, 0), table.nodeCount());
 }
 
 test "add node to routing table" {
-    const own_id = node_id.generateRandom();
+    var rng = Random.simRandom(0x401);
+    const own_id = node_id.generateRandom(&rng);
     var table = RoutingTable.init(own_id);
     const now: i64 = 1000000;
 
     const other = NodeInfo{
-        .id = node_id.generateRandom(),
+        .id = node_id.generateRandom(&rng),
         .address = std.net.Address.initIp4(.{ 10, 0, 0, 1 }, 6881),
     };
 
@@ -282,11 +285,12 @@ test "add node to routing table" {
 }
 
 test "update existing node" {
-    const own_id = node_id.generateRandom();
+    var rng = Random.simRandom(0x402);
+    const own_id = node_id.generateRandom(&rng);
     var table = RoutingTable.init(own_id);
     const now: i64 = 1000000;
 
-    const other_id = node_id.generateRandom();
+    const other_id = node_id.generateRandom(&rng);
     const info = NodeInfo{
         .id = other_id,
         .address = std.net.Address.initIp4(.{ 10, 0, 0, 1 }, 6881),
@@ -368,19 +372,20 @@ test "bad node gets replaced" {
 }
 
 test "findClosest returns sorted results" {
-    const own_id = node_id.generateRandom();
+    var rng = Random.simRandom(0x403);
+    const own_id = node_id.generateRandom(&rng);
     var table = RoutingTable.init(own_id);
     const now: i64 = 1000000;
 
     // Add several nodes
     for (0..20) |_| {
         _ = table.addNode(.{
-            .id = node_id.generateRandom(),
+            .id = node_id.generateRandom(&rng),
             .address = std.net.Address.initIp4(.{ 10, 0, 0, 1 }, 6881),
         }, now);
     }
 
-    const target = node_id.generateRandom();
+    const target = node_id.generateRandom(&rng);
     var buf: [8]NodeInfo = undefined;
     const count = table.findClosest(target, 8, &buf);
     try std.testing.expect(count > 0);
@@ -392,13 +397,14 @@ test "findClosest returns sorted results" {
 }
 
 test "needsRefresh detects stale buckets" {
-    const own_id = node_id.generateRandom();
+    var rng = Random.simRandom(0x404);
+    const own_id = node_id.generateRandom(&rng);
     var table = RoutingTable.init(own_id);
     const now: i64 = 1000000;
 
     // Add a node -- bucket is fresh
     const other = NodeInfo{
-        .id = node_id.generateRandom(),
+        .id = node_id.generateRandom(&rng),
         .address = std.net.Address.initIp4(.{ 10, 0, 0, 1 }, 6881),
     };
     _ = table.addNode(other, now);
@@ -411,11 +417,12 @@ test "needsRefresh detects stale buckets" {
 }
 
 test "node classification" {
+    var rng = Random.simRandom(0x405);
     const now: i64 = 1000000;
 
     // Good: responded recently
     const good_node = NodeInfo{
-        .id = node_id.generateRandom(),
+        .id = node_id.generateRandom(&rng),
         .address = undefined,
         .last_seen = now - 100,
         .ever_responded = true,
@@ -425,7 +432,7 @@ test "node classification" {
 
     // Questionable: not seen recently
     const questionable_node = NodeInfo{
-        .id = node_id.generateRandom(),
+        .id = node_id.generateRandom(&rng),
         .address = undefined,
         .last_seen = now - good_timeout_secs - 1,
         .ever_responded = true,
@@ -435,7 +442,7 @@ test "node classification" {
 
     // Bad: multiple failures
     const bad_node = NodeInfo{
-        .id = node_id.generateRandom(),
+        .id = node_id.generateRandom(&rng),
         .address = undefined,
         .last_seen = now,
         .ever_responded = true,

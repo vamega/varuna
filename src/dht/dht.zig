@@ -12,6 +12,7 @@ const TokenManager = token.TokenManager;
 const lookup = @import("lookup.zig");
 const Lookup = lookup.Lookup;
 const bootstrap = @import("bootstrap.zig");
+const Random = @import("../runtime/random.zig").Random;
 
 /// Maximum number of concurrent lookups.
 const max_lookups: usize = 16;
@@ -239,6 +240,11 @@ fn addressesEqual(a: std.net.Address, b: std.net.Address) bool {
 /// for the event loop to send via io_uring SENDMSG.
 pub const DhtEngine = struct {
     allocator: std.mem.Allocator,
+    /// Daemon-wide CSPRNG. Borrowed (not owned) — typically points
+    /// into the shared `EventLoop.random`. Used for node-ID
+    /// generation (bucket refresh, lookup target seeding) and token
+    /// rotation. Same source for production and sim.
+    random: *Random,
     own_id: NodeId,
     table: RoutingTable,
     tokens: TokenManager,
@@ -300,12 +306,13 @@ pub const DhtEngine = struct {
         }
     }
 
-    pub fn init(allocator: std.mem.Allocator, own_id: NodeId) DhtEngine {
+    pub fn init(allocator: std.mem.Allocator, random: *Random, own_id: NodeId) DhtEngine {
         return .{
             .allocator = allocator,
+            .random = random,
             .own_id = own_id,
             .table = RoutingTable.init(own_id),
-            .tokens = TokenManager.init(),
+            .tokens = TokenManager.init(random),
             .send_queue = std.ArrayList(OutboundPacket).empty,
             .peer_results = std.ArrayList(PeerResult).empty,
             .peer_store = PeerStore.init(allocator),
@@ -321,9 +328,10 @@ pub const DhtEngine = struct {
     /// Instead we initialize each field individually via pointer dereference,
     /// and use explicit loops for the large arrays so Zig writes directly
     /// into the heap allocation.
-    pub fn create(allocator: std.mem.Allocator, own_id: NodeId) !*DhtEngine {
+    pub fn create(allocator: std.mem.Allocator, random: *Random, own_id: NodeId) !*DhtEngine {
         const self = try allocator.create(DhtEngine);
         self.allocator = allocator;
+        self.random = random;
         self.own_id = own_id;
         // Initialize the routing table in place (160 KBuckets).
         self.table.own_id = own_id;
@@ -332,7 +340,7 @@ pub const DhtEngine = struct {
             b.last_changed = 0;
             // nodes[] intentionally left undefined (count=0, so never read).
         }
-        self.tokens = TokenManager.init();
+        self.tokens = TokenManager.init(random);
         self.next_txn_id = 1;
         // Initialize nullable arrays via explicit loops to avoid ~38 KB / ~688 KB
         // stack temporaries that would arise from array-literal assignment.
@@ -385,7 +393,7 @@ pub const DhtEngine = struct {
         if (!self.enabled) return;
 
         // Rotate token secrets
-        self.tokens.maybeRotate(now);
+        self.tokens.maybeRotate(self.random, now);
 
         // Sweep expired peer-store entries so memory stays bounded
         // even when no `get_peers` query triggers the lazy sweep.
@@ -1012,7 +1020,7 @@ pub const DhtEngine = struct {
 
         const targets = [_][20]u8{
             self.own_id,
-            node_id.generateRandom(), // random target for breadth
+            node_id.generateRandom(self.random), // random target for breadth
         };
 
         for (targets) |target| {
@@ -1058,7 +1066,7 @@ pub const DhtEngine = struct {
     fn refreshBucket(self: *DhtEngine, bucket_idx: u8, now: i64) void {
         _ = now;
         // Generate a random ID in the bucket range and do a find_node
-        const target = node_id.randomIdInBucket(self.own_id, bucket_idx);
+        const target = node_id.randomIdInBucket(self.random, self.own_id, bucket_idx);
 
         const idx = for (0..max_lookups) |i| {
             if (self.active_lookups[i] == null) break i;
@@ -1238,8 +1246,9 @@ fn parseCompactPeers(
 
 test "DhtEngine init and deinit" {
     const allocator = std.testing.allocator;
-    const own_id = node_id.generateRandom();
-    var engine = DhtEngine.init(allocator, own_id);
+    var rng = Random.simRandom(0x300);
+    const own_id = node_id.generateRandom(&rng);
+    var engine = DhtEngine.init(allocator, &rng, own_id);
     defer engine.deinit();
 
     try std.testing.expectEqual(own_id, engine.own_id);
@@ -1248,8 +1257,9 @@ test "DhtEngine init and deinit" {
 
 test "DhtEngine handles ping query" {
     const allocator = std.testing.allocator;
-    const own_id = node_id.generateRandom();
-    var engine = DhtEngine.init(allocator, own_id);
+    var rng = Random.simRandom(0x301);
+    const own_id = node_id.generateRandom(&rng);
+    var engine = DhtEngine.init(allocator, &rng, own_id);
     defer engine.deinit();
 
     // Build a ping query
@@ -1271,15 +1281,16 @@ test "DhtEngine handles ping query" {
 
 test "DhtEngine handles find_node query" {
     const allocator = std.testing.allocator;
-    const own_id = node_id.generateRandom();
-    var engine = DhtEngine.init(allocator, own_id);
+    var rng = Random.simRandom(0x302);
+    const own_id = node_id.generateRandom(&rng);
+    var engine = DhtEngine.init(allocator, &rng, own_id);
     defer engine.deinit();
 
     // Add some nodes to the table first
     const now: i64 = 1000000;
     for (0..5) |i| {
         _ = engine.table.addNode(.{
-            .id = node_id.generateRandom(),
+            .id = node_id.generateRandom(&rng),
             .address = std.net.Address.initIp4(.{ 10, 0, 0, @intCast(i + 1) }, 6881),
         }, now);
     }
@@ -1287,7 +1298,7 @@ test "DhtEngine handles find_node query" {
     var query_buf: [512]u8 = undefined;
     var sender_id: NodeId = undefined;
     @memset(&sender_id, 0x42);
-    const target = node_id.generateRandom();
+    const target = node_id.generateRandom(&rng);
     const len = try krpc.encodeFindNodeQuery(&query_buf, 0x1234, sender_id, target);
 
     const sender_addr = std.net.Address.initIp4(.{ 10, 0, 0, 99 }, 6881);
@@ -1300,7 +1311,8 @@ test "DhtEngine handles find_node query" {
 
 test "DhtEngine disabled ignores messages" {
     const allocator = std.testing.allocator;
-    var engine = DhtEngine.init(allocator, node_id.generateRandom());
+    var rng = Random.simRandom(0x303);
+    var engine = DhtEngine.init(allocator, &rng, node_id.generateRandom(&rng));
     defer engine.deinit();
     engine.enabled = false;
 
@@ -1316,7 +1328,8 @@ test "DhtEngine disabled ignores messages" {
 
 test "DhtEngine tick rotates tokens" {
     const allocator = std.testing.allocator;
-    var engine = DhtEngine.init(allocator, node_id.generateRandom());
+    var rng = Random.simRandom(0x304);
+    var engine = DhtEngine.init(allocator, &rng, node_id.generateRandom(&rng));
     defer engine.deinit();
 
     const ip = [_]u8{ 10, 0, 0, 1 };
@@ -1332,7 +1345,8 @@ test "DhtEngine tick rotates tokens" {
 
 test "DhtEngine requestPeers registers both v1 and v2 hashes for hybrid torrents" {
     const allocator = std.testing.allocator;
-    var engine = DhtEngine.init(allocator, node_id.generateRandom());
+    var rng = Random.simRandom(0x305);
+    var engine = DhtEngine.init(allocator, &rng, node_id.generateRandom(&rng));
     defer engine.deinit();
 
     const v1_hash: [20]u8 = [_]u8{0xAA} ** 20;
@@ -1350,7 +1364,8 @@ test "DhtEngine requestPeers registers both v1 and v2 hashes for hybrid torrents
 
 test "DhtEngine requestPeers v1-only (null v2) registers only one hash" {
     const allocator = std.testing.allocator;
-    var engine = DhtEngine.init(allocator, node_id.generateRandom());
+    var rng = Random.simRandom(0x306);
+    var engine = DhtEngine.init(allocator, &rng, node_id.generateRandom(&rng));
     defer engine.deinit();
 
     const v1_hash: [20]u8 = [_]u8{0xAA} ** 20;
@@ -1361,7 +1376,8 @@ test "DhtEngine requestPeers v1-only (null v2) registers only one hash" {
 
 test "DhtEngine forceRequery toggles search-done flag for both hashes" {
     const allocator = std.testing.allocator;
-    var engine = DhtEngine.init(allocator, node_id.generateRandom());
+    var rng = Random.simRandom(0x307);
+    var engine = DhtEngine.init(allocator, &rng, node_id.generateRandom(&rng));
     defer engine.deinit();
 
     const v1_hash: [20]u8 = [_]u8{0xAA} ** 20;
@@ -1379,14 +1395,15 @@ test "DhtEngine forceRequery toggles search-done flag for both hashes" {
 
 test "DhtEngine announcePeer fans out to v1 and v2 hashes" {
     const allocator = std.testing.allocator;
-    var engine = DhtEngine.init(allocator, node_id.generateRandom());
+    var rng = Random.simRandom(0x308);
+    var engine = DhtEngine.init(allocator, &rng, node_id.generateRandom(&rng));
     defer engine.deinit();
 
     // Seed routing table so both lookups have candidates.
     const now: i64 = 1_000_000;
     for (0..10) |i| {
         _ = engine.table.addNode(.{
-            .id = node_id.generateRandom(),
+            .id = node_id.generateRandom(&rng),
             .address = std.net.Address.initIp4(.{ 10, 0, 0, @intCast(i + 1) }, 6881),
         }, now);
     }
@@ -1411,14 +1428,15 @@ test "DhtEngine announcePeer fans out to v1 and v2 hashes" {
 
 test "DhtEngine get_peers starts lookup" {
     const allocator = std.testing.allocator;
-    var engine = DhtEngine.init(allocator, node_id.generateRandom());
+    var rng = Random.simRandom(0x309);
+    var engine = DhtEngine.init(allocator, &rng, node_id.generateRandom(&rng));
     defer engine.deinit();
 
     // Add nodes so lookup has candidates
     const now: i64 = 1000000;
     for (0..10) |i| {
         _ = engine.table.addNode(.{
-            .id = node_id.generateRandom(),
+            .id = node_id.generateRandom(&rng),
             .address = std.net.Address.initIp4(.{ 10, 0, 0, @intCast(i + 1) }, 6881),
         }, now);
     }

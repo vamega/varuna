@@ -1,4 +1,5 @@
 const std = @import("std");
+const Random = @import("../runtime/random.zig").Random;
 
 /// 160-bit node identifier used in the Kademlia DHT (BEP 5).
 pub const NodeId = [20]u8;
@@ -13,9 +14,13 @@ pub const NodeInfo = struct {
 };
 
 /// Generate a random 160-bit node ID.
-pub fn generateRandom() NodeId {
+///
+/// `random` is the daemon-wide CSPRNG (`runtime.Random`). Production
+/// holds an OS-seeded ChaCha8; sim tests inject a known seed so node
+/// IDs are byte-deterministic.
+pub fn generateRandom(random: *Random) NodeId {
     var id: NodeId = undefined;
-    std.crypto.random.bytes(&id);
+    random.bytes(&id);
     return id;
 }
 
@@ -66,9 +71,9 @@ pub fn order(a: NodeId, b: NodeId) std.math.Order {
 /// Generate a random node ID that falls within a specific bucket range.
 /// Used for bucket refresh: generates an ID whose XOR distance from
 /// `own_id` has its highest bit at position `bucket_index`.
-pub fn randomIdInBucket(own_id: NodeId, bucket_index: u8) NodeId {
+pub fn randomIdInBucket(random: *Random, own_id: NodeId, bucket_index: u8) NodeId {
     var id: NodeId = undefined;
-    std.crypto.random.bytes(&id);
+    random.bytes(&id);
 
     // XOR with own_id to get a distance, then set the correct bit pattern
     var dist = xorDistance(own_id, id);
@@ -165,22 +170,33 @@ pub fn encodeCompactNodes(allocator: std.mem.Allocator, nodes: []const NodeInfo)
 // ── Tests ──────────────────────────────────────────────
 
 test "xorDistance is symmetric" {
-    const a = generateRandom();
-    const b = generateRandom();
+    var rng = Random.simRandom(0xdead);
+    const a = generateRandom(&rng);
+    const b = generateRandom(&rng);
     const d1 = xorDistance(a, b);
     const d2 = xorDistance(b, a);
     try std.testing.expectEqual(d1, d2);
 }
 
 test "xorDistance with self is zero" {
-    const a = generateRandom();
+    var rng = Random.simRandom(0xdead);
+    const a = generateRandom(&rng);
     const d = xorDistance(a, a);
     try std.testing.expectEqual(d, [_]u8{0} ** 20);
 }
 
 test "distanceBucket returns null for same ID" {
-    const a = generateRandom();
+    var rng = Random.simRandom(0xdead);
+    const a = generateRandom(&rng);
     try std.testing.expect(distanceBucket(a, a) == null);
+}
+
+test "generateRandom is byte-deterministic under SimRandom" {
+    var r1 = Random.simRandom(0xc0ffee);
+    var r2 = Random.simRandom(0xc0ffee);
+    const id1 = generateRandom(&r1);
+    const id2 = generateRandom(&r2);
+    try std.testing.expectEqualSlices(u8, &id1, &id2);
 }
 
 test "distanceBucket returns correct bucket" {
@@ -223,7 +239,8 @@ test "isCloser picks the closer node" {
 }
 
 test "compact node encode/decode roundtrip" {
-    const id = generateRandom();
+    var rng = Random.simRandom(0x42);
+    const id = generateRandom(&rng);
     const node = NodeInfo{
         .id = id,
         .address = std.net.Address.initIp4(.{ 192, 168, 1, 100 }, 6881),
@@ -236,11 +253,12 @@ test "compact node encode/decode roundtrip" {
 }
 
 test "compact nodes batch encode/decode" {
+    var rng = Random.simRandom(0x43);
     const allocator = std.testing.allocator;
     var nodes: [3]NodeInfo = undefined;
     for (&nodes, 0..) |*n, i| {
         n.* = .{
-            .id = generateRandom(),
+            .id = generateRandom(&rng),
             .address = std.net.Address.initIp4(.{ 10, 0, 0, @intCast(i + 1) }, @intCast(6881 + i)),
         };
     }
@@ -257,10 +275,11 @@ test "compact nodes batch encode/decode" {
 }
 
 test "randomIdInBucket generates ID in correct bucket" {
-    const own_id = generateRandom();
+    var rng = Random.simRandom(0x44);
+    const own_id = generateRandom(&rng);
     // Test several bucket indices
     for ([_]u8{ 0, 1, 10, 50, 100, 150, 159 }) |bucket| {
-        const id = randomIdInBucket(own_id, bucket);
+        const id = randomIdInBucket(&rng, own_id, bucket);
         const actual_bucket = distanceBucket(own_id, id).?;
         try std.testing.expectEqual(bucket, actual_bucket);
     }
