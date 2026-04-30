@@ -48,6 +48,192 @@ pub const OutboundPacket = struct {
     remote: std.net.Address,
 };
 
+/// Peer-store for `announce_peer` per BEP 5 §"Peers".
+///
+/// Acts as a tiny ephemeral peer tracker: peers tell us "I have this
+/// info-hash on this port" via `announce_peer`, and later `get_peers`
+/// queries return the list back in `values` / `values6`. Without this,
+/// our DHT would lie ("yes, I'll remember") but never serve any
+/// announced peer back — every `get_peers` would fall through to
+/// closest-nodes only.
+///
+/// Per BEP 5 the peer is reachable for ~30 minutes; the announcer is
+/// expected to refresh every ~30 minutes, so any unrefreshed entry is
+/// safely evicted at TTL. Per-info-hash capacity is bounded to defend
+/// against memory exhaustion from a single hash flooded with announces;
+/// at-cap eviction is FIFO (oldest entry replaced first).
+const PeerStore = struct {
+    /// BEP 5 default expiry. Sender re-announces every ~30 minutes.
+    pub const ttl_secs: i64 = 30 * 60;
+    /// Bounded per-info-hash capacity. libtorrent and rakshasa cap
+    /// somewhere between 30 and 100; we use 100 as a defensive ceiling
+    /// so a single hash cannot dominate memory.
+    pub const max_peers_per_hash: usize = 100;
+
+    const Entry = struct {
+        address: std.net.Address,
+        expires_at: i64,
+    };
+
+    const PeerList = std.ArrayListUnmanaged(Entry);
+
+    map: std.AutoHashMap([20]u8, PeerList),
+
+    fn init(allocator: std.mem.Allocator) PeerStore {
+        return .{ .map = std.AutoHashMap([20]u8, PeerList).init(allocator) };
+    }
+
+    fn deinit(self: *PeerStore, allocator: std.mem.Allocator) void {
+        var it = self.map.valueIterator();
+        while (it.next()) |list| list.deinit(allocator);
+        self.map.deinit();
+    }
+
+    /// Record an announce for `info_hash` from `peer_addr`.
+    ///
+    /// If `peer_addr` is already in the list for this hash, refresh its
+    /// expiry. Otherwise append. When the list is at capacity, evict
+    /// the oldest entry (FIFO) and replace with the new one.
+    ///
+    /// The `peer_addr` parameter is named to avoid shadowing the
+    /// outer-module `const address = @import("../net/address.zig")`.
+    fn announce(
+        self: *PeerStore,
+        allocator: std.mem.Allocator,
+        info_hash: [20]u8,
+        peer_addr: std.net.Address,
+        now: i64,
+    ) void {
+        const gop = self.map.getOrPut(info_hash) catch return;
+        if (!gop.found_existing) {
+            gop.value_ptr.* = .empty;
+        }
+        var list = gop.value_ptr;
+
+        // Refresh existing entry: same family, same address.
+        for (list.items) |*e| {
+            if (addressesEqual(e.address, peer_addr)) {
+                e.expires_at = now + ttl_secs;
+                return;
+            }
+        }
+
+        // New entry. FIFO eviction at capacity.
+        if (list.items.len >= max_peers_per_hash) {
+            // Drop the oldest entry; later items shift down. ArrayList
+            // does not expose a dedicated "pop_front" primitive, so we
+            // do it explicitly. The list is bounded to <=100, so
+            // O(n) shift is fine.
+            const tail = list.items[1..];
+            std.mem.copyForwards(Entry, list.items[0 .. list.items.len - 1], tail);
+            list.items.len -= 1;
+        }
+        list.append(allocator, .{
+            .address = peer_addr,
+            .expires_at = now + ttl_secs,
+        }) catch return;
+    }
+
+    /// Pack non-expired peers for `info_hash` into the caller-supplied
+    /// IPv4 and IPv6 buffers and return the populated counts.
+    /// Capped at the buffer lengths.
+    fn encodeValues(
+        self: *PeerStore,
+        info_hash: [20]u8,
+        v4_buf: *[max_peers_per_hash][6]u8,
+        v6_buf: *[max_peers_per_hash][18]u8,
+        now: i64,
+    ) struct { v4: usize, v6: usize } {
+        const list = self.map.getPtr(info_hash) orelse return .{ .v4 = 0, .v6 = 0 };
+        var v4: usize = 0;
+        var v6: usize = 0;
+        for (list.items) |e| {
+            if (e.expires_at <= now) continue;
+            switch (e.address.any.family) {
+                std.posix.AF.INET => {
+                    if (v4 >= v4_buf.len) continue;
+                    const addr_bytes: [4]u8 = @bitCast(e.address.in.sa.addr);
+                    @memcpy(v4_buf[v4][0..4], &addr_bytes);
+                    std.mem.writeInt(u16, v4_buf[v4][4..6], e.address.getPort(), .big);
+                    v4 += 1;
+                },
+                std.posix.AF.INET6 => {
+                    if (v6 >= v6_buf.len) continue;
+                    @memcpy(v6_buf[v6][0..16], &e.address.in6.sa.addr);
+                    std.mem.writeInt(u16, v6_buf[v6][16..18], e.address.getPort(), .big);
+                    v6 += 1;
+                },
+                else => continue,
+            }
+        }
+        return .{ .v4 = v4, .v6 = v6 };
+    }
+
+    /// Drop expired entries everywhere. Empty per-hash lists are
+    /// removed entirely so memory does not accumulate after a churn
+    /// of one-shot announces.
+    fn sweep(self: *PeerStore, allocator: std.mem.Allocator, now: i64) void {
+        // Two-pass: first prune expired entries from each list (in
+        // place, swap-remove), then collect-and-remove now-empty lists.
+        // Iterators don't allow deletion during traversal, so we pre-
+        // collect keys to remove.
+        var stale_keys: [16][20]u8 = undefined;
+        var stale_count: usize = 0;
+
+        var it = self.map.iterator();
+        while (it.next()) |kv| {
+            var list = kv.value_ptr;
+            var i: usize = 0;
+            while (i < list.items.len) {
+                if (list.items[i].expires_at <= now) {
+                    _ = list.swapRemove(i);
+                } else {
+                    i += 1;
+                }
+            }
+            if (list.items.len == 0) {
+                if (stale_count < stale_keys.len) {
+                    stale_keys[stale_count] = kv.key_ptr.*;
+                    stale_count += 1;
+                }
+                // If the prune batch is full this iteration, the
+                // remaining empty lists get reaped on the next sweep —
+                // not a leak, just deferred work.
+            }
+        }
+        for (stale_keys[0..stale_count]) |k| {
+            if (self.map.fetchRemove(k)) |kv| {
+                var list = kv.value;
+                list.deinit(allocator);
+            }
+        }
+    }
+
+    /// Number of unique info-hashes currently tracked (for tests).
+    fn hashCount(self: *const PeerStore) usize {
+        return self.map.count();
+    }
+
+    /// Number of peers stored for an info-hash (for tests).
+    fn peerCount(self: *PeerStore, info_hash: [20]u8) usize {
+        const list = self.map.getPtr(info_hash) orelse return 0;
+        return list.items.len;
+    }
+};
+
+/// Compare two `std.net.Address` values for equality of the on-wire
+/// peer identity (family + IP + port). Mirrors `address.addressEql`'s
+/// shape but is restricted to v4/v6 and includes the port.
+fn addressesEqual(a: std.net.Address, b: std.net.Address) bool {
+    if (a.any.family != b.any.family) return false;
+    if (a.getPort() != b.getPort()) return false;
+    return switch (a.any.family) {
+        std.posix.AF.INET => a.in.sa.addr == b.in.sa.addr,
+        std.posix.AF.INET6 => std.mem.eql(u8, &a.in6.sa.addr, &b.in6.sa.addr),
+        else => false,
+    };
+}
+
 /// DHT engine (BEP 5). Manages the routing table, processes incoming
 /// KRPC messages, drives iterative lookups, and produces outbound packets
 /// for the event loop to send via io_uring SENDMSG.
@@ -64,6 +250,9 @@ pub const DhtEngine = struct {
     /// Peer results from completed get_peers lookups.
     /// The event loop picks these up and feeds them into the peer pipeline.
     peer_results: std.ArrayList(PeerResult),
+    /// Peers announced to us via `announce_peer` (BEP 5). Returned in
+    /// `values` / `values6` of subsequent `get_peers` responses.
+    peer_store: PeerStore,
     /// Listen port for announce_peer (the daemon's peer listen port).
     listen_port: u16 = 6881,
     /// Bootstrapping state.
@@ -119,6 +308,7 @@ pub const DhtEngine = struct {
             .tokens = TokenManager.init(),
             .send_queue = std.ArrayList(OutboundPacket).empty,
             .peer_results = std.ArrayList(PeerResult).empty,
+            .peer_store = PeerStore.init(allocator),
         };
     }
 
@@ -150,6 +340,7 @@ pub const DhtEngine = struct {
         for (&self.active_lookups) |*l| l.* = null;
         self.send_queue = std.ArrayList(OutboundPacket).empty;
         self.peer_results = std.ArrayList(PeerResult).empty;
+        self.peer_store = PeerStore.init(allocator);
         self.listen_port = 6881;
         self.bootstrapped = false;
         self.bootstrap_pending = false;
@@ -168,6 +359,7 @@ pub const DhtEngine = struct {
         }
         self.peer_results.deinit(self.allocator);
         self.send_queue.deinit(self.allocator);
+        self.peer_store.deinit(self.allocator);
     }
 
     /// Process an incoming UDP datagram that starts with 'd' (KRPC).
@@ -194,6 +386,10 @@ pub const DhtEngine = struct {
 
         // Rotate token secrets
         self.tokens.maybeRotate(now);
+
+        // Sweep expired peer-store entries so memory stays bounded
+        // even when no `get_peers` query triggers the lazy sweep.
+        self.peer_store.sweep(self.allocator, now);
 
         // Check for query timeouts
         self.checkTimeouts(now);
@@ -370,23 +566,37 @@ pub const DhtEngine = struct {
         var closest_buf: [routing_table.K]NodeInfo = undefined;
         const count = self.table.findClosest(target, routing_table.K, &closest_buf);
 
-        // Encode compact IPv4 nodes (26 bytes each). Skip IPv6 nodes -- they would
-        // need the "nodes6" field (BEP 32) which requires a different encoder path.
+        // Split closest nodes by address family. Per BEP 32 a dual-stack
+        // DHT echoes IPv4 nodes in `nodes` (26 bytes each: 20-byte id +
+        // 4-byte addr + 2-byte port) and IPv6 nodes in `nodes6` (38
+        // bytes each: 20 + 16 + 2). Either field is omitted when empty.
         var nodes_buf: [routing_table.K * 26]u8 = undefined;
         var nodes_len: usize = 0;
+        var nodes6_buf: [routing_table.K * 38]u8 = undefined;
+        var nodes6_len: usize = 0;
         for (0..count) |i| {
-            if (closest_buf[i].address.any.family != std.posix.AF.INET) continue;
-            const compact = node_id.encodeCompactNode(closest_buf[i]);
-            @memcpy(nodes_buf[nodes_len..][0..26], &compact);
-            nodes_len += 26;
+            switch (closest_buf[i].address.any.family) {
+                std.posix.AF.INET => {
+                    const compact = node_id.encodeCompactNode(closest_buf[i]);
+                    @memcpy(nodes_buf[nodes_len..][0..26], &compact);
+                    nodes_len += 26;
+                },
+                std.posix.AF.INET6 => {
+                    const compact = node_id.encodeCompactNode6(closest_buf[i]);
+                    @memcpy(nodes6_buf[nodes6_len..][0..38], &compact);
+                    nodes6_len += 38;
+                },
+                else => continue,
+            }
         }
 
-        var buf: [1024]u8 = undefined;
-        const len = krpc.encodeFindNodeResponse(
+        var buf: [1500]u8 = undefined;
+        const len = krpc.encodeFindNodeResponseDual(
             &buf,
             q.transaction_id,
             self.own_id,
-            nodes_buf[0..nodes_len],
+            if (nodes_len > 0) nodes_buf[0..nodes_len] else null,
+            if (nodes6_len > 0) nodes6_buf[0..nodes6_len] else null,
         ) catch return;
         self.queueSend(buf[0..len], sender);
     }
@@ -398,28 +608,60 @@ pub const DhtEngine = struct {
         const ip_bytes = addressToBytes(sender);
         const peer_token = self.tokens.generateToken(&ip_bytes);
 
-        // We don't store peer lists ourselves (we're not a tracker).
-        // Return closest IPv4 nodes instead (BEP 32 "nodes6" field would be
-        // needed for IPv6 nodes but requires a different encoder path).
+        // Per BEP 5 the response carries either `values` (announced peers
+        // we know about) or a fallback list of closest nodes — and BEP 32
+        // splits the latter into `nodes` (IPv4) and `nodes6` (IPv6). Look
+        // up announced peers in our peer-store and emit them in the
+        // appropriate `values` / `values6` fields, then always include
+        // the closest known nodes so well-behaved clients can continue
+        // iterating if they want more breadth.
+        const now = std.time.timestamp();
+        // Sweep expired peers lazily on each lookup so the announce table
+        // does not accumulate entries past their BEP 5 TTL.
+        self.peer_store.sweep(self.allocator, now);
+
+        var values_v4_buf: [PeerStore.max_peers_per_hash][6]u8 = undefined;
+        var values_v6_buf: [PeerStore.max_peers_per_hash][18]u8 = undefined;
+        const values_counts = self.peer_store.encodeValues(
+            info_hash,
+            &values_v4_buf,
+            &values_v6_buf,
+            now,
+        );
+
         var closest_buf: [routing_table.K]NodeInfo = undefined;
         const count = self.table.findClosest(info_hash, routing_table.K, &closest_buf);
 
         var nodes_buf: [routing_table.K * 26]u8 = undefined;
         var nodes_len: usize = 0;
+        var nodes6_buf: [routing_table.K * 38]u8 = undefined;
+        var nodes6_len: usize = 0;
         for (0..count) |i| {
-            if (closest_buf[i].address.any.family != std.posix.AF.INET) continue;
-            const compact = node_id.encodeCompactNode(closest_buf[i]);
-            @memcpy(nodes_buf[nodes_len..][0..26], &compact);
-            nodes_len += 26;
+            switch (closest_buf[i].address.any.family) {
+                std.posix.AF.INET => {
+                    const compact = node_id.encodeCompactNode(closest_buf[i]);
+                    @memcpy(nodes_buf[nodes_len..][0..26], &compact);
+                    nodes_len += 26;
+                },
+                std.posix.AF.INET6 => {
+                    const compact = node_id.encodeCompactNode6(closest_buf[i]);
+                    @memcpy(nodes6_buf[nodes6_len..][0..38], &compact);
+                    nodes6_len += 38;
+                },
+                else => continue,
+            }
         }
 
-        var buf: [1024]u8 = undefined;
-        const len = krpc.encodeGetPeersResponseNodes(
+        var buf: [1500]u8 = undefined;
+        const len = krpc.encodeGetPeersResponseFull(
             &buf,
             q.transaction_id,
             self.own_id,
             &peer_token,
-            nodes_buf[0..nodes_len],
+            if (nodes_len > 0) nodes_buf[0..nodes_len] else null,
+            if (nodes6_len > 0) nodes6_buf[0..nodes6_len] else null,
+            if (values_counts.v4 > 0) values_v4_buf[0..values_counts.v4] else null,
+            if (values_counts.v6 > 0) values_v6_buf[0..values_counts.v6] else null,
         ) catch return;
         self.queueSend(buf[0..len], sender);
     }
@@ -437,13 +679,36 @@ pub const DhtEngine = struct {
             return;
         }
 
-        // Accept the announce (we just respond with our ID).
-        // In a full implementation, we'd store the peer info.
+        // The info_hash is required in announce_peer (BEP 5). Without
+        // it we have nothing to key the announcement under.
+        const info_hash = q.target orelse {
+            self.sendError(q.transaction_id, @intFromEnum(krpc.ErrorCode.protocol), "missing info_hash", sender);
+            return;
+        };
+
+        // Per BEP 5, `implied_port=1` means "use the source port of this
+        // datagram instead of the announced port" — protects clients
+        // behind NAT that don't know their externally-visible port.
+        // Otherwise use `port` from the query.
+        var peer_addr = sender;
+        if (!q.implied_port) {
+            const announced_port = q.port orelse {
+                self.sendError(q.transaction_id, @intFromEnum(krpc.ErrorCode.protocol), "missing port", sender);
+                return;
+            };
+            peer_addr.setPort(announced_port);
+        }
+
+        const now = std.time.timestamp();
+        self.peer_store.announce(self.allocator, info_hash, peer_addr, now);
+
+        // BEP 5: a successful announce_peer is acknowledged by a `ping`-
+        // shaped response containing the responder's id.
         var buf: [512]u8 = undefined;
         const len = krpc.encodePingResponse(&buf, q.transaction_id, self.own_id) catch return;
         self.queueSend(buf[0..len], sender);
 
-        log.debug("accepted announce_peer from {f}", .{sender});
+        log.debug("accepted announce_peer from {f} for hash {x}", .{ peer_addr, info_hash[0..4].* });
     }
 
     fn sendError(self: *DhtEngine, txn_id: []const u8, code: u32, message: []const u8, sender: std.net.Address) void {
