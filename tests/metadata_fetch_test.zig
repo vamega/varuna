@@ -155,14 +155,15 @@ test "AsyncMetadataFetchOf(SimIO): legacy-fd send path causes all peers to fail"
     const allocator = std.testing.allocator;
 
     const EL_SimIO = event_loop_mod.EventLoopOf(SimIO);
-    // No fault injection — every connect succeeds. But the fd returned
-    // by `posix.socket()` is a real kernel fd, well below SimIO's
-    // `socket_fd_base = 1000`, so SimIO's `slotForFd` returns null and
-    // both `recv` and `send` go through the "legacy fd: zero-byte
-    // success" path. `send` returning 0 is treated as failure by the
-    // state machine (`if (res <= 0) ... releaseSlot; tryNextPeer`),
-    // so each peer fails after handshake send. With three peers, the
-    // state machine cycles through all three slots and finishes false.
+    // No fault injection — every socket() and connect() succeeds. But
+    // the fd returned by `self.io.socket()` is a synthetic SimIO fd
+    // (from `synthetic_fd_base = 100_000`), which is NOT in SimIO's
+    // socket pool, so `slotForFd` returns null and both `recv` and
+    // `send` go through the "legacy fd: zero-byte success" path.
+    // `send` returning 0 is treated as failure by the state machine
+    // (`if (res <= 0) ... releaseSlot; tryNextPeer`), so each peer
+    // fails after handshake send. With three peers, the state machine
+    // cycles through all three slots and finishes false.
     const sim_io = try SimIO.init(allocator, .{ .seed = 0xC0DE_C0DE });
     var el = EL_SimIO.initBareWithIO(allocator, sim_io, 0) catch |err| {
         if (err == error.SystemResources) return error.SkipZigTest;

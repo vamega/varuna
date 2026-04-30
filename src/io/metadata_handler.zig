@@ -13,6 +13,7 @@ const socket_util = @import("../net/socket.zig");
 const io_interface = @import("io_interface.zig");
 const backend = @import("backend.zig");
 const RealIO = backend.RealIO;
+const sim_io_mod = @import("sim_io.zig");
 
 /// Async BEP 9 metadata fetch state machine, parameterised over the IO
 /// backend.
@@ -75,6 +76,7 @@ pub fn AsyncMetadataFetchOf(comptime IO: type) type {
 
         pub const SlotState = enum {
             free,
+            socket_creating,
             connecting,
             handshake_send,
             handshake_recv,
@@ -194,6 +196,55 @@ pub fn AsyncMetadataFetchOf(comptime IO: type) type {
             return @intCast(offset / @sizeOf(Slot));
         }
 
+        fn metadataSocketComplete(
+            userdata: ?*anyopaque,
+            completion: *io_interface.Completion,
+            result: io_interface.Result,
+        ) io_interface.CallbackAction {
+            const self: *Self = @ptrCast(@alignCast(userdata.?));
+            const slot: *Slot = @fieldParentPtr("completion", completion);
+            if (self.done or slot.state == .free) return .disarm;
+            const slot_idx = self.slotIdxFor(slot);
+            const fd = switch (result) {
+                .socket => |r| r catch {
+                    log.debug(
+                        "metadata: failed to create socket for peer {d}",
+                        .{slot.peer_idx},
+                    );
+                    self.releaseSlot(slot_idx);
+                    self.tryNextPeer(slot_idx);
+                    return .disarm;
+                },
+                else => {
+                    self.releaseSlot(slot_idx);
+                    self.tryNextPeer(slot_idx);
+                    return .disarm;
+                },
+            };
+            slot.fd = fd;
+
+            // Best-effort socket tuning — only meaningful when the fd
+            // is a real kernel socket. SimIO returns synthetic fds that
+            // aren't valid `setsockopt` targets and `posix.setsockopt`
+            // panics on BADF (`catch {}` doesn't catch the unreachable),
+            // so skip the call under SimIO entirely.
+            if (comptime IO != sim_io_mod.SimIO) {
+                socket_util.configurePeerSocket(fd);
+            }
+
+            slot.state = .connecting;
+            self.io.connect(
+                .{ .fd = fd, .addr = self.peers[slot.peer_idx] },
+                &slot.completion,
+                self,
+                metadataConnectComplete,
+            ) catch {
+                self.releaseSlot(slot_idx);
+                self.tryNextPeer(slot_idx);
+            };
+            return .disarm;
+        }
+
         fn metadataConnectComplete(
             userdata: ?*anyopaque,
             completion: *io_interface.Completion,
@@ -263,28 +314,17 @@ pub fn AsyncMetadataFetchOf(comptime IO: type) type {
             self.peers_attempted += 1;
 
             const addr = self.peers[peer_idx];
-            const family = addr.any.family;
-
-            const fd = posix.socket(
-                family,
-                posix.SOCK.STREAM | posix.SOCK.CLOEXEC | posix.SOCK.NONBLOCK,
-                posix.IPPROTO.TCP,
-            ) catch {
-                log.debug("metadata: failed to create socket for peer {d}", .{peer_idx});
-                self.tryNextPeer(slot_idx);
-                return;
-            };
-
-            socket_util.configurePeerSocket(fd);
+            const family: u32 = addr.any.family;
 
             const slot = &self.slots[slot_idx];
             slot.* = Slot{
-                .state = .connecting,
-                .fd = fd,
+                .state = .socket_creating,
+                .fd = -1,
                 .peer_idx = peer_idx,
             };
 
-            // Allocate buffers
+            // Allocate buffers up front so they're guaranteed available
+            // when the protocol state machine starts running.
             slot.send_buf = self.allocator.alloc(u8, send_buf_size) catch {
                 self.releaseSlot(slot_idx);
                 self.tryNextPeer(slot_idx);
@@ -298,11 +338,19 @@ pub fn AsyncMetadataFetchOf(comptime IO: type) type {
 
             self.active_slots += 1;
 
-            self.io.connect(
-                .{ .fd = fd, .addr = self.peers[peer_idx] },
+            // Async socket creation through the IO contract — no direct
+            // posix.socket() so SimIO can drive the fetch end-to-end.
+            // metadataSocketComplete chains the connect once the fd is
+            // available.
+            self.io.socket(
+                .{
+                    .domain = family,
+                    .sock_type = posix.SOCK.STREAM | posix.SOCK.CLOEXEC | posix.SOCK.NONBLOCK,
+                    .protocol = posix.IPPROTO.TCP,
+                },
                 &slot.completion,
                 self,
-                metadataConnectComplete,
+                metadataSocketComplete,
             ) catch {
                 self.releaseSlot(slot_idx);
                 self.tryNextPeer(slot_idx);
@@ -809,7 +857,7 @@ pub fn AsyncMetadataFetchOf(comptime IO: type) type {
             if (slot.state == .free) return;
 
             if (slot.fd >= 0) {
-                posix.close(slot.fd);
+                self.io.closeSocket(slot.fd);
             }
             if (slot.send_buf) |buf| self.allocator.free(buf);
             if (slot.recv_buf) |buf| self.allocator.free(buf);
