@@ -441,7 +441,7 @@ pub fn EventLoopOf(comptime IO: type) type {
             @memset(peers, Peer{});
 
             const hasher = if (hasher_threads > 0)
-                Hasher.create(allocator, hasher_threads) catch null
+                Hasher.realInit(allocator, hasher_threads) catch null
             else
                 null;
 

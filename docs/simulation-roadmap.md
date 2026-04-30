@@ -104,27 +104,28 @@ remaining nondeterminism boundaries.
    Tracked in STATUS.md "Next" — estimated 3-4 days. Until that lands,
    sim tests touching the 5 callers remain non-byte-deterministic; use
    behavioral assertions instead.
-3. **SimHasher** — make the hasher deterministic (~2-3 days). Today
-   `src/io/hasher.zig` spawns real OS threads via `std.Thread.spawn`,
-   which is the last source of non-determinism the EL can't control.
-   Workers should consume scheduled tasks from the simulator's clock
-   in test builds, eliminating the thread-spawn boundary entirely. The
-   alternative ("accept real threads, EL stays deterministic") is
-   rejected — leaving real threads in the picture means hashing-
-   related races and re-orderings remain non-reproducible, defeating
-   the point of single-daemon-deterministic simulation.
-
-   Two implementation shapes to evaluate:
-   - **Tagged-union hasher** (mirrors Clock/Random): `Hasher` is a
-     union of `RealHasher` (existing thread pool) and `SimHasher`
-     (synchronous compute on the EL thread, scheduled via SimIO's
-     completion queue). Daemon callers stay on the alias.
-   - **Comptime-parameterized hasher**: `HasherOf(comptime Backend)`
-     (mirrors EventLoopOf, AsyncRecheckOf). Heavier cascade since
-     `AsyncRecheck` and other consumers hold a hasher pointer.
-
-   The tagged-union shape probably wins given the existing
-   Clock/Random precedent and the smaller call-site footprint.
+3. ~~**SimHasher** — make the hasher deterministic.~~ Closed
+   2026-04-30. Tagged-union shape landed: `src/io/hasher.zig` exposes
+   `Hasher = union(enum) { real: *RealHasher, sim: *SimHasher }` with
+   the production thread pool unchanged in `RealHasher` and a new
+   single-threaded `SimHasher` that hashes synchronously on the EL
+   thread and pushes results onto its queue. Sim tests already call
+   `peer_policy.processHashResults` every tick, so the next tick after
+   submit drains the result deterministically — no worker thread, no
+   race. `SimHasher.FaultConfig.merkle_pread_fault_prob` injects pread
+   failures via a seeded `DefaultPrng` so two runs with the same seed
+   produce the same fault sequence. Daemon path: `Hasher.realInit
+   (allocator, threads)` (replaces the historical `Hasher.create`);
+   sim-test path: `Hasher.simInit(allocator, seed)`. The
+   comptime-parameterised alternative (`HasherOf(comptime Backend)`)
+   was not pursued — the tagged-union shape matched Clock/Random,
+   kept the consumer surface (event_loop / peer_policy / recheck /
+   web_seed_handler / protocol) compiling unchanged, and avoided a
+   `*HasherOf(IO)` cascade through `AsyncRecheckOf`. Stretch: rewired
+   `tests/recheck_test.zig`'s three `AsyncRecheckOf(SimIO)` tests to
+   SimHasher — fixes a real-thread-vs-SimIO-tick-budget flake that
+   previously fired in ~25 % of CI runs (now 0/8 over fresh runs).
+   See `progress-reports/2026-04-30-simhasher.md`.
 
 ## Phase 3 — Cluster simulation (future)
 

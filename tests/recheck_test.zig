@@ -10,6 +10,7 @@ const Sha1 = varuna.crypto.Sha1;
 const sim_io_mod = varuna.io.sim_io;
 const SimIO = sim_io_mod.SimIO;
 const recheck_mod = varuna.io.recheck;
+const Hasher = varuna.io.hasher.Hasher;
 const posix = std.posix;
 
 const piece_data_len = 1024;
@@ -556,14 +557,28 @@ test "AsyncRecheckOf(SimIO): all pieces verify against registered file content" 
     const session = try Session.load(allocator, torrent_bytes, data_root);
     defer session.deinit(allocator);
 
-    // ── 3. Spin up EventLoopOf(SimIO) with a real hasher ─────
+    // ── 3. Spin up EventLoopOf(SimIO) with a SimHasher ───────
+    //
+    // Pass `hasher_threads = 0` so initBareWithIO doesn't spawn a
+    // RealHasher thread pool; we inject SimHasher manually below.
+    // The previous shape (real thread pool against SimIO) was the
+    // root cause of the historical "all pieces verify" flake — the
+    // recheck submits hash jobs into the pool, but the EL ticks
+    // synchronously through SimIO completions, so finishing the
+    // recheck within the 1024-tick budget required the worker thread
+    // to keep up. SimHasher hashes synchronously on the EL thread
+    // and pushes the result to its queue, so the next tick's
+    // `processHashResults` drains it deterministically — no race,
+    // no flake. (Logged in progress-reports/2026-04-30-simhasher.md.)
     const EL_SimIO = event_loop_mod.EventLoopOf(SimIO);
     const sim_io = try SimIO.init(allocator, .{ .seed = 0xCAFE_BABE });
-    var el = EL_SimIO.initBareWithIO(allocator, sim_io, 1) catch |err| {
+    var el = EL_SimIO.initBareWithIO(allocator, sim_io, 0) catch |err| {
         if (err == error.SystemResources) return error.SkipZigTest;
         return err;
     };
     defer el.deinit();
+
+    el.hasher = try Hasher.simInit(allocator, 0xCAFE_BABE);
 
     // ── 4. Register file content for the synthetic fd ────────
     //
@@ -657,13 +672,18 @@ test "AsyncRecheckOf(SimIO): corrupt piece is reported incomplete" {
     const session = try Session.load(allocator, torrent_bytes, data_root);
     defer session.deinit(allocator);
 
+    // SimHasher injection mirrors the happy-path test above — the
+    // race between RealHasher's worker thread and the SimIO tick
+    // budget previously caused this test to flake.
     const EL_SimIO = event_loop_mod.EventLoopOf(SimIO);
     const sim_io = try SimIO.init(allocator, .{ .seed = 0xDEAD_BEEF });
-    var el = EL_SimIO.initBareWithIO(allocator, sim_io, 1) catch |err| {
+    var el = EL_SimIO.initBareWithIO(allocator, sim_io, 0) catch |err| {
         if (err == error.SystemResources) return error.SkipZigTest;
         return err;
     };
     defer el.deinit();
+
+    el.hasher = try Hasher.simInit(allocator, 0xDEAD_BEEF);
 
     const synthetic_fd: posix.fd_t = 50;
     try el.io.setFileBytes(synthetic_fd, &file_bytes);
@@ -745,13 +765,21 @@ test "AsyncRecheckOf(SimIO): all-known-complete fast path skips disk reads" {
     const session = try Session.load(allocator, torrent_bytes, data_root);
     defer session.deinit(allocator);
 
+    // SimHasher injection — see happy-path test for rationale. The
+    // fast-path test never enqueues a hash job (every piece is
+    // pre-marked complete), so the hasher choice doesn't influence
+    // the assertion; switching to SimHasher just keeps the suite's
+    // hasher selection consistent across the AsyncRecheckOf(SimIO)
+    // group.
     const EL_SimIO = event_loop_mod.EventLoopOf(SimIO);
     const sim_io = try SimIO.init(allocator, .{});
-    var el = EL_SimIO.initBareWithIO(allocator, sim_io, 1) catch |err| {
+    var el = EL_SimIO.initBareWithIO(allocator, sim_io, 0) catch |err| {
         if (err == error.SystemResources) return error.SkipZigTest;
         return err;
     };
     defer el.deinit();
+
+    el.hasher = try Hasher.simInit(allocator, 0);
 
     // Mark every piece as known-complete so AsyncRecheck skips reads.
     var known = try Bitfield.init(allocator, session.pieceCount());

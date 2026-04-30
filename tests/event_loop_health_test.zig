@@ -84,7 +84,7 @@ test "EL.deinit drains hasher.completed_results without leaking valid bufs" {
     const Hasher = varuna.io.hasher.Hasher;
     const Sha1 = std.crypto.hash.Sha1;
 
-    var hasher = Hasher.create(std.testing.allocator, 2) catch return error.SkipZigTest;
+    var hasher = Hasher.realInit(std.testing.allocator, 2) catch return error.SkipZigTest;
 
     // Submit a piece whose hash will verify.
     const data = try std.testing.allocator.alloc(u8, 4);
