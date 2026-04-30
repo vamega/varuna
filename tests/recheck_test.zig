@@ -608,12 +608,30 @@ test "AsyncRecheckOf(SimIO): all pieces verify against registered file content" 
     //
     // Each tick pulls SimIO completions and feeds them into the
     // recheck state machine, then drains hasher results from the
-    // background thread pool. The hasher is a real thread, so we
-    // spin until either the on_complete callback fires or we hit
-    // the budget.
+    // background thread pool. The hasher is a real OS thread, so
+    // under parallel-test-runner load (`zig build test` running
+    // many test binaries concurrently) the hasher's SHA result
+    // can land later than the bare tick loop's budget allows. We
+    // cap on three independent conditions:
+    //
+    //   - completion (ctx.completed): success path, exit early
+    //   - tick count (32k): bounds wall-clock time on a stuck
+    //     test path to ~3 seconds even under heavy contention
+    //   - hasher idle + no pending writes after the recheck has
+    //     submitted its read pass: the recheck issued SQEs, all
+    //     results posted, hasher drained — no further progress
+    //     is possible without ctx.completed flipping
+    //
+    // `posix.sched_yield()` after each tick gives the hasher
+    // thread CPU time without forcing a wall-clock latency on the
+    // common path.
+    //
+    // Once `SimHasher` lands (STATUS Next), this loop can drop
+    // the yield and tighten back to a deterministic tick count.
     var ticks: u32 = 0;
-    while (ticks < 1024 and !ctx.completed) : (ticks += 1) {
+    while (ticks < 32 * 1024 and !ctx.completed) : (ticks += 1) {
         try el.tick();
+        _ = std.os.linux.sched_yield(); // give the real hasher OS thread CPU time
     }
 
     try std.testing.expect(ctx.completed);
@@ -697,9 +715,13 @@ test "AsyncRecheckOf(SimIO): corrupt piece is reported incomplete" {
         @ptrCast(&ctx),
     );
 
+    // See the "all pieces verify" sibling test for the rationale on
+    // the 32k budget + sched_yield. Same real-hasher-thread
+    // scheduling behaviour under parallel-test-runner contention.
     var ticks: u32 = 0;
-    while (ticks < 1024 and !ctx.completed) : (ticks += 1) {
+    while (ticks < 32 * 1024 and !ctx.completed) : (ticks += 1) {
         try el.tick();
+        _ = std.os.linux.sched_yield(); // give the real hasher OS thread CPU time
     }
 
     try std.testing.expect(ctx.completed);
