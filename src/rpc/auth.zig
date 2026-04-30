@@ -1,11 +1,12 @@
 const std = @import("std");
+const Random = @import("../runtime/random.zig").Random;
 
 /// Session-based authentication matching qBittorrent's auth flow.
 /// Sessions are identified by a random 32-character hex string (SID).
 /// Sessions expire after a configurable inactivity timeout.
 pub const SessionStore = struct {
     const max_sessions = 10;
-    const sid_len = 32;
+    pub const sid_len = 32;
 
     sessions: [max_sessions]?Session = [_]?Session{null} ** max_sessions,
     session_timeout_secs: i64 = 3600, // 1 hour default
@@ -17,7 +18,11 @@ pub const SessionStore = struct {
 
     /// Create a new session, returning the SID hex string.
     /// If max sessions are reached, evicts the oldest one.
-    pub fn createSession(self: *SessionStore) [sid_len]u8 {
+    ///
+    /// `random` is the daemon-wide CSPRNG (`runtime.Random`).
+    /// Production holds an OS-seeded ChaCha8; sim tests inject a known
+    /// seed so SIDs are byte-deterministic across runs.
+    pub fn createSession(self: *SessionStore, random: *Random) [sid_len]u8 {
         const now = std.time.timestamp();
 
         // Find a free slot or the oldest session
@@ -36,7 +41,7 @@ pub const SessionStore = struct {
         }
 
         var sid: [sid_len]u8 = undefined;
-        generateSessionId(&sid);
+        generateSessionId(random, &sid);
 
         self.sessions[target] = .{
             .sid = sid,
@@ -96,10 +101,10 @@ pub const SessionStore = struct {
     }
 };
 
-fn generateSessionId(buf: *[SessionStore.sid_len]u8) void {
+fn generateSessionId(random: *Random, buf: *[SessionStore.sid_len]u8) void {
     const charset = "0123456789abcdef";
     var random_bytes: [SessionStore.sid_len / 2]u8 = undefined;
-    std.crypto.random.bytes(&random_bytes);
+    random.bytes(&random_bytes);
     for (random_bytes, 0..) |byte, i| {
         buf[i * 2] = charset[byte >> 4];
         buf[i * 2 + 1] = charset[byte & 0x0f];
@@ -144,8 +149,9 @@ fn extractSidFromCookieValue(cookie: []const u8) ?[]const u8 {
 // ── Tests ─────────────────────────────────────────────────
 
 test "create and validate session" {
+    var rng = Random.simRandom(0x800);
     var store = SessionStore{};
-    const sid = store.createSession();
+    const sid = store.createSession(&rng);
 
     try std.testing.expect(store.validateSession(&sid));
     try std.testing.expect(!store.validateSession("not-a-valid-sid-at-all-too-short"));
@@ -153,8 +159,9 @@ test "create and validate session" {
 }
 
 test "remove session invalidates it" {
+    var rng = Random.simRandom(0x801);
     var store = SessionStore{};
-    const sid = store.createSession();
+    const sid = store.createSession(&rng);
 
     try std.testing.expect(store.validateSession(&sid));
     store.removeSession(&sid);
@@ -162,8 +169,9 @@ test "remove session invalidates it" {
 }
 
 test "expired session is rejected" {
+    var rng = Random.simRandom(0x802);
     var store = SessionStore{ .session_timeout_secs = 0 };
-    const sid = store.createSession();
+    const sid = store.createSession(&rng);
 
     // With 0 timeout, any session created in the past is expired
     // Force expiry by setting last_active to the past
@@ -176,13 +184,14 @@ test "expired session is rejected" {
 }
 
 test "max sessions evicts oldest" {
+    var rng = Random.simRandom(0x803);
     var store = SessionStore{};
     const now = std.time.timestamp();
 
     // Fill all slots
     var sids: [SessionStore.max_sessions][SessionStore.sid_len]u8 = undefined;
     for (0..SessionStore.max_sessions) |i| {
-        sids[i] = store.createSession();
+        sids[i] = store.createSession(&rng);
         // Stagger timestamps so oldest is deterministic, but anchor them
         // to "now" — `validateSession` rejects anything older than
         // `session_timeout_secs` (default 1h) relative to current time.
@@ -198,7 +207,7 @@ test "max sessions evicts oldest" {
     }
 
     // Create one more -- should evict the oldest (index 0)
-    const new_sid = store.createSession();
+    const new_sid = store.createSession(&rng);
     try std.testing.expect(store.validateSession(&new_sid));
     try std.testing.expect(!store.validateSession(&sids[0]));
     // Most recent should still be valid
@@ -225,13 +234,14 @@ test "no cookie header returns null" {
 }
 
 test "active count tracks sessions" {
+    var rng = Random.simRandom(0x804);
     var store = SessionStore{};
     try std.testing.expectEqual(@as(usize, 0), store.activeCount());
 
-    _ = store.createSession();
+    _ = store.createSession(&rng);
     try std.testing.expectEqual(@as(usize, 1), store.activeCount());
 
-    const sid2 = store.createSession();
+    const sid2 = store.createSession(&rng);
     try std.testing.expectEqual(@as(usize, 2), store.activeCount());
 
     store.removeSession(&sid2);
@@ -241,8 +251,9 @@ test "active count tracks sessions" {
 // ── Additional session store tests ───────────────────────
 
 test "validate session with wrong length returns false" {
+    var rng = Random.simRandom(0x805);
     var store = SessionStore{};
-    _ = store.createSession();
+    _ = store.createSession(&rng);
 
     // Too short
     try std.testing.expect(!store.validateSession("abc"));
@@ -255,8 +266,9 @@ test "validate session with wrong length returns false" {
 }
 
 test "remove session with wrong length is no-op" {
+    var rng = Random.simRandom(0x806);
     var store = SessionStore{};
-    const sid = store.createSession();
+    const sid = store.createSession(&rng);
 
     // Removing with wrong length should not affect the valid session
     store.removeSession("short");
@@ -268,8 +280,9 @@ test "remove session with wrong length is no-op" {
 }
 
 test "remove nonexistent session is no-op" {
+    var rng = Random.simRandom(0x807);
     var store = SessionStore{};
-    const sid = store.createSession();
+    const sid = store.createSession(&rng);
 
     // Remove a session that doesn't exist (correct length but wrong content)
     store.removeSession("zzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz");
@@ -280,10 +293,11 @@ test "remove nonexistent session is no-op" {
 }
 
 test "created session IDs are unique" {
+    var rng = Random.simRandom(0x808);
     var store = SessionStore{};
-    const sid1 = store.createSession();
-    const sid2 = store.createSession();
-    const sid3 = store.createSession();
+    const sid1 = store.createSession(&rng);
+    const sid2 = store.createSession(&rng);
+    const sid3 = store.createSession(&rng);
 
     try std.testing.expect(!std.mem.eql(u8, &sid1, &sid2));
     try std.testing.expect(!std.mem.eql(u8, &sid2, &sid3));
@@ -291,8 +305,9 @@ test "created session IDs are unique" {
 }
 
 test "session IDs are 32-char hex strings" {
+    var rng = Random.simRandom(0x809);
     var store = SessionStore{};
-    const sid = store.createSession();
+    const sid = store.createSession(&rng);
     const hex_chars = "0123456789abcdef";
 
     for (sid) |c| {
@@ -300,9 +315,20 @@ test "session IDs are 32-char hex strings" {
     }
 }
 
+test "session IDs are byte-deterministic under SimRandom" {
+    var r1 = Random.simRandom(0x80a);
+    var r2 = Random.simRandom(0x80a);
+    var s1 = SessionStore{};
+    var s2 = SessionStore{};
+    const sid1 = s1.createSession(&r1);
+    const sid2 = s2.createSession(&r2);
+    try std.testing.expectEqualSlices(u8, &sid1, &sid2);
+}
+
 test "active count excludes expired sessions" {
+    var rng = Random.simRandom(0x80b);
     var store = SessionStore{ .session_timeout_secs = 0 };
-    const sid = store.createSession();
+    const sid = store.createSession(&rng);
 
     // Force session into the past
     for (&store.sessions) |*slot| {
@@ -317,8 +343,9 @@ test "active count excludes expired sessions" {
 }
 
 test "validate refreshes last_active timestamp" {
+    var rng = Random.simRandom(0x80c);
     var store = SessionStore{ .session_timeout_secs = 100 };
-    const sid = store.createSession();
+    const sid = store.createSession(&rng);
 
     // Manually set last_active to something old but not expired
     for (&store.sessions) |*slot| {
@@ -344,11 +371,12 @@ test "validate refreshes last_active timestamp" {
 }
 
 test "max sessions eviction picks oldest by last_active" {
+    var rng = Random.simRandom(0x80d);
     var store = SessionStore{};
 
     // Fill all slots and stagger timestamps
     for (0..SessionStore.max_sessions) |i| {
-        _ = store.createSession();
+        _ = store.createSession(&rng);
         // Set last_active so slot 0 is oldest (timestamp 0), slot 1 is 1, etc.
         store.sessions[i].?.last_active = @intCast(i);
     }
@@ -356,7 +384,7 @@ test "max sessions eviction picks oldest by last_active" {
     // All slots full. Creating another session should evict the slot with
     // last_active=0 (the oldest).
     const old_sid_0 = store.sessions[0].?.sid;
-    const new_sid = store.createSession();
+    const new_sid = store.createSession(&rng);
 
     // The old session at slot 0 should be gone
     try std.testing.expect(!store.validateSession(&old_sid_0));

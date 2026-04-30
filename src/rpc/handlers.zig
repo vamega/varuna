@@ -160,7 +160,17 @@ pub const ApiHandler = struct {
             return withCors(.{ .body = "Fails.", .content_type = "text/plain" });
         }
 
-        const sid = self.session_store.createSession();
+        // Pull the daemon-wide CSPRNG from the shared event loop. In
+        // tests that build an ApiHandler without an event loop this
+        // path is unreachable because login predates any RPC call,
+        // but we defensively fall back to a freshly-seeded
+        // realRandom() if the shared event loop is missing.
+        const sid = if (self.session_manager.shared_event_loop) |el|
+            self.session_store.createSession(&el.random)
+        else blk: {
+            var fallback = @import("../runtime/random.zig").Random.realRandom();
+            break :blk self.session_store.createSession(&fallback);
+        };
         const header = std.fmt.allocPrint(allocator, "Set-Cookie: SID={s}; HttpOnly; SameSite=Lax; path=/\r\n" ++ cors_headers, .{sid}) catch
             return .{ .status = 500, .body = "{\"error\":\"internal\"}" };
         return .{
