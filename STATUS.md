@@ -337,16 +337,27 @@ branch-predicted switch per call.
 
 **`runtime.Clock` (`src/runtime/clock.zig`)**
 
-Three resolutions backed by a single i128-ns sim variant:
+Three resolutions backed by a single u64-ns sim variant:
 
 - `now()`   → i64 seconds (matches `std.time.timestamp()`)
 - `nowMs()` → i64 milliseconds (matches `std.time.milliTimestamp()`)
-- `nowNs()` → i128 nanoseconds (matches `std.time.nanoTimestamp()`)
+- `nowNs()` → u64 nanoseconds (narrower than
+  `std.time.nanoTimestamp()`'s `i128` on purpose — see below)
 
 Constructors `Clock.simAtSecs`/`simAtMs`/`simAtNs` plus
 `advance{Secs,Ms,Ns}` / `set{Secs,Ms,Ns}`. The existing shim at
 `src/io/clock.zig` re-exports the type so `EventLoop.clock`,
 peer/protocol/web-seed/uTP handlers continue to compile unchanged.
+
+**ns width: u64, not i128.** The whole simulation timeline
+(`SimIO.now_ns: u64`, `Simulator.clock_ns: u64`,
+`PendingEntry.deadline_ns: u64`) was already u64; matching that
+invariant cuts a cache line off the TokenBucket struct, lets future
+callers fit ns timestamps in `std.atomic.Value(u64)`, and avoids a
+128-bit conversion at every `EventLoop → SimIO` boundary. u64 ns
+since Unix epoch wraps in **year ~2554** (`2^64 ns ≈ 584.5 years`) —
+enormously more headroom than a daemon needs. A
+`@sizeOf(Clock) <= 16` regression test guards the invariant.
 
 **`runtime.Random` (`src/runtime/random.zig`)**
 
@@ -359,10 +370,14 @@ the call shapes the daemon actually uses.
 - `src/io/rate_limiter.zig` — `TokenBucket` no longer reads
   `std.time.nanoTimestamp()` internally. `consume`/`available`/
   `delayNs`/`refill`/`setRate` renamed to `*At` variants and take an
-  absolute `now_ns: i128` parameter. EventLoop snapshots
-  `self.clock.nowNs()` once per consume/throttle path. Inline tests
-  rewritten on deterministic timestamps; new test asserts refill
-  credits 250 ms / 1 s deterministically.
+  absolute `now_ns: u64` parameter. EventLoop snapshots
+  `self.clock.nowNs()` once per consume/throttle path. The
+  `last_refill_ns == 0` magic-value sentinel was replaced with
+  `last_refill_ns: ?u64` so a sim test anchored at `t = 0` no longer
+  re-seeds on every refill. Inline tests rewritten on deterministic
+  timestamps; new tests assert refill credits 250 ms / 1 s
+  deterministically, clock-going-backward is a no-op, and the t=0
+  anchor doesn't credit a half-millennium of tokens.
 
 - `src/io/peer_policy.zig` — 13 in-source test sites swap
   `std.time.timestamp()` → `el.clock.now()` so peer-policy unit tests

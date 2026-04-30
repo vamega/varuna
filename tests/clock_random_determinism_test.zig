@@ -148,7 +148,7 @@ test "rate-limit + key-generation pipeline is deterministic under sim sources" {
     const ScenarioOut = struct {
         first_consume: u64,
         key: [8]u8,
-        post_clock_ns: i128,
+        post_clock_ns: u64,
     };
 
     const scenario = struct {

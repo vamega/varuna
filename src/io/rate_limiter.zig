@@ -15,6 +15,10 @@ const std = @import("std");
 /// `refillAt`/`consumeAt`/`availableAt`/`delayNsAt` accept the timestamp
 /// directly; the legacy `consume`/`available`/`delayNs` shims are gone
 /// (always pass `now_ns` from `EventLoop.clock.nowNs()`).
+///
+/// Time width: `now_ns` is `u64` to match `SimIO.now_ns: u64` and the
+/// `runtime.Clock` abstraction. u64 nanoseconds-since-epoch wraps in
+/// year ~2554 — see `src/runtime/clock.zig` for rationale.
 pub const TokenBucket = struct {
     /// Maximum tokens (burst size). Equals `rate` (1 second of burst).
     capacity: u64,
@@ -25,10 +29,13 @@ pub const TokenBucket = struct {
     /// Fill rate in bytes per second. 0 = unlimited.
     rate: u64,
 
-    /// Timestamp of last refill, in absolute nanoseconds. Zero means
-    /// "uninitialised" — first refill seeds it from the caller-supplied
-    /// `now_ns` without crediting elapsed time.
-    last_refill_ns: i128,
+    /// Timestamp of last refill, in absolute u64 nanoseconds. `null`
+    /// means "uninitialised" — first refill seeds it from the
+    /// caller-supplied `now_ns` without crediting elapsed time.
+    /// Optional sentinel (vs the previous `== 0` magic value) so a sim
+    /// test anchored at `t = 0` doesn't accidentally re-seed every
+    /// refill.
+    last_refill_ns: ?u64,
 
     /// Comptime-friendly init that defers timestamp seeding to first use.
     pub fn init(rate: u64) TokenBucket {
@@ -41,13 +48,13 @@ pub const TokenBucket = struct {
             .capacity = if (rate == 0) std.math.maxInt(u64) else rate,
             .tokens = if (rate == 0) std.math.maxInt(u64) else rate,
             .rate = rate,
-            .last_refill_ns = 0,
+            .last_refill_ns = null,
         };
     }
 
     /// Set a new rate (bytes/sec). 0 = unlimited.
     /// Resets the bucket to full capacity at the new rate.
-    pub fn setRate(self: *TokenBucket, rate: u64, now_ns: i128) void {
+    pub fn setRate(self: *TokenBucket, rate: u64, now_ns: u64) void {
         self.rate = rate;
         self.capacity = if (rate == 0) std.math.maxInt(u64) else rate;
         self.tokens = self.capacity;
@@ -55,22 +62,22 @@ pub const TokenBucket = struct {
     }
 
     /// Refill tokens based on elapsed time, using the caller-supplied
-    /// absolute nanosecond timestamp.
-    pub fn refillAt(self: *TokenBucket, now_ns: i128) void {
+    /// absolute u64 nanosecond timestamp.
+    pub fn refillAt(self: *TokenBucket, now_ns: u64) void {
         if (self.rate == 0) return; // unlimited
 
-        if (self.last_refill_ns == 0) {
+        const last = self.last_refill_ns orelse {
             // First call after lazy init -- just seed the timestamp,
             // bucket is already full.
             self.last_refill_ns = now_ns;
             return;
-        }
-        const elapsed_ns = now_ns - self.last_refill_ns;
-        if (elapsed_ns <= 0) return;
+        };
+        if (now_ns <= last) return; // clock didn't advance (or went backward)
+
+        const elapsed_ns: u64 = now_ns - last;
 
         // tokens_to_add = rate * elapsed_ns / 1e9
-        const elapsed_u: u128 = @intCast(elapsed_ns);
-        const add: u128 = @as(u128, self.rate) * elapsed_u / std.time.ns_per_s;
+        const add: u128 = @as(u128, self.rate) * @as(u128, elapsed_ns) / std.time.ns_per_s;
         if (add == 0) return;
 
         const add_clamped: u64 = @intCast(@min(add, self.capacity));
@@ -79,7 +86,7 @@ pub const TokenBucket = struct {
     }
 
     /// Try to consume `amount` tokens at `now_ns`.
-    pub fn consumeAt(self: *TokenBucket, amount: u64, now_ns: i128) u64 {
+    pub fn consumeAt(self: *TokenBucket, amount: u64, now_ns: u64) u64 {
         if (self.rate == 0) return amount; // unlimited
 
         self.refillAt(now_ns);
@@ -92,7 +99,7 @@ pub const TokenBucket = struct {
     }
 
     /// Check how many bytes can be consumed at `now_ns`.
-    pub fn availableAt(self: *TokenBucket, now_ns: i128) u64 {
+    pub fn availableAt(self: *TokenBucket, now_ns: u64) u64 {
         if (self.rate == 0) return std.math.maxInt(u64);
 
         self.refillAt(now_ns);
@@ -101,7 +108,7 @@ pub const TokenBucket = struct {
 
     /// Return the delay in nanoseconds (relative to `now_ns`) until
     /// `amount` tokens would be available.
-    pub fn delayNsAt(self: *TokenBucket, amount: u64, now_ns: i128) u64 {
+    pub fn delayNsAt(self: *TokenBucket, amount: u64, now_ns: u64) u64 {
         if (self.rate == 0) return 0;
 
         self.refillAt(now_ns);
@@ -137,12 +144,12 @@ pub const RateLimiter = struct {
     }
 
     /// Set download rate limit (bytes/sec). 0 = unlimited.
-    pub fn setDownloadRate(self: *RateLimiter, rate: u64, now_ns: i128) void {
+    pub fn setDownloadRate(self: *RateLimiter, rate: u64, now_ns: u64) void {
         self.download.setRate(rate, now_ns);
     }
 
     /// Set upload rate limit (bytes/sec). 0 = unlimited.
-    pub fn setUploadRate(self: *RateLimiter, rate: u64, now_ns: i128) void {
+    pub fn setUploadRate(self: *RateLimiter, rate: u64, now_ns: u64) void {
         self.upload.setRate(rate, now_ns);
     }
 
@@ -261,16 +268,40 @@ test "available returns max for unlimited" {
 }
 
 test "refill credits elapsed time deterministically" {
-    const t0: i128 = std.time.ns_per_s; // anchor at 1s past the sentinel zero
+    // Anchored at t=0 — `last_refill_ns: ?u64` makes this safe (the
+    // earlier `== 0` sentinel would have re-seeded on every call).
     var bucket = TokenBucket.init(1_000); // 1000 bytes/sec
-    _ = bucket.consumeAt(1_000, t0); // drain (also seeds last_refill_ns=t0)
+    _ = bucket.consumeAt(1_000, 0); // drain (also seeds last_refill_ns=0)
     try std.testing.expectEqual(@as(u64, 0), bucket.tokens);
 
     // After 250 ms we should get 250 tokens.
-    bucket.refillAt(t0 + 250 * std.time.ns_per_ms);
+    bucket.refillAt(250 * std.time.ns_per_ms);
     try std.testing.expectEqual(@as(u64, 250), bucket.tokens);
 
     // After another 750 ms (1s total) we should be back to capacity.
-    bucket.refillAt(t0 + 1 * std.time.ns_per_s);
+    bucket.refillAt(1 * std.time.ns_per_s);
     try std.testing.expectEqual(@as(u64, 1_000), bucket.tokens);
+}
+
+test "refill clock-going-backward is a no-op" {
+    var bucket = TokenBucket.init(1_000);
+    _ = bucket.consumeAt(1_000, 1_000_000_000); // drain at t=1s
+    bucket.refillAt(500_000_000); // pretend now < last_refill: must not credit
+    try std.testing.expectEqual(@as(u64, 0), bucket.tokens);
+}
+
+test "refill across the t=0 anchor seeds rather than crediting" {
+    // Catches the sentinel-zero regression: starting at t=0 must NOT
+    // credit a half-millennium of tokens.
+    var bucket = TokenBucket.init(1_000);
+    _ = bucket.consumeAt(1_000, 0); // drain at t=0; seeds last_refill_ns
+    try std.testing.expectEqual(@as(u64, 0), bucket.tokens);
+
+    // Same instant — no credit.
+    bucket.refillAt(0);
+    try std.testing.expectEqual(@as(u64, 0), bucket.tokens);
+
+    // 100 ms later — 100 tokens.
+    bucket.refillAt(100 * std.time.ns_per_ms);
+    try std.testing.expectEqual(@as(u64, 100), bucket.tokens);
 }

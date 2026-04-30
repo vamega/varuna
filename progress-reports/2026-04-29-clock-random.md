@@ -7,11 +7,16 @@ remaining nondeterminism boundaries against `std.time.*` and
 `std.crypto.random`. Both use the same tagged-union dispatch shape as
 the existing `src/io/clock.zig`:
 
-- **`src/runtime/clock.zig`** — `Clock = union(enum) { real, sim: i128 }`
-  with three accessors (`now` → secs, `nowMs` → ms, `nowNs` → ns) and
-  matching `advance*` / `set*` mutators. The sim variant stores
-  absolute nanoseconds so all three resolutions agree on the same
-  logical timeline. Constructors `simAtSecs` / `simAtMs` / `simAtNs`.
+- **`src/runtime/clock.zig`** — `Clock = union(enum) { real, sim: u64 }`
+  with three accessors (`now` → i64 secs, `nowMs` → i64 ms, `nowNs` →
+  u64 ns) and matching `advance*` / `set*` mutators. The sim variant
+  stores absolute u64 nanoseconds so all three resolutions agree on
+  the same logical timeline. Constructors `simAtSecs` / `simAtMs` /
+  `simAtNs`. **u64, not i128**: matches the existing
+  `SimIO.now_ns: u64` / `PendingEntry.deadline_ns: u64` invariant the
+  rest of the simulator uses, fits in 16-byte `Clock` (regression
+  test enforces it), wraps in year ~2554 — far past any reasonable
+  daemon lifetime.
 - **`src/runtime/random.zig`** — `Random = union(enum) { real,
   sim: std.Random.DefaultPrng }` with `bytes`/`int`/`uintLessThan`. The
   module-level docstring catalogues which `std.crypto.random` callers
@@ -47,7 +52,7 @@ ms / ns resolutions production code actually needs.
 
 | Subsystem | Change |
 | --- | --- |
-| `src/io/rate_limiter.zig` | `TokenBucket` no longer reads `std.time.nanoTimestamp()` internally. Method names changed: `consume`/`available`/`delayNs`/`refill`/`setRate` → `*At` variants taking `now_ns: i128`. |
+| `src/io/rate_limiter.zig` | `TokenBucket` no longer reads `std.time.nanoTimestamp()` internally. Method names changed: `consume`/`available`/`delayNs`/`refill`/`setRate` → `*At` variants taking `now_ns: u64`. `last_refill_ns` switched from `i128` (with `== 0` sentinel) to `?u64` to eliminate the fragile magic value. |
 | `src/io/event_loop.zig` | `consumeDownloadTokens` / `consumeUploadTokens` / `isDownloadThrottled` / `isUploadThrottled` / `set{Global,Torrent}{Dl,Ul}Limit` snapshot `self.clock.nowNs()` once and pass through. New `random: Random = .real` field on `Self` (no production consumer yet). |
 | `src/io/peer_policy.zig` | 13 in-source test sites: `std.time.timestamp()` → `el.clock.now()`. Production paths already used `self.clock.now()`. |
 | `src/tracker/types.zig` | `Request.generateKey(rng: *Random)` — first Random migration. The tracker `key` parameter is a stable client identifier where predictability isn't a security failure. |
@@ -124,13 +129,15 @@ The test now asserts:
    `self.clock.nowNs()` once per public throttle method to avoid
    sampling jitter mid-call.
 
-3. **Sentinel zero in `last_refill_ns` is fragile.** The original code
-   used `last_refill_ns == 0` as the "uninitialised, defer to first
-   refill" sentinel. After migration this means a sim test starting at
-   absolute time 0 ns triggers re-init on every refill (no time
-   credited). My initial determinism test hit this; fixed by anchoring
-   the test at `t0 = ns_per_s` instead. Switching to `?i128` would be
-   cleaner but touches the comptime init pattern; deferred.
+3. **Sentinel zero in `last_refill_ns` was fragile; replaced with
+   `?u64`.** The original code used `last_refill_ns == 0` as the
+   "uninitialised, defer to first refill" sentinel. A sim test
+   starting at absolute time 0 ns would trigger re-init on every
+   refill (no time ever credited). The narrowing-to-u64 work was a
+   natural moment to also switch the field to `?u64`, eliminating the
+   magic value. Two new tests guard the corner case:
+   `refill clock-going-backward is a no-op` and
+   `refill across the t=0 anchor seeds rather than crediting`.
 
 4. **`std.crypto.random` sites are not all the same.** The
    simulator-friendly category turned out to be smaller than the
@@ -141,6 +148,19 @@ The test now asserts:
    (UDP tracker tx IDs, uTP conn IDs, tracker `key`, and a future
    smart-ban tie-break). Migrated 1 (tracker `key`); others tracked
    as follow-up.
+
+5. **u64 vs i128 for ns timestamps — match the existing invariant,
+   not the stdlib.** The first cut returned `i128` from `nowNs()` to
+   mirror `std.time.nanoTimestamp()`. Team-lead review pointed out
+   that the rest of the simulation timeline (`SimIO.now_ns: u64`,
+   `Simulator.clock_ns: u64`, `PendingEntry.deadline_ns: u64`) was
+   already u64; mismatching widened the `Clock` struct beyond a
+   16-byte cache slice, forced 128-bit conversion at every
+   `EventLoop → SimIO` boundary, and gave up the ability to put a ns
+   timestamp behind `std.atomic.Value(u64)` later. u64 ns since the
+   epoch wraps in year ~2554, well outside any plausible daemon
+   lifetime. A `@sizeOf(Clock) <= 16` regression test guards the
+   choice.
 
 ## Remaining work
 
