@@ -1,23 +1,70 @@
 //! DNS resolution interface for the varuna daemon.
 //!
 //! This module provides a unified `DnsResolver` type and `resolveOnce` function
-//! that dispatch to either a threadpool-based or c-ares-based backend depending
-//! on the build configuration:
+//! that dispatch to one of three backends depending on the build configuration:
 //!
 //!   - `-Ddns=threadpool` (default): uses `getaddrinfo` on background threads
-//!   - `-Ddns=c-ares`: uses the c-ares async DNS library with epoll fd monitoring
+//!   - `-Ddns=c_ares`: uses the c-ares async DNS library with epoll fd monitoring
+//!   - `-Ddns=custom`: uses the in-tree Zig-native resolver under
+//!     `src/io/dns_custom/`. Phase F transitional dispatch — see below.
 //!
-//! Both backends provide the same public API: `DnsResolver` with `init`, `deinit`,
-//! `resolve`, `invalidate`, `clearAll`, plus a standalone `resolveOnce` function.
-//! Both share the same TTL cache behavior (5-minute TTL, 64-entry max).
+//! All three backends provide the same public `DnsResolver` API: `init`,
+//! `deinit`, `resolve`, `resolveAsync`, `cacheResult`, `invalidate`,
+//! `clearAll`, plus a standalone `resolveOnce` function. They share the
+//! same TTL cache behaviour (default 1-hour cap, 64-entry max).
+//!
+//! ## `-Ddns=custom` Phase F status (2026-04-30)
+//!
+//! The custom backend's library bodies (`message.zig`, `cache.zig`,
+//! `query.zig`, `resolv_conf.zig`, `resolver.zig`) landed in commit
+//! `86d8fc3`. The full executor refactor that swaps the daemon's
+//! `HttpExecutor` / `UdpTrackerExecutor` from the threadpool's
+//! `eventfd-poll` async DNS path to the IO-contract-native callback
+//! shape exposed by `DnsResolverOf(IO)` is a follow-up — see
+//! `progress-reports/2026-04-29-custom-dns-library.md` §"Phase F
+//! integration" and `progress-reports/2026-04-30-dns-phase-f.md`.
+//!
+//! Until that refactor lands, `-Ddns=custom` selects a transitional
+//! facade that:
+//!   - re-exports the custom library's `DnsResolverOf` /
+//!     `Config` / `ResolveResult` types (`pub const dns_custom = ...`)
+//!     so callers — and the SimIO integration test in
+//!     `tests/dns_custom_integration_test.zig` — can drive the
+//!     library directly with their own IO instance;
+//!   - keeps the `DnsResolver` cache + async-resolve surface bound
+//!     to the threadpool implementation so existing executors
+//!     compile and run without regressions.
+//!
+//! In other words: under `-Ddns=custom`, the in-tree Zig DNS library
+//! is **available** to callers that opt in but is **not yet wired**
+//! into the daemon's tracker / web-seed paths. Selecting the flag
+//! does not yet close the `bind_device` DNS leak that motivated the
+//! library — that comes with the executor refactor.
 
 const std = @import("std");
 const build_options = @import("build_options");
 
-const backend = if (build_options.dns_backend == .c_ares)
-    @import("dns_cares.zig")
-else
-    @import("dns_threadpool.zig");
+/// In-tree Zig DNS library re-export. Available regardless of
+/// `dns_backend`; callers that want to drive the new library
+/// directly (e.g. integration tests parameterised over SimIO)
+/// import it through this re-export so they don't take a direct
+/// dependency on the `src/io/dns_custom/` layout.
+pub const dns_custom = struct {
+    pub const resolver = @import("dns_custom/resolver.zig");
+    pub const message = @import("dns_custom/message.zig");
+    pub const cache = @import("dns_custom/cache.zig");
+    pub const query = @import("dns_custom/query.zig");
+    pub const resolv_conf = @import("dns_custom/resolv_conf.zig");
+};
+
+const backend = switch (build_options.dns_backend) {
+    .c_ares => @import("dns_cares.zig"),
+    // `.custom` reuses the threadpool implementation for the
+    // public `DnsResolver` shape until the executor refactor lands;
+    // see the module docstring for rationale. The custom library
+    // itself is still reachable through `dns_custom.*` above.
+    .threadpool, .custom => @import("dns_threadpool.zig"),
+};
 
 /// Thread-safe DNS resolver with TTL-based caching.
 ///
