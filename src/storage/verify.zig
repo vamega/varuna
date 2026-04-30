@@ -247,6 +247,7 @@ pub fn recheckExistingData(
     allocator: std.mem.Allocator,
     session: *const torrent.session.Session,
     store: *writer.PieceStore,
+    io: *@import("../io/backend.zig").RealIO,
     known_complete: ?*const PieceSet,
 ) !RecheckState {
     var complete_pieces = try PieceSet.init(allocator, session.pieceCount());
@@ -260,7 +261,7 @@ pub fn recheckExistingData(
     // For v2 torrents, verify per-file Merkle roots
     if (session.layout.version == .v2) {
         if (session.metainfo.file_tree_v2) |v2_files| {
-            return recheckV2(allocator, session, store, known_complete, v2_files);
+            return recheckV2(allocator, session, store, io, known_complete, v2_files);
         }
     }
 
@@ -281,7 +282,7 @@ pub fn recheckExistingData(
         defer freePiecePlan(allocator, plan);
 
         const piece_data = scratch[0..plan.piece_length];
-        store.readPiece(plan.spans, piece_data) catch continue;
+        store.readPiece(io, plan.spans, piece_data) catch continue;
         if (try verifyPieceBuffer(plan, piece_data)) {
             try complete_pieces.set(piece_index);
             bytes_complete += plan.piece_length;
@@ -301,6 +302,7 @@ fn recheckV2(
     allocator: std.mem.Allocator,
     session: *const torrent.session.Session,
     store: *writer.PieceStore,
+    io: *@import("../io/backend.zig").RealIO,
     known_complete: ?*const PieceSet,
     v2_files: []const torrent.metainfo.V2File,
 ) !RecheckState {
@@ -347,7 +349,7 @@ fn recheckV2(
             const plan = try planPieceVerification(allocator, session, file.first_piece);
             defer freePiecePlan(allocator, plan);
             const piece_data = scratch[0..plan.piece_length];
-            store.readPiece(plan.spans, piece_data) catch continue;
+            store.readPiece(io, plan.spans, piece_data) catch continue;
             var actual: [32]u8 = undefined;
             Sha256.hash(piece_data, &actual, .{});
             if (std.mem.eql(u8, &actual, &v2_files[file_idx].pieces_root)) {
@@ -371,7 +373,7 @@ fn recheckV2(
             };
             defer freePiecePlan(allocator, plan);
             const piece_data = scratch[0..plan.piece_length];
-            store.readPiece(plan.spans, piece_data) catch {
+            store.readPiece(io, plan.spans, piece_data) catch {
                 all_readable = false;
                 break;
             };
@@ -561,9 +563,9 @@ test "recheck existing on-disk pieces" {
 
     const piece0 = try planPieceVerification(std.testing.allocator, &session, 0);
     defer freePiecePlan(std.testing.allocator, piece0);
-    try store.writePiece(piece0.spans, "spam");
+    try store.writePiece(&verify_io, piece0.spans, "spam");
 
-    var state = try recheckExistingData(std.testing.allocator, &session, &store, null);
+    var state = try recheckExistingData(std.testing.allocator, &session, &store, &verify_io, null);
     defer state.deinit(std.testing.allocator);
 
     try std.testing.expect(state.complete_pieces.has(0));

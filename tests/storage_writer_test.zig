@@ -91,7 +91,7 @@ test "PieceStoreOf(SimIO): init + sync happy path" {
 
     // Sync drains two fsyncs through SimIO -> contract -> heap. With no
     // fault injection this completes in a single tick.
-    try store.sync();
+    try store.sync(&sim);
 }
 
 test "PieceStoreOf(SimIO): fallocate fault propagates from init" {
@@ -147,7 +147,7 @@ test "PieceStoreOf(SimIO): fsync fault propagates from sync" {
 
     sim.config.faults.fsync_error_probability = 1.0;
 
-    try std.testing.expectError(error.InputOutput, store.sync());
+    try std.testing.expectError(error.InputOutput, store.sync(&sim));
 }
 
 test "PieceStoreOf(SimIO): do_not_download priority skips fallocate" {
@@ -221,7 +221,7 @@ test "PieceStoreOf(SimIO): writePiece + readPiece across two spans" {
     try std.testing.expectEqual(@as(usize, 2), plan.spans.len);
 
     // Submit the writes; both SimIO completions must drain cleanly.
-    try store.writePiece(plan.spans, "spam");
+    try store.writePiece(&sim, plan.spans, "spam");
 
     // Register expected post-write content per file. Piece 0 spans
     // alpha[0..3] = "spa" and beta/gamma[0..1] = "m".
@@ -229,7 +229,7 @@ test "PieceStoreOf(SimIO): writePiece + readPiece across two spans" {
     try sim.setFileBytes(store.files[1].?.handle, "m");
 
     var piece_buffer: [4]u8 = undefined;
-    try store.readPiece(plan.spans, piece_buffer[0..]);
+    try store.readPiece(&sim, plan.spans, piece_buffer[0..]);
     try std.testing.expectEqualStrings("spam", &piece_buffer);
 }
 
@@ -266,7 +266,7 @@ test "PieceStoreOf(SimIO): writePiece propagates SimIO write fault" {
     // write is cleaner than a fresh init.)
     sim.config.faults.write_error_probability = 1.0;
 
-    try std.testing.expectError(error.NoSpaceLeft, store.writePiece(plan.spans, "spam"));
+    try std.testing.expectError(error.NoSpaceLeft, store.writePiece(&sim, plan.spans, "spam"));
 }
 
 test "PieceStoreOf(SimIO): readPiece propagates SimIO read fault" {
@@ -298,7 +298,7 @@ test "PieceStoreOf(SimIO): readPiece propagates SimIO read fault" {
     sim.config.faults.read_error_probability = 1.0;
 
     var piece_buffer: [4]u8 = undefined;
-    try std.testing.expectError(error.InputOutput, store.readPiece(plan.spans, piece_buffer[0..]));
+    try std.testing.expectError(error.InputOutput, store.readPiece(&sim, plan.spans, piece_buffer[0..]));
 }
 
 // ── truncate fallback path (filesystem-portability) ───────
@@ -403,13 +403,13 @@ test "PieceStoreOf(SimIO): writePiece + readPiece across three spans" {
 
     // Single piece of 9 bytes spanning alpha (3) + beta (3) + gamma (3).
     const piece_data: []const u8 = "ABCdef-XY"; // 9 bytes
-    try store.writePiece(plan.spans, piece_data);
+    try store.writePiece(&sim, plan.spans, piece_data);
 
     try sim.setFileBytes(store.files[0].?.handle, "ABC");
     try sim.setFileBytes(store.files[1].?.handle, "def");
     try sim.setFileBytes(store.files[2].?.handle, "-XY");
 
     var piece_buffer: [9]u8 = undefined;
-    try store.readPiece(plan.spans, piece_buffer[0..]);
+    try store.readPiece(&sim, plan.spans, piece_buffer[0..]);
     try std.testing.expectEqualStrings(piece_data, &piece_buffer);
 }
