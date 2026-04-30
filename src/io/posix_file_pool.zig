@@ -83,6 +83,8 @@ pub const FileOp = union(enum) {
     fsync: ifc.FsyncOp,
     fallocate: ifc.FallocateOp,
     truncate: ifc.TruncateOp,
+    splice: ifc.SpliceOp,
+    copy_file_range: ifc.CopyFileRangeOp,
 };
 
 /// A completed op ready to fire its callback. The pool stages these in
@@ -359,6 +361,8 @@ fn executeOp(op: FileOp) Result {
         .fsync => |p| .{ .fsync = executeFsync(p) },
         .fallocate => |p| .{ .fallocate = executeFallocate(p) },
         .truncate => |p| .{ .truncate = executeTruncate(p) },
+        .splice => |p| .{ .splice = executeSplice(p) },
+        .copy_file_range => |p| .{ .copy_file_range = executeCopyFileRange(p) },
     };
 }
 
@@ -442,6 +446,85 @@ fn executeTruncate(op: ifc.TruncateOp) anyerror!void {
     return posix.ftruncate(op.fd, op.length);
 }
 
+fn executeSplice(op: ifc.SpliceOp) anyerror!usize {
+    if (comptime builtin.target.os.tag != .linux) {
+        // splice(2) is Linux-only. Posix-not-Linux backends report the
+        // op as unsupported; callers fall back to copy_file_range or
+        // read/write loops.
+        return error.OperationNotSupported;
+    }
+    const linux = std.os.linux;
+    // Pass nullable offsets per `splice(2)` semantics: maxInt(u64) means
+    // "the corresponding fd is a pipe; ignore the offset".
+    var off_in: i64 = @bitCast(op.in_offset);
+    var off_out: i64 = @bitCast(op.out_offset);
+    const off_in_ptr: ?*i64 = if (op.in_offset == std.math.maxInt(u64)) null else &off_in;
+    const off_out_ptr: ?*i64 = if (op.out_offset == std.math.maxInt(u64)) null else &off_out;
+    // splice isn't in std.os.linux's wrapped syscalls, so we issue it
+    // directly via syscall6 and decode the errno.
+    const rc = linux.syscall6(
+        .splice,
+        @as(usize, @bitCast(@as(isize, op.in_fd))),
+        @intFromPtr(off_in_ptr),
+        @as(usize, @bitCast(@as(isize, op.out_fd))),
+        @intFromPtr(off_out_ptr),
+        op.len,
+        op.flags,
+    );
+    switch (linux.E.init(rc)) {
+        .SUCCESS => return @intCast(rc),
+        .BADF => return error.BadFileDescriptor,
+        .INVAL => return error.InvalidArgument,
+        .NOMEM => return error.SystemResources,
+        .SPIPE => return error.InvalidArgument,
+        .IO => return error.InputOutput,
+        .NOSPC => return error.NoSpaceLeft,
+        .PIPE => return error.BrokenPipe,
+        .AGAIN => return error.WouldBlock,
+        else => |e| return posix.unexpectedErrno(e),
+    }
+}
+
+fn executeCopyFileRange(op: ifc.CopyFileRangeOp) anyerror!usize {
+    if (comptime builtin.target.os.tag == .linux) {
+        const linux = std.os.linux;
+        // copy_file_range(2): fast in-kernel copy. With offset pointers,
+        // the file's own offset isn't advanced. The kernel returns the
+        // number of bytes transferred (0 indicates EOF).
+        var off_in: i64 = @intCast(op.in_offset);
+        var off_out: i64 = @intCast(op.out_offset);
+        const rc = linux.copy_file_range(op.in_fd, &off_in, op.out_fd, &off_out, op.len, op.flags);
+        switch (linux.E.init(rc)) {
+            .SUCCESS => return @intCast(rc),
+            .BADF => return error.BadFileDescriptor,
+            .INVAL => return error.InvalidArgument,
+            .XDEV => return error.OperationNotSupported,
+            .NOSYS => return error.OperationNotSupported,
+            .OPNOTSUPP => return error.OperationNotSupported,
+            .IO => return error.InputOutput,
+            .NOSPC => return error.NoSpaceLeft,
+            .ISDIR => return error.IsDir,
+            .OVERFLOW => return error.FileTooBig,
+            .TXTBSY => return error.WouldBlock,
+            else => |e| return posix.unexpectedErrno(e),
+        }
+    }
+    // Non-Linux: emulate via a single positioned read/write pair. The
+    // worker thread loop in `MoveJob` chunks larger transfers, so a
+    // single `pread` / `pwrite` here is sufficient.
+    var stack_buf: [128 * 1024]u8 = undefined;
+    const want = @min(op.len, stack_buf.len);
+    const n_read = try posix.pread(op.in_fd, stack_buf[0..want], op.in_offset);
+    if (n_read == 0) return 0;
+    var written: usize = 0;
+    while (written < n_read) {
+        const w = try posix.pwrite(op.out_fd, stack_buf[written..n_read], op.out_offset + written);
+        if (w == 0) return error.WriteShort;
+        written += w;
+    }
+    return n_read;
+}
+
 fn makeCancelledResult(op: FileOp) Result {
     return switch (op) {
         .read => .{ .read = error.OperationCanceled },
@@ -449,6 +532,8 @@ fn makeCancelledResult(op: FileOp) Result {
         .fsync => .{ .fsync = error.OperationCanceled },
         .fallocate => .{ .fallocate = error.OperationCanceled },
         .truncate => .{ .truncate = error.OperationCanceled },
+        .splice => .{ .splice = error.OperationCanceled },
+        .copy_file_range => .{ .copy_file_range = error.OperationCanceled },
     };
 }
 

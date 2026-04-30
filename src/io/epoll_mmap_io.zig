@@ -731,6 +731,63 @@ pub const EpollMmapIO = struct {
         _ = try self.deliverInline(c, result);
     }
 
+    pub fn splice(self: *EpollMmapIO, op: ifc.SpliceOp, c: *Completion, ud: ?*anyopaque, cb: Callback) !void {
+        try self.armCompletion(c, .{ .splice = op }, ud, cb);
+        // The mmap backends don't host a thread pool — splice runs on
+        // the EL thread. The only daemon caller is the async file-move
+        // job, which is one-shot per torrent relocation; the resulting
+        // EL stall is bounded and observably acceptable.
+        const result: Result = blk: {
+            var off_in: i64 = @bitCast(op.in_offset);
+            var off_out: i64 = @bitCast(op.out_offset);
+            const off_in_ptr: ?*i64 = if (op.in_offset == std.math.maxInt(u64)) null else &off_in;
+            const off_out_ptr: ?*i64 = if (op.out_offset == std.math.maxInt(u64)) null else &off_out;
+            const rc = linux.syscall6(
+                .splice,
+                @as(usize, @bitCast(@as(isize, op.in_fd))),
+                @intFromPtr(off_in_ptr),
+                @as(usize, @bitCast(@as(isize, op.out_fd))),
+                @intFromPtr(off_out_ptr),
+                op.len,
+                op.flags,
+            );
+            switch (linux.E.init(rc)) {
+                .SUCCESS => break :blk .{ .splice = @as(usize, @intCast(rc)) },
+                .BADF => break :blk .{ .splice = error.BadFileDescriptor },
+                .INVAL => break :blk .{ .splice = error.InvalidArgument },
+                .NOMEM => break :blk .{ .splice = error.SystemResources },
+                .SPIPE => break :blk .{ .splice = error.InvalidArgument },
+                .IO => break :blk .{ .splice = error.InputOutput },
+                .NOSPC => break :blk .{ .splice = error.NoSpaceLeft },
+                .PIPE => break :blk .{ .splice = error.BrokenPipe },
+                .AGAIN => break :blk .{ .splice = error.WouldBlock },
+                else => |e| break :blk .{ .splice = posix.unexpectedErrno(e) },
+            }
+        };
+        _ = try self.deliverInline(c, result);
+    }
+
+    pub fn copy_file_range(self: *EpollMmapIO, op: ifc.CopyFileRangeOp, c: *Completion, ud: ?*anyopaque, cb: Callback) !void {
+        try self.armCompletion(c, .{ .copy_file_range = op }, ud, cb);
+        const result: Result = blk: {
+            var off_in: i64 = @bitCast(op.in_offset);
+            var off_out: i64 = @bitCast(op.out_offset);
+            const rc = linux.copy_file_range(op.in_fd, &off_in, op.out_fd, &off_out, op.len, op.flags);
+            switch (linux.E.init(rc)) {
+                .SUCCESS => break :blk .{ .copy_file_range = @as(usize, @intCast(rc)) },
+                .BADF => break :blk .{ .copy_file_range = error.BadFileDescriptor },
+                .INVAL => break :blk .{ .copy_file_range = error.InvalidArgument },
+                .XDEV, .NOSYS, .OPNOTSUPP => break :blk .{ .copy_file_range = error.OperationNotSupported },
+                .IO => break :blk .{ .copy_file_range = error.InputOutput },
+                .NOSPC => break :blk .{ .copy_file_range = error.NoSpaceLeft },
+                .ISDIR => break :blk .{ .copy_file_range = error.IsDir },
+                .OVERFLOW => break :blk .{ .copy_file_range = error.FileTooBig },
+                else => |e| break :blk .{ .copy_file_range = posix.unexpectedErrno(e) },
+            }
+        };
+        _ = try self.deliverInline(c, result);
+    }
+
     // ── Mmap helpers ──────────────────────────────────────
 
     fn ensureMapping(self: *EpollMmapIO, fd: posix.fd_t) !MmapEntry {

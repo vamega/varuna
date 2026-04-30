@@ -865,6 +865,16 @@ pub const EpollPosixIO = struct {
         try self.submitFileOp(.{ .truncate = op }, c);
     }
 
+    pub fn splice(self: *EpollPosixIO, op: ifc.SpliceOp, c: *Completion, ud: ?*anyopaque, cb: Callback) !void {
+        try self.armCompletion(c, .{ .splice = op }, ud, cb);
+        try self.submitFileOp(.{ .splice = op }, c);
+    }
+
+    pub fn copy_file_range(self: *EpollPosixIO, op: ifc.CopyFileRangeOp, c: *Completion, ud: ?*anyopaque, cb: Callback) !void {
+        try self.armCompletion(c, .{ .copy_file_range = op }, ud, cb);
+        try self.submitFileOp(.{ .copy_file_range = op }, c);
+    }
+
     fn submitFileOp(self: *EpollPosixIO, op: FileOp, c: *Completion) !void {
         // Bump active so `tick`'s early-return guard knows we have
         // outstanding work; matches the timer / registered-fd path.
