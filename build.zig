@@ -276,6 +276,17 @@ pub fn build(b: *std.Build) void {
     const run_private_tracker_tests = b.addRunArtifact(private_tracker_tests);
     test_step.dependOn(&run_private_tracker_tests.step);
 
+    const clock_random_determinism_tests = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("tests/clock_random_determinism_test.zig"),
+            .target = target,
+            .optimize = optimize,
+            .imports = &varuna_import,
+        }),
+    });
+    const run_clock_random_determinism_tests = b.addRunArtifact(clock_random_determinism_tests);
+    test_step.dependOn(&run_clock_random_determinism_tests.step);
+
     const udp_tracker_tests = b.addTest(.{
         .root_module = b.createModule(.{
             .root_source_file = b.path("tests/udp_tracker_test.zig"),

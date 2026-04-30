@@ -1009,6 +1009,13 @@ pub const KqueuePosixIO = struct {
 
 // ── Helpers ───────────────────────────────────────────────
 
+/// Monotonic ns reader for the kqueue backend's own scheduling.
+///
+/// Clock injection note: the runtime `Clock` abstraction explicitly
+/// excludes IO-backend internal timekeeping. The kqueue backend IS the
+/// time source for its own deadline heap; routing through `Clock` would
+/// be circular. SimIO has its own logical clock; this code only runs on
+/// real macOS/BSD kqueue.
 inline fn monotonicNs() u64 {
     return @intCast(std.time.nanoTimestamp());
 }

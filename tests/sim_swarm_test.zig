@@ -130,7 +130,7 @@ test "VirtualPeer seeder transfers a piece to EventLoop downloader" {
 
     el.encryption_mode = .disabled;
     // Advance the sim clock so time-based gates (unchoke interval, etc.) open.
-    el.clock = .{ .sim = 10_000 };
+    el.clock = varuna.runtime.Clock.simAtSecs(10_000);
 
     // ── 6. Register the torrent ──────────────────────────────────
     const peer_id = "-VR0001-simdl0000001".*;

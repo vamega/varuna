@@ -187,7 +187,7 @@ fn runScenario(seed: u64, opts: ScenarioOpts) !void {
     el.ban_list = &ban_list;
 
     el.encryption_mode = .disabled;
-    el.clock = .{ .sim = 1_000_000 };
+    el.clock = varuna.runtime.Clock.simAtSecs(1_000_000);
 
     const downloader_peer_id = "-VR0001-msseventloop".*;
     const tid = try el.addTorrent(&session, &tracker, shared_fds, downloader_peer_id);

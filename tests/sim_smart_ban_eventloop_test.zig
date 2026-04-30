@@ -46,6 +46,7 @@ const ifc = varuna.io.io_interface;
 const sim_io_mod = varuna.io.sim_io;
 const SimIO = sim_io_mod.SimIO;
 const event_loop_mod = varuna.io.event_loop;
+const clock_mod = varuna.runtime.clock;
 const SimPeer = varuna.sim.SimPeer;
 const SimPeerBehavior = varuna.sim.sim_peer.Behavior;
 const peer_wire = varuna.net.peer_wire;
@@ -208,7 +209,7 @@ fn runOneSeedAgainstEventLoop(seed: u64, opts: BuggifyOpts) !SeedOutcome {
     el.ban_list = &ban_list;
 
     el.encryption_mode = .disabled;
-    el.clock = .{ .sim = 1_000_000 }; // 1 ms past zero so time-gated logic opens
+    el.clock = clock_mod.Clock.simAtSecs(1_000_000); // far past zero so time-gated logic opens
 
     // ── 5. Register the torrent ──────────────────────────────────
     const downloader_peer_id = "-VR0001-simdleventl0".*;
