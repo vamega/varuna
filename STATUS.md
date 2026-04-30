@@ -313,6 +313,76 @@ See `progress-reports/2026-04-25-stage2-event-loop-migration.md` for the Stage 2
 - ~~**Daemon graceful shutdown**~~: Fixed. In-flight transfer draining with configurable timeout now ensures clean exit on SIGTERM/SIGINT.
 - `IORING_OP_SETSOCKOPT` (kernel 6.7+), `IORING_OP_BIND`/`LISTEN` (kernel 6.11+) not available on current kernel 6.6. Per-peer setsockopt (TCP_NODELAY, buffer sizes) remains synchronous.
 
+## Last Verified Milestone (2026-04-29 — Custom DNS library (Phases A–E foundation, F deferred))
+
+Lays the groundwork for replacing c-ares + the threadpool backend
+with a contract-native DNS resolver under `src/io/dns_custom/`. Per
+the Round-1+2 design docs (`docs/custom-dns-design.md`,
+`docs/custom-dns-design-round2.md`), Option A — build a custom
+contract-native DNS library — is the path forward. This milestone
+lands the foundation: parser, cache, resolv.conf, query state
+machine, top-level resolver. The `-Ddns=custom` build dispatch
+(Phase F) is deferred to a follow-up; the existing `threadpool`
+(default) and `c_ares` backends are untouched.
+
+**Files added (~1 500 LOC + tests)**
+
+- `src/io/dns_custom/message.zig` — DNS wire format encode/decode
+  (RFC 1035, RFC 3596). 35 tests. Hardening patterns ported
+  directly from the round-1-through-round-4 KRPC / bencode
+  audits: saturating-subtraction length-prefix bounds,
+  compression-pointer strict-decrease invariant + hop cap, label
+  cap (63), wire-name cap (255), rdlength bound, mismatched-
+  question rejection, A=4 / AAAA=16 rdlength check, adversarial
+  fuzz no-panic.
+- `src/io/dns_custom/cache.zig` — bounded TTL cache with positive
+  + negative entries, per-record TTL clamping, sweep helper.
+  12 tests.
+- `src/io/dns_custom/resolv_conf.zig` — `/etc/resolv.conf`
+  parser. 14 tests. IPv4/IPv6, zone-id stripping, comments, CRLF,
+  glibc-style invalid-IP skip-and-continue.
+- `src/io/dns_custom/query.zig` — `QueryOf(IO)` per-lookup state
+  machine generic over the IO contract. socket → optional
+  applyBindDevice → connect → send → recv with per-server +
+  total timeouts, multi-server fallback, txid match, NXDOMAIN
+  delivery, CNAME chain target surfaced.
+- `src/io/dns_custom/resolver.zig` — `DnsResolverOf(IO)`
+  composing cache + servers + Query. Public surface mirrors the
+  existing `dns.zig` backends (cacheLookup / cacheAuthoritative
+  / cacheNxdomain / invalidate / clearAll). `bind_device` plumbed
+  through Config (Phase E).
+
+**What this fixes / unlocks**
+
+- The latent `bind_device` DNS leak (the existing threadpool
+  backend silently bypasses `network.bind_device = "wg0"` because
+  glibc's `getaddrinfo` owns its own UDP socket — see Known
+  Issues). Phase E in the new resolver applies `SO_BINDTODEVICE`
+  to every DNS UDP socket natively.
+- Per-record TTL respect (the threadpool backend uses `cap_s`
+  as a fixed lifetime because `getaddrinfo` doesn't expose TTL).
+- Negative caching for NXDOMAIN / SERVFAIL, capped at the floor.
+- Eventual elimination of the `vendor/c-ares/` 45 KLoC C
+  dependency once Phase F lands.
+- `SimIO.injectRandomFault` BUGGIFY testability for the resolver
+  (Phase E follow-up; the resolver is generic over IO so the
+  same fault-injection harness that drives KRPC, AsyncRecheck,
+  and metadata-fetch will apply).
+
+**Phases completed**: A (parser + tests), B (UDP transport state
+machine, compile-checked), C (cache + TTL respect), D
+(resolv.conf), E (bind_device hook).
+
+**Phase F deferred**: the `-Ddns=custom` build flag dispatch and
+the SimIO end-to-end smoke test are queued. Per the design doc
+this is a 1-day mechanical follow-up; deferred to a separate
+session to keep this milestone scoped to the foundation.
+
+**Test count delta**: +73 tests (1 604 → 1 677).
+
+See `progress-reports/2026-04-29-custom-dns-library.md` for the
+arc.
+
 ## Last Verified Milestone (2026-04-29 — DHT correctness: KRPC sender_id required + IPv6 outbound + announce_peer storage)
 
 Closes three external-reviewer issues against the DHT subsystem (R1, R2,
