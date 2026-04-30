@@ -86,20 +86,24 @@ remaining nondeterminism boundaries.
    peer-policy test sites) and one Random consumer
    (`tracker.Request.generateKey`).
 
-   **Crypto-determinism boundary** explicitly NOT crossed. Five
-   `std.crypto.random` callers — MSE keys
-   (`src/crypto/mse.zig`), peer ID (`src/torrent/peer_id.zig`),
-   DHT node ID (`src/dht/node_id.zig`), DHT tokens
-   (`src/dht/token.zig`), RPC SID (`src/rpc/auth.zig`) — stay on
-   the OS CSPRNG because predictability would break their security
-   property. Sim tests that exercise these paths use behavioural
-   assertions ("handshake completed", "did not panic") rather than
-   byte-equality, OR configure around the path entirely
-   (`encryption_mode = .disabled`, hardcoded peer IDs). See
-   `src/runtime/random.zig` module docstring for the full list of
-   affected test classes and the build-flag-gated escape hatch
-   (option 2) reserved for the day a bug reproduces only under
-   specific crypto bytes.
+   **Crypto-determinism boundary** initially documented as "do not
+   cross" — but the team has since committed to closing it. The
+   current 5 `std.crypto.random` callers (MSE keys
+   `src/crypto/mse.zig`, peer ID `src/torrent/peer_id.zig`, DHT node
+   ID `src/dht/node_id.zig`, DHT tokens `src/dht/token.zig`, RPC SID
+   `src/rpc/auth.zig`) will migrate to a daemon-seeded CSPRNG.
+   Production behavior: at startup, seed a ChaCha20-based CSPRNG once
+   from `std.crypto.random.bytes(&seed)`; route all subsequent random
+   reads through the seeded instance. Cryptographic strength is
+   preserved because a 256-bit seed from a real source plus a modern
+   CSPRNG is computationally indistinguishable from a true random
+   source for the lifetime of a single daemon process — the standard
+   "seed once, generate many" pattern. Sim builds inject a known seed
+   via the same surface; same CSPRNG implementation; same code paths;
+   just a deterministic seed. This closes the boundary entirely.
+   Tracked in STATUS.md "Next" — estimated 3-4 days. Until that lands,
+   sim tests touching the 5 callers remain non-byte-deterministic; use
+   behavioral assertions instead.
 3. **SimHasher** — make the hasher deterministic (~2-3 days). Today
    `src/io/hasher.zig` spawns real OS threads via `std.Thread.spawn`,
    which is the last source of non-determinism the EL can't control.
