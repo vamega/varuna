@@ -17,7 +17,12 @@ const default_thread_count = 4;
 /// from disk and computing SHA-256 hashes for an entire file's piece range.
 /// These run on the same worker threads and deliver results through a
 /// separate queue (drainMerkleResultsInto).
-pub const Hasher = struct {
+///
+/// **Production hasher.** Sim tests should use `SimHasher` (added in a
+/// follow-up commit) wrapped by the tagged-union `Hasher` variant; this
+/// `RealHasher` struct retains the historical thread-pool semantics for
+/// the daemon path.
+pub const RealHasher = struct {
     allocator: std.mem.Allocator,
     threads: []std.Thread,
     running: std.atomic.Value(bool) = std.atomic.Value(bool).init(true),
@@ -84,19 +89,19 @@ pub const Hasher = struct {
         piece_hashes: ?[][32]u8,
     };
 
-    /// Create a heap-allocated Hasher. Must be heap-allocated because
+    /// Create a heap-allocated RealHasher. Must be heap-allocated because
     /// worker threads hold pointers to it.
     ///
     /// `thread_count == 0` selects the **inline mode**: no worker threads
     /// are spawned, and `submitVerify` / `submitMerkleJob` process the
     /// job synchronously on the calling thread before returning. This is
     /// for sim tests that want deterministic step-driven hash results.
-    pub fn create(allocator: std.mem.Allocator, thread_count: ?u32) !*Hasher {
+    pub fn create(allocator: std.mem.Allocator, thread_count: ?u32) !*RealHasher {
         const count = thread_count orelse default_thread_count;
         const efd = try posix.eventfd(0, linux.EFD.NONBLOCK | linux.EFD.CLOEXEC);
         errdefer posix.close(efd);
 
-        const self = try allocator.create(Hasher);
+        const self = try allocator.create(RealHasher);
         self.* = .{
             .allocator = allocator,
             .threads = try allocator.alloc(std.Thread, count),
@@ -124,12 +129,12 @@ pub const Hasher = struct {
         return self;
     }
 
-    /// Whether this Hasher runs in inline mode (no worker threads).
-    inline fn isInline(self: *const Hasher) bool {
+    /// Whether this RealHasher runs in inline mode (no worker threads).
+    inline fn isInline(self: *const RealHasher) bool {
         return self.threads.len == 0;
     }
 
-    pub fn deinit(self: *Hasher) void {
+    pub fn deinit(self: *RealHasher) void {
         self.running.store(false, .release);
         self.queue_cond.broadcast();
 
@@ -149,7 +154,7 @@ pub const Hasher = struct {
         // graceful drains that timed out, crash paths — completed_results
         // may still hold valid bufs the EL never got around to processing.
         // Without this defensive free, those bufs leak (EventLoop.deinit
-        // destroys the Hasher before its own drain phase can run).
+        // destroys the RealHasher before its own drain phase can run).
         // Losing the verified data on disk is acceptable in shutdown;
         // leaking the buffer is not.
         for (self.completed_results.items) |result| {
@@ -178,7 +183,7 @@ pub const Hasher = struct {
     /// Submit a piece for background SHA verification.
     /// Called from the event loop thread. Does not block.
     pub fn submitVerify(
-        self: *Hasher,
+        self: *RealHasher,
         slot: u16,
         piece_index: u32,
         piece_buf: []u8,
@@ -190,7 +195,7 @@ pub const Hasher = struct {
 
     /// Submit a piece for verification with extended options (hash type, recheck flag).
     pub fn submitVerifyEx(
-        self: *Hasher,
+        self: *RealHasher,
         slot: u16,
         piece_index: u32,
         piece_buf: []u8,
@@ -254,7 +259,7 @@ pub const Hasher = struct {
     /// piece data from disk and computes SHA-256 hashes for the file's pieces.
     /// Called from the event loop thread. Does not block.
     pub fn submitMerkleJob(
-        self: *Hasher,
+        self: *RealHasher,
         torrent_id: u32,
         file_index: u32,
         first_piece: u32,
@@ -280,7 +285,7 @@ pub const Hasher = struct {
     /// Called from the event loop thread. The returned slice is valid until
     /// the next call to drainResultsInto (which reuses the swap buffer).
     /// This avoids the TOCTOU race of the old drainResults+clearResults pair.
-    pub fn drainResultsInto(self: *Hasher, swap_buf: *std.ArrayList(Result)) []const Result {
+    pub fn drainResultsInto(self: *RealHasher, swap_buf: *std.ArrayList(Result)) []const Result {
         self.result_mutex.lock();
         defer self.result_mutex.unlock();
 
@@ -301,7 +306,7 @@ pub const Hasher = struct {
 
     /// Atomically drain completed Merkle tree building results.
     /// Called from the event loop thread. Works like drainResultsInto.
-    pub fn drainMerkleResultsInto(self: *Hasher, swap_buf: *std.ArrayList(MerkleResult)) []const MerkleResult {
+    pub fn drainMerkleResultsInto(self: *RealHasher, swap_buf: *std.ArrayList(MerkleResult)) []const MerkleResult {
         self.result_mutex.lock();
         defer self.result_mutex.unlock();
 
@@ -314,7 +319,7 @@ pub const Hasher = struct {
 
     /// Returns true if there are pending jobs, in-flight hashes, or unread results.
     /// Called from the event loop thread to decide whether draining is complete.
-    pub fn hasPendingWork(self: *Hasher) bool {
+    pub fn hasPendingWork(self: *RealHasher) bool {
         if (self.in_flight.load(.acquire) > 0) return true;
         {
             self.queue_mutex.lock();
@@ -331,15 +336,15 @@ pub const Hasher = struct {
         return false;
     }
 
-    pub fn getEventFd(self: *Hasher) posix.fd_t {
+    pub fn getEventFd(self: *RealHasher) posix.fd_t {
         return self.event_fd;
     }
 
-    pub fn threadCount(self: *const Hasher) usize {
+    pub fn threadCount(self: *const RealHasher) usize {
         return self.threads.len;
     }
 
-    fn workerFn(self: *Hasher) void {
+    fn workerFn(self: *RealHasher) void {
         while (self.running.load(.acquire)) {
             // Wait for any job (piece verify or Merkle)
             self.queue_mutex.lock();
@@ -412,7 +417,7 @@ pub const Hasher = struct {
     /// compute SHA-256 hashes for every piece in the file's range.
     /// Runs on a worker thread -- disk I/O via pread is acceptable here
     /// (not on the event loop thread).
-    fn processMerkleJob(self: *Hasher, job: MerkleJob) void {
+    fn processMerkleJob(self: *RealHasher, job: MerkleJob) void {
         const hashes = self.allocator.alloc([32]u8, job.piece_count) catch {
             self.pushMerkleResult(.{
                 .torrent_id = job.torrent_id,
@@ -494,7 +499,7 @@ pub const Hasher = struct {
     }
 
     /// Push a Merkle result onto the result queue (called from worker thread).
-    fn pushMerkleResult(self: *Hasher, result: MerkleResult) void {
+    fn pushMerkleResult(self: *RealHasher, result: MerkleResult) void {
         self.result_mutex.lock();
         self.merkle_results.append(self.allocator, result) catch {
             // OOM: free hashes if present
@@ -507,8 +512,14 @@ pub const Hasher = struct {
     }
 };
 
+/// Temporary backwards-compat alias. Consumer migration to the
+/// tagged-union `Hasher` happens in a follow-up commit; until then
+/// `Hasher` keeps resolving to the production `RealHasher` so the rest
+/// of the daemon compiles unchanged.
+pub const Hasher = RealHasher;
+
 test "hasher pool verifies pieces correctly" {
-    var hasher = Hasher.create(std.testing.allocator, 2) catch return error.SkipZigTest;
+    var hasher = RealHasher.create(std.testing.allocator, 2) catch return error.SkipZigTest;
     defer {
         hasher.deinit();
         std.testing.allocator.destroy(hasher);
@@ -529,7 +540,7 @@ test "hasher pool verifies pieces correctly" {
     try hasher.submitVerify(1, 1, data2, expected2, 0);
 
     // Wait for results using the swap-based API
-    var swap_buf = std.ArrayList(Hasher.Result).empty;
+    var swap_buf = std.ArrayList(RealHasher.Result).empty;
     defer swap_buf.deinit(std.testing.allocator);
 
     var attempts: u32 = 0;
@@ -555,7 +566,7 @@ test "hasher pool verifies pieces correctly" {
 }
 
 test "hasher pool thread count" {
-    var hasher = Hasher.create(std.testing.allocator, 8) catch return error.SkipZigTest;
+    var hasher = RealHasher.create(std.testing.allocator, 8) catch return error.SkipZigTest;
     defer {
         hasher.deinit();
         std.testing.allocator.destroy(hasher);
@@ -567,7 +578,7 @@ test "hasher pool thread count" {
 test "merkle job hashes file pieces from disk" {
     const allocator = std.testing.allocator;
 
-    var hasher = Hasher.create(allocator, 2) catch return error.SkipZigTest;
+    var hasher = RealHasher.create(allocator, 2) catch return error.SkipZigTest;
     defer {
         hasher.deinit();
         allocator.destroy(hasher);
@@ -623,7 +634,7 @@ test "merkle job hashes file pieces from disk" {
     try hasher.submitMerkleJob(0, 0, 0, 2, &layout, &shared_fds);
 
     // Wait for results
-    var swap_buf = std.ArrayList(Hasher.MerkleResult).empty;
+    var swap_buf = std.ArrayList(RealHasher.MerkleResult).empty;
     defer swap_buf.deinit(allocator);
 
     var attempts: u32 = 0;
@@ -662,7 +673,7 @@ test "merkle job hashes file pieces from disk" {
 test "merkle job returns null hashes on bad fd" {
     const allocator = std.testing.allocator;
 
-    var hasher = Hasher.create(allocator, 1) catch return error.SkipZigTest;
+    var hasher = RealHasher.create(allocator, 1) catch return error.SkipZigTest;
     defer {
         hasher.deinit();
         allocator.destroy(hasher);
@@ -696,7 +707,7 @@ test "merkle job returns null hashes on bad fd" {
     const shared_fds = [_]posix.fd_t{-1};
     try hasher.submitMerkleJob(0, 0, 0, 1, &layout, &shared_fds);
 
-    var swap_buf = std.ArrayList(Hasher.MerkleResult).empty;
+    var swap_buf = std.ArrayList(RealHasher.MerkleResult).empty;
     defer swap_buf.deinit(allocator);
 
     var attempts: u32 = 0;
