@@ -270,7 +270,7 @@ fn startMseInitiator(self: anytype, slot: u16) !void {
 
     // Allocate MSE initiator state
     const mi = try self.allocator.create(mse.MseInitiatorHandshake);
-    mi.* = mse.MseInitiatorHandshake.init(tc.info_hash, self.encryption_mode);
+    mi.* = mse.MseInitiatorHandshake.init(&self.random, tc.info_hash, self.encryption_mode);
     peer.mse_initiator = mi;
 
     // Get first action (send DH key)
@@ -1152,7 +1152,7 @@ fn startMseResponder(self: anytype, slot: u16, bytes_received: usize) void {
         self.removePeer(slot);
         return;
     };
-    mr.* = mse.MseResponderHandshake.initWithLookup(&self.mse_req2_to_hash, self.encryption_mode);
+    mr.* = mse.MseResponderHandshake.initWithLookup(&self.random, &self.mse_req2_to_hash, self.encryption_mode);
     peer.mse_responder = mr;
 
     // Copy all bytes already received into the DH key buffer.
