@@ -306,6 +306,16 @@ pub const SimIO = struct {
     /// memory alive for as long as reads against `fd` may fire.
     file_content: std.AutoHashMap(posix.fd_t, []const u8),
 
+    /// FIFO of pre-prepared fds returned by future `socket()` calls.
+    /// Each `socket` submission consumes one entry; if the queue is
+    /// empty the op falls back to `nextSyntheticFd()`.
+    ///
+    /// Lets tests script "next call to `io.socket()` returns this
+    /// specific fd" — used by AsyncMetadataFetchOf(SimIO) happy-path
+    /// tests to wire the fetcher to a `createSocketpair` half whose
+    /// recv queue has been pre-loaded with scripted protocol responses.
+    prepared_socket_fds: std.ArrayList(posix.fd_t) = .empty,
+
     pub fn init(allocator: std.mem.Allocator, config: Config) !SimIO {
         const slots = try allocator.alloc(Pending, config.pending_capacity);
         errdefer allocator.free(slots);
@@ -351,6 +361,7 @@ pub const SimIO = struct {
 
     pub fn deinit(self: *SimIO) void {
         self.file_content.deinit();
+        self.prepared_socket_fds.deinit(self.allocator);
         self.allocator.free(self.pending);
         self.allocator.free(self.recv_queue_pool);
         self.allocator.free(self.sockets);
@@ -365,6 +376,60 @@ pub const SimIO = struct {
     /// copy. Calling twice with the same fd replaces the registration.
     pub fn setFileBytes(self: *SimIO, fd: posix.fd_t, bytes: []const u8) !void {
         try self.file_content.put(fd, bytes);
+    }
+
+    /// Enqueue `fd` so the next `socket()` submission returns it
+    /// instead of a fresh synthetic fd. FIFO across multiple calls.
+    ///
+    /// Pair with `createSocketpair` to script "the metadata fetch's
+    /// next socket() resolves to side-A of this pair" — caller pushes
+    /// scripted bytes onto the partner side via
+    /// `pushSocketRecvBytes` and the fetch state machine drives
+    /// against it as if it were a live peer.
+    pub fn enqueueSocketResult(self: *SimIO, fd: posix.fd_t) !void {
+        try self.prepared_socket_fds.append(self.allocator, fd);
+    }
+
+    /// Append `bytes` directly to the recv queue for `fd`, the
+    /// scripted-peer mirror of `setFileBytes`. The fetcher consumes
+    /// these bytes through normal `recv` ops as if a live partner had
+    /// `send`-ed them.
+    ///
+    /// Returns `error.InvalidFd` if `fd` is not in the socket pool
+    /// (i.e. not allocated by `createSocketpair`), `error.SocketClosed`
+    /// if the slot has been closed, or `error.RecvQueueFull` if the
+    /// queue lacks the capacity for the full slice. Pre-load all
+    /// scripted bytes upfront so a parked recv never has to wait —
+    /// the queue's ring-buffer write is atomic per call.
+    ///
+    /// If a recv is currently parked on `fd`, this wakes it (mirrors
+    /// the wake-up path in `send`).
+    pub fn pushSocketRecvBytes(self: *SimIO, fd: posix.fd_t, bytes: []const u8) !void {
+        const slot = self.slotForFd(fd) orelse return error.InvalidFd;
+        const sock = &self.sockets[slot];
+        if (sock.closed) return error.SocketClosed;
+
+        const written = sock.recv_queue.append(bytes);
+        if (written != bytes.len) return error.RecvQueueFull;
+
+        if (sock.parked_recv) |waiter| {
+            sock.parked_recv = null;
+            const wst = simState(waiter);
+            assert(wst.in_flight);
+            assert(wst.parked_socket_index == slot);
+            wst.parked_socket_index = sentinel_index;
+            switch (waiter.op) {
+                .recv => |recv_op| {
+                    const want = @min(recv_op.buf.len, sock.recv_queue.count);
+                    const got = if (want > 0)
+                        sock.recv_queue.consume(recv_op.buf[0..want])
+                    else
+                        @as(usize, 0);
+                    try self.schedule(waiter, .{ .recv = got }, self.config.faults.recv_latency_ns);
+                },
+                else => unreachable, // only recv ops park on a socket
+            }
+        }
     }
 
     /// Current simulated time.
@@ -891,7 +956,15 @@ pub const SimIO = struct {
 
     pub fn socket(self: *SimIO, op: ifc.SocketOp, c: *Completion, ud: ?*anyopaque, cb: Callback) !void {
         try self.armCompletion(c, .{ .socket = op }, ud, cb);
-        return self.schedule(c, .{ .socket = self.nextSyntheticFd() }, 0);
+        // Consume a pre-prepared fd if any, so tests can script which
+        // fd the caller's next `socket()` resolves to. Falls back to a
+        // fresh synthetic fd (the legacy behaviour) when the queue is
+        // empty.
+        const fd = if (self.prepared_socket_fds.items.len > 0)
+            self.prepared_socket_fds.orderedRemove(0)
+        else
+            self.nextSyntheticFd();
+        return self.schedule(c, .{ .socket = fd }, 0);
     }
 
     pub fn connect(self: *SimIO, op: ifc.ConnectOp, c: *Completion, ud: ?*anyopaque, cb: Callback) !void {

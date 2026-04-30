@@ -995,6 +995,29 @@ pub fn build(b: *std.Build) void {
     test_metadata_fetch_step.dependOn(&run_metadata_fetch_tests.step);
     test_step.dependOn(&run_metadata_fetch_tests.step);
 
+    // ── AsyncMetadataFetchOf(SimIO) live BUGGIFY harness ────
+    //
+    // 32-seed BUGGIFY harness: per-tick `injectRandomFault` plus per-op
+    // FaultConfig (recv/send error probabilities) wraps the happy-path
+    // metadata-fetch scenario. Catches handshake-recovery races, partial-
+    // send retries, slot cleanup under recv-error injection, and
+    // assembler-reset paths the foundation tests can't see.
+    const metadata_fetch_buggify_tests = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("tests/metadata_fetch_live_buggify_test.zig"),
+            .target = target,
+            .optimize = optimize,
+            .imports = &varuna_import,
+        }),
+    });
+    const run_metadata_fetch_buggify_tests = b.addRunArtifact(metadata_fetch_buggify_tests);
+    const test_metadata_fetch_buggify_step = b.step(
+        "test-metadata-fetch-live-buggify",
+        "Run AsyncMetadataFetchOf(SimIO) live-pipeline BUGGIFY harness (32 seeds)",
+    );
+    test_metadata_fetch_buggify_step.dependOn(&run_metadata_fetch_buggify_tests.step);
+    test_step.dependOn(&run_metadata_fetch_buggify_tests.step);
+
     // ── PieceStoreOf(SimIO) integration tests ──────────────
     //
     // Exercises the new fallocate + fsync ops on the IO contract via

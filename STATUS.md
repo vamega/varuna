@@ -286,8 +286,8 @@ See `progress-reports/2026-04-25-stage2-event-loop-migration.md` for the Stage 2
 - ~~**`web_seed.MultiPieceRange.length` u32 truncation**~~: (DONE 2026-04-27) `computeMultiPieceRanges` now rejects with `error.RunTooLarge` when the byte span would overflow u32, instead of panicking on the inner `@intCast`. Investigation showed `MultiPieceRange.length` is never read by the production handler and the rest of the pipeline is u32-byte-bounded throughout, so the entry-validation form is the cleanest fix. Regression test added in `tests/web_seed_buggify_test.zig`.
 - ~~**`bencode_scanner.skipValue` explicit-stack rewrite**~~: (DONE 2026-04-27) replaced the recursion-with-depth-counter form with the same explicit container stack used by `krpc.skipValue`. Same `max_depth = 64` cap, same observable behaviour, but no recursion. Hand-rolled because Zig 0.15.2 does not expose `std.BoundedArray`.
 - ~~**BT PIECE block_index regression test**~~: (DONE 2026-04-27) inline tests in `src/io/protocol.zig` covering `block_offset = 1 GiB` (the exact pre-fix panic value) and `block_offset = maxInt(u32)` (the absolute upper bound of the wire field). Now visible because round-1 dark-test audit landed `src/io/root.zig`'s `test {}` block.
-- **Happy-path `AsyncMetadataFetchOf(SimIO)` integration test.** The Track 3 refactor landed `AsyncMetadataFetchOf(IO)` plus three foundation error-path tests (`tests/metadata_fetch_test.zig`), but the happy-path test (peer scripts a valid info dictionary; assembler completes; `verifyAndComplete` fires; `result_bytes != null`) is deferred. Two design options: (a) refactor `connectPeer`'s `posix.socket()` call to route through `self.io.socket()` so SimIO returns a synthetic fd that's tied to a SimIO socket-pool slot — this requires an async chain (`socket → connect → send`) instead of the current sync `socket()` + async `connect()`; (b) extend SimIO with `setSocketRecvScript(fd, bytes)` that overrides recv for arbitrary fds (mirrors `setFileBytes` shape) plus a "swallow sends to scripted fds" path. Option (a) is cleaner architecturally; option (b) is closer to the recheck pattern. Either approach also unlocks a live-pipeline BUGGIFY harness for `AsyncMetadataFetchOf(SimIO)` (per-tick `injectRandomFault` + per-op `FaultConfig` × 32 seeds), which would catch state-machine recovery paths the foundation tests can't see. Estimated 1-2 days for happy-path + BUGGIFY combined.
-- **Live-pipeline BUGGIFY harness for AsyncMetadataFetchOf(SimIO).** Same shape as the AsyncRecheck follow-up (per-tick `injectRandomFault` + per-op `FaultConfig` over 32 deterministic seeds), gated on the happy-path integration test above. Catches handshake-recovery races, partial-send retries, slot cleanup under recv-error injection, and assembler-reset paths that the algorithm-level `tests/ut_metadata_buggify_test.zig` and the foundation error-path tests can't see together. Estimated 0.5-1 day once the happy-path is in place.
+- ~~**Happy-path `AsyncMetadataFetchOf(SimIO)` integration test.**~~ Closed 2026-04-29. `connectPeer` now submits via `self.io.socket()` instead of the synchronous `posix.socket()` (new `SlotState.socket_creating` + `metadataSocketComplete` callback), and `releaseSlot` routes through `self.io.closeSocket()`. Two SimIO additions wire the test: `enqueueSocketResult(fd)` (next `socket()` returns this specific fd) and `pushSocketRecvBytes(fd, bytes)` (the scripted-peer mirror of `setFileBytes`, including the parked-recv wake-up path). Happy-path test (`tests/metadata_fetch_test.zig`): one peer, scripted BT handshake reply + extension handshake (with `metadata_size` and a non-zero `ut_metadata` ID) + ut_metadata data response carrying a 256-byte info dictionary. Assertions: `completed`, `had_metadata`, `result_len == 256`, first/last byte match. `socket_util.configurePeerSocket` is now gated behind a comptime `IO != SimIO` check because `posix.setsockopt` panics on BADF (unreachable, not a returned error) for synthetic SimIO fds. See `progress-reports/2026-04-29-executor-genericization.md`.
+- ~~**Live-pipeline BUGGIFY harness for AsyncMetadataFetchOf(SimIO).**~~ Closed 2026-04-29. `tests/metadata_fetch_live_buggify_test.zig` runs the canonical 32-seed BUGGIFY pattern (per-tick `injectRandomFault` p=0.05, per-op `FaultConfig` recv/send 0.05 each) against 5 scripted peers (more than `max_slots = 3` so retry refill is exercised). Asserts safety invariants only — every seed completes, `result_bytes` is either null or matches the original info dict exactly, `peers_attempted` is bounded; anti-vacuous-pass guard requires `seeds_with_metadata > 0`. Current run: 32/32 complete, 32/32 deliver metadata, 124 total peers attempted (28 fault-induced retries). Wired through new `zig build test-metadata-fetch-live-buggify` step. See `progress-reports/2026-04-29-executor-genericization.md`.
 - ~~**uTP extension chain not consumed in production.**~~ (DONE 2026-04-28) `src/net/utp_manager.zig` now walks the BEP 29 extension chain via `stripExtensions` and hands the trailing bytes to the BT framing layer. Truncated chains and over-cap SACK lengths (> `sack_bitmask_max`) are rejected with `null` — manager drops the malformed datagram cleanly. 9 inline regression tests (single SACK, multi-hop, truncated, missing per-extension header, oversized SACK, non-terminating chain, plus full-pipeline tests). See `progress-reports/2026-04-28-utp-fixes-and-net-wiring.md`.
 - ~~**uTP reorder buffer indexing mismatch + dangling-slice UAF.**~~ (DONE 2026-04-28) Both `bufferReorder` and `deliverReordered` now index by absolute `seq_nr % max_reorder_buf`, so out-of-order packets are reachable. `ReorderEntry.data` is `?[]u8` (owned heap copy) instead of a borrowed slice into the shared `utp_recv_buf` — fixes the latent UAF. Slot eviction frees the prior occupant; `UtpSocket.delivered_payloads` keeps slices alive across the result-handling window then frees on the next `processPacket`/`deinit`. 8 inline regression tests including the exact UAF scenario. Production wiring: `PacketResult` now carries `reorder_data`/`reorder_delivered` and `src/io/utp_handler.zig` drains the buffered payloads into `deliverUtpData`. See `progress-reports/2026-04-28-utp-fixes-and-net-wiring.md`.
 - ~~**`writePiece` / `readPiece` migration to the IO contract.**~~ Closed 2026-04-28. PieceStore's per-piece write and read paths now route through `self.io.write` / `self.io.read` with caller-owned per-span completions and a multi-completion drain loop (mirrors `sync`'s shape). Removes the last synchronous `posix.pwrite` / `posix.pread` in storage. See `progress-reports/2026-04-28-storage-rw-io-contract.md`.
@@ -1419,6 +1419,85 @@ clean.
 * `c026158 tests: BUGGIFY harness for ut_metadata parser + uTP SACK decoder`
 
 Reference: `progress-reports/2026-04-26-audit-hunt-round3.md`.
+
+## Last Verified Milestone (2026-04-29 — Executor genericization R1: HttpExecutor / UdpTrackerExecutor / AsyncMetadataFetch)
+
+Closes the C2/C3 follow-ups from the external review. Four
+bisectable commits, tests pass at every commit (pattern #8).
+
+### EG1 — `HttpExecutorOf(comptime IO: type)` (commit `317d177`)
+
+`src/io/http_executor.zig` was hardcoded to `io: *RealIO` despite
+sitting alongside three already-generic state machines
+(`AsyncRecheckOf`, `AsyncMetadataFetchOf`, `PieceStoreOf`). Wrapped
+the struct in `pub fn HttpExecutorOf(comptime IO: type) type` with
+`Self = @This()` inside; daemon-side `pub const HttpExecutor =
+HttpExecutorOf(RealIO)` keeps every caller compiling unchanged.
+Internal references switched from `*HttpExecutor` to `*Self`. The
+existing two inline tests (`appendRecvData` target_buf paths) stayed
+inside the struct and now compile under the alias.
+
+### EG2 — `UdpTrackerExecutorOf(comptime IO: type)` (commit `be294b1`)
+
+Same shape applied to `src/daemon/udp_tracker_executor.zig`. Daemon
+alias `pub const UdpTrackerExecutor = UdpTrackerExecutorOf(RealIO)`
+preserves the existing public surface (`SessionManager`, `EventLoop`,
+`TorrentSession` callers all unchanged).
+
+### EG3 — `AsyncMetadataFetch` socket lifecycle through IO contract (commit `55d4111`)
+
+Replaced the synchronous `posix.socket()` in `connectPeer` with the
+async `self.io.socket()` op + a new `metadataSocketComplete`
+callback that chains the connect once the fd is available. Replaced
+`posix.close()` in `releaseSlot` with `self.io.closeSocket()` so
+SimIO can reclaim its socket-pool slots correctly. Added a new
+`SlotState.socket_creating` between `.free` and `.connecting` to
+gate `releaseSlot` idempotence (the existing `.free` check still
+works because `state` is only set to `.socket_creating` after
+successful submit; allocation failures roll back through the
+existing buffer-OOM error path).
+
+`socket_util.configurePeerSocket` is gated behind a comptime
+`IO != SimIO` check because `posix.setsockopt` panics on BADF
+(`unreachable`, not a returned error) when handed a SimIO synthetic
+fd — `catch {}` doesn't catch a hard panic. Real backends still
+get TCP_NODELAY / SNDBUF / RCVBUF tuning unchanged.
+
+### EG4 — `AsyncMetadataFetchOf(SimIO)` happy-path integration test + SimIO scripted-recv extension (commit `ccb0df3`)
+
+Added `enqueueSocketResult(fd)` and `pushSocketRecvBytes(fd, bytes)`
+to `src/io/sim_io.zig` (~50 LOC). The first overrides the next
+`socket()` op result so tests can wire the fetcher to a specific
+`createSocketpair` half; the second is the scripted-peer mirror of
+`setFileBytes`, appending bytes directly to a socket's recv queue
+(with parked-recv wake-up if applicable). Both have crisp error
+contracts (`InvalidFd`, `SocketClosed`, `RecvQueueFull`).
+
+The new `tests/metadata_fetch_test.zig` test
+"AsyncMetadataFetchOf(SimIO): happy-path scripted peer delivers
+verified info dict" pre-loads three protocol responses onto the
+fetcher's recv queue (BT handshake reply with the BEP 10 reserved
+bit set; bencoded extension handshake advertising
+`metadata_size`+`ut_metadata=2`; ut_metadata data response carrying
+a 256-byte info dictionary), starts the fetch with one peer, drives
+SimIO ticks, and asserts:
+- callback fires with `result_bytes != null`
+- `result_bytes.len == 256`
+- first / last byte of result match the original info bytes (the
+  SHA-1 verify path succeeded, otherwise `assembler.reset()` would
+  have been called and `result_bytes` would be null)
+
+Test count delta: 4 → 4 in `test-metadata-fetch` (the deferred
+test landed alongside replacing the deferral comment).
+
+### EG metrics
+- 4 commits, all bisectable (pattern #8)
+- 3 backends remain: io_uring, epoll_posix verified at every step
+- 1552/1568 tests pass on full suite (15 skipped, ~1 flaky in
+  unrelated UDP/uTP areas — pre-existing, runs 4-of-5 green)
+- `test-metadata-fetch` passes 4/4 deterministically
+- `progress-reports/2026-04-29-executor-genericization.md` for the
+  full narrative
 
 ## Last Verified Milestone (2026-04-26 — Track 3: AsyncMetadataFetch IO-generic refactor)
 
