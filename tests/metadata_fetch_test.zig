@@ -3,26 +3,20 @@
 //! Drives the parameterised metadata-fetch state machine end-to-end
 //! through `EventLoopOf(SimIO)`. These tests force the second
 //! instantiation (`AsyncMetadataFetchOf(SimIO)`) through the
-//! typechecker and exercise the connect/send/recv error-handling
-//! paths inside the state machine — the no-peer fast-fail, the
-//! connect-error retry-then-finish path, and the all-peers-fail-
-//! handshake-send path.
+//! typechecker and exercise both error edges and the happy path:
 //!
-//! These three together prove `AsyncMetadataFetchOf(IO)` is real
-//! (not just typechecks) and that the SimIO event loop drives
-//! the state machine correctly through the major error edges.
+//!   * no-peer fast-fail
+//!   * connect-error retry-then-finish
+//!   * all-peers-fail-handshake-send (legacy fd send returns 0 bytes)
+//!   * happy-path: scripted peer replies with a valid info dictionary
+//!     and `verifyAndComplete` fires
 //!
-//! Happy-path metadata fetch (peer responds with a valid info
-//! dictionary, assembler completes, `verifyAndComplete` fires) is
-//! deferred to a follow-up that needs either a refactor of
-//! `connectPeer`'s `posix.socket()` call to route through the IO
-//! interface, or a SimIO `setSocketRecvScript` extension that lets
-//! tests script BEP 9 protocol responses on arbitrary fds. The
-//! state machine's bidirectional protocol shape is substantively
-//! different from the recheck refactor's one-way disk-read shape;
-//! `setFileBytes` doesn't trivially port. See
-//! `progress-reports/2026-04-26-async-metadata-fetch-io-generic.md`
-//! for the discussion.
+//! The happy-path test is enabled by the SimIO socket lifecycle
+//! refactor in commit 55d4111: `connectPeer` now submits via
+//! `self.io.socket()` instead of `posix.socket()`, so a SimIO
+//! `enqueueSocketResult` + `pushSocketRecvBytes` pair can route the
+//! fetcher to a `createSocketpair` half pre-loaded with scripted BT
+//! handshake / extension handshake / ut_metadata data responses.
 
 const std = @import("std");
 const varuna = @import("varuna");
@@ -30,6 +24,10 @@ const event_loop_mod = varuna.io.event_loop;
 const sim_io_mod = varuna.io.sim_io;
 const SimIO = sim_io_mod.SimIO;
 const metadata_handler = varuna.io.metadata_handler;
+const ut_metadata = varuna.net.ut_metadata;
+const ext = varuna.net.extensions;
+const pw = varuna.net.peer_wire;
+const Sha1 = varuna.crypto.Sha1;
 const posix = std.posix;
 
 const tick_budget: u32 = 256;
@@ -211,6 +209,168 @@ test "AsyncMetadataFetchOf(SimIO): legacy-fd send path causes all peers to fail"
 
     try std.testing.expect(ctx.completed);
     try std.testing.expect(!ctx.had_metadata);
+
+    el.cancelMetadataFetch();
+}
+
+// ── Helper: build a scripted peer's response stream ──────────
+//
+// The metadata fetcher sees the peer as an opaque byte stream.
+// Pre-build the entire response (BT handshake reply, extension
+// handshake reply, ut_metadata data response) so the SimIO recv
+// queue can deliver it across the fetcher's recv submissions.
+//
+// Returns a heap-allocated buffer the caller must free.
+fn buildScriptedPeerResponses(
+    allocator: std.mem.Allocator,
+    info_hash: [20]u8,
+    peer_handshake_id: [20]u8,
+    info_bytes: []const u8,
+) ![]u8 {
+    const peer_ut_metadata_id: u8 = 2; // arbitrary non-zero
+    const metadata_size: u32 = @intCast(info_bytes.len);
+
+    var out = std.ArrayList(u8).empty;
+    errdefer out.deinit(allocator);
+
+    // ── BT handshake reply (68 bytes) ───────────────────────
+    try out.append(allocator, pw.protocol_length);
+    try out.appendSlice(allocator, pw.protocol_string);
+    var reserved = [_]u8{0} ** 8;
+    reserved[ext.reserved_byte] |= ext.reserved_mask;
+    try out.appendSlice(allocator, &reserved);
+    try out.appendSlice(allocator, &info_hash);
+    try out.appendSlice(allocator, &peer_handshake_id);
+
+    // ── Extension handshake reply ──────────────────────────
+    // The peer advertises its own ut_metadata ID and the metadata
+    // size. The fetcher will send pieces requests using this ID.
+    var ext_payload_buf: [256]u8 = undefined;
+    var ext_payload_dict = std.ArrayList(u8).empty;
+    defer ext_payload_dict.deinit(allocator);
+    try ext_payload_dict.appendSlice(allocator, "d1:md11:ut_metadatai");
+    var fbs = std.io.fixedBufferStream(&ext_payload_buf);
+    try fbs.writer().print("{d}", .{peer_ut_metadata_id});
+    try ext_payload_dict.appendSlice(allocator, fbs.getWritten());
+    try ext_payload_dict.appendSlice(allocator, "ee13:metadata_sizei");
+    fbs = std.io.fixedBufferStream(&ext_payload_buf);
+    try fbs.writer().print("{d}", .{metadata_size});
+    try ext_payload_dict.appendSlice(allocator, fbs.getWritten());
+    try ext_payload_dict.appendSlice(allocator, "e1:pi6881e1:v6:varunae");
+    const ext_payload = ext_payload_dict.items;
+
+    const ext_hs_msg_len: u32 = @intCast(2 + ext_payload.len); // msg_id + sub_id + payload
+    var len_be: [4]u8 = undefined;
+    std.mem.writeInt(u32, &len_be, ext_hs_msg_len, .big);
+    try out.appendSlice(allocator, &len_be);
+    try out.append(allocator, ext.msg_id);
+    try out.append(allocator, ext.handshake_sub_id);
+    try out.appendSlice(allocator, ext_payload);
+
+    // ── ut_metadata data response (piece 0) ────────────────
+    // The peer uses our advertised local_ut_metadata_id when
+    // sending data TO us.
+    const data_header = try ut_metadata.encodeData(allocator, 0, metadata_size);
+    defer allocator.free(data_header);
+    const data_msg_len: u32 = @intCast(2 + data_header.len + info_bytes.len);
+    std.mem.writeInt(u32, &len_be, data_msg_len, .big);
+    try out.appendSlice(allocator, &len_be);
+    try out.append(allocator, ext.msg_id);
+    try out.append(allocator, ext.local_ut_metadata_id);
+    try out.appendSlice(allocator, data_header);
+    try out.appendSlice(allocator, info_bytes);
+
+    return out.toOwnedSlice(allocator);
+}
+
+test "AsyncMetadataFetchOf(SimIO): happy-path scripted peer delivers verified info dict" {
+    const allocator = std.testing.allocator;
+
+    const EL_SimIO = event_loop_mod.EventLoopOf(SimIO);
+
+    // Tiny info dictionary: the fetcher treats it as opaque bytes
+    // and only verifies the SHA-1. A 256-byte payload covers the
+    // single-piece path (≤ metadata_piece_size = 16 KiB).
+    var info_bytes: [256]u8 = undefined;
+    for (&info_bytes, 0..) |*b, i| b.* = @intCast(i & 0xff);
+    var info_hash: [20]u8 = undefined;
+    Sha1.hash(&info_bytes, &info_hash, .{});
+
+    const peer_handshake_id = [_]u8{0xCC} ** 20;
+
+    var sim_io = try SimIO.init(allocator, .{ .seed = 0xFADE_FACE });
+    // Allocate the socketpair BEFORE moving sim_io into the EventLoop.
+    // The EventLoop owns the SimIO instance after `initBareWithIO`,
+    // so we hand it the prepared pair / queues via `el.io.*`.
+    const pair = try sim_io.createSocketpair();
+    const fetcher_fd = pair[0];
+
+    const scripted = try buildScriptedPeerResponses(
+        allocator,
+        info_hash,
+        peer_handshake_id,
+        &info_bytes,
+    );
+    defer allocator.free(scripted);
+
+    try sim_io.enqueueSocketResult(fetcher_fd);
+    try sim_io.pushSocketRecvBytes(fetcher_fd, scripted);
+
+    var el = EL_SimIO.initBareWithIO(allocator, sim_io, 0) catch |err| {
+        if (err == error.SystemResources) return error.SkipZigTest;
+        return err;
+    };
+    defer el.deinit();
+
+    const Ctx = struct {
+        completed: bool = false,
+        had_metadata: bool = false,
+        result_len: usize = 0,
+        result_first_byte: u8 = 0,
+        result_last_byte: u8 = 0,
+    };
+    var ctx = Ctx{};
+
+    const peers = [_]std.net.Address{
+        std.net.Address.initIp4(.{ 127, 0, 0, 1 }, 6881),
+    };
+
+    el.startMetadataFetch(
+        info_hash,
+        [_]u8{0xBB} ** 20,
+        6881,
+        false,
+        &peers,
+        struct {
+            fn cb(mf: *EL_SimIO.AsyncMetadataFetch) void {
+                const c: *Ctx = @ptrCast(@alignCast(mf.caller_ctx.?));
+                c.completed = true;
+                c.had_metadata = mf.result_bytes != null;
+                if (mf.result_bytes) |rb| {
+                    c.result_len = rb.len;
+                    if (rb.len > 0) {
+                        c.result_first_byte = rb[0];
+                        c.result_last_byte = rb[rb.len - 1];
+                    }
+                }
+            }
+        }.cb,
+        @ptrCast(&ctx),
+    ) catch |err| {
+        if (err == error.SystemResources) return error.SkipZigTest;
+        return err;
+    };
+
+    var ticks: u32 = 0;
+    while (ticks < tick_budget and !ctx.completed) : (ticks += 1) {
+        try el.io.tick(0);
+    }
+
+    try std.testing.expect(ctx.completed);
+    try std.testing.expect(ctx.had_metadata);
+    try std.testing.expectEqual(info_bytes.len, ctx.result_len);
+    try std.testing.expectEqual(info_bytes[0], ctx.result_first_byte);
+    try std.testing.expectEqual(info_bytes[info_bytes.len - 1], ctx.result_last_byte);
 
     el.cancelMetadataFetch();
 }
