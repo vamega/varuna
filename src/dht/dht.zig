@@ -1065,6 +1065,85 @@ test "DhtEngine tick rotates tokens" {
     try std.testing.expect(engine.tokens.validateToken(&token_before, &ip));
 }
 
+test "DhtEngine requestPeers registers both v1 and v2 hashes for hybrid torrents" {
+    const allocator = std.testing.allocator;
+    var engine = DhtEngine.init(allocator, node_id.generateRandom());
+    defer engine.deinit();
+
+    const v1_hash: [20]u8 = [_]u8{0xAA} ** 20;
+    const v2_truncated: [20]u8 = [_]u8{0xBB} ** 20;
+
+    engine.requestPeers(v1_hash, v2_truncated);
+    try std.testing.expectEqual(@as(u8, 2), engine.pending_search_count);
+    try std.testing.expectEqualSlices(u8, &v1_hash, &engine.pending_searches[0]);
+    try std.testing.expectEqualSlices(u8, &v2_truncated, &engine.pending_searches[1]);
+
+    // Re-registering is idempotent.
+    engine.requestPeers(v1_hash, v2_truncated);
+    try std.testing.expectEqual(@as(u8, 2), engine.pending_search_count);
+}
+
+test "DhtEngine requestPeers v1-only (null v2) registers only one hash" {
+    const allocator = std.testing.allocator;
+    var engine = DhtEngine.init(allocator, node_id.generateRandom());
+    defer engine.deinit();
+
+    const v1_hash: [20]u8 = [_]u8{0xAA} ** 20;
+    engine.requestPeers(v1_hash, null);
+    try std.testing.expectEqual(@as(u8, 1), engine.pending_search_count);
+    try std.testing.expectEqualSlices(u8, &v1_hash, &engine.pending_searches[0]);
+}
+
+test "DhtEngine forceRequery toggles search-done flag for both hashes" {
+    const allocator = std.testing.allocator;
+    var engine = DhtEngine.init(allocator, node_id.generateRandom());
+    defer engine.deinit();
+
+    const v1_hash: [20]u8 = [_]u8{0xAA} ** 20;
+    const v2_truncated: [20]u8 = [_]u8{0xBB} ** 20;
+
+    engine.requestPeers(v1_hash, v2_truncated);
+    // Pretend both have already been queried at least once.
+    engine.pending_search_done[0] = true;
+    engine.pending_search_done[1] = true;
+
+    engine.forceRequery(v1_hash, v2_truncated);
+    try std.testing.expect(!engine.pending_search_done[0]);
+    try std.testing.expect(!engine.pending_search_done[1]);
+}
+
+test "DhtEngine announcePeer fans out to v1 and v2 hashes" {
+    const allocator = std.testing.allocator;
+    var engine = DhtEngine.init(allocator, node_id.generateRandom());
+    defer engine.deinit();
+
+    // Seed routing table so both lookups have candidates.
+    const now: i64 = 1_000_000;
+    for (0..10) |i| {
+        _ = engine.table.addNode(.{
+            .id = node_id.generateRandom(),
+            .address = std.net.Address.initIp4(.{ 10, 0, 0, @intCast(i + 1) }, 6881),
+        }, now);
+    }
+
+    const v1_hash: [20]u8 = [_]u8{0xAA} ** 20;
+    const v2_truncated: [20]u8 = [_]u8{0xBB} ** 20;
+    try engine.announcePeer(v1_hash, v2_truncated, 6881);
+
+    // Two active lookups should now be running, one for each hash.
+    var v1_seen = false;
+    var v2_seen = false;
+    for (engine.active_lookups) |lk| {
+        if (lk) |l| {
+            if (std.mem.eql(u8, &l.target, &v1_hash)) v1_seen = true;
+            if (std.mem.eql(u8, &l.target, &v2_truncated)) v2_seen = true;
+        }
+    }
+    try std.testing.expect(v1_seen);
+    try std.testing.expect(v2_seen);
+    try std.testing.expectEqual(@as(u16, 6881), engine.listen_port);
+}
+
 test "DhtEngine get_peers starts lookup" {
     const allocator = std.testing.allocator;
     var engine = DhtEngine.init(allocator, node_id.generateRandom());
