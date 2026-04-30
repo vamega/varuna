@@ -291,6 +291,7 @@ pub const TorrentSession = struct {
 
     pub fn createFromMagnet(
         allocator: std.mem.Allocator,
+        random: *@import("../runtime/random.zig").Random,
         magnet_uri: []const u8,
         save_path: []const u8,
         masquerade_as: ?[]const u8,
@@ -325,11 +326,8 @@ pub const TorrentSession = struct {
             .total_size = 0, // unknown until metadata fetched
             .piece_count = 0, // unknown until metadata fetched
             .added_on = std.time.timestamp(),
-            .peer_id = try peer_id_mod.generate(masquerade_as),
-            .tracker_key = blk: {
-                var rng = @import("../runtime/random.zig").Random.realRandom();
-                break :blk tracker.announce.Request.generateKey(&rng);
-            },
+            .peer_id = try peer_id_mod.generate(random, masquerade_as),
+            .tracker_key = tracker.announce.Request.generateKey(random),
             .is_magnet = true,
             .magnet_trackers = if (trackers.len > 0) trackers else null,
         };
@@ -337,6 +335,7 @@ pub const TorrentSession = struct {
 
     pub fn create(
         allocator: std.mem.Allocator,
+        random: *@import("../runtime/random.zig").Random,
         torrent_bytes: []const u8,
         save_path: []const u8,
         masquerade_as: ?[]const u8,
@@ -363,11 +362,8 @@ pub const TorrentSession = struct {
             .total_size = meta.totalSize(),
             .piece_count = try meta.pieceCount(),
             .added_on = std.time.timestamp(),
-            .peer_id = try peer_id_mod.generate(masquerade_as),
-            .tracker_key = blk: {
-                var rng = @import("../runtime/random.zig").Random.realRandom();
-                break :blk tracker.announce.Request.generateKey(&rng);
-            },
+            .peer_id = try peer_id_mod.generate(random, masquerade_as),
+            .tracker_key = tracker.announce.Request.generateKey(random),
             .is_private = meta.private,
             .info_hash_v2 = meta.info_hash_v2,
         };
@@ -1628,7 +1624,7 @@ pub const TorrentSession = struct {
         const parsed = udp_mod.parseUdpUrl(request.announce_url) orelse return false;
         const executor = self.udp_tracker_executor orelse return false;
 
-        const key_value: u32 = if (request.key) |k| std.mem.readInt(u32, k[0..4], .big) else udp_mod.generateTransactionId();
+        const key_value: u32 = if (request.key) |k| std.mem.readInt(u32, k[0..4], .big) else udp_mod.generateTransactionId(executor.random);
         var job = UdpTrackerExecutor.Job{
             .context = @ptrCast(self),
             .on_complete = on_complete,

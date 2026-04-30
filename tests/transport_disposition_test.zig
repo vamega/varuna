@@ -160,7 +160,7 @@ const TestCtx = struct {
             .sync_state = .{ .allocator = std.testing.allocator },
             .peer_sync_state = .{ .allocator = std.testing.allocator },
         };
-        const sid = handler.session_store.createSession();
+        const sid = handler.session_store.createSession(&el_ptr.random);
         return .{ .handler = handler, .sm = sm, .sid = sid };
     }
 

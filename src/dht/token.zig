@@ -1,4 +1,5 @@
 const std = @import("std");
+const Random = @import("../runtime/random.zig").Random;
 
 /// Token manager for announce_peer security (BEP 5).
 ///
@@ -17,11 +18,11 @@ pub const TokenManager = struct {
     /// Rotation interval: 5 minutes.
     pub const rotation_interval_secs: i64 = 5 * 60;
 
-    pub fn init() TokenManager {
+    pub fn init(random: *Random) TokenManager {
         var secret: [16]u8 = undefined;
         var prev_secret: [16]u8 = undefined;
-        std.crypto.random.bytes(&secret);
-        std.crypto.random.bytes(&prev_secret);
+        random.bytes(&secret);
+        random.bytes(&prev_secret);
         return .{
             .secret = secret,
             .prev_secret = prev_secret,
@@ -30,11 +31,11 @@ pub const TokenManager = struct {
     }
 
     /// Initialize with a specific timestamp (for testing).
-    pub fn initWithTime(now: i64) TokenManager {
+    pub fn initWithTime(random: *Random, now: i64) TokenManager {
         var secret: [16]u8 = undefined;
         var prev_secret: [16]u8 = undefined;
-        std.crypto.random.bytes(&secret);
-        std.crypto.random.bytes(&prev_secret);
+        random.bytes(&secret);
+        random.bytes(&prev_secret);
         return .{
             .secret = secret,
             .prev_secret = prev_secret,
@@ -59,10 +60,10 @@ pub const TokenManager = struct {
     }
 
     /// Rotate secrets if enough time has passed.
-    pub fn maybeRotate(self: *TokenManager, now: i64) void {
+    pub fn maybeRotate(self: *TokenManager, random: *Random, now: i64) void {
         if (now - self.last_rotation >= rotation_interval_secs) {
             self.prev_secret = self.secret;
-            std.crypto.random.bytes(&self.secret);
+            random.bytes(&self.secret);
             self.last_rotation = now;
         }
     }
@@ -78,7 +79,8 @@ pub const TokenManager = struct {
 // ── Tests ──────────────────────────────────────────────
 
 test "token generation is deterministic for same IP" {
-    const mgr = TokenManager.init();
+    var rng = Random.simRandom(0x100);
+    const mgr = TokenManager.init(&rng);
     const ip = [_]u8{ 192, 168, 1, 100 };
     const t1 = mgr.generateToken(&ip);
     const t2 = mgr.generateToken(&ip);
@@ -86,7 +88,8 @@ test "token generation is deterministic for same IP" {
 }
 
 test "tokens differ for different IPs" {
-    const mgr = TokenManager.init();
+    var rng = Random.simRandom(0x101);
+    const mgr = TokenManager.init(&rng);
     const ip1 = [_]u8{ 192, 168, 1, 100 };
     const ip2 = [_]u8{ 192, 168, 1, 101 };
     const t1 = mgr.generateToken(&ip1);
@@ -95,14 +98,16 @@ test "tokens differ for different IPs" {
 }
 
 test "validate accepts current token" {
-    const mgr = TokenManager.init();
+    var rng = Random.simRandom(0x102);
+    const mgr = TokenManager.init(&rng);
     const ip = [_]u8{ 10, 0, 0, 1 };
     const token = mgr.generateToken(&ip);
     try std.testing.expect(mgr.validateToken(&token, &ip));
 }
 
 test "validate rejects wrong IP" {
-    const mgr = TokenManager.init();
+    var rng = Random.simRandom(0x103);
+    const mgr = TokenManager.init(&rng);
     const ip1 = [_]u8{ 10, 0, 0, 1 };
     const ip2 = [_]u8{ 10, 0, 0, 2 };
     const token = mgr.generateToken(&ip1);
@@ -110,26 +115,29 @@ test "validate rejects wrong IP" {
 }
 
 test "validate rejects garbage token" {
-    const mgr = TokenManager.init();
+    var rng = Random.simRandom(0x104);
+    const mgr = TokenManager.init(&rng);
     const ip = [_]u8{ 10, 0, 0, 1 };
     const garbage = [_]u8{ 0, 0, 0, 0, 0, 0, 0, 0 };
     try std.testing.expect(!mgr.validateToken(&garbage, &ip));
 }
 
 test "validate rejects wrong-length token" {
-    const mgr = TokenManager.init();
+    var rng = Random.simRandom(0x105);
+    const mgr = TokenManager.init(&rng);
     const ip = [_]u8{ 10, 0, 0, 1 };
     const short = [_]u8{ 1, 2, 3 };
     try std.testing.expect(!mgr.validateToken(&short, &ip));
 }
 
 test "rotation preserves previous secret" {
-    var mgr = TokenManager.initWithTime(1000);
+    var rng = Random.simRandom(0x106);
+    var mgr = TokenManager.initWithTime(&rng, 1000);
     const ip = [_]u8{ 192, 168, 0, 1 };
     const token_before = mgr.generateToken(&ip);
 
     // Rotate
-    mgr.maybeRotate(1000 + TokenManager.rotation_interval_secs);
+    mgr.maybeRotate(&rng, 1000 + TokenManager.rotation_interval_secs);
 
     // Old token should still validate (via prev_secret)
     try std.testing.expect(mgr.validateToken(&token_before, &ip));
@@ -140,14 +148,24 @@ test "rotation preserves previous secret" {
 }
 
 test "double rotation invalidates old token" {
-    var mgr = TokenManager.initWithTime(1000);
+    var rng = Random.simRandom(0x107);
+    var mgr = TokenManager.initWithTime(&rng, 1000);
     const ip = [_]u8{ 192, 168, 0, 1 };
     const token_old = mgr.generateToken(&ip);
 
     // Rotate twice
-    mgr.maybeRotate(1000 + TokenManager.rotation_interval_secs);
-    mgr.maybeRotate(1000 + 2 * TokenManager.rotation_interval_secs);
+    mgr.maybeRotate(&rng, 1000 + TokenManager.rotation_interval_secs);
+    mgr.maybeRotate(&rng, 1000 + 2 * TokenManager.rotation_interval_secs);
 
     // Old token should no longer validate (both secrets rotated)
     try std.testing.expect(!mgr.validateToken(&token_old, &ip));
+}
+
+test "TokenManager init is byte-deterministic under SimRandom" {
+    var r1 = Random.simRandom(0x202);
+    var r2 = Random.simRandom(0x202);
+    const m1 = TokenManager.init(&r1);
+    const m2 = TokenManager.init(&r2);
+    try std.testing.expectEqualSlices(u8, &m1.secret, &m2.secret);
+    try std.testing.expectEqualSlices(u8, &m1.prev_secret, &m2.prev_secret);
 }

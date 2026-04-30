@@ -297,7 +297,7 @@ See `progress-reports/2026-04-25-stage2-event-loop-migration.md` for the Stage 2
 - **Daemon submission paths for bind / listen / setsockopt.** Now that the `FeatureSupport` flags exist, the daemon's listen-socket bring-up paths (`src/io/event_loop.zig` peer listener / uTP listener / RPC server) and the per-peer setsockopt calls (TCP_NODELAY, buffer sizes, BINDTODEVICE applied via `src/net/socket.zig`) can branch on `feature_support.supports_bind` / `supports_listen` / `supports_setsockopt` and dispatch async io_uring SQEs when supported, falling back to `posix.bind(2)` / `posix.listen(2)` / `posix.setsockopt(2)` otherwise. Estimated 0.5-1 day per call-site cluster.
 - **Live-pipeline BUGGIFY harness for `PieceStoreOf(SimIO)`.** Wrap the integration tests in `tests/storage_writer_test.zig` with the canonical BUGGIFY shape — per-tick `injectRandomFault` + per-op `FaultConfig` × 32 seeds. Catches recovery paths the foundation tests can't see (errdefer cleanup of partially-opened files when the 2nd of 5 fallocates fails; sync's pending-counter under fsync error storms; per-span resubmit racing with cancellation under read/write fault injection). Reference shape: `tests/recheck_live_buggify_test.zig`. Estimated 0.5-1 day. Now also covers writePiece/readPiece short-write/short-read loops.
 - ~~**SimHasher — make the hasher pool deterministic.**~~ Closed 2026-04-30. `src/io/hasher.zig` is now a tagged-union `Hasher = union(enum) { real: *RealHasher, sim: *SimHasher }` (mirrors `runtime.Clock` / `runtime.Random`). The production thread pool moved into `RealHasher` unchanged; `SimHasher` hashes synchronously on the EL thread and pushes results onto its queue, so the next `peer_policy.processHashResults` (called every tick) drains them deterministically. A `SimHasher.FaultConfig.merkle_pread_fault_prob` knob with a seeded `DefaultPrng` lets sim tests force pread failures reproducibly. Daemon construction `Hasher.realInit(allocator, threads)`; sim-test construction `Hasher.simInit(allocator, seed)`. Stretch: `tests/recheck_test.zig`'s three `AsyncRecheckOf(SimIO)` tests rewired to SimHasher — across 8 fresh runs the previously-flaky "all pieces verify" / "corrupt piece" assertions now pass 8/8 (vs. ~25 % flake rate on the real-thread shape). See `progress-reports/2026-04-30-simhasher.md`.
-- **Migrate `std.crypto.random` callers to a daemon-seeded CSPRNG.** The 2026-04-29 SimRandom round documented 5 callers (MSE keys, peer ID, DHT node ID, DHT tokens, RPC SID) as a "crypto-determinism boundary" deliberately left on `std.crypto.random` for production unpredictability — but that means sim tests touching those paths can't be byte-deterministic, defeating single-daemon full-determinism. Resolved direction: at daemon startup, seed a CSPRNG (e.g. `std.Random.ChaCha`) once from a real cryptographic source (`std.crypto.random.bytes(&seed)`), then route ALL random reads through that seeded CSPRNG. Production keeps cryptographic strength because a 256-bit seed from a real source plus a modern CSPRNG is computationally indistinguishable from a true random source for the lifetime of a single daemon process — standard "seed once, generate many" pattern. Sim builds inject a deterministic seed via the same surface; same CSPRNG implementation, same code paths, just a known seed. This closes the crypto-determinism boundary entirely. Implementation likely requires plumbing a `*Random` reference through to the 5 sensitive callers (injection rather than module global, so tests can vary the seed per test case). Estimated 3-4 days. The existing `runtime.Random` (currently `RealRandom = wraps std.crypto.random` vs `SimRandom = DefaultPrng`) gets retrofitted: both variants use the same ChaCha-based CSPRNG; only the seed source differs.
+- ~~**Migrate `std.crypto.random` callers to a daemon-seeded CSPRNG.**~~ Closed 2026-04-30. `runtime.Random` retrofitted: both `.real` and `.sim` variants now wrap `std.Random.ChaCha` (ChaCha8 IETF with fast-key-erasure forward security per Bernstein 2017); the only difference is the seed source. `Random.realRandom()` reads 32 bytes from `std.crypto.random.bytes()` once at construction and seeds ChaCha8; `Random.simRandomFromKey([32]u8)` / `Random.simRandom(u64)` take the seed as a parameter. The five preserved-CSPRNG sites — MSE handshake DH keys (`src/crypto/mse.zig`), peer ID (`src/torrent/peer_id.zig`), DHT node ID (`src/dht/node_id.zig`), DHT tokens (`src/dht/token.zig`), RPC SID (`src/rpc/auth.zig`) — plus the two non-cryptographic sites (`src/net/utp.zig` connection-id, `src/tracker/udp.zig` transaction-id) all draw from the daemon-wide `EventLoop.random` via `*Random` injection through their constructors. `grep -rn 'std\.crypto\.random' src/` shows only the seed-reading call inside `Random.realRandom` itself. Tests in `tests/csprng_determinism_test.zig` assert byte-equality across two scenario runs for every sensitive output (peer ID, node ID, token secret, RPC SID, MSE DH private/public key) under a single shared `*Random` — the previously-documented "crypto-determinism boundary" can now use byte-equality assertions where it previously had to use behavioural ones. See `progress-reports/2026-04-30-csprng-migration.md` and `docs/simulation-roadmap.md` Phase 2 #2.
 
 ### Testing
 - ~~**External-review test gaps T2/T3/T4.**~~ Closed 2026-04-30. (T2) Private-torrent → DHT gating proven. The privacy gate now lives in three `TorrentSession` helpers (`dhtRegisterPeers` / `dhtForceRequery` / `dhtAnnouncePeer`) — all three former call sites in `src/main.zig` and `src/daemon/torrent_session.zig` now route through them so the gate is enforced in one place. New `tests/private_torrent_dht_test.zig` verifies private/public symmetry across all three operations including hybrid v2 truncation. (T3) `tests/rpc_server_stress_test.zig` extended with 6 routing tests that wire a real `ApiHandler` onto a real `ApiServer`, fire HTTP requests through real posix sockets, and assert end-to-end auth → routing → handler → response (login round-trip, auth-required 403, app/version, app/buildInfo, app/defaultSavePath, torrents/info, torrents/categories + createCategory, unknown-path 404 from the handler). (T4) Happy-path coverage added in 4 endpoint-family files: `tests/api_categories_test.zig`, `tests/api_share_limits_test.zig`, `tests/api_tracker_edits_test.zig`, `tests/api_sync_export_test.zig`. 40 new tests total. See `progress-reports/2026-04-30-api-tests-t2-t3-t4.md`.
@@ -432,6 +432,117 @@ these changes — already on the team's flake-diagnosis list.
 
 See `progress-reports/2026-04-30-misc-cleanup.md` for per-task
 detail.
+
+## Last Verified Milestone (2026-04-30 — daemon-seeded CSPRNG closes the crypto-determinism boundary)
+
+Routes every `std.crypto.random` reader in the daemon through a
+single `runtime.Random` instance held on the `EventLoop`, which is
+seeded once at startup from the OS CSPRNG and runs `std.Random.ChaCha`
+(ChaCha8 IETF with fast-key-erasure forward security) for the lifetime
+of the process. Sim builds inject a deterministic 32-byte seed via the
+same surface and produce byte-identical output for every sensitive
+caller.
+
+**Design choice**
+
+Both variants of `runtime.Random` now wrap the same generator type
+(`std.Random.ChaCha`); only the seed source differs. Production seeds
+from `std.crypto.random.bytes()` once at construction; sim seeds from
+a 32-byte key passed in via `Random.simRandomFromKey([32]u8)` or its
+u64 convenience overload `Random.simRandom(u64)`. Cryptographic
+strength rests on (1) seed indistinguishability (`getrandom(2)` is
+the same source BoringSSL / OpenSSL / Go `crypto/rand` use as their
+CSPRNG seed), (2) ChaCha8 indistinguishability from random
+(distinguishing implies breaking the underlying ChaCha permutation —
+this is the construction Bernstein recommends for fast-key-erasure
+RNGs and the same construction Linux 5.18+'s `getrandom(2)` itself
+uses internally), and (3) process-local state with no
+fork-without-reseed (varuna does not fork). Detailed threat model in
+`src/runtime/random.zig`.
+
+**Plumbing landed (Pattern #14, all five callers + two non-crypto
+extras)**
+
+The `*Random` reference is borrowed from `EventLoop.random` and
+threaded through constructors:
+
+- `src/torrent/peer_id.zig` — `generate(random: *Random, masquerade)`
+  takes the daemon-wide RNG. Call sites in
+  `src/daemon/torrent_session.zig` (`TorrentSession.create` /
+  `createFromMagnet`) accept a `*Random` parameter and pass
+  `&el.random` from `SessionManager.addTorrent` / `addMagnet`.
+- `src/dht/node_id.zig` — `generateRandom(random: *Random)` and
+  `randomIdInBucket(random, own_id, bucket)`. `DhtEngine` gains a
+  borrowed `random: *Random` field; `init` / `create` take it. All
+  internal callers (`startBootstrap` random target, `refreshBucket`)
+  use `self.random`. `src/main.zig` passes
+  `&shared_el.random`.
+- `src/dht/token.zig` — `TokenManager.init(random)`,
+  `initWithTime(random, now)`, `maybeRotate(random, now)`. The
+  `DhtEngine.tick` rotation site forwards `self.random`.
+- `src/crypto/mse.zig` — `MseInitiatorHandshake` /
+  `MseResponderHandshake` gain a `random: *Random` field;
+  `init` / `initWithLookup` take it. Internal padding-length and
+  padding-bytes generation switches from `std.crypto.random` to
+  `self.random`. The blocking-POSIX `handshakeInitiator` /
+  `handshakeResponder` (used only in `varuna-ctl` paths) take an
+  explicit `*Random` parameter. `src/io/peer_handler.zig` passes
+  `&self.random` at construction.
+- `src/rpc/auth.zig` — `SessionStore.createSession(random)` takes
+  `*Random`; the production handler in `src/rpc/handlers.zig`
+  retrieves it from `self.session_manager.shared_event_loop.?.random`.
+- `src/net/utp.zig` — `UtpSocket.connect(random, now_us)` (16-bit
+  conn-id is collision-avoidance, not security, but routes through
+  the same source for sim determinism).
+  `src/net/utp_manager.zig:UtpManager.connect` gains a `*Random`
+  parameter; `src/io/event_loop.zig` passes `&self.random`.
+- `src/tracker/udp.zig` — `generateTransactionId(random)` and
+  `fetchViaUdp(allocator, random, request)`. The production
+  `UdpTrackerExecutor` gains a borrowed `random: *Random` field
+  populated from `&el.random` at create time
+  (`src/daemon/session_manager.zig` `ensureUdpTrackerExecutor`).
+
+**Module-level globals were explicitly rejected** for the
+test-injection surface — same reasoning as the DNS `bind_device`
+cleanup round (`docs/custom-dns-design-round2.md` §1). Pass-through
+constructors keep the wiring auditable and let tests vary the seed
+per-case without process-global mutation.
+
+**`grep -rn 'std\.crypto\.random' src/`** now reports only the seed
+read inside `Random.realRandom()` itself (and one reference inside a
+docstring in `src/io/dns_custom/query.zig`). The
+crypto-determinism boundary previously documented in
+`src/runtime/random.zig` is closed.
+
+**Tests**
+
+- `tests/csprng_determinism_test.zig` (new) — 11 byte-equality tests
+  covering: ChaCha8 reproducibility under both key shapes, every
+  per-caller site (peer ID, masqueraded peer ID, node ID, token
+  manager init / rotation, RPC SID, MSE initiator + responder DH
+  keys), and a whole-daemon scenario that runs the full sequence
+  (peer ID → node ID → token → SID → MSE handshake init) under one
+  shared `*Random` and asserts byte-identity vs distinct seeds.
+- Inline tests in each migrated file gain a "byte-deterministic
+  under SimRandom" assertion — `src/torrent/peer_id.zig`,
+  `src/dht/node_id.zig`, `src/dht/token.zig`, `src/rpc/auth.zig`,
+  `src/runtime/random.zig`.
+- 6 new tests in inline blocks + 11 in the new dedicated file = 17
+  determinism tests added; total test count went from 1656 → 1679+.
+
+**Surprises**
+
+- The team-lead brief listed five callers; `grep` found seven (uTP
+  conn-id and UDP tracker tx-id are non-cryptographic but were
+  flagged in the original `runtime.Random` docstring as "Safe to
+  swap for Random in tests"). Migrating those alongside satisfies
+  Pattern #14's "every caller, no exceptions" rule and means the
+  whole-daemon determinism story is genuinely complete.
+- `EventLoop.random` had a `Random = .real` default (the old void
+  variant). With ChaCha state in the payload, the field default
+  became invalid; `initBare` now seeds explicitly via
+  `Random.realRandom()`. Tests that overwrite `el.random` with a
+  sim variant after construction continue to work unchanged.
 
 ## Last Verified Milestone (2026-04-29 — runtime Clock + Random abstractions for sim-time determinism)
 

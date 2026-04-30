@@ -1610,13 +1610,15 @@ fn runSyncDelta(
     try manager.category_store.create("bench", "/tmp/bench");
     try manager.tag_store.create("fast");
 
+    var bench_rng = varuna.runtime.Random.realRandom();
+
     for (0..torrent_count) |idx| {
         const torrent_bytes = try makeTorrentBytes(allocator, idx);
         defer allocator.free(torrent_bytes);
 
         const session = try allocator.create(TorrentSession);
         errdefer allocator.destroy(session);
-        session.* = try TorrentSession.create(allocator, torrent_bytes, "/tmp/varuna-bench", null);
+        session.* = try TorrentSession.create(allocator, &bench_rng, torrent_bytes, "/tmp/varuna-bench", null);
         errdefer session.deinit();
 
         if ((idx & 1) == 0) {
@@ -1705,7 +1707,7 @@ fn runSyncStatsLive(
 
         const session = try allocator.create(TorrentSession);
         errdefer allocator.destroy(session);
-        session.* = try TorrentSession.create(allocator, torrent_bytes, "/tmp/varuna-bench", null);
+        session.* = try TorrentSession.create(allocator, &event_loop.random, torrent_bytes, "/tmp/varuna-bench", null);
         errdefer session.deinit();
         session.shared_event_loop = &event_loop;
 

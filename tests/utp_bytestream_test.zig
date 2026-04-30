@@ -5,6 +5,10 @@ const UtpSocket = utp.UtpSocket;
 const Header = utp.Header;
 const State = utp.State;
 const PacketType = utp.PacketType;
+const Random = varuna.runtime.Random;
+
+/// File-scoped sim-seeded CSPRNG for the uTP byte-stream tests.
+var bytestream_test_rng: Random = Random.simRandom(0xb71);
 
 // ── Test: Full BT handshake over uTP byte stream ────────────────
 //
@@ -28,7 +32,7 @@ test "BT handshake over uTP byte stream" {
     client.allocator = allocator;
     defer client.deinit();
 
-    const syn_pkt = client.connect(1_000_000);
+    const syn_pkt = client.connect(&bytestream_test_rng, 1_000_000);
     const syn_hdr = Header.decode(&syn_pkt).?;
 
     var server = UtpSocket{};
@@ -155,7 +159,7 @@ test "multiple BT wire messages over uTP byte stream" {
     server.allocator = allocator;
     defer server.deinit();
 
-    const syn = client.connect(1_000_000);
+    const syn = client.connect(&bytestream_test_rng, 1_000_000);
     const syn_hdr = Header.decode(&syn).?;
     const syn_ack = server.acceptSyn(syn_hdr, 1_001_000);
     _ = client.processPacket(Header.decode(&syn_ack).?, &.{}, 1_002_000);
@@ -228,7 +232,7 @@ test "fragmented PIECE message over uTP" {
     defer server.deinit();
 
     // Connect
-    const syn = client.connect(1_000_000);
+    const syn = client.connect(&bytestream_test_rng, 1_000_000);
     const syn_hdr = Header.decode(&syn).?;
     const syn_ack = server.acceptSyn(syn_hdr, 1_001_000);
     _ = client.processPacket(Header.decode(&syn_ack).?, &.{}, 1_002_000);

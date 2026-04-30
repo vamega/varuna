@@ -42,6 +42,19 @@ const node_id = varuna.dht.node_id;
 const routing_table = varuna.dht.routing_table;
 const NodeId = node_id.NodeId;
 const NodeInfo = node_id.NodeInfo;
+const Random = varuna.runtime.Random;
+
+/// Test-local helper. Maintains a fixed sim-seeded PRNG so node IDs
+/// generated inside this test file are byte-deterministic — same
+/// shape as the per-test `var rng = Random.simRandom(...)` pattern
+/// in `src/dht/dht.zig` inline tests, but file-scoped here because
+/// these tests sprinkle `node_id.generateRandom` across many helper
+/// functions and call sites.
+var test_rng: Random = Random.simRandom(0xc0ffee79);
+
+fn testNodeId() NodeId {
+    return node_id.generateRandom(&test_rng);
+}
 
 // ── Layer 1: Random-byte fuzz of krpc.parse ──────────────────
 
@@ -243,7 +256,7 @@ test "BUGGIFY: bit-flip mutation of valid KRPC ping query stays safe" {
     // Build a real ping query, then flip one byte at a random
     // position 1024 times per seed. The mutated packet must not
     // panic regardless of where the flip lands.
-    const our_id = node_id.generateRandom();
+    const our_id = testNodeId();
     var orig_buf: [256]u8 = undefined;
     const orig_len = try krpc.encodePingQuery(&orig_buf, 0xAABB, our_id);
     try testing.expect(orig_len > 0 and orig_len < orig_buf.len);
@@ -371,8 +384,8 @@ test "BUGGIFY: RoutingTable findClosest with zero-length out buffer is safe" {
 // ── Layer 1: KRPC encode happy-path size sanity ─────────────────
 
 test "BUGGIFY: KRPC encoder happy-path output sizes are bounded" {
-    const our_id = node_id.generateRandom();
-    const target = node_id.generateRandom();
+    const our_id = testNodeId();
+    const target = testNodeId();
 
     var ok: [256]u8 = undefined;
     const ping_len = try krpc.encodePingQuery(&ok, 0xAABB, our_id);
@@ -411,7 +424,7 @@ test "BUGGIFY: KRPC encoder happy-path output sizes are bounded" {
 // hit.
 
 test "encoder: encodePingQuery returns NoSpaceLeft on tiny buffers" {
-    const our_id = node_id.generateRandom();
+    const our_id = testNodeId();
     // Try every length 0..min_size-1 — every one must error.
     var got_ok = false;
     var probe: [256]u8 = undefined;
@@ -433,8 +446,8 @@ test "encoder: encodePingQuery returns NoSpaceLeft on tiny buffers" {
 }
 
 test "encoder: encodeFindNodeQuery returns NoSpaceLeft on tiny buffers" {
-    const our_id = node_id.generateRandom();
-    const target = node_id.generateRandom();
+    const our_id = testNodeId();
+    const target = testNodeId();
     var probe: [256]u8 = undefined;
     const ok_len = try krpc.encodeFindNodeQuery(&probe, 0xAABB, our_id, target);
 
@@ -447,7 +460,7 @@ test "encoder: encodeFindNodeQuery returns NoSpaceLeft on tiny buffers" {
 }
 
 test "encoder: encodeGetPeersQuery returns NoSpaceLeft on tiny buffers" {
-    const our_id = node_id.generateRandom();
+    const our_id = testNodeId();
     var probe: [256]u8 = undefined;
     const ok_len = try krpc.encodeGetPeersQuery(&probe, 0xAABB, our_id, [_]u8{0} ** 20);
 
@@ -459,7 +472,7 @@ test "encoder: encodeGetPeersQuery returns NoSpaceLeft on tiny buffers" {
 }
 
 test "encoder: encodeAnnouncePeerQuery returns NoSpaceLeft on tiny buffers" {
-    const our_id = node_id.generateRandom();
+    const our_id = testNodeId();
     var token_buf: [32]u8 = undefined;
     @memset(&token_buf, 0xab);
     var probe: [256]u8 = undefined;
@@ -489,7 +502,7 @@ test "encoder: encodeAnnouncePeerQuery returns NoSpaceLeft on tiny buffers" {
 }
 
 test "encoder: encodePingResponse returns NoSpaceLeft on tiny buffers" {
-    const our_id = node_id.generateRandom();
+    const our_id = testNodeId();
     const tid = "tt";
     var probe: [256]u8 = undefined;
     const ok_len = try krpc.encodePingResponse(&probe, tid, our_id);
@@ -502,7 +515,7 @@ test "encoder: encodePingResponse returns NoSpaceLeft on tiny buffers" {
 }
 
 test "encoder: encodeFindNodeResponse returns NoSpaceLeft on tiny buffers" {
-    const our_id = node_id.generateRandom();
+    const our_id = testNodeId();
     const tid = "tt";
     var nodes_blob: [52]u8 = undefined;
     @memset(&nodes_blob, 0x42);
@@ -517,7 +530,7 @@ test "encoder: encodeFindNodeResponse returns NoSpaceLeft on tiny buffers" {
 }
 
 test "encoder: encodeGetPeersResponseValues returns NoSpaceLeft on tiny buffers" {
-    const our_id = node_id.generateRandom();
+    const our_id = testNodeId();
     const tid = "tt";
     const tok = "abcdefgh";
     const values = [_][6]u8{
@@ -535,7 +548,7 @@ test "encoder: encodeGetPeersResponseValues returns NoSpaceLeft on tiny buffers"
 }
 
 test "encoder: encodeGetPeersResponseNodes returns NoSpaceLeft on tiny buffers" {
-    const our_id = node_id.generateRandom();
+    const our_id = testNodeId();
     const tid = "tt";
     const tok = "abcdefgh";
     var nodes_blob: [78]u8 = undefined;
@@ -791,7 +804,7 @@ test "parser: round-trip after hardening (regression for valid inputs)" {
     // Belt-and-braces: confirm the hardened parser still accepts a
     // canonical ping query / response / error.
     var buf: [512]u8 = undefined;
-    const our_id = node_id.generateRandom();
+    const our_id = testNodeId();
 
     {
         const len = try krpc.encodePingQuery(&buf, 0x1234, our_id);
@@ -827,7 +840,7 @@ test "parser: round-trip after hardening (regression for valid inputs)" {
 
 test "BUGGIFY: token validation is panic-free and forgery-resistant" {
     const Token = varuna.dht.token.TokenManager;
-    var mgr = Token.initWithTime(1000);
+    var mgr = Token.initWithTime(&test_rng, 1000);
 
     // Per-seed, drive the secret rotation while feeding random
     // adversarial tokens against random IPs. None should validate.
@@ -855,7 +868,7 @@ test "BUGGIFY: token validation is panic-free and forgery-resistant" {
             // Occasionally rotate. Old tokens (from this random space)
             // remain rejectable.
             if (prng.random().uintLessThan(u8, 16) == 0) {
-                mgr.maybeRotate(1000 + @as(i64, @intCast(rotations + 1)) * Token.rotation_interval_secs);
+                mgr.maybeRotate(&test_rng, 1000 + @as(i64, @intCast(rotations + 1)) * Token.rotation_interval_secs);
                 rotations += 1;
             }
         }
@@ -868,7 +881,7 @@ test "BUGGIFY: token validation is panic-free and forgery-resistant" {
 
 test "token: cross-IP and cross-secret tokens are rejected" {
     const Token = varuna.dht.token.TokenManager;
-    var mgr = Token.initWithTime(1000);
+    var mgr = Token.initWithTime(&test_rng, 1000);
     const ip_a = [_]u8{ 192, 168, 0, 1 };
     const ip_b = [_]u8{ 192, 168, 0, 2 };
 
@@ -877,8 +890,8 @@ test "token: cross-IP and cross-secret tokens are rejected" {
     try testing.expect(!mgr.validateToken(&t_a, &ip_b));
 
     // Rotate twice; t_a is now from a fully-replaced secret pair.
-    mgr.maybeRotate(1000 + Token.rotation_interval_secs);
-    mgr.maybeRotate(1000 + 2 * Token.rotation_interval_secs);
+    mgr.maybeRotate(&test_rng, 1000 + Token.rotation_interval_secs);
+    mgr.maybeRotate(&test_rng, 1000 + 2 * Token.rotation_interval_secs);
     try testing.expect(!mgr.validateToken(&t_a, &ip_a));
 }
 
@@ -1021,7 +1034,7 @@ test "BUGGIFY: compact peer-list parsing rejects adversarial length prefix" {
                     // construct a tiny DhtEngine and feed the response
                     // through `handleIncoming`; this exercises the
                     // adversarial code path end-to-end.
-                    var engine = varuna.dht.DhtEngine.init(testing.allocator, node_id.generateRandom());
+                    var engine = varuna.dht.DhtEngine.init(testing.allocator, &test_rng, testNodeId());
                     defer engine.deinit();
                     engine.handleIncoming(inp, std.net.Address.initIp4(.{ 1, 2, 3, 4 }, 6881));
                     // Drain anything we queued so deinit is clean.
@@ -1048,7 +1061,7 @@ test "BUGGIFY: compact peer-list parsing rejects adversarial length prefix" {
 // table, no panic.
 
 test "txn-id mismatch: unsolicited response causes no state mutation" {
-    var engine = varuna.dht.DhtEngine.init(testing.allocator, node_id.generateRandom());
+    var engine = varuna.dht.DhtEngine.init(testing.allocator, &test_rng, testNodeId());
     defer engine.deinit();
 
     // Build a real ping response that the engine never queried for.
@@ -1076,7 +1089,7 @@ test "txn-id mismatch: unsolicited response causes no state mutation" {
 // 1-byte or 0-byte txn id must not panic, must not match.
 
 test "txn-id length != 2 is harmless" {
-    var engine = varuna.dht.DhtEngine.init(testing.allocator, node_id.generateRandom());
+    var engine = varuna.dht.DhtEngine.init(testing.allocator, &test_rng, testNodeId());
     defer engine.deinit();
 
     // Hand-craft a response with a 1-byte txn id.
@@ -1132,14 +1145,14 @@ fn peekLastSend(engine: *dht.DhtEngine) ?[]const u8 {
 }
 
 test "R2: respondFindNode emits both nodes and nodes6 for mixed routing table" {
-    var engine = dht.DhtEngine.init(testing.allocator, node_id.generateRandom());
+    var engine = dht.DhtEngine.init(testing.allocator, &test_rng, testNodeId());
     defer engine.deinit();
 
     const now: i64 = 1_000_000;
     // Add 3 v4 nodes
     for (0..3) |i| {
         _ = engine.table.addNode(.{
-            .id = node_id.generateRandom(),
+            .id = testNodeId(),
             .address = std.net.Address.initIp4(.{ 10, 0, 0, @intCast(i + 1) }, 6881),
         }, now);
     }
@@ -1148,7 +1161,7 @@ test "R2: respondFindNode emits both nodes and nodes6 for mixed routing table" {
         var addr6: [16]u8 = [_]u8{0} ** 16;
         addr6[15] = @intCast(i + 1);
         _ = engine.table.addNode(.{
-            .id = node_id.generateRandom(),
+            .id = testNodeId(),
             .address = std.net.Address.initIp6(addr6, 6881, 0, 0),
         }, now);
     }
@@ -1161,7 +1174,7 @@ test "R2: respondFindNode emits both nodes and nodes6 for mixed routing table" {
     var query_buf: [512]u8 = undefined;
     var sender_id: NodeId = undefined;
     @memset(&sender_id, 0xAB);
-    const target = node_id.generateRandom();
+    const target = testNodeId();
     const len = try krpc.encodeFindNodeQuery(&query_buf, 0xBEEF, sender_id, target);
     const sender = std.net.Address.initIp4(.{ 10, 0, 0, 99 }, 6881);
     engine.handleIncoming(query_buf[0..len], sender);
@@ -1190,21 +1203,21 @@ test "R2: respondFindNode emits both nodes and nodes6 for mixed routing table" {
 }
 
 test "R2: respondGetPeers emits both nodes and nodes6 when no peers known" {
-    var engine = dht.DhtEngine.init(testing.allocator, node_id.generateRandom());
+    var engine = dht.DhtEngine.init(testing.allocator, &test_rng, testNodeId());
     defer engine.deinit();
 
     const now: i64 = 2_000_000;
     // 2 v4, 2 v6 nodes
     for (0..2) |i| {
         _ = engine.table.addNode(.{
-            .id = node_id.generateRandom(),
+            .id = testNodeId(),
             .address = std.net.Address.initIp4(.{ 192, 168, 1, @intCast(i + 1) }, 51413),
         }, now);
         var addr6: [16]u8 = [_]u8{0} ** 16;
         addr6[14] = 0xfe;
         addr6[15] = @intCast(i + 1);
         _ = engine.table.addNode(.{
-            .id = node_id.generateRandom(),
+            .id = testNodeId(),
             .address = std.net.Address.initIp6(addr6, 51413, 0, 0),
         }, now);
     }
@@ -1270,7 +1283,7 @@ fn primeTokenFor(
 }
 
 test "R3: announce_peer with valid token stores peer; get_peers returns it in values" {
-    var engine = dht.DhtEngine.init(testing.allocator, node_id.generateRandom());
+    var engine = dht.DhtEngine.init(testing.allocator, &test_rng, testNodeId());
     defer engine.deinit();
     defer drainAndFree(&engine);
 
@@ -1343,7 +1356,7 @@ test "R3: announce_peer with valid token stores peer; get_peers returns it in va
 }
 
 test "R3: announce_peer with invalid token does not store" {
-    var engine = dht.DhtEngine.init(testing.allocator, node_id.generateRandom());
+    var engine = dht.DhtEngine.init(testing.allocator, &test_rng, testNodeId());
     defer engine.deinit();
     defer drainAndFree(&engine);
 
@@ -1372,7 +1385,7 @@ test "R3: announce_peer with invalid token does not store" {
 }
 
 test "R3: announce_peer implied_port=1 uses UDP source port" {
-    var engine = dht.DhtEngine.init(testing.allocator, node_id.generateRandom());
+    var engine = dht.DhtEngine.init(testing.allocator, &test_rng, testNodeId());
     defer engine.deinit();
     defer drainAndFree(&engine);
 
@@ -1427,7 +1440,7 @@ test "R3: announce_peer implied_port=1 uses UDP source port" {
 }
 
 test "R3: peer_store sweep removes expired entries" {
-    var engine = dht.DhtEngine.init(testing.allocator, node_id.generateRandom());
+    var engine = dht.DhtEngine.init(testing.allocator, &test_rng, testNodeId());
     defer engine.deinit();
     defer drainAndFree(&engine);
 

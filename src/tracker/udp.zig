@@ -347,9 +347,15 @@ pub fn retransmitTimeout(attempt: u32) u64 {
 }
 
 /// Generate a random transaction ID.
-pub fn generateTransactionId() u32 {
+///
+/// `random` is the daemon-wide CSPRNG (`runtime.Random`). Transaction
+/// IDs are a non-cryptographic 32-bit nonce for matching responses
+/// to outstanding BEP 15 requests, but they go through the same
+/// daemon-wide source so sim tests get byte-deterministic tx-id
+/// sequences alongside the rest of the daemon's RNG output.
+pub fn generateTransactionId(random: *@import("../runtime/random.zig").Random) u32 {
     var buf: [4]u8 = undefined;
-    std.crypto.random.bytes(&buf);
+    random.bytes(&buf);
     return std.mem.readInt(u32, &buf, .big);
 }
 
@@ -439,6 +445,7 @@ pub fn resetGlobalCache() void {
 /// Implements BEP 15 connect + announce with exponential backoff retries.
 pub fn fetchViaUdp(
     allocator: std.mem.Allocator,
+    random: *@import("../runtime/random.zig").Random,
     request: types.Request,
 ) !types.Response {
     const parsed = parseUdpUrl(request.announce_url) orelse return error.InvalidTrackerUrl;
@@ -461,11 +468,11 @@ pub fn fetchViaUdp(
     const connection_id = if (global_conn_cache.get(parsed.host, parsed.port)) |cached_id|
         cached_id
     else
-        try performConnect(fd, parsed.host, parsed.port);
+        try performConnect(fd, random, parsed.host, parsed.port);
 
     // Step 2: Announce
-    var announce_txid = generateTransactionId();
-    const key_value: u32 = if (request.key) |k| std.mem.readInt(u32, k[0..4], .big) else generateTransactionId();
+    var announce_txid = generateTransactionId(random);
+    const key_value: u32 = if (request.key) |k| std.mem.readInt(u32, k[0..4], .big) else generateTransactionId(random);
     const announce_req = AnnounceRequest{
         .connection_id = connection_id,
         .transaction_id = announce_txid,
@@ -506,11 +513,11 @@ pub fn fetchViaUdp(
             // If we used a cached connection ID, it may be stale -- retry with fresh connect
             if (attempt == 0 and global_conn_cache.get(parsed.host, parsed.port) != null) {
                 global_conn_cache.invalidate(parsed.host, parsed.port);
-                const fresh_id = performConnect(fd, parsed.host, parsed.port) catch continue;
+                const fresh_id = performConnect(fd, random, parsed.host, parsed.port) catch continue;
                 // Rebuild announce with fresh connection ID
                 var retry_req = announce_req;
                 retry_req.connection_id = fresh_id;
-                announce_txid = generateTransactionId();
+                announce_txid = generateTransactionId(random);
                 retry_req.transaction_id = announce_txid;
                 const retry_buf = retry_req.encode();
                 sendAll(fd, &retry_buf) catch continue;
@@ -546,8 +553,8 @@ pub fn fetchViaUdp(
 }
 
 /// Perform the UDP connect handshake with exponential backoff retries.
-fn performConnect(fd: posix.fd_t, host: []const u8, port: u16) !u64 {
-    const transaction_id = generateTransactionId();
+fn performConnect(fd: posix.fd_t, random: *@import("../runtime/random.zig").Random, host: []const u8, port: u16) !u64 {
+    const transaction_id = generateTransactionId(random);
     const connect_req = ConnectRequest{ .transaction_id = transaction_id };
     const connect_buf = connect_req.encode();
 
@@ -1063,8 +1070,10 @@ test "connection cache reuse skips connect" {
 }
 
 test "transaction id is random" {
-    const id1 = generateTransactionId();
-    const id2 = generateTransactionId();
+    const Random = @import("../runtime/random.zig").Random;
+    var rng = Random.simRandom(0xc0c0);
+    const id1 = generateTransactionId(&rng);
+    const id2 = generateTransactionId(&rng);
     // Not a guarantee, but extremely unlikely to be equal
     try std.testing.expect(id1 != id2);
 }

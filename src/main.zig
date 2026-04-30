@@ -508,11 +508,11 @@ fn initDht(
                 break :blk saved_id;
             }
         }
-        break :blk varuna.dht.node_id.generateRandom();
+        break :blk varuna.dht.node_id.generateRandom(&shared_el.random);
     };
 
     if (cfg.network.dht) {
-        const engine = varuna.dht.DhtEngine.create(allocator, dht_node_id) catch |err| {
+        const engine = varuna.dht.DhtEngine.create(allocator, &shared_el.random, dht_node_id) catch |err| {
             try stdout.print("warning: failed to create DHT engine: {s}\n", .{@errorName(err)});
             try stdout.flush();
             return state;

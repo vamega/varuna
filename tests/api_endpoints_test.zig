@@ -24,7 +24,12 @@ const TestCtx = struct {
             .sync_state = .{ .allocator = std.testing.allocator },
             .peer_sync_state = .{ .allocator = std.testing.allocator },
         };
-        const sid = handler.session_store.createSession();
+        // Test SessionStore directly without an event loop — use a
+        // local sim-seeded CSPRNG. Production goes through
+        // `ApiHandler.handleLogin` which pulls from the daemon-wide
+        // event-loop random.
+        var test_rng = @import("varuna").runtime.Random.simRandom(0xa11ce);
+        const sid = handler.session_store.createSession(&test_rng);
         return .{ .handler = handler, .sm = sm, .sid = sid };
     }
 

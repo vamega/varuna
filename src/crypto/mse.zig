@@ -21,6 +21,7 @@ const std = @import("std");
 const backend = @import("backend.zig");
 const Sha1 = backend.Sha1;
 const Rc4 = backend.Rc4;
+const Random = @import("../runtime/random.zig").Random;
 
 const log = std.log.scoped(.mse);
 
@@ -121,9 +122,14 @@ pub const HandshakeResult = struct {
 };
 
 /// Generate a random DH private key (768 bits).
-fn generatePrivateKey() [dh_key_size]u8 {
+///
+/// `random` is the daemon-wide CSPRNG (`runtime.Random`). Production
+/// holds an OS-seeded ChaCha8; sim tests inject a known seed so DH
+/// keys (and the derived shared secret, RC4 streams, padding lengths,
+/// padding bytes) are byte-deterministic across runs.
+fn generatePrivateKey(random: *Random) [dh_key_size]u8 {
     var key: [dh_key_size]u8 = undefined;
-    std.crypto.random.bytes(&key);
+    random.bytes(&key);
     return key;
 }
 
@@ -228,26 +234,29 @@ fn recvExact(fd: posix.fd_t, buf: []u8) !void {
 ///
 /// The initiator knows which torrent it wants to connect to, so SKEY = info_hash.
 /// Uses blocking POSIX I/O (suitable for background threads).
+///
+/// `random` is the daemon-wide CSPRNG (`runtime.Random`).
 pub fn handshakeInitiator(
     fd: posix.fd_t,
+    random: *Random,
     info_hash: [20]u8,
     mode: EncryptionMode,
     allocator: std.mem.Allocator,
 ) !HandshakeResult {
     // Step 1: Generate DH keypair
-    const private_key = generatePrivateKey();
+    const private_key = generatePrivateKey(random);
     const public_key = computePublicKey(private_key);
 
     // Step 2: Send Ya + PadA
     // PadA is 0..512 random bytes
     var pad_a_len_bytes: [2]u8 = undefined;
-    std.crypto.random.bytes(&pad_a_len_bytes);
+    random.bytes(&pad_a_len_bytes);
     const pad_a_len: u16 = std.mem.readInt(u16, &pad_a_len_bytes, .big) % (max_pad_len + 1);
 
     var send_buf: [dh_key_size + max_pad_len]u8 = undefined;
     @memcpy(send_buf[0..dh_key_size], &public_key);
     if (pad_a_len > 0) {
-        std.crypto.random.bytes(send_buf[dh_key_size .. dh_key_size + pad_a_len]);
+        random.bytes(send_buf[dh_key_size .. dh_key_size + pad_a_len]);
     }
     try sendAll(fd, send_buf[0 .. dh_key_size + pad_a_len]);
 
@@ -293,7 +302,7 @@ pub fn handshakeInitiator(
     // Build the plaintext of the encrypted portion
     // VC(8) + crypto_provide(4) + len(PadC)(2) + PadC(0..512) + len(IA)(2) + IA(0)
     var pad_c_len_bytes: [2]u8 = undefined;
-    std.crypto.random.bytes(&pad_c_len_bytes);
+    random.bytes(&pad_c_len_bytes);
     const pad_c_len: u16 = std.mem.readInt(u16, &pad_c_len_bytes, .big) % (max_pad_len + 1);
 
     const enc_payload_len = 8 + 4 + 2 + pad_c_len + 2;
@@ -304,7 +313,7 @@ pub fn handshakeInitiator(
     std.mem.writeInt(u32, enc_payload[8..12], crypto_provide_val, .big);
     std.mem.writeInt(u16, enc_payload[12..14], pad_c_len, .big);
     if (pad_c_len > 0) {
-        std.crypto.random.bytes(enc_payload[14 .. 14 + pad_c_len]);
+        random.bytes(enc_payload[14 .. 14 + pad_c_len]);
     }
     std.mem.writeInt(u16, enc_payload[14 + pad_c_len ..][0..2], 0, .big); // len(IA) = 0
 
@@ -386,8 +395,11 @@ pub fn handshakeInitiator(
 ///
 /// The responder must identify the torrent from the SKEY hash sent by the initiator.
 /// `known_hashes` is the list of info-hashes we're willing to accept.
+///
+/// `random` is the daemon-wide CSPRNG (`runtime.Random`).
 pub fn handshakeResponder(
     fd: posix.fd_t,
+    random: *Random,
     known_hashes: []const [20]u8,
     mode: EncryptionMode,
     allocator: std.mem.Allocator,
@@ -398,18 +410,18 @@ pub fn handshakeResponder(
     if (!isValidDhPublicKey(peer_public_key)) return error.InvalidDhPublicKey;
 
     // Step 2: Generate our DH keypair
-    const private_key = generatePrivateKey();
+    const private_key = generatePrivateKey(random);
     const public_key = computePublicKey(private_key);
 
     // Step 3: Send Yb + PadB
     var pad_b_len_bytes: [2]u8 = undefined;
-    std.crypto.random.bytes(&pad_b_len_bytes);
+    random.bytes(&pad_b_len_bytes);
     const pad_b_len: u16 = std.mem.readInt(u16, &pad_b_len_bytes, .big) % (max_pad_len + 1);
 
     var send_buf: [dh_key_size + max_pad_len]u8 = undefined;
     @memcpy(send_buf[0..dh_key_size], &public_key);
     if (pad_b_len > 0) {
-        std.crypto.random.bytes(send_buf[dh_key_size .. dh_key_size + pad_b_len]);
+        random.bytes(send_buf[dh_key_size .. dh_key_size + pad_b_len]);
     }
     try sendAll(fd, send_buf[0 .. dh_key_size + pad_b_len]);
 
@@ -571,7 +583,7 @@ pub fn handshakeResponder(
 
     // Build and send: encrypted(VC + crypto_select + len(PadD) + PadD)
     var pad_d_len_bytes: [2]u8 = undefined;
-    std.crypto.random.bytes(&pad_d_len_bytes);
+    random.bytes(&pad_d_len_bytes);
     const pad_d_len: u16 = std.mem.readInt(u16, &pad_d_len_bytes, .big) % (max_pad_len + 1);
 
     const resp_len = 8 + 4 + 2 + pad_d_len;
@@ -582,7 +594,7 @@ pub fn handshakeResponder(
     std.mem.writeInt(u32, resp_buf[8..12], crypto_select, .big);
     std.mem.writeInt(u16, resp_buf[12..14], pad_d_len, .big);
     if (pad_d_len > 0) {
-        std.crypto.random.bytes(resp_buf[14 .. 14 + pad_d_len]);
+        random.bytes(resp_buf[14 .. 14 + pad_d_len]);
     }
 
     enc_cipher.process(resp_buf, resp_buf);
@@ -722,6 +734,10 @@ const mse_recv_buf_size = 1088;
 /// Async MSE handshake state for initiator (outbound connections).
 pub const MseInitiatorHandshake = struct {
     phase: InitiatorPhase = .send_dh_key,
+    /// Daemon-wide CSPRNG. Borrowed (not owned) — must outlive the
+    /// handshake. Drives DH private-key generation, padding lengths,
+    /// and padding bytes. Same source for production and sim.
+    random: *Random,
     private_key: [dh_key_size]u8 = undefined,
     public_key: [dh_key_size]u8 = undefined,
     shared_secret: [dh_key_size]u8 = undefined,
@@ -763,24 +779,25 @@ pub const MseInitiatorHandshake = struct {
     crypto_provide_val: u32 = 0,
 
     /// Initialize and prepare the first send (DH public key + PadA).
-    pub fn init(info_hash: [20]u8, mode: EncryptionMode) MseInitiatorHandshake {
+    pub fn init(random: *Random, info_hash: [20]u8, mode: EncryptionMode) MseInitiatorHandshake {
         var self = MseInitiatorHandshake{
+            .random = random,
             .info_hash = info_hash,
             .mode = mode,
         };
 
         // Generate DH keypair
-        self.private_key = generatePrivateKey();
+        self.private_key = generatePrivateKey(random);
         self.public_key = computePublicKey(self.private_key);
 
         // Prepare send: Ya + PadA
         var pad_a_len_bytes: [2]u8 = undefined;
-        std.crypto.random.bytes(&pad_a_len_bytes);
+        random.bytes(&pad_a_len_bytes);
         const pad_a_len: u16 = std.mem.readInt(u16, &pad_a_len_bytes, .big) % (max_pad_len + 1);
 
         @memcpy(self.send_buf[0..dh_key_size], &self.public_key);
         if (pad_a_len > 0) {
-            std.crypto.random.bytes(self.send_buf[dh_key_size .. dh_key_size + pad_a_len]);
+            random.bytes(self.send_buf[dh_key_size .. dh_key_size + pad_a_len]);
         }
         self.send_len = dh_key_size + pad_a_len;
 
@@ -850,7 +867,7 @@ pub const MseInitiatorHandshake = struct {
                 // Encrypted portion: VC(8) + crypto_provide(4) + len(PadC)(2) + PadC + len(IA)(2)
                 self.crypto_provide_val = cryptoProvideFromMode(self.mode);
                 var pad_c_len_bytes: [2]u8 = undefined;
-                std.crypto.random.bytes(&pad_c_len_bytes);
+                self.random.bytes(&pad_c_len_bytes);
                 const pad_c_len: u16 = std.mem.readInt(u16, &pad_c_len_bytes, .big) % (max_pad_len + 1);
 
                 const enc_start: usize = 40;
@@ -860,7 +877,7 @@ pub const MseInitiatorHandshake = struct {
                 std.mem.writeInt(u32, enc_buf[8..12], self.crypto_provide_val, .big);
                 std.mem.writeInt(u16, enc_buf[12..14], pad_c_len, .big);
                 if (pad_c_len > 0) {
-                    std.crypto.random.bytes(enc_buf[14 .. 14 + pad_c_len]);
+                    self.random.bytes(enc_buf[14 .. 14 + pad_c_len]);
                 }
                 std.mem.writeInt(u16, enc_buf[14 + pad_c_len ..][0..2], 0, .big); // len(IA) = 0
 
@@ -963,6 +980,10 @@ pub const MseInitiatorHandshake = struct {
 /// Async MSE handshake state for responder (inbound connections).
 pub const MseResponderHandshake = struct {
     phase: ResponderPhase = .recv_dh_key,
+    /// Daemon-wide CSPRNG. Borrowed (not owned) — must outlive the
+    /// handshake. Drives DH private-key generation, padding lengths,
+    /// and padding bytes. Same source for production and sim.
+    random: *Random,
     private_key: [dh_key_size]u8 = undefined,
     public_key: [dh_key_size]u8 = undefined,
     shared_secret: [dh_key_size]u8 = undefined,
@@ -1017,27 +1038,29 @@ pub const MseResponderHandshake = struct {
     crypto_method: u32 = 0,
 
     /// Initialize and return the first action (recv DH key).
-    pub fn init(known_hashes: []const [20]u8, mode: EncryptionMode) MseResponderHandshake {
+    pub fn init(random: *Random, known_hashes: []const [20]u8, mode: EncryptionMode) MseResponderHandshake {
         var self = MseResponderHandshake{
+            .random = random,
             .mode = mode,
             .known_hashes = known_hashes,
         };
 
         // Generate DH keypair
-        self.private_key = generatePrivateKey();
+        self.private_key = generatePrivateKey(random);
         self.public_key = computePublicKey(self.private_key);
 
         return self;
     }
 
-    pub fn initWithLookup(known_hash_lookup: *const std.AutoHashMap([20]u8, [20]u8), mode: EncryptionMode) MseResponderHandshake {
+    pub fn initWithLookup(random: *Random, known_hash_lookup: *const std.AutoHashMap([20]u8, [20]u8), mode: EncryptionMode) MseResponderHandshake {
         var self = MseResponderHandshake{
+            .random = random,
             .mode = mode,
             .known_hashes = &.{},
             .known_hash_lookup = known_hash_lookup,
         };
 
-        self.private_key = generatePrivateKey();
+        self.private_key = generatePrivateKey(random);
         self.public_key = computePublicKey(self.private_key);
 
         return self;
@@ -1097,12 +1120,12 @@ pub const MseResponderHandshake = struct {
 
                 // Prepare send: Yb + PadB
                 var pad_b_len_bytes: [2]u8 = undefined;
-                std.crypto.random.bytes(&pad_b_len_bytes);
+                self.random.bytes(&pad_b_len_bytes);
                 const pad_b_len: u16 = std.mem.readInt(u16, &pad_b_len_bytes, .big) % (max_pad_len + 1);
 
                 @memcpy(self.send_buf[0..dh_key_size], &self.public_key);
                 if (pad_b_len > 0) {
-                    std.crypto.random.bytes(self.send_buf[dh_key_size .. dh_key_size + pad_b_len]);
+                    self.random.bytes(self.send_buf[dh_key_size .. dh_key_size + pad_b_len]);
                 }
                 self.send_len = dh_key_size + pad_b_len;
                 self.phase = .send_dh_key;
@@ -1318,7 +1341,7 @@ pub const MseResponderHandshake = struct {
     fn buildAndSendResponse(self: *MseResponderHandshake) MseAction {
         // Build: encrypted(VC + crypto_select + len(PadD) + PadD)
         var pad_d_len_bytes: [2]u8 = undefined;
-        std.crypto.random.bytes(&pad_d_len_bytes);
+        self.random.bytes(&pad_d_len_bytes);
         const pad_d_len: u16 = std.mem.readInt(u16, &pad_d_len_bytes, .big) % (max_pad_len + 1);
 
         const resp_len = 8 + 4 + 2 + pad_d_len;
@@ -1326,7 +1349,7 @@ pub const MseResponderHandshake = struct {
         std.mem.writeInt(u32, self.send_buf[8..12], self.crypto_method, .big);
         std.mem.writeInt(u16, self.send_buf[12..14], pad_d_len, .big);
         if (pad_d_len > 0) {
-            std.crypto.random.bytes(self.send_buf[14 .. 14 + pad_d_len]);
+            self.random.bytes(self.send_buf[14 .. 14 + pad_d_len]);
         }
 
         // Encrypt
@@ -1508,10 +1531,11 @@ test "DH powMod known-vector test (verified against Python)" {
 }
 
 test "DH key exchange produces same shared secret" {
+    var rng = Random.simRandom(0x600);
     // Generate two keypairs
-    const priv_a = generatePrivateKey();
+    const priv_a = generatePrivateKey(&rng);
     const pub_a = computePublicKey(priv_a);
-    const priv_b = generatePrivateKey();
+    const priv_b = generatePrivateKey(&rng);
     const pub_b = computePublicKey(priv_b);
 
     // Compute shared secrets both ways
@@ -1526,7 +1550,8 @@ test "DH key exchange produces same shared secret" {
 }
 
 test "DH public key is not trivial" {
-    const priv = generatePrivateKey();
+    var rng = Random.simRandom(0x601);
+    const priv = generatePrivateKey(&rng);
     const pub_key = computePublicKey(priv);
 
     // Public key should not be all zeros or all ones
@@ -1548,7 +1573,8 @@ test "reject invalid DH public keys" {
     one[dh_key_size - 1] = 1;
     try std.testing.expect(!isValidDhPublicKey(one));
 
-    try std.testing.expect(isValidDhPublicKey(computePublicKey(generatePrivateKey())));
+    var rng2 = Random.simRandom(0x602);
+    try std.testing.expect(isValidDhPublicKey(computePublicKey(generatePrivateKey(&rng2))));
 }
 
 test "hash derivation functions produce different outputs" {
@@ -1680,10 +1706,11 @@ test "full MSE handshake via loopback socket pair" {
     // individual components. The full handshake is tested via the
     // integration test with separate threads.
 
+    var rng = Random.simRandom(0x603);
     // Test that DH key exchange works correctly
-    const priv_a = generatePrivateKey();
+    const priv_a = generatePrivateKey(&rng);
     const pub_a = computePublicKey(priv_a);
-    const priv_b = generatePrivateKey();
+    const priv_b = generatePrivateKey(&rng);
     const pub_b = computePublicKey(priv_b);
 
     const sa = computeSharedSecret(priv_a, pub_b);
@@ -1750,7 +1777,8 @@ test "threaded full MSE handshake" {
             defer posix.close(fd);
 
             const known = [_][20]u8{hash};
-            var result = try handshakeResponder(fd, &known, .preferred, std.testing.allocator);
+            var rng = Random.realRandom();
+            var result = try handshakeResponder(fd, &rng, &known, .preferred, std.testing.allocator);
             defer result.deinit();
 
             try std.testing.expectEqual(crypto_rc4, result.crypto_method);
@@ -1769,7 +1797,8 @@ test "threaded full MSE handshake" {
     {
         defer posix.close(fds[0]);
 
-        var result = handshakeInitiator(fds[0], info_hash, .preferred, std.testing.allocator) catch |err| {
+        var rng = Random.realRandom();
+        var result = handshakeInitiator(fds[0], &rng, info_hash, .preferred, std.testing.allocator) catch |err| {
             log.err("initiator handshake failed: {s}", .{@errorName(err)});
             responder_thread.join();
             return err;
@@ -1794,8 +1823,9 @@ test "threaded MSE handshake with plaintext fallback" {
             defer posix.close(fd);
 
             const known = [_][20]u8{hash};
+            var rng = Random.realRandom();
             // Responder only allows plaintext
-            var result = try handshakeResponder(fd, &known, .disabled, std.testing.allocator);
+            var result = try handshakeResponder(fd, &rng, &known, .disabled, std.testing.allocator);
             defer result.deinit();
 
             try std.testing.expectEqual(crypto_plaintext, result.crypto_method);
@@ -1813,8 +1843,9 @@ test "threaded MSE handshake with plaintext fallback" {
     {
         defer posix.close(fds[0]);
 
+        var rng = Random.realRandom();
         // Initiator allows both
-        var result = handshakeInitiator(fds[0], info_hash, .enabled, std.testing.allocator) catch |err| {
+        var result = handshakeInitiator(fds[0], &rng, info_hash, .enabled, std.testing.allocator) catch |err| {
             log.err("initiator handshake failed: {s}", .{@errorName(err)});
             responder_thread.join();
             return err;
@@ -1832,8 +1863,9 @@ test "threaded MSE handshake with plaintext fallback" {
 // ── Async MSE state machine tests ───────────────────────
 
 test "MseInitiatorHandshake init produces send action" {
+    var rng = Random.simRandom(0x700);
     const info_hash = [_]u8{0x42} ** 20;
-    var hs = MseInitiatorHandshake.init(info_hash, .preferred);
+    var hs = MseInitiatorHandshake.init(&rng, info_hash, .preferred);
     const action = hs.start();
     switch (action) {
         .send => |data| {
@@ -1846,8 +1878,9 @@ test "MseInitiatorHandshake init produces send action" {
 }
 
 test "MseInitiatorHandshake send_dh_key transitions to recv_dh_key" {
+    var rng = Random.simRandom(0x701);
     const info_hash = [_]u8{0x42} ** 20;
-    var hs = MseInitiatorHandshake.init(info_hash, .preferred);
+    var hs = MseInitiatorHandshake.init(&rng, info_hash, .preferred);
     _ = hs.start();
 
     // After DH key send completes, should recv peer's DH key
@@ -1862,8 +1895,9 @@ test "MseInitiatorHandshake send_dh_key transitions to recv_dh_key" {
 }
 
 test "MseInitiatorHandshake recv_dh_key partial recv continues" {
+    var rng = Random.simRandom(0x702);
     const info_hash = [_]u8{0x42} ** 20;
-    var hs = MseInitiatorHandshake.init(info_hash, .preferred);
+    var hs = MseInitiatorHandshake.init(&rng, info_hash, .preferred);
     _ = hs.start();
     _ = hs.feedSend(); // -> recv_dh_key
 
@@ -1880,13 +1914,14 @@ test "MseInitiatorHandshake recv_dh_key partial recv continues" {
 }
 
 test "MseInitiatorHandshake recv_dh_key complete transitions to send_crypto_req" {
+    var rng = Random.simRandom(0x703);
     const info_hash = [_]u8{0x42} ** 20;
-    var hs = MseInitiatorHandshake.init(info_hash, .preferred);
+    var hs = MseInitiatorHandshake.init(&rng, info_hash, .preferred);
     _ = hs.start();
     _ = hs.feedSend(); // -> recv_dh_key
 
     // Generate a valid peer public key
-    const peer_priv = generatePrivateKey();
+    const peer_priv = generatePrivateKey(&rng);
     const peer_pub = computePublicKey(peer_priv);
     hs.peer_public_key = peer_pub;
 
@@ -1905,8 +1940,9 @@ test "MseInitiatorHandshake recv_dh_key complete transitions to send_crypto_req"
 }
 
 test "MseInitiatorHandshake zero recv is connection_closed" {
+    var rng = Random.simRandom(0x704);
     const info_hash = [_]u8{0x42} ** 20;
-    var hs = MseInitiatorHandshake.init(info_hash, .preferred);
+    var hs = MseInitiatorHandshake.init(&rng, info_hash, .preferred);
     _ = hs.start();
     _ = hs.feedSend(); // -> recv_dh_key
 
@@ -1920,9 +1956,10 @@ test "MseInitiatorHandshake zero recv is connection_closed" {
 }
 
 test "MseResponderHandshake init starts with recv" {
+    var rng = Random.simRandom(0x705);
     const info_hash = [_]u8{0x42} ** 20;
     const known = [_][20]u8{info_hash};
-    var hs = MseResponderHandshake.init(&known, .preferred);
+    var hs = MseResponderHandshake.init(&rng, &known, .preferred);
     const action = hs.start();
     switch (action) {
         .recv => |buf| {
@@ -1933,13 +1970,14 @@ test "MseResponderHandshake init starts with recv" {
 }
 
 test "MseResponderHandshake recv_dh_key transitions to send_dh_key" {
+    var rng = Random.simRandom(0x706);
     const info_hash = [_]u8{0x42} ** 20;
     const known = [_][20]u8{info_hash};
-    var hs = MseResponderHandshake.init(&known, .preferred);
+    var hs = MseResponderHandshake.init(&rng, &known, .preferred);
     _ = hs.start();
 
     // Generate a valid initiator public key
-    const init_priv = generatePrivateKey();
+    const init_priv = generatePrivateKey(&rng);
     const init_pub = computePublicKey(init_priv);
     hs.peer_public_key = init_pub;
 
@@ -1956,8 +1994,9 @@ test "MseResponderHandshake recv_dh_key transitions to send_dh_key" {
 }
 
 test "MseInitiatorHandshake rejects invalid DH public key" {
+    var rng = Random.simRandom(0x707);
     const info_hash = [_]u8{0x42} ** 20;
-    var hs = MseInitiatorHandshake.init(info_hash, .preferred);
+    var hs = MseInitiatorHandshake.init(&rng, info_hash, .preferred);
     _ = hs.start();
     _ = hs.feedSend();
     hs.peer_public_key = [_]u8{0} ** dh_key_size;
@@ -1970,9 +2009,10 @@ test "MseInitiatorHandshake rejects invalid DH public key" {
 }
 
 test "MseResponderHandshake rejects oversized initial payload" {
+    var rng = Random.simRandom(0x708);
     const info_hash = [_]u8{0x42} ** 20;
     const known = [_][20]u8{info_hash};
-    var hs = MseResponderHandshake.init(&known, .preferred);
+    var hs = MseResponderHandshake.init(&rng, &known, .preferred);
     hs.phase = .recv_pad_c_ia_len;
     hs.pad_c_len = 0;
     hs.remaining_len = 2;
@@ -1987,13 +2027,14 @@ test "MseResponderHandshake rejects oversized initial payload" {
 }
 
 test "MseResponderHandshake send_dh_key transitions to recv_req1_scan" {
+    var rng = Random.simRandom(0x709);
     const info_hash = [_]u8{0x42} ** 20;
     const known = [_][20]u8{info_hash};
-    var hs = MseResponderHandshake.init(&known, .preferred);
+    var hs = MseResponderHandshake.init(&rng, &known, .preferred);
     _ = hs.start();
 
     // Simulate DH key recv
-    const init_priv = generatePrivateKey();
+    const init_priv = generatePrivateKey(&rng);
     const init_pub = computePublicKey(init_priv);
     hs.peer_public_key = init_pub;
     _ = hs.feedRecv(dh_key_size); // -> send_dh_key
@@ -2023,9 +2064,10 @@ test "looksLikeMse detects BT vs MSE first byte" {
 }
 
 test "MseInitiatorHandshake result returns plaintext for disabled mode" {
+    var rng = Random.simRandom(0x70a);
     // When crypto_method is plaintext, result should be plaintext PeerCrypto
     const info_hash = [_]u8{0x42} ** 20;
-    var hs = MseInitiatorHandshake.init(info_hash, .disabled);
+    var hs = MseInitiatorHandshake.init(&rng, info_hash, .disabled);
     hs.crypto_method = crypto_plaintext;
     hs.phase = .done;
 
@@ -2036,13 +2078,14 @@ test "MseInitiatorHandshake result returns plaintext for disabled mode" {
 }
 
 test "MseResponderHandshake unknown info-hash fails" {
+    var rng = Random.simRandom(0x70b);
     const info_hash = [_]u8{0x42} ** 20;
     const wrong_hash = [_]u8{0xFF} ** 20;
     const known = [_][20]u8{wrong_hash}; // doesn't match info_hash
-    var hs = MseResponderHandshake.init(&known, .preferred);
+    var hs = MseResponderHandshake.init(&rng, &known, .preferred);
 
     // Set up shared secret and expected values
-    const priv_a = generatePrivateKey();
+    const priv_a = generatePrivateKey(&rng);
     const pub_a = computePublicKey(priv_a);
     const priv_b = hs.private_key;
 
@@ -2081,13 +2124,14 @@ test "encryption mode config: cryptoProvideFromMode coverage" {
 }
 
 test "MseInitiatorHandshake vc_scan exceeds limit returns vc_not_found" {
+    var rng = Random.simRandom(0x70c);
     const info_hash = [_]u8{0x42} ** 20;
-    var hs = MseInitiatorHandshake.init(info_hash, .preferred);
+    var hs = MseInitiatorHandshake.init(&rng, info_hash, .preferred);
     _ = hs.start();
     _ = hs.feedSend(); // -> recv_dh_key
 
     // Provide valid DH key
-    const peer_priv = generatePrivateKey();
+    const peer_priv = generatePrivateKey(&rng);
     const peer_pub = computePublicKey(peer_priv);
     hs.peer_public_key = peer_pub;
     _ = hs.feedRecv(dh_key_size); // -> send_crypto_req
@@ -2117,12 +2161,14 @@ test "MseInitiatorHandshake vc_scan exceeds limit returns vc_not_found" {
 }
 
 test "MseInitiator and MseResponder shared_secret agree after DH exchange" {
+    var rng_a = Random.simRandom(0x70d);
+    var rng_b = Random.simRandom(0x70e);
     const info_hash = [_]u8{0x42} ** 20;
     const known = [_][20]u8{info_hash};
 
     // Create initiator and responder
-    var ini = MseInitiatorHandshake.init(info_hash, .preferred);
-    var resp = MseResponderHandshake.init(&known, .preferred);
+    var ini = MseInitiatorHandshake.init(&rng_a, info_hash, .preferred);
+    var resp = MseResponderHandshake.init(&rng_b, &known, .preferred);
 
     // Initiator's first action: send Ya + PadA. Extract Ya (first dh_key_size bytes).
     const ini_send_action = ini.start();
@@ -2158,13 +2204,15 @@ test "MseInitiator and MseResponder shared_secret agree after DH exchange" {
 }
 
 test "MseInitiator and MseResponder full async handshake completes" {
+    var rng_a = Random.simRandom(0x70f);
+    var rng_b = Random.simRandom(0x710);
     // Simulate the full async MSE handshake, piping data between both sides.
     // This is the async equivalent of a blocking handshakeInitiator/handshakeResponder pair.
     const info_hash = [_]u8{0x42} ** 20;
     const known = [_][20]u8{info_hash};
 
-    var ini = MseInitiatorHandshake.init(info_hash, .preferred);
-    var resp = MseResponderHandshake.init(&known, .preferred);
+    var ini = MseInitiatorHandshake.init(&rng_a, info_hash, .preferred);
+    var resp = MseResponderHandshake.init(&rng_b, &known, .preferred);
 
     // Step 1: Initiator sends Ya + PadA
     const ini_start = ini.start();

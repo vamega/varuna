@@ -189,7 +189,8 @@ pub const SessionManager = struct {
         const session = try self.allocator.create(TorrentSession);
         errdefer self.allocator.destroy(session);
 
-        session.* = try TorrentSession.create(self.allocator, torrent_bytes, save_path, self.masquerade_as);
+        const el = self.shared_event_loop orelse return error.SharedEventLoopNotConfigured;
+        session.* = try TorrentSession.create(self.allocator, &el.random, torrent_bytes, save_path, self.masquerade_as);
         errdefer session.deinit();
 
         try self.configureManagedSession(session);
@@ -206,7 +207,8 @@ pub const SessionManager = struct {
         const session = try self.allocator.create(TorrentSession);
         errdefer self.allocator.destroy(session);
 
-        session.* = try TorrentSession.createFromMagnet(self.allocator, magnet_uri, save_path, self.masquerade_as);
+        const el = self.shared_event_loop orelse return error.SharedEventLoopNotConfigured;
+        session.* = try TorrentSession.createFromMagnet(self.allocator, &el.random, magnet_uri, save_path, self.masquerade_as);
         errdefer session.deinit();
 
         try self.configureManagedSession(session);
@@ -720,7 +722,7 @@ pub const SessionManager = struct {
     fn ensureUdpTrackerExecutor(self: *SessionManager) !*UdpTrackerExecutor {
         if (self.udp_tracker_executor == null) {
             const el = self.shared_event_loop orelse return error.SharedEventLoopNotConfigured;
-            self.udp_tracker_executor = try UdpTrackerExecutor.create(self.allocator, &el.io, .{
+            self.udp_tracker_executor = try UdpTrackerExecutor.create(self.allocator, &el.io, &el.random, .{
                 .bind_device = self.bind_device,
             });
             // Wire into event loop for CQE dispatch

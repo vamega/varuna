@@ -30,19 +30,18 @@ What does NOT yet work deterministically:
 - DNS lookups (real network, outside SimIO, plus `bind_device` is
   silently bypassed)
 - Hasher pool — uses real OS threads via `std.Thread.spawn`
-- Security-critical randomness (MSE keys, peer ID, DHT node ID, DHT
-  tokens, RPC SID) — deliberately stays on `std.crypto.random` so
-  production unpredictability is preserved. Sim tests that touch
-  these paths configure around them (`encryption_mode = .disabled`,
-  fixed peer IDs) or use behavioural assertions. See
-  `src/runtime/random.zig` for the policy.
 
-What now DOES work deterministically (post-Phase-2 SimClock/SimRandom):
+What now DOES work deterministically (post-Phase-2 SimClock + SimRandom + CSPRNG migration):
 
 - Wall-clock reads via `runtime.Clock` (Real / Sim variants)
-- Non-cryptographic randomness via `runtime.Random` (tracker `key`
-  migrated; UDP tx IDs / uTP conn IDs / smart-ban tie-breaks
-  tracked as follow-up)
+- All daemon randomness via `runtime.Random` (tagged-union over
+  `.real: ChaCha` / `.sim: ChaCha`; only the seed source differs).
+  Closed 2026-04-30 — covers the previously-preserved sites (MSE
+  handshake DH keys, peer ID, DHT node ID, DHT tokens, RPC SID)
+  alongside the non-cryptographic ones (UDP tx IDs, uTP conn IDs,
+  tracker `key`, smart-ban tie-breaks). See
+  `progress-reports/2026-04-30-csprng-migration.md` and
+  `src/runtime/random.zig` for the threat model.
 - External services — trackers, web seeds, DHT nodes, DNS servers —
   are real or hand-mocked, not sim partners
 - Multi-daemon simulation (one daemon per simulator process today)
@@ -80,30 +79,42 @@ remaining nondeterminism boundaries.
 2. **SimClock + SimRandom abstractions** (~1-2 days each). DONE
    (`progress-reports/2026-04-29-clock-random.md`). `runtime.Clock`
    (tagged-union over `.real` / `.sim: u64`) and `runtime.Random`
-   (tagged-union over `.real` / `.sim: DefaultPrng`) live in
-   `src/runtime/`; `EventLoop` carries both as fields. Callers
-   migrated for nanos-precision time (`rate_limiter.zig`,
-   peer-policy test sites) and one Random consumer
-   (`tracker.Request.generateKey`).
+   (originally tagged-union over `.real: void` /
+   `.sim: DefaultPrng`) live in `src/runtime/`; `EventLoop` carries
+   both as fields. Callers migrated for nanos-precision time
+   (`rate_limiter.zig`, peer-policy test sites) and one Random
+   consumer (`tracker.Request.generateKey`).
 
-   **Crypto-determinism boundary** initially documented as "do not
-   cross" — but the team has since committed to closing it. The
-   current 5 `std.crypto.random` callers (MSE keys
-   `src/crypto/mse.zig`, peer ID `src/torrent/peer_id.zig`, DHT node
-   ID `src/dht/node_id.zig`, DHT tokens `src/dht/token.zig`, RPC SID
-   `src/rpc/auth.zig`) will migrate to a daemon-seeded CSPRNG.
-   Production behavior: at startup, seed a ChaCha20-based CSPRNG once
-   from `std.crypto.random.bytes(&seed)`; route all subsequent random
-   reads through the seeded instance. Cryptographic strength is
-   preserved because a 256-bit seed from a real source plus a modern
-   CSPRNG is computationally indistinguishable from a true random
-   source for the lifetime of a single daemon process — the standard
-   "seed once, generate many" pattern. Sim builds inject a known seed
-   via the same surface; same CSPRNG implementation; same code paths;
-   just a deterministic seed. This closes the boundary entirely.
-   Tracked in STATUS.md "Next" — estimated 3-4 days. Until that lands,
-   sim tests touching the 5 callers remain non-byte-deterministic; use
-   behavioral assertions instead.
+   **Crypto-determinism boundary** — closed 2026-04-30
+   (`progress-reports/2026-04-30-csprng-migration.md`). The five
+   `std.crypto.random` callers documented in the SimRandom round
+   (MSE keys `src/crypto/mse.zig`, peer ID
+   `src/torrent/peer_id.zig`, DHT node ID `src/dht/node_id.zig`,
+   DHT tokens `src/dht/token.zig`, RPC SID `src/rpc/auth.zig`) plus
+   two non-cryptographic stragglers (uTP conn-id
+   `src/net/utp.zig`, UDP tracker tx-id `src/tracker/udp.zig`) all
+   route through the daemon-wide `EventLoop.random` via `*Random`
+   injection through their constructors.
+
+   `runtime.Random` was retrofitted: both `.real` and `.sim`
+   variants now wrap `std.Random.ChaCha` (ChaCha8 IETF with
+   fast-key-erasure forward security per Bernstein 2017); only the
+   seed source differs. Production: 32 bytes from
+   `std.crypto.random.bytes()` once at construction. Sim:
+   `Random.simRandomFromKey([32]u8)` or `Random.simRandom(u64)`
+   takes the seed as a parameter. Cryptographic strength is
+   preserved because a 256-bit seed from a real source plus a
+   modern CSPRNG is computationally indistinguishable from a true
+   random source for the lifetime of a single daemon process —
+   standard "seed once, generate many" pattern, same construction
+   `getrandom(2)` itself uses internally on Linux 5.18+.
+
+   Sim tests can now use byte-equality assertions instead of
+   behavioural assertions on every previously-boundary path. See
+   `tests/csprng_determinism_test.zig` for the canonical proof:
+   one shared `*Random` reproduces every sensitive output (peer
+   ID, node ID, token secret, RPC SID, MSE DH private/public key)
+   byte-for-byte across two scenario runs.
 3. ~~**SimHasher** — make the hasher deterministic.~~ Closed
    2026-04-30. Tagged-union shape landed: `src/io/hasher.zig` exposes
    `Hasher = union(enum) { real: *RealHasher, sim: *SimHasher }` with
