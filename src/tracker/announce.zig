@@ -22,7 +22,13 @@ pub fn fetchAutoWithDns(
     request: Request,
 ) !Response {
     if (std.mem.startsWith(u8, request.announce_url, "udp://")) {
-        return @import("udp.zig").fetchViaUdp(allocator, request);
+        // Synchronous fetchViaUdp is the varuna-ctl path — it is not
+        // used by the daemon (which goes through `UdpTrackerExecutor`
+        // and the daemon-wide `EventLoop.random`). A local
+        // `realRandom()` here is fine: varuna-ctl is short-lived and
+        // not driven by the simulator.
+        var rng = @import("../runtime/random.zig").Random.realRandom();
+        return @import("udp.zig").fetchViaUdp(allocator, &rng, request);
     }
     return fetchViaHttp(allocator, dns_resolver, request);
 }

@@ -1367,7 +1367,7 @@ pub fn EventLoopOf(comptime IO: type) type {
             }
 
             const now_us = utp_handler.utpNowUs();
-            const conn = mgr.connect(address, now_us) catch |err| {
+            const conn = mgr.connect(&self.random, address, now_us) catch |err| {
                 log.warn("uTP connect failed: {s}", .{@errorName(err)});
                 return error.UtpConnectFailed;
             };

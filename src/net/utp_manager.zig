@@ -3,6 +3,7 @@ const utp = @import("utp.zig");
 const Header = utp.Header;
 const UtpSocket = utp.UtpSocket;
 const State = utp.State;
+const Random = @import("../runtime/random.zig").Random;
 
 /// Maximum number of concurrent uTP connections.
 pub const max_connections: u16 = 512;
@@ -53,13 +54,13 @@ pub const UtpManager = struct {
 
     /// Initiate an outbound uTP connection. Returns the slot index and
     /// the SYN packet to send.
-    pub fn connect(self: *UtpManager, remote: std.net.Address, now_us: u32) !ConnectResult {
+    pub fn connect(self: *UtpManager, random: *Random, remote: std.net.Address, now_us: u32) !ConnectResult {
         const slot = self.allocSlot() orelse return error.TooManyConnections;
         const sock = self.connections[slot].?;
         sock.remote_addr = remote;
         sock.allocator = self.allocator;
 
-        const syn_pkt = sock.connect(now_us);
+        const syn_pkt = sock.connect(random, now_us);
 
         return .{
             .slot = slot,
@@ -389,12 +390,17 @@ pub const PacketResult = struct {
 
 // ── Tests ─────────────────────────────────────────────────
 
+/// File-scoped sim-seeded CSPRNG for the UtpManager test fixtures.
+/// The connection-id is a 16-bit collision-avoidance value, not a
+/// security primitive — these tests treat it as opaque.
+var utp_test_rng: Random = Random.simRandom(0xa70);
+
 test "manager connect allocates slot and produces SYN" {
     var mgr = UtpManager.init(std.testing.allocator);
     defer mgr.deinit();
     const remote = std.net.Address.initIp4(.{ 127, 0, 0, 1 }, 6881);
 
-    const result = try mgr.connect(remote, 1_000_000);
+    const result = try mgr.connect(&utp_test_rng, remote, 1_000_000);
     try std.testing.expect(result.slot < max_connections);
     try std.testing.expectEqual(@as(u16, 1), mgr.connectionCount());
 
@@ -469,7 +475,7 @@ test "manager full handshake between two managers" {
     const server_addr = std.net.Address.initIp4(.{ 127, 0, 0, 1 }, 6000);
 
     // Client sends SYN.
-    const conn = try client_mgr.connect(server_addr, 1_000_000);
+    const conn = try client_mgr.connect(&utp_test_rng, server_addr, 1_000_000);
 
     // Server receives SYN.
     const srv_result = server_mgr.processPacket(&conn.syn_packet, client_addr, 1_001_000);
@@ -491,7 +497,7 @@ test "manager close sends FIN" {
     defer mgr.deinit();
     const remote = std.net.Address.initIp4(.{ 127, 0, 0, 1 }, 6881);
 
-    const conn = try mgr.connect(remote, 1_000_000);
+    const conn = try mgr.connect(&utp_test_rng, remote, 1_000_000);
     // Manually transition to connected for testing.
     mgr.connections[conn.slot].?.state = .connected;
 
@@ -509,10 +515,10 @@ test "manager connection count tracks correctly" {
 
     try std.testing.expectEqual(@as(u16, 0), mgr.connectionCount());
 
-    const c1 = try mgr.connect(remote, 1_000_000);
+    const c1 = try mgr.connect(&utp_test_rng, remote, 1_000_000);
     try std.testing.expectEqual(@as(u16, 1), mgr.connectionCount());
 
-    const c2 = try mgr.connect(remote, 1_000_000);
+    const c2 = try mgr.connect(&utp_test_rng, remote, 1_000_000);
     try std.testing.expectEqual(@as(u16, 2), mgr.connectionCount());
 
     // Reset one connection -- should free the slot.
@@ -528,7 +534,7 @@ test "manager connect sets allocator on socket" {
     defer mgr.deinit();
     const remote = std.net.Address.initIp4(.{ 127, 0, 0, 1 }, 6881);
 
-    const conn = try mgr.connect(remote, 1_000_000);
+    const conn = try mgr.connect(&utp_test_rng, remote, 1_000_000);
     const sock = mgr.getSocket(conn.slot).?;
     try std.testing.expect(sock.allocator != null);
 
@@ -545,7 +551,7 @@ test "manager handshake with retransmission and data exchange" {
     const server_addr = std.net.Address.initIp4(.{ 127, 0, 0, 1 }, 6000);
 
     // Client connects.
-    const conn = try client_mgr.connect(server_addr, 1_000_000);
+    const conn = try client_mgr.connect(&utp_test_rng, server_addr, 1_000_000);
     const client_sock = client_mgr.getSocket(conn.slot).?;
     try std.testing.expectEqual(@as(u16, 1), client_sock.out_buf_count);
 
@@ -588,7 +594,7 @@ test "manager collectRetransmits returns timed-out packets" {
     // orphaned at idx 0; handleTimeout then marked an empty slot at
     // idx 10 as needs_resend, and collectRetransmits returned zero.
     // Use the natural buffered SYN as the timeout target instead.
-    const conn = try mgr.connect(remote, 1_000_000);
+    const conn = try mgr.connect(&utp_test_rng, remote, 1_000_000);
 
     // Simulate timeout: advance past the initial RTO (1s).
     var timeout_buf: [64]u16 = undefined;
@@ -611,7 +617,7 @@ test "manager freeSlot cleans up outbound buffers" {
     defer mgr.deinit();
     const remote = std.net.Address.initIp4(.{ 127, 0, 0, 1 }, 6881);
 
-    const conn = try mgr.connect(remote, 1_000_000);
+    const conn = try mgr.connect(&utp_test_rng, remote, 1_000_000);
 
     // SYN is buffered with allocator-owned data.
     const sock = mgr.getSocket(conn.slot).?;

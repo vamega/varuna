@@ -1588,7 +1588,7 @@ pub const TorrentSession = struct {
         const parsed = udp_mod.parseUdpUrl(request.announce_url) orelse return false;
         const executor = self.udp_tracker_executor orelse return false;
 
-        const key_value: u32 = if (request.key) |k| std.mem.readInt(u32, k[0..4], .big) else udp_mod.generateTransactionId();
+        const key_value: u32 = if (request.key) |k| std.mem.readInt(u32, k[0..4], .big) else udp_mod.generateTransactionId(executor.random);
         var job = UdpTrackerExecutor.Job{
             .context = @ptrCast(self),
             .on_complete = on_complete,

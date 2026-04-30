@@ -5,6 +5,7 @@ const udp = @import("../tracker/udp.zig");
 const dns_mod = @import("../io/dns.zig");
 const DnsResolver = dns_mod.DnsResolver;
 const DnsJob = @import("../io/dns_threadpool.zig").DnsJob;
+const Random = @import("../runtime/random.zig").Random;
 
 const io_interface = @import("../io/io_interface.zig");
 const backend = @import("../io/backend.zig");
@@ -36,6 +37,10 @@ pub fn UdpTrackerExecutorOf(comptime IO: type) type {
         running: std.atomic.Value(bool) = std.atomic.Value(bool).init(true),
 
         io: *IO,
+        /// Daemon-wide CSPRNG. Borrowed (not owned) — typically points
+        /// into the shared `EventLoop.random`. Drives transaction-id
+        /// generation. Same source for production and sim.
+        random: *Random,
         dns_event_fd: posix.fd_t,
         dns_poll_completion: io_interface.Completion = .{},
 
@@ -165,7 +170,7 @@ pub fn UdpTrackerExecutorOf(comptime IO: type) type {
 
         // ── Public API ───────────────────────────────────────────
 
-        pub fn create(allocator: std.mem.Allocator, io: *IO, config: Config) !*Self {
+        pub fn create(allocator: std.mem.Allocator, io: *IO, random: *Random, config: Config) !*Self {
             const self = try allocator.create(Self);
             errdefer allocator.destroy(self);
 
@@ -175,6 +180,7 @@ pub fn UdpTrackerExecutorOf(comptime IO: type) type {
             self.* = .{
                 .allocator = allocator,
                 .io = io,
+                .random = random,
                 .dns_event_fd = dns_event_fd,
                 .pending_jobs = std.ArrayList(Job).empty,
                 .max_slots = config.max_slots,
@@ -438,7 +444,7 @@ pub fn UdpTrackerExecutorOf(comptime IO: type) type {
 
         fn startConnect(self: *Self, slot: *RequestSlot, slot_idx: u16) void {
             slot.state = .connecting;
-            slot.connect_txid = udp.generateTransactionId();
+            slot.connect_txid = udp.generateTransactionId(self.random);
             slot.last_send_time = std.time.timestamp();
 
             const pkt = udp.ConnectRequest{ .transaction_id = slot.connect_txid };
@@ -452,7 +458,7 @@ pub fn UdpTrackerExecutorOf(comptime IO: type) type {
 
         fn startAnnounce(self: *Self, slot: *RequestSlot, slot_idx: u16) void {
             slot.state = .announcing;
-            slot.request_txid = udp.generateTransactionId();
+            slot.request_txid = udp.generateTransactionId(self.random);
             slot.last_send_time = std.time.timestamp();
 
             const req = udp.AnnounceRequest{
@@ -479,7 +485,7 @@ pub fn UdpTrackerExecutorOf(comptime IO: type) type {
 
         fn startScrape(self: *Self, slot: *RequestSlot, slot_idx: u16) void {
             slot.state = .scraping;
-            slot.request_txid = udp.generateTransactionId();
+            slot.request_txid = udp.generateTransactionId(self.random);
             slot.last_send_time = std.time.timestamp();
 
             const encoded = udp.ScrapeRequest.encodeSingle(

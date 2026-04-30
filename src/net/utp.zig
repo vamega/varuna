@@ -1,5 +1,6 @@
 const std = @import("std");
 const Ledbat = @import("ledbat.zig").Ledbat;
+const Random = @import("../runtime/random.zig").Random;
 
 /// uTP (Micro Transport Protocol, BEP 29) packet types.
 pub const PacketType = enum(u4) {
@@ -315,10 +316,16 @@ pub const UtpSocket = struct {
     /// Begin an outbound connection. Generates a SYN packet and stores
     /// it in the outbound buffer for retransmission on timeout.
     /// Returns the encoded SYN packet to send.
-    pub fn connect(self: *UtpSocket, now_us: u32) [Header.size]u8 {
+    ///
+    /// `random` is the daemon-wide CSPRNG (`runtime.Random`). The uTP
+    /// connection-id is a 16-bit collision-avoidance token, not a
+    /// security primitive — the protocol tolerates collisions — but
+    /// it goes through the same daemon-wide source for sim
+    /// determinism.
+    pub fn connect(self: *UtpSocket, random: *Random, now_us: u32) [Header.size]u8 {
         // Generate random connection_id.
         var rng_buf: [2]u8 = undefined;
-        std.crypto.random.bytes(&rng_buf);
+        random.bytes(&rng_buf);
         const conn_id = std.mem.readInt(u16, &rng_buf, .little);
 
         self.recv_id = conn_id;
@@ -942,7 +949,8 @@ test "seqDiff wrapping arithmetic" {
 
 test "connect produces SYN packet" {
     var sock = UtpSocket{};
-    const pkt = sock.connect(1_000_000);
+    var rng = Random.simRandom(0x900);
+    const pkt = sock.connect(&rng, 1_000_000);
 
     const hdr = Header.decode(&pkt) orelse return error.DecodeFailed;
     try std.testing.expectEqual(PacketType.st_syn, hdr.packet_type);
@@ -978,7 +986,8 @@ test "acceptSyn transitions to connected" {
 test "three-way handshake" {
     // Initiator (client).
     var client = UtpSocket{};
-    const syn_pkt = client.connect(1_000_000);
+    var rng = Random.simRandom(0x901);
+    const syn_pkt = client.connect(&rng, 1_000_000);
     const syn_hdr = Header.decode(&syn_pkt).?;
 
     // Responder (server) receives SYN.
@@ -1510,7 +1519,8 @@ test "connect stores SYN in outbound buffer for retransmission" {
     sock.allocator = allocator;
     defer sock.deinit();
 
-    _ = sock.connect(1_000_000);
+    var rng = Random.simRandom(0x902);
+    _ = sock.connect(&rng, 1_000_000);
 
     // SYN should be stored in the outbound buffer.
     try std.testing.expectEqual(@as(u16, 1), sock.out_buf_count);
@@ -1674,7 +1684,8 @@ test "three-way handshake with retransmission buffer" {
     var client = UtpSocket{};
     client.allocator = allocator;
     defer client.deinit();
-    const syn_pkt = client.connect(1_000_000);
+    var rng = Random.simRandom(0x903);
+    const syn_pkt = client.connect(&rng, 1_000_000);
     const syn_hdr = Header.decode(&syn_pkt).?;
 
     try std.testing.expectEqual(State.syn_sent, client.state);

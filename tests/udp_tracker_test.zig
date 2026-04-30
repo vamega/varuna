@@ -1,6 +1,12 @@
 const std = @import("std");
 const varuna = @import("varuna");
 const udp = varuna.tracker.udp;
+const Random = varuna.runtime.Random;
+
+/// File-scoped sim-seeded CSPRNG for the UDP tracker test fixtures.
+/// The transaction id is a 32-bit nonce — these tests only assert
+/// matching, not unpredictability.
+var udp_test_rng: Random = Random.simRandom(0xb70);
 
 // ── UDP Tracker Integration Tests (BEP 15) ──────────────────
 //
@@ -105,7 +111,7 @@ test "full UDP connect then announce over real sockets" {
     const url = std.fmt.bufPrint(&url_buf, "udp://127.0.0.1:{d}/announce", .{port}) catch unreachable;
 
     // Perform the UDP announce
-    const response = try udp.fetchViaUdp(std.testing.allocator, .{
+    const response = try udp.fetchViaUdp(std.testing.allocator, &udp_test_rng, .{
         .announce_url = url,
         .info_hash = [_]u8{0xAA} ** 20,
         .peer_id = [_]u8{0xBB} ** 20,
@@ -167,7 +173,7 @@ test "error response from tracker" {
     var url_buf: [64]u8 = undefined;
     const url = std.fmt.bufPrint(&url_buf, "udp://127.0.0.1:{d}/announce", .{port}) catch unreachable;
 
-    const result = udp.fetchViaUdp(std.testing.allocator, .{
+    const result = udp.fetchViaUdp(std.testing.allocator, &udp_test_rng, .{
         .announce_url = url,
         .info_hash = [_]u8{0xAA} ** 20,
         .peer_id = [_]u8{0xBB} ** 20,
@@ -248,7 +254,7 @@ test "connection ID reuse across announces" {
     const url = std.fmt.bufPrint(&url_buf, "udp://127.0.0.1:{d}/announce", .{port}) catch unreachable;
 
     // First announce: connect + announce
-    const resp1 = try udp.fetchViaUdp(std.testing.allocator, .{
+    const resp1 = try udp.fetchViaUdp(std.testing.allocator, &udp_test_rng, .{
         .announce_url = url,
         .info_hash = [_]u8{0xDD} ** 20,
         .peer_id = [_]u8{0xEE} ** 20,
@@ -260,7 +266,7 @@ test "connection ID reuse across announces" {
     try std.testing.expectEqual(@as(u32, 900), resp1.interval);
 
     // Second announce: should reuse cached connection ID (no connect needed)
-    const resp2 = try udp.fetchViaUdp(std.testing.allocator, .{
+    const resp2 = try udp.fetchViaUdp(std.testing.allocator, &udp_test_rng, .{
         .announce_url = url,
         .info_hash = [_]u8{0xDD} ** 20,
         .peer_id = [_]u8{0xEE} ** 20,

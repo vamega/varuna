@@ -722,7 +722,7 @@ pub const SessionManager = struct {
     fn ensureUdpTrackerExecutor(self: *SessionManager) !*UdpTrackerExecutor {
         if (self.udp_tracker_executor == null) {
             const el = self.shared_event_loop orelse return error.SharedEventLoopNotConfigured;
-            self.udp_tracker_executor = try UdpTrackerExecutor.create(self.allocator, &el.io, .{
+            self.udp_tracker_executor = try UdpTrackerExecutor.create(self.allocator, &el.io, &el.random, .{
                 .bind_device = self.bind_device,
             });
             // Wire into event loop for CQE dispatch
