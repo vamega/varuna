@@ -8,6 +8,13 @@ SEED_PORT="${SEED_PORT:-6881}"
 SEED_API_PORT="${SEED_API_PORT:-8081}"
 DOWNLOAD_PORT="${DOWNLOAD_PORT:-6882}"
 DOWNLOAD_API_PORT="${DOWNLOAD_API_PORT:-8082}"
+# Cross-backend validation hook: when IO_BACKEND is set to a non-default
+# value (epoll_posix, epoll_mmap, ...), the daemon binary is rebuilt with
+# `-Dio=$IO_BACKEND` after the default io_uring build. The default build
+# is still required because varuna-tools (used to create the test
+# fixture) is hard-wired to io_uring per AGENTS.md and is not installed
+# under non-io_uring backends.
+IO_BACKEND="${IO_BACKEND:-io_uring}"
 TRACKER_PID=""
 SEED_DAEMON_PID=""
 DOWNLOAD_DAEMON_PID=""
@@ -68,7 +75,21 @@ DOWNLOAD_LOG="$WORK_DIR/download.log"
 
 printf 'hello from varuna swarm demo\n' >"$PAYLOAD_PATH"
 
-mise exec -- zig build >/dev/null
+# Pick the build wrapper. `mise exec` is the standard path documented in
+# AGENTS.md, but the nix-based devshell doesn't ship mise — there `zig`
+# is on $PATH directly. Fall through transparently.
+if command -v mise >/dev/null 2>&1; then
+  ZIG_BUILD=(mise exec -- zig build)
+else
+  ZIG_BUILD=(zig build)
+fi
+
+"${ZIG_BUILD[@]}" >/dev/null
+
+if [[ "$IO_BACKEND" != "io_uring" ]]; then
+  echo "rebuilding varuna with -Dio=$IO_BACKEND (varuna-tools stays io_uring)"
+  "${ZIG_BUILD[@]}" "-Dio=$IO_BACKEND" >/dev/null
+fi
 
 "$VARUNA_TOOLS" create \
   -a "http://127.0.0.1:$TRACKER_PORT/announce" \
