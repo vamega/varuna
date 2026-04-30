@@ -38,7 +38,7 @@
 //! Daemon callers (`src/storage/writer.zig`, `src/io/event_loop.zig`,
 //! `src/io/recheck.zig`, `src/io/metadata_handler.zig`,
 //! `src/io/http_executor.zig`, `src/rpc/server.zig`,
-//! `src/daemon/tracker_executor.zig`, `src/daemon/udp_tracker_executor.zig`,
+//! `src/tracker/executor.zig`, `src/tracker/udp_executor.zig`,
 //! `src/daemon/torrent_session.zig`) reach the chosen backend through
 //! the `RealIO` alias here. Standalone CLI tools (`src/app.zig`,
 //! `src/storage/verify.zig`) and benchmarks (`src/perf/workloads.zig`)

@@ -11,8 +11,8 @@ const ResumeDb = @import("../storage/state_db.zig").ResumeDb;
 const BanList = @import("../net/ban_list.zig").BanList;
 const SmartBan = @import("../net/smart_ban.zig").SmartBan;
 const HttpExecutor = @import("../io/http_executor.zig").HttpExecutor;
-const TrackerExecutor = @import("tracker_executor.zig").TrackerExecutor;
-const UdpTrackerExecutor = @import("udp_tracker_executor.zig").UdpTrackerExecutor;
+const TrackerExecutor = @import("../tracker/executor.zig").TrackerExecutor;
+const UdpTrackerExecutor = @import("../tracker/udp_executor.zig").UdpTrackerExecutor;
 
 /// Manages multiple torrent sessions for the daemon.
 /// Thread-safe: the API server and event loop can access concurrently.
