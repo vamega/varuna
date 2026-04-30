@@ -337,7 +337,15 @@ pub const DnsResolver = struct {
         const epfd = try posix.epoll_create1(linux.EPOLL.CLOEXEC);
         defer posix.close(epfd);
 
-        // Process loop: wait on c-ares fds until done or timeout
+        // Process loop: wait on c-ares fds until done or timeout.
+        //
+        // Clock injection note: these `std.time.milliTimestamp()` calls
+        // intentionally bypass the runtime `Clock` abstraction. This
+        // function runs on a DNS worker thread alongside a synchronous
+        // `epoll_wait`; the wait deadline is computed against real wall
+        // time and there's no way to drive it deterministically without
+        // also virtualising c-ares' internal IO. Sim-time DNS is
+        // tracked as follow-up work.
         var deadline_ms: i32 = query_timeout_ms;
         const start_ts = std.time.milliTimestamp();
 

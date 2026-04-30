@@ -2214,12 +2214,12 @@ pub fn EventLoopOf(comptime IO: type) type {
 
         /// Set global download rate limit (bytes/sec). 0 = unlimited.
         pub fn setGlobalDlLimit(self: *Self, rate: u64) void {
-            self.global_rate_limiter.setDownloadRate(rate);
+            self.global_rate_limiter.setDownloadRate(rate, self.clock.nowNs());
         }
 
         /// Set global upload rate limit (bytes/sec). 0 = unlimited.
         pub fn setGlobalUlLimit(self: *Self, rate: u64) void {
-            self.global_rate_limiter.setUploadRate(rate);
+            self.global_rate_limiter.setUploadRate(rate, self.clock.nowNs());
         }
 
         /// Get global download rate limit (bytes/sec). 0 = unlimited.
@@ -2244,14 +2244,14 @@ pub fn EventLoopOf(comptime IO: type) type {
         /// Set per-torrent download rate limit (bytes/sec). 0 = unlimited.
         pub fn setTorrentDlLimit(self: *Self, torrent_id: TorrentId, rate: u64) void {
             if (self.getTorrentContext(torrent_id)) |tc| {
-                tc.rate_limiter.setDownloadRate(rate);
+                tc.rate_limiter.setDownloadRate(rate, self.clock.nowNs());
             }
         }
 
         /// Set per-torrent upload rate limit (bytes/sec). 0 = unlimited.
         pub fn setTorrentUlLimit(self: *Self, torrent_id: TorrentId, rate: u64) void {
             if (self.getTorrentContext(torrent_id)) |tc| {
-                tc.rate_limiter.setUploadRate(rate);
+                tc.rate_limiter.setUploadRate(rate, self.clock.nowNs());
             }
         }
 
@@ -2314,17 +2314,18 @@ pub fn EventLoopOf(comptime IO: type) type {
         /// and global rate limiters. Returns the number of bytes allowed (may be
         /// less than requested). Returns 0 if throttled.
         pub fn consumeDownloadTokens(self: *Self, torrent_id: TorrentId, amount: u64) u64 {
+            const now_ns = self.clock.nowNs();
             // Check per-torrent limit first
             var allowed = amount;
             if (self.getTorrentContext(torrent_id)) |tc| {
                 if (tc.rate_limiter.download.isActive()) {
-                    allowed = tc.rate_limiter.download.consume(allowed);
+                    allowed = tc.rate_limiter.download.consumeAt(allowed, now_ns);
                     if (allowed == 0) return 0;
                 }
             }
             // Then check global limit
             if (self.global_rate_limiter.download.isActive()) {
-                allowed = self.global_rate_limiter.download.consume(allowed);
+                allowed = self.global_rate_limiter.download.consumeAt(allowed, now_ns);
             }
             return allowed;
         }
@@ -2332,27 +2333,29 @@ pub fn EventLoopOf(comptime IO: type) type {
         /// Check if an upload of `amount` bytes is allowed by both per-torrent
         /// and global rate limiters. Returns the number of bytes allowed.
         pub fn consumeUploadTokens(self: *Self, torrent_id: TorrentId, amount: u64) u64 {
+            const now_ns = self.clock.nowNs();
             var allowed = amount;
             if (self.getTorrentContext(torrent_id)) |tc| {
                 if (tc.rate_limiter.upload.isActive()) {
-                    allowed = tc.rate_limiter.upload.consume(allowed);
+                    allowed = tc.rate_limiter.upload.consumeAt(allowed, now_ns);
                     if (allowed == 0) return 0;
                 }
             }
             if (self.global_rate_limiter.upload.isActive()) {
-                allowed = self.global_rate_limiter.upload.consume(allowed);
+                allowed = self.global_rate_limiter.upload.consumeAt(allowed, now_ns);
             }
             return allowed;
         }
 
         /// Check if download is currently throttled for a torrent.
         pub fn isDownloadThrottled(self: *Self, torrent_id: TorrentId) bool {
+            const now_ns = self.clock.nowNs();
             if (self.global_rate_limiter.download.isActive()) {
-                if (self.global_rate_limiter.download.available() == 0) return true;
+                if (self.global_rate_limiter.download.availableAt(now_ns) == 0) return true;
             }
             if (self.getTorrentContext(torrent_id)) |tc| {
                 if (tc.rate_limiter.download.isActive()) {
-                    if (tc.rate_limiter.download.available() == 0) return true;
+                    if (tc.rate_limiter.download.availableAt(now_ns) == 0) return true;
                 }
             }
             return false;
@@ -2360,12 +2363,13 @@ pub fn EventLoopOf(comptime IO: type) type {
 
         /// Check if upload is currently throttled for a torrent.
         pub fn isUploadThrottled(self: *Self, torrent_id: TorrentId) bool {
+            const now_ns = self.clock.nowNs();
             if (self.global_rate_limiter.upload.isActive()) {
-                if (self.global_rate_limiter.upload.available() == 0) return true;
+                if (self.global_rate_limiter.upload.availableAt(now_ns) == 0) return true;
             }
             if (self.getTorrentContext(torrent_id)) |tc| {
                 if (tc.rate_limiter.upload.isActive()) {
-                    if (tc.rate_limiter.upload.available() == 0) return true;
+                    if (tc.rate_limiter.upload.availableAt(now_ns) == 0) return true;
                 }
             }
             return false;

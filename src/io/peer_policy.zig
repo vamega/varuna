@@ -1829,7 +1829,7 @@ test "recalculateUnchokes unchokes top peers by download speed" {
         peer.peer_interested = true;
         peer.am_choking = true;
         peer.current_dl_speed = speed;
-        peer.last_activity = std.time.timestamp();
+        peer.last_activity = el.clock.now();
         el.markActivePeer(slot);
     }
 
@@ -1864,7 +1864,7 @@ test "recalculateUnchokes uses upload speed in seed mode" {
         peer.peer_interested = true;
         peer.am_choking = true;
         peer.current_ul_speed = speed;
-        peer.last_activity = std.time.timestamp();
+        peer.last_activity = el.clock.now();
         el.markActivePeer(slot);
     }
 
@@ -1913,7 +1913,7 @@ test "recalculateUnchokes respects interval gating" {
     defer el.deinit();
 
     // Set last recalc to now so the interval check fails
-    el.last_unchoke_recalc = std.time.timestamp();
+    el.last_unchoke_recalc = el.clock.now();
 
     el.peers[0].state = .active_recv_header;
     el.peers[0].mode = .outbound;
@@ -1935,7 +1935,7 @@ test "checkPeerTimeouts removes inactive download peers" {
     // Peer 0: download mode, last activity is old (should be timed out)
     el.peers[0].state = .active_recv_header;
     el.peers[0].mode = .outbound;
-    el.peers[0].last_activity = std.time.timestamp() - (peer_timeout_secs + 10);
+    el.peers[0].last_activity = el.clock.now() - (peer_timeout_secs + 10);
     el.peer_count = 1;
     el.markActivePeer(0);
 
@@ -1953,7 +1953,7 @@ test "checkPeerTimeouts does not remove seed mode peers" {
     // Peer 0: seed mode, last activity is old -- should NOT be timed out
     el.peers[0].state = .active_recv_header;
     el.peers[0].mode = .inbound;
-    el.peers[0].last_activity = std.time.timestamp() - (peer_timeout_secs + 100);
+    el.peers[0].last_activity = el.clock.now() - (peer_timeout_secs + 100);
     el.peer_count = 1;
     el.markActivePeer(0);
 
@@ -1971,7 +1971,7 @@ test "checkPeerTimeouts does not remove recently active peers" {
     // Peer 0: download mode, recently active -- should NOT be timed out
     el.peers[0].state = .active_recv_header;
     el.peers[0].mode = .outbound;
-    el.peers[0].last_activity = std.time.timestamp() - 5; // 5 seconds ago
+    el.peers[0].last_activity = el.clock.now() - 5; // 5 seconds ago
     el.peer_count = 1;
     el.markActivePeer(0);
 
@@ -1988,12 +1988,12 @@ test "checkPeerTimeouts skips free and disconnecting peers" {
     // Peer 0: free state with old timestamp -- should be skipped
     el.peers[0].state = .free;
     el.peers[0].mode = .outbound;
-    el.peers[0].last_activity = std.time.timestamp() - (peer_timeout_secs + 100);
+    el.peers[0].last_activity = el.clock.now() - (peer_timeout_secs + 100);
 
     // Peer 1: disconnecting state with old timestamp -- should be skipped
     el.peers[1].state = .disconnecting;
     el.peers[1].mode = .outbound;
-    el.peers[1].last_activity = std.time.timestamp() - (peer_timeout_secs + 100);
+    el.peers[1].last_activity = el.clock.now() - (peer_timeout_secs + 100);
     el.markActivePeer(1);
 
     // These should not crash or remove anything
@@ -2014,7 +2014,7 @@ test "sendKeepAlives queues send for quiet peer" {
     peer.mode = .outbound;
     peer.send_pending = false;
     // Set last_activity well beyond the keepalive interval
-    peer.last_activity = std.time.timestamp() - (keepalive_interval_secs + 10);
+    peer.last_activity = el.clock.now() - (keepalive_interval_secs + 10);
     // Need a valid fd for the ring.send call -- use a /dev/null fd.
     // EventLoop.deinit() closes peer.fd via io.closeSocket, so we must
     // NOT close it ourselves: a double-close would panic in posix.close
@@ -2031,7 +2031,7 @@ test "sendKeepAlives queues send for quiet peer" {
     // With /dev/null, the SQE should be accepted by the ring.
     if (peer.send_pending) {
         // Verify last_activity was updated to approximately now
-        const now = std.time.timestamp();
+        const now = el.clock.now();
         try std.testing.expect(now - peer.last_activity < 5);
     }
 }
@@ -2045,7 +2045,7 @@ test "sendKeepAlives skips peer with recent activity" {
     peer.state = .active_recv_header;
     peer.mode = .outbound;
     peer.send_pending = false;
-    peer.last_activity = std.time.timestamp() - 10; // only 10 seconds ago, well within interval
+    peer.last_activity = el.clock.now() - 10; // only 10 seconds ago, well within interval
     peer.fd = -1;
     el.markActivePeer(slot);
 
@@ -2066,7 +2066,7 @@ test "sendKeepAlives skips peer with send already pending" {
     peer.state = .active_recv_header;
     peer.mode = .outbound;
     peer.send_pending = true; // already has a send in flight
-    peer.last_activity = std.time.timestamp() - (keepalive_interval_secs + 10);
+    peer.last_activity = el.clock.now() - (keepalive_interval_secs + 10);
     peer.fd = -1;
     el.markActivePeer(slot);
 
@@ -2087,7 +2087,7 @@ test "sendKeepAlives skips non-active peers" {
     peer.state = .handshake_send;
     peer.mode = .outbound;
     peer.send_pending = false;
-    peer.last_activity = std.time.timestamp() - (keepalive_interval_secs + 10);
+    peer.last_activity = el.clock.now() - (keepalive_interval_secs + 10);
     peer.fd = -1;
     el.markActivePeer(slot);
 
