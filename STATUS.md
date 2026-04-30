@@ -313,6 +313,130 @@ See `progress-reports/2026-04-25-stage2-event-loop-migration.md` for the Stage 2
 - ~~**Daemon graceful shutdown**~~: Fixed. In-flight transfer draining with configurable timeout now ensures clean exit on SIGTERM/SIGINT.
 - `IORING_OP_SETSOCKOPT` (kernel 6.7+), `IORING_OP_BIND`/`LISTEN` (kernel 6.11+) not available on current kernel 6.6. Per-peer setsockopt (TCP_NODELAY, buffer sizes) remains synchronous.
 
+## Last Verified Milestone (2026-04-29 — runtime Clock + Random abstractions for sim-time determinism)
+
+Lifts wall-clock and crypto-random reads out of the daemon hot path so
+single-daemon-deterministic simulation (`SimulatorOf(EventLoopOf(SimIO))`)
+can drive everything that previously hit `std.time.*` or
+`std.crypto.random` directly. Closes a long-standing simulation
+nondeterminism boundary called out in the simulation roadmap.
+
+**Design choice**
+
+Tagged-union dispatch (Option A from the team-lead's two-option brief)
+for both `runtime.Clock` and `runtime.Random`. Sized the choice
+empirically: ~50 production callers reach for `std.time.timestamp`,
+~25 reach for `std.crypto.random`. A comptime cascade
+(`ClockOf(comptime Impl: type)`, mirroring the existing IO contract)
+would force every consumer's generic graph to widen for what's
+ultimately a single switch on a 24-byte union — the IO contract
+deserves comptime because IO type is fundamental to the call surface;
+Clock and Random just return values with nothing to monomorphise over.
+A single `union(enum) { real: void, sim: T }` tagged dispatch is one
+branch-predicted switch per call.
+
+**`runtime.Clock` (`src/runtime/clock.zig`)**
+
+Three resolutions backed by a single i128-ns sim variant:
+
+- `now()`   → i64 seconds (matches `std.time.timestamp()`)
+- `nowMs()` → i64 milliseconds (matches `std.time.milliTimestamp()`)
+- `nowNs()` → i128 nanoseconds (matches `std.time.nanoTimestamp()`)
+
+Constructors `Clock.simAtSecs`/`simAtMs`/`simAtNs` plus
+`advance{Secs,Ms,Ns}` / `set{Secs,Ms,Ns}`. The existing shim at
+`src/io/clock.zig` re-exports the type so `EventLoop.clock`,
+peer/protocol/web-seed/uTP handlers continue to compile unchanged.
+
+**`runtime.Random` (`src/runtime/random.zig`)**
+
+`.real` wraps `std.crypto.random` (production CSPRNG). `.sim` wraps a
+seeded `std.Random.DefaultPrng`. `bytes`/`int`/`uintLessThan` cover
+the call shapes the daemon actually uses.
+
+**Migrations landed**
+
+- `src/io/rate_limiter.zig` — `TokenBucket` no longer reads
+  `std.time.nanoTimestamp()` internally. `consume`/`available`/
+  `delayNs`/`refill`/`setRate` renamed to `*At` variants and take an
+  absolute `now_ns: i128` parameter. EventLoop snapshots
+  `self.clock.nowNs()` once per consume/throttle path. Inline tests
+  rewritten on deterministic timestamps; new test asserts refill
+  credits 250 ms / 1 s deterministically.
+
+- `src/io/peer_policy.zig` — 13 in-source test sites swap
+  `std.time.timestamp()` → `el.clock.now()` so peer-policy unit tests
+  inherit sim-clock semantics for free. Production peer_policy paths
+  already used `self.clock.now()`.
+
+- `src/io/event_loop.zig` — gains `random: Random = .real` next to
+  `clock: Clock = .real`, establishing the convention for follow-up
+  callers.
+
+- `src/tracker/types.zig:Request.generateKey(rng: *Random)` — first
+  Random migration, demonstrating the pattern. Caller in
+  `src/daemon/torrent_session.zig` and tests in
+  `tests/private_tracker_test.zig` updated.
+
+**Documented exemptions**
+
+`src/io/dns_cares.zig` (synchronous c-ares resolve runs against real
+`epoll_wait` on a worker thread; deadline computation must match real
+wall time without parallel virtualisation of c-ares' IO).
+`src/io/kqueue_posix_io.zig` and `src/io/kqueue_mmap_io.zig`
+(`monotonicNs()` IS the kqueue backend's own time source — routing
+through `Clock` would be circular). Each gets an inline comment so
+future work doesn't try to "fix" them.
+
+**Cryptographic randomness preserved** in MSE handshake DH keys / pad
+lengths (`src/crypto/mse.zig`), peer ID suffix
+(`src/torrent/peer_id.zig`), DHT node ID (`src/dht/node_id.zig`), DHT
+announce_peer tokens (`src/dht/token.zig`), RPC session SID
+(`src/rpc/auth.zig`). The `runtime.Random` module-level docstring
+spells out the safe-vs-must-stay-on-CSPRNG list as institutional
+memory.
+
+**Determinism win demonstrated**
+
+`tests/clock_random_determinism_test.zig` drives a
+TokenBucket consume sequence across 1.35 s of sim time and a
+`Request.generateKey` sequence across 5 seeds, asserting byte-for-byte
+identical output across runs. Includes a combined-sources test that
+runs a rate-limit + key-gen pipeline twice with the same seed and
+expects identical output, then again with a different seed and
+expects identical bucket math but divergent keys.
+
+**Follow-ups**
+
+- UDP tracker transaction IDs (`src/tracker/udp.zig:generateTransactionId`)
+  and uTP connection IDs (`src/net/utp.zig:UtpSocket.connect`) are safe
+  to migrate but their callers (`UdpTrackerExecutor`, `UtpSocket`) need
+  a `*Random` field plumbed in from EventLoop. Tracked separately.
+- `src/io/dns_cares.zig` milliTimestamp routing through Clock requires
+  also virtualising c-ares' epoll layer — a larger DNS-sim project.
+- `src/perf/workloads.zig:1418` nanoTimestamp left as-is (tmpfile
+  uniqifier; not a time-domain operation).
+
+**Files**
+
+- `src/runtime/clock.zig` (new)
+- `src/runtime/random.zig` (new)
+- `src/io/clock.zig` (now a re-export shim)
+- `src/io/event_loop.zig`, `src/io/rate_limiter.zig`,
+  `src/io/peer_policy.zig`
+- `src/tracker/types.zig`, `src/tracker/announce.zig`,
+  `src/daemon/torrent_session.zig`
+- `src/io/dns_cares.zig`, `src/io/kqueue_posix_io.zig`,
+  `src/io/kqueue_mmap_io.zig` (exemption comments)
+- `src/runtime/root.zig` (module exports)
+- `tests/clock_random_determinism_test.zig` (new),
+  `tests/private_tracker_test.zig`,
+  `tests/sim_smart_ban_eventloop_test.zig`,
+  `tests/sim_smart_ban_phase12_eventloop_test.zig`,
+  `tests/sim_multi_source_eventloop_test.zig`,
+  `tests/sim_swarm_test.zig` (sim-clock constructor migration)
+- `progress-reports/2026-04-29-clock-random.md`
+
 ## Last Verified Milestone (2026-04-29 — DHT correctness: KRPC sender_id required + IPv6 outbound + announce_peer storage)
 
 Closes three external-reviewer issues against the DHT subsystem (R1, R2,
