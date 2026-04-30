@@ -168,8 +168,14 @@ fn parseQuery(tid: []const u8, method: Method, a_raw: []const u8) !Query {
     var query = Query{
         .transaction_id = tid,
         .method = method,
+        // `sender_id` is intentionally `undefined` until the "id" key is
+        // observed in the bencoded body. Per BEP 5 every KRPC query MUST
+        // carry the querier's node id; the post-loop `id_seen` check
+        // rejects messages that omit it so this field is never observed
+        // while still undefined.
         .sender_id = undefined,
     };
+    var id_seen = false;
 
     if (a_raw.len < 2 or a_raw[0] != 'd') return error.InvalidKrpc;
     var pos: usize = 1;
@@ -179,6 +185,7 @@ fn parseQuery(tid: []const u8, method: Method, a_raw: []const u8) !Query {
             const id = parseByteString(a_raw, &pos) orelse return error.InvalidKrpc;
             if (id.len != 20) return error.InvalidKrpc;
             @memcpy(&query.sender_id, id);
+            id_seen = true;
         } else if (std.mem.eql(u8, key, "target")) {
             const target = parseByteString(a_raw, &pos) orelse return error.InvalidKrpc;
             if (target.len != 20) return error.InvalidKrpc;
@@ -203,14 +210,21 @@ fn parseQuery(tid: []const u8, method: Method, a_raw: []const u8) !Query {
             skipValue(a_raw, &pos) orelse return error.InvalidKrpc;
         }
     }
+    // BEP 5: the "id" key is mandatory in every query body. Reject
+    // malformed queries that omit it instead of silently propagating
+    // an `undefined` sender_id into the routing table.
+    if (!id_seen) return error.InvalidKrpc;
     return query;
 }
 
 fn parseResponse(tid: []const u8, r_raw: []const u8) !Response {
     var resp = Response{
         .transaction_id = tid,
+        // See parseQuery for rationale: the post-loop `id_seen` check
+        // ensures we never observe `sender_id` while still undefined.
         .sender_id = undefined,
     };
+    var id_seen = false;
 
     if (r_raw.len < 2 or r_raw[0] != 'd') return error.InvalidKrpc;
     var pos: usize = 1;
@@ -220,6 +234,7 @@ fn parseResponse(tid: []const u8, r_raw: []const u8) !Response {
             const id = parseByteString(r_raw, &pos) orelse return error.InvalidKrpc;
             if (id.len != 20) return error.InvalidKrpc;
             @memcpy(&resp.sender_id, id);
+            id_seen = true;
         } else if (std.mem.eql(u8, key, "nodes")) {
             resp.nodes = parseByteString(r_raw, &pos) orelse return error.InvalidKrpc;
         } else if (std.mem.eql(u8, key, "nodes6")) {
@@ -250,6 +265,9 @@ fn parseResponse(tid: []const u8, r_raw: []const u8) !Response {
             skipValue(r_raw, &pos) orelse return error.InvalidKrpc;
         }
     }
+    // BEP 5: the "id" key is mandatory in every response body too.
+    // Drop malformed responses that omit it.
+    if (!id_seen) return error.InvalidKrpc;
     return resp;
 }
 
@@ -592,12 +610,49 @@ fn encodeQuery(
 
 /// Encode a ping/find_node response.
 pub fn encodePingResponse(buf: []u8, txn_id: []const u8, our_id: NodeId) EncodeError!usize {
-    return encodeResponse(buf, txn_id, our_id, null, null, null);
+    return encodeResponse(buf, txn_id, our_id, null, null, null, null, null);
 }
 
 /// Encode a find_node response with compact nodes.
 pub fn encodeFindNodeResponse(buf: []u8, txn_id: []const u8, our_id: NodeId, nodes: []const u8) EncodeError!usize {
-    return encodeResponse(buf, txn_id, our_id, nodes, null, null);
+    return encodeResponse(buf, txn_id, our_id, nodes, null, null, null, null);
+}
+
+/// Encode a dual-stack find_node response (BEP 32). Emits "nodes" and
+/// "nodes6" only when each is non-empty; either may be empty/null.
+/// At least one should be supplied for a meaningful response.
+pub fn encodeFindNodeResponseDual(
+    buf: []u8,
+    txn_id: []const u8,
+    our_id: NodeId,
+    nodes_v4: ?[]const u8,
+    nodes_v6: ?[]const u8,
+) EncodeError!usize {
+    return encodeResponse(buf, txn_id, our_id, nodes_v4, nodes_v6, null, null, null);
+}
+
+/// Encode a dual-stack get_peers response (BEP 5 + BEP 32).
+///
+/// All BEP 5 / BEP 32 fields are optional and emitted in bencode
+/// lexicographic key order: id, nodes, nodes6, token, values, values6.
+/// `token` is required by BEP 5 for any get_peers response (so the
+/// querier can later announce_peer); pass an empty string to elide.
+///
+/// Either or both of (nodes, nodes6) and (values, values6) may be
+/// supplied. Per BEP 5, callers should include closest nodes as a
+/// fallback alongside any known peers — well-behaved clients prefer
+/// `values` when present but use `nodes`/`nodes6` to continue iterating.
+pub fn encodeGetPeersResponseFull(
+    buf: []u8,
+    txn_id: []const u8,
+    our_id: NodeId,
+    token: []const u8,
+    nodes_v4: ?[]const u8,
+    nodes_v6: ?[]const u8,
+    values_v4: ?[]const [6]u8,
+    values_v6: ?[]const [18]u8,
+) EncodeError!usize {
+    return encodeResponse(buf, txn_id, our_id, nodes_v4, nodes_v6, token, values_v4, values_v6);
 }
 
 /// Encode a get_peers response with peers (values).
@@ -687,13 +742,20 @@ fn encodeResponse(
     txn_id: []const u8,
     our_id: NodeId,
     nodes: ?[]const u8,
+    nodes6: ?[]const u8,
     token: ?[]const u8,
     values: ?[]const [6]u8,
+    values6: ?[]const [18]u8,
 ) EncodeError!usize {
     var w = Writer{ .buf = buf };
     try w.dictBegin();
 
-    // "r" dict
+    // "r" dict — fields are emitted in bencode lexicographic key order:
+    //   id < nodes < nodes6 < token < values < values6
+    // Bencode dictionaries are required to be sorted; mis-ordered keys
+    // are technically invalid. Empty optionals are skipped entirely so
+    // we never emit `nodes` / `values` / etc. with a zero-length body
+    // (some implementations treat empty fields as a parse signal).
     try w.byteString("r");
     try w.dictBegin();
 
@@ -701,8 +763,17 @@ fn encodeResponse(
     try w.byteString(&our_id);
 
     if (nodes) |n| {
-        try w.byteString("nodes");
-        try w.byteString(n);
+        if (n.len > 0) {
+            try w.byteString("nodes");
+            try w.byteString(n);
+        }
+    }
+
+    if (nodes6) |n| {
+        if (n.len > 0) {
+            try w.byteString("nodes6");
+            try w.byteString(n);
+        }
     }
 
     if (token) |t| {
@@ -711,12 +782,25 @@ fn encodeResponse(
     }
 
     if (values) |vals| {
-        try w.byteString("values");
-        try w.listBegin();
-        for (vals) |v| {
-            try w.byteString(&v);
+        if (vals.len > 0) {
+            try w.byteString("values");
+            try w.listBegin();
+            for (vals) |v| {
+                try w.byteString(&v);
+            }
+            try w.containerEnd();
         }
-        try w.containerEnd();
+    }
+
+    if (values6) |vals| {
+        if (vals.len > 0) {
+            try w.byteString("values6");
+            try w.listBegin();
+            for (vals) |v| {
+                try w.byteString(&v);
+            }
+            try w.containerEnd();
+        }
     }
 
     try w.containerEnd(); // end "r" dict
