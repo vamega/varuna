@@ -16,7 +16,7 @@ pub fn build(b: *std.Build) void {
     const dns_backend = b.option(
         DnsBackend,
         "dns",
-        "DNS resolver backend: 'threadpool' uses getaddrinfo on background threads (default), 'c-ares' uses the c-ares async DNS library",
+        "DNS resolver backend: 'threadpool' uses getaddrinfo on background threads (default), 'c-ares' uses the c-ares async DNS library, 'custom' uses the in-tree Zig-native resolver under src/io/dns_custom/",
     ) orelse .threadpool;
 
     // ── IO backend selection ──────────────────────────────────
@@ -1305,6 +1305,20 @@ const DnsBackend = enum {
     /// c-ares async DNS library with epoll fd monitoring.
     /// Requires libc-ares-dev (Debian/Ubuntu) or c-ares-devel (RHEL/Fedora).
     c_ares,
+    /// In-tree Zig-native resolver living under `src/io/dns_custom/`.
+    /// Honors `network.bind_device` (closing the DNS leak the threadpool
+    /// backend has, see `docs/custom-dns-design-round2.md` §1) and is
+    /// generic over the IO contract so SimIO tests can drive scripted
+    /// DNS responses deterministically.
+    ///
+    /// **Phase F status:** the dispatch in `src/io/dns.zig` exposes a
+    /// transitional facade — the `init/deinit/cacheResult/invalidate/
+    /// clearAll/bind_device` cache surface and the standalone
+    /// `resolveOnce` helper run through the custom library; the
+    /// daemon's `HttpExecutor` / `UdpTrackerExecutor` `resolveAsync`
+    /// path retains threadpool semantics until the executor refactor
+    /// lands. See `progress-reports/2026-04-30-dns-phase-f.md`.
+    custom,
 };
 
 /// TLS backend selection.
