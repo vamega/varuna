@@ -16,7 +16,7 @@ pub fn build(b: *std.Build) void {
     const dns_backend = b.option(
         DnsBackend,
         "dns",
-        "DNS resolver backend: 'threadpool' uses getaddrinfo on background threads (default), 'c-ares' uses the c-ares async DNS library",
+        "DNS resolver backend: 'threadpool' uses getaddrinfo on background threads (default), 'c-ares' uses the c-ares async DNS library, 'custom' uses the in-tree Zig-native resolver under src/io/dns_custom/",
     ) orelse .threadpool;
 
     // ── IO backend selection ──────────────────────────────────
@@ -332,6 +332,28 @@ pub fn build(b: *std.Build) void {
         "Run piece hash lifecycle tests (loadForSeeding/freePieces/loadPiecesForRecheck)",
     );
     test_piece_hash_step.dependOn(&run_piece_hash_lifecycle_tests.step);
+
+    // ── Custom DNS library — Phase F integration tests ───────
+    //
+    // Drives `QueryOf(ScriptedIo)` end-to-end against scripted DNS
+    // server responses. See the test file's module docstring for the
+    // ScriptedIo design rationale (real `AF_UNIX` `SOCK_DGRAM` fds so
+    // `query.zig`'s `posix.close` on deliver doesn't EBADF).
+    const dns_custom_integration_tests = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("tests/dns_custom_integration_test.zig"),
+            .target = target,
+            .optimize = optimize,
+            .imports = &varuna_import,
+        }),
+    });
+    const run_dns_custom_integration_tests = b.addRunArtifact(dns_custom_integration_tests);
+    const test_dns_custom_integration_step = b.step(
+        "test-dns-custom",
+        "Run Phase F end-to-end integration tests for the custom DNS library",
+    );
+    test_dns_custom_integration_step.dependOn(&run_dns_custom_integration_tests.step);
+    test_step.dependOn(&run_dns_custom_integration_tests.step);
 
     // ── SO_BINDTODEVICE tests ────────────────────────────────
     const bind_device_tests = b.addTest(.{
@@ -1305,6 +1327,20 @@ const DnsBackend = enum {
     /// c-ares async DNS library with epoll fd monitoring.
     /// Requires libc-ares-dev (Debian/Ubuntu) or c-ares-devel (RHEL/Fedora).
     c_ares,
+    /// In-tree Zig-native resolver living under `src/io/dns_custom/`.
+    /// Honors `network.bind_device` (closing the DNS leak the threadpool
+    /// backend has, see `docs/custom-dns-design-round2.md` §1) and is
+    /// generic over the IO contract so SimIO tests can drive scripted
+    /// DNS responses deterministically.
+    ///
+    /// **Phase F status:** the dispatch in `src/io/dns.zig` exposes a
+    /// transitional facade — the `init/deinit/cacheResult/invalidate/
+    /// clearAll/bind_device` cache surface and the standalone
+    /// `resolveOnce` helper run through the custom library; the
+    /// daemon's `HttpExecutor` / `UdpTrackerExecutor` `resolveAsync`
+    /// path retains threadpool semantics until the executor refactor
+    /// lands. See `progress-reports/2026-04-30-dns-phase-f.md`.
+    custom,
 };
 
 /// TLS backend selection.
