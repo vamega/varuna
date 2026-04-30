@@ -15,8 +15,8 @@ const metadata_fetch = @import("../net/metadata_fetch.zig");
 const ResumeWriter = storage.resume_state.ResumeWriter;
 const ResumeDb = storage.resume_state.ResumeDb;
 const DhtEngine = @import("../dht/dht.zig").DhtEngine;
-const TrackerExecutor = @import("tracker_executor.zig").TrackerExecutor;
-const UdpTrackerExecutor = @import("udp_tracker_executor.zig").UdpTrackerExecutor;
+const TrackerExecutor = @import("../tracker/executor.zig").TrackerExecutor;
+const UdpTrackerExecutor = @import("../tracker/udp_executor.zig").UdpTrackerExecutor;
 const TorrentId = @import("../io/event_loop.zig").TorrentId;
 const Bitfield = @import("../bitfield.zig").Bitfield;
 const AsyncRecheck = @import("../io/recheck.zig").AsyncRecheck;
@@ -1646,7 +1646,7 @@ pub const TorrentSession = struct {
         return true;
     }
 
-    fn udpAnnounceComplete(context: *anyopaque, result: @import("udp_tracker_executor.zig").UdpTrackerExecutor.RequestResult) void {
+    fn udpAnnounceComplete(context: *anyopaque, result: @import("../tracker/udp_executor.zig").UdpTrackerExecutor.RequestResult) void {
         const self: *TorrentSession = @ptrCast(@alignCast(context));
         defer self.finishAnnounceJob();
 
@@ -1791,7 +1791,7 @@ pub const TorrentSession = struct {
         return true;
     }
 
-    fn udpScrapeComplete(context: *anyopaque, result: @import("udp_tracker_executor.zig").UdpTrackerExecutor.RequestResult) void {
+    fn udpScrapeComplete(context: *anyopaque, result: @import("../tracker/udp_executor.zig").UdpTrackerExecutor.RequestResult) void {
         const self: *TorrentSession = @ptrCast(@alignCast(context));
         defer self.finishScrapeJob();
 

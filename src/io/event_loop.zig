@@ -283,11 +283,18 @@ pub fn EventLoopOf(comptime IO: type) type {
         // CQEs for http_socket/http_connect/http_send/http_recv route here.
         http_executor: ?*@import("http_executor.zig").HttpExecutor = null,
 
-        // Tracker executor (thin wrapper around http_executor, shares the event loop's ring)
-        tracker_executor: ?*@import("../daemon/tracker_executor.zig").TrackerExecutor = null,
+        // Tracker executor (thin wrapper around http_executor, shares the event loop's ring).
+        // Lives in `src/tracker/` so the dependency points downward
+        // (io ← tracker, never io → daemon). The EventLoop only stores
+        // the pointer and nulls it on deinit; daemon callers (SessionManager)
+        // construct the executor and wire it in.
+        tracker_executor: ?*@import("../tracker/executor.zig").TrackerExecutor = null,
 
-        // UDP tracker executor (shares the event loop's ring, BEP 15)
-        udp_tracker_executor: ?*@import("../daemon/udp_tracker_executor.zig").UdpTrackerExecutor = null,
+        // UDP tracker executor (shares the event loop's ring, BEP 15).
+        // Same layering rule as `tracker_executor` above — lives in
+        // `src/tracker/`. EventLoop calls `tick()` once per loop iteration
+        // (see below); construction and lifecycle live in SessionManager.
+        udp_tracker_executor: ?*@import("../tracker/udp_executor.zig").UdpTrackerExecutor = null,
 
         // Complete pieces bitfield (for seeding -- which pieces we can serve)
         complete_pieces: ?*const Bitfield = null,
