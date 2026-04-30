@@ -347,6 +347,62 @@ test "verifyAndStoreHashesResponse rejects non-power-of-two length" {
     ));
 }
 
+test "BEP 52 hashes message round-trip stores leaves" {
+    // Smoke test: build a hashes-message payload as a peer would send it,
+    // decode it, run it through verifyAndStoreHashesResponse, and assert
+    // the per-piece leaves end up in the store.
+    const allocator = testing.allocator;
+    const hash_exchange = @import("../net/hash_exchange.zig");
+
+    // 4-piece file with a real Merkle root.
+    const h0 = merkle.hashLeaf("piece0");
+    const h1 = merkle.hashLeaf("piece1");
+    const h2 = merkle.hashLeaf("piece2");
+    const h3 = merkle.hashLeaf("piece3");
+    const piece_hashes = [_][32]u8{ h0, h1, h2, h3 };
+    var tree = try merkle.MerkleTree.fromPieceHashes(allocator, &piece_hashes);
+    defer tree.deinit();
+    const root = tree.root();
+
+    // Peer constructs and sends a "full leaf layer" hashes response.
+    const sent = hash_exchange.HashesResponse{
+        .file_index = 0,
+        .base_layer = 0,
+        .index = 0,
+        .length = 4,
+        .proof_layers = 0,
+        .hashes = &piece_hashes,
+        .proof = &.{},
+    };
+    const wire = try hash_exchange.encodeHashesResponse(allocator, sent);
+    defer allocator.free(wire);
+
+    // We decode the wire form (as the receiver would).
+    const got = try hash_exchange.decodeHashesResponse(allocator, wire);
+    defer hash_exchange.freeHashesResponse(allocator, got);
+
+    // Verify + store.
+    var store = try LeafHashStore.init(allocator, 4);
+    defer store.deinit();
+
+    try testing.expect(verifyAndStoreHashesResponse(
+        &store,
+        0, // file_first_piece
+        4, // file_piece_count
+        root,
+        got.base_layer,
+        got.index,
+        got.hashes,
+        got.proof,
+    ));
+
+    try testing.expectEqual(@as(u32, 4), store.count());
+    try testing.expectEqual(h0, store.get(0).?);
+    try testing.expectEqual(h1, store.get(1).?);
+    try testing.expectEqual(h2, store.get(2).?);
+    try testing.expectEqual(h3, store.get(3).?);
+}
+
 test "verifyAndStoreHashesResponse skips padded positions past file_piece_count" {
     const allocator = testing.allocator;
 
