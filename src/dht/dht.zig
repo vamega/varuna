@@ -79,11 +79,11 @@ const PeerStore = struct {
 
     map: std.AutoHashMap([20]u8, PeerList),
 
-    fn init(allocator: std.mem.Allocator) PeerStore {
+    pub fn init(allocator: std.mem.Allocator) PeerStore {
         return .{ .map = std.AutoHashMap([20]u8, PeerList).init(allocator) };
     }
 
-    fn deinit(self: *PeerStore, allocator: std.mem.Allocator) void {
+    pub fn deinit(self: *PeerStore, allocator: std.mem.Allocator) void {
         var it = self.map.valueIterator();
         while (it.next()) |list| list.deinit(allocator);
         self.map.deinit();
@@ -97,7 +97,7 @@ const PeerStore = struct {
     ///
     /// The `peer_addr` parameter is named to avoid shadowing the
     /// outer-module `const address = @import("../net/address.zig")`.
-    fn announce(
+    pub fn announce(
         self: *PeerStore,
         allocator: std.mem.Allocator,
         info_hash: [20]u8,
@@ -137,7 +137,7 @@ const PeerStore = struct {
     /// Pack non-expired peers for `info_hash` into the caller-supplied
     /// IPv4 and IPv6 buffers and return the populated counts.
     /// Capped at the buffer lengths.
-    fn encodeValues(
+    pub fn encodeValues(
         self: *PeerStore,
         info_hash: [20]u8,
         v4_buf: *[max_peers_per_hash][6]u8,
@@ -172,7 +172,7 @@ const PeerStore = struct {
     /// Drop expired entries everywhere. Empty per-hash lists are
     /// removed entirely so memory does not accumulate after a churn
     /// of one-shot announces.
-    fn sweep(self: *PeerStore, allocator: std.mem.Allocator, now: i64) void {
+    pub fn sweep(self: *PeerStore, allocator: std.mem.Allocator, now: i64) void {
         // Two-pass: first prune expired entries from each list (in
         // place, swap-remove), then collect-and-remove now-empty lists.
         // Iterators don't allow deletion during traversal, so we pre-
@@ -210,12 +210,12 @@ const PeerStore = struct {
     }
 
     /// Number of unique info-hashes currently tracked (for tests).
-    fn hashCount(self: *const PeerStore) usize {
+    pub fn hashCount(self: *const PeerStore) usize {
         return self.map.count();
     }
 
     /// Number of peers stored for an info-hash (for tests).
-    fn peerCount(self: *PeerStore, info_hash: [20]u8) usize {
+    pub fn peerCount(self: *PeerStore, info_hash: [20]u8) usize {
         const list = self.map.getPtr(info_hash) orelse return 0;
         return list.items.len;
     }

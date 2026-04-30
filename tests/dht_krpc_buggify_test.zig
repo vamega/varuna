@@ -1100,3 +1100,434 @@ test "txn-id length != 2 is harmless" {
         testing.allocator.free(peers);
     }
 }
+
+// ── R2: IPv6 outbound (BEP 32 dual-stack) ────────────────────────────
+//
+// Before the BEP 32 fix, `respondFindNode` and `respondGetPeers`
+// dropped every IPv6 node from the closest set with
+// `if (family != AF.INET) continue;`. The parser side already handled
+// inbound `nodes6`; the encoder side was the gap. These tests pin the
+// fix: a routing table containing both v4 and v6 nodes must produce a
+// response with both `nodes` and `nodes6` fields populated.
+
+const dht = varuna.dht;
+
+/// Drain all outbound packets on the engine and free the slice.
+fn drainAndFree(engine: *dht.DhtEngine) void {
+    const pkts = engine.drainSendQueue();
+    if (pkts.len > 0) testing.allocator.free(pkts);
+    const peers = engine.drainPeerResults();
+    if (peers.len > 0) {
+        for (peers) |p| testing.allocator.free(p.peers);
+        testing.allocator.free(peers);
+    }
+}
+
+/// Look at the most recent outbound packet without removing it; tests
+/// then call `drainAndFree` to clean up. Returns null if none queued.
+fn peekLastSend(engine: *dht.DhtEngine) ?[]const u8 {
+    if (engine.send_queue.items.len == 0) return null;
+    const pkt = &engine.send_queue.items[engine.send_queue.items.len - 1];
+    return pkt.data[0..pkt.len];
+}
+
+test "R2: respondFindNode emits both nodes and nodes6 for mixed routing table" {
+    var engine = dht.DhtEngine.init(testing.allocator, node_id.generateRandom());
+    defer engine.deinit();
+
+    const now: i64 = 1_000_000;
+    // Add 3 v4 nodes
+    for (0..3) |i| {
+        _ = engine.table.addNode(.{
+            .id = node_id.generateRandom(),
+            .address = std.net.Address.initIp4(.{ 10, 0, 0, @intCast(i + 1) }, 6881),
+        }, now);
+    }
+    // Add 3 v6 nodes
+    for (0..3) |i| {
+        var addr6: [16]u8 = [_]u8{0} ** 16;
+        addr6[15] = @intCast(i + 1);
+        _ = engine.table.addNode(.{
+            .id = node_id.generateRandom(),
+            .address = std.net.Address.initIp6(addr6, 6881, 0, 0),
+        }, now);
+    }
+
+    // Drive a find_node query. Note: handleQuery also adds the querier
+    // to the routing table — so the closest set may include the
+    // sender's IPv4 entry. We assert only the structural BEP 32
+    // invariants (both fields present, lengths match the wire format)
+    // rather than exact counts.
+    var query_buf: [512]u8 = undefined;
+    var sender_id: NodeId = undefined;
+    @memset(&sender_id, 0xAB);
+    const target = node_id.generateRandom();
+    const len = try krpc.encodeFindNodeQuery(&query_buf, 0xBEEF, sender_id, target);
+    const sender = std.net.Address.initIp4(.{ 10, 0, 0, 99 }, 6881);
+    engine.handleIncoming(query_buf[0..len], sender);
+
+    const out = peekLastSend(&engine) orelse return error.TestUnexpectedResult;
+    defer drainAndFree(&engine);
+
+    // Parse the response and assert both nodes and nodes6 populated.
+    const parsed = try krpc.parse(out);
+    switch (parsed) {
+        .response => |r| {
+            try testing.expect(r.nodes != null);
+            try testing.expect(r.nodes6 != null);
+            // BEP 5 wire format: 26 bytes per IPv4 entry.
+            try testing.expect(r.nodes.?.len > 0);
+            try testing.expectEqual(@as(usize, 0), r.nodes.?.len % 26);
+            // BEP 32 wire format: 38 bytes per IPv6 entry.
+            try testing.expect(r.nodes6.?.len > 0);
+            try testing.expectEqual(@as(usize, 0), r.nodes6.?.len % 38);
+            // We added 3 v6 nodes; v6 querier never gets added (querier
+            // is v4 here), so v6 count is exactly 3.
+            try testing.expectEqual(@as(usize, 3 * 38), r.nodes6.?.len);
+        },
+        else => try testing.expect(false),
+    }
+}
+
+test "R2: respondGetPeers emits both nodes and nodes6 when no peers known" {
+    var engine = dht.DhtEngine.init(testing.allocator, node_id.generateRandom());
+    defer engine.deinit();
+
+    const now: i64 = 2_000_000;
+    // 2 v4, 2 v6 nodes
+    for (0..2) |i| {
+        _ = engine.table.addNode(.{
+            .id = node_id.generateRandom(),
+            .address = std.net.Address.initIp4(.{ 192, 168, 1, @intCast(i + 1) }, 51413),
+        }, now);
+        var addr6: [16]u8 = [_]u8{0} ** 16;
+        addr6[14] = 0xfe;
+        addr6[15] = @intCast(i + 1);
+        _ = engine.table.addNode(.{
+            .id = node_id.generateRandom(),
+            .address = std.net.Address.initIp6(addr6, 51413, 0, 0),
+        }, now);
+    }
+
+    var info_hash: [20]u8 = undefined;
+    @memset(&info_hash, 0x33);
+    var query_buf: [512]u8 = undefined;
+    var sender_id: NodeId = undefined;
+    @memset(&sender_id, 0x44);
+    const len = try krpc.encodeGetPeersQuery(&query_buf, 0xCAFE, sender_id, info_hash);
+    const sender = std.net.Address.initIp4(.{ 10, 0, 0, 50 }, 6881);
+    engine.handleIncoming(query_buf[0..len], sender);
+
+    const out = peekLastSend(&engine) orelse return error.TestUnexpectedResult;
+    defer drainAndFree(&engine);
+
+    const parsed = try krpc.parse(out);
+    switch (parsed) {
+        .response => |r| {
+            // Structural BEP 5 + BEP 32 invariants. The querier (a v4
+            // sender) gets added to the table by handleQuery, so the v4
+            // count here is 3 (2 seeded + sender), v6 stays at 2.
+            try testing.expect(r.nodes != null);
+            try testing.expectEqual(@as(usize, 0), r.nodes.?.len % 26);
+            try testing.expect(r.nodes6 != null);
+            try testing.expectEqual(@as(usize, 2 * 38), r.nodes6.?.len);
+            // No peers announced yet → no values/values6
+            try testing.expect(r.values_raw == null);
+            try testing.expect(r.values6_raw == null);
+            // Token is always emitted on get_peers responses
+            try testing.expect(r.token != null);
+        },
+        else => try testing.expect(false),
+    }
+}
+
+// ── R3: peer storage for announce_peer (BEP 5) ──────────────────────
+//
+// Before the fix, `respondAnnouncePeer` validated the token, queued a
+// ping reply, and discarded the announce. `get_peers` always fell
+// through to closest-nodes. The test surface here exercises the full
+// announce → store → get_peers → values pipeline plus the
+// expiry/eviction invariants.
+
+/// Helper: send a get_peers query and obtain the token from the
+/// response. The token is what the announcer must echo back.
+fn primeTokenFor(
+    engine: *dht.DhtEngine,
+    sender: std.net.Address,
+    info_hash: [20]u8,
+) ![]const u8 {
+    var qbuf: [512]u8 = undefined;
+    var sid: NodeId = undefined;
+    @memset(&sid, 0x55);
+    const qlen = try krpc.encodeGetPeersQuery(&qbuf, 0x0001, sid, info_hash);
+    engine.handleIncoming(qbuf[0..qlen], sender);
+    const out = peekLastSend(engine) orelse return error.TestUnexpectedResult;
+    const parsed = try krpc.parse(out);
+    return switch (parsed) {
+        .response => |r| r.token orelse error.TestUnexpectedResult,
+        else => error.TestUnexpectedResult,
+    };
+}
+
+test "R3: announce_peer with valid token stores peer; get_peers returns it in values" {
+    var engine = dht.DhtEngine.init(testing.allocator, node_id.generateRandom());
+    defer engine.deinit();
+    defer drainAndFree(&engine);
+
+    var info_hash: [20]u8 = undefined;
+    @memset(&info_hash, 0x77);
+    const announcer = std.net.Address.initIp4(.{ 100, 64, 1, 5 }, 9000);
+
+    // Prime: get a token by sending get_peers first.
+    const tok_slice = try primeTokenFor(&engine, announcer, info_hash);
+    // Copy out — the buffer is the engine's own send queue and may move.
+    var tok_buf: [32]u8 = undefined;
+    @memcpy(tok_buf[0..tok_slice.len], tok_slice);
+    const tok = tok_buf[0..tok_slice.len];
+
+    // Drain the prime response so subsequent peek looks at the announce reply.
+    const out0 = engine.drainSendQueue();
+    if (out0.len > 0) testing.allocator.free(out0);
+
+    // Build announce_peer query: implied_port=0, port=51234.
+    var ap_buf: [512]u8 = undefined;
+    var sid: NodeId = undefined;
+    @memset(&sid, 0xAA);
+    const announce_port: u16 = 51234;
+    const ap_len = try krpc.encodeAnnouncePeerQuery(
+        &ap_buf,
+        0x0002,
+        sid,
+        info_hash,
+        announce_port,
+        tok,
+        false,
+    );
+    engine.handleIncoming(ap_buf[0..ap_len], announcer);
+
+    // Engine should have stored exactly one peer for this hash.
+    try testing.expectEqual(@as(usize, 1), engine.peer_store.peerCount(info_hash));
+
+    // Drain the announce ack.
+    const out1 = engine.drainSendQueue();
+    if (out1.len > 0) testing.allocator.free(out1);
+
+    // Now ask get_peers from a *different* sender; the response should
+    // include the announced peer in `values`.
+    const querier = std.net.Address.initIp4(.{ 8, 8, 8, 8 }, 1234);
+    var qbuf: [512]u8 = undefined;
+    @memset(&sid, 0xBB);
+    const qlen = try krpc.encodeGetPeersQuery(&qbuf, 0x0003, sid, info_hash);
+    engine.handleIncoming(qbuf[0..qlen], querier);
+
+    const out2 = peekLastSend(&engine) orelse return error.TestUnexpectedResult;
+    const parsed = try krpc.parse(out2);
+    switch (parsed) {
+        .response => |r| {
+            try testing.expect(r.values_raw != null);
+            // Decode the values list manually: it must contain the
+            // announcer's IPv4 + announce_port (51234), not the UDP
+            // source port (9000), since implied_port was false.
+            const raw = r.values_raw.?;
+            try testing.expect(raw.len > 2);
+            try testing.expectEqual(@as(u8, 'l'), raw[0]);
+            // First entry: "6:" + 4-byte IP + 2-byte port
+            try testing.expectEqualStrings("6:", raw[1..3]);
+            const ip_part = raw[3..7];
+            try testing.expectEqualSlices(u8, &.{ 100, 64, 1, 5 }, ip_part);
+            const port = std.mem.readInt(u16, raw[7..9], .big);
+            try testing.expectEqual(announce_port, port);
+        },
+        else => try testing.expect(false),
+    }
+}
+
+test "R3: announce_peer with invalid token does not store" {
+    var engine = dht.DhtEngine.init(testing.allocator, node_id.generateRandom());
+    defer engine.deinit();
+    defer drainAndFree(&engine);
+
+    var info_hash: [20]u8 = undefined;
+    @memset(&info_hash, 0xC0);
+
+    var ap_buf: [512]u8 = undefined;
+    var sid: NodeId = undefined;
+    @memset(&sid, 0xDE);
+    // Forge a token of valid length but wrong bytes.
+    const fake_tok = [_]u8{0xFF} ** 8;
+    const ap_len = try krpc.encodeAnnouncePeerQuery(
+        &ap_buf,
+        0x0010,
+        sid,
+        info_hash,
+        12345,
+        &fake_tok,
+        false,
+    );
+    const announcer = std.net.Address.initIp4(.{ 5, 5, 5, 5 }, 6881);
+    engine.handleIncoming(ap_buf[0..ap_len], announcer);
+
+    // No peer stored.
+    try testing.expectEqual(@as(usize, 0), engine.peer_store.peerCount(info_hash));
+}
+
+test "R3: announce_peer implied_port=1 uses UDP source port" {
+    var engine = dht.DhtEngine.init(testing.allocator, node_id.generateRandom());
+    defer engine.deinit();
+    defer drainAndFree(&engine);
+
+    var info_hash: [20]u8 = undefined;
+    @memset(&info_hash, 0x88);
+    const announcer = std.net.Address.initIp4(.{ 7, 7, 7, 7 }, 4567);
+
+    const tok_slice = try primeTokenFor(&engine, announcer, info_hash);
+    var tok_buf: [32]u8 = undefined;
+    @memcpy(tok_buf[0..tok_slice.len], tok_slice);
+    const tok = tok_buf[0..tok_slice.len];
+    const out0 = engine.drainSendQueue();
+    if (out0.len > 0) testing.allocator.free(out0);
+
+    var ap_buf: [512]u8 = undefined;
+    var sid: NodeId = undefined;
+    @memset(&sid, 0x99);
+    // implied_port=true; the announced port should be ignored.
+    const ap_len = try krpc.encodeAnnouncePeerQuery(
+        &ap_buf,
+        0x0020,
+        sid,
+        info_hash,
+        9999,
+        tok,
+        true,
+    );
+    engine.handleIncoming(ap_buf[0..ap_len], announcer);
+
+    try testing.expectEqual(@as(usize, 1), engine.peer_store.peerCount(info_hash));
+    // Confirm via get_peers that the stored port matches the source
+    // port (4567), not the announced port (9999).
+    const out1 = engine.drainSendQueue();
+    if (out1.len > 0) testing.allocator.free(out1);
+
+    var qbuf: [512]u8 = undefined;
+    @memset(&sid, 0x77);
+    const qlen = try krpc.encodeGetPeersQuery(&qbuf, 0x0021, sid, info_hash);
+    const querier = std.net.Address.initIp4(.{ 1, 1, 1, 1 }, 80);
+    engine.handleIncoming(qbuf[0..qlen], querier);
+
+    const out2 = peekLastSend(&engine) orelse return error.TestUnexpectedResult;
+    const parsed = try krpc.parse(out2);
+    const r = switch (parsed) {
+        .response => |x| x,
+        else => return error.TestUnexpectedResult,
+    };
+    const raw = r.values_raw orelse return error.TestUnexpectedResult;
+    // Skip 'l' + "6:" then read IP+port
+    const port = std.mem.readInt(u16, raw[7..9], .big);
+    try testing.expectEqual(@as(u16, 4567), port);
+}
+
+test "R3: peer_store sweep removes expired entries" {
+    var engine = dht.DhtEngine.init(testing.allocator, node_id.generateRandom());
+    defer engine.deinit();
+    defer drainAndFree(&engine);
+
+    var info_hash: [20]u8 = undefined;
+    @memset(&info_hash, 0xEE);
+
+    // Inject an entry directly through the public API: the announce
+    // path requires a token round-trip; for a sweep test we exercise
+    // the underlying store via two announces and then advance time.
+    const announcer = std.net.Address.initIp4(.{ 2, 2, 2, 2 }, 6881);
+    const tok_slice = try primeTokenFor(&engine, announcer, info_hash);
+    var tok_buf: [32]u8 = undefined;
+    @memcpy(tok_buf[0..tok_slice.len], tok_slice);
+    const tok = tok_buf[0..tok_slice.len];
+    const out0 = engine.drainSendQueue();
+    if (out0.len > 0) testing.allocator.free(out0);
+
+    var ap_buf: [512]u8 = undefined;
+    var sid: NodeId = undefined;
+    @memset(&sid, 0x12);
+    const ap_len = try krpc.encodeAnnouncePeerQuery(&ap_buf, 0x0030, sid, info_hash, 12345, tok, false);
+    engine.handleIncoming(ap_buf[0..ap_len], announcer);
+    try testing.expectEqual(@as(usize, 1), engine.peer_store.peerCount(info_hash));
+
+    // Advance the engine clock past the BEP 5 30-min TTL and sweep.
+    const future = std.time.timestamp() + 60 * 60;
+    engine.peer_store.sweep(testing.allocator, future);
+    try testing.expectEqual(@as(usize, 0), engine.peer_store.peerCount(info_hash));
+    // The empty hash entry should have been reaped from the map too.
+    try testing.expectEqual(@as(usize, 0), engine.peer_store.hashCount());
+}
+
+test "R3: peer_store FIFO eviction at per-hash capacity" {
+    // Construct a peer-store directly so we can drive it past the cap
+    // without burning 100 token round-trips through the engine.
+    const PeerStore = @TypeOf(@as(dht.DhtEngine, undefined).peer_store);
+    var store = PeerStore.init(testing.allocator);
+    defer store.deinit(testing.allocator);
+
+    var info_hash: [20]u8 = undefined;
+    @memset(&info_hash, 0xAB);
+
+    const cap = PeerStore.max_peers_per_hash;
+    const now: i64 = 5_000_000;
+
+    // Fill to capacity with unique addresses.
+    for (0..cap) |i| {
+        const addr = std.net.Address.initIp4(.{ 10, 0, 0, 0 }, @intCast(10000 + i));
+        store.announce(testing.allocator, info_hash, addr, now);
+    }
+    try testing.expectEqual(cap, store.peerCount(info_hash));
+
+    // One more new address: the oldest must be evicted (FIFO), so total
+    // count stays at cap. Use a distinct port range to make the new
+    // entry obviously distinguishable.
+    const newcomer = std.net.Address.initIp4(.{ 10, 0, 0, 0 }, 60000);
+    store.announce(testing.allocator, info_hash, newcomer, now);
+    try testing.expectEqual(cap, store.peerCount(info_hash));
+
+    // Encode values: the oldest (port 10000) must be gone, the
+    // newcomer (port 60000) must be present.
+    var v4_buf: [PeerStore.max_peers_per_hash][6]u8 = undefined;
+    var v6_buf: [PeerStore.max_peers_per_hash][18]u8 = undefined;
+    const counts = store.encodeValues(info_hash, &v4_buf, &v6_buf, now);
+    try testing.expectEqual(cap, counts.v4);
+    try testing.expectEqual(@as(usize, 0), counts.v6);
+
+    var saw_oldest = false;
+    var saw_newcomer = false;
+    for (v4_buf[0..counts.v4]) |entry| {
+        const port = std.mem.readInt(u16, entry[4..6], .big);
+        if (port == 10000) saw_oldest = true;
+        if (port == 60000) saw_newcomer = true;
+    }
+    try testing.expect(!saw_oldest);
+    try testing.expect(saw_newcomer);
+}
+
+test "R3: re-announce by same peer refreshes expiry, does not duplicate" {
+    const PeerStore = @TypeOf(@as(dht.DhtEngine, undefined).peer_store);
+    var store = PeerStore.init(testing.allocator);
+    defer store.deinit(testing.allocator);
+
+    var info_hash: [20]u8 = undefined;
+    @memset(&info_hash, 0x44);
+
+    const addr = std.net.Address.initIp4(.{ 11, 22, 33, 44 }, 2020);
+    const now: i64 = 100;
+    store.announce(testing.allocator, info_hash, addr, now);
+    store.announce(testing.allocator, info_hash, addr, now + 60);
+    try testing.expectEqual(@as(usize, 1), store.peerCount(info_hash));
+
+    // After the original TTL would have expired but before the refresh
+    // TTL, the entry must still be present.
+    const after_orig_ttl = now + PeerStore.ttl_secs + 1;
+    store.sweep(testing.allocator, after_orig_ttl);
+    try testing.expectEqual(@as(usize, 1), store.peerCount(info_hash));
+
+    // After the refresh TTL, it should be gone.
+    const after_refresh_ttl = now + 60 + PeerStore.ttl_secs + 1;
+    store.sweep(testing.allocator, after_refresh_ttl);
+    try testing.expectEqual(@as(usize, 0), store.peerCount(info_hash));
+}
