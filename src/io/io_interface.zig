@@ -84,6 +84,9 @@ pub const Operation = union(enum) {
     socket: SocketOp,
     connect: ConnectOp,
     accept: AcceptOp,
+    bind: BindOp,
+    listen: ListenOp,
+    setsockopt: SetsockoptOp,
 
     // Timers and readiness.
     timeout: TimeoutOp,
@@ -185,6 +188,35 @@ pub const AcceptOp = struct {
     multishot: bool = false,
 };
 
+pub const BindOp = struct {
+    fd: posix.fd_t,
+    /// The local address the socket should be bound to. The backend
+    /// reads `addr.any` plus `addr.getOsSockLen()` at submission time;
+    /// the caller must keep the address value alive at least until the
+    /// callback fires (a stack copy in the Op struct is fine — it lives
+    /// inside `Completion.op`).
+    addr: std.net.Address,
+};
+
+pub const ListenOp = struct {
+    fd: posix.fd_t,
+    backlog: u31 = 128,
+};
+
+pub const SetsockoptOp = struct {
+    fd: posix.fd_t,
+    /// `level` argument to `setsockopt(2)` (e.g. `SOL_SOCKET`,
+    /// `IPPROTO_TCP`, `IPPROTO_IPV6`).
+    level: u32,
+    /// `optname` argument (e.g. `SO_REUSEADDR`, `TCP_NODELAY`,
+    /// `IPV6_V6ONLY`, `SO_BINDTODEVICE`).
+    optname: u32,
+    /// Option value bytes. Caller-owned, must outlive the SQE submit
+    /// (RealIO async path: the kernel reads the buffer asynchronously,
+    /// so the slice must remain valid until the callback fires).
+    optval: []const u8,
+};
+
 pub const TimeoutOp = struct {
     ns: u64,
 };
@@ -225,6 +257,9 @@ pub const Result = union(enum) {
     socket: anyerror!posix.fd_t,
     connect: anyerror!void,
     accept: anyerror!Accepted,
+    bind: anyerror!void,
+    listen: anyerror!void,
+    setsockopt: anyerror!void,
     timeout: anyerror!void,
     /// `revents` bitmask returned for poll completions.
     poll: anyerror!u32,
@@ -357,6 +392,9 @@ comptime {
 //   pub fn socket   (self: *@This(), op: SocketOp,   c: *Completion, ud: ?*anyopaque, cb: Callback) !void;
 //   pub fn connect  (self: *@This(), op: ConnectOp,  c: *Completion, ud: ?*anyopaque, cb: Callback) !void;
 //   pub fn accept   (self: *@This(), op: AcceptOp,   c: *Completion, ud: ?*anyopaque, cb: Callback) !void;
+//   pub fn bind     (self: *@This(), op: BindOp,     c: *Completion, ud: ?*anyopaque, cb: Callback) !void;
+//   pub fn listen   (self: *@This(), op: ListenOp,   c: *Completion, ud: ?*anyopaque, cb: Callback) !void;
+//   pub fn setsockopt(self: *@This(), op: SetsockoptOp, c: *Completion, ud: ?*anyopaque, cb: Callback) !void;
 //   pub fn timeout  (self: *@This(), op: TimeoutOp,  c: *Completion, ud: ?*anyopaque, cb: Callback) !void;
 //   pub fn poll     (self: *@This(), op: PollOp,     c: *Completion, ud: ?*anyopaque, cb: Callback) !void;
 //
@@ -365,6 +403,76 @@ comptime {
 // op's callback fires with the appropriate cancel error.
 //
 //   pub fn cancel(self: *@This(), op: CancelOp, c: *Completion, ud: ?*anyopaque, cb: Callback) !void;
+
+// ── Blocking-wait helpers for one-shot startup paths ─────
+//
+// Listener bring-up (peer / uTP / RPC server) is intentionally
+// synchronous-shaped at the call site: one socket setup, then `bind`,
+// then `listen`, then a `submitAccept`. The `bind` / `listen` /
+// `setsockopt` ops in this contract are async-shaped (callback-driven)
+// to give RealIO a clean home for the new io_uring ops, but the
+// callsites don't need to be restructured to be callback-driven —
+// these are one-shot startup ops, not state-machine transitions.
+//
+// Both helpers below submit the contract op and then drive `io.tick`
+// until the completion fires, returning the kernel result. On RealIO
+// with kernel ≥6.11 (bind/listen) or ≥6.7 (setsockopt) this routes
+// through io_uring; on older kernels the contract method's sync
+// fallback fires the callback inline and `tick` is a no-op. All other
+// backends fire inline.
+//
+// Use these only for one-shot startup paths — they spin in `tick(1)`
+// which is fine at startup but the wrong primitive for hot paths.
+
+const BlockingCtx = struct {
+    done: bool = false,
+    err: ?anyerror = null,
+};
+
+fn blockingCallback(
+    userdata: ?*anyopaque,
+    _: *Completion,
+    result: Result,
+) CallbackAction {
+    const ctx: *BlockingCtx = @ptrCast(@alignCast(userdata.?));
+    ctx.done = true;
+    ctx.err = switch (result) {
+        .bind => |r| if (r) |_| null else |e| e,
+        .listen => |r| if (r) |_| null else |e| e,
+        .setsockopt => |r| if (r) |_| null else |e| e,
+        else => error.UnexpectedResult,
+    };
+    return .disarm;
+}
+
+/// Submit `bind` and block (via `io.tick(1)`) until the completion
+/// fires. Use this only at one-shot listener bring-up — the spin in
+/// `tick(1)` is appropriate for startup but not for steady state.
+pub fn bindBlocking(io: anytype, op: BindOp) !void {
+    var ctx = BlockingCtx{};
+    var c = Completion{};
+    try io.bind(op, &c, &ctx, blockingCallback);
+    while (!ctx.done) try io.tick(1);
+    if (ctx.err) |e| return e;
+}
+
+/// See `bindBlocking`.
+pub fn listenBlocking(io: anytype, op: ListenOp) !void {
+    var ctx = BlockingCtx{};
+    var c = Completion{};
+    try io.listen(op, &c, &ctx, blockingCallback);
+    while (!ctx.done) try io.tick(1);
+    if (ctx.err) |e| return e;
+}
+
+/// See `bindBlocking`.
+pub fn setsockoptBlocking(io: anytype, op: SetsockoptOp) !void {
+    var ctx = BlockingCtx{};
+    var c = Completion{};
+    try io.setsockopt(op, &c, &ctx, blockingCallback);
+    while (!ctx.done) try io.tick(1);
+    if (ctx.err) |e| return e;
+}
 
 // ── Tests ─────────────────────────────────────────────────
 

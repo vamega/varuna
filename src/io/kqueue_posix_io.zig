@@ -533,6 +533,9 @@ pub const KqueuePosixIO = struct {
             .socket => |op| try self.socket(op, c, ud, cb),
             .connect => |op| try self.connect(op, c, ud, cb),
             .accept => |op| try self.accept(op, c, ud, cb),
+            .bind => |op| try self.bind(op, c, ud, cb),
+            .listen => |op| try self.listen(op, c, ud, cb),
+            .setsockopt => |op| try self.setsockopt(op, c, ud, cb),
             .timeout => |op| try self.timeout(op, c, ud, cb),
             .poll => |op| try self.poll(op, c, ud, cb),
             .cancel => |op| try self.cancel(op, c, ud, cb),
@@ -762,6 +765,36 @@ pub const KqueuePosixIO = struct {
         try self.armCompletion(c, .{ .timeout = op }, ud, cb);
         const deadline = monotonicNs() +| op.ns;
         try self.pushTimer(deadline, c);
+    }
+
+    /// Synchronous fallback. kqueue has no equivalent ring; bind is a
+    /// fast in-kernel call so we run it inline and post the result via
+    /// the completed queue.
+    pub fn bind(self: *KqueuePosixIO, op: ifc.BindOp, c: *Completion, ud: ?*anyopaque, cb: Callback) !void {
+        try self.armCompletion(c, .{ .bind = op }, ud, cb);
+        const result: Result = if (posix.bind(op.fd, &op.addr.any, op.addr.getOsSockLen())) |_|
+            .{ .bind = {} }
+        else |err|
+            .{ .bind = err };
+        self.pushCompleted(c, result);
+    }
+
+    pub fn listen(self: *KqueuePosixIO, op: ifc.ListenOp, c: *Completion, ud: ?*anyopaque, cb: Callback) !void {
+        try self.armCompletion(c, .{ .listen = op }, ud, cb);
+        const result: Result = if (posix.listen(op.fd, op.backlog)) |_|
+            .{ .listen = {} }
+        else |err|
+            .{ .listen = err };
+        self.pushCompleted(c, result);
+    }
+
+    pub fn setsockopt(self: *KqueuePosixIO, op: ifc.SetsockoptOp, c: *Completion, ud: ?*anyopaque, cb: Callback) !void {
+        try self.armCompletion(c, .{ .setsockopt = op }, ud, cb);
+        const result: Result = if (posix.setsockopt(op.fd, @intCast(op.level), op.optname, op.optval)) |_|
+            .{ .setsockopt = {} }
+        else |err|
+            .{ .setsockopt = err };
+        self.pushCompleted(c, result);
     }
 
     pub fn socket(self: *KqueuePosixIO, op: ifc.SocketOp, c: *Completion, ud: ?*anyopaque, cb: Callback) !void {
@@ -1051,6 +1084,9 @@ fn makeCancelledResult(op: Operation) Result {
         .socket => .{ .socket = error.OperationCanceled },
         .connect => .{ .connect = error.OperationCanceled },
         .accept => .{ .accept = error.OperationCanceled },
+        .bind => .{ .bind = error.OperationCanceled },
+        .listen => .{ .listen = error.OperationCanceled },
+        .setsockopt => .{ .setsockopt = error.OperationCanceled },
         .timeout => .{ .timeout = error.OperationCanceled },
         .poll => .{ .poll = error.OperationCanceled },
         .cancel => .{ .cancel = error.OperationCanceled },

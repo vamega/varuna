@@ -344,6 +344,9 @@ pub const KqueueMmapIO = struct {
             .fsync => |op| try self.fsync(op, c, ud, cb),
             .fallocate => |op| try self.fallocate(op, c, ud, cb),
             .truncate => |op| try self.truncate(op, c, ud, cb),
+            .bind => |op| try self.bind(op, c, ud, cb),
+            .listen => |op| try self.listen(op, c, ud, cb),
+            .setsockopt => |op| try self.setsockopt(op, c, ud, cb),
             .socket => |op| try self.socket(op, c, ud, cb),
             .connect => |op| try self.connect(op, c, ud, cb),
             .accept => |op| try self.accept(op, c, ud, cb),
@@ -621,6 +624,34 @@ pub const KqueueMmapIO = struct {
         try self.armCompletion(c, .{ .timeout = op }, ud, cb);
         const deadline = monotonicNs() +| op.ns;
         try self.pushTimer(deadline, c);
+    }
+
+    /// Synchronous fallback. See `KqueuePosixIO.bind`.
+    pub fn bind(self: *KqueueMmapIO, op: ifc.BindOp, c: *Completion, ud: ?*anyopaque, cb: Callback) !void {
+        try self.armCompletion(c, .{ .bind = op }, ud, cb);
+        const result: Result = if (posix.bind(op.fd, &op.addr.any, op.addr.getOsSockLen())) |_|
+            .{ .bind = {} }
+        else |err|
+            .{ .bind = err };
+        self.pushCompleted(c, result);
+    }
+
+    pub fn listen(self: *KqueueMmapIO, op: ifc.ListenOp, c: *Completion, ud: ?*anyopaque, cb: Callback) !void {
+        try self.armCompletion(c, .{ .listen = op }, ud, cb);
+        const result: Result = if (posix.listen(op.fd, op.backlog)) |_|
+            .{ .listen = {} }
+        else |err|
+            .{ .listen = err };
+        self.pushCompleted(c, result);
+    }
+
+    pub fn setsockopt(self: *KqueueMmapIO, op: ifc.SetsockoptOp, c: *Completion, ud: ?*anyopaque, cb: Callback) !void {
+        try self.armCompletion(c, .{ .setsockopt = op }, ud, cb);
+        const result: Result = if (posix.setsockopt(op.fd, @intCast(op.level), op.optname, op.optval)) |_|
+            .{ .setsockopt = {} }
+        else |err|
+            .{ .setsockopt = err };
+        self.pushCompleted(c, result);
     }
 
     pub fn socket(self: *KqueueMmapIO, op: ifc.SocketOp, c: *Completion, ud: ?*anyopaque, cb: Callback) !void {
@@ -952,6 +983,9 @@ fn makeCancelledResult(op: Operation) Result {
         .fsync => .{ .fsync = error.OperationCanceled },
         .fallocate => .{ .fallocate = error.OperationCanceled },
         .truncate => .{ .truncate = error.OperationCanceled },
+        .bind => .{ .bind = error.OperationCanceled },
+        .listen => .{ .listen = error.OperationCanceled },
+        .setsockopt => .{ .setsockopt = error.OperationCanceled },
         .socket => .{ .socket = error.OperationCanceled },
         .connect => .{ .connect = error.OperationCanceled },
         .accept => .{ .accept = error.OperationCanceled },
