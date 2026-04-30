@@ -247,30 +247,57 @@ pub const DhtEngine = struct {
     /// Register an info_hash for peer search. The DHT engine will start
     /// get_peers lookups automatically once bootstrapped, and re-query
     /// periodically. Call this before or after the engine is bootstrapped.
+    ///
+    /// BEP 52: for hybrid torrents, pass the v2 info_hash truncated to its
+    /// first 20 bytes as `info_hash_v2_truncated`. Both hashes are
+    /// registered as independent searches so that v1-only and v2-only
+    /// peers both find us via the DHT. Pure-v1 callers pass `null`.
+    pub fn requestPeers(
+        self: *DhtEngine,
+        info_hash: [20]u8,
+        info_hash_v2_truncated: ?[20]u8,
+    ) void {
+        self.registerSearch(info_hash);
+        if (info_hash_v2_truncated) |v2| self.registerSearch(v2);
+    }
+
     /// Force an immediate requery for an already-registered info hash.
     /// Used when a torrent is integrated into the event loop after the
     /// initial get_peers results were dropped (torrent wasn't registered yet).
-    pub fn forceRequery(self: *DhtEngine, info_hash: [20]u8) void {
+    ///
+    /// BEP 52: pass the truncated v2 hash for hybrid torrents so both
+    /// hashes are requeried. See `requestPeers` for the v2 truncation rule.
+    pub fn forceRequery(
+        self: *DhtEngine,
+        info_hash: [20]u8,
+        info_hash_v2_truncated: ?[20]u8,
+    ) void {
+        self.requerySearch(info_hash);
+        if (info_hash_v2_truncated) |v2| self.requerySearch(v2);
+    }
+
+    /// Append a single hash to the pending-search slate. Idempotent.
+    fn registerSearch(self: *DhtEngine, hash: [20]u8) void {
         for (0..self.pending_search_count) |i| {
-            if (std.mem.eql(u8, &self.pending_searches[i], &info_hash)) {
+            if (std.mem.eql(u8, &self.pending_searches[i], &hash)) return;
+        }
+        if (self.pending_search_count >= self.pending_searches.len) return;
+        const idx = self.pending_search_count;
+        @memcpy(&self.pending_searches[idx], &hash);
+        self.pending_search_done[idx] = false; // new hash — search on next tick
+        self.pending_search_count += 1;
+    }
+
+    /// Mark a previously-registered hash as needing immediate requery, or
+    /// register it fresh if absent.
+    fn requerySearch(self: *DhtEngine, hash: [20]u8) void {
+        for (0..self.pending_search_count) |i| {
+            if (std.mem.eql(u8, &self.pending_searches[i], &hash)) {
                 self.pending_search_done[i] = false; // triggers immediate search on next tick
                 return;
             }
         }
-        // If not found, register it as new
-        self.requestPeers(info_hash);
-    }
-
-    pub fn requestPeers(self: *DhtEngine, info_hash: [20]u8) void {
-        // Check if already registered
-        for (0..self.pending_search_count) |i| {
-            if (std.mem.eql(u8, &self.pending_searches[i], &info_hash)) return;
-        }
-        if (self.pending_search_count >= self.pending_searches.len) return;
-        const idx = self.pending_search_count;
-        @memcpy(&self.pending_searches[idx], &info_hash);
-        self.pending_search_done[idx] = false; // new hash — search on next tick
-        self.pending_search_count += 1;
+        self.registerSearch(hash);
     }
 
     /// Start a get_peers lookup for a torrent info-hash.
@@ -302,14 +329,42 @@ pub const DhtEngine = struct {
     /// Announce to the DHT that we have a torrent on the given port.
     /// Performs a get_peers lookup first to collect tokens, then
     /// sends announce_peer to the K closest nodes.
-    pub fn announcePeer(self: *DhtEngine, info_hash: [20]u8, port: u16) !void {
+    ///
+    /// BEP 52: for hybrid torrents, pass the v2 info_hash truncated to its
+    /// first 20 bytes as `info_hash_v2_truncated`. Both hashes are
+    /// announced so v1-only and v2-only peers can find us. Pure-v1
+    /// callers pass `null`.
+    ///
+    /// If a v2 lookup cannot be started (e.g. no nodes for that hash yet),
+    /// we still try the v1 announce so the v1 swarm benefits — and vice
+    /// versa. The function only surfaces an error when both attempts fail.
+    pub fn announcePeer(
+        self: *DhtEngine,
+        info_hash: [20]u8,
+        info_hash_v2_truncated: ?[20]u8,
+        port: u16,
+    ) !void {
         if (!self.enabled) return error.DhtDisabled;
 
         // For now, just start a get_peers lookup. When it completes,
         // we'll send announce_peer messages using the collected tokens.
         // This is handled in completeLookup().
         self.listen_port = port;
-        try self.getPeers(info_hash);
+
+        const v1_err: ?anyerror = if (self.getPeers(info_hash)) |_| null else |e| e;
+        const v2_err: ?anyerror = if (info_hash_v2_truncated) |v2|
+            (if (self.getPeers(v2)) |_| null else |e| e)
+        else
+            null;
+
+        // If both attempts errored, surface one (prefer v1).
+        if (v1_err) |e1| {
+            if (info_hash_v2_truncated == null) return e1;
+            if (v2_err != null) return e1;
+        } else if (v2_err) |e2| {
+            // v1 succeeded, v2 failed — log but don't fail the call.
+            log.debug("DHT announce v2 failed: {s}", .{@errorName(e2)});
+        }
     }
 
     /// Drain the outbound send queue. Returns packets for the event loop to send.
