@@ -840,6 +840,27 @@ pub fn build(b: *std.Build) void {
     test_api_step.dependOn(&run_api_tests.step);
     test_step.dependOn(&run_api_tests.step);
 
+    // ── API happy-path tests by endpoint family (T4) ───────
+    const api_happy_path_tests = [_][]const u8{
+        "tests/api_categories_test.zig",
+        "tests/api_share_limits_test.zig",
+        "tests/api_tracker_edits_test.zig",
+        "tests/api_sync_export_test.zig",
+    };
+    for (api_happy_path_tests) |src| {
+        const t = b.addTest(.{
+            .root_module = b.createModule(.{
+                .root_source_file = b.path(src),
+                .target = target,
+                .optimize = optimize,
+                .imports = &varuna_import,
+            }),
+        });
+        const run_t = b.addRunArtifact(t);
+        test_api_step.dependOn(&run_t.step);
+        test_step.dependOn(&run_t.step);
+    }
+
     // ── Transport disposition tests ──────────────────────────
     const transport_tests = b.addTest(.{
         .root_module = b.createModule(.{
