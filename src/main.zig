@@ -290,20 +290,14 @@ pub fn main() !void {
                     }
                     // Start DHT search immediately -- don't wait for tracker to finish.
                     // The tracker may take minutes (UDP timeouts), but DHT can find
-                    // peers in parallel once bootstrapped.
-                    if (!sess.is_private and !sess.dht_registered) {
+                    // peers in parallel once bootstrapped. The is_private gate
+                    // (BEP 27) is enforced inside `TorrentSession.dhtRegisterPeers`.
+                    if (!sess.dht_registered) {
                         if (shared_el.dht_engine) |engine| {
-                            // BEP 52: for hybrid torrents, also search by the
-                            // truncated v2 info-hash (first 20 bytes) so we
-                            // discover v2-only peers via the DHT.
-                            const v2_truncated: ?[20]u8 = if (sess.info_hash_v2) |full_v2| blk: {
-                                var t: [20]u8 = undefined;
-                                @memcpy(&t, full_v2[0..20]);
-                                break :blk t;
-                            } else null;
-                            engine.requestPeers(sess.info_hash, v2_truncated);
-                            sess.dht_registered = true;
-                            std.log.info("DHT: registered {x} for peer search", .{sess.info_hash[0..4].*});
+                            if (sess.dhtRegisterPeers(engine)) {
+                                sess.dht_registered = true;
+                                std.log.info("DHT: registered {x} for peer search", .{sess.info_hash[0..4].*});
+                            }
                         }
                     }
                 }

@@ -276,6 +276,17 @@ pub fn build(b: *std.Build) void {
     const run_private_tracker_tests = b.addRunArtifact(private_tracker_tests);
     test_step.dependOn(&run_private_tracker_tests.step);
 
+    const private_torrent_dht_tests = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("tests/private_torrent_dht_test.zig"),
+            .target = target,
+            .optimize = optimize,
+            .imports = &varuna_import,
+        }),
+    });
+    const run_private_torrent_dht_tests = b.addRunArtifact(private_torrent_dht_tests);
+    test_step.dependOn(&run_private_torrent_dht_tests.step);
+
     const clock_random_determinism_tests = b.addTest(.{
         .root_module = b.createModule(.{
             .root_source_file = b.path("tests/clock_random_determinism_test.zig"),

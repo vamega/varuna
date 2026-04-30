@@ -14,6 +14,7 @@ const ut_metadata = @import("../net/ut_metadata.zig");
 const metadata_fetch = @import("../net/metadata_fetch.zig");
 const ResumeWriter = storage.resume_state.ResumeWriter;
 const ResumeDb = storage.resume_state.ResumeDb;
+const DhtEngine = @import("../dht/dht.zig").DhtEngine;
 const TrackerExecutor = @import("tracker_executor.zig").TrackerExecutor;
 const UdpTrackerExecutor = @import("udp_tracker_executor.zig").UdpTrackerExecutor;
 const TorrentId = @import("../io/event_loop.zig").TorrentId;
@@ -685,11 +686,11 @@ pub const TorrentSession = struct {
         // is registered in the event loop (findTorrentIdByInfoHash will work).
         // BEP 52: requery both the v1 and (truncated) v2 hashes for hybrid
         // torrents so we discover peers that only know one of the hashes.
-        if (!self.is_private) {
-            if (sel.dht_engine) |engine| {
-                const v2_truncated = self.dhtV2HashTruncated();
-                engine.forceRequery(self.info_hash, v2_truncated);
-            }
+        // Gating on `is_private` (BEP 27) lives inside `dhtForceRequery` so
+        // the privacy invariant is enforced in one place — see also
+        // `tests/private_torrent_dht_test.zig`.
+        if (sel.dht_engine) |engine| {
+            _ = self.dhtForceRequery(engine);
         }
 
         // Schedule initial announce now that the torrent is registered.
@@ -934,11 +935,48 @@ pub const TorrentSession = struct {
     /// use as a DHT key. Returns null for pure-v1 torrents. The DHT mainline
     /// only supports 20-byte keys, so v2 hashes (32 bytes / SHA-256) are
     /// truncated per BEP 52's DHT integration guidance.
-    fn dhtV2HashTruncated(self: *const TorrentSession) ?[20]u8 {
+    pub fn dhtV2HashTruncated(self: *const TorrentSession) ?[20]u8 {
         const full_v2 = self.info_hash_v2 orelse return null;
         var truncated: [20]u8 = undefined;
         @memcpy(&truncated, full_v2[0..20]);
         return truncated;
+    }
+
+    /// Register this torrent's info-hash(es) for DHT peer discovery.
+    /// **Gates on `is_private` (BEP 27)**: private torrents must not leak
+    /// to the DHT, so this is a no-op for them. Returns `true` only when a
+    /// registration was actually performed.
+    ///
+    /// All daemon DHT entry points for `requestPeers` MUST go through this
+    /// helper so the privacy gate is centralised in one place.
+    pub fn dhtRegisterPeers(self: *const TorrentSession, engine: *DhtEngine) bool {
+        if (self.is_private) return false;
+        const v2_truncated = self.dhtV2HashTruncated();
+        engine.requestPeers(self.info_hash, v2_truncated);
+        return true;
+    }
+
+    /// Force an immediate DHT requery for this torrent's info-hash(es).
+    /// **Gates on `is_private` (BEP 27)**: no-op for private torrents.
+    /// Returns `true` only when a requery was actually issued.
+    pub fn dhtForceRequery(self: *const TorrentSession, engine: *DhtEngine) bool {
+        if (self.is_private) return false;
+        const v2_truncated = self.dhtV2HashTruncated();
+        engine.forceRequery(self.info_hash, v2_truncated);
+        return true;
+    }
+
+    /// Announce that we have this torrent on `self.port` to the DHT.
+    /// **Gates on `is_private` (BEP 27)**: no-op for private torrents.
+    /// Returns `true` only when an announce was actually issued (the
+    /// underlying `engine.announcePeer` may itself fail downstream — those
+    /// errors are swallowed to mirror the existing call-site behaviour;
+    /// adjust call sites if you want them surfaced).
+    pub fn dhtAnnouncePeer(self: *const TorrentSession, engine: *DhtEngine) bool {
+        if (self.is_private) return false;
+        const v2_truncated = self.dhtV2HashTruncated();
+        engine.announcePeer(self.info_hash, v2_truncated, self.port) catch {};
+        return true;
     }
 
     fn computeAnnounceJitterMs(self: *const TorrentSession) u64 {
@@ -1451,14 +1489,12 @@ pub const TorrentSession = struct {
         );
 
         // DHT announce: tell the network we are seeding this torrent.
-        // Disabled for private torrents (BEP 27).
+        // Disabled for private torrents (BEP 27) — gated inside
+        // `dhtAnnouncePeer`, mirrored by `tests/private_torrent_dht_test.zig`.
         // BEP 52: announce against both v1 and (truncated) v2 hashes for
         // hybrid torrents so v2-only searchers can find us.
-        if (!self.is_private) {
-            if (sel.dht_engine) |engine| {
-                const v2_truncated = self.dhtV2HashTruncated();
-                engine.announcePeer(self.info_hash, v2_truncated, self.port) catch {};
-            }
+        if (sel.dht_engine) |engine| {
+            _ = self.dhtAnnouncePeer(engine);
         }
 
         self.pending_seed_setup = false;
