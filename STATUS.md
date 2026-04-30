@@ -317,6 +317,44 @@ See `progress-reports/2026-04-25-stage2-event-loop-migration.md` for the Stage 2
 - ~~**Daemon graceful shutdown**~~: Fixed. In-flight transfer draining with configurable timeout now ensures clean exit on SIGTERM/SIGINT.
 - `IORING_OP_SETSOCKOPT` (kernel 6.7+), `IORING_OP_BIND`/`LISTEN` (kernel 6.11+) not available on current kernel 6.6. Per-peer setsockopt (TCP_NODELAY, buffer sizes) remains synchronous. (`FeatureSupport` has detection flags as of 2026-04-30; daemon submission paths still pending — see "Daemon submission paths for bind / listen / setsockopt" follow-up above.)
 
+## Last Verified Milestone (2026-04-30 — close upward dependency: tracker executors moved from src/daemon/ to src/tracker/)
+
+External review C1 flagged that `src/io/event_loop.zig` directly imported
+two types from `src/daemon/`, creating an upward dependency from a
+lower-layer subsystem (io_uring infrastructure) to a higher-layer one
+(session orchestration). Closed by physically relocating the executors
+into `src/tracker/`, where they belong by name and by their import
+graph (both files only depend on `src/io/`, `src/tracker/`, and
+`src/runtime/` — never on `src/daemon/`).
+
+Coupling inventory (before): two `?*Executor` fields on EventLoop, one
+`tick()` call per loop iteration, two `null` assignments in deinit.
+Total: 5 lines that referenced `../daemon/` from `src/io/`. After: zero.
+
+Moves: `src/daemon/tracker_executor.zig` → `src/tracker/executor.zig`;
+`src/daemon/udp_tracker_executor.zig` → `src/tracker/udp_executor.zig`.
+All importers (`session_manager`, `torrent_session`, `perf/workloads`,
+`event_loop`, `backend.zig` docs) point at the new paths. The
+`src/daemon/root.zig` re-exports were dropped; `src/tracker/root.zig`
+gained them.
+
+Verification: `grep -rn '@import.*../daemon/' src/io/` is empty.
+`zig build test` passes the same `1731/1747` tests as the baseline
+(only the Task #23-gated `phase 2B steady-state honest-co-located-peer`
+sim test still fails — pre-existing and unrelated). Option B
+(interface + vtable in `src/io`) was rejected: the actual coupling is
+one method (`tick()`) and a nullable pointer; an interface would add
+ceremony without removing concrete shape.
+
+Key files: `src/tracker/executor.zig` (was `src/daemon/tracker_executor.zig`),
+`src/tracker/udp_executor.zig` (was `src/daemon/udp_tracker_executor.zig`),
+`src/io/event_loop.zig:286-297` (executor fields with new layering
+comment), `src/daemon/root.zig`, `src/tracker/root.zig`,
+`src/daemon/session_manager.zig:14-15`,
+`src/daemon/torrent_session.zig:18-19`, `src/perf/workloads.zig:23`,
+`src/io/backend.zig:41`. Progress report at
+`progress-reports/2026-04-30-close-upward-dependency.md`.
+
 ## Last Verified Milestone (2026-04-30 — misc cleanup: PieceStore.io UAF + FeatureSupport extension + BEP 52 v2 piece validation + blocking-helper warnings)
 
 Four small contained cleanups consolidated into one engineer's session,
