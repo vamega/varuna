@@ -162,6 +162,56 @@ The test now asserts:
    lifetime. A `@sizeOf(Clock) <= 16` regression test guards the
    choice.
 
+6. **Crypto-determinism boundary — option 1 + 4 hybrid, matching
+   what sim tests already do.** Five `std.crypto.random` callers
+   stay on the OS CSPRNG: MSE keys / pad lengths
+   (`src/crypto/mse.zig`), peer ID suffix
+   (`src/torrent/peer_id.zig`), DHT node ID
+   (`src/dht/node_id.zig`), DHT announce_peer tokens
+   (`src/dht/token.zig`), RPC session SID (`src/rpc/auth.zig`).
+   Predictability would break each one's security property, so a
+   seeded PRNG isn't a drop-in replacement.
+
+   Team-lead review surfaced the obvious follow-up: this means a
+   "deterministic full-daemon simulation" is incomplete by exactly
+   the entropy these callers consume. Four options were on the
+   table:
+
+   1. Accept the boundary, use behavioural assertions and
+      test-scope discipline to dodge it.
+   2. Build-flag-gated comptime redirection (TigerBeetle pattern).
+   3. `*SecureRandom` wrapper struct threaded through every site.
+   4. Unit-test the crypto code paths in isolation, never expose
+      them to SimulatorOf.
+
+   **Picked option 1+4**, because that's already what varuna's
+   existing sim tests do without anyone documenting it:
+
+   - All four `tests/sim_*_eventloop_test.zig` files set
+     `el.encryption_mode = .disabled` and use a hardcoded peer ID
+     (`"-VR0001-simdleventl0".*` and friends). They never hit MSE
+     keys or peer-id generation.
+   - `tests/dht_krpc_buggify_test.zig` calls
+     `node_id.generateRandom()` once for starting state, then drives
+     1024 bit-flip iterations with its own seeded `DefaultPrng`. The
+     assertion is "must not panic", which tolerates the variable
+     starting ID.
+   - `src/crypto/mse.zig` inline tests (32) run MSE against itself
+     with real `std.crypto.random`; assertions are "handshake
+     completed", not byte equality.
+
+   So the existing test architecture already implements the hybrid.
+   This commit just makes the boundary explicit so future engineers
+   don't mistake the non-determinism for a bug. The
+   `src/runtime/random.zig` module-level docstring carries the
+   policy and lists affected test classes.
+
+   **Option 2 is reserved as an escape hatch** for the day a real
+   bug reproduces only under specific MSE/DHT crypto bytes — five
+   sites is a small enough surface that a `-Dtest_crypto_seeded`
+   build flag remains feasible later. **Option 3 was rejected** as
+   invasive for marginal value.
+
 ## Remaining work
 
 1. **UDP tracker transaction IDs** (`src/tracker/udp.zig:generateTransactionId`,

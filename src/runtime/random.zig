@@ -42,6 +42,56 @@
 //!   * Tracker `key` parameter — supposed to be random but used as a
 //!     stable client identifier; tests benefit from determinism.
 //!
+//! ## Simulation determinism boundary
+//!
+//! Because the must-stay-on-CSPRNG list above never sees the
+//! simulator's seeded PRNG, **any code path that exercises an MSE
+//! handshake, peer-id generation, DHT node-id generation, DHT token
+//! rotation, or RPC SID issuance is non-deterministic across sim
+//! runs**. Three options were considered for closing this gap:
+//!
+//! 1. **Accept the boundary** (chosen). Sim tests that need byte-
+//!    determinism configure around the crypto sites:
+//!    `el.encryption_mode = .disabled`, hardcoded peer IDs like
+//!    `"-VR0001-simdleventl0".*`, callers pass an explicit node ID
+//!    instead of calling `node_id.generateRandom()`. Sim tests that
+//!    legitimately exercise a crypto path use *behavioural*
+//!    assertions rather than byte equality (the MSE inline tests in
+//!    `src/crypto/mse.zig` and `tests/dht_krpc_buggify_test.zig` both
+//!    follow this pattern today — they pass deterministically because
+//!    "handshake completed" / "did not panic" doesn't depend on which
+//!    DH key or node ID was rolled).
+//!
+//! 2. **Build-flag-gated determinism** (escape hatch — not yet
+//!    implemented). A future `-Dtest_crypto_seeded=true` flag could
+//!    comptime-redirect the five sites above to a seeded source for
+//!    sim builds only. Reserved for the day a real bug reproduces
+//!    only under specific MSE/DHT crypto bytes; would require CI
+//!    proof that production binaries don't carry the flag.
+//!
+//! 3. **Wrapper struct cascading**. Threading a `*SecureRandom`
+//!    through MSE / peer_id / DHT / RPC was rejected — invasive for
+//!    marginal value given the existing test-scope discipline already
+//!    avoids the problem.
+//!
+//! **Test classes affected by the boundary:**
+//!
+//!   * `src/crypto/mse.zig` inline tests (~32) — exercise full MSE
+//!     handshake against itself; use behavioural assertions.
+//!   * `tests/dht_krpc_buggify_test.zig` — calls
+//!     `node_id.generateRandom()` for starting state; bit-flip
+//!     iteration uses its own seeded `DefaultPrng`; "must not panic"
+//!     assertions tolerate the variation.
+//!   * `tests/sim_*_eventloop_test.zig` (4 files) — currently dodge
+//!     the boundary entirely via `encryption_mode = .disabled` and
+//!     fixed peer IDs. Adding crypto coverage to any of them would
+//!     require following one of the patterns above.
+//!
+//! The hybrid Option-1+test-discipline approach matches what the
+//! existing sim tests already do; this module just makes the boundary
+//! explicit so future engineers don't try to "fix" the
+//! non-determinism without weighing the security cost.
+//!
 //! ## Usage
 //!
 //! ```zig

@@ -29,8 +29,20 @@ What does NOT yet work deterministically:
 - SQLite calls (real disk, real threading, outside SimIO)
 - DNS lookups (real network, outside SimIO, plus `bind_device` is
   silently bypassed)
-- Time, randomness, hasher pool (use `std.time.nanoTimestamp`,
-  `std.crypto.random`, real OS threads)
+- Hasher pool — uses real OS threads via `std.Thread.spawn`
+- Security-critical randomness (MSE keys, peer ID, DHT node ID, DHT
+  tokens, RPC SID) — deliberately stays on `std.crypto.random` so
+  production unpredictability is preserved. Sim tests that touch
+  these paths configure around them (`encryption_mode = .disabled`,
+  fixed peer IDs) or use behavioural assertions. See
+  `src/runtime/random.zig` for the policy.
+
+What now DOES work deterministically (post-Phase-2 SimClock/SimRandom):
+
+- Wall-clock reads via `runtime.Clock` (Real / Sim variants)
+- Non-cryptographic randomness via `runtime.Random` (tracker `key`
+  migrated; UDP tx IDs / uTP conn IDs / smart-ban tie-breaks
+  tracked as follow-up)
 - External services — trackers, web seeds, DHT nodes, DNS servers —
   are real or hand-mocked, not sim partners
 - Multi-daemon simulation (one daemon per simulator process today)
@@ -65,11 +77,29 @@ remaining nondeterminism boundaries.
    threadpool as build-flag selectable backends. Closes the DNS
    nondeterminism + the `bind_device` leak; gives BUGGIFY-able DNS
    queries.
-2. **SimClock + SimRandom abstractions** (~1-2 days each). Type-
-   parameterize callers of `std.time.nanoTimestamp` and
-   `std.crypto.random` so the simulator owns logical time and the
-   deterministic PRNG seed. Most candidates are in `src/io/`,
-   `src/dht/`, `src/tracker/`.
+2. **SimClock + SimRandom abstractions** (~1-2 days each). DONE
+   (`progress-reports/2026-04-29-clock-random.md`). `runtime.Clock`
+   (tagged-union over `.real` / `.sim: u64`) and `runtime.Random`
+   (tagged-union over `.real` / `.sim: DefaultPrng`) live in
+   `src/runtime/`; `EventLoop` carries both as fields. Callers
+   migrated for nanos-precision time (`rate_limiter.zig`,
+   peer-policy test sites) and one Random consumer
+   (`tracker.Request.generateKey`).
+
+   **Crypto-determinism boundary** explicitly NOT crossed. Five
+   `std.crypto.random` callers — MSE keys
+   (`src/crypto/mse.zig`), peer ID (`src/torrent/peer_id.zig`),
+   DHT node ID (`src/dht/node_id.zig`), DHT tokens
+   (`src/dht/token.zig`), RPC SID (`src/rpc/auth.zig`) — stay on
+   the OS CSPRNG because predictability would break their security
+   property. Sim tests that exercise these paths use behavioural
+   assertions ("handshake completed", "did not panic") rather than
+   byte-equality, OR configure around the path entirely
+   (`encryption_mode = .disabled`, hardcoded peer IDs). See
+   `src/runtime/random.zig` module docstring for the full list of
+   affected test classes and the build-flag-gated escape hatch
+   (option 2) reserved for the day a bug reproduces only under
+   specific crypto bytes.
 3. **SimHasher** or hasher-pool refactor (~2-3 days). Today
    `src/io/hasher.zig` spawns real OS threads via `std.Thread.spawn`.
    Either make the pool deterministic (workers consume scheduled

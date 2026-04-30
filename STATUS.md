@@ -411,6 +411,26 @@ announce_peer tokens (`src/dht/token.zig`), RPC session SID
 spells out the safe-vs-must-stay-on-CSPRNG list as institutional
 memory.
 
+**Crypto-determinism boundary, explicitly accepted (option 1+4
+hybrid).** Code paths that consume the five preserved-CSPRNG sites
+above are non-deterministic across sim runs by design — predictability
+in production would break the protocols' security properties. Sim
+tests that need byte-determinism configure around the crypto sites
+(`encryption_mode = .disabled`, hardcoded peer IDs); sim tests that
+exercise crypto paths use behavioural assertions ("handshake
+completed", "did not panic") rather than byte-equality. This matches
+what varuna's existing sim tests already do without anyone documenting
+it. Test classes affected: `src/crypto/mse.zig` inline tests (~32
+tests, behavioural), `tests/dht_krpc_buggify_test.zig` (calls
+`node_id.generateRandom()` once, fuzz iteration uses its own seeded
+PRNG), and the four `tests/sim_*_eventloop_test.zig` files (dodge the
+boundary entirely). Build-flag-gated comptime redirection (TigerBeetle
+pattern) reserved as an escape hatch in case a future bug reproduces
+only under specific crypto bytes; rejected for routine use because the
+five sites are isolated enough that the test discipline scales without
+shipping a sim-build with weakened crypto. See
+`src/runtime/random.zig` module docstring for the full policy.
+
 **Determinism win demonstrated**
 
 `tests/clock_random_determinism_test.zig` drives a
