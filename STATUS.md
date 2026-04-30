@@ -473,6 +473,66 @@ expects identical bucket math but divergent keys.
   `tests/sim_multi_source_eventloop_test.zig`,
   `tests/sim_swarm_test.zig` (sim-clock constructor migration)
 - `progress-reports/2026-04-29-clock-random.md`
+## Last Verified Milestone (2026-04-30 — Custom DNS library Phase F: build-flag dispatch + integration test)
+
+Lands the build-flag and library-test parts of the deferred Phase F
+on top of the Phase A–E foundation (commit `86d8fc3`,
+`progress-reports/2026-04-29-custom-dns-library.md`).
+
+**Three commits**
+
+1. `build: add -Ddns=custom backend selector` — extends the
+   `DnsBackend` enum and the `-Ddns=` choice list with `custom`.
+2. `dns: dispatch -Ddns=custom and re-export dns_custom library`
+   — `src/io/dns.zig` re-exports the custom library types as
+   `pub const dns_custom = struct { ... }` so callers can drive
+   `DnsResolverOf(IO)` directly with their own IO. Under
+   `-Ddns=custom`, the public `DnsResolver` shape continues to
+   alias the threadpool implementation as a transitional measure
+   until the executor refactor lands; the docstring documents
+   the gap, and selecting the flag does not yet close the
+   `bind_device` DNS leak.
+3. `tests: add Phase F integration test for custom DNS library`
+   — `tests/dns_custom_integration_test.zig` drives `QueryOf(IO)`
+   end-to-end through scripted DNS server responses (happy path,
+   NXDOMAIN, off-path-attacker txid mismatch).
+
+**Why the dispatch is transitional, not a full cut-over**
+
+The custom library's public surface (`DnsResolverOf(IO)` —
+generic over IO, callback-based async) is fundamentally different
+from threadpool/c-ares (concrete `DnsResolver`, eventfd-poll async
+via `resolveAsync(host, port, notify_fd)`). Migrating the daemon's
+`HttpExecutor` / `UdpTrackerExecutor` from the threadpool's
+eventfd-poll pathway to the IO-contract callback shape is the
+executor refactor — substantially more work than the dispatch
+extension. Filed as the next follow-up.
+
+**Why the integration test is `ScriptedIo`, not `SimIO`**
+
+`query.zig`'s `closeSocket()` calls `std.posix.close(socket_fd)`
+directly on the deliver path. `posix.close()` `unreachable`s on
+`EBADF`, and SimIO's slot fds are synthetic integers (1000+) that
+are not real OS fds — so SimIO can't drive Query end-to-end today.
+The cleanest fix would be adding a `close` op to the IO contract;
+out of scope for this round per the file-ownership boundaries.
+The `ScriptedIo` test wrapper allocates real `AF_UNIX` `SOCK_DGRAM`
+fds for every `socket()` op so `posix.close()` succeeds, while
+the recv path is fully scripted.
+
+**Test count delta**: +4 tests
+(`tests/dns_custom_integration_test.zig`).
+
+**Follow-ups filed**
+
+- The full executor refactor that would actually use
+  `DnsResolverOf(RealIO)` inside the daemon. Estimated 2-3 days.
+- Add a `close` op to the IO contract so SimIO can drive
+  Query end-to-end (drop the `ScriptedIo` wrapper). Estimated
+  0.5 day.
+
+See `progress-reports/2026-04-30-dns-phase-f.md` for the arc.
+
 ## Last Verified Milestone (2026-04-29 — Custom DNS library (Phases A–E foundation, F deferred))
 
 Lays the groundwork for replacing c-ares + the threadpool backend
