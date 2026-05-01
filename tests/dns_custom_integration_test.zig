@@ -2,22 +2,22 @@
 //!
 //! Drives `QueryOf(IO)` through a complete A query → response cycle
 //! against a scripted in-process DNS server. The IO contract is
-//! satisfied by a tiny `ScriptedIo` test wrapper rather than full
-//! `SimIO` because `query.zig` calls `std.posix.close(self.socket_fd)`
-//! directly inside `closeSocket()` on the deliver path. SimIO's slot
-//! fds are synthetic integers (1000+) that aren't real OS fds, so
-//! `posix.close()` would `unreachable` on `EBADF`. `ScriptedIo`
-//! sidesteps that by allocating a real `AF_UNIX` `SOCK_DGRAM` fd on
-//! every `socket()` op — `posix.close()` succeeds at deliver time —
-//! while the recv path is fully scripted and never touches the
-//! kernel.
+//! satisfied by a tiny `ScriptedIo` test wrapper. It gives the tests
+//! deterministic DNS responses and operation ordering without standing
+//! up the full simulator. `ScriptedIo` allocates real `AF_UNIX`
+//! `SOCK_DGRAM` fds on `socket()` so the same close path is harmless
+//! while the recv path is fully scripted.
 //!
-//! The two scenarios cover the happy path:
+//! The scenarios cover the happy path and resolver hardening:
 //!   1. **A query → A response with the question section echoed**:
 //!      verifies the parser accepts a well-formed answer, txid match,
 //!      question-section verification, and surfaces the resolved
 //!      `192.0.2.42` to the caller's callback.
-//!   2. **A query → NXDOMAIN response**: verifies the parser surfaces
+//!   2. **bind_device sequencing**: verifies SO_BINDTODEVICE is routed
+//!      through the IO `setsockopt` contract before DNS connect/send.
+//!   3. **resolver-level async lookup**: verifies `DnsResolverOf(IO)`
+//!      owns the query, resolves an A record, and populates its TTL cache.
+//!   4. **A query → NXDOMAIN response**: verifies the parser surfaces
 //!      `.nx_domain` to the caller, exercising the negative-answer
 //!      delivery path.
 //!
@@ -64,13 +64,29 @@ const ScriptedIo = struct {
     pending: std.ArrayList(Pending) = .empty,
     timers: std.ArrayList(Pending) = .empty,
     scripted_recv: std.ArrayList([]const u8) = .empty,
+    operation_log: std.ArrayList(OperationKind) = .empty,
     /// Real OS fds we've allocated; closed in `deinit` if the caller
     /// didn't already close them (the Query is supposed to).
     open_fds: std.ArrayList(posix.fd_t) = .empty,
+    last_setsockopt_level: u32 = 0,
+    last_setsockopt_optname: u32 = 0,
+    last_setsockopt_value: [16]u8 = undefined,
+    last_setsockopt_value_len: u8 = 0,
     /// If non-null, the next `socket()` op returns this error instead
     /// of allocating an fd. Lets a future test exercise the
     /// per-server fallback path.
     next_socket_err: ?anyerror = null,
+
+    const OperationKind = enum {
+        socket,
+        setsockopt,
+        connect,
+        send,
+        recv,
+        timeout,
+        cancel,
+        close_socket,
+    };
 
     const Pending = struct {
         completion: *Completion,
@@ -97,6 +113,18 @@ const ScriptedIo = struct {
         self.pending.deinit(self.allocator);
         self.timers.deinit(self.allocator);
         self.scripted_recv.deinit(self.allocator);
+        self.operation_log.deinit(self.allocator);
+    }
+
+    fn record(self: *ScriptedIo, kind: OperationKind) !void {
+        try self.operation_log.append(self.allocator, kind);
+    }
+
+    fn firstOperationIndex(self: *const ScriptedIo, kind: OperationKind) ?usize {
+        for (self.operation_log.items, 0..) |op, i| {
+            if (op == kind) return i;
+        }
+        return null;
     }
 
     /// Push scripted bytes that the next `recv()` will consume. Test
@@ -137,6 +165,7 @@ const ScriptedIo = struct {
 
     pub fn socket(self: *ScriptedIo, op: ifc.SocketOp, c: *Completion, ud: ?*anyopaque, cb: Callback) !void {
         _ = op; // family / sock_type / protocol ignored by ScriptedIo
+        try self.record(.socket);
         c.userdata = ud;
         c.callback = cb;
 
@@ -162,8 +191,28 @@ const ScriptedIo = struct {
         });
     }
 
+    pub fn setsockopt(self: *ScriptedIo, op: ifc.SetsockoptOp, c: *Completion, ud: ?*anyopaque, cb: Callback) !void {
+        try self.record(.setsockopt);
+        c.userdata = ud;
+        c.callback = cb;
+
+        self.last_setsockopt_level = op.level;
+        self.last_setsockopt_optname = op.optname;
+        self.last_setsockopt_value_len = @intCast(@min(op.optval.len, self.last_setsockopt_value.len));
+        @memcpy(
+            self.last_setsockopt_value[0..self.last_setsockopt_value_len],
+            op.optval[0..self.last_setsockopt_value_len],
+        );
+
+        try self.pending.append(self.allocator, .{
+            .completion = c,
+            .result = .{ .setsockopt = {} },
+        });
+    }
+
     pub fn connect(self: *ScriptedIo, op: ifc.ConnectOp, c: *Completion, ud: ?*anyopaque, cb: Callback) !void {
         _ = op;
+        try self.record(.connect);
         c.userdata = ud;
         c.callback = cb;
         try self.pending.append(self.allocator, .{
@@ -173,6 +222,7 @@ const ScriptedIo = struct {
     }
 
     pub fn send(self: *ScriptedIo, op: ifc.SendOp, c: *Completion, ud: ?*anyopaque, cb: Callback) !void {
+        try self.record(.send);
         c.userdata = ud;
         c.callback = cb;
         try self.pending.append(self.allocator, .{
@@ -182,6 +232,7 @@ const ScriptedIo = struct {
     }
 
     pub fn recv(self: *ScriptedIo, op: ifc.RecvOp, c: *Completion, ud: ?*anyopaque, cb: Callback) !void {
+        try self.record(.recv);
         c.userdata = ud;
         c.callback = cb;
 
@@ -206,6 +257,7 @@ const ScriptedIo = struct {
 
     pub fn timeout(self: *ScriptedIo, op: ifc.TimeoutOp, c: *Completion, ud: ?*anyopaque, cb: Callback) !void {
         _ = op;
+        try self.record(.timeout);
         c.userdata = ud;
         c.callback = cb;
         // Park on the dedicated timer queue. `tick()` ignores timer
@@ -219,6 +271,7 @@ const ScriptedIo = struct {
     }
 
     pub fn cancel(self: *ScriptedIo, op: ifc.CancelOp, c: *Completion, ud: ?*anyopaque, cb: Callback) !void {
+        try self.record(.cancel);
         c.userdata = ud;
         c.callback = cb;
 
@@ -248,7 +301,14 @@ const ScriptedIo = struct {
             }
         }
     }
+
+    pub fn closeSocket(self: *ScriptedIo, fd: posix.fd_t) void {
+        self.record(.close_socket) catch {};
+        posix.close(fd);
+    }
 };
+
+const ScriptedResolver = dns_custom.resolver.DnsResolverOf(ScriptedIo);
 
 // ── DNS response builders ───────────────────────────────────
 
@@ -334,6 +394,12 @@ const Capture = struct {
     resolved_addr: ?std.net.Address = null,
 };
 
+const ResolverCapture = struct {
+    delivered: bool = false,
+    result: ?dns_custom.resolver.ResolveResult = null,
+    resolved_addr: ?std.net.Address = null,
+};
+
 fn captureCallback(
     ud: ?*anyopaque,
     _: *dns_custom.query.QueryOf(ScriptedIo),
@@ -348,6 +414,19 @@ fn captureCallback(
             std.net.Address.initIp4(a.bytes[0..4].*, 80)
         else
             std.net.Address.initIp6(a.bytes[0..16].*, 80, 0, 0);
+    }
+}
+
+fn resolverCaptureCallback(
+    ud: ?*anyopaque,
+    _: *ScriptedResolver.ResolveJob,
+    result: dns_custom.resolver.ResolveResult,
+) void {
+    const cap: *ResolverCapture = @ptrCast(@alignCast(ud.?));
+    cap.delivered = true;
+    cap.result = result;
+    if (result == .resolved) {
+        cap.resolved_addr = result.resolved;
     }
 }
 
@@ -417,6 +496,44 @@ test "QueryOf(ScriptedIo): A query resolves to expected address" {
     }
 }
 
+test "QueryOf(ScriptedIo): bind_device is applied through IO before DNS connect" {
+    var io = ScriptedIo.init(testing.allocator);
+    defer io.deinit();
+
+    const txid: u16 = 0xB1D0;
+    const host = "bound.varuna.local";
+    const expected_v4 = [4]u8{ 203, 0, 113, 7 };
+    var resp_buf: [512]u8 = undefined;
+    const resp_len = try buildAResponse(&resp_buf, txid, host, expected_v4, 300);
+    try io.pushRecv(resp_buf[0..resp_len]);
+
+    const QueryT = dns_custom.query.QueryOf(ScriptedIo);
+    var query = try QueryT.create(testing.allocator, &io);
+    defer query.destroy();
+
+    const servers = [_]std.net.Address{
+        std.net.Address.initIp4(.{ 8, 8, 8, 8 }, 53),
+    };
+    var capture = Capture{};
+    try query.start(.{
+        .host = host,
+        .qtype = .a,
+        .servers = &servers,
+        .bind_device = "wg0",
+        .txid = txid,
+    }, &capture, captureCallback);
+
+    try io.tick(64);
+
+    try testing.expect(capture.delivered);
+    const setsockopt_idx = io.firstOperationIndex(.setsockopt) orelse return error.MissingBindDeviceSetsockopt;
+    const connect_idx = io.firstOperationIndex(.connect) orelse return error.MissingDnsConnect;
+    try testing.expect(setsockopt_idx < connect_idx);
+    try testing.expectEqual(std.posix.SOL.SOCKET, io.last_setsockopt_level);
+    try testing.expectEqual(std.posix.SO.BINDTODEVICE, io.last_setsockopt_optname);
+    try testing.expectEqualSlices(u8, "wg0\x00", io.last_setsockopt_value[0..io.last_setsockopt_value_len]);
+}
+
 test "QueryOf(ScriptedIo): NXDOMAIN delivers .nx_domain to caller" {
     var io = ScriptedIo.init(testing.allocator);
     defer io.deinit();
@@ -449,6 +566,50 @@ test "QueryOf(ScriptedIo): NXDOMAIN delivers .nx_domain to caller" {
     switch (capture.result.?) {
         .nx_domain => {},
         else => return error.UnexpectedResultVariant,
+    }
+}
+
+test "DnsResolverOf.resolveAsync: A query resolves and caches answer" {
+    var io = ScriptedIo.init(testing.allocator);
+    defer io.deinit();
+
+    const host = "resolver.varuna.local";
+    const expected_v4 = [4]u8{ 198, 51, 100, 44 };
+    var resp_buf: [512]u8 = undefined;
+    // The resolver owns txid selection; tests can override it for deterministic packets.
+    const txid: u16 = 0x4444;
+    const resp_len = try buildAResponse(&resp_buf, txid, host, expected_v4, 120);
+    try io.pushRecv(resp_buf[0..resp_len]);
+
+    const servers = [_]std.net.Address{
+        std.net.Address.initIp4(.{ 9, 9, 9, 9 }, 53),
+    };
+    var resolver = try ScriptedResolver.init(testing.allocator, &io, .{
+        .servers = &servers,
+        .test_txid_override = txid,
+    });
+    defer resolver.deinit(testing.allocator);
+
+    var capture = ResolverCapture{};
+    const start = try resolver.resolveAsync(host, 8080, &capture, resolverCaptureCallback);
+    const job = switch (start) {
+        .pending => |pending| pending,
+        .resolved => return error.UnexpectedImmediateResolve,
+        .nx_domain, .failed => return error.UnexpectedImmediateResolveFailure,
+    };
+    defer job.destroy();
+
+    try io.tick(128);
+
+    try testing.expect(capture.delivered);
+    const resolved = capture.resolved_addr orelse return error.MissingResolvedAddress;
+    try testing.expectEqual(@as(u16, 8080), resolved.getPort());
+    try testing.expectEqualSlices(u8, &expected_v4, std.mem.asBytes(&resolved.in.sa.addr));
+
+    const cached = resolver.cacheLookup(host, 9090) orelse return error.MissingResolverCacheEntry;
+    switch (cached) {
+        .resolved => |addr| try testing.expectEqual(@as(u16, 9090), addr.getPort()),
+        else => return error.UnexpectedNonResolved,
     }
 }
 

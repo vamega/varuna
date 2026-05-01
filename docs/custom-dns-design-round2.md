@@ -392,15 +392,19 @@ Wire-up:
   on the loop (`src/io/event_loop.zig:204`). When the resolver is
   constructed, copy this string into `Config.bind_device`.
 - `query.zig` opens the UDP socket via `io.socket(...)`, then on the
-  socket-create CQE applies `socket_util.applyBindDevice(fd, name)`
-  before the first `sendmsg`. ~5 LOC.
+  socket-create CQE submits IO-contract
+  `setsockopt(SO_BINDTODEVICE, name)` before the UDP connect/send. The
+  option buffer lives in the query state until the setsockopt completion
+  fires, so RealIO can use an async kernel op where available.
 - TCP fallback (DNS-over-TCP for truncated responses) gets the same
   treatment.
-- Existing `socket_util.applyBindDevice` enforces IFNAMSIZ; reuse it.
+- The same IFNAMSIZ validation is applied before submitting setsockopt.
 
-This closes the latent bind_device→DNS leak today, and surfaces the
-DNS-via-interface story as an explicit, configurable knob without a
-new top-level config option.
+Implementation note (2026-05-01): the custom library now has this
+bind-device sequencing inside `QueryOf(IO)` and a resolver-level
+`DnsResolverOf(IO).resolveAsync()` path. The daemon leak is not fully
+closed until HTTP/UDP tracker executors are moved from the transitional
+threadpool facade to that custom resolver API.
 
 ### §6.2 — Don't bother with macOS `IP_BOUND_IF`
 

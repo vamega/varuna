@@ -2,15 +2,15 @@
 //!
 //! Generic over the IO backend (`RealIO`, `EpollIO`, `KqueueIO`,
 //! `SimIO`) — every primitive used here (`socket`, `connect`,
-//! `send`, `recv`, `timeout`, `cancel`) is in
+//! `send`, `recv`, `timeout`, `cancel`, `closeSocket`) is in
 //! `io_interface.zig` and is implemented by all four backends.
 //!
 //! Lifecycle:
 //!   1. `start(host, qtype, callback)` — encodes the query and submits
 //!      `socket()` for a fresh UDP fd (per-query source-port
 //!      randomization comes from the kernel's ephemeral allocation).
-//!   2. On socket CQE: optionally `applyBindDevice(fd)` (Linux), then
-//!      submit `connect()` to the current server.
+//!   2. On socket CQE: optionally submit SO_BINDTODEVICE through the
+//!      IO contract, then submit `connect()` to the current server.
 //!   3. On connect CQE: submit `send()` of the encoded query and
 //!      `recv()` for the response, plus a `timeout()` that races
 //!      against the recv.
@@ -39,7 +39,6 @@ const log = std.log.scoped(.dns_custom);
 
 const message = @import("message.zig");
 const io_interface = @import("../io_interface.zig");
-const applyBindDevice = @import("../../net/socket.zig").applyBindDevice;
 
 /// Caller-supplied configuration for a single Query.
 pub const QueryParams = struct {
@@ -58,9 +57,9 @@ pub const QueryParams = struct {
     /// Total query budget across all servers (ns). Default 5000 ms.
     total_timeout_ns: u64 = 5_000 * std.time.ns_per_ms,
     /// Optional SO_BINDTODEVICE name (Linux). When set, applied to the
-    /// query UDP socket after socket() returns. Mirrors what peer /
-    /// tracker / RPC sockets do today and closes the bind_device DNS
-    /// leak documented in `docs/custom-dns-design-round2.md` §1.
+    /// query UDP socket after socket() returns. This closes the
+    /// bind_device DNS leak for direct custom-resolver callers; daemon
+    /// tracker/web-seed executors still need to be wired to this API.
     bind_device: ?[]const u8 = null,
     /// 16-bit transaction ID. Caller picks; randomized per query for
     /// poisoning defense (`std.crypto.random.intRangeAtMost(u16, 0,
@@ -117,6 +116,11 @@ pub fn QueryOf(comptime IO: type) type {
         /// Recv buffer sized to UDP max + a generous EDNS payload.
         recv_buf: [4096]u8 = undefined,
         recv_len: usize = 0,
+        /// SO_BINDTODEVICE option bytes. Linux expects a nul-terminated
+        /// interface name, and the IO contract requires optval to stay
+        /// alive until the setsockopt completion fires.
+        bind_device_opt: [16]u8 = undefined,
+        bind_device_opt_len: u8 = 0,
         /// Most recent specific error, surfaced in `.failed`.
         last_err: anyerror = error.DnsResolutionFailed,
 
@@ -155,6 +159,7 @@ pub fn QueryOf(comptime IO: type) type {
         pub const State = enum {
             idle,
             opening_socket,
+            binding_device,
             connecting,
             sending,
             receiving,
@@ -239,6 +244,23 @@ pub fn QueryOf(comptime IO: type) type {
             self.op_in_flight = true;
         }
 
+        fn submitBindDevice(self: *Self, device: []const u8) !void {
+            try self.prepareBindDeviceOpt(device);
+            self.state = .binding_device;
+            try self.io.setsockopt(
+                .{
+                    .fd = self.socket_fd,
+                    .level = posix.SOL.SOCKET,
+                    .optname = posix.SO.BINDTODEVICE,
+                    .optval = self.bind_device_opt[0..self.bind_device_opt_len],
+                },
+                &self.op_completion,
+                self,
+                onBindDevice,
+            );
+            self.op_in_flight = true;
+        }
+
         fn submitSend(self: *Self) !void {
             self.state = .sending;
             try self.io.send(
@@ -284,13 +306,16 @@ pub fn QueryOf(comptime IO: type) type {
                     if (r) |fd| {
                         self.socket_fd = fd;
                         if (self.params.bind_device) |dev| {
-                            applyBindDevice(fd, dev) catch |err| {
+                            self.submitBindDevice(dev) catch |err| {
                                 // Log but don't fail — match peer-handler behavior
                                 // (continue without binding when CAP_NET_RAW is missing).
-                                log.warn("dns: applyBindDevice({s}) failed: {t}", .{ dev, err });
+                                log.warn("dns: bind_device='{s}' setup failed: {t}", .{ dev, err });
+                                self.submitConnect() catch |connect_err| {
+                                    self.last_err = connect_err;
+                                    self.advanceServerOrFail();
+                                };
                             };
-                        }
-                        self.submitConnect() catch |err| {
+                        } else self.submitConnect() catch |err| {
                             self.last_err = err;
                             self.advanceServerOrFail();
                         };
@@ -298,6 +323,35 @@ pub fn QueryOf(comptime IO: type) type {
                         self.last_err = err;
                         self.advanceServerOrFail();
                     }
+                },
+                else => {
+                    self.last_err = error.UnexpectedResult;
+                    self.advanceServerOrFail();
+                },
+            }
+            return .disarm;
+        }
+
+        fn onBindDevice(
+            ud: ?*anyopaque,
+            _: *io_interface.Completion,
+            result: io_interface.Result,
+        ) io_interface.CallbackAction {
+            const self: *Self = @ptrCast(@alignCast(ud.?));
+            self.op_in_flight = false;
+            switch (result) {
+                .setsockopt => |r| {
+                    if (r) |_| {} else |err| {
+                        // Do not fail DNS entirely when the process lacks
+                        // CAP_NET_RAW or the interface disappeared. This
+                        // matches the existing socket-binding policy.
+                        const dev = self.params.bind_device orelse "";
+                        log.warn("dns: bind_device='{s}' setsockopt failed: {t}", .{ dev, err });
+                    }
+                    self.submitConnect() catch |err| {
+                        self.last_err = err;
+                        self.advanceServerOrFail();
+                    };
                 },
                 else => {
                     self.last_err = error.UnexpectedResult;
@@ -582,9 +636,17 @@ pub fn QueryOf(comptime IO: type) type {
 
         fn closeSocket(self: *Self) void {
             if (self.socket_fd >= 0) {
-                std.posix.close(self.socket_fd);
+                self.io.closeSocket(self.socket_fd);
                 self.socket_fd = -1;
             }
+        }
+
+        fn prepareBindDeviceOpt(self: *Self, device: []const u8) !void {
+            const IFNAMSIZ = self.bind_device_opt.len;
+            if (device.len == 0 or device.len >= IFNAMSIZ) return error.InvalidInterfaceName;
+            @memcpy(self.bind_device_opt[0..device.len], device);
+            self.bind_device_opt[device.len] = 0;
+            self.bind_device_opt_len = @intCast(device.len + 1);
         }
 
         fn noopCancel(

@@ -151,16 +151,17 @@ Varuna's current minimum kernel is 6.6, which covers everything up to and includ
 
 ## DNS Resolution Notes
 
-`getaddrinfo()` is a blocking call with no io_uring equivalent. `src/io/dns.zig` provides a unified `DnsResolver` interface with **two build-time configurable backends**:
+`getaddrinfo()` is a blocking call with no io_uring equivalent. `src/io/dns.zig` provides a unified daemon-facing `DnsResolver` interface with **two proven build-time configurable backends**, plus an experimental custom resolver library:
 
 ### Backend selection
 
-Build with `-Ddns=threadpool` (default) or `-Ddns=c-ares`:
+Build with `-Ddns=threadpool` (default), `-Ddns=c-ares`, or `-Ddns=custom`:
 
 | Backend | Flag | Library | How it resolves |
 |---------|------|---------|-----------------|
 | Threadpool | `-Ddns=threadpool` | None (glibc) | `getaddrinfo()` on a background thread, 5-second timeout |
 | c-ares | `-Ddns=c-ares` | `libc-ares-dev` | c-ares async DNS with epoll fd monitoring, 5-second timeout |
+| Custom | `-Ddns=custom` | None | Transitional daemon facade still aliases threadpool; direct callers can use `dns.dns_custom.resolver.DnsResolverOf(IO).resolveAsync()` for A/AAAA UDP queries through the IO contract |
 
 ### Shared behavior (both backends)
 
@@ -184,12 +185,17 @@ Implementation: `src/io/dns_cares.zig`. Uses the c-ares async DNS library. On ca
 
 **Requirements**: `libc-ares-dev` (Debian/Ubuntu) or `c-ares-devel` (RHEL/Fedora).
 
+### Custom resolver library
+
+Implementation: `src/io/dns_custom/`. `DnsResolverOf(IO).resolveAsync()` now owns `QueryOf(IO)` jobs for simple A/AAAA hostname lookup, uses `/etc/resolv.conf` nameservers or explicit test/config overrides, follows CNAME-only responses by issuing a follow-up query, and caches positive/NXDOMAIN answers through the custom TTL cache. `QueryOf(IO)` creates UDP sockets through the IO contract and, when `Config.bind_device` is set, submits IO-contract `setsockopt(SO_BINDTODEVICE)` before DNS connect/send. This is the first production slice of the custom path; the daemon's HTTP and UDP tracker executors are not yet wired to it.
+
 ### Architecture
 
 ```
 src/io/dns.zig           -- public interface (dispatches based on build_options)
 src/io/dns_threadpool.zig -- threadpool backend (getaddrinfo + background thread)
 src/io/dns_cares.zig     -- c-ares backend (async DNS + epoll fd monitoring)
+src/io/dns_custom/       -- in-tree DNS packet/query/resolver library
 ```
 
 ## SHA Hardware Acceleration Notes

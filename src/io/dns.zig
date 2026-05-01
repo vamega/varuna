@@ -1,34 +1,36 @@
 //! DNS resolution interface for the varuna daemon.
 //!
 //! This module provides a unified `DnsResolver` type and `resolveOnce` function
-//! that dispatch to one of three backends depending on the build configuration:
+//! that dispatch to the currently proven daemon backends:
 //!
 //!   - `-Ddns=threadpool` (default): uses `getaddrinfo` on background threads
 //!   - `-Ddns=c_ares`: uses the c-ares async DNS library with epoll fd monitoring
-//!   - `-Ddns=custom`: uses the in-tree Zig-native resolver under
-//!     `src/io/dns_custom/`. Phase F transitional dispatch — see below.
+//!   - `-Ddns=custom`: exposes the in-tree Zig-native resolver under
+//!     `src/io/dns_custom/`, but keeps the daemon facade on threadpool
+//!     until the executor refactor lands. See below.
 //!
-//! All three backends provide the same public `DnsResolver` API: `init`,
+//! The daemon-facing backends provide the same public `DnsResolver` API: `init`,
 //! `deinit`, `resolve`, `resolveAsync`, `cacheResult`, `invalidate`,
 //! `clearAll`, plus a standalone `resolveOnce` function. They share the
 //! same TTL cache behaviour (default 1-hour cap, 64-entry max).
 //!
-//! ## `-Ddns=custom` Phase F status (2026-04-30)
+//! ## `-Ddns=custom` transitional status (2026-05-01)
 //!
 //! The custom backend's library bodies (`message.zig`, `cache.zig`,
 //! `query.zig`, `resolv_conf.zig`, `resolver.zig`) landed in commit
-//! `86d8fc3`. The full executor refactor that swaps the daemon's
-//! `HttpExecutor` / `UdpTrackerExecutor` from the threadpool's
-//! `eventfd-poll` async DNS path to the IO-contract-native callback
-//! shape exposed by `DnsResolverOf(IO)` is a follow-up — see
-//! `progress-reports/2026-04-29-custom-dns-library.md` §"Phase F
-//! integration" and `progress-reports/2026-04-30-dns-phase-f.md`.
+//! `86d8fc3`. The resolver now has a real `DnsResolverOf(IO).resolveAsync`
+//! production path for A/AAAA hostname lookup through `QueryOf(IO)`, with
+//! `bind_device` applied via the IO `setsockopt` contract before DNS UDP
+//! connect/send. The full executor refactor that swaps the daemon's
+//! `HttpExecutor` / `UdpTrackerExecutor` from the threadpool's eventfd-poll
+//! async DNS path to this IO-contract-native callback shape remains a
+//! follow-up — see `progress-reports/2026-05-01-custom-dns-resolver-slice.md`.
 //!
 //! Until that refactor lands, `-Ddns=custom` selects a transitional
 //! facade that:
 //!   - re-exports the custom library's `DnsResolverOf` /
-//!     `Config` / `ResolveResult` types (`pub const dns_custom = ...`)
-//!     so callers — and the SimIO integration test in
+//!     `Config` / `ResolveResult` / `ResolveJob` types
+//!     (`pub const dns_custom = ...`) so callers — and the integration test in
 //!     `tests/dns_custom_integration_test.zig` — can drive the
 //!     library directly with their own IO instance;
 //!   - keeps the `DnsResolver` cache + async-resolve surface bound
@@ -37,9 +39,9 @@
 //!
 //! In other words: under `-Ddns=custom`, the in-tree Zig DNS library
 //! is **available** to callers that opt in but is **not yet wired**
-//! into the daemon's tracker / web-seed paths. Selecting the flag
-//! does not yet close the `bind_device` DNS leak that motivated the
-//! library — that comes with the executor refactor.
+//! into the daemon's tracker / web-seed paths. Selecting the flag alone
+//! still does not close the daemon's `bind_device` DNS leak; directly using
+//! `DnsResolverOf(IO)` does route custom DNS sockets through bind_device.
 
 const std = @import("std");
 const build_options = @import("build_options");
@@ -97,9 +99,11 @@ pub const resolveOnce = backend.resolveOnce;
 /// through the configured interface like peer / tracker / RPC traffic.
 /// The threadpool backend (`-Ddns=threadpool`, the build default)
 /// stores the value but cannot apply it — `getaddrinfo` owns its own
-/// UDP socket internally with no caller hook. See `docs/custom-dns-
-/// design-round2.md` §1 and STATUS.md "Known Issues" for the gap and
-/// the queued custom-DNS-library follow-up.
+/// UDP socket internally with no caller hook. The custom DNS library
+/// has a direct `DnsResolverOf(IO)` path that can apply bind_device
+/// through the IO contract, but the daemon facade remains transitional
+/// until tracker/web-seed executors use that callback API. See
+/// `docs/custom-dns-design-round2.md` §1 and STATUS.md "Known Issues".
 ///
 /// **Lifetime contract**: when set, the slice must outlive the
 /// `DnsResolver`. The daemon's caller chain borrows it from

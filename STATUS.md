@@ -7,7 +7,7 @@ Update it whenever a milestone lands, the near-term backlog changes, or a new op
 
 ### Core Protocol
 - `.torrent` ingestion, bencode parsing, metainfo parsing, info-hash calculation, piece/file layout mapping.
-- HTTP, HTTPS, and UDP tracker announce (BEP 15) with compact peer lists, multi-tracker simultaneous announce (BEP 12). All tiers queried in parallel; first successful response wins. Async DNS resolution with TTL-based caching (`src/io/dns.zig`). Build-time configurable backend: threadpool (default) or c-ares (`-Ddns=c-ares`). HTTPS via vendored BoringSSL with BIO pair transport (all network I/O stays on io_uring); build-time configurable: `-Dtls=boringssl` (default) or `-Dtls=none`.
+- HTTP, HTTPS, and UDP tracker announce (BEP 15) with compact peer lists, multi-tracker simultaneous announce (BEP 12). All tiers queried in parallel; first successful response wins. Async DNS resolution with TTL-based caching (`src/io/dns.zig`). Build-time configurable backend: threadpool (default), c-ares (`-Ddns=c-ares`), or experimental custom (`-Ddns=custom`, direct custom resolver path exists but daemon executors still use the transitional threadpool facade). HTTPS via vendored BoringSSL with BIO pair transport (all network I/O stays on io_uring); build-time configurable: `-Dtls=boringssl` (default) or `-Dtls=none`.
 - Full UDP tracker support (BEP 15): connect/announce/scrape protocol, connection ID caching (2-minute TTL), exponential backoff retries (15 * 2^n seconds), error response handling. io_uring-based async executor (`IORING_OP_SENDMSG`/`IORING_OP_RECVMSG`) for daemon hot path; blocking client for CLI tools. Daemon auto-detects `udp://` URLs and routes to UDP executor. 35+ tests including loopback socket integration tests.
 - Tracker scrape (HTTP + UDP): seeders/leechers/snatches queried every 30 minutes.
 - Private tracker support: private flag parsing and enforcement (BEP 27). Per-session key, numwant, compact=1. PEX disabled for private torrents.
@@ -77,7 +77,7 @@ Update it whenever a milestone lands, the near-term backlog changes, or a new op
 - Bind interface (SO_BINDTODEVICE), bind address, port ranges (port_min/port_max).
 - Download/upload speed limits (per-torrent + global), connection limits, hasher threads, piece cache sizing.
 - API credentials (api_username, api_password).
-- Build options: `-Dsqlite=system|bundled`, `-Ddns=threadpool|c-ares`, `-Dtls=boringssl|none`, `-Dcrypto=varuna|stdlib|boringssl`.
+- Build options: `-Dsqlite=system|bundled`, `-Ddns=threadpool|c-ares|custom`, `-Dtls=boringssl|none`, `-Dcrypto=varuna|stdlib|boringssl`.
 - Configurable crypto backend (`-Dcrypto`): `varuna` (default, SHA-1 with runtime SHA-NI/AArch64 hardware detection), `stdlib` (Zig std.crypto), `boringssl` (vendored BoringSSL SHA/RC4). Unified dispatch via `src/crypto/backend.zig`. Build-time validation prevents `-Dcrypto=boringssl` when `-Dtls=none`.
 - Peer ID masquerading: `network.masquerade_as` config option to identify as qBittorrent, rTorrent, uTorrent, Deluge, or Transmission. Useful for private trackers with client whitelists.
 
@@ -318,7 +318,7 @@ See `progress-reports/2026-04-25-stage2-event-loop-migration.md` for the Stage 2
 
 ## Known Issues
 
-- **`bind_device` is silently bypassed by the threadpool DNS backend (the build default).** `network.bind_device = "wg0"` is correctly applied to peer connections (TCP listen + connect), uTP / DHT UDP listener, RPC server accept, HTTP tracker client, and UDP tracker client — but DNS queries via the default `-Ddns=threadpool` backend leak out the default route. `getaddrinfo` owns its own UDP socket internally and offers no hook for the application to apply `SO_BINDTODEVICE`. Workaround: build with `-Ddns=c_ares`, which registers an `ares_set_socket_callback` on the c-ares channel that calls `applyBindDevice` for every UDP/TCP socket the channel opens — closes the gap fully on that backend. The plumbing is now an explicit `bind_device` field on `dns.Config`, threaded from `cfg.network.bind_device` through `SessionManager.bind_device` → `HttpExecutor.Config.bind_device` / `UdpTrackerExecutor.Config.bind_device` → `DnsResolver.init`. Full fix queued behind the custom-DNS-library work in `docs/custom-dns-design-round2.md` §1; the custom resolver controls its own sockets and applies `SO_BINDTODEVICE` natively. (2026-04-28)
+- **`bind_device` is silently bypassed by the threadpool DNS backend (the build default).** `network.bind_device = "wg0"` is correctly applied to peer connections (TCP listen + connect), uTP / DHT UDP listener, RPC server accept, HTTP tracker client, and UDP tracker client — but DNS queries via the default `-Ddns=threadpool` backend leak out the default route. `getaddrinfo` owns its own UDP socket internally and offers no hook for the application to apply `SO_BINDTODEVICE`. Workaround: build with `-Ddns=c_ares`, which registers an `ares_set_socket_callback` on the c-ares channel that calls `applyBindDevice` for every UDP/TCP socket the channel opens — closes the gap fully on that backend. The plumbing is now an explicit `bind_device` field on `dns.Config`, threaded from `cfg.network.bind_device` through `SessionManager.bind_device` → `HttpExecutor.Config.bind_device` / `UdpTrackerExecutor.Config.bind_device` → `DnsResolver.init`. The custom resolver library now has an IO-contract `DnsResolverOf(IO).resolveAsync()` path that owns DNS UDP sockets and applies `SO_BINDTODEVICE` through `io.setsockopt` before DNS connect/send, but the daemon's HTTP and UDP tracker executors are not yet wired to that path. Full fix is the executor refactor tracked in `docs/custom-dns-design-round2.md` §1. (Updated 2026-05-01)
 - The packaged Ubuntu `opentracker` build requires explicit info-hash whitelisting (`--whitelist-hash`).
 - On WSL2, `perf stat`/`perf record` require kernel-matched `linux-tools` package; many hardware counters report `<not supported>`.
 - `zig build test-torrent-session` intermittently hits Zig cache/toolchain failures (`manifest_create Unexpected`).
@@ -803,6 +803,33 @@ expects identical bucket math but divergent keys.
   `tests/sim_multi_source_eventloop_test.zig`,
   `tests/sim_swarm_test.zig` (sim-clock constructor migration)
 - `progress-reports/2026-04-29-clock-random.md`
+
+## Last Verified Milestone (2026-05-01 — Custom DNS resolver production slice)
+
+Builds on the Phase F custom DNS library by adding the first resolver-level
+production path (`progress-reports/2026-05-01-custom-dns-resolver-slice.md`):
+
+- `src/io/dns_custom/query.zig` now applies `bind_device` through the IO
+  `setsockopt(SO_BINDTODEVICE)` contract before DNS UDP connect/send, and
+  routes socket cleanup through `io.closeSocket` instead of direct
+  `posix.close`.
+- `src/io/dns_custom/resolver.zig` now exposes
+  `DnsResolverOf(IO).resolveAsync(host, port, ctx, callback)` with numeric-IP
+  fast path, TTL cache lookup, A query first, AAAA fallback when A fails,
+  CNAME follow-up, NXDOMAIN negative caching, and positive TTL caching.
+- `tests/dns_custom_integration_test.zig` adds coverage that bind_device is
+  sequenced before DNS connect and that resolver-level A lookup resolves and
+  caches through the custom path.
+
+The daemon-facing `src/io/dns.zig` `-Ddns=custom` facade is still transitional:
+HTTP tracker, HTTPS tracker/web-seed, and UDP tracker executors continue to use
+the threadpool-compatible public `DnsResolver` shape until they are refactored
+from eventfd DNS jobs to the custom callback API.
+
+Verification under Zig 0.15.2 via Nix: `zig build test-dns-custom --summary
+failures`, `zig build test-dns-custom -Ddns=custom --summary failures`,
+`zig build --summary failures`, and `zig build test --summary failures` pass.
+
 ## Last Verified Milestone (2026-04-30 — Custom DNS library Phase F: build-flag dispatch + integration test)
 
 Lands the build-flag and library-test parts of the deferred Phase F
@@ -838,17 +865,13 @@ eventfd-poll pathway to the IO-contract callback shape is the
 executor refactor — substantially more work than the dispatch
 extension. Filed as the next follow-up.
 
-**Why the integration test is `ScriptedIo`, not `SimIO`**
+**Why the integration test is `ScriptedIo`, not full `SimIO`**
 
-`query.zig`'s `closeSocket()` calls `std.posix.close(socket_fd)`
-directly on the deliver path. `posix.close()` `unreachable`s on
-`EBADF`, and SimIO's slot fds are synthetic integers (1000+) that
-are not real OS fds — so SimIO can't drive Query end-to-end today.
-The cleanest fix would be adding a `close` op to the IO contract;
-out of scope for this round per the file-ownership boundaries.
-The `ScriptedIo` test wrapper allocates real `AF_UNIX` `SOCK_DGRAM`
-fds for every `socket()` op so `posix.close()` succeeds, while
-the recv path is fully scripted.
+`ScriptedIo` keeps the DNS response bytes and operation ordering fully
+deterministic without standing up the broader simulator harness. As of
+2026-05-01, `query.zig` routes cleanup through `io.closeSocket`, so the
+old direct-`posix.close` blocker is gone; a true SimIO DNS test is now a
+practical follow-up once the resolver API is wired into daemon executors.
 
 **Test count delta**: +4 tests
 (`tests/dns_custom_integration_test.zig`).
