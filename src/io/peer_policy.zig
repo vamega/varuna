@@ -741,9 +741,12 @@ pub fn completePieceDownload(self: anytype, slot: u16) void {
         Sha1.hash(piece_buf[0..piece_buf.len], &actual, .{});
         const valid = std.mem.eql(u8, &actual, &hash);
         if (valid) {
-            // Write piece to disk via io_uring
+            // Write piece to disk via io_uring. The hash has already been
+            // verified above (or by the SHA-256 leaf check in the v2 path);
+            // we only need the span layout here, so use planPieceSpans —
+            // safe even after Session.freePieces() drops the v1 hash table.
             var span_scratch: [8]LayoutSpan = undefined;
-            const plan = storage.verify.planPieceVerificationWithScratch(self.allocator, sess, piece_index, span_scratch[0..]) catch {
+            const plan = storage.verify.planPieceSpansWithScratch(self.allocator, sess, piece_index, span_scratch[0..]) catch {
                 cleanupCompletionFailure(self, peer, dp, pt, piece_index);
                 return;
             };
@@ -961,9 +964,10 @@ fn completeV2PieceDownload(
 
     // Verified: submit the per-span disk writes. Same shape as the
     // inline-verify path below — see that path's comments for
-    // pending-write tracking semantics.
+    // pending-write tracking semantics. Span-only plan: hash already
+    // verified above, so safe across Session.freePieces().
     var span_scratch: [8]LayoutSpan = undefined;
-    const plan = storage.verify.planPieceVerificationWithScratch(self.allocator, sess, piece_index, span_scratch[0..]) catch {
+    const plan = storage.verify.planPieceSpansWithScratch(self.allocator, sess, piece_index, span_scratch[0..]) catch {
         cleanupCompletionFailure(self, peer, dp, pt, piece_index);
         return;
     };
@@ -1142,9 +1146,11 @@ pub fn processHashResults(self: anytype) void {
                 continue;
             }
 
-            // Write verified piece to disk via io_uring
+            // Write verified piece to disk via io_uring. The hasher returned
+            // valid=true for this result, so we only need the span layout —
+            // planPieceSpans is safe across Session.freePieces().
             var span_scratch: [8]LayoutSpan = undefined;
-            const plan = storage.verify.planPieceVerificationWithScratch(self.allocator, sess, result.piece_index, span_scratch[0..]) catch {
+            const plan = storage.verify.planPieceSpansWithScratch(self.allocator, sess, result.piece_index, span_scratch[0..]) catch {
                 self.allocator.free(result.piece_buf);
                 continue;
             };

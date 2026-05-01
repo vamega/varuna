@@ -509,9 +509,11 @@ fn inlineVerifyMultiPiece(el: anytype, slot: *WebSeedSlot) void {
             continue;
         }
 
-        // Write piece to disk via io_uring
+        // Write piece to disk via io_uring. Hash was verified inline above
+        // (Sha1.hash + std.mem.eql against expected_hash), so we only need
+        // span layout here — planPieceSpans is safe across Session.freePieces().
         var span_scratch: [8]LayoutSpan = undefined;
-        const plan = storage.verify.planPieceVerificationWithScratch(
+        const plan = storage.verify.planPieceSpansWithScratch(
             el.allocator,
             sess,
             piece_index,

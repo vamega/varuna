@@ -264,9 +264,14 @@ pub fn servePieceRequest(self: anytype, slot: u16, payload: []const u8) void {
         }
     }
 
-    // Submit async io_uring reads for all spans (no blocking)
+    // Submit async io_uring reads for all spans (no blocking).
+    //
+    // Use planPieceSpans rather than planPieceVerificationWithScratch:
+    // serving a piece doesn't need the expected hash, and seed-mode sessions
+    // have called Session.freePieces() to drop the v1 hash table. Reading
+    // pieceHash here would fail with error.PiecesNotLoaded for every REQUEST.
     var span_scratch: [8]LayoutSpan = undefined;
-    const plan = storage.verify.planPieceVerificationWithScratch(self.allocator, sess, piece_index, span_scratch[0..]) catch return;
+    const plan = storage.verify.planPieceSpansWithScratch(self.allocator, sess, piece_index, span_scratch[0..]) catch return;
     defer plan.deinit(self.allocator);
 
     if (plan.spans.len == 0) return;
