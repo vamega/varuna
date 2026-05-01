@@ -211,16 +211,17 @@ fn handleSocketResult(self: anytype, slot: u16, res: i32) void {
         };
     }
 
+    peer.connect_pending = true;
     self.io.connect(
         .{ .fd = fd, .addr = peer.address },
         &peer.connect_completion,
         self,
         peerConnectCompleteFor(@TypeOf(self.*)),
     ) catch {
+        peer.connect_pending = false;
         self.removePeer(slot);
         return;
     };
-    peer.connect_pending = true;
 }
 
 /// Factory: callback bound to `Peer.connect_completion` (after socket

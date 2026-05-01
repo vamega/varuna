@@ -401,6 +401,7 @@ pub fn UdpTrackerExecutorOf(comptime IO: type) type {
             // Submit async socket creation via io_interface — udpSocketComplete
             // will set the destination and start the BEP 15 flow.
             const family: u32 = slot.address.any.family;
+            slot.state = .connecting;
             self.io.socket(
                 .{ .domain = family, .sock_type = posix.SOCK.DGRAM | posix.SOCK.CLOEXEC | posix.SOCK.NONBLOCK, .protocol = posix.IPPROTO.UDP },
                 &slot.completion,
@@ -410,7 +411,6 @@ pub fn UdpTrackerExecutorOf(comptime IO: type) type {
                 self.completeSlot(slot_idx, .{ .err = error.SocketCreateFailed });
                 return;
             };
-            slot.state = .connecting;
         }
 
         /// Handle async UDP socket creation CQE — set destination and start BEP 15 flow.

@@ -1248,21 +1248,24 @@ pub fn EventLoopOf(comptime IO: type) type {
             };
             self.storePeerSwarmHash(peer, selected_hash);
 
-            // Submit async socket creation via io_interface. The callback
-            // (peer_handler.peerSocketCompleteFor(Self)) configures the fd
-            // and chains the connect.
-            try self.io.socket(
-                .{ .domain = family, .sock_type = posix.SOCK.STREAM | posix.SOCK.CLOEXEC | posix.SOCK.NONBLOCK, .protocol = posix.IPPROTO.TCP },
-                &peer.connect_completion,
-                self,
-                peer_handler.peerSocketCompleteFor(Self),
-            );
             peer.connect_pending = true;
-
             self.peer_count += 1;
             self.half_open_count += 1;
             self.markActivePeer(slot);
             self.attachPeerToTorrent(torrent_id, slot);
+
+            // Submit async socket creation via io_interface. The callback
+            // (peer_handler.peerSocketCompleteFor(Self)) configures the fd
+            // and chains the connect.
+            self.io.socket(
+                .{ .domain = family, .sock_type = posix.SOCK.STREAM | posix.SOCK.CLOEXEC | posix.SOCK.NONBLOCK, .protocol = posix.IPPROTO.TCP },
+                &peer.connect_completion,
+                self,
+                peer_handler.peerSocketCompleteFor(Self),
+            ) catch |err| {
+                self.removePeer(slot);
+                return err;
+            };
             return slot;
         }
 

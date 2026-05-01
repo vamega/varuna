@@ -24,6 +24,7 @@ const varuna = @import("varuna");
 const ifc = varuna.io.io_interface;
 const epoll_mmap_io = varuna.io.epoll_mmap_io;
 const EpollMmapIO = epoll_mmap_io.EpollMmapIO;
+const HttpExecutor = varuna.io.http_executor.HttpExecutorOf(EpollMmapIO);
 
 const Completion = ifc.Completion;
 const Result = ifc.Result;
@@ -149,6 +150,86 @@ fn fallocateCb(ud: ?*anyopaque, _: *Completion, result: Result) CallbackAction {
     return .disarm;
 }
 
+fn createHttpListenSocket() !struct { fd: posix.fd_t, port: u16 } {
+    const fd = try posix.socket(
+        posix.AF.INET,
+        posix.SOCK.STREAM | posix.SOCK.CLOEXEC | posix.SOCK.NONBLOCK,
+        posix.IPPROTO.TCP,
+    );
+    errdefer posix.close(fd);
+
+    var addr = try std.net.Address.parseIp4("127.0.0.1", 0);
+    var enable: c_int = 1;
+    try posix.setsockopt(fd, posix.SOL.SOCKET, posix.SO.REUSEADDR, std.mem.asBytes(&enable));
+    try posix.bind(fd, &addr.any, addr.getOsSockLen());
+    try posix.listen(fd, 1);
+
+    var bound: posix.sockaddr.storage = undefined;
+    var len: posix.socklen_t = @sizeOf(posix.sockaddr.storage);
+    try posix.getsockname(fd, @ptrCast(&bound), &len);
+    const bound_addr = std.net.Address{ .any = @as(*posix.sockaddr, @ptrCast(&bound)).* };
+    return .{ .fd = fd, .port = bound_addr.getPort() };
+}
+
+const HttpCloseServerCtx = struct {
+    listen_fd: posix.fd_t,
+};
+
+fn runCloseDelimitedHttpServer(ctx: *HttpCloseServerCtx) void {
+    const deadline_ns = std.time.nanoTimestamp() + 5 * std.time.ns_per_s;
+    const conn_fd = while (std.time.nanoTimestamp() < deadline_ns) {
+        break posix.accept(
+            ctx.listen_fd,
+            null,
+            null,
+            posix.SOCK.CLOEXEC | posix.SOCK.NONBLOCK,
+        ) catch |err| switch (err) {
+            error.WouldBlock => {
+                std.Thread.sleep(1_000_000);
+                continue;
+            },
+            else => return,
+        };
+    } else return;
+    defer posix.close(conn_fd);
+
+    var buf: [1024]u8 = undefined;
+    var used: usize = 0;
+    while (used < buf.len and std.time.nanoTimestamp() < deadline_ns) {
+        const n = posix.recv(conn_fd, buf[used..], 0) catch |err| switch (err) {
+            error.WouldBlock => {
+                std.Thread.sleep(1_000_000);
+                continue;
+            },
+            else => return,
+        };
+        if (n == 0) return;
+        used += n;
+        if (std.mem.indexOf(u8, buf[0..used], "\r\n\r\n") != null) break;
+    }
+
+    _ = posix.send(conn_fd, "HTTP/1.1 200 OK\r\nConnection: close\r\n\r\nhello world", 0) catch {};
+}
+
+const HttpResultBox = struct {
+    done: bool = false,
+    status: u16 = 0,
+    body_len: usize = 0,
+    body_matches: bool = false,
+    err: ?anyerror = null,
+};
+
+fn httpCloseComplete(ctx: *anyopaque, result: HttpExecutor.RequestResult) void {
+    const box: *HttpResultBox = @ptrCast(@alignCast(ctx));
+    box.done = true;
+    box.status = result.status;
+    box.err = result.err;
+    if (result.body) |body| {
+        box.body_len = body.len;
+        box.body_matches = std.mem.eql(u8, body, "hello world");
+    }
+}
+
 // ── Tests ─────────────────────────────────────────────────
 
 test "EpollMmapIO multi-tick send/recv round-trip on real socketpair" {
@@ -196,6 +277,47 @@ test "EpollMmapIO closeSocket cancels parked send callback" {
 
     try testing.expectEqual(@as(u32, 1), counter.sent);
     try testing.expectEqual(error.OperationCanceled, counter.last_err.?);
+}
+
+test "EpollMmapIO HttpExecutor completes close-delimited response" {
+    var io = try skipIfUnavailable();
+    defer io.deinit();
+
+    const listen = try createHttpListenSocket();
+    defer posix.close(listen.fd);
+
+    var server_ctx = HttpCloseServerCtx{ .listen_fd = listen.fd };
+    const server_thread = try std.Thread.spawn(.{}, runCloseDelimitedHttpServer, .{&server_ctx});
+    defer server_thread.join();
+
+    var executor = try HttpExecutor.create(testing.allocator, &io, .{});
+    defer executor.destroy();
+
+    var url_buf: [128]u8 = undefined;
+    const url = try std.fmt.bufPrint(&url_buf, "http://127.0.0.1:{d}/announce", .{listen.port});
+    var result = HttpResultBox{};
+    var job = HttpExecutor.Job{
+        .context = &result,
+        .on_complete = httpCloseComplete,
+        .url_len = @intCast(url.len),
+        .host_len = "127.0.0.1".len,
+    };
+    @memcpy(job.url[0..url.len], url);
+    @memcpy(job.host[0.."127.0.0.1".len], "127.0.0.1");
+    try executor.submit(job);
+
+    var attempts: u32 = 0;
+    while (!result.done and attempts < 1000) : (attempts += 1) {
+        executor.tick();
+        try io.tick(0);
+        std.Thread.sleep(1_000_000);
+    }
+
+    try testing.expect(result.done);
+    try testing.expectEqual(@as(?anyerror, null), result.err);
+    try testing.expectEqual(@as(u16, 200), result.status);
+    try testing.expectEqual(@as(usize, "hello world".len), result.body_len);
+    try testing.expect(result.body_matches);
 }
 
 test "EpollMmapIO mmap-backed write triggers remap on file growth" {

@@ -1,4 +1,5 @@
 const std = @import("std");
+const build_options = @import("build_options");
 const kernel = @import("kernel.zig");
 const requirements = @import("requirements.zig");
 
@@ -21,8 +22,22 @@ pub const Summary = struct {
 };
 
 pub fn ensureSupported(summary: Summary) !void {
-    if (summary.support == .unsupported) return error.UnsupportedKernel;
-    if (!summary.io_uring_available) return error.IoUringUnavailable;
+    if (selectedBackendRequiresKernelFloor() and summary.support == .unsupported) return error.UnsupportedKernel;
+    if (selectedBackendRequiresIoUring() and !summary.io_uring_available) return error.IoUringUnavailable;
+}
+
+fn selectedBackendRequiresKernelFloor() bool {
+    return switch (build_options.io_backend) {
+        .io_uring => true,
+        else => false,
+    };
+}
+
+fn selectedBackendRequiresIoUring() bool {
+    return switch (build_options.io_backend) {
+        .io_uring => true,
+        else => false,
+    };
 }
 
 pub fn detectCurrent(allocator: std.mem.Allocator) !Summary {
@@ -94,7 +109,7 @@ test "classify preferred non WSL kernel summary" {
     try std.testing.expect(!summary.is_wsl);
 }
 
-test "ensureSupported rejects unsupported kernels" {
+test "ensureSupported applies kernel floor only to io_uring backend" {
     const summary = try fromStrings(
         std.testing.allocator,
         "6.5.0-custom",
@@ -103,10 +118,13 @@ test "ensureSupported rejects unsupported kernels" {
     );
     defer summary.deinit(std.testing.allocator);
 
-    try std.testing.expectError(error.UnsupportedKernel, ensureSupported(summary));
+    switch (build_options.io_backend) {
+        .io_uring => try std.testing.expectError(error.UnsupportedKernel, ensureSupported(summary)),
+        else => try ensureSupported(summary),
+    }
 }
 
-test "ensureSupported rejects missing io_uring" {
+test "ensureSupported requires io_uring only for io_uring backend" {
     var summary = try fromStrings(
         std.testing.allocator,
         "6.8.12-generic",
@@ -116,5 +134,8 @@ test "ensureSupported rejects missing io_uring" {
     defer summary.deinit(std.testing.allocator);
     summary.io_uring_available = false;
 
-    try std.testing.expectError(error.IoUringUnavailable, ensureSupported(summary));
+    switch (build_options.io_backend) {
+        .io_uring => try std.testing.expectError(error.IoUringUnavailable, ensureSupported(summary)),
+        else => try ensureSupported(summary),
+    }
 }

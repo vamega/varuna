@@ -508,6 +508,7 @@ pub fn HttpExecutorOf(comptime IO: type) type {
 
         fn startConnect(self: *Self, slot: *RequestSlot, slot_idx: u16) void {
             const family: u32 = slot.address.any.family;
+            slot.state = .connecting;
             // Submit async socket creation -- httpSocketComplete will chain the connect.
             self.io.socket(
                 .{ .domain = family, .sock_type = posix.SOCK.STREAM | posix.SOCK.CLOEXEC | posix.SOCK.NONBLOCK, .protocol = posix.IPPROTO.TCP },
@@ -518,7 +519,6 @@ pub fn HttpExecutorOf(comptime IO: type) type {
                 self.completeSlot(slot_idx, .{ .err = error.SocketCreateFailed });
                 return;
             };
-            slot.state = .connecting;
         }
 
         /// Callback for the async socket creation. Stores the new fd on the

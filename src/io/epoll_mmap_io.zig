@@ -508,8 +508,15 @@ pub const EpollMmapIO = struct {
         try self.armCompletion(c, .{ .connect = op }, ud, cb);
         const addrlen = op.addr.getOsSockLen();
         if (posix.connect(op.fd, &op.addr.any, addrlen)) {
-            // Completed immediately; still report completion from tick so
-            // callers observe the same ordering as io_uring.
+            const action = try self.deliverInline(c, .{ .connect = {} });
+            switch (action) {
+                .disarm => return,
+                .rearm => switch (c.op) {
+                    .connect => |new_op| try self.connect(new_op, c, ud, cb),
+                    else => return,
+                },
+            }
+            return;
         } else |err| switch (err) {
             error.WouldBlock => {},
             else => {
