@@ -59,7 +59,7 @@ Required local setup:
 scripts/setup-worktree.sh <worktree-path>
 ```
 
-That shallow-initializes (`--depth 1`) the build-dep submodules `vendor/boringssl` + `vendor/c-ares`, and symlinks `reference-codebases/` from the main checkout (read-only — never modify reference codebases inside a worktree, the symlink reaches main's submodule pointers).
+That shallow-initializes (`--depth 1`) the build-dep submodules `vendor/boringssl` + `vendor/c-ares`, symlinks `reference-codebases/` from the main checkout (read-only — never modify reference codebases inside a worktree, the symlink reaches main's submodule pointers), and symlinks `.zig-cache/` to the main checkout so worker builds share the compiler cache. `zig-out/` stays per-worktree so branch builds do not overwrite each other's binaries. The script also marks the tracked `reference-codebases/*` gitlinks as `skip-worktree` in the worker checkout and adds local excludes for setup symlinks, so those artifacts do not appear in `git status`.
 
 Note: `reference-codebases/*` submodules are *registered* in `.gitmodules` but **not** initialized by `setup-worktree.sh` (the script only creates the symlink). In a fresh main checkout they are empty until you run `git submodule update --init reference-codebases/<name>` explicitly. In worktrees, the symlink resolves to the main checkout's reference-codebases tree, so they appear populated only if main has initialized them.
 
