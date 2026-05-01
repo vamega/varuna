@@ -11,8 +11,9 @@
 //! to a piece (multi-source download).
 //!
 //! Lifecycle:
-//!   1. completePieceDownload() -> snapshotAttribution(tid, piece, peer_addrs)
-//!      records which peer sent each block, keyed by (tid, piece).
+//!   1. completePieceDownload() -> snapshotAttribution(tid, piece, piece_buf, peer_addrs)
+//!      records which peer sent each block, keyed by the exact piece buffer
+//!      submitted for hash verification.
 //!   2. processHashResults():
 //!      - on FAIL: onPieceFailed(tid, piece, piece_buf, block_size)
 //!        computes per-block SHA-1 and stores {peer_addr, digest} keyed by
@@ -42,6 +43,12 @@ pub const PieceKey = struct {
     piece_index: u32,
 };
 
+pub const AttributionKey = struct {
+    torrent_id: u32,
+    piece_index: u32,
+    piece_buf_addr: usize,
+};
+
 /// Per-block peer attribution for a specific piece download.
 /// null entries mean "unknown peer" (e.g. block wasn't attributed, or web seed).
 pub const PieceAttribution = struct {
@@ -61,16 +68,19 @@ pub const SmartBan = struct {
     /// a successful re-download to determine which peer(s) sent corrupt data.
     records: std.AutoHashMap(BlockKey, BlockRecord),
 
-    /// Transient per-piece attribution snapshots.  Populated at
+    /// Transient per-buffer attribution snapshots. Populated at
     /// completePieceDownload and consumed when the matching hash result
-    /// arrives in processHashResults (whether pass or fail).
-    pending_attributions: std.AutoHashMap(PieceKey, PieceAttribution),
+    /// arrives in processHashResults (whether pass or fail). Including
+    /// the piece-buffer address prevents a later re-download of the same
+    /// (torrent, piece) from overwriting attribution for an older hasher
+    /// job that has not returned yet.
+    pending_attributions: std.AutoHashMap(AttributionKey, PieceAttribution),
 
     pub fn init(allocator: std.mem.Allocator) SmartBan {
         return .{
             .allocator = allocator,
             .records = std.AutoHashMap(BlockKey, BlockRecord).init(allocator),
-            .pending_attributions = std.AutoHashMap(PieceKey, PieceAttribution).init(allocator),
+            .pending_attributions = std.AutoHashMap(AttributionKey, PieceAttribution).init(allocator),
         };
     }
 
@@ -91,13 +101,15 @@ pub const SmartBan = struct {
         self: *SmartBan,
         torrent_id: u32,
         piece_index: u32,
+        piece_buf: []const u8,
         block_peers: []?std.net.Address,
     ) !void {
-        const key = PieceKey{ .torrent_id = torrent_id, .piece_index = piece_index };
+        const key = attributionKey(torrent_id, piece_index, piece_buf);
 
         // Defensive: if an existing attribution is present for this key,
-        // free it before overwriting.  This can happen if the hash result
-        // for the previous attempt was dropped (e.g. torrent removed).
+        // free it before overwriting. This is only expected if an old hash
+        // result was dropped and the allocator later reused the same piece
+        // buffer address for the same torrent/piece.
         if (self.pending_attributions.fetchRemove(key)) |old| {
             self.allocator.free(old.value.block_peers);
         }
@@ -116,7 +128,7 @@ pub const SmartBan = struct {
         piece_buf: []const u8,
         block_size: u32,
     ) !void {
-        const key = PieceKey{ .torrent_id = torrent_id, .piece_index = piece_index };
+        const key = attributionKey(torrent_id, piece_index, piece_buf);
         const attribution = self.pending_attributions.fetchRemove(key) orelse return;
         defer self.allocator.free(attribution.value.block_peers);
 
@@ -171,7 +183,7 @@ pub const SmartBan = struct {
         block_size: u32,
     ) ![]std.net.Address {
         // Always consume the attribution for the current (passing) piece.
-        const cur_key = PieceKey{ .torrent_id = torrent_id, .piece_index = piece_index };
+        const cur_key = attributionKey(torrent_id, piece_index, piece_buf);
         if (self.pending_attributions.fetchRemove(cur_key)) |att| {
             self.allocator.free(att.value.block_peers);
         }
@@ -235,7 +247,7 @@ pub const SmartBan = struct {
         for (rkeys.items) |k| _ = self.records.remove(k);
 
         // Free and remove all pending attributions for this torrent
-        var pkeys = std.ArrayList(PieceKey).empty;
+        var pkeys = std.ArrayList(AttributionKey).empty;
         defer pkeys.deinit(self.allocator);
 
         var pit = self.pending_attributions.iterator();
@@ -259,6 +271,14 @@ pub const SmartBan = struct {
     /// Returns the number of pending attribution entries (for tests/observability).
     pub fn pendingAttributionCount(self: *const SmartBan) usize {
         return self.pending_attributions.count();
+    }
+
+    fn attributionKey(torrent_id: u32, piece_index: u32, piece_buf: []const u8) AttributionKey {
+        return .{
+            .torrent_id = torrent_id,
+            .piece_index = piece_index,
+            .piece_buf_addr = @intFromPtr(piece_buf.ptr),
+        };
     }
 };
 
@@ -289,7 +309,7 @@ test "smart ban: records and matches block hashes for failed then passed piece" 
     attr[1] = peer_b;
     attr[2] = peer_a;
     attr[3] = peer_b;
-    try sb.snapshotAttribution(1, 5, attr);
+    try sb.snapshotAttribution(1, 5, piece_bad[0..], attr);
 
     // Piece fails
     try sb.onPieceFailed(1, 5, piece_bad[0..], block_size);
@@ -302,7 +322,7 @@ test "smart ban: records and matches block hashes for failed then passed piece" 
     attr2[1] = peer_b;
     attr2[2] = peer_b;
     attr2[3] = peer_b;
-    try sb.snapshotAttribution(1, 5, attr2);
+    try sb.snapshotAttribution(1, 5, piece_good[0..], attr2);
 
     // Piece passes -- check that peer A is identified
     const bad = try sb.onPiecePassed(1, 5, piece_good[0..], block_size);
@@ -348,10 +368,9 @@ test "smart ban: clearTorrent removes all entries for torrent" {
     const attr = try alloc.alloc(?std.net.Address, 2);
     attr[0] = peer;
     attr[1] = peer;
-    try sb.snapshotAttribution(1, 0, attr);
-
     var piece: [32]u8 = undefined;
     @memset(&piece, 0);
+    try sb.snapshotAttribution(1, 0, piece[0..], attr);
     try sb.onPieceFailed(1, 0, piece[0..], 16);
     try testing.expectEqual(@as(usize, 2), sb.recordCount());
 
@@ -359,7 +378,7 @@ test "smart ban: clearTorrent removes all entries for torrent" {
     const attr2 = try alloc.alloc(?std.net.Address, 2);
     attr2[0] = peer;
     attr2[1] = peer;
-    try sb.snapshotAttribution(2, 0, attr2);
+    try sb.snapshotAttribution(2, 0, piece[0..], attr2);
     try testing.expectEqual(@as(usize, 1), sb.pendingAttributionCount());
 
     sb.clearTorrent(1);
@@ -382,10 +401,9 @@ test "smart ban: null block_peer entries are skipped (web seed)" {
     const attr = try alloc.alloc(?std.net.Address, 2);
     attr[0] = null;
     attr[1] = peer;
-    try sb.snapshotAttribution(1, 0, attr);
-
     var piece: [32]u8 = undefined;
     @memset(&piece, 0);
+    try sb.snapshotAttribution(1, 0, piece[0..], attr);
     try sb.onPieceFailed(1, 0, piece[0..], 16);
     // Only 1 record (block 1); the null block was skipped.
     try testing.expectEqual(@as(usize, 1), sb.recordCount());
@@ -403,13 +421,55 @@ test "smart ban: snapshotAttribution replaces existing entry" {
     const attr1 = try alloc.alloc(?std.net.Address, 2);
     attr1[0] = peer;
     attr1[1] = peer;
-    try sb.snapshotAttribution(1, 0, attr1);
+    var piece: [32]u8 = undefined;
+    @memset(&piece, 0);
+    try sb.snapshotAttribution(1, 0, piece[0..], attr1);
 
     const attr2 = try alloc.alloc(?std.net.Address, 3);
     attr2[0] = peer;
     attr2[1] = peer;
     attr2[2] = peer;
-    try sb.snapshotAttribution(1, 0, attr2);
+    try sb.snapshotAttribution(1, 0, piece[0..], attr2);
 
     try testing.expectEqual(@as(usize, 1), sb.pendingAttributionCount());
+}
+
+test "smart ban: same piece overlapping hash jobs keep independent attribution" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+
+    var sb = SmartBan.init(alloc);
+    defer sb.deinit();
+
+    const corrupt_peer = try std.net.Address.parseIp4("1.2.3.4", 0);
+    const honest_peer = try std.net.Address.parseIp4("5.6.7.8", 0);
+
+    var failed_piece: [32]u8 = undefined;
+    var passing_piece: [32]u8 = undefined;
+    @memset(&failed_piece, 0);
+    @memset(&passing_piece, 0);
+    @memset(failed_piece[16..32], 0xCC);
+
+    const failed_attr = try alloc.alloc(?std.net.Address, 2);
+    failed_attr[0] = honest_peer;
+    failed_attr[1] = corrupt_peer;
+    try sb.snapshotAttribution(1, 0, failed_piece[0..], failed_attr);
+
+    const passing_attr = try alloc.alloc(?std.net.Address, 2);
+    passing_attr[0] = honest_peer;
+    passing_attr[1] = honest_peer;
+    try sb.snapshotAttribution(1, 0, passing_piece[0..], passing_attr);
+
+    try testing.expectEqual(@as(usize, 2), sb.pendingAttributionCount());
+
+    try sb.onPieceFailed(1, 0, failed_piece[0..], 16);
+    try testing.expectEqual(@as(usize, 1), sb.pendingAttributionCount());
+
+    const bad = try sb.onPiecePassed(1, 0, passing_piece[0..], 16);
+    defer alloc.free(bad);
+
+    try testing.expectEqual(@as(usize, 1), bad.len);
+    try testing.expect(bad[0].eql(corrupt_peer));
+    try testing.expectEqual(@as(usize, 0), sb.pendingAttributionCount());
+    try testing.expectEqual(@as(usize, 0), sb.recordCount());
 }

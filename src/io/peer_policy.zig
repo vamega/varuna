@@ -706,7 +706,7 @@ pub fn completePieceDownload(self: anytype, slot: u16) void {
         // processHashResults (on both pass and fail paths).
         if (dp) |d| {
             if (self.smart_ban) |sb| {
-                snapshotAttributionForSmartBan(self, sb, peer.torrent_id, piece_index, d);
+                snapshotAttributionForSmartBan(self, sb, peer.torrent_id, piece_index, piece_buf, d);
             }
         }
 
@@ -1756,6 +1756,7 @@ fn snapshotAttributionForSmartBan(
     sb: *SmartBan,
     torrent_id: u32,
     piece_index: u32,
+    piece_buf: []const u8,
     d: *const DownloadingPiece,
 ) void {
     const block_count = d.block_infos.len;
@@ -1782,7 +1783,7 @@ fn snapshotAttributionForSmartBan(
         block_peers[i] = bi.delivered_address;
     }
 
-    sb.snapshotAttribution(torrent_id, piece_index, block_peers) catch {
+    sb.snapshotAttribution(torrent_id, piece_index, piece_buf, block_peers) catch {
         // On failure, free the slice we just allocated.
         self.allocator.free(block_peers);
     };

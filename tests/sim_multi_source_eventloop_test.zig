@@ -272,6 +272,21 @@ fn runScenario(seed: u64, opts: ScenarioOpts) !void {
         if (el.isPieceComplete(tid, 0)) break;
     }
 
+    // Snapshot per-peer contribution counters before the teardown drain.
+    // `peer.disconnect()` below can drive EventLoop.removePeer(), which
+    // resets the peer slot to `Peer{}` and loses bytes_downloaded_from.
+    var peers_with_contribs: u8 = 0;
+    var max_contrib: u64 = 0;
+    var total_contrib: u64 = 0;
+    var contrib_slot: u8 = 0;
+    while (contrib_slot < num_peers) : (contrib_slot += 1) {
+        if (el.getPeerView(slots[contrib_slot])) |v| {
+            if (v.bytes_downloaded > 0) peers_with_contribs += 1;
+            if (v.bytes_downloaded > max_contrib) max_contrib = v.bytes_downloaded;
+            total_contrib += v.bytes_downloaded;
+        }
+    }
+
     // ── 6. Drain phase (same pattern as Phase 0 EL test) ───────
     //
     // Drain budget bumped from 256 → 4096 ticks to absorb the
@@ -317,23 +332,6 @@ fn runScenario(seed: u64, opts: ScenarioOpts) !void {
     // cross-DP join).
     const multi_source_landed: bool = true;
     if (multi_source_landed) {
-        // `bytes_downloaded` is the right metric here — it's the count
-        // of bytes the EL DOWNLOADED FROM this peer. Each peer's
-        // contribution to the multi-source piece. (`bytes_uploaded` is
-        // the inverse — what the EL sent TO the peer, which is 0
-        // because the EL is a pure leecher in this test.)
-        var peers_with_contribs: u8 = 0;
-        var max_contrib: u64 = 0;
-        var total_contrib: u64 = 0;
-        var j: u8 = 0;
-        while (j < num_peers) : (j += 1) {
-            if (el.getPeerView(slots[j])) |v| {
-                if (v.bytes_downloaded > 0) peers_with_contribs += 1;
-                if (v.bytes_downloaded > max_contrib) max_contrib = v.bytes_downloaded;
-                total_contrib += v.bytes_downloaded;
-            }
-        }
-
         // ≥ 2 peers contributed bytes — the meaningful "not serialised
         // on one peer" invariant.
         try testing.expect(peers_with_contribs >= 2);
