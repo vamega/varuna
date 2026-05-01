@@ -898,19 +898,61 @@ pub const DiskWriteOp = DiskWriteOpOf(EventLoop);
 /// existing `handleDiskWriteResult`, and frees the tracking struct.
 pub fn diskWriteCompleteFor(comptime EL: type) io_interface.Callback {
     return struct {
+        fn failWrite(op: *DiskWriteOpOf(EL)) void {
+            const el = op.el;
+            const write_id = op.write_id;
+            el.allocator.destroy(op);
+            handleDiskWriteResult(el, write_id, -1);
+        }
+
         fn cb(
             userdata: ?*anyopaque,
-            _: *io_interface.Completion,
+            completion: *io_interface.Completion,
             result: io_interface.Result,
         ) io_interface.CallbackAction {
             const op: *DiskWriteOpOf(EL) = @ptrCast(@alignCast(userdata.?));
-            const res: i32 = switch (result) {
-                .write => |r| if (r) |n|
-                    std.math.cast(i32, n) orelse std.math.maxInt(i32)
-                else |_|
-                    -1,
-                else => -1,
+            const submitted = switch (completion.op) {
+                .write => |write_op| write_op,
+                else => {
+                    failWrite(op);
+                    return .disarm;
+                },
             };
+
+            const written = switch (result) {
+                .write => |r| r catch {
+                    failWrite(op);
+                    return .disarm;
+                },
+                else => {
+                    failWrite(op);
+                    return .disarm;
+                },
+            };
+
+            if (written == 0) {
+                failWrite(op);
+                return .disarm;
+            }
+
+            if (written < submitted.buf.len) {
+                op.el.io.write(
+                    .{
+                        .fd = submitted.fd,
+                        .buf = submitted.buf[written..],
+                        .offset = submitted.offset + @as(u64, @intCast(written)),
+                    },
+                    completion,
+                    op,
+                    diskWriteCompleteFor(EL),
+                ) catch {
+                    failWrite(op);
+                    return .disarm;
+                };
+                return .disarm;
+            }
+
+            const res = std.math.cast(i32, written) orelse std.math.maxInt(i32);
             const el = op.el;
             const write_id = op.write_id;
             el.allocator.destroy(op);
@@ -1266,4 +1308,88 @@ test "handleDiskWrite releases piece when any submit failed" {
     try std.testing.expectEqual(@as(usize, 0), el.pending_writes.count());
     try std.testing.expectEqual(@as(u32, 0), tracker.completedCount());
     try std.testing.expectEqual(@as(?u32, 0), tracker.claimPiece(null));
+}
+
+test "diskWriteComplete resubmits short positive writes" {
+    const sim_io = @import("sim_io.zig");
+    const SimEventLoop = @import("event_loop.zig").EventLoopOf(sim_io.SimIO);
+
+    const ShortWrite = struct {
+        forced: bool = false,
+
+        fn hook(sim: *sim_io.SimIO, ctx: ?*anyopaque) void {
+            const self: *@This() = @ptrCast(@alignCast(ctx.?));
+            if (self.forced) return;
+
+            var idx: u32 = 0;
+            while (idx < sim.pending_len) : (idx += 1) {
+                switch (sim.pending[idx].completion.op) {
+                    .write => |op| {
+                        if (op.buf.len == 16) {
+                            sim.pending[idx].result = .{ .write = @as(usize, 4) };
+                            self.forced = true;
+                            return;
+                        }
+                    },
+                    else => {},
+                }
+            }
+        }
+    };
+
+    var short_write = ShortWrite{};
+    var sim = try sim_io.SimIO.init(std.testing.allocator, .{ .max_ops_per_tick = 1 });
+    sim.pre_tick_hook = ShortWrite.hook;
+    sim.pre_tick_ctx = &short_write;
+
+    var el = try SimEventLoop.initBareWithIO(std.testing.allocator, sim, 0);
+    defer el.deinit();
+
+    const buf = try std.testing.allocator.alloc(u8, 16);
+    @memset(buf, 0xAB);
+
+    const write_id = try el.createPendingWrite(.{
+        .piece_index = 0,
+        .torrent_id = 0,
+    }, .{
+        .write_id = 0,
+        .piece_index = 0,
+        .torrent_id = 0,
+        .slot = 0,
+        .buf = buf,
+        .spans_remaining = 1,
+    });
+
+    const EL = @TypeOf(el);
+    const wop = try std.testing.allocator.create(DiskWriteOpOf(EL));
+    wop.* = .{ .el = &el, .write_id = write_id };
+
+    try el.io.write(
+        .{ .fd = 42, .buf = buf, .offset = 100 },
+        &wop.completion,
+        wop,
+        diskWriteCompleteFor(EL),
+    );
+
+    try el.io.tick(1);
+
+    try std.testing.expect(short_write.forced);
+    try std.testing.expectEqual(@as(usize, 1), el.pending_writes.count());
+    const pending_w = el.getPendingWriteById(write_id) orelse return error.MissingPendingWrite;
+    try std.testing.expectEqual(@as(u32, 1), pending_w.spans_remaining);
+    try std.testing.expectEqual(@as(u32, 0), pending_w.piece_index);
+    try std.testing.expectEqual(@as(usize, 1), el.io.pending_len);
+    switch (wop.completion.op) {
+        .write => |op| {
+            try std.testing.expectEqual(@as(posix.fd_t, 42), op.fd);
+            try std.testing.expectEqual(@as(u64, 104), op.offset);
+            try std.testing.expectEqual(@as(usize, 12), op.buf.len);
+            try std.testing.expectEqualSlices(u8, buf[4..], op.buf);
+        },
+        else => return error.ExpectedWriteResubmission,
+    }
+
+    try el.io.tick(1);
+
+    try std.testing.expectEqual(@as(usize, 0), el.pending_writes.count());
 }
