@@ -12,6 +12,10 @@ Keep implementation under `src/`. The current major subsystems are:
 - `src/rpc/` - qBittorrent-compatible WebAPI handlers, sync state, auth, HTTP server
 - `src/crypto/` - MSE, hashing helpers, RC4, crypto backends
 - `src/runtime/` - runtime/kernel probing and startup gating
+- `src/sim/` - simulator, virtual peers, deterministic I/O backend for simulation-first tests
+- `src/ctl/` - `varuna-ctl` daemon control CLI
+- `src/tools/` - `varuna-tools` (torrent create / inspect)
+- `src/bench/` - CPU microbenchmarks (parser, bencode, SHA-1, metainfo) wired through `zig build bench`
 - `src/perf/` - benchmarks and profiling helpers exposed through `build.zig`
 
 Keep reusable fixtures in `testdata/`. Keep profiling helpers in `perf/` or `scripts/`.
@@ -45,7 +49,7 @@ Required local setup:
 - SQLite dev package: `libsqlite3-dev` on Ubuntu/Debian
 - local Linux/io_uring docs for substantial kernel work: `man-db`, `manpages`, `manpages-dev`, `manpages-posix`, `manpages-posix-dev`, `liburing-dev`
 - git submodules initialized with `git submodule update --init`
-- `vendor/boringssl` initialized or `zig build` will fail
+- `vendor/boringssl` and `vendor/c-ares` initialized or `zig build` will fail
 
 ### Worktree setup
 
@@ -55,7 +59,9 @@ Required local setup:
 scripts/setup-worktree.sh <worktree-path>
 ```
 
-That initializes `vendor/boringssl` + `vendor/c-ares` (build deps) and symlinks `reference-codebases/` from the main checkout (read-only — never modify reference codebases inside a worktree, the symlink reaches main's submodule pointers).
+That shallow-initializes (`--depth 1`) the build-dep submodules `vendor/boringssl` + `vendor/c-ares`, and symlinks `reference-codebases/` from the main checkout (read-only — never modify reference codebases inside a worktree, the symlink reaches main's submodule pointers).
+
+Note: `reference-codebases/*` submodules are *registered* in `.gitmodules` but **not** initialized by `setup-worktree.sh` (the script only creates the symlink). In a fresh main checkout they are empty until you run `git submodule update --init reference-codebases/<name>` explicitly. In worktrees, the symlink resolves to the main checkout's reference-codebases tree, so they appear populated only if main has initialized them.
 
 Reference repos under `reference-codebases/`:
 - `libtorrent` - arvidn/libtorrent
@@ -78,6 +84,8 @@ Core commands:
 - `zig build perf-record -- ...`
 - `zig fmt .`
 - `./scripts/demo_swarm.sh`
+
+Run `zig build --help` for the full list — there are 40+ focused test/sim/buggify/parity targets beyond the ones above (e.g. `test-sim-*`, `test-api`, `test-recheck`, `test-event-loop`, `test-bind-device`, `test-swarm`, `soak-test`).
 
 Rules:
 - add practical new commands to `build.zig` instead of one-off shell scripts
@@ -111,10 +119,13 @@ Allowed daemon exceptions (background threads only):
 - stdout logging
 - test helpers that simulate peers or trackers
 - `uname` for runtime probing
+- sd_notify (`src/daemon/systemd.zig`) -- one-shot AF_UNIX `connect`/`write` to the `$NOTIFY_SOCKET` for `READY=1` / `STOPPING=1`. Best-effort startup/shutdown notification, not on any hot path.
 
 **Do not spawn background threads for I/O.** If something needs to happen concurrently, submit it as io_uring SQEs. Background threads are only for CPU-bound work (hashing) and APIs that cannot use io_uring (SQLite, DNS without c-ares). The multi-tracker announce thread pool and the `startWorker` blocking-I/O patterns are known violations being removed.
 
 When adding daemon I/O, use the ring or event loop and verify with `strace -f -yy -c` that it routes through `io_uring_enter`.
+
+See [docs/io_uring_static_violation_analysis.md](docs/io_uring_static_violation_analysis.md) for the static analysis of current and historical violations.
 
 ## Key Docs
 - [docs/io-uring-syscalls.md](docs/io-uring-syscalls.md) - syscall reference and current io_uring coverage
@@ -129,6 +140,8 @@ Before assuming a feature is absent, check [STATUS.md](STATUS.md), recent `progr
 ## Style
 Use `zig fmt`. Prefer small modules, explicit ownership, and low-allocation designs. Use `snake_case` for files/functions/locals and `PascalCase` for types. Keep Linux- and io_uring-specific code explicit.
 
+For the simulation-first testing model and the IO abstraction that backs it, see [STYLE.md](STYLE.md), [docs/simulation-roadmap.md](docs/simulation-roadmap.md), and [docs/io-abstraction-plan.md](docs/io-abstraction-plan.md).
+
 ## Testing
 Write unit tests inline with `test` blocks. Put broader scenarios under `tests/`. Prioritize protocol correctness, piece verification, persistence safety, and performance regressions. Name tests after behavior, for example `test "rejects invalid bencode length"`.
 
@@ -136,4 +149,10 @@ Write unit tests inline with `test` blocks. Put broader scenarios under `tests/`
 Use short imperative commit subjects, for example `storage: add piece file mapper`. Keep commits scoped to one subsystem. PRs should include intent, design tradeoffs, test coverage, and benchmark deltas for performance-sensitive changes.
 
 ## Scope
-Linux only, modern kernels only, headless daemon first. Private-tracker BEPs come before public-tracker features. Network filesystems are out of scope.
+Linux + io_uring is the design focus. Private-tracker BEPs come before public-tracker features. Network filesystems are out of scope.
+
+Alternate IO backends exist for narrow reasons:
+- `epoll` (`src/io/epoll_posix_io.zig`, `src/io/epoll_mmap_io.zig`) — for users who want to run varuna inside a container or sandbox that blocks the `io_uring` syscalls.
+- `kqueue` (`src/io/kqueue_*.zig`) — for development on macOS only.
+
+These are not the primary deployment target. New daemon I/O code must still use the ring (see io_uring Policy); the alternate backends ride on the same `EventLoopOf(...)` contract surface so they pick up new behavior automatically when the contract is implemented correctly.

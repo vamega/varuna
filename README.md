@@ -32,9 +32,8 @@ varuna-tools inspect file.torrent
 
 ### Known Limitations
 
-- **No smart ban**: When a peer sends corrupt data that fails piece hash verification, the piece is re-downloaded but the peer is not penalized or banned. A smart ban implementation (per-block SHA-1 tracking with cross-reference on piece pass, matching libtorrent's approach) is planned. See `docs/future-features.md` for the implementation plan.
-- **No multi-source piece assembly**: Each piece is downloaded from a single peer. Requesting different blocks of the same piece from multiple peers simultaneously is not yet supported. This is a prerequisite for the full smart ban algorithm to be effective in mixed-peer scenarios.
-- MSE/PE encryption handshake has known issues in mixed mode (`vc_not_found` / `req1_not_found`).
+- **`scripts/demo_swarm.sh` baseline regression under `-Dio=io_uring`** (current main): two daemons connect and complete MSE + BEP-10 handshakes, but no BITFIELD/INTERESTED/UNCHOKE/PIECE messages follow and progress stays at 0.0. The in-process `transfer_integration_test` still passes, so the algorithm-layer wire-protocol logic in `src/io/peer_handler.zig` is intact; the failure is at the daemon-glue boundary across two real processes. Last verified passing at commit `3ab5f59` (2026-04-30). See `progress-reports/2026-04-30-backend-validation.md`.
+- **`network.bind_device` is silently bypassed by the default threadpool DNS backend**: peer connections, uTP/DHT, RPC, and tracker clients honor `bind_device`, but `getaddrinfo` owns its own UDP socket internally with no hook for `SO_BINDTODEVICE`. Workaround: build with `-Ddns=c_ares`, which applies `bind_device` for every socket the c-ares channel opens. Full fix queued behind the custom-DNS work in `docs/custom-dns-design-round2.md` §1.
 
 The living scope and architecture record lives in [DECISIONS.md](DECISIONS.md). Keep that file updated as constraints and design choices change.
 Use [STATUS.md](STATUS.md) as the current ledger for what is already implemented, what is next, and which issues are still open.
@@ -60,21 +59,32 @@ Reference implementations worth studying:
 - `rtorrent`: long-lived private-tracker workflows and headless ergonomics
 - `vortex`: examples of a BitTorrent client built around `io_uring`
 
-## Initial Build Approach
-The repository is still at bootstrap stage. The first implementation steps should be:
+## Building from source
 
-1. Add `build.zig` and a small `src/main.zig` daemon entrypoint.
-2. Establish subsystem boundaries under `src/` for protocol, storage, tracker, and control plane code.
-3. Build a test-first foundation for bencode, metainfo parsing, hashing, and piece mapping.
-4. Add an `io_uring` event loop, kernel capability probing, and storage abstraction before higher-level torrent management.
-5. Expose an HTTP control API over both Unix socket and TCP socket transports.
+Linux only. Kernel `6.6` minimum (WSL2 baseline).
 
-Use Zig `0.15.2` or the latest stable Zig release. Do not use nightly builds.
-Use `mise` to install pinned tools for this repository.
+System packages (Ubuntu/Debian):
 
 ```bash
+sudo apt install libsqlite3-dev liburing-dev
+```
+
+Toolchain — Zig stable (`0.15.2` or the latest stable; never nightly), pinned via `mise`:
+
+```bash
+mise trust          # in new checkouts/worktrees, before mise exec
 mise install
 ```
+
+Submodules and build:
+
+```bash
+git submodule update --init       # vendor/boringssl, vendor/c-ares, reference-codebases
+zig build                         # produces varuna, varuna-ctl, varuna-tools
+zig build test                    # all unit tests
+```
+
+For worktrees, run `scripts/setup-worktree.sh <path>` instead of plain `git submodule update --init` — it initializes the build-dep submodules and symlinks `reference-codebases/` from the main checkout. See [AGENTS.md](AGENTS.md) for the full contributor workflow.
 
 ## Working Principles
 - Prefer `io_uring` where it actually improves the design.
