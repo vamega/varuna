@@ -1240,6 +1240,7 @@ pub fn EventLoopOf(comptime IO: type) type {
                 self,
                 peer_handler.peerSocketCompleteFor(Self),
             );
+            peer.connect_pending = true;
 
             self.peer_count += 1;
             self.half_open_count += 1;
@@ -1713,6 +1714,7 @@ pub fn EventLoopOf(comptime IO: type) type {
 
         pub fn removePeer(self: *Self, slot: u16) void {
             const peer = &self.peers[slot];
+            if (peer.state == .disconnecting) return;
             // Track half-open connection cleanup
             if (peer.state == .connecting and self.half_open_count > 0) {
                 self.half_open_count -= 1;
@@ -1761,14 +1763,26 @@ pub fn EventLoopOf(comptime IO: type) type {
             self.unmarkIdle(slot);
             self.unmarkActivePeer(slot);
 
-            // Free any tracked send buffers before closing the fd.  After
-            // close, stale CQEs will arrive for this slot -- the guard in
-            // handleSend will ignore them because the slot is .free.
+            // Free any tracked send buffers before closing the fd. Ghost
+            // PendingSends stay claimed until their CQEs arrive.
             self.freeAllPendingSends(slot);
 
             const torrent_id = peer.torrent_id;
-            self.cleanupPeer(peer);
-            peer.* = Peer{};
+            const embedded_completions = peerEmbeddedCompletionCount(peer);
+            if (embedded_completions > 0) {
+                if (peer.fd >= 0) {
+                    if (peer.transport == .tcp) {
+                        self.shutdownPeerFd(peer.fd);
+                    }
+                    self.io.closeSocket(peer.fd);
+                    peer.fd = -1;
+                }
+                peer.state = .disconnecting;
+                peer.disconnecting_completions = embedded_completions;
+            } else {
+                self.cleanupPeer(peer);
+                peer.* = Peer{};
+            }
             if (self.peer_count > 0) self.peer_count -= 1;
 
             if (self.peerCountForTorrent(torrent_id) == 0) {
@@ -1780,6 +1794,26 @@ pub fn EventLoopOf(comptime IO: type) type {
                     tc.last_speed_check = 0;
                 }
             }
+        }
+
+        fn peerEmbeddedCompletionCount(peer: *const Peer) u8 {
+            var count: u8 = 0;
+            if (peer.connect_pending) count += 1;
+            if (peer.recv_pending) count += 1;
+            if (peer.untracked_send_pending) count += 1;
+            return count;
+        }
+
+        pub fn completeDisconnectingPeerCompletion(self: *Self, slot: u16) void {
+            const peer = &self.peers[slot];
+            if (peer.state != .disconnecting) return;
+            if (peer.disconnecting_completions > 0) {
+                peer.disconnecting_completions -= 1;
+            }
+            if (peer.disconnecting_completions != 0) return;
+
+            self.cleanupPeer(peer);
+            peer.* = Peer{};
         }
 
         // ── Run loop ───────────────────────────────────────────

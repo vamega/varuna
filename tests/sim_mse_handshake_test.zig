@@ -536,13 +536,13 @@ test "MSE removePeer during in-flight handshake — does not crash or corrupt ne
         // Step 2: forcibly remove the peer (simulates checkPeerTimeouts
         // firing on a stalled MSE handshake).
         el.removePeer(out_slot);
-        try testing.expectEqual(varuna.io.event_loop.PeerState.free, el.peers[out_slot].state);
+        try testing.expectEqual(varuna.io.event_loop.PeerState.disconnecting, el.peers[out_slot].state);
 
         // Drive ticks so any pending CQEs (the closeSocket-fired
-        // recv-error CQE) drain on the freed slot. handleRecvResult
-        // must early-return on `peer.state == .free` and not touch
-        // the heap-freed mse_initiator.
+        // recv-error CQE) drain on the quarantined slot. The slot only
+        // returns to .free after the stale CQE has fired.
         for (0..8) |_| try el.tick();
+        try testing.expectEqual(varuna.io.event_loop.PeerState.free, el.peers[out_slot].state);
 
         // Step 3: re-use the slot for a NEW inbound MSE handshake.
         // If the historical race exists, the OLD recv CQE arriving
@@ -578,6 +578,84 @@ test "MSE removePeer during in-flight handshake — does not crash or corrupt ne
         try testing.expect(el.peers[in_slot].mse_responder == null);
         try testing.expectEqual(mse.crypto_rc4, el.peers[in_slot].crypto.crypto_method);
     }
+}
+
+test "MSE removePeer with delayed close CQE quarantines slot until stale recv drains" {
+    const allocator = testing.allocator;
+    const seed: u64 = 0x5151_2026;
+
+    const sim_io = try SimIO.init(allocator, .{
+        .seed = seed,
+        .socket_capacity = 16,
+        .recv_queue_capacity_bytes = 64 * 1024,
+        .pending_capacity = 4096,
+        .faults = .{
+            .delayed_close_cqe_min_ticks = 16,
+            .delayed_close_cqe_max_ticks = 16,
+        },
+    });
+    var el = EL_SimIO.initBareWithIO(allocator, sim_io, 0) catch |err| {
+        if (err == error.SystemResources) return error.SkipZigTest;
+        return err;
+    };
+    defer el.deinit();
+    el.random = Random.simRandom(seed);
+    el.encryption_mode = .preferred;
+    el.hasher = try Hasher.simInit(allocator, seed ^ 0xa5a5);
+
+    var info_hash: [20]u8 = undefined;
+    var hash_rng = Random.simRandom(seed ^ 0xfeed);
+    hash_rng.bytes(&info_hash);
+    const empty_fds = [_]posix.fd_t{};
+    const tid = try el.addTorrentContext(.{
+        .shared_fds = empty_fds[0..],
+        .info_hash = info_hash,
+        .peer_id = [_]u8{0xAA} ** 20,
+    });
+
+    const out_pair = try el.io.createSocketpair();
+    try el.io.enqueueSocketResult(out_pair[0]);
+    const out_addr = std.net.Address.initIp4(.{ 10, 0, 0, 1 }, 6881);
+    const out_slot = try el.addPeerForTorrent(out_addr, tid);
+
+    for (0..4) |_| try el.tick();
+    try testing.expect(el.peers[out_slot].mse_initiator != null);
+
+    el.removePeer(out_slot);
+    try testing.expectEqual(varuna.io.event_loop.PeerState.disconnecting, el.peers[out_slot].state);
+
+    const in_pair = try el.io.createSocketpair();
+    const in_addr = std.net.Address.initIp4(.{ 10, 0, 0, 2 }, 6881);
+    const in_slot = try el.addInboundPeer(tid, in_pair[0], in_addr);
+    try testing.expect(in_slot != out_slot);
+
+    var peer_random_in = Random.simRandom(seed ^ 0xbeef_0002);
+    var in_initiator_backing: mse.MseInitiatorHandshake = undefined;
+    var in_driver: PeerMseDriver = undefined;
+    try in_driver.initInitiator(
+        &el.io,
+        in_pair[1],
+        &peer_random_in,
+        info_hash,
+        .preferred,
+        &in_initiator_backing,
+    );
+
+    var ticks: u32 = 0;
+    while (ticks < 256) : (ticks += 1) {
+        try el.tick();
+        if (in_driver.outcome != .in_progress and
+            el.peers[out_slot].state == .free)
+        {
+            for (0..4) |_| try el.tick();
+            break;
+        }
+    }
+
+    try testing.expectEqual(varuna.io.event_loop.PeerState.free, el.peers[out_slot].state);
+    try testing.expectEqual(PeerMseDriver.Outcome.complete, in_driver.outcome);
+    try testing.expect(el.peers[in_slot].mse_responder == null);
+    try testing.expectEqual(mse.crypto_rc4, el.peers[in_slot].crypto.crypto_method);
 }
 
 test "MSE handshake under recv-error injection (8 seeds × 0.05 fault prob)" {

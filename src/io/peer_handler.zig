@@ -161,6 +161,12 @@ pub fn peerSocketCompleteFor(comptime EL: type) io_interface.Callback {
 
 fn handleSocketResult(self: anytype, slot: u16, res: i32) void {
     const peer = &self.peers[slot];
+    if (peer.state == .disconnecting) {
+        peer.connect_pending = false;
+        if (res >= 0) self.io.closeSocket(@intCast(res));
+        self.completeDisconnectingPeerCompletion(slot);
+        return;
+    }
     if (peer.state == .free) {
         // Route through the IO contract (RealIO -> posix.close;
         // SimIO -> mark synthetic slot closed). Raw posix.close on
@@ -170,6 +176,7 @@ fn handleSocketResult(self: anytype, slot: u16, res: i32) void {
     }
 
     if (peer.state != .connecting) {
+        peer.connect_pending = false;
         log.debug("slot {d}: ignoring stale socket CQE (state={s})", .{
             slot, @tagName(peer.state),
         });
@@ -177,6 +184,7 @@ fn handleSocketResult(self: anytype, slot: u16, res: i32) void {
         return;
     }
 
+    peer.connect_pending = false;
     if (res < 0) {
         log.warn("async socket creation failed for slot {d}: res={d}", .{ slot, res });
         self.removePeer(slot);
@@ -211,6 +219,7 @@ fn handleSocketResult(self: anytype, slot: u16, res: i32) void {
         self.removePeer(slot);
         return;
     };
+    peer.connect_pending = true;
 }
 
 /// Factory: callback bound to `Peer.connect_completion` (after socket
@@ -238,10 +247,18 @@ pub fn peerConnectCompleteFor(comptime EL: type) io_interface.Callback {
 }
 
 fn handleConnectResult(self: anytype, slot: u16, res: i32) void {
-    // Connection attempt completed (success or failure) -- no longer half-open
-    if (self.half_open_count > 0) self.half_open_count -= 1;
-
     const peer = &self.peers[slot];
+    if (peer.state == .disconnecting) {
+        peer.connect_pending = false;
+        self.completeDisconnectingPeerCompletion(slot);
+        return;
+    }
+
+    // Connection attempt completed (success or failure) -- no longer half-open
+    const was_connect_pending = peer.connect_pending;
+    peer.connect_pending = false;
+    if (was_connect_pending and self.half_open_count > 0) self.half_open_count -= 1;
+
     // Guard: stale CQE for an already-freed slot
     if (peer.state == .free) return;
 
@@ -301,6 +318,7 @@ fn startMseInitiator(self: anytype, slot: u16) !void {
             ) catch {
                 return error.SubmitFailed;
             };
+            peer.untracked_send_pending = true;
             peer.send_pending = true;
         },
         else => return error.UnexpectedAction,
@@ -356,6 +374,7 @@ pub fn sendBtHandshake(self: anytype, slot: u16) void {
         self.removePeer(slot);
         return;
     };
+    peer.untracked_send_pending = true;
     peer.send_pending = true;
 }
 
@@ -421,11 +440,36 @@ pub fn pendingSendCompleteFor(comptime EL: type) io_interface.Callback {
 fn handleSendResult(self: anytype, slot: u16, send_id: u32, send_res: i32) void {
     const peer = &self.peers[slot];
 
+    if (send_id != 0) {
+        if (self.findPendingSend(slot, send_id)) |ps| {
+            switch (ps.storage) {
+                .ghost => {
+                    self.freeOnePendingSend(slot, send_id);
+                    return;
+                },
+                else => {},
+            }
+        }
+    }
+
+    if (peer.state == .disconnecting) {
+        if (send_id != 0) self.freeOnePendingSend(slot, send_id);
+        if (send_id == 0) {
+            peer.untracked_send_pending = false;
+            self.completeDisconnectingPeerCompletion(slot);
+        }
+        return;
+    }
+
     // Guard: if the peer slot was already freed (stale CQE from a
     // previously-closed fd), just free the tracked buffer if any.
     if (peer.state == .free) {
         if (send_id != 0) self.freeOnePendingSend(slot, send_id);
         return;
+    }
+
+    if (send_id == 0) {
+        peer.untracked_send_pending = false;
     }
 
     if (send_res <= 0) {
@@ -465,7 +509,7 @@ fn handleSendResult(self: anytype, slot: u16, send_id: u32, send_res: i32) void 
         }
     }
 
-    peer.send_pending = self.hasPendingSendForSlot(slot);
+    peer.send_pending = peer.untracked_send_pending or self.hasPendingSendForSlot(slot);
 
     switch (peer.state) {
         .mse_handshake_send => {
@@ -483,6 +527,7 @@ fn handleSendResult(self: anytype, slot: u16, send_id: u32, send_res: i32) void 
                 ) catch {
                     self.removePeer(slot);
                 };
+                peer.untracked_send_pending = true;
                 peer.send_pending = true;
                 return;
             }
@@ -505,6 +550,7 @@ fn handleSendResult(self: anytype, slot: u16, send_id: u32, send_res: i32) void 
                 ) catch {
                     self.removePeer(slot);
                 };
+                peer.untracked_send_pending = true;
                 peer.send_pending = true;
                 return;
             }
@@ -624,9 +670,16 @@ inline fn errToCqeRes(_: anyerror) i32 {
 fn handleRecvResult(self: anytype, slot: u16, recv_res: i32) void {
     const peer = &self.peers[slot];
 
+    if (peer.state == .disconnecting) {
+        peer.recv_pending = false;
+        self.completeDisconnectingPeerCompletion(slot);
+        return;
+    }
+
     // Guard: if the peer slot was already freed (stale CQE from a
     // previously-closed fd), ignore the completion entirely.
     if (peer.state == .free) return;
+    peer.recv_pending = false;
 
     if (recv_res <= 0) {
         // Guard: if the peer is reconnecting (connecting state), this is a stale
@@ -816,6 +869,7 @@ fn handleRecvResult(self: anytype, slot: u16, recv_res: i32) void {
                 self.removePeer(slot);
                 return;
             };
+            peer.untracked_send_pending = true;
             peer.send_pending = true;
         },
         .active_recv_header => {
@@ -869,7 +923,7 @@ fn handleRecvResult(self: anytype, slot: u16, recv_res: i32) void {
             }
             // Full message received -- process it
             protocol.processMessage(self, slot);
-            if (peer.state == .free) return;
+            if (peer.state != .active_recv_body) return;
             // Free body and read next header
             if (peer.body_is_heap) {
                 if (peer.body_buf) |buf| self.allocator.free(buf);
@@ -1055,6 +1109,7 @@ fn executeMseAction(self: anytype, slot: u16, action: mse.MseAction, is_initiato
                 handleMseFailure(self, slot, is_initiator);
                 return;
             };
+            peer.untracked_send_pending = true;
             peer.send_pending = true;
         },
         .recv => |buf| {
@@ -1069,6 +1124,7 @@ fn executeMseAction(self: anytype, slot: u16, action: mse.MseAction, is_initiato
                 handleMseFailure(self, slot, is_initiator);
                 return;
             };
+            peer.recv_pending = true;
         },
         .complete => {
             // MSE handshake succeeded -- extract crypto state and proceed to BT handshake
@@ -1212,6 +1268,7 @@ fn attemptMseFallback(self: anytype, slot: u16) void {
         self.removePeer(slot);
         return;
     };
+    peer.connect_pending = true;
     if (self.half_open_count < self.max_half_open) {
         self.half_open_count += 1;
     }
@@ -1257,6 +1314,7 @@ fn startMseResponder(self: anytype, slot: u16, bytes_received: usize) void {
             self.removePeer(slot);
             return;
         };
+        peer.recv_pending = true;
     } else {
         // Already have the full DH key -- feed it directly.
         const action = mr.feedRecv(mse.dh_key_size);

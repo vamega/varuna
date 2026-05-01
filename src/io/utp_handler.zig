@@ -443,7 +443,7 @@ fn deliverUtpData(self: anytype, utp_slot: u16, data: []const u8) void {
             if (peer.body_offset >= peer.body_expected) {
                 // Full message received
                 protocol.processMessage(self, peer_slot);
-                if (peer.state == .free) return;
+                if (peer.state != .active_recv_body) return;
                 if (peer.body_is_heap) {
                     if (peer.body_buf) |buf| self.allocator.free(buf);
                 }

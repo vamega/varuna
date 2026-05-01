@@ -73,6 +73,13 @@ pub const Peer = struct {
 
     // Peer wire state
     send_pending: bool = false,
+    recv_pending: bool = false,
+    connect_pending: bool = false,
+    untracked_send_pending: bool = false,
+    // Peer removal quarantine: embedded connect/recv/untracked-send
+    // completions still owned by the backend after close. The slot stays
+    // `.disconnecting` until this reaches zero.
+    disconnecting_completions: u8 = 0,
     peer_choking: bool = true,
     am_choking: bool = true,
     am_interested: bool = false,

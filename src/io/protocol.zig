@@ -474,6 +474,7 @@ pub fn submitHandshakeRecv(self: anytype, slot: u16) !void {
         self,
         peer_handler.peerRecvCompleteFor(@TypeOf(self.*)),
     );
+    peer.recv_pending = true;
 }
 
 pub fn submitHeaderRecv(self: anytype, slot: u16) !void {
@@ -485,6 +486,7 @@ pub fn submitHeaderRecv(self: anytype, slot: u16) !void {
         self,
         peer_handler.peerRecvCompleteFor(@TypeOf(self.*)),
     );
+    peer.recv_pending = true;
 }
 
 pub fn submitBodyRecv(self: anytype, slot: u16) !void {
@@ -496,6 +498,7 @@ pub fn submitBodyRecv(self: anytype, slot: u16) !void {
         self,
         peer_handler.peerRecvCompleteFor(@TypeOf(self.*)),
     );
+    peer.recv_pending = true;
 }
 
 pub fn submitMessage(self: anytype, slot: u16, id: u8, payload: []const u8) !void {
