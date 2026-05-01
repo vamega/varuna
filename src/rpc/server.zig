@@ -1,7 +1,5 @@
 const std = @import("std");
 const posix = std.posix;
-const linux = std.os.linux;
-const ring_mod = @import("../io/ring.zig");
 const socket_util = @import("../net/socket.zig");
 const auth = @import("auth.zig");
 const io_interface = @import("../io/io_interface.zig");
@@ -41,483 +39,487 @@ pub const request_arena_slab = 256 * 1024;
 /// UIs hold 1–3 connections, so the typical working set is 64–192 MiB.
 pub const request_arena_capacity = 64 * 1024 * 1024;
 
-const event_loop_mod = @import("../io/event_loop.zig");
+const ClientOp = struct {
+    completion: io_interface.Completion = .{},
+    server: *anyopaque = undefined,
+    slot: u8 = 0,
+    gen: u32 = 0,
+};
 
 /// HTTP API server running on the shared io_interface backend.
 /// Accept, recv, parse, route, send -- all via `io.*` ops with caller-
 /// owned Completions. Each in-flight per-client op carries a generation
 /// counter via a heap-allocated ClientOp tracker so stale CQEs after
 /// slot reuse are filtered cheaply.
-pub const ApiServer = struct {
-    io: *RealIO,
-    allocator: std.mem.Allocator,
-    listen_fd: posix.fd_t = -1,
-    clients: [max_api_clients]ApiClient = [_]ApiClient{.{}} ** max_api_clients,
-    client_generations: [max_api_clients]u32 = [_]u32{0} ** max_api_clients,
-    handler: *const fn (std.mem.Allocator, Request) Response = defaultHandler,
-    running: bool = true,
-    accept_completion: io_interface.Completion = .{},
+pub fn ApiServerOf(comptime IO: type) type {
+    return struct {
+        const Self = @This();
 
-    pub fn init(allocator: std.mem.Allocator, io: *RealIO, bind_addr: []const u8, port: u16) !ApiServer {
-        return initWithDevice(allocator, io, bind_addr, port, null);
-    }
+        io: *IO,
+        allocator: std.mem.Allocator,
+        listen_fd: posix.fd_t = -1,
+        clients: [max_api_clients]ApiClient = [_]ApiClient{.{}} ** max_api_clients,
+        client_generations: [max_api_clients]u32 = [_]u32{0} ** max_api_clients,
+        handler: *const fn (std.mem.Allocator, Request) Response = defaultHandler,
+        running: bool = true,
+        accept_completion: io_interface.Completion = .{},
 
-    /// Create an API server using a pre-existing listen socket (e.g. from
-    /// systemd socket activation). The caller retains ownership of the fd.
-    pub fn initWithFd(allocator: std.mem.Allocator, io: *RealIO, listen_fd: posix.fd_t) !ApiServer {
-        var server: ApiServer = .{
-            .io = io,
-            .allocator = allocator,
-            .listen_fd = listen_fd,
-        };
-        preallocateRequestArenas(&server);
-        return server;
-    }
-
-    pub fn initWithDevice(allocator: std.mem.Allocator, io: *RealIO, bind_addr: []const u8, port: u16, bind_device: ?[]const u8) !ApiServer {
-        // Create and bind listen socket
-        const addr = try std.net.Address.parseIp4(bind_addr, port);
-        const fd = try posix.socket(
-            addr.any.family,
-            posix.SOCK.STREAM | posix.SOCK.CLOEXEC | posix.SOCK.NONBLOCK,
-            posix.IPPROTO.TCP,
-        );
-        errdefer posix.close(fd);
-
-        // SO_REUSEADDR. Routes through io_uring URING_CMD setsockopt on
-        // kernel ≥6.7 (`feature_support.supports_setsockopt == true`),
-        // sync `posix.setsockopt(2)` fallback otherwise.
-        const enable: u32 = 1;
-        try io_interface.setsockoptBlocking(io, .{
-            .fd = fd,
-            .level = posix.SOL.SOCKET,
-            .optname = posix.SO.REUSEADDR,
-            .optval = std.mem.asBytes(&enable),
-        });
-
-        // SO_BINDTODEVICE if configured
-        if (bind_device) |device| {
-            try socket_util.applyBindDevice(fd, device);
+        pub fn init(allocator: std.mem.Allocator, io: *IO, bind_addr: []const u8, port: u16) !Self {
+            return initWithDevice(allocator, io, bind_addr, port, null);
         }
 
-        // Routes through io_uring on kernel ≥6.11; sync fallback otherwise.
-        try io_interface.bindBlocking(io, .{ .fd = fd, .addr = addr });
-        try io_interface.listenBlocking(io, .{ .fd = fd, .backlog = 128 });
+        /// Create an API server using a pre-existing listen socket (e.g. from
+        /// systemd socket activation). The caller retains ownership of the fd.
+        pub fn initWithFd(allocator: std.mem.Allocator, io: *IO, listen_fd: posix.fd_t) !Self {
+            var server: Self = .{
+                .io = io,
+                .allocator = allocator,
+                .listen_fd = listen_fd,
+            };
+            preallocateRequestArenas(&server);
+            return server;
+        }
 
-        var server: ApiServer = .{
-            .io = io,
-            .allocator = allocator,
-            .listen_fd = fd,
-        };
-        preallocateRequestArenas(&server);
-        return server;
-    }
+        pub fn initWithDevice(allocator: std.mem.Allocator, io: *IO, bind_addr: []const u8, port: u16, bind_device: ?[]const u8) !Self {
+            // Create and bind listen socket
+            const addr = try std.net.Address.parseIp4(bind_addr, port);
+            const fd = try posix.socket(
+                addr.any.family,
+                posix.SOCK.STREAM | posix.SOCK.CLOEXEC | posix.SOCK.NONBLOCK,
+                posix.IPPROTO.TCP,
+            );
+            errdefer posix.close(fd);
 
-    pub fn deinit(self: *ApiServer) void {
-        for (&self.clients) |*client| {
+            // SO_REUSEADDR. Routes through io_uring URING_CMD setsockopt on
+            // kernel ≥6.7 (`feature_support.supports_setsockopt == true`),
+            // sync `posix.setsockopt(2)` fallback otherwise.
+            const enable: u32 = 1;
+            try io_interface.setsockoptBlocking(io, .{
+                .fd = fd,
+                .level = posix.SOL.SOCKET,
+                .optname = posix.SO.REUSEADDR,
+                .optval = std.mem.asBytes(&enable),
+            });
+
+            // SO_BINDTODEVICE if configured
+            if (bind_device) |device| {
+                try socket_util.applyBindDevice(fd, device);
+            }
+
+            // Routes through io_uring on kernel ≥6.11; sync fallback otherwise.
+            try io_interface.bindBlocking(io, .{ .fd = fd, .addr = addr });
+            try io_interface.listenBlocking(io, .{ .fd = fd, .backlog = 128 });
+
+            var server: Self = .{
+                .io = io,
+                .allocator = allocator,
+                .listen_fd = fd,
+            };
+            preallocateRequestArenas(&server);
+            return server;
+        }
+
+        pub fn deinit(self: *Self) void {
+            for (&self.clients) |*client| {
+                if (client.fd >= 0) {
+                    posix.close(client.fd);
+                    client.fd = -1;
+                }
+                if (client.recv_buf) |buf| {
+                    self.allocator.free(buf);
+                    client.recv_buf = null;
+                }
+                releaseClientResponse(self, client);
+                if (client.request_arena) |*arena| {
+                    arena.deinit();
+                    client.request_arena = null;
+                }
+            }
+            if (self.listen_fd >= 0) posix.close(self.listen_fd);
+            // io is shared, not owned — don't deinit it
+        }
+
+        pub fn setHandler(self: *Self, handler: *const fn (std.mem.Allocator, Request) Response) void {
+            self.handler = handler;
+        }
+
+        /// Per-op tracking struct. Now **embedded in `ApiClient`** (one
+        /// `recv_op` + one `send_op` per slot), so submit/complete cycles
+        /// don't allocate. Each slot has at most one in-flight recv + one
+        /// in-flight send at a time, which is a Pattern #1 ("Single
+        /// Completion per long-lived slot for serial state machines")
+        /// configuration in `STYLE.md`. Stale completion filtering uses the
+        /// `gen` snapshot taken at submission time vs `client_generations`
+        /// at completion.
+        pub fn stop(self: *Self) void {
+            self.running = false;
+        }
+
+        // ── Run helpers (tests / benchmarks) ──────────────────
+
+        /// Run a standalone event loop. For tests and benchmarks only.
+        pub fn run(self: *Self) !void {
+            try self.submitAccept();
+            while (self.running) {
+                try self.io.tick(1);
+            }
+        }
+
+        /// Process one batch of completions. Non-blocking. For tests and
+        /// benchmarks only.
+        pub fn poll(self: *Self) !bool {
+            try self.io.tick(0);
+            return true;
+        }
+
+        // ── Accept ────────────────────────────────────────────
+
+        pub fn submitAccept(self: *Self) !void {
+            try self.io.accept(
+                .{ .fd = self.listen_fd, .multishot = true },
+                &self.accept_completion,
+                self,
+                apiAcceptComplete,
+            );
+        }
+
+        fn apiAcceptComplete(
+            userdata: ?*anyopaque,
+            _: *io_interface.Completion,
+            result: io_interface.Result,
+        ) io_interface.CallbackAction {
+            const self: *Self = @ptrCast(@alignCast(userdata.?));
+            const new_fd = switch (result) {
+                .accept => |r| r catch return .rearm,
+                else => return .rearm,
+            };
+            const accepted_fd = new_fd.fd;
+
+            const slot = self.allocClientSlot() orelse {
+                posix.close(accepted_fd);
+                return .rearm;
+            };
+
+            const client = &self.clients[slot];
+            client.fd = accepted_fd;
+            client.recv_offset = 0;
+
+            self.submitRecv(slot) catch {
+                self.closeClient(slot);
+            };
+            return .rearm;
+        }
+
+        // ── Recv ──────────────────────────────────────────────
+
+        fn submitRecv(self: *Self, slot: u8) !void {
+            const client = &self.clients[slot];
+            if (client.fd < 0) return error.InvalidClientSlot;
+            const op = &client.recv_op;
+            op.* = .{
+                .completion = .{},
+                .server = self,
+                .slot = slot,
+                .gen = self.client_generations[slot],
+            };
+            const storage = recvStorage(client);
+            try self.io.recv(
+                .{ .fd = client.fd, .buf = storage[client.recv_offset..] },
+                &op.completion,
+                op,
+                apiRecvComplete,
+            );
+        }
+
+        fn apiRecvComplete(
+            userdata: ?*anyopaque,
+            _: *io_interface.Completion,
+            result: io_interface.Result,
+        ) io_interface.CallbackAction {
+            const op: *ClientOp = @ptrCast(@alignCast(userdata.?));
+            const self: *Self = @ptrCast(@alignCast(op.server));
+            const slot = op.slot;
+            const gen = op.gen;
+
+            if (!self.isLiveClient(slot, gen)) return .disarm;
+
+            const n = switch (result) {
+                .recv => |r| r catch {
+                    self.closeClient(slot);
+                    return .disarm;
+                },
+                else => return .disarm,
+            };
+            if (n == 0) {
+                self.closeClient(slot);
+                return .disarm;
+            }
+            const client = &self.clients[slot];
+            client.recv_offset += n;
+            self.processBufferedRequest(slot);
+            return .disarm;
+        }
+
+        // ── Send ──────────────────────────────────────────────
+
+        fn submitSend(self: *Self, slot: u8) !void {
+            const client = &self.clients[slot];
+            const header = client.header_buf orelse return error.NoSendBuffer;
+            var iov_len: usize = 0;
+            if (client.header_offset < header.len) {
+                const remaining = header[client.header_offset..];
+                client.send_iov[iov_len] = .{
+                    .base = remaining.ptr,
+                    .len = remaining.len,
+                };
+                iov_len += 1;
+            }
+            if (client.body_offset < client.body.len) {
+                const remaining = client.body[client.body_offset..];
+                client.send_iov[iov_len] = .{
+                    .base = remaining.ptr,
+                    .len = remaining.len,
+                };
+                iov_len += 1;
+            }
+            if (iov_len == 0) return error.NoSendBuffer;
+            client.send_msg = .{
+                .name = null,
+                .namelen = 0,
+                .iov = @ptrCast(&client.send_iov),
+                .iovlen = iov_len,
+                .control = null,
+                .controllen = 0,
+                .flags = 0,
+            };
+            const op = &client.send_op;
+            op.* = .{
+                .completion = .{},
+                .server = self,
+                .slot = slot,
+                .gen = self.client_generations[slot],
+            };
+            try self.io.sendmsg(
+                .{ .fd = client.fd, .msg = &client.send_msg },
+                &op.completion,
+                op,
+                apiSendComplete,
+            );
+        }
+
+        fn apiSendComplete(
+            userdata: ?*anyopaque,
+            _: *io_interface.Completion,
+            result: io_interface.Result,
+        ) io_interface.CallbackAction {
+            const op: *ClientOp = @ptrCast(@alignCast(userdata.?));
+            const self: *Self = @ptrCast(@alignCast(op.server));
+            const slot = op.slot;
+            const gen = op.gen;
+
+            if (!self.isLiveClient(slot, gen)) return .disarm;
+            const sent = switch (result) {
+                .sendmsg => |r| r catch {
+                    self.closeClient(slot);
+                    return .disarm;
+                },
+                else => return .disarm,
+            };
+            if (sent == 0) {
+                self.closeClient(slot);
+                return .disarm;
+            }
+
+            const client = &self.clients[slot];
+            const complete = advanceSendProgress(client, sent) catch {
+                self.closeClient(slot);
+                return .disarm;
+            };
+            if (complete) {
+                if (!client.keep_alive) {
+                    self.closeClient(slot);
+                    return .disarm;
+                }
+                releaseClientResponse(self, client);
+                if (client.recv_offset > 0) {
+                    self.processBufferedRequest(slot);
+                } else {
+                    self.submitRecv(slot) catch {
+                        self.closeClient(slot);
+                    };
+                }
+                return .disarm;
+            }
+            self.submitSend(slot) catch {
+                self.closeClient(slot);
+            };
+            return .disarm;
+        }
+
+        fn sendResponse(self: *Self, slot: u8, response: Response) void {
+            const client = &self.clients[slot];
+            var owned_body = response.owned_body;
+            errdefer if (owned_body) |owned| {
+                if (!ownedBodyManagedByArena(client, owned)) self.allocator.free(owned);
+            };
+            defer if (response.owned_extra_headers) |owned| {
+                if (!ownedBodyManagedByArena(client, owned)) self.allocator.free(owned);
+            };
+
+            releaseClientResponse(self, client);
+
+            const header_len = responseHeaderLength(response, client.keep_alive);
+            if (header_len <= client.header_inline.len) {
+                client.header_buf = writeResponseHeader(client.header_inline[0..header_len], response, client.keep_alive) catch return;
+                client.header_is_heap = false;
+            } else {
+                const header_buf = self.allocator.alloc(u8, header_len) catch return;
+                errdefer self.allocator.free(header_buf);
+                const written = writeResponseHeader(header_buf, response, client.keep_alive) catch return;
+                client.header_buf = written;
+                client.header_is_heap = true;
+            }
+
+            client.header_offset = 0;
+            client.body = response.body;
+            client.body_offset = 0;
+            client.owned_body = owned_body;
+            owned_body = null;
+
+            self.submitSend(slot) catch {
+                self.closeClient(slot);
+                return;
+            };
+        }
+
+        fn processBufferedRequest(self: *Self, slot: u8) void {
+            const client = &self.clients[slot];
+            const data = recvData(client);
+
+            const header_end = std.mem.indexOf(u8, data, "\r\n\r\n") orelse {
+                if (client.recv_offset >= max_request_size) {
+                    self.sendErrorResponse(slot, 413, "Request Too Large");
+                } else {
+                    if (client.recv_offset == recvStorage(client).len) {
+                        const next_capacity = @min(max_request_size, recvStorage(client).len * 2);
+                        ensureRecvCapacity(self, client, next_capacity) catch {
+                            self.sendErrorResponse(slot, 500, "Internal Server Error");
+                            return;
+                        };
+                    }
+                    self.submitRecv(slot) catch {
+                        self.closeClient(slot);
+                    };
+                }
+                return;
+            };
+
+            const body_start = header_end + 4;
+            const first_line_end = std.mem.indexOf(u8, data, "\r\n") orelse {
+                self.sendErrorResponse(slot, 400, "Bad Request");
+                return;
+            };
+            const headers = data[first_line_end + 2 .. header_end];
+            const content_length = parseContentLength(headers) orelse 0;
+            const total_needed = body_start + content_length;
+            if (total_needed > max_request_size) {
+                self.sendErrorResponse(slot, 413, "Request Too Large");
+                return;
+            }
+            if (data.len < total_needed) {
+                ensureRecvCapacity(self, client, total_needed) catch |err| {
+                    switch (err) {
+                        error.RequestTooLarge => self.sendErrorResponse(slot, 413, "Request Too Large"),
+                        else => self.sendErrorResponse(slot, 500, "Internal Server Error"),
+                    }
+                    return;
+                };
+
+                self.submitRecv(slot) catch {
+                    self.closeClient(slot);
+                };
+                return;
+            }
+
+            const parsed = parseRequest(data[0..total_needed]) orelse {
+                self.sendErrorResponse(slot, 400, "Bad Request");
+                return;
+            };
+
+            client.keep_alive = parsed.request.keep_alive;
+
+            const remaining = client.recv_offset - parsed.consumed_len;
+            if (remaining > 0) {
+                const storage = recvStorage(client);
+                std.mem.copyForwards(u8, storage[0..remaining], storage[parsed.consumed_len .. parsed.consumed_len + remaining]);
+            }
+            client.recv_offset = remaining;
+
+            // Stage 2 zero-alloc: route handler allocations through the per-slot
+            // bump arena. Reset before each call — guaranteed safe at this entry
+            // point because `handleSend` calls `releaseClientResponse` on
+            // send-complete *before* we re-enter `processBufferedRequest`. If
+            // the slot's arena failed to pre-allocate (rare), fall back to the
+            // parent allocator so we still respond rather than 500.
+            const handler_allocator = ensureRequestArena(self, client) catch self.allocator;
+
+            const response = self.handler(handler_allocator, parsed.request);
+            self.sendResponse(slot, response);
+        }
+
+        fn sendErrorResponse(self: *Self, slot: u8, status: u16, message: []const u8) void {
+            self.sendResponse(slot, .{
+                .status = status,
+                .content_type = "text/plain",
+                .body = message,
+            });
+        }
+
+        fn closeClient(self: *Self, slot: u8) void {
+            const client = &self.clients[slot];
+            var retained_recv_buf: ?[]u8 = null;
+            var retained_arena: ?scratch.TieredArena = null;
             if (client.fd >= 0) {
                 posix.close(client.fd);
                 client.fd = -1;
             }
             if (client.recv_buf) |buf| {
-                self.allocator.free(buf);
-                client.recv_buf = null;
+                if (buf.len <= retained_recv_buf_limit) {
+                    retained_recv_buf = buf;
+                } else {
+                    self.allocator.free(buf);
+                }
+            }
+            // Retain arena across slot reuse, same as `recv_buf`. The slab is
+            // reset (lazily — by `ensureRequestArena` on the next request),
+            // not freed. Only `deinit` truly frees the slab.
+            if (client.request_arena) |arena| {
+                retained_arena = arena;
             }
             releaseClientResponse(self, client);
-            if (client.request_arena) |*arena| {
-                arena.deinit();
-                client.request_arena = null;
-            }
+            client.* = .{};
+            client.recv_buf = retained_recv_buf;
+            client.request_arena = retained_arena;
         }
-        if (self.listen_fd >= 0) posix.close(self.listen_fd);
-        // io is shared, not owned — don't deinit it
-    }
 
-    pub fn setHandler(self: *ApiServer, handler: *const fn (std.mem.Allocator, Request) Response) void {
-        self.handler = handler;
-    }
+        fn allocClientSlot(self: *Self) ?u8 {
+            for (&self.clients, 0..) |*client, i| {
+                if (client.fd < 0) {
+                    self.client_generations[i] +%= 1;
+                    if (self.client_generations[i] == 0) self.client_generations[i] = 1;
+                    return @intCast(i);
+                }
+            }
+            return null;
+        }
 
-    /// Per-op tracking struct. Now **embedded in `ApiClient`** (one
-    /// `recv_op` + one `send_op` per slot), so submit/complete cycles
-    /// don't allocate. Each slot has at most one in-flight recv + one
-    /// in-flight send at a time, which is a Pattern #1 ("Single
-    /// Completion per long-lived slot for serial state machines")
-    /// configuration in `STYLE.md`. Stale completion filtering uses the
-    /// `gen` snapshot taken at submission time vs `client_generations`
-    /// at completion.
-    const ClientOp = struct {
-        completion: io_interface.Completion = .{},
-        server: *ApiServer = undefined,
-        slot: u8 = 0,
-        gen: u32 = 0,
+        fn isLiveClient(self: *const Self, slot: u8, generation: u32) bool {
+            return self.client_generations[slot] == generation and self.clients[slot].fd >= 0;
+        }
     };
+}
 
-    pub fn stop(self: *ApiServer) void {
-        self.running = false;
-    }
-
-    // ── Run helpers (tests / benchmarks) ──────────────────
-
-    /// Run a standalone event loop. For tests and benchmarks only.
-    pub fn run(self: *ApiServer) !void {
-        try self.submitAccept();
-        while (self.running) {
-            try self.io.tick(1);
-        }
-    }
-
-    /// Process one batch of completions. Non-blocking. For tests and
-    /// benchmarks only.
-    pub fn poll(self: *ApiServer) !bool {
-        try self.io.tick(0);
-        return true;
-    }
-
-    // ── Accept ────────────────────────────────────────────
-
-    pub fn submitAccept(self: *ApiServer) !void {
-        try self.io.accept(
-            .{ .fd = self.listen_fd, .multishot = true },
-            &self.accept_completion,
-            self,
-            apiAcceptComplete,
-        );
-    }
-
-    fn apiAcceptComplete(
-        userdata: ?*anyopaque,
-        _: *io_interface.Completion,
-        result: io_interface.Result,
-    ) io_interface.CallbackAction {
-        const self: *ApiServer = @ptrCast(@alignCast(userdata.?));
-        const new_fd = switch (result) {
-            .accept => |r| r catch return .rearm,
-            else => return .rearm,
-        };
-        const accepted_fd = new_fd.fd;
-
-        const slot = self.allocClientSlot() orelse {
-            posix.close(accepted_fd);
-            return .rearm;
-        };
-
-        const client = &self.clients[slot];
-        client.fd = accepted_fd;
-        client.recv_offset = 0;
-
-        self.submitRecv(slot) catch {
-            self.closeClient(slot);
-        };
-        return .rearm;
-    }
-
-    // ── Recv ──────────────────────────────────────────────
-
-    fn submitRecv(self: *ApiServer, slot: u8) !void {
-        const client = &self.clients[slot];
-        if (client.fd < 0) return error.InvalidClientSlot;
-        const op = &client.recv_op;
-        op.* = .{
-            .completion = .{},
-            .server = self,
-            .slot = slot,
-            .gen = self.client_generations[slot],
-        };
-        const storage = recvStorage(client);
-        try self.io.recv(
-            .{ .fd = client.fd, .buf = storage[client.recv_offset..] },
-            &op.completion,
-            op,
-            apiRecvComplete,
-        );
-    }
-
-    fn apiRecvComplete(
-        userdata: ?*anyopaque,
-        _: *io_interface.Completion,
-        result: io_interface.Result,
-    ) io_interface.CallbackAction {
-        const op: *ClientOp = @ptrCast(@alignCast(userdata.?));
-        const self = op.server;
-        const slot = op.slot;
-        const gen = op.gen;
-
-        if (!self.isLiveClient(slot, gen)) return .disarm;
-
-        const n = switch (result) {
-            .recv => |r| r catch {
-                self.closeClient(slot);
-                return .disarm;
-            },
-            else => return .disarm,
-        };
-        if (n == 0) {
-            self.closeClient(slot);
-            return .disarm;
-        }
-        const client = &self.clients[slot];
-        client.recv_offset += n;
-        self.processBufferedRequest(slot);
-        return .disarm;
-    }
-
-    // ── Send ──────────────────────────────────────────────
-
-    fn submitSend(self: *ApiServer, slot: u8) !void {
-        const client = &self.clients[slot];
-        const header = client.header_buf orelse return error.NoSendBuffer;
-        var iov_len: usize = 0;
-        if (client.header_offset < header.len) {
-            const remaining = header[client.header_offset..];
-            client.send_iov[iov_len] = .{
-                .base = remaining.ptr,
-                .len = remaining.len,
-            };
-            iov_len += 1;
-        }
-        if (client.body_offset < client.body.len) {
-            const remaining = client.body[client.body_offset..];
-            client.send_iov[iov_len] = .{
-                .base = remaining.ptr,
-                .len = remaining.len,
-            };
-            iov_len += 1;
-        }
-        if (iov_len == 0) return error.NoSendBuffer;
-        client.send_msg = .{
-            .name = null,
-            .namelen = 0,
-            .iov = @ptrCast(&client.send_iov),
-            .iovlen = iov_len,
-            .control = null,
-            .controllen = 0,
-            .flags = 0,
-        };
-        const op = &client.send_op;
-        op.* = .{
-            .completion = .{},
-            .server = self,
-            .slot = slot,
-            .gen = self.client_generations[slot],
-        };
-        try self.io.sendmsg(
-            .{ .fd = client.fd, .msg = &client.send_msg },
-            &op.completion,
-            op,
-            apiSendComplete,
-        );
-    }
-
-    fn apiSendComplete(
-        userdata: ?*anyopaque,
-        _: *io_interface.Completion,
-        result: io_interface.Result,
-    ) io_interface.CallbackAction {
-        const op: *ClientOp = @ptrCast(@alignCast(userdata.?));
-        const self = op.server;
-        const slot = op.slot;
-        const gen = op.gen;
-
-        if (!self.isLiveClient(slot, gen)) return .disarm;
-        const sent = switch (result) {
-            .sendmsg => |r| r catch {
-                self.closeClient(slot);
-                return .disarm;
-            },
-            else => return .disarm,
-        };
-        if (sent == 0) {
-            self.closeClient(slot);
-            return .disarm;
-        }
-
-        const client = &self.clients[slot];
-        const complete = advanceSendProgress(client, sent) catch {
-            self.closeClient(slot);
-            return .disarm;
-        };
-        if (complete) {
-            if (!client.keep_alive) {
-                self.closeClient(slot);
-                return .disarm;
-            }
-            releaseClientResponse(self, client);
-            if (client.recv_offset > 0) {
-                self.processBufferedRequest(slot);
-            } else {
-                self.submitRecv(slot) catch {
-                    self.closeClient(slot);
-                };
-            }
-            return .disarm;
-        }
-        self.submitSend(slot) catch {
-            self.closeClient(slot);
-        };
-        return .disarm;
-    }
-
-    fn sendResponse(self: *ApiServer, slot: u8, response: Response) void {
-        const client = &self.clients[slot];
-        var owned_body = response.owned_body;
-        errdefer if (owned_body) |owned| {
-            if (!ownedBodyManagedByArena(client, owned)) self.allocator.free(owned);
-        };
-        defer if (response.owned_extra_headers) |owned| {
-            if (!ownedBodyManagedByArena(client, owned)) self.allocator.free(owned);
-        };
-
-        releaseClientResponse(self, client);
-
-        const header_len = responseHeaderLength(response, client.keep_alive);
-        if (header_len <= client.header_inline.len) {
-            client.header_buf = writeResponseHeader(client.header_inline[0..header_len], response, client.keep_alive) catch return;
-            client.header_is_heap = false;
-        } else {
-            const header_buf = self.allocator.alloc(u8, header_len) catch return;
-            errdefer self.allocator.free(header_buf);
-            const written = writeResponseHeader(header_buf, response, client.keep_alive) catch return;
-            client.header_buf = written;
-            client.header_is_heap = true;
-        }
-
-        client.header_offset = 0;
-        client.body = response.body;
-        client.body_offset = 0;
-        client.owned_body = owned_body;
-        owned_body = null;
-
-        self.submitSend(slot) catch {
-            self.closeClient(slot);
-            return;
-        };
-    }
-
-    fn processBufferedRequest(self: *ApiServer, slot: u8) void {
-        const client = &self.clients[slot];
-        const data = recvData(client);
-
-        const header_end = std.mem.indexOf(u8, data, "\r\n\r\n") orelse {
-            if (client.recv_offset >= max_request_size) {
-                self.sendErrorResponse(slot, 413, "Request Too Large");
-            } else {
-                if (client.recv_offset == recvStorage(client).len) {
-                    const next_capacity = @min(max_request_size, recvStorage(client).len * 2);
-                    ensureRecvCapacity(self, client, next_capacity) catch {
-                        self.sendErrorResponse(slot, 500, "Internal Server Error");
-                        return;
-                    };
-                }
-                self.submitRecv(slot) catch {
-                    self.closeClient(slot);
-                };
-            }
-            return;
-        };
-
-        const body_start = header_end + 4;
-        const first_line_end = std.mem.indexOf(u8, data, "\r\n") orelse {
-            self.sendErrorResponse(slot, 400, "Bad Request");
-            return;
-        };
-        const headers = data[first_line_end + 2 .. header_end];
-        const content_length = parseContentLength(headers) orelse 0;
-        const total_needed = body_start + content_length;
-        if (total_needed > max_request_size) {
-            self.sendErrorResponse(slot, 413, "Request Too Large");
-            return;
-        }
-        if (data.len < total_needed) {
-            ensureRecvCapacity(self, client, total_needed) catch |err| {
-                switch (err) {
-                    error.RequestTooLarge => self.sendErrorResponse(slot, 413, "Request Too Large"),
-                    else => self.sendErrorResponse(slot, 500, "Internal Server Error"),
-                }
-                return;
-            };
-
-            self.submitRecv(slot) catch {
-                self.closeClient(slot);
-            };
-            return;
-        }
-
-        const parsed = parseRequest(data[0..total_needed]) orelse {
-            self.sendErrorResponse(slot, 400, "Bad Request");
-            return;
-        };
-
-        client.keep_alive = parsed.request.keep_alive;
-
-        const remaining = client.recv_offset - parsed.consumed_len;
-        if (remaining > 0) {
-            const storage = recvStorage(client);
-            std.mem.copyForwards(u8, storage[0..remaining], storage[parsed.consumed_len .. parsed.consumed_len + remaining]);
-        }
-        client.recv_offset = remaining;
-
-        // Stage 2 zero-alloc: route handler allocations through the per-slot
-        // bump arena. Reset before each call — guaranteed safe at this entry
-        // point because `handleSend` calls `releaseClientResponse` on
-        // send-complete *before* we re-enter `processBufferedRequest`. If
-        // the slot's arena failed to pre-allocate (rare), fall back to the
-        // parent allocator so we still respond rather than 500.
-        const handler_allocator = ensureRequestArena(self, client) catch self.allocator;
-
-        const response = self.handler(handler_allocator, parsed.request);
-        self.sendResponse(slot, response);
-    }
-
-    fn sendErrorResponse(self: *ApiServer, slot: u8, status: u16, message: []const u8) void {
-        self.sendResponse(slot, .{
-            .status = status,
-            .content_type = "text/plain",
-            .body = message,
-        });
-    }
-
-    fn closeClient(self: *ApiServer, slot: u8) void {
-        const client = &self.clients[slot];
-        var retained_recv_buf: ?[]u8 = null;
-        var retained_arena: ?scratch.TieredArena = null;
-        if (client.fd >= 0) {
-            posix.close(client.fd);
-            client.fd = -1;
-        }
-        if (client.recv_buf) |buf| {
-            if (buf.len <= retained_recv_buf_limit) {
-                retained_recv_buf = buf;
-            } else {
-                self.allocator.free(buf);
-            }
-        }
-        // Retain arena across slot reuse, same as `recv_buf`. The slab is
-        // reset (lazily — by `ensureRequestArena` on the next request),
-        // not freed. Only `deinit` truly frees the slab.
-        if (client.request_arena) |arena| {
-            retained_arena = arena;
-        }
-        releaseClientResponse(self, client);
-        client.* = .{};
-        client.recv_buf = retained_recv_buf;
-        client.request_arena = retained_arena;
-    }
-
-    fn allocClientSlot(self: *ApiServer) ?u8 {
-        for (&self.clients, 0..) |*client, i| {
-            if (client.fd < 0) {
-                self.client_generations[i] +%= 1;
-                if (self.client_generations[i] == 0) self.client_generations[i] = 1;
-                return @intCast(i);
-            }
-        }
-        return null;
-    }
-
-    fn isLiveClient(self: *const ApiServer, slot: u8, generation: u32) bool {
-        return self.client_generations[slot] == generation and self.clients[slot].fd >= 0;
-    }
-};
+pub const ApiServer = ApiServerOf(RealIO);
 
 // ── HTTP types ────────────────────────────────────────────
 
@@ -566,8 +568,8 @@ pub const ApiClient = struct {
     /// state machines). Replaces the prior `allocator.create(ClientOp)`
     /// per recv/send — this slot has at most one in-flight recv and at
     /// most one in-flight send at any time, so static storage suffices.
-    recv_op: ApiServer.ClientOp = .{},
-    send_op: ApiServer.ClientOp = .{},
+    recv_op: ClientOp = .{},
+    send_op: ClientOp = .{},
 };
 
 const ParsedRequest = struct {
@@ -583,7 +585,7 @@ fn recvData(client: *ApiClient) []u8 {
     return recvStorage(client)[0..client.recv_offset];
 }
 
-fn ensureRecvCapacity(self: *ApiServer, client: *ApiClient, min_capacity: usize) !void {
+fn ensureRecvCapacity(self: anytype, client: *ApiClient, min_capacity: usize) !void {
     if (min_capacity > max_request_size) return error.RequestTooLarge;
     if (min_capacity <= recvStorage(client).len) return;
 
@@ -714,7 +716,7 @@ pub fn writeResponseHeader(dest: []u8, response: Response, keep_alive: bool) ![]
 /// once during `init`/`initWithFd`/`initWithDevice`.  Slots whose
 /// pre-allocation fails (rare; only on parent-allocator OOM at startup)
 /// are left null; `ensureRequestArena` lazy-inits them on first request.
-fn preallocateRequestArenas(server: *ApiServer) void {
+fn preallocateRequestArenas(server: anytype) void {
     for (&server.clients) |*client| {
         client.request_arena = scratch.TieredArena.init(
             server.allocator,
@@ -731,7 +733,7 @@ fn preallocateRequestArenas(server: *ApiServer) void {
 /// drained — which is guaranteed at the `processBufferedRequest` entry
 /// point because `handleSend` calls `releaseClientResponse` on
 /// send-complete *before* re-entering `processBufferedRequest`.
-fn ensureRequestArena(self: *ApiServer, client: *ApiClient) !std.mem.Allocator {
+fn ensureRequestArena(self: anytype, client: *ApiClient) !std.mem.Allocator {
     if (client.request_arena) |*arena| {
         arena.reset();
         return arena.allocator();
@@ -787,7 +789,7 @@ fn advanceSendProgress(client: *ApiClient, sent: usize) !bool {
     return client.header_offset == header.len and client.body_offset == client.body.len;
 }
 
-fn releaseClientResponse(self: *ApiServer, client: *ApiClient) void {
+fn releaseClientResponse(self: anytype, client: *ApiClient) void {
     if (client.header_is_heap) {
         if (client.header_buf) |buf| self.allocator.free(buf);
     }

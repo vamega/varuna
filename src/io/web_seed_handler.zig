@@ -2,11 +2,9 @@ const std = @import("std");
 const posix = std.posix;
 const log = std.log.scoped(.web_seed);
 
-const EventLoop = @import("event_loop.zig").EventLoop;
 const TorrentContext = @import("types.zig").TorrentContext;
 const TorrentId = @import("types.zig").TorrentId;
 const encodeUserData = @import("types.zig").encodeUserData;
-const HttpExecutor = @import("http_executor.zig").HttpExecutor;
 const WebSeedManager = @import("../net/web_seed.zig").WebSeedManager;
 const MultiPieceRange = @import("../net/web_seed.zig").MultiPieceRange;
 const Hasher = @import("hasher.zig").Hasher;
@@ -49,10 +47,12 @@ pub const WebSeedSlot = struct {
 
 /// Context pointer embedded in each HttpExecutor.Job to identify
 /// which web seed slot and event loop a range completion belongs to.
-const RangeContext = struct {
-    event_loop: *EventLoop,
-    slot_index: u8,
-};
+fn RangeContextOf(comptime EventLoop: type) type {
+    return struct {
+        event_loop: *EventLoop,
+        slot_index: u8,
+    };
+}
 
 /// Called each tick from the event loop. Scans torrents for available
 /// web seeds and unclaimed pieces, then submits batched HTTP range requests
@@ -208,13 +208,17 @@ fn slotIndex(el: anytype, slot: *WebSeedSlot) u8 {
 
 fn submitMultiPieceRangeRequest(
     el: anytype,
-    he: *HttpExecutor,
+    he: anytype,
     wsm: *WebSeedManager,
     slot_idx: u8,
     seed_index: usize,
     range: MultiPieceRange,
     run_buf: []u8,
 ) !void {
+    const EventLoop = @TypeOf(el.*);
+    const HttpExecutor = @TypeOf(he.*);
+    const RangeContext = RangeContextOf(EventLoop);
+
     const url = wsm.buildFileUrl(el.allocator, seed_index, range.file_index) catch |err| {
         log.warn("web seed: buildFileUrl failed: {s}", .{@errorName(err)});
         return err;
@@ -225,16 +229,13 @@ fn submitMultiPieceRangeRequest(
     // Freed in the completion callback.
     const ctx = el.allocator.create(RangeContext) catch return error.OutOfMemory;
     ctx.* = .{
-        // RangeContext.event_loop is concrete `*EventLoop` (RealIO).
-        // Web-seed path doesn't fire under simulator_mode usage; cast
-        // keeps SimIO instantiations compiling.
-        .event_loop = @ptrCast(@alignCast(el)),
+        .event_loop = el,
         .slot_index = slot_idx,
     };
 
     var job = HttpExecutor.Job{
         .context = @ptrCast(ctx),
-        .on_complete = webSeedRangeComplete,
+        .on_complete = webSeedRangeCompleteFor(EventLoop, HttpExecutor),
     };
 
     // Set the URL (job.url is a fixed-size array)
@@ -300,80 +301,88 @@ fn extractHost(url: []const u8) ?[]const u8 {
 }
 
 /// HttpExecutor completion callback for a single range request.
-fn webSeedRangeComplete(context: *anyopaque, result: HttpExecutor.RequestResult) void {
-    const ctx: *RangeContext = @ptrCast(@alignCast(context));
-    const el = ctx.event_loop;
-    const slot_idx = ctx.slot_index;
-    el.allocator.destroy(ctx);
+fn webSeedRangeCompleteFor(
+    comptime EventLoop: type,
+    comptime HttpExecutor: type,
+) *const fn (*anyopaque, HttpExecutor.RequestResult) void {
+    return struct {
+        fn callback(context: *anyopaque, result: HttpExecutor.RequestResult) void {
+            const RangeContext = RangeContextOf(EventLoop);
+            const ctx: *RangeContext = @ptrCast(@alignCast(context));
+            const el = ctx.event_loop;
+            const slot_idx = ctx.slot_index;
+            el.allocator.destroy(ctx);
 
-    if (slot_idx >= max_web_seed_slots) return;
-    const slot = &el.web_seed_slots[slot_idx];
-    if (slot.state != .downloading) return;
+            if (slot_idx >= max_web_seed_slots) return;
+            const slot = &el.web_seed_slots[slot_idx];
+            if (slot.state != .downloading) return;
 
-    // Check HTTP status
-    if (result.err != null or (result.status != 200 and result.status != 206)) {
-        log.debug("web seed: range failed for pieces {d}..{d} (status={d}, err={?})", .{
-            slot.first_piece,
-            slot.first_piece + slot.piece_count - 1,
-            result.status,
-            result.err,
-        });
-        slot.ranges_failed = true;
+            // Check HTTP status
+            if (result.err != null or (result.status != 200 and result.status != 206)) {
+                log.debug("web seed: range failed for pieces {d}..{d} (status={d}, err={?})", .{
+                    slot.first_piece,
+                    slot.first_piece + slot.piece_count - 1,
+                    result.status,
+                    result.err,
+                });
+                slot.ranges_failed = true;
 
-        // Classify the failure for backoff decisions
-        if (result.status == 404) {
-            // Disable seed permanently on 404 (file not found)
-            if (el.getTorrentContext(slot.torrent_id)) |tc| {
-                if (tc.web_seed_manager) |wsm| wsm.disable(slot.seed_index);
-            }
-        }
-        // Note: status=0 with no error (stale pooled connection) is still
-        // a failure -- ranges_failed stays true. The seed will be retried
-        // without backoff penalty below.
-    }
-
-    slot.ranges_completed += 1;
-
-    // Wait for all ranges to finish
-    if (slot.ranges_completed < slot.ranges_total) return;
-
-    // All ranges are done
-    if (slot.ranges_failed) {
-        // For stale pooled connections (status=0, no error), release pieces
-        // without penalizing the seed -- the connection was just stale.
-        const stale_conn = result.status == 0 and result.err == null;
-        if (stale_conn) {
-            // Release pieces back to pool without backoff penalty
-            if (el.getTorrentContext(slot.torrent_id)) |tc| {
-                if (tc.piece_tracker) |pt| {
-                    var i: u32 = 0;
-                    while (i < slot.piece_count) : (i += 1) {
-                        pt.releasePiece(slot.first_piece + i);
+                // Classify the failure for backoff decisions
+                if (result.status == 404) {
+                    // Disable seed permanently on 404 (file not found)
+                    if (el.getTorrentContext(slot.torrent_id)) |tc| {
+                        if (tc.web_seed_manager) |wsm| wsm.disable(slot.seed_index);
                     }
                 }
-                // Mark seed idle (no backoff) so it can retry immediately
+                // Note: status=0 with no error (stale pooled connection) is still
+                // a failure -- ranges_failed stays true. The seed will be retried
+                // without backoff penalty below.
+            }
+
+            slot.ranges_completed += 1;
+
+            // Wait for all ranges to finish
+            if (slot.ranges_completed < slot.ranges_total) return;
+
+            // All ranges are done
+            if (slot.ranges_failed) {
+                // For stale pooled connections (status=0, no error), release pieces
+                // without penalizing the seed -- the connection was just stale.
+                const stale_conn = result.status == 0 and result.err == null;
+                if (stale_conn) {
+                    // Release pieces back to pool without backoff penalty
+                    if (el.getTorrentContext(slot.torrent_id)) |tc| {
+                        if (tc.piece_tracker) |pt| {
+                            var i: u32 = 0;
+                            while (i < slot.piece_count) : (i += 1) {
+                                pt.releasePiece(slot.first_piece + i);
+                            }
+                        }
+                        // Mark seed idle (no backoff) so it can retry immediately
+                        if (tc.web_seed_manager) |wsm| {
+                            wsm.markSuccess(slot.seed_index, 0);
+                        }
+                    }
+                    if (slot.buf) |buf| el.allocator.free(buf);
+                    slot.reset();
+                } else {
+                    failSlot(el, slot);
+                }
+                return;
+            }
+
+            // Mark the seed as idle immediately so the next piece can start
+            // downloading while these are being hash-verified and written.
+            if (el.getTorrentContext(slot.torrent_id)) |tc| {
                 if (tc.web_seed_manager) |wsm| {
-                    wsm.markSuccess(slot.seed_index, 0);
+                    wsm.markSuccess(slot.seed_index, slot.total_bytes);
                 }
             }
-            if (slot.buf) |buf| el.allocator.free(buf);
-            slot.reset();
-        } else {
-            failSlot(el, slot);
-        }
-        return;
-    }
 
-    // Mark the seed as idle immediately so the next piece can start
-    // downloading while these are being hash-verified and written.
-    if (el.getTorrentContext(slot.torrent_id)) |tc| {
-        if (tc.web_seed_manager) |wsm| {
-            wsm.markSuccess(slot.seed_index, slot.total_bytes);
+            // Submit each piece in the run to the hasher individually
+            submitPiecesToHasher(el, slot, slotIndex(el, slot));
         }
-    }
-
-    // Submit each piece in the run to the hasher individually
-    submitPiecesToHasher(el, slot, slotIndex(el, slot));
+    }.callback;
 }
 
 /// Split the completed multi-piece buffer at piece boundaries and submit
@@ -539,7 +548,8 @@ fn inlineVerifyMultiPiece(el: anytype, slot: *WebSeedSlot) void {
         };
         @memcpy(piece_buf, piece_data);
 
-        const pending_key = EventLoop.PendingWriteKey{
+        const EL = @TypeOf(el.*);
+        const pending_key = EL.PendingWriteKey{
             .piece_index = piece_index,
             .torrent_id = slot.torrent_id,
         };
@@ -560,7 +570,6 @@ fn inlineVerifyMultiPiece(el: anytype, slot: *WebSeedSlot) void {
         for (plan.spans) |span| {
             if (tc.shared_fds[span.file_index] < 0) continue;
             const block = piece_buf[span.piece_offset .. span.piece_offset + span.length];
-            const EL = @TypeOf(el.*);
             const wop = el.allocator.create(peer_handler.DiskWriteOpOf(EL)) catch |err| {
                 log.warn("web seed: write op alloc for piece {d}: {s}", .{ piece_index, @errorName(err) });
                 if (el.getPendingWrite(pending_key)) |pending_w| {

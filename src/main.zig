@@ -1,4 +1,5 @@
 const std = @import("std");
+const builtin = @import("builtin");
 const varuna = @import("varuna");
 
 pub fn main() !void {
@@ -45,12 +46,14 @@ pub fn main() !void {
     // Banner
     try stdout.print("varuna daemon starting\n", .{});
     try varuna.app.writeStartupBannerForSummary(stdout, startup_summary);
-    varuna.runtime.probe.ensureSupported(startup_summary) catch |err| {
+    const requested_backend = try varuna.config.parseRuntimeIoBackend(cfg.daemon.io_backend);
+    const selected_backend = varuna.runtime.probe.selectRuntimeIoBackend(requested_backend, startup_summary) catch |err| {
         switch (err) {
             error.UnsupportedKernel => {
                 try stdout.print(
-                    "startup blocked: kernel {s} is below the supported minimum {}.{}\n",
+                    "startup blocked: requested io backend \"{s}\" requires kernel {s} to meet the supported minimum {}.{}\n",
                     .{
+                        varuna.config.runtimeIoBackendName(requested_backend),
                         startup_summary.release,
                         varuna.runtime.requirements.minimum_supported.major,
                         varuna.runtime.requirements.minimum_supported.minor,
@@ -58,24 +61,72 @@ pub fn main() !void {
                 );
             },
             error.IoUringUnavailable => {
-                try stdout.print("startup blocked: io_uring is unavailable on this host\n", .{});
+                try stdout.print(
+                    "startup blocked: requested io backend \"{s}\" requires io_uring, but io_uring is unavailable on this host\n",
+                    .{varuna.config.runtimeIoBackendName(requested_backend)},
+                );
+            },
+            error.UnsupportedIoBackend => {
+                try stdout.print(
+                    "startup blocked: requested io backend \"{s}\" is not supported on {s}\n",
+                    .{ varuna.config.runtimeIoBackendName(requested_backend), @tagName(builtin.os.tag) },
+                );
             },
             else => return err,
         }
         try stdout.flush();
         return err;
     };
+    try stdout.print("io backend: {s}\n", .{varuna.config.runtimeIoBackendName(selected_backend)});
     try stdout.flush();
+
+    try runDaemonWithSelectedBackend(selected_backend, allocator, cfg, stdout);
+}
+
+fn runDaemonWithSelectedBackend(
+    selected_backend: varuna.config.RuntimeIoBackend,
+    allocator: std.mem.Allocator,
+    cfg: varuna.config.Config,
+    stdout: *std.Io.Writer,
+) !void {
+    switch (selected_backend) {
+        .auto => unreachable,
+        .io_uring => return runDaemonWithBackend(varuna.io.backend.IoUringBackend, allocator, cfg, stdout),
+        .epoll_posix => return runDaemonWithBackend(varuna.io.backend.EpollPosixBackend, allocator, cfg, stdout),
+        .epoll_mmap => return runDaemonWithBackend(varuna.io.backend.EpollMmapBackend, allocator, cfg, stdout),
+        .kqueue_posix => {
+            if (comptime builtin.os.tag == .macos) {
+                return runDaemonWithBackend(varuna.io.backend.KqueuePosixBackend, allocator, cfg, stdout);
+            }
+            return error.UnsupportedIoBackend;
+        },
+        .kqueue_mmap => {
+            if (comptime builtin.os.tag == .macos) {
+                return runDaemonWithBackend(varuna.io.backend.KqueueMmapBackend, allocator, cfg, stdout);
+            }
+            return error.UnsupportedIoBackend;
+        },
+    }
+}
+
+fn runDaemonWithBackend(
+    comptime IO: type,
+    allocator: std.mem.Allocator,
+    cfg: varuna.config.Config,
+    stdout: *std.Io.Writer,
+) !void {
+    const EventLoop = varuna.io.event_loop.EventLoopOf(IO);
+    const ApiHandler = varuna.rpc.handlers.ApiHandlerOf(IO);
 
     // Shared event loop for all torrents (single-threaded I/O).
     // Heap-allocated because EventLoop is very large (peers array, torrent
     // contexts, etc.) and would overflow the stack alongside the GPA state.
-    const shared_el_heap = allocator.create(varuna.io.event_loop.EventLoop) catch |err| {
+    const shared_el_heap = allocator.create(EventLoop) catch |err| {
         try stdout.print("failed to allocate event loop: {s}\n", .{@errorName(err)});
         try stdout.flush();
         return err;
     };
-    shared_el_heap.* = varuna.io.event_loop.EventLoop.initBare(allocator, cfg.performance.hasher_threads) catch |err| {
+    shared_el_heap.* = EventLoop.initBare(allocator, cfg.performance.hasher_threads) catch |err| {
         try stdout.print("failed to create event loop: {s}\n", .{@errorName(err)});
         try stdout.flush();
         allocator.destroy(shared_el_heap);
@@ -164,11 +215,11 @@ pub fn main() !void {
     }
 
     // Session manager
-    var session_manager = initSessionManager(allocator, shared_el, cfg, resume_db_path);
+    var session_manager = initSessionManager(IO, allocator, shared_el, cfg, resume_db_path);
     defer session_manager.deinit();
 
     // API handler
-    var api_handler = varuna.rpc.handlers.ApiHandler{
+    var api_handler = ApiHandler{
         .session_manager = &session_manager,
         .sync_state = varuna.rpc.sync.SyncState.init(allocator),
         .peer_sync_state = varuna.rpc.sync.PeerSyncState.init(allocator),
@@ -181,12 +232,13 @@ pub fn main() !void {
     // HTTP API server (all I/O via io_uring)
     const systemd_fds = varuna.daemon.systemd.listenFds();
     var socket_activated = false;
-    var api_server = try initApiServer(allocator, shared_el, cfg, systemd_fds, stdout, &socket_activated);
+    var api_server = try initApiServer(IO, allocator, shared_el, cfg, systemd_fds, stdout, &socket_activated);
     defer api_server.deinit();
 
     // Set handler via a closure-like wrapper
     // Since we can't capture api_handler in a fn pointer, we use a global
-    api_handler_global = &api_handler;
+    setGlobalApiHandler(IO, &api_handler);
+    defer api_handler_global = null;
     api_server.setHandler(globalApiHandler);
 
     if (socket_activated) {
@@ -470,7 +522,7 @@ const DhtState = struct {
 /// DHT engine. Wires the engine into `shared_el.dht_engine` on success.
 fn initDht(
     allocator: std.mem.Allocator,
-    shared_el: *varuna.io.event_loop.EventLoop,
+    shared_el: anytype,
     cfg: varuna.config.Config,
     stdout: *std.Io.Writer,
 ) !DhtState {
@@ -540,12 +592,13 @@ fn initDht(
 
 /// Create and configure a SessionManager from the loaded config.
 fn initSessionManager(
+    comptime IO: type,
     allocator: std.mem.Allocator,
-    shared_el: *varuna.io.event_loop.EventLoop,
+    shared_el: *varuna.io.event_loop.EventLoopOf(IO),
     cfg: varuna.config.Config,
     resume_db_path: ?[*:0]const u8,
-) varuna.daemon.session_manager.SessionManager {
-    var sm = varuna.daemon.session_manager.SessionManager.init(allocator);
+) varuna.daemon.session_manager.SessionManagerOf(IO) {
+    var sm = varuna.daemon.session_manager.SessionManagerOf(IO).init(allocator);
     sm.shared_event_loop = shared_el;
     sm.port = cfg.network.port_min;
     sm.max_peers = cfg.network.max_peers;
@@ -585,13 +638,16 @@ fn initSessionManager(
 /// Create the HTTP API server, using systemd socket activation if available,
 /// otherwise binding to the configured address and port.
 fn initApiServer(
+    comptime IO: type,
     allocator: std.mem.Allocator,
-    shared_el: *varuna.io.event_loop.EventLoop,
+    shared_el: *varuna.io.event_loop.EventLoopOf(IO),
     cfg: varuna.config.Config,
     systemd_fds: ?[]const std.posix.fd_t,
     stdout: *std.Io.Writer,
     socket_activated: *bool,
-) !varuna.rpc.server.ApiServer {
+) !varuna.rpc.server.ApiServerOf(IO) {
+    const ApiServer = varuna.rpc.server.ApiServerOf(IO);
+
     if (systemd_fds) |fds| {
         // Use the first inherited fd as the API listen socket.
         // If systemd passes multiple sockets, the first one on api_port
@@ -604,14 +660,14 @@ fn initApiServer(
             }
         }
         socket_activated.* = true;
-        return varuna.rpc.server.ApiServer.initWithFd(allocator, &shared_el.io, api_fd) catch |err| {
+        return ApiServer.initWithFd(allocator, &shared_el.io, api_fd) catch |err| {
             try stdout.print("failed to init API server with socket activation: {s}\n", .{@errorName(err)});
             try stdout.flush();
             return err;
         };
     } else {
         socket_activated.* = false;
-        return varuna.rpc.server.ApiServer.initWithDevice(allocator, &shared_el.io, cfg.daemon.api_bind, cfg.daemon.api_port, cfg.network.bind_device) catch |err| {
+        return ApiServer.initWithDevice(allocator, &shared_el.io, cfg.daemon.api_bind, cfg.daemon.api_port, cfg.network.bind_device) catch |err| {
             try stdout.print("failed to start API server: {s}\n", .{@errorName(err)});
             try stdout.flush();
             return err;
@@ -671,11 +727,32 @@ fn createListenSocket(
 }
 
 // Global state for handler dispatch (Zig fn pointers can't capture state)
-var api_handler_global: ?*varuna.rpc.handlers.ApiHandler = null;
+const ApiHandlerDispatch = struct {
+    ctx: *anyopaque,
+    handle: *const fn (*anyopaque, std.mem.Allocator, varuna.rpc.server.Request) varuna.rpc.server.Response,
+};
+
+var api_handler_global: ?ApiHandlerDispatch = null;
+
+fn setGlobalApiHandler(comptime IO: type, handler: *varuna.rpc.handlers.ApiHandlerOf(IO)) void {
+    api_handler_global = .{
+        .ctx = handler,
+        .handle = struct {
+            fn handle(
+                ctx: *anyopaque,
+                allocator: std.mem.Allocator,
+                request: varuna.rpc.server.Request,
+            ) varuna.rpc.server.Response {
+                const typed_handler: *varuna.rpc.handlers.ApiHandlerOf(IO) = @ptrCast(@alignCast(ctx));
+                return typed_handler.handle(allocator, request);
+            }
+        }.handle,
+    };
+}
 
 fn globalApiHandler(allocator: std.mem.Allocator, request: varuna.rpc.server.Request) varuna.rpc.server.Response {
-    if (api_handler_global) |handler| {
-        return handler.handle(allocator, request);
+    if (api_handler_global) |dispatch| {
+        return dispatch.handle(dispatch.ctx, allocator, request);
     }
     return .{ .status = 500, .body = "{\"error\":\"handler not initialized\"}" };
 }

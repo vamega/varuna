@@ -60,8 +60,9 @@
 //!   ... submission methods ...
 //!
 //! Note: `init` signatures differ. RealIO takes `Config{ .entries, .flags }`.
-//! The readiness backends and SimIO take `(allocator, Config)`. Callers that
-//! want to switch backends dynamically need to handle this at the call site.
+//! The readiness backends and SimIO take `(allocator, Config)`. Runtime daemon
+//! startup selects a concrete backend branch and uses the generic init helpers
+//! below so the rest of the stack can stay on the `EventLoopOf(IO)` contract.
 
 const std = @import("std");
 const build_options = @import("build_options");
@@ -135,20 +136,35 @@ pub const SelectedBackend = enum {
 /// that want a SimIO construct it directly with their own seeded fault
 /// config. There's no sensible default `SimIO.init` shape we could pick
 /// here that would match what tests actually want.
-pub fn initWithCapacity(allocator: std.mem.Allocator, capacity: u32) !RealIO {
+pub fn initWithCapacityFor(comptime IO: type, allocator: std.mem.Allocator, capacity: u32) !IO {
     const entries: u16 = @intCast(@min(capacity, std.math.maxInt(u16)));
-    return switch (selected) {
-        .io_uring => RealIO.init(.{ .entries = entries }),
-        .epoll_posix => RealIO.init(allocator, .{ .max_completions = capacity, .file_pool_workers = 4 }),
-        .epoll_mmap => RealIO.init(allocator, .{ .max_completions = capacity }),
-        .kqueue_posix => RealIO.init(allocator, .{ .timer_capacity = capacity, .pending_capacity = @max(capacity, 256), .file_pool_workers = 4 }),
-        .kqueue_mmap => RealIO.init(allocator, .{ .timer_capacity = capacity, .pending_capacity = @max(capacity, 256) }),
-        .sim => @compileError("backend.initOneshot is not available under -Dio=sim; sim instances are caller-constructed for tests"),
-    };
+    if (IO == IoUringBackend) {
+        return IO.init(.{ .entries = entries });
+    } else if (IO == EpollPosixBackend) {
+        return IO.init(allocator, .{ .max_completions = capacity, .file_pool_workers = 4 });
+    } else if (IO == EpollMmapBackend) {
+        return IO.init(allocator, .{ .max_completions = capacity });
+    } else if (IO == KqueuePosixBackend) {
+        return IO.init(allocator, .{ .timer_capacity = capacity, .pending_capacity = @max(capacity, 256), .file_pool_workers = 4 });
+    } else if (IO == KqueueMmapBackend) {
+        return IO.init(allocator, .{ .timer_capacity = capacity, .pending_capacity = @max(capacity, 256) });
+    } else if (IO == SimBackend) {
+        @compileError("backend.initWithCapacityFor is not available for SimIO; sim instances are caller-constructed for tests");
+    } else {
+        @compileError("unsupported IO backend type");
+    }
+}
+
+pub fn initWithCapacity(allocator: std.mem.Allocator, capacity: u32) !RealIO {
+    return initWithCapacityFor(RealIO, allocator, capacity);
 }
 
 pub fn initOneshot(allocator: std.mem.Allocator) !RealIO {
     return initWithCapacity(allocator, 16);
+}
+
+pub fn initOneshotFor(comptime IO: type, allocator: std.mem.Allocator) !IO {
+    return initWithCapacityFor(IO, allocator, 16);
 }
 
 /// Construct a long-lived production-sized instance of the selected
@@ -162,18 +178,39 @@ pub fn initOneshot(allocator: std.mem.Allocator) !RealIO {
 /// `-Dio=io_uring`.
 ///
 /// Same `@compileError` rationale as `initOneshot` for `.sim`.
-pub fn initEventLoop(allocator: std.mem.Allocator) !RealIO {
-    return switch (selected) {
-        .io_uring => RealIO.init(.{
+pub fn initEventLoopFor(comptime IO: type, allocator: std.mem.Allocator) !IO {
+    if (IO == IoUringBackend) {
+        return IO.init(.{
             .entries = 256,
             .flags = std.os.linux.IORING_SETUP_COOP_TASKRUN | std.os.linux.IORING_SETUP_SINGLE_ISSUER,
-        }),
-        .epoll_posix => RealIO.init(allocator, .{ .max_completions = 1024, .file_pool_workers = 4 }),
-        .epoll_mmap => RealIO.init(allocator, .{ .max_completions = 1024 }),
-        .kqueue_posix => RealIO.init(allocator, .{ .timer_capacity = 256, .pending_capacity = 4096, .file_pool_workers = 4 }),
-        .kqueue_mmap => RealIO.init(allocator, .{ .timer_capacity = 256, .pending_capacity = 4096 }),
-        .sim => @compileError("backend.initEventLoop is not available under -Dio=sim; sim event loops are caller-constructed for tests"),
-    };
+        });
+    } else if (IO == EpollPosixBackend) {
+        return IO.init(allocator, .{ .max_completions = 1024, .file_pool_workers = 4 });
+    } else if (IO == EpollMmapBackend) {
+        return IO.init(allocator, .{ .max_completions = 1024 });
+    } else if (IO == KqueuePosixBackend) {
+        return IO.init(allocator, .{ .timer_capacity = 256, .pending_capacity = 4096, .file_pool_workers = 4 });
+    } else if (IO == KqueueMmapBackend) {
+        return IO.init(allocator, .{ .timer_capacity = 256, .pending_capacity = 4096 });
+    } else if (IO == SimBackend) {
+        @compileError("backend.initEventLoopFor is not available for SimIO; sim event loops are caller-constructed for tests");
+    } else {
+        @compileError("unsupported IO backend type");
+    }
+}
+
+pub fn initEventLoop(allocator: std.mem.Allocator) !RealIO {
+    return initEventLoopFor(RealIO, allocator);
+}
+
+pub fn nameFor(comptime IO: type) []const u8 {
+    if (IO == IoUringBackend) return "io_uring";
+    if (IO == EpollPosixBackend) return "epoll_posix";
+    if (IO == EpollMmapBackend) return "epoll_mmap";
+    if (IO == KqueuePosixBackend) return "kqueue_posix";
+    if (IO == KqueueMmapBackend) return "kqueue_mmap";
+    if (IO == SimBackend) return "sim";
+    @compileError("unsupported IO backend type");
 }
 
 test "backend selector resolves to a real type" {

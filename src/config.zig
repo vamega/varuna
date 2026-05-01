@@ -2,6 +2,36 @@ const std = @import("std");
 const toml = @import("toml");
 const mse = @import("crypto/mse.zig");
 
+pub const RuntimeIoBackend = enum {
+    auto,
+    io_uring,
+    epoll_posix,
+    epoll_mmap,
+    kqueue_posix,
+    kqueue_mmap,
+};
+
+pub fn parseRuntimeIoBackend(value: []const u8) !RuntimeIoBackend {
+    if (std.mem.eql(u8, value, "auto")) return .auto;
+    if (std.mem.eql(u8, value, "io_uring") or std.mem.eql(u8, value, "io-uring")) return .io_uring;
+    if (std.mem.eql(u8, value, "epoll_posix") or std.mem.eql(u8, value, "epoll-posix") or std.mem.eql(u8, value, "epoll+posix")) return .epoll_posix;
+    if (std.mem.eql(u8, value, "epoll_mmap") or std.mem.eql(u8, value, "epoll-mmap") or std.mem.eql(u8, value, "epoll+mmap")) return .epoll_mmap;
+    if (std.mem.eql(u8, value, "kqueue_posix") or std.mem.eql(u8, value, "kqueue-posix") or std.mem.eql(u8, value, "kqueue+posix")) return .kqueue_posix;
+    if (std.mem.eql(u8, value, "kqueue_mmap") or std.mem.eql(u8, value, "kqueue-mmap") or std.mem.eql(u8, value, "kqueue+mmap")) return .kqueue_mmap;
+    return error.InvalidIoBackend;
+}
+
+pub fn runtimeIoBackendName(value: RuntimeIoBackend) []const u8 {
+    return switch (value) {
+        .auto => "auto",
+        .io_uring => "io_uring",
+        .epoll_posix => "epoll_posix",
+        .epoll_mmap => "epoll_mmap",
+        .kqueue_posix => "kqueue_posix",
+        .kqueue_mmap => "kqueue_mmap",
+    };
+}
+
 /// Fine-grained transport control inspired by uTorrent's `bt.transp_disposition`.
 /// Each bit controls a specific transport direction:
 ///   bit 0 (1): allow outgoing TCP connections
@@ -140,6 +170,9 @@ pub const Config = struct {
         api_bind: []const u8 = "127.0.0.1",
         api_username: []const u8 = "admin",
         api_password: []const u8 = "adminadmin",
+        /// Runtime IO backend: "auto", "io_uring", "epoll_posix",
+        /// "epoll_mmap", "kqueue_posix", or "kqueue_mmap".
+        io_backend: []const u8 = "auto",
         /// Enable torrent queueing. When false, all torrents are active.
         queueing_enabled: bool = false,
         /// Max torrents actively downloading. -1 = unlimited.
@@ -449,6 +482,7 @@ pub fn loadDefault(allocator: std.mem.Allocator) !LoadedConfig {
 }
 
 pub fn validateConfig(config: Config) !void {
+    _ = try parseRuntimeIoBackend(config.daemon.io_backend);
     _ = try parseEncryptionMode(config.network.encryption);
     _ = config.network.resolveTransportDisposition();
 }
@@ -473,6 +507,7 @@ test "default config has sensible values" {
     try std.testing.expectEqual(@as(u32, 4), config.performance.hasher_threads);
     try std.testing.expectEqual(@as(?[]const u8, null), config.network.bind_device);
     try std.testing.expectEqual(@as(?[]const u8, null), config.network.bind_address);
+    try std.testing.expectEqualStrings("auto", config.daemon.io_backend);
 }
 
 test "load missing file returns FileNotFound" {
@@ -485,6 +520,18 @@ test "parseEncryptionMode recognizes all modes" {
     try std.testing.expectEqual(mse.EncryptionMode.enabled, try parseEncryptionMode("enabled"));
     try std.testing.expectEqual(mse.EncryptionMode.disabled, try parseEncryptionMode("disabled"));
     try std.testing.expectError(error.InvalidEncryptionMode, parseEncryptionMode("unknown"));
+}
+
+test "parseRuntimeIoBackend recognizes runtime backend names" {
+    try std.testing.expectEqual(RuntimeIoBackend.auto, try parseRuntimeIoBackend("auto"));
+    try std.testing.expectEqual(RuntimeIoBackend.io_uring, try parseRuntimeIoBackend("io_uring"));
+    try std.testing.expectEqual(RuntimeIoBackend.io_uring, try parseRuntimeIoBackend("io-uring"));
+    try std.testing.expectEqual(RuntimeIoBackend.epoll_posix, try parseRuntimeIoBackend("epoll_posix"));
+    try std.testing.expectEqual(RuntimeIoBackend.epoll_posix, try parseRuntimeIoBackend("epoll+posix"));
+    try std.testing.expectEqual(RuntimeIoBackend.epoll_mmap, try parseRuntimeIoBackend("epoll_mmap"));
+    try std.testing.expectEqual(RuntimeIoBackend.kqueue_posix, try parseRuntimeIoBackend("kqueue_posix"));
+    try std.testing.expectEqual(RuntimeIoBackend.kqueue_mmap, try parseRuntimeIoBackend("kqueue+mmap"));
+    try std.testing.expectError(error.InvalidIoBackend, parseRuntimeIoBackend("select"));
 }
 
 test "loadDefault stops on malformed config in current directory" {

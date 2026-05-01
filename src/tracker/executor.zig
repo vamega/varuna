@@ -1,6 +1,6 @@
 const std = @import("std");
 const linux = std.os.linux;
-pub const HttpExecutor = @import("../io/http_executor.zig").HttpExecutor;
+const http_executor_mod = @import("../io/http_executor.zig");
 const RealIO = @import("../io/backend.zig").RealIO;
 
 const log = std.log.scoped(.tracker_executor);
@@ -11,88 +11,95 @@ const log = std.log.scoped(.tracker_executor);
 /// other callers continue to work unchanged.  All state-machine, DNS,
 /// TLS, connection pool, and slot management logic now lives in
 /// `src/io/http_executor.zig`.
-pub const TrackerExecutor = struct {
-    allocator: std.mem.Allocator,
-    http: *HttpExecutor,
+pub fn TrackerExecutorOf(comptime IO: type) type {
+    return struct {
+        const Self = @This();
+        pub const HttpExecutor = http_executor_mod.HttpExecutorOf(IO);
 
-    // Re-export HttpExecutor types so existing callers compile unchanged.
-    pub const CompletionFn = HttpExecutor.CompletionFn;
-    pub const RequestResult = HttpExecutor.RequestResult;
+        allocator: std.mem.Allocator,
+        http: *HttpExecutor,
 
-    pub const Job = struct {
-        context: *anyopaque,
-        on_complete: CompletionFn,
-        url: [max_url_len]u8 = undefined,
-        url_len: u16 = 0,
-        host: [max_host_len]u8 = undefined,
-        host_len: u8 = 0,
+        // Re-export HttpExecutor types so existing callers compile unchanged.
+        pub const CompletionFn = HttpExecutor.CompletionFn;
+        pub const RequestResult = HttpExecutor.RequestResult;
 
-        const max_host_len = 253;
-        const max_url_len = 2048;
+        pub const Job = struct {
+            context: *anyopaque,
+            on_complete: CompletionFn,
+            url: [max_url_len]u8 = undefined,
+            url_len: u16 = 0,
+            host: [max_host_len]u8 = undefined,
+            host_len: u8 = 0,
 
-        pub fn urlSlice(self: *const Job) []const u8 {
-            return self.url[0..self.url_len];
-        }
+            const max_host_len = 253;
+            const max_url_len = 2048;
 
-        pub fn hostSlice(self: *const Job) []const u8 {
-            return self.host[0..self.host_len];
-        }
-    };
+            pub fn urlSlice(self: *const Job) []const u8 {
+                return self.url[0..self.url_len];
+            }
 
-    pub const Config = struct {
-        max_concurrent: u16 = 8,
-        max_per_host: u16 = 3,
-        /// Optional `SO_BINDTODEVICE` interface name forwarded to the
-        /// inner `HttpExecutor`'s `DnsResolver`. The slice lifetime
-        /// must outlive the executor.
-        bind_device: ?[]const u8 = null,
-    };
-
-    // ── Public API ───────────────────────────────────────────
-
-    pub fn create(allocator: std.mem.Allocator, io: *RealIO, config: Config) !*TrackerExecutor {
-        const self = try allocator.create(TrackerExecutor);
-        errdefer allocator.destroy(self);
-
-        self.* = .{
-            .allocator = allocator,
-            .http = try HttpExecutor.create(allocator, io, .{
-                .max_concurrent = config.max_concurrent,
-                .max_per_host = config.max_per_host,
-                .bind_device = config.bind_device,
-            }),
+            pub fn hostSlice(self: *const Job) []const u8 {
+                return self.host[0..self.host_len];
+            }
         };
 
-        return self;
-    }
-
-    pub fn destroy(self: *TrackerExecutor) void {
-        self.http.destroy();
-        self.allocator.destroy(self);
-    }
-
-    /// Submit a tracker HTTP(S) GET request. Thread-safe.
-    /// Converts TrackerExecutor.Job to HttpExecutor.Job and delegates.
-    pub fn submit(self: *TrackerExecutor, job: Job) !void {
-        var http_job = HttpExecutor.Job{
-            .context = job.context,
-            .on_complete = job.on_complete,
-            .url_len = job.url_len,
-            .host_len = job.host_len,
+        pub const Config = struct {
+            max_concurrent: u16 = 8,
+            max_per_host: u16 = 3,
+            /// Optional `SO_BINDTODEVICE` interface name forwarded to the
+            /// inner `HttpExecutor`'s `DnsResolver`. The slice lifetime
+            /// must outlive the executor.
+            bind_device: ?[]const u8 = null,
         };
-        @memcpy(http_job.url[0..job.url_len], job.url[0..job.url_len]);
-        @memcpy(http_job.host[0..job.host_len], job.host[0..job.host_len]);
-        try self.http.submit(http_job);
-    }
 
-    /// Process pending jobs, check timeouts, and start deferred requests.
-    /// Called from the main event loop's tick().
-    pub fn tick(self: *TrackerExecutor) void {
-        self.http.tick();
-    }
+        // ── Public API ───────────────────────────────────────────
 
-    /// Dispatch a CQE from the shared event loop.
-    pub fn dispatchCqe(self: *TrackerExecutor, cqe: linux.io_uring_cqe) void {
-        self.http.dispatchCqe(cqe);
-    }
-};
+        pub fn create(allocator: std.mem.Allocator, io: *IO, config: Config) !*Self {
+            const self = try allocator.create(Self);
+            errdefer allocator.destroy(self);
+
+            self.* = .{
+                .allocator = allocator,
+                .http = try HttpExecutor.create(allocator, io, .{
+                    .max_concurrent = config.max_concurrent,
+                    .max_per_host = config.max_per_host,
+                    .bind_device = config.bind_device,
+                }),
+            };
+
+            return self;
+        }
+
+        pub fn destroy(self: *Self) void {
+            self.http.destroy();
+            self.allocator.destroy(self);
+        }
+
+        /// Submit a tracker HTTP(S) GET request. Thread-safe.
+        /// Converts TrackerExecutor.Job to HttpExecutor.Job and delegates.
+        pub fn submit(self: *Self, job: Job) !void {
+            var http_job = HttpExecutor.Job{
+                .context = job.context,
+                .on_complete = job.on_complete,
+                .url_len = job.url_len,
+                .host_len = job.host_len,
+            };
+            @memcpy(http_job.url[0..job.url_len], job.url[0..job.url_len]);
+            @memcpy(http_job.host[0..job.host_len], job.host[0..job.host_len]);
+            try self.http.submit(http_job);
+        }
+
+        /// Process pending jobs, check timeouts, and start deferred requests.
+        /// Called from the main event loop's tick().
+        pub fn tick(self: *Self) void {
+            self.http.tick();
+        }
+
+        /// Dispatch a CQE from the shared event loop.
+        pub fn dispatchCqe(self: *Self, cqe: linux.io_uring_cqe) void {
+            self.http.dispatchCqe(cqe);
+        }
+    };
+}
+
+pub const TrackerExecutor = TrackerExecutorOf(RealIO);

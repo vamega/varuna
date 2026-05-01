@@ -1,9 +1,12 @@
 const std = @import("std");
+const builtin = @import("builtin");
 const build_options = @import("build_options");
+const config_mod = @import("../config.zig");
 const kernel = @import("kernel.zig");
 const requirements = @import("requirements.zig");
 
 const ring_mod = @import("../io/ring.zig");
+const RuntimeIoBackend = config_mod.RuntimeIoBackend;
 
 pub const Summary = struct {
     release: []const u8,
@@ -22,21 +25,56 @@ pub const Summary = struct {
 };
 
 pub fn ensureSupported(summary: Summary) !void {
-    if (selectedBackendRequiresKernelFloor() and summary.support == .unsupported) return error.UnsupportedKernel;
-    if (selectedBackendRequiresIoUring() and !summary.io_uring_available) return error.IoUringUnavailable;
+    if (build_options.io_backend == .sim) return;
+    try ensureSupportedForBackend(summary, buildSelectedBackend());
 }
 
-fn selectedBackendRequiresKernelFloor() bool {
-    return switch (build_options.io_backend) {
-        .io_uring => true,
-        else => false,
+pub fn selectRuntimeIoBackend(requested: RuntimeIoBackend, summary: Summary) !RuntimeIoBackend {
+    const selected = if (requested == .auto) try defaultBackendForHost(summary) else requested;
+    try ensurePlatformSupportsBackend(selected);
+    try ensureSupportedForBackend(summary, selected);
+    return selected;
+}
+
+pub fn ensureSupportedForBackend(summary: Summary, selected: RuntimeIoBackend) !void {
+    switch (selected) {
+        .auto => unreachable,
+        .io_uring => {
+            if (summary.support == .unsupported) return error.UnsupportedKernel;
+            if (!summary.io_uring_available) return error.IoUringUnavailable;
+        },
+        .epoll_posix, .epoll_mmap, .kqueue_posix, .kqueue_mmap => {},
+    }
+}
+
+fn defaultBackendForHost(summary: Summary) !RuntimeIoBackend {
+    return switch (builtin.os.tag) {
+        .linux => if (summary.support != .unsupported and summary.io_uring_available) .io_uring else .epoll_posix,
+        .macos => .kqueue_posix,
+        else => error.UnsupportedIoBackend,
     };
 }
 
-fn selectedBackendRequiresIoUring() bool {
+fn ensurePlatformSupportsBackend(selected: RuntimeIoBackend) !void {
+    switch (selected) {
+        .auto => unreachable,
+        .io_uring, .epoll_posix, .epoll_mmap => {
+            if (builtin.os.tag != .linux) return error.UnsupportedIoBackend;
+        },
+        .kqueue_posix, .kqueue_mmap => {
+            if (builtin.os.tag != .macos) return error.UnsupportedIoBackend;
+        },
+    }
+}
+
+fn buildSelectedBackend() RuntimeIoBackend {
     return switch (build_options.io_backend) {
-        .io_uring => true,
-        else => false,
+        .io_uring => .io_uring,
+        .epoll_posix => .epoll_posix,
+        .epoll_mmap => .epoll_mmap,
+        .kqueue_posix => .kqueue_posix,
+        .kqueue_mmap => .kqueue_mmap,
+        .sim => .auto,
     };
 }
 
@@ -137,5 +175,55 @@ test "ensureSupported requires io_uring only for io_uring backend" {
     switch (build_options.io_backend) {
         .io_uring => try std.testing.expectError(error.IoUringUnavailable, ensureSupported(summary)),
         else => try ensureSupported(summary),
+    }
+}
+
+test "runtime auto prefers io_uring when available on Linux" {
+    var summary = try fromStrings(
+        std.testing.allocator,
+        "6.8.12-generic",
+        "#12-Ubuntu SMP",
+        "x86_64",
+    );
+    defer summary.deinit(std.testing.allocator);
+    summary.io_uring_available = true;
+
+    switch (builtin.os.tag) {
+        .linux => try std.testing.expectEqual(RuntimeIoBackend.io_uring, try selectRuntimeIoBackend(.auto, summary)),
+        .macos => try std.testing.expectEqual(RuntimeIoBackend.kqueue_posix, try selectRuntimeIoBackend(.auto, summary)),
+        else => try std.testing.expectError(error.UnsupportedIoBackend, selectRuntimeIoBackend(.auto, summary)),
+    }
+}
+
+test "runtime auto falls back to epoll_posix on Linux when io_uring is unavailable" {
+    var summary = try fromStrings(
+        std.testing.allocator,
+        "6.8.12-generic",
+        "#12-Ubuntu SMP",
+        "x86_64",
+    );
+    defer summary.deinit(std.testing.allocator);
+    summary.io_uring_available = false;
+
+    switch (builtin.os.tag) {
+        .linux => try std.testing.expectEqual(RuntimeIoBackend.epoll_posix, try selectRuntimeIoBackend(.auto, summary)),
+        .macos => try std.testing.expectEqual(RuntimeIoBackend.kqueue_posix, try selectRuntimeIoBackend(.auto, summary)),
+        else => try std.testing.expectError(error.UnsupportedIoBackend, selectRuntimeIoBackend(.auto, summary)),
+    }
+}
+
+test "explicit io_uring still requires io_uring support" {
+    var summary = try fromStrings(
+        std.testing.allocator,
+        "6.8.12-generic",
+        "#12-Ubuntu SMP",
+        "x86_64",
+    );
+    defer summary.deinit(std.testing.allocator);
+    summary.io_uring_available = false;
+
+    switch (builtin.os.tag) {
+        .linux => try std.testing.expectError(error.IoUringUnavailable, selectRuntimeIoBackend(.io_uring, summary)),
+        else => try std.testing.expectError(error.UnsupportedIoBackend, selectRuntimeIoBackend(.io_uring, summary)),
     }
 }

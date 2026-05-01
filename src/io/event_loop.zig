@@ -31,6 +31,10 @@ pub const DownloadingPieceKey = dp_mod.DownloadingPieceKey;
 pub const DownloadingPieceMap = dp_mod.DownloadingPieceMap;
 
 const recheck_mod = @import("recheck.zig");
+const http_executor_mod = @import("http_executor.zig");
+const tracker_executor_mod = @import("../tracker/executor.zig");
+const udp_tracker_executor_mod = @import("../tracker/udp_executor.zig");
+const rpc_server_mod = @import("../rpc/server.zig");
 
 // Sub-modules: focused implementations that operate on *EventLoop
 const peer_handler = @import("peer_handler.zig");
@@ -91,6 +95,10 @@ pub fn EventLoopOf(comptime IO: type) type {
         // instantiation; sim tests instantiate `AsyncMetadataFetchOf(SimIO)`
         // through this alias.
         pub const AsyncMetadataFetch = metadata_handler.AsyncMetadataFetchOf(IO);
+        pub const HttpExecutor = http_executor_mod.HttpExecutorOf(IO);
+        pub const TrackerExecutor = tracker_executor_mod.TrackerExecutorOf(IO);
+        pub const UdpTrackerExecutor = udp_tracker_executor_mod.UdpTrackerExecutorOf(IO);
+        pub const ApiServer = rpc_server_mod.ApiServerOf(IO);
 
         pub const PendingWriteKey = struct {
             piece_index: u32,
@@ -277,24 +285,24 @@ pub fn EventLoopOf(comptime IO: type) type {
         dht_engine: ?*@import("../dht/dht.zig").DhtEngine = null,
 
         // API server (shares the event loop's ring)
-        api_server: ?*@import("../rpc/server.zig").ApiServer = null,
+        api_server: ?*ApiServer = null,
 
         // Generic HTTP executor (shares the event loop's ring).
         // CQEs for http_socket/http_connect/http_send/http_recv route here.
-        http_executor: ?*@import("http_executor.zig").HttpExecutor = null,
+        http_executor: ?*HttpExecutor = null,
 
         // Tracker executor (thin wrapper around http_executor, shares the event loop's ring).
         // Lives in `src/tracker/` so the dependency points downward
         // (io ← tracker, never io → daemon). The EventLoop only stores
         // the pointer and nulls it on deinit; daemon callers (SessionManager)
         // construct the executor and wire it in.
-        tracker_executor: ?*@import("../tracker/executor.zig").TrackerExecutor = null,
+        tracker_executor: ?*TrackerExecutor = null,
 
         // UDP tracker executor (shares the event loop's ring, BEP 15).
         // Same layering rule as `tracker_executor` above — lives in
         // `src/tracker/`. EventLoop calls `tick()` once per loop iteration
         // (see below); construction and lifecycle live in SessionManager.
-        udp_tracker_executor: ?*@import("../tracker/udp_executor.zig").UdpTrackerExecutor = null,
+        udp_tracker_executor: ?*UdpTrackerExecutor = null,
 
         // Complete pieces bitfield (for seeding -- which pieces we can serve)
         complete_pieces: ?*const Bitfield = null,
@@ -436,7 +444,7 @@ pub fn EventLoopOf(comptime IO: type) type {
         /// `initBareWithIO`, passing a SimIO instance configured with
         /// the test's socket pool capacity.
         pub fn initBare(allocator: std.mem.Allocator, hasher_threads: u32) !@This() {
-            const io = try backend.initEventLoop(allocator);
+            const io = try backend.initEventLoopFor(IO, allocator);
             return initBareWithIO(allocator, io, hasher_threads);
         }
 
@@ -538,7 +546,7 @@ pub fn EventLoopOf(comptime IO: type) type {
             shared_fds: []const posix.fd_t,
             peer_id: [20]u8,
             hasher_threads: u32,
-        ) !EventLoop {
+        ) !Self {
             var el = try initBare(allocator, hasher_threads);
 
             const tid = try el.addTorrent(session, piece_tracker, shared_fds, peer_id);

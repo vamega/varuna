@@ -44,16 +44,18 @@ pub const SyncState = struct {
     /// `request_rid` is the rid the client sent (0 = full sync).
     pub fn computeDelta(
         self: *SyncState,
-        session_manager: *SessionManager,
+        session_manager: anytype,
         allocator: std.mem.Allocator,
         request_rid: u64,
     ) ![]u8 {
+        const SessionManagerType = @TypeOf(session_manager.*);
+
         // Fetch current torrent stats
         const stats = try session_manager.getAllStats(allocator);
         defer allocator.free(stats);
 
         // Get global transfer info via facade
-        const transfer = session_manager.getTransferInfo(allocator) catch SessionManager.TransferInfo{};
+        const transfer = session_manager.getTransferInfo(allocator) catch SessionManagerType.TransferInfo{};
         const dl_limit = transfer.dl_limit;
         const ul_limit = transfer.ul_limit;
         const dht_nodes = transfer.dht_nodes;
@@ -237,13 +239,14 @@ pub const PeerSyncState = struct {
 
     pub fn computeDelta(
         self: *PeerSyncState,
-        session_manager: *SessionManager,
+        session_manager: anytype,
         allocator: std.mem.Allocator,
         torrent_hash: []const u8,
         request_rid: u64,
     ) ![]u8 {
+        const SessionManagerType = @TypeOf(session_manager.*);
         const peers = try session_manager.getTorrentPeers(allocator, torrent_hash);
-        defer SessionManager.freePeerInfos(allocator, peers);
+        defer SessionManagerType.freePeerInfos(allocator, peers);
 
         const prev_snapshot = self.getSnapshot(request_rid, torrent_hash);
         const full_update = request_rid == 0 or prev_snapshot == null;
@@ -313,7 +316,7 @@ pub const PeerSyncState = struct {
         self: *PeerSyncState,
         rid: u64,
         torrent_hash: []const u8,
-        peers: []const SessionManager.PeerInfo,
+        peers: anytype,
     ) void {
         if (torrent_hash.len != 40) return;
         const slot = rid % max_snapshots;
@@ -369,7 +372,7 @@ fn serializeTorrentObject(allocator: std.mem.Allocator, out: *std.ArrayList(u8),
     return compat.serializeTorrentJson(allocator, out, stat, false);
 }
 
-fn peerHash(peer: SessionManager.PeerInfo) u64 {
+fn peerHash(peer: anytype) u64 {
     var hasher = std.hash.Wyhash.init(0);
     hasher.update(peer.ip);
     hasher.update(std.mem.asBytes(&peer.port));
@@ -388,7 +391,7 @@ fn peerHash(peer: SessionManager.PeerInfo) u64 {
 fn serializePeerObject(
     allocator: std.mem.Allocator,
     json_buf: *std.ArrayList(u8),
-    peer: SessionManager.PeerInfo,
+    peer: anytype,
 ) !void {
     const esc = json_esc.jsonSafe;
     try json_buf.writer(allocator).print("\"{f}\":{{\"client\":\"{f}\",\"connection\":\"\",\"country\":\"\",\"country_code\":\"\",\"dl_speed\":{},\"downloaded\":{},\"files\":\"\",\"flags\":\"{f}\",\"flags_desc\":\"\",\"hashfails\":{},\"ip\":\"{f}\",\"port\":{},\"progress\":{d:.4},\"relevance\":1,\"up_speed\":{},\"uploaded\":{},\"upload_only\":{}}}", .{

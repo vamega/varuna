@@ -136,7 +136,7 @@ pub const QueueManager = struct {
     pub fn shouldBeActive(
         self: *const QueueManager,
         info_hash_hex: [40]u8,
-        sessions: *const std.StringHashMap(*TorrentSession),
+        sessions: anytype,
     ) bool {
         if (!self.config.enabled) return true;
 
@@ -204,7 +204,7 @@ pub const QueueManager = struct {
     /// The caller must actually start/queue the sessions.
     pub fn enforce(
         self: *const QueueManager,
-        sessions: *const std.StringHashMap(*TorrentSession),
+        sessions: anytype,
     ) EnforceResult {
         var result = EnforceResult{};
         if (!self.config.enabled) return result;
@@ -290,7 +290,7 @@ pub const QueueManager = struct {
         }
     }
 
-    fn isDownloading(session: *const TorrentSession) bool {
+    fn isDownloading(session: anytype) bool {
         return session.state != .seeding;
     }
 };
