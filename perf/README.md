@@ -36,6 +36,35 @@ These commands build `varuna` first and then run it under the selected tool. Pas
   Writes sampled profiling data to `perf/output/perf.data`.
 - `zig build perf-workload -- request_batch --iterations=100000`
   Runs the synthetic workload harness (`zig-out/bin/varuna-perf`) for targeted allocation and cache baselines.
+- `zig build perf-swarm-backends`
+  Runs the live tracker/seeder/downloader swarm matrix in perf mode and writes a throughput summary under `perf/output/backend-swarm-perf-*/summary.tsv`.
+
+## Live Swarm Backend Perf
+
+Use `perf-swarm-backends` when comparing the production Linux daemon backends through the real swarm path instead of synthetic CPU-only workloads.
+The harness reuses `scripts/backend_swarm_matrix.sh` and `scripts/demo_swarm.sh`, so it requires `opentracker` and starts one tracker, seeder daemon, and downloader daemon per backend run.
+
+Default run:
+
+```bash
+zig build -Doptimize=ReleaseFast perf-swarm-backends
+```
+
+Useful overrides:
+
+```bash
+BACKENDS="io_uring epoll_posix epoll_mmap" PAYLOAD_BYTES=67108864 RUNS=3 TIMEOUT=240 zig build -Doptimize=ReleaseFast perf-swarm-backends
+OUT_DIR=perf/output/manual-backend-swarm BACKENDS="io_uring epoll_posix" PAYLOAD_BYTES=16777216 zig build perf-swarm-backends
+```
+
+The perf-mode `summary.tsv` columns are:
+
+```text
+run	backend	status	elapsed_seconds	transfer_seconds	payload_bytes	throughput_mib_s	work_dir	log
+```
+
+Interpret `throughput_mib_s` as `payload_bytes / transfer_seconds`, where `transfer_seconds` is measured by `demo_swarm.sh` from downloader add until completed progress is observed.
+Small payloads are dominated by startup and one-second polling granularity; use larger payloads and multiple `RUNS` for backend deltas that are close together.
 
 ## Synthetic Workloads
 
