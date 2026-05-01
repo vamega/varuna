@@ -270,13 +270,43 @@ pub fn servePieceRequest(self: anytype, slot: u16, payload: []const u8) void {
     // serving a piece doesn't need the expected hash, and seed-mode sessions
     // have called Session.freePieces() to drop the v1 hash table. Reading
     // pieceHash here would fail with error.PiecesNotLoaded for every REQUEST.
+    //
+    // The piece_index has already been validated against complete_pieces and
+    // pieceSize above, so planPieceSpans can really only fail here on OOM
+    // (heap path) — InvalidPieceIndex would mean state corruption. Both are
+    // unexpected; surface them via log + drop the peer connection rather
+    // than silently no-op'ing the REQUEST (which would leave the peer
+    // waiting for a PIECE that never arrives, the original freePieces bug).
     var span_scratch: [8]LayoutSpan = undefined;
-    const plan = storage.verify.planPieceSpansWithScratch(self.allocator, sess, piece_index, span_scratch[0..]) catch return;
+    const plan = storage.verify.planPieceSpansWithScratch(self.allocator, sess, piece_index, span_scratch[0..]) catch |err| {
+        log.warn("seed: planPieceSpans piece={d} torrent={d} slot={d} err={s}; dropping peer", .{
+            piece_index, peer.torrent_id, slot, @errorName(err),
+        });
+        self.removePeer(slot);
+        return;
+    };
     defer plan.deinit(self.allocator);
 
-    if (plan.spans.len == 0) return;
+    if (plan.spans.len == 0) {
+        // pieceSpanCount returning 0 for an in-bounds piece is a layout
+        // invariant violation — every piece must touch at least one file.
+        // Surface this and drop the peer.
+        log.warn("seed: planPieceSpans yielded 0 spans piece={d} torrent={d} slot={d}; dropping peer", .{
+            piece_index, peer.torrent_id, slot,
+        });
+        self.removePeer(slot);
+        return;
+    }
 
-    const piece_buffer = self.createPieceBuffer(piece_size) catch return;
+    const piece_buffer = self.createPieceBuffer(piece_size) catch |err| {
+        // Buffer pool exhausted / OOM: log so this isn't invisible during
+        // a seed-side stall investigation. Still recoverable (peer will
+        // re-REQUEST); don't drop the connection for a transient pool miss.
+        log.warn("seed: createPieceBuffer piece={d} size={d} err={s}", .{
+            piece_index, piece_size, @errorName(err),
+        });
+        return;
+    };
     const read_id = nextSeedReadId(self);
 
     self.pending_reads.append(self.allocator, .{
@@ -288,7 +318,8 @@ pub fn servePieceRequest(self: anytype, slot: u16, payload: []const u8) void {
         .piece_buffer = piece_buffer,
         .reads_remaining = 0,
         .submitted_span_count = 0,
-    }) catch {
+    }) catch |err| {
+        log.warn("seed: pending_reads.append err={s}; releasing buffer", .{@errorName(err)});
         self.releasePieceBuffer(piece_buffer);
         return;
     };
