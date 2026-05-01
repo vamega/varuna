@@ -494,11 +494,17 @@ test "AsyncRecheck skips all known-complete pieces" {
     const allocator = std.testing.allocator;
 
     // Build a minimal session with 4 pieces
+    const piece_hashes =
+        "aaaaaaaaaaaaaaaaaaaa" ++
+        "bbbbbbbbbbbbbbbbbbbb" ++
+        "cccccccccccccccccccc" ++
+        "dddddddddddddddddddd";
     const input =
-        "d4:infod6:lengthi16e4:name8:test.bin12:piece lengthi4e6:pieces80:" ++
-        "aaaabbbbccccddddeeeeAAAABBBBCCCCDDDDEEEEee";
-    const session = session_mod.Session.load(allocator, input, "/tmp/recheck_test") catch
-        return error.SkipZigTest;
+        "d4:infod6:lengthi16e4:name8:test.bin12:piece lengthi4e6:pieces" ++
+        std.fmt.comptimePrint("{d}:", .{piece_hashes.len}) ++
+        piece_hashes ++
+        "ee";
+    const session = try session_mod.Session.load(allocator, input, "/tmp/recheck_test");
     defer session.deinit(allocator);
 
     // Create a "known_complete" bitfield with all pieces set
@@ -509,14 +515,8 @@ test "AsyncRecheck skips all known-complete pieces" {
         try known.set(i);
     }
 
-    // We can't create a real IoUring or Hasher in unit tests, so test
-    // the fast path by verifying the bitfield accounting.
-    // This tests the skip logic indirectly: create and immediately check
-    // that known-complete pieces are counted correctly by the state machine's
-    // start() path.
-
-    // Instead of exercising the full state machine (which needs a ring),
-    // verify the bitfield skip logic directly.
+    // Can't construct a real ring/Hasher in unit tests; verify the
+    // bitfield skip accounting directly.
     var complete = try Bitfield.init(allocator, session.pieceCount());
     defer complete.deinit(allocator);
     var bytes: u64 = 0;
