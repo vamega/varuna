@@ -368,6 +368,7 @@ fn deliverUtpData(self: anytype, utp_slot: u16, data: []const u8) void {
 
             if (peer.handshake_offset >= 68) {
                 processUtpOutboundHandshake(self, peer_slot);
+                if (peer.state == .free) return;
                 // Feed any remaining data.
                 if (to_copy < data.len) {
                     deliverUtpData(self, utp_slot, data[to_copy..]);
@@ -384,6 +385,7 @@ fn deliverUtpData(self: anytype, utp_slot: u16, data: []const u8) void {
             if (peer.handshake_offset >= 68) {
                 // Process the completed handshake
                 processUtpInboundHandshake(self, peer_slot);
+                if (peer.state == .free) return;
                 // Feed any remaining data.
                 if (to_copy < data.len) {
                     deliverUtpData(self, utp_slot, data[to_copy..]);
@@ -440,6 +442,7 @@ fn deliverUtpData(self: anytype, utp_slot: u16, data: []const u8) void {
             if (peer.body_offset >= peer.body_expected) {
                 // Full message received
                 protocol.processMessage(self, peer_slot);
+                if (peer.state == .free) return;
                 if (peer.body_is_heap) {
                     if (peer.body_buf) |buf| self.allocator.free(buf);
                 }
@@ -463,6 +466,11 @@ fn deliverUtpData(self: anytype, utp_slot: u16, data: []const u8) void {
 fn processUtpOutboundHandshake(self: anytype, peer_slot: u16) void {
     const peer = &self.peers[peer_slot];
     const tc = self.getTorrentContext(peer.torrent_id) orelse {
+        self.removePeer(peer_slot);
+        return;
+    };
+
+    pw.validateHandshakePrefix(peer.handshake_buf[0..68]) catch {
         self.removePeer(peer_slot);
         return;
     };
@@ -500,6 +508,12 @@ fn processUtpOutboundHandshake(self: anytype, peer_slot: u16) void {
 /// Process a completed inbound handshake from a uTP peer.
 fn processUtpInboundHandshake(self: anytype, peer_slot: u16) void {
     const peer = &self.peers[peer_slot];
+
+    pw.validateHandshakePrefix(peer.handshake_buf[0..68]) catch {
+        self.removePeer(peer_slot);
+        return;
+    };
+
     const inbound_hash = peer.handshake_buf[28..48];
 
     // Match info_hash against all registered torrents.
@@ -753,6 +767,96 @@ pub fn utpTick(self: anytype) void {
 pub fn utpNowUs() u32 {
     const ts = std.time.microTimestamp();
     return @truncate(@as(u64, @intCast(ts)));
+}
+
+test "uTP handshake delivery rejects invalid protocol prefix" {
+    const event_loop_mod = @import("event_loop.zig");
+    const SimIO = @import("sim_io.zig").SimIO;
+    const EL = event_loop_mod.EventLoopOf(SimIO);
+
+    const sim_io = try SimIO.init(std.testing.allocator, .{ .seed = 0x5251 });
+    var el = try EL.initBareWithIO(std.testing.allocator, sim_io, 0);
+    defer el.deinit();
+
+    const info_hash = [_]u8{0xAA} ** 20;
+    const peer_id = [_]u8{0xBB} ** 20;
+    const empty_fds = [_]posix.fd_t{};
+    const torrent_id = try el.addTorrentContext(.{
+        .shared_fds = empty_fds[0..],
+        .info_hash = info_hash,
+        .peer_id = peer_id,
+    });
+
+    const slot: u16 = 0;
+    const peer = &el.peers[slot];
+    peer.* = Peer{
+        .fd = -1,
+        .state = .handshake_recv,
+        .mode = .outbound,
+        .transport = .utp,
+        .torrent_id = torrent_id,
+        .utp_slot = 7,
+    };
+    el.peer_count = 1;
+    el.markActivePeer(slot);
+    el.attachPeerToTorrent(torrent_id, slot);
+
+    var handshake = pw.serializeHandshake(info_hash, peer_id);
+    handshake[1] = 'X';
+    deliverUtpData(&el, 7, &handshake);
+
+    try std.testing.expectEqual(event_loop_mod.PeerState.free, el.peers[slot].state);
+}
+
+test "uTP body delivery does not re-arm a slot removed by message processing" {
+    const event_loop_mod = @import("event_loop.zig");
+    const SimIO = @import("sim_io.zig").SimIO;
+    const session_mod = @import("../torrent/session.zig");
+    const layout_mod = @import("../torrent/layout.zig");
+    const EL = event_loop_mod.EventLoopOf(SimIO);
+
+    const sim_io = try SimIO.init(std.testing.allocator, .{ .seed = 0x5252 });
+    var el = try EL.initBareWithIO(std.testing.allocator, sim_io, 0);
+    defer el.deinit();
+
+    var fake_session = session_mod.Session{
+        .torrent_bytes = &.{},
+        .metainfo = undefined,
+        .layout = layout_mod.Layout{
+            .piece_length = 16 * 1024,
+            .piece_count = 9,
+            .total_size = 9 * 16 * 1024,
+            .files = &.{},
+        },
+        .manifest = undefined,
+        .pieces_allocator = std.testing.allocator,
+    };
+    const empty_fds = [_]posix.fd_t{};
+    const torrent_id = try el.addTorrentContext(.{
+        .session = &fake_session,
+        .shared_fds = empty_fds[0..],
+        .info_hash = [_]u8{0} ** 20,
+        .peer_id = [_]u8{0} ** 20,
+    });
+
+    const slot: u16 = 0;
+    const peer = &el.peers[slot];
+    peer.* = Peer{
+        .fd = -1,
+        .state = .active_recv_header,
+        .mode = .outbound,
+        .transport = .utp,
+        .torrent_id = torrent_id,
+        .utp_slot = 7,
+    };
+    el.peer_count = 1;
+    el.markActivePeer(slot);
+    el.attachPeerToTorrent(torrent_id, slot);
+
+    const invalid_bitfield_frame = [_]u8{ 0, 0, 0, 2, 5, 0x80 };
+    deliverUtpData(&el, 7, &invalid_bitfield_frame);
+
+    try std.testing.expectEqual(event_loop_mod.PeerState.free, el.peers[slot].state);
 }
 
 /// Normalize an IPv4-mapped IPv6 address (::ffff:x.x.x.x) to a plain IPv4

@@ -706,6 +706,10 @@ fn handleRecvResult(self: anytype, slot: u16, recv_res: i32) void {
                 };
                 return;
             }
+            pw.validateHandshakePrefix(peer.handshake_buf[0..68]) catch {
+                self.removePeer(slot);
+                return;
+            };
             // Validate handshake: accept v1 or v2 (BEP 52) info-hash
             const recv_hash = peer.handshake_buf[28..48];
             const v1_match = std.mem.eql(u8, recv_hash, tc_recv.info_hash[0..]);
@@ -758,6 +762,10 @@ fn handleRecvResult(self: anytype, slot: u16, recv_res: i32) void {
                 };
                 return;
             }
+            pw.validateHandshakePrefix(peer.handshake_buf[0..68]) catch {
+                self.removePeer(slot);
+                return;
+            };
             // Match info_hash against all registered torrents.
             // BEP 52: for hybrid torrents, also match on the truncated v2 info-hash
             // since v2-capable peers may use the SHA-256 info-hash in the handshake.
@@ -857,6 +865,7 @@ fn handleRecvResult(self: anytype, slot: u16, recv_res: i32) void {
             }
             // Full message received -- process it
             protocol.processMessage(self, slot);
+            if (peer.state == .free) return;
             // Free body and read next header
             if (peer.body_is_heap) {
                 if (peer.body_buf) |buf| self.allocator.free(buf);
@@ -1265,6 +1274,99 @@ pub fn detectAndHandleInboundMse(self: anytype, slot: u16, first_byte: u8, n: us
     }
 
     return false;
+}
+
+test "handshake receive rejects invalid protocol prefix" {
+    const event_loop_mod = @import("event_loop.zig");
+    const SimIO = @import("sim_io.zig").SimIO;
+    const EL = event_loop_mod.EventLoopOf(SimIO);
+
+    const sim_io = try SimIO.init(std.testing.allocator, .{ .seed = 0x5150 });
+    var el = try EL.initBareWithIO(std.testing.allocator, sim_io, 0);
+    defer el.deinit();
+
+    const info_hash = [_]u8{0xAA} ** 20;
+    const peer_id = [_]u8{0xBB} ** 20;
+    const empty_fds = [_]posix.fd_t{};
+    const torrent_id = try el.addTorrentContext(.{
+        .shared_fds = empty_fds[0..],
+        .info_hash = info_hash,
+        .peer_id = peer_id,
+    });
+
+    const slot: u16 = 0;
+    const peer = &el.peers[slot];
+    peer.* = Peer{
+        .fd = -1,
+        .state = .handshake_recv,
+        .mode = .outbound,
+        .torrent_id = torrent_id,
+    };
+    el.peer_count = 1;
+    el.markActivePeer(slot);
+    el.attachPeerToTorrent(torrent_id, slot);
+
+    var handshake = pw.serializeHandshake(info_hash, peer_id);
+    handshake[1] = 'X';
+    @memcpy(peer.handshake_buf[0..68], &handshake);
+
+    handleRecvResult(&el, slot, 68);
+
+    try std.testing.expectEqual(PeerState.free, el.peers[slot].state);
+}
+
+test "body completion does not re-arm a slot removed by message processing" {
+    const event_loop_mod = @import("event_loop.zig");
+    const SimIO = @import("sim_io.zig").SimIO;
+    const session_mod = @import("../torrent/session.zig");
+    const layout_mod = @import("../torrent/layout.zig");
+    const EL = event_loop_mod.EventLoopOf(SimIO);
+
+    const sim_io = try SimIO.init(std.testing.allocator, .{ .seed = 0x5151 });
+    var el = try EL.initBareWithIO(std.testing.allocator, sim_io, 0);
+    defer el.deinit();
+
+    var fake_session = session_mod.Session{
+        .torrent_bytes = &.{},
+        .metainfo = undefined,
+        .layout = layout_mod.Layout{
+            .piece_length = 16 * 1024,
+            .piece_count = 9,
+            .total_size = 9 * 16 * 1024,
+            .files = &.{},
+        },
+        .manifest = undefined,
+        .pieces_allocator = std.testing.allocator,
+    };
+    const empty_fds = [_]posix.fd_t{};
+    const torrent_id = try el.addTorrentContext(.{
+        .session = &fake_session,
+        .shared_fds = empty_fds[0..],
+        .info_hash = [_]u8{0} ** 20,
+        .peer_id = [_]u8{0} ** 20,
+    });
+
+    const slot: u16 = 0;
+    const peer = &el.peers[slot];
+    peer.* = Peer{
+        .fd = -1,
+        .state = .active_recv_body,
+        .mode = .outbound,
+        .torrent_id = torrent_id,
+    };
+    el.peer_count = 1;
+    el.markActivePeer(slot);
+    el.attachPeerToTorrent(torrent_id, slot);
+
+    peer.small_body_buf[0] = 5;
+    peer.small_body_buf[1] = 0x80;
+    peer.body_buf = peer.small_body_buf[0..2];
+    peer.body_expected = 2;
+    peer.body_offset = 0;
+
+    handleRecvResult(&el, slot, 2);
+
+    try std.testing.expectEqual(PeerState.free, el.peers[slot].state);
 }
 
 test "handleDiskWrite releases piece when any submit failed" {

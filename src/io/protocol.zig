@@ -34,6 +34,10 @@ pub fn processMessage(self: anytype, slot: u16) void {
 
     const id = body[0];
     const payload = body[1..];
+    if (!pw.validatePayloadLength(id, payload.len)) {
+        self.removePeer(slot);
+        return;
+    }
 
     switch (id) {
         0 => { // choke
@@ -1337,6 +1341,28 @@ test "have with out-of-range piece index does not crash" {
 
     peer.availability.?.deinit(testing.allocator);
     peer.availability = null;
+}
+
+test "malformed have payload removes peer" {
+    var el = try EventLoop.initBare(testing.allocator, 0);
+    defer el.deinit();
+    try setupTestTorrent(&el, null);
+    const slot = try setupTestPeer(&el);
+    const peer = &el.peers[slot];
+
+    el.peer_count = 1;
+    el.markActivePeer(slot);
+    el.attachPeerToTorrent(peer.torrent_id, slot);
+
+    peer.small_body_buf[0] = 4;
+    peer.small_body_buf[1] = 0;
+    peer.small_body_buf[2] = 0;
+    peer.small_body_buf[3] = 0;
+    peer.body_buf = peer.small_body_buf[0..4];
+
+    processMessage(&el, slot);
+
+    try testing.expectEqual(.free, el.peers[slot].state);
 }
 
 test "have creates availability bitfield lazily when session exists" {

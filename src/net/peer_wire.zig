@@ -21,6 +21,7 @@ pub fn recvExact(fd: posix.fd_t, buf: []u8) !void {
 
 pub const protocol_string = "BitTorrent protocol";
 pub const protocol_length: u8 = protocol_string.len;
+pub const handshake_length: usize = 68;
 pub const max_message_length: u32 = 1 * 1024 * 1024;
 
 /// BEP 10 extension message ID.
@@ -93,6 +94,29 @@ pub fn serializeHandshakeV2(info_hash: [20]u8, peer_id: [20]u8, is_v2: bool) [68
     return buffer;
 }
 
+pub fn validateHandshakePrefix(buffer: []const u8) !void {
+    if (buffer.len < 1 + protocol_string.len) {
+        return error.InvalidHandshakeProtocol;
+    }
+    if (buffer[0] != protocol_length) {
+        return error.InvalidHandshakeProtocol;
+    }
+    if (!std.mem.eql(u8, buffer[1 .. 1 + protocol_string.len], protocol_string)) {
+        return error.InvalidHandshakeProtocol;
+    }
+}
+
+pub fn validatePayloadLength(id: u8, payload_length: usize) bool {
+    return switch (id) {
+        0, 1, 2, 3 => payload_length == 0,
+        4 => payload_length == 4,
+        6, 8 => payload_length == 12,
+        7 => payload_length >= 8,
+        9 => payload_length == 2,
+        else => true,
+    };
+}
+
 pub fn writeHandshake(
     fd: posix.fd_t,
     info_hash: [20]u8,
@@ -103,25 +127,17 @@ pub fn writeHandshake(
 }
 
 pub fn readHandshake(fd: posix.fd_t) !Handshake {
-    var length_buffer: [1]u8 = undefined;
-    try recvExact(fd, &length_buffer);
-    if (length_buffer[0] != protocol_length) {
-        return error.InvalidHandshakeProtocol;
-    }
-
-    var buffer: [67]u8 = undefined;
-    try recvExact(fd, &buffer);
-
-    if (!std.mem.eql(u8, buffer[0..protocol_string.len], protocol_string)) {
-        return error.InvalidHandshakeProtocol;
-    }
+    var buffer: [handshake_length]u8 = undefined;
+    try recvExact(fd, buffer[0..1]);
+    try recvExact(fd, buffer[1..]);
+    try validateHandshakePrefix(&buffer);
 
     var reserved: [8]u8 = undefined;
     var info_hash: [20]u8 = undefined;
     var peer_id: [20]u8 = undefined;
-    @memcpy(reserved[0..], buffer[19..27]);
-    @memcpy(info_hash[0..], buffer[27..47]);
-    @memcpy(peer_id[0..], buffer[47..67]);
+    @memcpy(reserved[0..], buffer[20..28]);
+    @memcpy(info_hash[0..], buffer[28..48]);
+    @memcpy(peer_id[0..], buffer[48..68]);
 
     return .{
         .reserved = reserved,
@@ -370,6 +386,36 @@ test "handshake serialization roundtrip" {
     try std.testing.expectEqualSlices(u8, &peer_id, buf[48..68]);
     // total length
     try std.testing.expectEqual(@as(usize, 68), buf.len);
+}
+
+test "handshake prefix validation rejects wrong length byte" {
+    var buf = serializeHandshake([_]u8{0xAA} ** 20, [_]u8{0xBB} ** 20);
+    buf[0] = protocol_length + 1;
+
+    try std.testing.expectError(error.InvalidHandshakeProtocol, validateHandshakePrefix(&buf));
+}
+
+test "handshake prefix validation rejects wrong protocol string" {
+    var buf = serializeHandshake([_]u8{0xAA} ** 20, [_]u8{0xBB} ** 20);
+    buf[1] = 'X';
+
+    try std.testing.expectError(error.InvalidHandshakeProtocol, validateHandshakePrefix(&buf));
+}
+
+test "peer wire payload length validation rejects malformed fixed-size messages" {
+    try std.testing.expect(validatePayloadLength(0, 0));
+    try std.testing.expect(!validatePayloadLength(0, 1));
+    try std.testing.expect(validatePayloadLength(4, 4));
+    try std.testing.expect(!validatePayloadLength(4, 3));
+    try std.testing.expect(validatePayloadLength(6, 12));
+    try std.testing.expect(!validatePayloadLength(6, 11));
+    try std.testing.expect(validatePayloadLength(8, 12));
+    try std.testing.expect(!validatePayloadLength(8, 13));
+    try std.testing.expect(validatePayloadLength(9, 2));
+    try std.testing.expect(!validatePayloadLength(9, 0));
+    try std.testing.expect(validatePayloadLength(7, 8));
+    try std.testing.expect(!validatePayloadLength(7, 7));
+    try std.testing.expect(validatePayloadLength(255, 99));
 }
 
 test "handshake preserves distinct info_hash and peer_id" {
