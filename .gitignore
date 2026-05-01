@@ -10,4 +10,5 @@
 *.deb
 .claude/worktrees/
 .claude/ralph-loop.local.md
+.claude/*.lock
 .codex/worktrees/
