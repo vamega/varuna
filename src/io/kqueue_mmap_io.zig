@@ -344,6 +344,10 @@ pub const KqueueMmapIO = struct {
             .fsync => |op| try self.fsync(op, c, ud, cb),
             .fallocate => |op| try self.fallocate(op, c, ud, cb),
             .truncate => |op| try self.truncate(op, c, ud, cb),
+            .openat => |op| try self.openat(op, c, ud, cb),
+            .mkdirat => |op| try self.mkdirat(op, c, ud, cb),
+            .renameat => |op| try self.renameat(op, c, ud, cb),
+            .unlinkat => |op| try self.unlinkat(op, c, ud, cb),
             .bind => |op| try self.bind(op, c, ud, cb),
             .listen => |op| try self.listen(op, c, ud, cb),
             .setsockopt => |op| try self.setsockopt(op, c, ud, cb),
@@ -651,6 +655,44 @@ pub const KqueueMmapIO = struct {
             .{ .setsockopt = {} }
         else |err|
             .{ .setsockopt = err };
+        self.pushCompleted(c, result);
+    }
+
+    pub fn openat(self: *KqueueMmapIO, op: ifc.OpenAtOp, c: *Completion, ud: ?*anyopaque, cb: Callback) !void {
+        try self.armCompletion(c, .{ .openat = op }, ud, cb);
+        const result: Result = if (posix.openat(op.dir_fd, op.path, op.flags, op.mode)) |fd|
+            .{ .openat = fd }
+        else |err|
+            .{ .openat = err };
+        self.pushCompleted(c, result);
+    }
+
+    pub fn mkdirat(self: *KqueueMmapIO, op: ifc.MkdirAtOp, c: *Completion, ud: ?*anyopaque, cb: Callback) !void {
+        try self.armCompletion(c, .{ .mkdirat = op }, ud, cb);
+        const result: Result = if (posix.mkdirat(op.dir_fd, op.path, op.mode)) |_|
+            .{ .mkdirat = {} }
+        else |err|
+            .{ .mkdirat = err };
+        self.pushCompleted(c, result);
+    }
+
+    pub fn renameat(self: *KqueueMmapIO, op: ifc.RenameAtOp, c: *Completion, ud: ?*anyopaque, cb: Callback) !void {
+        try self.armCompletion(c, .{ .renameat = op }, ud, cb);
+        const result: Result = if (op.flags != 0)
+            .{ .renameat = error.OperationNotSupported }
+        else if (posix.renameat(op.old_dir_fd, op.old_path, op.new_dir_fd, op.new_path)) |_|
+            .{ .renameat = {} }
+        else |err|
+            .{ .renameat = err };
+        self.pushCompleted(c, result);
+    }
+
+    pub fn unlinkat(self: *KqueueMmapIO, op: ifc.UnlinkAtOp, c: *Completion, ud: ?*anyopaque, cb: Callback) !void {
+        try self.armCompletion(c, .{ .unlinkat = op }, ud, cb);
+        const result: Result = if (posix.unlinkat(op.dir_fd, op.path, op.flags)) |_|
+            .{ .unlinkat = {} }
+        else |err|
+            .{ .unlinkat = err };
         self.pushCompleted(c, result);
     }
 
@@ -1013,6 +1055,10 @@ fn makeCancelledResult(op: Operation) Result {
         .fsync => .{ .fsync = error.OperationCanceled },
         .fallocate => .{ .fallocate = error.OperationCanceled },
         .truncate => .{ .truncate = error.OperationCanceled },
+        .openat => .{ .openat = error.OperationCanceled },
+        .mkdirat => .{ .mkdirat = error.OperationCanceled },
+        .renameat => .{ .renameat = error.OperationCanceled },
+        .unlinkat => .{ .unlinkat = error.OperationCanceled },
         .bind => .{ .bind = error.OperationCanceled },
         .listen => .{ .listen = error.OperationCanceled },
         .setsockopt => .{ .setsockopt = error.OperationCanceled },

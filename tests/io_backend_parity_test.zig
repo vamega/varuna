@@ -29,12 +29,13 @@ const CallbackAction = ifc.CallbackAction;
 fn requireBackendMethods(comptime IO: type) void {
     comptime {
         const required = [_][]const u8{
-            "init",    "deinit",  "tick",
-            "recv",    "send",    "recvmsg",
-            "sendmsg", "read",    "write",
-            "fsync",   "socket",  "connect",
-            "accept",  "timeout", "poll",
-            "cancel",
+            "init",     "deinit",   "tick",
+            "recv",     "send",     "recvmsg",
+            "sendmsg",  "read",     "write",
+            "fsync",    "openat",   "mkdirat",
+            "renameat", "unlinkat", "socket",
+            "connect",  "accept",   "timeout",
+            "poll",     "cancel",
         };
         for (required) |name| {
             if (!@hasDecl(IO, name)) {
@@ -104,6 +105,144 @@ fn runCancelOfNothing(
     }
 }
 
+fn runDirectoryOpsRoundTrip(
+    comptime IO: type,
+    io: *IO,
+    root_fd: posix.fd_t,
+    drain_fn: fn (io: *IO) anyerror!void,
+) !void {
+    {
+        var c = Completion{};
+        var counter = Counter{};
+        try io.mkdirat(.{ .dir_fd = root_fd, .path = "stage", .mode = 0o755 }, &c, &counter, counterCallback);
+        if (counter.fires == 0) try drain_fn(io);
+        try testing.expectEqual(@as(u32, 1), counter.fires);
+        switch (counter.last_result.?) {
+            .mkdirat => |r| try r,
+            else => try testing.expect(false),
+        }
+    }
+
+    {
+        var c = Completion{};
+        var counter = Counter{};
+        try io.openat(
+            .{
+                .dir_fd = root_fd,
+                .path = "stage/file.tmp",
+                .flags = .{ .ACCMODE = .WRONLY, .CREAT = true, .TRUNC = true },
+                .mode = 0o644,
+            },
+            &c,
+            &counter,
+            counterCallback,
+        );
+        if (counter.fires == 0) try drain_fn(io);
+        try testing.expectEqual(@as(u32, 1), counter.fires);
+        const fd = switch (counter.last_result.?) {
+            .openat => |r| try r,
+            else => return error.UnexpectedResult,
+        };
+        io.closeSocket(fd);
+    }
+
+    {
+        var c = Completion{};
+        var counter = Counter{};
+        try io.renameat(
+            .{
+                .old_dir_fd = root_fd,
+                .old_path = "stage/file.tmp",
+                .new_dir_fd = root_fd,
+                .new_path = "stage/file.dat",
+            },
+            &c,
+            &counter,
+            counterCallback,
+        );
+        if (counter.fires == 0) try drain_fn(io);
+        try testing.expectEqual(@as(u32, 1), counter.fires);
+        switch (counter.last_result.?) {
+            .renameat => |r| try r,
+            else => try testing.expect(false),
+        }
+    }
+
+    {
+        var c = Completion{};
+        var counter = Counter{};
+        try io.openat(
+            .{
+                .dir_fd = root_fd,
+                .path = "stage/file.dat",
+                .flags = .{ .ACCMODE = .RDONLY },
+                .mode = 0,
+            },
+            &c,
+            &counter,
+            counterCallback,
+        );
+        if (counter.fires == 0) try drain_fn(io);
+        try testing.expectEqual(@as(u32, 1), counter.fires);
+        const fd = switch (counter.last_result.?) {
+            .openat => |r| try r,
+            else => return error.UnexpectedResult,
+        };
+        io.closeSocket(fd);
+    }
+
+    {
+        var c = Completion{};
+        var counter = Counter{};
+        try io.unlinkat(.{ .dir_fd = root_fd, .path = "stage/file.dat" }, &c, &counter, counterCallback);
+        if (counter.fires == 0) try drain_fn(io);
+        try testing.expectEqual(@as(u32, 1), counter.fires);
+        switch (counter.last_result.?) {
+            .unlinkat => |r| try r,
+            else => try testing.expect(false),
+        }
+    }
+
+    {
+        var c = Completion{};
+        var counter = Counter{};
+        try io.openat(
+            .{
+                .dir_fd = root_fd,
+                .path = "stage/file.dat",
+                .flags = .{ .ACCMODE = .RDONLY },
+                .mode = 0,
+            },
+            &c,
+            &counter,
+            counterCallback,
+        );
+        if (counter.fires == 0) try drain_fn(io);
+        try testing.expectEqual(@as(u32, 1), counter.fires);
+        switch (counter.last_result.?) {
+            .openat => |r| try testing.expectError(error.FileNotFound, r),
+            else => try testing.expect(false),
+        }
+    }
+
+    {
+        var c = Completion{};
+        var counter = Counter{};
+        try io.unlinkat(
+            .{ .dir_fd = root_fd, .path = "stage", .flags = posix.AT.REMOVEDIR },
+            &c,
+            &counter,
+            counterCallback,
+        );
+        if (counter.fires == 0) try drain_fn(io);
+        try testing.expectEqual(@as(u32, 1), counter.fires);
+        switch (counter.last_result.?) {
+            .unlinkat => |r| try r,
+            else => try testing.expect(false),
+        }
+    }
+}
+
 // ── Drain helpers per backend ─────────────────────────────
 
 fn drainReal(io: *RealIO) !void {
@@ -143,5 +282,22 @@ test "RealIO and SimIO both report OperationNotFound for stray cancels" {
         var io = RealIO.init(.{ .entries = 16 }) catch return;
         defer io.deinit();
         try runCancelOfNothing(RealIO, &io, drainReal);
+    }
+}
+
+test "RealIO and SimIO both perform fd-relative directory ops" {
+    {
+        var io = try SimIO.init(testing.allocator, .{});
+        defer io.deinit();
+        try runDirectoryOpsRoundTrip(SimIO, &io, posix.AT.FDCWD, drainSim);
+    }
+
+    {
+        var tmp = testing.tmpDir(.{});
+        defer tmp.cleanup();
+
+        var io = RealIO.init(.{ .entries = 16 }) catch return;
+        defer io.deinit();
+        try runDirectoryOpsRoundTrip(RealIO, &io, tmp.dir.fd, drainReal);
     }
 }

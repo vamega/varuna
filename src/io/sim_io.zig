@@ -120,6 +120,14 @@ pub const FaultConfig = struct {
     /// Probability that a copy_file_range completes with
     /// `error.InputOutput`. Used by MoveJob fault tests.
     copy_file_range_error_probability: f32 = 0.0,
+    /// Directory-op fault knobs used by future MoveJob/PieceStore.init
+    /// state-machine tests. Each successful op still mutates the virtual
+    /// filesystem deterministically; a fault returns `error.InputOutput`
+    /// and leaves state unchanged.
+    openat_error_probability: f32 = 0.0,
+    mkdirat_error_probability: f32 = 0.0,
+    renameat_error_probability: f32 = 0.0,
+    unlinkat_error_probability: f32 = 0.0,
     /// Probability that an fsync completes with `error.InputOutput`
     /// (disk failure mid-flush). Distinct from
     /// `write_error_probability` so BUGGIFY can target sync-only paths.
@@ -412,6 +420,11 @@ pub const SimFile = struct {
     }
 };
 
+const SimFsKind = enum {
+    file,
+    dir,
+};
+
 // ── SimIO ─────────────────────────────────────────────────
 
 pub const SimIO = struct {
@@ -479,6 +492,12 @@ pub const SimIO = struct {
     /// caller may free its source slice immediately after the call.
     file_state: std.AutoHashMap(posix.fd_t, SimFile),
 
+    /// Minimal virtual namespace for fd-relative directory ops. Keys are
+    /// normalized path strings owned by SimIO; fd handles opened through
+    /// `openat` store an owned copy in `fd_paths`.
+    fs_nodes: std.StringHashMapUnmanaged(SimFsKind) = .{},
+    fd_paths: std.AutoHashMap(posix.fd_t, []u8),
+
     /// FIFO of pre-prepared fds returned by future `socket()` calls.
     /// Each `socket` submission consumes one entry; if the queue is
     /// empty the op falls back to `nextSyntheticFd()`.
@@ -534,7 +553,7 @@ pub const SimIO = struct {
             head = i;
         }
 
-        return .{
+        var self = SimIO{
             .allocator = allocator,
             .rng = std.Random.DefaultPrng.init(config.seed),
             .config = config,
@@ -543,13 +562,25 @@ pub const SimIO = struct {
             .recv_queue_pool = queue_buf,
             .free_socket_head = head,
             .file_state = std.AutoHashMap(posix.fd_t, SimFile).init(allocator),
+            .fd_paths = std.AutoHashMap(posix.fd_t, []u8).init(allocator),
         };
+        errdefer self.deinit();
+
+        try self.putFsNode(".", .dir);
+        try self.putFsNode("/", .dir);
+        return self;
     }
 
     pub fn deinit(self: *SimIO) void {
         var it = self.file_state.iterator();
         while (it.next()) |entry| entry.value_ptr.deinit(self.allocator);
         self.file_state.deinit();
+        var node_it = self.fs_nodes.iterator();
+        while (node_it.next()) |entry| self.allocator.free(entry.key_ptr.*);
+        self.fs_nodes.deinit(self.allocator);
+        var fd_it = self.fd_paths.iterator();
+        while (fd_it.next()) |entry| self.allocator.free(entry.value_ptr.*);
+        self.fd_paths.deinit();
         self.prepared_socket_fds.deinit(self.allocator);
         self.allocator.free(self.pending);
         self.allocator.free(self.recv_queue_pool);
@@ -735,6 +766,10 @@ pub const SimIO = struct {
             .fsync => |op| try self.fsync(op, c, ud, cb),
             .fallocate => |op| try self.fallocate(op, c, ud, cb),
             .truncate => |op| try self.truncate(op, c, ud, cb),
+            .openat => |op| try self.openat(op, c, ud, cb),
+            .mkdirat => |op| try self.mkdirat(op, c, ud, cb),
+            .renameat => |op| try self.renameat(op, c, ud, cb),
+            .unlinkat => |op| try self.unlinkat(op, c, ud, cb),
             .splice => |op| try self.splice(op, c, ud, cb),
             .copy_file_range => |op| try self.copy_file_range(op, c, ud, cb),
             .socket => |op| try self.socket(op, c, ud, cb),
@@ -923,6 +958,56 @@ pub const SimIO = struct {
         return @as(posix.fd_t, synthetic_fd_base + offset);
     }
 
+    fn putFsNode(self: *SimIO, path: []const u8, kind: SimFsKind) !void {
+        if (self.fs_nodes.getPtr(path)) |existing| {
+            existing.* = kind;
+            return;
+        }
+        const owned = try self.allocator.dupe(u8, path);
+        errdefer self.allocator.free(owned);
+        try self.fs_nodes.put(self.allocator, owned, kind);
+    }
+
+    fn removeFsNode(self: *SimIO, path: []const u8) void {
+        if (self.fs_nodes.fetchRemove(path)) |kv| self.allocator.free(kv.key);
+    }
+
+    fn resolveAt(self: *SimIO, dir_fd: posix.fd_t, path: [:0]const u8) ![]u8 {
+        if (path.len == 0) return error.FileNotFound;
+        if (path[0] == '/') return try self.allocator.dupe(u8, path);
+
+        const base = if (dir_fd == posix.AT.FDCWD)
+            "."
+        else
+            self.fd_paths.get(dir_fd) orelse return error.BadFileDescriptor;
+
+        if (std.mem.eql(u8, base, ".")) return try self.allocator.dupe(u8, path);
+        return try std.fmt.allocPrint(self.allocator, "{s}/{s}", .{ base, path });
+    }
+
+    fn parentPath(path: []const u8) []const u8 {
+        if (std.mem.lastIndexOfScalar(u8, path, '/')) |idx| {
+            if (idx == 0) return "/";
+            return path[0..idx];
+        }
+        return ".";
+    }
+
+    fn hasDir(self: *SimIO, path: []const u8) bool {
+        return if (self.fs_nodes.get(path)) |kind| kind == .dir else false;
+    }
+
+    fn hasChild(self: *SimIO, dir_path: []const u8) bool {
+        var iter = self.fs_nodes.iterator();
+        while (iter.next()) |entry| {
+            const path = entry.key_ptr.*;
+            if (path.len <= dir_path.len) continue;
+            if (!std.mem.startsWith(u8, path, dir_path)) continue;
+            if (std.mem.eql(u8, dir_path, ".") or path[dir_path.len] == '/') return true;
+        }
+        return false;
+    }
+
     // ── Socket pool helpers ───────────────────────────────
 
     fn allocSocketSlot(self: *SimIO) !u32 {
@@ -990,6 +1075,11 @@ pub const SimIO = struct {
     /// any) is also failed — modelling the peer-reset semantics that the
     /// EventLoop cares about. Slots are not returned to the free pool.
     pub fn closeSocket(self: *SimIO, fd: posix.fd_t) void {
+        if (self.fd_paths.fetchRemove(fd)) |kv| {
+            self.allocator.free(kv.value);
+            return;
+        }
+
         const slot = self.slotForFd(fd) orelse return;
         const sock = &self.sockets[slot];
         if (sock.closed) return;
@@ -1285,6 +1375,113 @@ pub const SimIO = struct {
         return self.schedule(c, .{ .copy_file_range = op.len }, 0);
     }
 
+    pub fn openat(self: *SimIO, op: ifc.OpenAtOp, c: *Completion, ud: ?*anyopaque, cb: Callback) !void {
+        try self.armCompletion(c, .{ .openat = op }, ud, cb);
+        const r = self.rng.random();
+        if (r.float(f32) < self.config.faults.openat_error_probability) {
+            return self.schedule(c, .{ .openat = error.InputOutput }, 0);
+        }
+
+        const path = self.resolveAt(op.dir_fd, op.path) catch |err| {
+            return self.schedule(c, .{ .openat = err }, 0);
+        };
+        defer self.allocator.free(path);
+
+        const kind = self.fs_nodes.get(path);
+        if (kind == null) {
+            if (!op.flags.CREAT) return self.schedule(c, .{ .openat = error.FileNotFound }, 0);
+            if (!self.hasDir(parentPath(path))) return self.schedule(c, .{ .openat = error.FileNotFound }, 0);
+            self.putFsNode(path, .file) catch {
+                return self.schedule(c, .{ .openat = error.NoSpaceLeft }, 0);
+            };
+        } else if (op.flags.CREAT and op.flags.EXCL) {
+            return self.schedule(c, .{ .openat = error.PathAlreadyExists }, 0);
+        } else if (op.flags.DIRECTORY and kind.? != .dir) {
+            return self.schedule(c, .{ .openat = error.NotDir }, 0);
+        }
+
+        const fd = self.nextSyntheticFd();
+        const owned = self.allocator.dupe(u8, path) catch {
+            return self.schedule(c, .{ .openat = error.NoSpaceLeft }, 0);
+        };
+        self.fd_paths.put(fd, owned) catch {
+            self.allocator.free(owned);
+            return self.schedule(c, .{ .openat = error.NoSpaceLeft }, 0);
+        };
+        return self.schedule(c, .{ .openat = fd }, 0);
+    }
+
+    pub fn mkdirat(self: *SimIO, op: ifc.MkdirAtOp, c: *Completion, ud: ?*anyopaque, cb: Callback) !void {
+        try self.armCompletion(c, .{ .mkdirat = op }, ud, cb);
+        const r = self.rng.random();
+        if (r.float(f32) < self.config.faults.mkdirat_error_probability) {
+            return self.schedule(c, .{ .mkdirat = error.InputOutput }, 0);
+        }
+
+        const path = self.resolveAt(op.dir_fd, op.path) catch |err| {
+            return self.schedule(c, .{ .mkdirat = err }, 0);
+        };
+        defer self.allocator.free(path);
+        if (self.fs_nodes.contains(path)) return self.schedule(c, .{ .mkdirat = error.PathAlreadyExists }, 0);
+        if (!self.hasDir(parentPath(path))) return self.schedule(c, .{ .mkdirat = error.FileNotFound }, 0);
+        self.putFsNode(path, .dir) catch {
+            return self.schedule(c, .{ .mkdirat = error.NoSpaceLeft }, 0);
+        };
+        return self.schedule(c, .{ .mkdirat = {} }, 0);
+    }
+
+    pub fn renameat(self: *SimIO, op: ifc.RenameAtOp, c: *Completion, ud: ?*anyopaque, cb: Callback) !void {
+        try self.armCompletion(c, .{ .renameat = op }, ud, cb);
+        const r = self.rng.random();
+        if (r.float(f32) < self.config.faults.renameat_error_probability) {
+            return self.schedule(c, .{ .renameat = error.InputOutput }, 0);
+        }
+        if (op.flags != 0) return self.schedule(c, .{ .renameat = error.OperationNotSupported }, 0);
+
+        const old_path = self.resolveAt(op.old_dir_fd, op.old_path) catch |err| {
+            return self.schedule(c, .{ .renameat = err }, 0);
+        };
+        defer self.allocator.free(old_path);
+        const new_path = self.resolveAt(op.new_dir_fd, op.new_path) catch |err| {
+            return self.schedule(c, .{ .renameat = err }, 0);
+        };
+        defer self.allocator.free(new_path);
+
+        const kind = self.fs_nodes.get(old_path) orelse {
+            return self.schedule(c, .{ .renameat = error.FileNotFound }, 0);
+        };
+        if (!self.hasDir(parentPath(new_path))) return self.schedule(c, .{ .renameat = error.FileNotFound }, 0);
+
+        self.removeFsNode(old_path);
+        self.putFsNode(new_path, kind) catch {
+            return self.schedule(c, .{ .renameat = error.NoSpaceLeft }, 0);
+        };
+        return self.schedule(c, .{ .renameat = {} }, 0);
+    }
+
+    pub fn unlinkat(self: *SimIO, op: ifc.UnlinkAtOp, c: *Completion, ud: ?*anyopaque, cb: Callback) !void {
+        try self.armCompletion(c, .{ .unlinkat = op }, ud, cb);
+        const r = self.rng.random();
+        if (r.float(f32) < self.config.faults.unlinkat_error_probability) {
+            return self.schedule(c, .{ .unlinkat = error.InputOutput }, 0);
+        }
+
+        const path = self.resolveAt(op.dir_fd, op.path) catch |err| {
+            return self.schedule(c, .{ .unlinkat = err }, 0);
+        };
+        defer self.allocator.free(path);
+        const kind = self.fs_nodes.get(path) orelse {
+            return self.schedule(c, .{ .unlinkat = error.FileNotFound }, 0);
+        };
+        const remove_dir = (op.flags & posix.AT.REMOVEDIR) != 0;
+        if (remove_dir and kind != .dir) return self.schedule(c, .{ .unlinkat = error.NotDir }, 0);
+        if (!remove_dir and kind == .dir) return self.schedule(c, .{ .unlinkat = error.IsDir }, 0);
+        if (remove_dir and self.hasChild(path)) return self.schedule(c, .{ .unlinkat = error.DirNotEmpty }, 0);
+
+        self.removeFsNode(path);
+        return self.schedule(c, .{ .unlinkat = {} }, 0);
+    }
+
     pub fn socket(self: *SimIO, op: ifc.SocketOp, c: *Completion, ud: ?*anyopaque, cb: Callback) !void {
         try self.armCompletion(c, .{ .socket = op }, ud, cb);
         // Consume a pre-prepared fd if any, so tests can script which
@@ -1438,6 +1635,10 @@ fn cancelResultFor(op: Operation) Result {
         .fsync => .{ .fsync = error.OperationCanceled },
         .fallocate => .{ .fallocate = error.OperationCanceled },
         .truncate => .{ .truncate = error.OperationCanceled },
+        .openat => .{ .openat = error.OperationCanceled },
+        .mkdirat => .{ .mkdirat = error.OperationCanceled },
+        .renameat => .{ .renameat = error.OperationCanceled },
+        .unlinkat => .{ .unlinkat = error.OperationCanceled },
         .splice => .{ .splice = error.OperationCanceled },
         .copy_file_range => .{ .copy_file_range = error.OperationCanceled },
         .socket => .{ .socket = error.OperationCanceled },
@@ -1467,6 +1668,10 @@ fn buggifyResultFor(op: Operation) Result {
         .fsync => .{ .fsync = error.InputOutput },
         .fallocate => .{ .fallocate = error.NoSpaceLeft },
         .truncate => .{ .truncate = error.InputOutput },
+        .openat => .{ .openat = error.InputOutput },
+        .mkdirat => .{ .mkdirat = error.InputOutput },
+        .renameat => .{ .renameat = error.InputOutput },
+        .unlinkat => .{ .unlinkat = error.InputOutput },
         .splice => .{ .splice = error.InputOutput },
         .copy_file_range => .{ .copy_file_range = error.InputOutput },
         .socket => .{ .socket = error.ProcessFdQuotaExceeded },

@@ -179,6 +179,10 @@ pub const RealIO = struct {
             .fsync => |op| try self.fsync(op, c, userdata, callback),
             .fallocate => |op| try self.fallocate(op, c, userdata, callback),
             .truncate => |op| try self.truncate(op, c, userdata, callback),
+            .openat => |op| try self.openat(op, c, userdata, callback),
+            .mkdirat => |op| try self.mkdirat(op, c, userdata, callback),
+            .renameat => |op| try self.renameat(op, c, userdata, callback),
+            .unlinkat => |op| try self.unlinkat(op, c, userdata, callback),
             .splice => |op| try self.splice(op, c, userdata, callback),
             .copy_file_range => |op| try self.copy_file_range(op, c, userdata, callback),
             .socket => |op| try self.socket(op, c, userdata, callback),
@@ -309,6 +313,135 @@ pub const RealIO = struct {
                 .rearm => switch (c.op) {
                     .truncate => |new_op| op = new_op,
                     else => return, // callback overwrote c.op with a different op (illegal under the contract)
+                },
+            }
+        }
+    }
+
+    /// `openat` dispatches through `IORING_OP_OPENAT` when the runtime
+    /// probe reports support (kernel ≥5.6), otherwise it falls back to
+    /// `posix.openat(2)` and fires the callback inline. The async path
+    /// requires a sentinel-terminated path owned by the caller until CQE.
+    pub fn openat(self: *RealIO, op_in: ifc.OpenAtOp, c: *Completion, ud: ?*anyopaque, cb: Callback) !void {
+        if (self.feature_support.supports_openat) {
+            try self.armCompletion(c, .{ .openat = op_in }, ud, cb);
+            const stored = &c.op.openat;
+            const sqe = try self.ring.openat(@intFromPtr(c), stored.dir_fd, stored.path.ptr, stored.flags, stored.mode);
+            _ = sqe;
+            return;
+        }
+
+        var op = op_in;
+        while (true) {
+            try self.armCompletion(c, .{ .openat = op }, ud, cb);
+            const result: Result = if (posix.openat(op.dir_fd, op.path, op.flags, op.mode)) |fd|
+                .{ .openat = fd }
+            else |err|
+                .{ .openat = err };
+
+            realState(c).in_flight = false;
+            const action = cb(ud, c, result);
+            switch (action) {
+                .disarm => return,
+                .rearm => switch (c.op) {
+                    .openat => |new_op| op = new_op,
+                    else => return,
+                },
+            }
+        }
+    }
+
+    pub fn mkdirat(self: *RealIO, op_in: ifc.MkdirAtOp, c: *Completion, ud: ?*anyopaque, cb: Callback) !void {
+        if (self.feature_support.supports_mkdirat) {
+            try self.armCompletion(c, .{ .mkdirat = op_in }, ud, cb);
+            const stored = &c.op.mkdirat;
+            const sqe = try self.ring.mkdirat(@intFromPtr(c), stored.dir_fd, stored.path.ptr, stored.mode);
+            _ = sqe;
+            return;
+        }
+
+        var op = op_in;
+        while (true) {
+            try self.armCompletion(c, .{ .mkdirat = op }, ud, cb);
+            const result: Result = if (posix.mkdirat(op.dir_fd, op.path, op.mode)) |_|
+                .{ .mkdirat = {} }
+            else |err|
+                .{ .mkdirat = err };
+
+            realState(c).in_flight = false;
+            const action = cb(ud, c, result);
+            switch (action) {
+                .disarm => return,
+                .rearm => switch (c.op) {
+                    .mkdirat => |new_op| op = new_op,
+                    else => return,
+                },
+            }
+        }
+    }
+
+    pub fn renameat(self: *RealIO, op_in: ifc.RenameAtOp, c: *Completion, ud: ?*anyopaque, cb: Callback) !void {
+        if (self.feature_support.supports_renameat) {
+            try self.armCompletion(c, .{ .renameat = op_in }, ud, cb);
+            const stored = &c.op.renameat;
+            const sqe = try self.ring.renameat(
+                @intFromPtr(c),
+                stored.old_dir_fd,
+                stored.old_path.ptr,
+                stored.new_dir_fd,
+                stored.new_path.ptr,
+                stored.flags,
+            );
+            _ = sqe;
+            return;
+        }
+
+        var op = op_in;
+        while (true) {
+            try self.armCompletion(c, .{ .renameat = op }, ud, cb);
+            const result: Result = if (op.flags != 0)
+                .{ .renameat = error.OperationNotSupported }
+            else if (posix.renameat(op.old_dir_fd, op.old_path, op.new_dir_fd, op.new_path)) |_|
+                .{ .renameat = {} }
+            else |err|
+                .{ .renameat = err };
+
+            realState(c).in_flight = false;
+            const action = cb(ud, c, result);
+            switch (action) {
+                .disarm => return,
+                .rearm => switch (c.op) {
+                    .renameat => |new_op| op = new_op,
+                    else => return,
+                },
+            }
+        }
+    }
+
+    pub fn unlinkat(self: *RealIO, op_in: ifc.UnlinkAtOp, c: *Completion, ud: ?*anyopaque, cb: Callback) !void {
+        if (self.feature_support.supports_unlinkat) {
+            try self.armCompletion(c, .{ .unlinkat = op_in }, ud, cb);
+            const stored = &c.op.unlinkat;
+            const sqe = try self.ring.unlinkat(@intFromPtr(c), stored.dir_fd, stored.path.ptr, stored.flags);
+            _ = sqe;
+            return;
+        }
+
+        var op = op_in;
+        while (true) {
+            try self.armCompletion(c, .{ .unlinkat = op }, ud, cb);
+            const result: Result = if (posix.unlinkat(op.dir_fd, op.path, op.flags)) |_|
+                .{ .unlinkat = {} }
+            else |err|
+                .{ .unlinkat = err };
+
+            realState(c).in_flight = false;
+            const action = cb(ud, c, result);
+            switch (action) {
+                .disarm => return,
+                .rearm => switch (c.op) {
+                    .unlinkat => |new_op| op = new_op,
+                    else => return,
                 },
             }
         }
@@ -614,6 +747,10 @@ fn buildResult(op: Operation, cqe: linux.io_uring_cqe) Result {
         // `RealIO.truncate` and never reaches `dispatchCqe`, so this
         // branch is unreachable in that case.
         .truncate => .{ .truncate = voidOrError(cqe) },
+        .openat => .{ .openat = fdOrError(cqe) },
+        .mkdirat => .{ .mkdirat = voidOrError(cqe) },
+        .renameat => .{ .renameat = voidOrError(cqe) },
+        .unlinkat => .{ .unlinkat = voidOrError(cqe) },
         .splice => .{ .splice = countOrError(cqe) },
         // copy_file_range completes synchronously inside `RealIO.copy_file_range`
         // and never reaches `dispatchCqe`; keep a shaped variant for
@@ -696,7 +833,7 @@ fn errnoToError(e: linux.E) anyerror {
         .PIPE => error.BrokenPipe,
         .CONNABORTED => error.ConnectionAborted,
         .CANCELED => error.OperationCanceled,
-        .NOENT => error.OperationNotFound,
+        .NOENT => error.FileNotFound,
         .ALREADY => error.AlreadyCompleted,
         .ADDRINUSE => error.AddressInUse,
         .ADDRNOTAVAIL => error.AddressNotAvailable,

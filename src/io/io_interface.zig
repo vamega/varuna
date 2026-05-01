@@ -79,6 +79,10 @@ pub const Operation = union(enum) {
     fsync: FsyncOp,
     fallocate: FallocateOp,
     truncate: TruncateOp,
+    openat: OpenAtOp,
+    mkdirat: MkdirAtOp,
+    renameat: RenameAtOp,
+    unlinkat: UnlinkAtOp,
     splice: SpliceOp,
     copy_file_range: CopyFileRangeOp,
 
@@ -164,6 +168,46 @@ pub const TruncateOp = struct {
     /// per-piece writes against `offset+len` past the original EOF
     /// don't surprise the kernel.
     length: u64,
+};
+
+/// `openat(2)` — fd-relative open/create for directory-state machines.
+///
+/// `path` is sentinel-terminated because RealIO's async io_uring path
+/// passes the pointer directly to the kernel; callers must keep the
+/// buffer alive until the completion fires. String literals satisfy this
+/// naturally. Sync fallback backends pass the same slice to `posix.openat`.
+pub const OpenAtOp = struct {
+    dir_fd: posix.fd_t,
+    path: [:0]const u8,
+    flags: posix.O,
+    mode: posix.mode_t = 0,
+};
+
+/// `mkdirat(2)` — fd-relative directory creation. Same path lifetime
+/// rule as `OpenAtOp`.
+pub const MkdirAtOp = struct {
+    dir_fd: posix.fd_t,
+    path: [:0]const u8,
+    mode: posix.mode_t,
+};
+
+/// `renameat2(2)` / `renameat(2)` — fd-relative rename. `flags = 0`
+/// maps to POSIX `renameat`; nonzero flags are Linux-specific and are
+/// supported only where the backend can issue `renameat2` semantics.
+pub const RenameAtOp = struct {
+    old_dir_fd: posix.fd_t,
+    old_path: [:0]const u8,
+    new_dir_fd: posix.fd_t,
+    new_path: [:0]const u8,
+    flags: u32 = 0,
+};
+
+/// `unlinkat(2)` — fd-relative file or directory removal. Pass
+/// `posix.AT.REMOVEDIR` in `flags` for directories.
+pub const UnlinkAtOp = struct {
+    dir_fd: posix.fd_t,
+    path: [:0]const u8,
+    flags: u32 = 0,
 };
 
 /// `splice(2)` — zero-copy move of up to `len` bytes between two fds.
@@ -297,6 +341,10 @@ pub const Result = union(enum) {
     fsync: anyerror!void,
     fallocate: anyerror!void,
     truncate: anyerror!void,
+    openat: anyerror!posix.fd_t,
+    mkdirat: anyerror!void,
+    renameat: anyerror!void,
+    unlinkat: anyerror!void,
     /// Bytes spliced. `0` means EOF on the input side (mirrors `splice(2)`).
     splice: anyerror!usize,
     /// Bytes copied. `0` means EOF on the input side (mirrors `copy_file_range(2)`).
@@ -436,6 +484,10 @@ comptime {
 //   pub fn fsync    (self: *@This(), op: FsyncOp,    c: *Completion, ud: ?*anyopaque, cb: Callback) !void;
 //   pub fn fallocate(self: *@This(), op: FallocateOp, c: *Completion, ud: ?*anyopaque, cb: Callback) !void;
 //   pub fn truncate (self: *@This(), op: TruncateOp, c: *Completion, ud: ?*anyopaque, cb: Callback) !void;
+//   pub fn openat   (self: *@This(), op: OpenAtOp,   c: *Completion, ud: ?*anyopaque, cb: Callback) !void;
+//   pub fn mkdirat  (self: *@This(), op: MkdirAtOp,  c: *Completion, ud: ?*anyopaque, cb: Callback) !void;
+//   pub fn renameat (self: *@This(), op: RenameAtOp, c: *Completion, ud: ?*anyopaque, cb: Callback) !void;
+//   pub fn unlinkat (self: *@This(), op: UnlinkAtOp, c: *Completion, ud: ?*anyopaque, cb: Callback) !void;
 //   pub fn socket   (self: *@This(), op: SocketOp,   c: *Completion, ud: ?*anyopaque, cb: Callback) !void;
 //   pub fn connect  (self: *@This(), op: ConnectOp,  c: *Completion, ud: ?*anyopaque, cb: Callback) !void;
 //   pub fn accept   (self: *@This(), op: AcceptOp,   c: *Completion, ud: ?*anyopaque, cb: Callback) !void;

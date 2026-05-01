@@ -160,6 +160,14 @@ pub const FeatureSupport = struct {
     /// flag is groundwork for the eventual contract op.
     supports_setsockopt: bool = false,
 
+    /// Directory/file namespace ops used by future EL-driven MoveJob and
+    /// PieceStore.init rewrites. All four have synchronous fallbacks so
+    /// older/backported kernels remain supported.
+    supports_openat: bool = false,
+    supports_mkdirat: bool = false,
+    supports_renameat: bool = false,
+    supports_unlinkat: bool = false,
+
     /// All-false sentinel used when the probe register itself isn't
     /// supported (kernel <5.6) or fails for any other reason. Every op
     /// gated on this struct must already have a synchronous fallback.
@@ -184,6 +192,10 @@ pub fn probeFeatures(ring: *linux.IoUring) FeatureSupport {
         // URING_CMD itself is a *necessary* condition only — see
         // FeatureSupport.supports_setsockopt for the caveat.
         .supports_setsockopt = p.is_supported(.URING_CMD),
+        .supports_openat = p.is_supported(.OPENAT),
+        .supports_mkdirat = p.is_supported(.MKDIRAT),
+        .supports_renameat = p.is_supported(.RENAMEAT),
+        .supports_unlinkat = p.is_supported(.UNLINKAT),
     };
 }
 
@@ -215,9 +227,13 @@ test "probeFeatures FeatureSupport.none has every flag false" {
     try std.testing.expectEqual(false, none.supports_bind);
     try std.testing.expectEqual(false, none.supports_listen);
     try std.testing.expectEqual(false, none.supports_setsockopt);
+    try std.testing.expectEqual(false, none.supports_openat);
+    try std.testing.expectEqual(false, none.supports_mkdirat);
+    try std.testing.expectEqual(false, none.supports_renameat);
+    try std.testing.expectEqual(false, none.supports_unlinkat);
 }
 
-test "probeFeatures bind/listen/setsockopt are bool-typed and queryable" {
+test "probeFeatures optional op flags are bool-typed and queryable" {
     // Mirror of the supports_ftruncate runtime-detection test: assert
     // the new fields exist and are reachable through the same
     // `probeFeatures(&ring)` shape. Doesn't pin a specific value —
@@ -232,9 +248,17 @@ test "probeFeatures bind/listen/setsockopt are bool-typed and queryable" {
     const _b: bool = features.supports_bind;
     const _l: bool = features.supports_listen;
     const _s: bool = features.supports_setsockopt;
+    const _o: bool = features.supports_openat;
+    const _m: bool = features.supports_mkdirat;
+    const _r: bool = features.supports_renameat;
+    const _u: bool = features.supports_unlinkat;
     _ = _b;
     _ = _l;
     _ = _s;
+    _ = _o;
+    _ = _m;
+    _ = _r;
+    _ = _u;
 }
 
 test "init and deinit ring" {

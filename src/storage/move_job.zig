@@ -5,13 +5,13 @@
 //!
 //! ## Why a dedicated thread
 //!
-//! Recursive directory walks combine many "boring" syscalls (opendir,
+//! Recursive directory walks combine many metadata syscalls (opendir,
 //! readdir, openat, fstatat, mkdirat, unlinkat, rmdir) with the actual
-//! data-transfer work (`copy_file_range`). Encoding every one of those
-//! through the async IO contract would multiply both LOC and the
-//! state-machine surface area without any throughput benefit — the
-//! whole job is bounded by disk I/O, not by CPU or by the EL's
-//! scheduling latency.
+//! data-transfer work (`copy_file_range`). The IO contract now has
+//! first-class `openat` / `mkdirat` / `renameat` / `unlinkat` primitives
+//! that a future MoveJob v2 can use, but this production mover remains
+//! the thread-based v1 until getdents/statx traversal and scheduling
+//! policy are wired into an EL-owned state machine.
 //!
 //! AGENTS.md sanctions a worker-thread for "one-time file creation,
 //! directory setup" — a setLocation move is the prototypical example.
