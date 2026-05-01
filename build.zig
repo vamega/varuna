@@ -641,6 +641,32 @@ pub fn build(b: *std.Build) void {
     test_sim_io_durability_step.dependOn(&run_sim_io_durability_tests.step);
     test_step.dependOn(&run_sim_io_durability_tests.step);
 
+    // ── Resume-DB durability gate (32-seed BUGGIFY) ───────
+    //
+    // 32-seed harness for the production durability gate (commit
+    // `aee2f09 storage: gate resume completions on durability`). Drives
+    // the real `EventLoopOf(SimIO)` write → sync sweep → resume DB
+    // pipeline and fires `sim.crash()` at varied ticks to assert that
+    // every piece the DB claims complete has its bytes durable in the
+    // SimIO durability layer. Replaces the earlier deliberately-
+    // failing single-seed bug repro now that the production fix has
+    // landed; this step is part of the default `test_step` aggregate.
+    const resume_durability_buggify_tests = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("tests/resume_durability_buggify_test.zig"),
+            .target = target,
+            .optimize = optimize,
+            .imports = &varuna_import,
+        }),
+    });
+    const run_resume_durability_buggify_tests = b.addRunArtifact(resume_durability_buggify_tests);
+    const test_resume_durability_buggify_step = b.step(
+        "test-resume-durability-buggify",
+        "32-seed BUGGIFY harness for the resume-DB durability barrier",
+    );
+    test_resume_durability_buggify_step.dependOn(&run_resume_durability_buggify_tests.step);
+    test_step.dependOn(&run_resume_durability_buggify_tests.step);
+
     // ── SimPeer protocol tests ─────────────────────────────
     const sim_peer_tests = b.addTest(.{
         .root_module = b.createModule(.{
