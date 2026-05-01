@@ -789,6 +789,27 @@ pub fn build(b: *std.Build) void {
     test_transfer_step.dependOn(&run_transfer_tests.step);
     test_step.dependOn(&run_transfer_tests.step);
 
+    // ── Seed-serve-after-freePieces regression test ─────────
+    // Reproduces the freePieces() bug from commit a4579e9: a seeder that
+    // has called Session.freePieces() must still serve REQUESTs. Without
+    // the planPieceSpans helper (Defense 1), this test times out because
+    // every REQUEST gets silently dropped.
+    const seed_serve_tests = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("tests/seed_serve_after_free_pieces_test.zig"),
+            .target = target,
+            .optimize = optimize,
+            .imports = &varuna_import,
+        }),
+    });
+    const run_seed_serve_tests = b.addRunArtifact(seed_serve_tests);
+    const test_seed_serve_step = b.step(
+        "test-seed-serve-after-free",
+        "Regression: seeder serves REQUEST after Session.freePieces()",
+    );
+    test_seed_serve_step.dependOn(&run_seed_serve_tests.step);
+    test_step.dependOn(&run_seed_serve_tests.step);
+
     // ── Sim swarm tests (VirtualPeer, clock injection) ──────
     const sim_swarm_tests = b.addTest(.{
         .root_module = b.createModule(.{

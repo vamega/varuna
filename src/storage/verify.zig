@@ -44,6 +44,64 @@ pub const PiecePlan = struct {
     }
 };
 
+/// A piece's span layout WITHOUT the expected hash. Returned by
+/// `planPieceSpans` for callers that only need to read or write piece data
+/// (seed serving, post-verification disk writes, web-seed disk writes) and
+/// must remain safe after `Session.freePieces()` has discarded the v1 hash
+/// table — so this helper deliberately does not consult `pieceHash`.
+pub const PieceSpans = struct {
+    piece_index: u32,
+    piece_length: u32,
+    spans: []torrent.layout.Layout.Span,
+    spans_owned: bool = true,
+
+    pub fn deinit(self: PieceSpans, allocator: std.mem.Allocator) void {
+        if (self.spans_owned) allocator.free(self.spans);
+    }
+};
+
+/// Plan the byte spans for a piece without reading the expected hash.
+///
+/// Use this for serving piece data (seed handler), writing already-verified
+/// pieces back to disk (peer download completion, web seed completion), and
+/// any other path that does not need to compare against the expected hash.
+///
+/// CRUCIAL: this helper must work on a session whose v1 hash table has been
+/// dropped via `Session.freePieces()`. Do NOT touch `session.layout.pieceHash`
+/// here — that's `planPieceVerificationWithScratch`'s job.
+pub fn planPieceSpans(
+    allocator: std.mem.Allocator,
+    session: *const torrent.session.Session,
+    piece_index: u32,
+) !PieceSpans {
+    return planPieceSpansWithScratch(allocator, session, piece_index, &.{});
+}
+
+pub fn planPieceSpansWithScratch(
+    allocator: std.mem.Allocator,
+    session: *const torrent.session.Session,
+    piece_index: u32,
+    scratch: []torrent.layout.Layout.Span,
+) !PieceSpans {
+    const span_count = try session.layout.pieceSpanCount(piece_index);
+    const use_scratch = span_count <= scratch.len;
+    const spans = if (use_scratch)
+        scratch[0..span_count]
+    else
+        try allocator.alloc(torrent.layout.Layout.Span, span_count);
+    errdefer if (!use_scratch) allocator.free(spans);
+
+    const mapped = try session.layout.mapPiece(piece_index, spans);
+    const piece_size = try session.layout.pieceSize(piece_index);
+
+    return .{
+        .piece_index = piece_index,
+        .piece_length = piece_size,
+        .spans = mapped,
+        .spans_owned = !use_scratch,
+    };
+}
+
 pub fn planPieceVerification(
     allocator: std.mem.Allocator,
     session: *const torrent.session.Session,
@@ -58,16 +116,12 @@ pub fn planPieceVerificationWithScratch(
     piece_index: u32,
     scratch: []torrent.layout.Layout.Span,
 ) !PiecePlan {
-    const span_count = try session.layout.pieceSpanCount(piece_index);
-    const use_scratch = span_count <= scratch.len;
-    const spans = if (use_scratch)
-        scratch[0..span_count]
-    else
-        try allocator.alloc(torrent.layout.Layout.Span, span_count);
-    errdefer if (!use_scratch) allocator.free(spans);
+    // Span/size computation is shared with planPieceSpans; the difference is
+    // that this helper additionally reads the expected hash, which fails after
+    // `Session.freePieces()`. Use planPieceSpans for span-only callers.
+    const piece_spans = try planPieceSpansWithScratch(allocator, session, piece_index, scratch);
+    errdefer piece_spans.deinit(allocator);
 
-    const mapped = try session.layout.mapPiece(piece_index, spans);
-    const piece_size = try session.layout.pieceSize(piece_index);
     const version = session.layout.version;
 
     if (version == .v2) {
@@ -81,13 +135,13 @@ pub fn planPieceVerificationWithScratch(
         else
             [_]u8{0} ** 32; // sentinel: Merkle verification needed
         return .{
-            .piece_index = piece_index,
-            .piece_length = piece_size,
+            .piece_index = piece_spans.piece_index,
+            .piece_length = piece_spans.piece_length,
             .expected_hash = [_]u8{0} ** 20,
             .expected_hash_v2 = expected_v2,
             .hash_type = .sha256,
-            .spans = mapped,
-            .spans_owned = !use_scratch,
+            .spans = piece_spans.spans,
+            .spans_owned = piece_spans.spans_owned,
             .v2_pieces_root = v2_result.pieces_root,
             .v2_piece_in_file = v2_result.piece_in_file,
             .v2_file_piece_count = v2_result.file_piece_count,
@@ -100,11 +154,11 @@ pub fn planPieceVerificationWithScratch(
     @memcpy(expected_hash[0..], piece_hash);
 
     return .{
-        .piece_index = piece_index,
-        .piece_length = piece_size,
+        .piece_index = piece_spans.piece_index,
+        .piece_length = piece_spans.piece_length,
         .expected_hash = expected_hash,
-        .spans = mapped,
-        .spans_owned = !use_scratch,
+        .spans = piece_spans.spans,
+        .spans_owned = piece_spans.spans_owned,
     };
 }
 
@@ -402,6 +456,67 @@ fn recheckV2(
         .complete_pieces = complete_pieces,
         .bytes_complete = bytes_complete,
     };
+}
+
+test "planPieceSpans returns span layout without reading hashes" {
+    const input =
+        "d4:infod5:filesl" ++ "d6:lengthi3e4:pathl5:alphaee" ++ "d6:lengthi7e4:pathl4:beta5:gammaeee" ++ "4:name4:root" ++ "12:piece lengthi4e" ++ "6:pieces60:abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ12345678ee";
+
+    const loaded = try torrent.session.Session.load(std.testing.allocator, input, "/srv/torrents");
+    defer loaded.deinit(std.testing.allocator);
+
+    const ps = try planPieceSpans(std.testing.allocator, &loaded, 0);
+    defer ps.deinit(std.testing.allocator);
+
+    try std.testing.expectEqual(@as(u32, 0), ps.piece_index);
+    try std.testing.expectEqual(@as(u32, 4), ps.piece_length);
+    try std.testing.expectEqual(@as(usize, 2), ps.spans.len);
+    try std.testing.expectEqual(@as(u32, 3), ps.spans[0].length);
+    try std.testing.expectEqual(@as(u32, 1), ps.spans[1].length);
+}
+
+test "planPieceSpans works after freePieces (regression: seed-mode REQUEST)" {
+    // This is the bug Defense 1 fixes: a seeder that has called
+    // session.freePieces() must still be able to plan reads for piece-serve
+    // requests. planPieceSpans deliberately does NOT touch the v1 hash table,
+    // so it must succeed where planPieceVerificationWithScratch fails.
+    const input =
+        "d4:infod6:lengthi10e4:name8:test.bin12:piece lengthi4e6:pieces60:abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ12345678ee";
+
+    var sess = try torrent.session.Session.loadForDownload(std.testing.allocator, input, "/srv/torrents");
+    defer sess.deinit(std.testing.allocator);
+
+    sess.freePieces();
+    try std.testing.expect(!sess.hasPieceHashes());
+
+    // planPieceSpans must still succeed — that's the whole point of this helper.
+    const ps = try planPieceSpans(std.testing.allocator, &sess, 0);
+    defer ps.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(u32, 4), ps.piece_length);
+
+    // planPieceVerificationWithScratch, by contrast, must surface
+    // PiecesNotLoaded — that's the bug-detection signal we no longer want to
+    // get from seed-serve callers.
+    try std.testing.expectError(
+        error.PiecesNotLoaded,
+        planPieceVerification(std.testing.allocator, &sess, 0),
+    );
+}
+
+test "planPieceSpansWithScratch uses scratch buffer when large enough" {
+    const input =
+        "d4:infod5:filesl" ++ "d6:lengthi3e4:pathl5:alphaee" ++ "d6:lengthi7e4:pathl4:beta5:gammaeee" ++ "4:name4:root" ++ "12:piece lengthi4e" ++ "6:pieces60:abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ12345678ee";
+
+    const loaded = try torrent.session.Session.load(std.testing.allocator, input, "/srv/torrents");
+    defer loaded.deinit(std.testing.allocator);
+
+    var scratch: [4]torrent.layout.Layout.Span = undefined;
+    const ps = try planPieceSpansWithScratch(std.testing.allocator, &loaded, 0, scratch[0..]);
+    defer ps.deinit(std.testing.allocator);
+
+    // Scratch buffer was used (not heap-allocated): spans_owned is false.
+    try std.testing.expect(!ps.spans_owned);
+    try std.testing.expectEqual(@as(usize, 2), ps.spans.len);
 }
 
 test "plan verification for multi file piece" {
