@@ -15,6 +15,11 @@ DOWNLOAD_API_PORT="${DOWNLOAD_API_PORT:-8082}"
 # fixture) is hard-wired to io_uring per AGENTS.md and is not installed
 # under non-io_uring backends.
 IO_BACKEND="${IO_BACKEND:-io_uring}"
+RUNTIME_IO_BACKEND="${RUNTIME_IO_BACKEND:-$IO_BACKEND}"
+PAYLOAD_BYTES="${PAYLOAD_BYTES:-}"
+TIMEOUT="${TIMEOUT:-60}"
+SKIP_BUILD="${SKIP_BUILD:-0}"
+ZIG_BUILD_EXTRA_ARGS="${ZIG_BUILD_EXTRA_ARGS:-}"
 TRACKER_PID=""
 SEED_DAEMON_PID=""
 DOWNLOAD_DAEMON_PID=""
@@ -22,13 +27,29 @@ DOWNLOAD_DAEMON_PID=""
 VARUNA="$ROOT_DIR/zig-out/bin/varuna"
 VARUNA_TOOLS="$ROOT_DIR/zig-out/bin/varuna-tools"
 
+terminate_pid() {
+  local pid="$1"
+  if [[ -z "$pid" ]] || ! kill -0 "$pid" 2>/dev/null; then
+    return 0
+  fi
+
+  kill "$pid" 2>/dev/null || true
+  for _ in $(seq 1 50); do
+    if ! kill -0 "$pid" 2>/dev/null; then
+      wait "$pid" 2>/dev/null || true
+      return 0
+    fi
+    sleep 0.1
+  done
+
+  kill -KILL "$pid" 2>/dev/null || true
+  wait "$pid" 2>/dev/null || true
+}
+
 cleanup() {
   for pid_var in DOWNLOAD_DAEMON_PID SEED_DAEMON_PID TRACKER_PID; do
     local pid="${!pid_var}"
-    if [[ -n "$pid" ]] && kill -0 "$pid" 2>/dev/null; then
-      kill "$pid" 2>/dev/null || true
-      wait "$pid" 2>/dev/null || true
-    fi
+    terminate_pid "$pid"
   done
 }
 trap cleanup EXIT
@@ -73,7 +94,16 @@ TRACKER_LOG="$WORK_DIR/tracker.log"
 SEED_LOG="$WORK_DIR/seed.log"
 DOWNLOAD_LOG="$WORK_DIR/download.log"
 
-printf 'hello from varuna swarm demo\n' >"$PAYLOAD_PATH"
+if [[ -n "$PAYLOAD_BYTES" ]]; then
+  if ! [[ "$PAYLOAD_BYTES" =~ ^[0-9]+$ ]] || [[ "$PAYLOAD_BYTES" -le 0 ]]; then
+    echo "PAYLOAD_BYTES must be a positive integer" >&2
+    exit 1
+  fi
+  dd if=/dev/zero of="$PAYLOAD_PATH" bs=1 count=0 seek="$PAYLOAD_BYTES" status=none
+else
+  printf 'hello from varuna swarm demo\n' >"$PAYLOAD_PATH"
+fi
+PAYLOAD_SIZE="$(wc -c <"$PAYLOAD_PATH" | tr -d ' ')"
 
 # Pick the build wrapper. `mise exec` is the standard path documented in
 # AGENTS.md, but the nix-based devshell doesn't ship mise — there `zig`
@@ -83,12 +113,18 @@ if command -v mise >/dev/null 2>&1; then
 else
   ZIG_BUILD=(zig build)
 fi
+ZIG_BUILD_ARGS=()
+if [[ -n "$ZIG_BUILD_EXTRA_ARGS" ]]; then
+  read -r -a ZIG_BUILD_ARGS <<<"$ZIG_BUILD_EXTRA_ARGS"
+fi
 
-"${ZIG_BUILD[@]}" >/dev/null
+if [[ "$SKIP_BUILD" != "1" ]]; then
+  "${ZIG_BUILD[@]}" "${ZIG_BUILD_ARGS[@]}" >/dev/null
 
-if [[ "$IO_BACKEND" != "io_uring" ]]; then
-  echo "rebuilding varuna with -Dio=$IO_BACKEND (varuna-tools stays io_uring)"
-  "${ZIG_BUILD[@]}" "-Dio=$IO_BACKEND" >/dev/null
+  if [[ "$IO_BACKEND" != "io_uring" ]]; then
+    echo "rebuilding varuna with -Dio=$IO_BACKEND (varuna-tools stays io_uring)"
+    "${ZIG_BUILD[@]}" "-Dio=$IO_BACKEND" "${ZIG_BUILD_ARGS[@]}" >/dev/null
+  fi
 fi
 
 "$VARUNA_TOOLS" create \
@@ -112,6 +148,7 @@ mkdir -p "$WORK_DIR/seed-daemon" "$WORK_DIR/download-daemon"
 
 cat >"$WORK_DIR/seed-daemon/varuna.toml" <<EOF
 [daemon]
+io_backend = "$RUNTIME_IO_BACKEND"
 api_port = ${SEED_API_PORT}
 api_bind = "127.0.0.1"
 api_username = "admin"
@@ -132,6 +169,7 @@ EOF
 
 cat >"$WORK_DIR/download-daemon/varuna.toml" <<EOF
 [daemon]
+io_backend = "$RUNTIME_IO_BACKEND"
 api_port = ${DOWNLOAD_API_PORT}
 api_bind = "127.0.0.1"
 api_username = "admin"
@@ -186,8 +224,9 @@ curl -s -b "SID=${DL_SID}" \
   --data-binary @"$TORRENT_PATH" >/dev/null
 
 # ── Poll until download completes or timeout ─────────────
-TIMEOUT=60
 ELAPSED=0
+PROGRESS=""
+TRANSFER_START_NS="$(date +%s%N)"
 echo "waiting for download to complete (timeout: ${TIMEOUT}s)..."
 while [[ $ELAPSED -lt $TIMEOUT ]]; do
   PROGRESS=$(api_get_progress "$DOWNLOAD_API_PORT" "$DL_SID")
@@ -207,12 +246,17 @@ if [[ $ELAPSED -ge $TIMEOUT ]]; then
   tail -20 "$DOWNLOAD_LOG" >&2 || true
   exit 1
 fi
+TRANSFER_END_NS="$(date +%s%N)"
+TRANSFER_SECONDS="$(awk -v elapsed_ns="$((TRANSFER_END_NS - TRANSFER_START_NS))" 'BEGIN { printf "%.3f", elapsed_ns / 1000000000 }')"
 
 # ── Verify transferred data ─────────────────────────────
 cmp "$PAYLOAD_PATH" "$WORK_DIR/download-root/fixture.bin"
 
 cat <<EOF
 swarm demo succeeded
+backend: $RUNTIME_IO_BACKEND
+payload_bytes: $PAYLOAD_SIZE
+transfer_seconds: $TRANSFER_SECONDS
 work dir: $WORK_DIR
 tracker log: $TRACKER_LOG
 seed log: $SEED_LOG

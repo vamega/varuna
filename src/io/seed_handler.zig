@@ -3,6 +3,9 @@ const posix = std.posix;
 const log = std.log.scoped(.event_loop);
 const storage = @import("../storage/root.zig");
 const EventLoop = @import("event_loop.zig").EventLoop;
+const buffer_pools = @import("buffer_pools.zig");
+const PieceBuffer = buffer_pools.PieceBuffer;
+const VectoredSendState = buffer_pools.VectoredSendState;
 const LayoutSpan = @import("../torrent/layout.zig").Layout.Span;
 const utp_handler = @import("utp_handler.zig");
 const io_interface = @import("io_interface.zig");
@@ -16,7 +19,7 @@ fn nextSeedReadId(self: anytype) u32 {
     return read_id;
 }
 
-fn findPendingSeedReadIndex(items: []const EventLoop.PendingPieceRead, read_id: u32) ?usize {
+fn findPendingSeedReadIndex(items: anytype, read_id: u32) ?usize {
     for (items, 0..) |pr, i| {
         if (pr.read_id == read_id) return i;
     }
@@ -28,32 +31,39 @@ fn findPendingSeedReadIndex(items: []const EventLoop.PendingPieceRead, read_id: 
 /// `seedReadComplete`. Carries the (read_id, span_index) that the legacy
 /// path packed into `user_data.context` so the callback can find the
 /// owning PendingPieceRead.
-const SeedReadOp = struct {
-    completion: io_interface.Completion = .{},
-    el: *EventLoop,
-    read_id: u32,
-    span_index: u8,
-};
-
-fn seedReadComplete(
-    userdata: ?*anyopaque,
-    _: *io_interface.Completion,
-    result: io_interface.Result,
-) io_interface.CallbackAction {
-    const op: *SeedReadOp = @ptrCast(@alignCast(userdata.?));
-    const res: i32 = switch (result) {
-        .read => |r| if (r) |n|
-            std.math.cast(i32, n) orelse std.math.maxInt(i32)
-        else |_|
-            -1,
-        else => -1,
+fn SeedReadOpOf(comptime EL: type) type {
+    return struct {
+        completion: io_interface.Completion = .{},
+        el: *EL,
+        read_id: u32,
+        span_index: u8,
     };
-    const el = op.el;
-    const read_id = op.read_id;
-    const span_index = op.span_index;
-    el.allocator.destroy(op);
-    handleSeedReadResult(el, read_id, span_index, res);
-    return .disarm;
+}
+
+fn seedReadCompleteFor(comptime EL: type) io_interface.Callback {
+    return struct {
+        fn cb(
+            userdata: ?*anyopaque,
+            _: *io_interface.Completion,
+            result: io_interface.Result,
+        ) io_interface.CallbackAction {
+            const SeedReadOp = SeedReadOpOf(EL);
+            const op: *SeedReadOp = @ptrCast(@alignCast(userdata.?));
+            const res: i32 = switch (result) {
+                .read => |r| if (r) |n|
+                    std.math.cast(i32, n) orelse std.math.maxInt(i32)
+                else |_|
+                    -1,
+                else => -1,
+            };
+            const el = op.el;
+            const read_id = op.read_id;
+            const span_index = op.span_index;
+            el.allocator.destroy(op);
+            handleSeedReadResult(el, read_id, span_index, res);
+            return .disarm;
+        }
+    }.cb;
 }
 
 fn queuePieceBlockResponse(
@@ -62,7 +72,7 @@ fn queuePieceBlockResponse(
     piece_index: u32,
     block_offset: u32,
     block_length: u32,
-    piece_buffer: *EventLoop.PieceBuffer,
+    piece_buffer: *PieceBuffer,
 ) !void {
     const start: usize = @intCast(block_offset);
     const len: usize = @intCast(block_length);
@@ -77,7 +87,7 @@ fn queuePieceBlockResponse(
     });
 }
 
-fn deferCachedPieceBuffer(self: anytype, piece_buffer: *EventLoop.PieceBuffer) void {
+fn deferCachedPieceBuffer(self: anytype, piece_buffer: *PieceBuffer) void {
     self.deferred_piece_buffers.append(self.allocator, .{
         .piece_buffer = piece_buffer,
     }) catch {
@@ -96,7 +106,7 @@ fn releaseDeferredPieceBuffers(self: anytype) void {
 fn createPlaintextBatchSendState(
     self: anytype,
     batch: anytype,
-) !*EventLoop.VectoredSendState {
+) !*VectoredSendState {
     const state = try self.acquireVectoredSendState(batch.len);
     const headers = state.headers;
     const iovecs = state.iovecs;
@@ -264,7 +274,7 @@ pub fn servePieceRequest(self: anytype, slot: u16, payload: []const u8) void {
         }
     }
 
-    // Submit async io_uring reads for all spans (no blocking).
+    // Submit async backend reads for all spans (no blocking).
     //
     // Use planPieceSpans rather than planPieceVerificationWithScratch:
     // serving a piece doesn't need the expected hash, and seed-mode sessions
@@ -326,8 +336,10 @@ pub fn servePieceRequest(self: anytype, slot: u16, payload: []const u8) void {
 
     const pending_index = self.pending_reads.items.len - 1;
     var submitted_reads: u32 = 0;
+    const EL = @TypeOf(self.*);
+    const SeedReadOp = SeedReadOpOf(EL);
 
-    // Submit one io_uring read per span (all non-blocking) via the new
+    // Submit one backend read per span (all non-blocking) via the
     // io_interface backend. Each span's SeedReadOp lives on the heap and
     // carries (read_id, span_index) so the callback can locate the
     // owning PendingPieceRead.
@@ -337,16 +349,12 @@ pub fn servePieceRequest(self: anytype, slot: u16, payload: []const u8) void {
             log.warn("seed read op alloc for piece {d}: {s}", .{ piece_index, @errorName(err) });
             continue;
         };
-        // SeedReadOp.el is concrete `*EventLoop` (= RealIO instantiation)
-        // for legacy reasons. The seed-serving path doesn't fire under
-        // simulator_mode usage, so the runtime-type-correctness is moot;
-        // this cast keeps SimIO instantiations compiling.
-        op.* = .{ .el = @ptrCast(@alignCast(self)), .read_id = read_id, .span_index = @intCast(span_index) };
+        op.* = .{ .el = self, .read_id = read_id, .span_index = @intCast(span_index) };
         self.io.read(
             .{ .fd = tc.shared_fds[span.file_index], .buf = target, .offset = span.file_offset },
             &op.completion,
             op,
-            seedReadComplete,
+            seedReadCompleteFor(EL),
         ) catch |err| {
             log.warn("disk read submit for piece {d}: {s}", .{ piece_index, @errorName(err) });
             self.allocator.destroy(op);
@@ -518,7 +526,7 @@ pub fn flushQueuedResponses(self: anytype) void {
     releaseDeferredPieceBuffers(self);
 }
 
-pub fn sendPieceBlock(self: anytype, slot: u16, piece_index: u32, block_offset: u32, block_length: u32, piece_buffer: *EventLoop.PieceBuffer) void {
+pub fn sendPieceBlock(self: anytype, slot: u16, piece_index: u32, block_offset: u32, block_length: u32, piece_buffer: *PieceBuffer) void {
     const start: usize = @intCast(block_offset);
     const len: usize = @intCast(block_length);
     if (start + len > piece_buffer.buf.len) return;
@@ -528,7 +536,8 @@ pub fn sendPieceBlock(self: anytype, slot: u16, piece_index: u32, block_offset: 
     // Check upload rate limit
     if (self.isUploadThrottled(peer.torrent_id)) return;
 
-    const batch = [_]EventLoop.QueuedBlockResponse{.{
+    const QueuedBlockResponse = @TypeOf(self.*).QueuedBlockResponse;
+    const batch = [_]QueuedBlockResponse{.{
         .slot = slot,
         .piece_index = piece_index,
         .block_offset = block_offset,

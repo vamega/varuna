@@ -1322,6 +1322,11 @@ pub fn build(b: *std.Build) void {
     swarm_cmd.step.dependOn(b.getInstallStep());
     swarm_step.dependOn(&swarm_cmd.step);
 
+    const swarm_backends_step = b.step("test-swarm-backends", "Run end-to-end swarm transfer test across Linux IO backends");
+    const swarm_backends_cmd = b.addSystemCommand(&.{ "env", "SKIP_BUILD=1", "bash", "./scripts/backend_swarm_matrix.sh" });
+    swarm_backends_cmd.step.dependOn(b.getInstallStep());
+    swarm_backends_step.dependOn(&swarm_backends_cmd.step);
+
     // ── Benchmarks ────────────────────────────────────────
     const bench_exe = b.addExecutable(.{
         .name = "varuna-bench",

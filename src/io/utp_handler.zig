@@ -6,7 +6,6 @@ const pw = @import("../net/peer_wire.zig");
 const ext = @import("../net/extensions.zig");
 const utp_mod = @import("../net/utp.zig");
 const utp_mgr = @import("../net/utp_manager.zig");
-const EventLoop = @import("event_loop.zig").EventLoop;
 const Peer = @import("event_loop.zig").Peer;
 const protocol = @import("protocol.zig");
 const io_interface = @import("io_interface.zig");
@@ -42,24 +41,28 @@ pub fn submitUtpRecv(self: anytype) !void {
         .{ .fd = self.udp_fd, .msg = &self.utp_recv_msg },
         &self.utp_recv_completion,
         self,
-        utpRecvComplete,
+        utpRecvCompleteFor(@TypeOf(self.*)),
     );
 }
 
-fn utpRecvComplete(
-    userdata: ?*anyopaque,
-    _: *io_interface.Completion,
-    result: io_interface.Result,
-) io_interface.CallbackAction {
-    const self: *EventLoop = @ptrCast(@alignCast(userdata.?));
-    const res: i32 = switch (result) {
-        .recvmsg => |r| if (r) |n|
-            std.math.cast(i32, n) orelse std.math.maxInt(i32)
-        else |err| if (err == error.OperationCanceled) -125 else -1, // -ECANCELED
-        else => -1,
-    };
-    handleUtpRecvResult(self, res);
-    return .disarm; // re-armed by handleUtpRecvResult via submitUtpRecv
+fn utpRecvCompleteFor(comptime EL: type) io_interface.Callback {
+    return struct {
+        fn cb(
+            userdata: ?*anyopaque,
+            _: *io_interface.Completion,
+            result: io_interface.Result,
+        ) io_interface.CallbackAction {
+            const self: *EL = @ptrCast(@alignCast(userdata.?));
+            const res: i32 = switch (result) {
+                .recvmsg => |r| if (r) |n|
+                    std.math.cast(i32, n) orelse std.math.maxInt(i32)
+                else |err| if (err == error.OperationCanceled) -125 else -1, // -ECANCELED
+                else => -1,
+            };
+            handleUtpRecvResult(self, res);
+            return .disarm; // re-armed by handleUtpRecvResult via submitUtpRecv
+        }
+    }.cb;
 }
 
 /// Submit a SENDMSG SQE to send a uTP packet over UDP.
@@ -97,31 +100,35 @@ pub fn submitUtpSend(self: anytype, data: []const u8, remote: std.net.Address) !
         .{ .fd = self.udp_fd, .msg = &self.utp_send_msg },
         &self.utp_send_completion,
         self,
-        utpSendComplete,
+        utpSendCompleteFor(@TypeOf(self.*)),
     );
     self.utp_send_pending = true;
 }
 
-fn utpSendComplete(
-    userdata: ?*anyopaque,
-    _: *io_interface.Completion,
-    result: io_interface.Result,
-) io_interface.CallbackAction {
-    const self: *EventLoop = @ptrCast(@alignCast(userdata.?));
-    const res: i32 = switch (result) {
-        .sendmsg => |r| if (r) |n|
-            std.math.cast(i32, n) orelse std.math.maxInt(i32)
-        else |_|
-            -1,
-        else => -1,
-    };
-    handleUtpSendResult(self, res);
-    return .disarm;
+fn utpSendCompleteFor(comptime EL: type) io_interface.Callback {
+    return struct {
+        fn cb(
+            userdata: ?*anyopaque,
+            _: *io_interface.Completion,
+            result: io_interface.Result,
+        ) io_interface.CallbackAction {
+            const self: *EL = @ptrCast(@alignCast(userdata.?));
+            const res: i32 = switch (result) {
+                .sendmsg => |r| if (r) |n|
+                    std.math.cast(i32, n) orelse std.math.maxInt(i32)
+                else |_|
+                    -1,
+                else => -1,
+            };
+            handleUtpSendResult(self, res);
+            return .disarm;
+        }
+    }.cb;
 }
 
 /// Queue a uTP packet for sending. If no send is in flight, submit immediately.
 pub fn utpSendPacket(self: anytype, data: []const u8, remote: std.net.Address) void {
-    const UtpQueuedPacket = EventLoop.UtpQueuedPacket;
+    const UtpQueuedPacket = @TypeOf(self.*).UtpQueuedPacket;
     if (self.utp_send_pending) {
         // Queue for later
         var pkt = UtpQueuedPacket{
