@@ -1011,7 +1011,13 @@ fn handleDiskWriteResult(self: anytype, write_id: u32, res: i32) void {
                             // duplicate completions (endgame races) wrote the
                             // same data so don't add new dirty state.
                             if (first_completion) {
-                                tc.dirty_writes_since_sync +|= 1;
+                                self.markPieceAwaitingDurability(pending_w.torrent_id, piece_index) catch |err| {
+                                    log.warn("piece {d} torrent {d}: durability tracking failed: {s}", .{
+                                        piece_index,
+                                        pending_w.torrent_id,
+                                        @errorName(err),
+                                    });
+                                };
                                 // Phase 1 of the piece-hash lifecycle: free the
                                 // SHA-1 hash now that the piece is verified-and-
                                 // persisted. Skip duplicate completions (endgame

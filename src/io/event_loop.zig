@@ -767,6 +767,8 @@ pub fn EventLoopOf(comptime IO: type) type {
                         wsm.deinit();
                         self.allocator.destroy(wsm);
                     }
+                    tc.pending_resume_durability.deinit(self.allocator);
+                    tc.durable_resume_pieces.deinit(self.allocator);
                     tc.peer_slots.deinit(self.allocator);
                 }
             }
@@ -1007,6 +1009,10 @@ pub fn EventLoopOf(comptime IO: type) type {
                     self.allocator.destroy(lh);
                     tc.leaf_hashes = null;
                 }
+                tc.pending_resume_durability.deinit(self.allocator);
+                tc.pending_resume_durability = std.ArrayList(u32).empty;
+                tc.durable_resume_pieces.deinit(self.allocator);
+                tc.durable_resume_pieces = std.ArrayList(u32).empty;
                 self.unregisterTorrentHashes(tc.info_hash, tc.info_hash_v2);
             }
             self.torrents.items[torrent_id] = null;
@@ -2006,6 +2012,9 @@ pub fn EventLoopOf(comptime IO: type) type {
             /// the fsync sweep are still un-fsync'd and should remain
             /// dirty for the next sync sweep to flush.
             dirty_snapshot: u32,
+            /// Number of pending resume-completion pieces covered by this
+            /// sweep. Pieces appended after submission remain pending.
+            pending_resume_snapshot_len: usize,
             /// First fsync error seen across the sweep, surfaced via
             /// log only — the daemon has no good recovery path beyond
             /// "try again next sync interval".
@@ -2066,6 +2075,7 @@ pub fn EventLoopOf(comptime IO: type) type {
                 .torrent_id = torrent_id,
                 .pending = open_count,
                 .dirty_snapshot = tc.dirty_writes_since_sync,
+                .pending_resume_snapshot_len = tc.pending_resume_durability.items.len,
                 .completions = completions,
             };
             tc.sync_in_flight = true;
@@ -2122,6 +2132,32 @@ pub fn EventLoopOf(comptime IO: type) type {
                 if (ctx.el.getTorrentContext(ctx.torrent_id)) |tc| {
                     tc.sync_in_flight = false;
                     if (ctx.first_error == null) {
+                        if (ctx.pending_resume_snapshot_len > 0) {
+                            const ready_count = @min(
+                                ctx.pending_resume_snapshot_len,
+                                tc.pending_resume_durability.items.len,
+                            );
+                            const ready = tc.pending_resume_durability.items[0..ready_count];
+                            tc.durable_resume_pieces.appendSlice(ctx.el.allocator, ready) catch |err| {
+                                ctx.first_error = err;
+                                log.warn("torrent {d} durable resume queue append: {s}", .{
+                                    ctx.torrent_id,
+                                    @errorName(err),
+                                });
+                            };
+                            if (ctx.first_error == null) {
+                                std.mem.copyForwards(
+                                    u32,
+                                    tc.pending_resume_durability.items[0 .. tc.pending_resume_durability.items.len - ready_count],
+                                    tc.pending_resume_durability.items[ready_count..],
+                                );
+                                tc.pending_resume_durability.shrinkRetainingCapacity(
+                                    tc.pending_resume_durability.items.len - ready_count,
+                                );
+                            }
+                        }
+                    }
+                    if (ctx.first_error == null) {
                         // Saturating subtract: any writes that completed
                         // during the sweep stay dirty for the next pass.
                         tc.dirty_writes_since_sync -|= ctx.dirty_snapshot;
@@ -2133,6 +2169,37 @@ pub fn EventLoopOf(comptime IO: type) type {
                 ctx.el.allocator.destroy(ctx);
             }
             return .disarm;
+        }
+
+        pub fn markPieceAwaitingDurability(
+            self: *Self,
+            torrent_id: TorrentId,
+            piece_index: u32,
+        ) !void {
+            const tc = self.getTorrentContext(torrent_id) orelse return error.TorrentNotFound;
+            tc.dirty_writes_since_sync +|= 1;
+            try tc.pending_resume_durability.append(self.allocator, piece_index);
+        }
+
+        pub fn markPieceDurableForResume(
+            self: *Self,
+            torrent_id: TorrentId,
+            piece_index: u32,
+        ) !void {
+            const tc = self.getTorrentContext(torrent_id) orelse return error.TorrentNotFound;
+            try tc.durable_resume_pieces.append(self.allocator, piece_index);
+        }
+
+        pub fn drainDurableResumePieces(
+            self: *Self,
+            torrent_id: TorrentId,
+            allocator: std.mem.Allocator,
+            out: *std.ArrayList(u32),
+        ) !void {
+            const tc = self.getTorrentContext(torrent_id) orelse return error.TorrentNotFound;
+            if (tc.durable_resume_pieces.items.len == 0) return;
+            try out.appendSlice(allocator, tc.durable_resume_pieces.items);
+            tc.durable_resume_pieces.clearRetainingCapacity();
         }
 
         /// Schedule the periodic torrent-sync sweep. Self-rescheduling:

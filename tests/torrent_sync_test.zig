@@ -193,6 +193,78 @@ test "submitTorrentSync: writes during sweep stay dirty for next pass" {
     try std.testing.expectEqual(@as(u32, 2), tc.dirty_writes_since_sync);
 }
 
+test "submitTorrentSync: resume completion rows wait for successful durability barrier" {
+    const allocator = std.testing.allocator;
+
+    var el = try buildEventLoop(allocator);
+    defer el.deinit();
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const target_root = try tmp.dir.realpathAlloc(allocator, ".");
+    defer allocator.free(target_root);
+
+    const session = try Session.load(allocator, single_piece_torrent, target_root);
+    defer session.deinit(allocator);
+
+    var resume_pieces = try Bitfield.init(allocator, session.pieceCount());
+    defer resume_pieces.deinit(allocator);
+
+    var pt = try PieceTracker.init(
+        allocator,
+        session.pieceCount(),
+        session.layout.piece_length,
+        session.totalSize(),
+        &resume_pieces,
+        0,
+    );
+    defer pt.deinit(allocator);
+
+    const fds = [_]posix.fd_t{42};
+    const tid = try registerTorrent(&el, &session, &pt, &fds);
+
+    try el.markPieceAwaitingDurability(tid, 0);
+    try el.markPieceAwaitingDurability(tid, 1);
+
+    var durable = std.ArrayList(u32).empty;
+    defer durable.deinit(allocator);
+
+    try el.drainDurableResumePieces(tid, allocator, &durable);
+    try std.testing.expectEqual(@as(usize, 0), durable.items.len);
+
+    el.submitTorrentSync(tid, false);
+    try std.testing.expect(el.getTorrentContext(tid).?.sync_in_flight);
+
+    // This completion lands after the sweep was submitted. It must stay
+    // dirty and must not be exposed to resume persistence with the first
+    // barrier's pieces.
+    try el.markPieceAwaitingDurability(tid, 2);
+
+    var ticks: u32 = 0;
+    while (ticks < 64 and el.getTorrentContext(tid).?.sync_in_flight) : (ticks += 1) {
+        el.io.tick(1) catch {};
+    }
+
+    try std.testing.expectEqual(@as(u32, 1), el.getTorrentContext(tid).?.dirty_writes_since_sync);
+
+    try el.drainDurableResumePieces(tid, allocator, &durable);
+    try std.testing.expectEqualSlices(u32, &[_]u32{ 0, 1 }, durable.items);
+
+    durable.clearRetainingCapacity();
+    try el.drainDurableResumePieces(tid, allocator, &durable);
+    try std.testing.expectEqual(@as(usize, 0), durable.items.len);
+
+    el.submitTorrentSync(tid, false);
+    ticks = 0;
+    while (ticks < 64 and el.getTorrentContext(tid).?.sync_in_flight) : (ticks += 1) {
+        el.io.tick(1) catch {};
+    }
+
+    try std.testing.expectEqual(@as(u32, 0), el.getTorrentContext(tid).?.dirty_writes_since_sync);
+    try el.drainDurableResumePieces(tid, allocator, &durable);
+    try std.testing.expectEqualSlices(u32, &[_]u32{2}, durable.items);
+}
+
 test "submitTorrentSync: idempotent when sweep already in flight" {
     const allocator = std.testing.allocator;
 

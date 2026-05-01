@@ -2397,12 +2397,31 @@ pub const TorrentSession = struct {
 
     // ── Resume persistence helpers ────────────────────────
 
-    /// Scan piece_tracker for newly completed pieces since last check
-    /// and queue them in the resume writer. Safe to call from any thread
-    /// (ResumeWriter.recordPiece is mutex-protected).
+    /// Queue newly completed pieces in the resume writer. For live
+    /// event-loop torrents, only pieces that crossed the per-torrent
+    /// durability barrier are eligible; the fallback scan is for
+    /// non-attached sessions that do not have async write state.
     pub fn persistNewCompletions(self: *TorrentSession) void {
         const rw = &(self.resume_writer orelse return);
         const pt = &(self.piece_tracker orelse return);
+
+        if (self.shared_event_loop) |sel| {
+            if (self.torrent_id_in_shared) |tid| {
+                var durable_pieces = std.ArrayList(u32).empty;
+                defer durable_pieces.deinit(self.allocator);
+
+                sel.drainDurableResumePieces(tid, self.allocator, &durable_pieces) catch return;
+                if (durable_pieces.items.len == 0) return;
+
+                for (durable_pieces.items) |piece_index| {
+                    rw.recordPiece(piece_index) catch {};
+                }
+                const added = std.math.cast(u32, durable_pieces.items.len) orelse std.math.maxInt(u32);
+                self.resume_last_count +|= added;
+                return;
+            }
+        }
+
         const current_count = pt.completedCount();
         if (current_count == self.resume_last_count) return;
 

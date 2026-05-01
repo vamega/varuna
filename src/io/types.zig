@@ -242,6 +242,12 @@ pub const TorrentContext = struct {
     // Mutated only on the event-loop thread (write completions and
     // sync submission) so a plain u32 is sufficient — no atomics.
     dirty_writes_since_sync: u32 = 0,
+    /// Piece completions whose writes have reached write CQEs but have
+    /// not yet been covered by a successful per-torrent fsync sweep.
+    pending_resume_durability: std.ArrayList(u32) = std.ArrayList(u32).empty,
+    /// Piece completions covered by a successful fsync sweep and ready
+    /// for the session's background resume writer to queue to SQLite.
+    durable_resume_pieces: std.ArrayList(u32) = std.ArrayList(u32).empty,
     /// Set while a `submitTorrentSync` is in flight against this
     /// torrent so the periodic timer / completion hook don't pile
     /// duplicate fsync sweeps on top of one another.
