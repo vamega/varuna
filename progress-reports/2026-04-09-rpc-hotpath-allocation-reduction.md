@@ -15,7 +15,7 @@ Removed the extra body duplication from `/api/v2/sync/maindata`.
 ## Remaining issues / follow-up
 
 - `/sync/torrentPeers` now has its own snapshot state, but the rest of the large RPC list endpoints still build temporary object graphs and strings on the request allocator.
-- `src/io/http.zig` was not changed in this pass; its daemon/tooling boundary remains as-is.
+- The HTTP client module was not changed in this pass; its daemon/tooling boundary remained as-is.
 
 ## Code references
 

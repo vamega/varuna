@@ -1,11 +1,11 @@
-# Generic HttpExecutor + Blocking HttpClient Retirement
+# Generic HttpExecutor + Synchronous HTTP Retirement
 
 **Date:** 2026-04-16
 
 ## What Changed
 
 Extracted a generic non-blocking io_uring HTTP client from the TrackerExecutor
-and retired the blocking `io/http.zig` HttpClient from all daemon code paths.
+and retired the former synchronous HTTP client from all daemon code paths.
 
 ### HttpExecutor (`src/io/http_executor.zig`, ~1011 lines)
 - Async HTTP(S) client over io_uring: SOCKET → CONNECT → SEND → RECV
@@ -22,12 +22,12 @@ and retired the blocking `io/http.zig` HttpClient from all daemon code paths.
 - Delegates tick() and dispatchCqe() to HttpExecutor
 - Backwards-compatible API for TorrentSession callers
 
-### Blocking HttpClient retired
+### Synchronous HTTP client retired
 - `torrent_session.zig` imports `url.zig` instead of `http.zig`
 - `web_seed.zig:downloadPiece` removed (dead code, never called from daemon)
 - New `src/io/url.zig` — pure URL parsing, no I/O dependency
 - `http.zig` re-exports ParsedUrl/parseUrl for CLI/test backwards compat
-- No daemon code path can reach the blocking HttpClient
+- No daemon code path can reach the former synchronous HTTP client
 
 ### collectMagnetPeers migrated
 - `collectMagnetPeers` replaced with `submitMagnetAnnounces`

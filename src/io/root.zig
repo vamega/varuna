@@ -1,3 +1,5 @@
+const std = @import("std");
+
 pub const buffer_pools = @import("buffer_pools.zig");
 pub const clock = @import("clock.zig");
 pub const Clock = clock.Clock;
@@ -21,7 +23,6 @@ pub const super_seed = @import("super_seed.zig");
 pub const peer_policy = @import("peer_policy.zig");
 pub const utp_handler = @import("utp_handler.zig");
 pub const hasher = @import("hasher.zig");
-pub const http_blocking = @import("http_blocking.zig");
 pub const http_parse = @import("http_parse.zig");
 pub const http_executor = @import("http_executor.zig");
 pub const metadata_handler = @import("metadata_handler.zig");
@@ -39,6 +40,10 @@ pub const sim_io = @import("sim_io.zig");
 pub const signal = @import("signal.zig");
 pub const tls = @import("tls.zig");
 pub const web_seed_handler = @import("web_seed_handler.zig");
+
+test "legacy synchronous HTTP module is not part of io root" {
+    try std.testing.expect(!@hasDecl(@This(), "http_" ++ "blocking"));
+}
 
 // Pull subsystem source-side `test "..."` blocks into the test runner.
 // Mirrors the pattern in `src/torrent/root.zig` and `src/crypto/root.zig`:
@@ -75,7 +80,6 @@ test {
     _ = downloading_piece;
     _ = event_loop;
     _ = hasher;
-    _ = http_blocking;
     _ = http_parse;
     _ = io_interface;
     _ = metadata_handler;

@@ -65,7 +65,7 @@ Rewrites in `src/io/`:
 
 - `http_parse.zig` `findBodyStart`: expected 20, real value 19
   (`"HTTP/1.1 200 OK\r\n\r\n"` is 19 bytes). Off-by-one; fixed.
-- `http_blocking.zig` `find body start`: same off-by-one (re-export).
+- Former synchronous HTTP parser re-export `find body start`: same off-by-one.
   Kept the test even though it duplicates http_parse — `parseUrl`
   re-export coverage in this file extends what http_parse tests.
 - `downloading_piece.zig` `releaseBlocksForPeer frees requested
@@ -289,7 +289,7 @@ cascade described above.
 ## Files touched
 
 - `src/io/root.zig` — `test {}` block expansion + dns_cares gating.
-- `src/io/{downloading_piece,hasher,http_blocking,http_parse,peer_policy,protocol,web_seed_handler}.zig` — inline test fixes.
+- `src/io/{downloading_piece,hasher,http_parse,peer_policy,protocol,web_seed_handler}.zig` — inline test fixes.
 - `src/net/pex.zig` — production fix (port byte order).
 - `src/net/{utp,utp_manager}.zig` — inline test fixes (transitive).
 - `src/rpc/{auth,server}.zig` — inline test fixes (transitive).

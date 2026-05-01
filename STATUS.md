@@ -266,7 +266,7 @@ See `progress-reports/2026-04-25-stage2-event-loop-migration.md` for the Stage 2
 - ~~**Wave 5 BEP 52 creation**~~: (DONE) `varuna-tools create --hybrid` produces BEP 52 hybrid v1+v2 torrents with SHA-256 Merkle trees, file tree structure, and pieces root.
 - ~~**Generic HttpExecutor**~~: (DONE) extracted from TrackerExecutor (~1011 lines). Supports custom headers (Range), target buffer for zero-copy body writes, HTTPS via BoringSSL. TrackerExecutor is now a thin 92-line wrapper.
 - ~~**BEP 19 web seed downloads**~~: (DONE) piece downloads via HTTP Range requests through HttpExecutor. Multi-piece batched requests (configurable `web_seed_max_request_bytes`, default 4MB). WebSeedManager handles URL management, piece-to-file mapping, backoff. E2e verified: 3 scenarios (1-request, multi-request, many-small-requests) all pass.
-- ~~**Blocking HttpClient retired**~~: (DONE) no daemon code path imports the blocking `io/http.zig` HttpClient. URL parsing extracted to `io/url.zig`. Only CLI tools and tests use the blocking client.
+- ~~**Synchronous HTTP client deleted**~~: (DONE) the old blocking HTTP network client was removed. Production HTTP tracker announces and web-seed range requests use `HttpExecutor`; `tracker/announce.zig` keeps only URL construction and response parsing helpers.
 - ~~**Transport disposition**~~: (DONE) fine-grained TCP/uTP control via `TransportDisposition` packed struct. TOML config accepts presets or flag lists. Runtime start/stop of TCP and UDP listeners via `reconcileListeners()`. Cancel-before-close with IORING_OP_ASYNC_CANCEL. 25 integration tests.
 - ~~**IORING_OP_SOCKET for hot-path socket creation**~~: (DONE) peer connections, tracker requests, and UDP tracker all use async socket creation. Startup socket() count: 13 → 3.
 - ~~**varuna-tools create**~~: (DONE) native Zig torrent creator with mktorrent feature parity. Parallel hashing (11x speedup at 16 threads). All test scripts use `varuna-tools create` — Node.js dependency eliminated.
@@ -503,11 +503,9 @@ path. Two paths landed:
   `AsyncMetadataFetchOf(IO)` replacement. Per-method warnings cite
   the AGENTS.md io_uring policy.
 
-- `src/io/http_blocking.zig`: docstring-only treatment (file
-  header expanded, per-method warnings on `get` /
-  `getWithHeaders` / `getRange`). Method renames would have
-  cascaded into `src/io/dns_threadpool.zig`, which is owned by the
-  dns-phase-f-and-flakes-engineer per the file-ownership split.
+- The old synchronous HTTP module originally received docstring-only
+  treatment in this round, then was deleted on 2026-05-01 after the
+  async executor became the only production HTTP network path.
 
 `src/storage/writer.zig`'s submit-and-drain methods were already
 documented as "blocks the calling thread on `io.tick`" in the
@@ -1064,10 +1062,8 @@ refactor.
   `Config.bind_device` for API parity (the existing "Known
   limitation" docstring is preserved verbatim — `getaddrinfo` still
   can't honour it, custom-DNS-library is the queued fix).
-- `src/io/http_executor.zig`, `src/io/http_blocking.zig` — `HttpExecutor.Config`
-  gains `bind_device: ?[]const u8 = null`, forwarded into
-  `DnsResolver.init`. (`http_blocking.zig` only owns parse/blocking
-  helpers used by varuna-ctl/varuna-tools per AGENTS.md, no daemon I/O.)
+- `src/io/http_executor.zig` — `HttpExecutor.Config` gains
+  `bind_device: ?[]const u8 = null`, forwarded into `DnsResolver.init`.
 - `src/daemon/tracker_executor.zig` — `TrackerExecutor.Config.bind_device`
   forwards into `HttpExecutor.Config.bind_device`.
 - `src/daemon/udp_tracker_executor.zig` — `UdpTrackerExecutor.Config.bind_device`
@@ -1296,11 +1292,10 @@ question.
 **Fix 1 — connect-failure invalidation (`698871c`)**: `DnsResolver.invalidate()`
 was exported but never called. When a tracker IP migrated or a CDN
 repointed, every subsequent announce would burn the full TTL window
-(then 5 min, now 1 h — see Fix 2) on the same dead IP. Now the four DNS
-consumers (HttpExecutor, HttpClient, UdpTrackerExecutor, plus
-`tracker/announce.zig` via HttpClient) call `invalidate(host)` on
-connect-failure variants that imply a stale resolved IP. Classification
-helper `dns.shouldInvalidateOnConnectError(err) -> bool`:
+(then 5 min, now 1 h — see Fix 2) on the same dead IP. The async HTTP and
+UDP tracker executors call `invalidate(host)` on connect-failure variants
+that imply a stale resolved IP. Classification helper
+`dns.shouldInvalidateOnConnectError(err) -> bool`:
 
   - **Invalidate**: `ConnectionRefused`, `ConnectionTimedOut` (covers
     both kernel ETIMEDOUT and the io_uring `link_timeout` deadline),
@@ -2441,9 +2436,7 @@ Conclusions: no `>2×` regressions; Stage 2 perf is clean for shipping. `peer_ac
 - `zig build -Doptimize=ReleaseFast perf-workload -- peer_accept_burst --iterations=4000 --clients=1`: multishot listener `~6.91e8 ns` vs one-shot A/B baseline `~7.34e8 ns`
 - `zig build -Doptimize=ReleaseFast perf-workload -- api_get_seq --iterations=4000 --clients=8`: keep-alive server `7.33e7 ns` / `7.92e7 ns` vs pre-change `2.41e8 ns`
 - `zig build -Doptimize=ReleaseFast perf-workload -- mse_responder_prep --iterations=2000 --torrents=20000`: shared lookup `5.21e4 ns` / `3.57e4 ns` vs pre-change `1.02e9 ns`
-- `zig build -Doptimize=ReleaseFast perf-workload -- tracker_http_fresh --iterations=2000`: `7.31e8 ns` / `7.04e8 ns`
 - `zig build -Doptimize=ReleaseFast perf-workload -- tracker_http_reuse_potential --iterations=2000`: `2.83e8 ns` / `2.72e8 ns` (benchmark-only potential, not yet wired into production tracker flow)
-- `zig build -Doptimize=ReleaseFast perf-workload -- tracker_announce_fresh --iterations=2000`: `8.49e8 ns` / `8.80e8 ns`
 - `zig build -Doptimize=ReleaseFast perf-workload -- tracker_announce_executor --iterations=2000`: `4.28e8 ns` / `4.50e8 ns`
 - `zig build -Doptimize=ReleaseFast perf-workload -- tick_sparse_torrents --iterations=500 --torrents=10000 --peers=512 --scale=20`: `2.80e9 ns` -> `1.09e7 ns`, `0` allocs before and after
 - `zig build -Doptimize=ReleaseFast perf-workload -- peer_churn --iterations=5000 --peers=4096 --scale=128`: `1.13e9 ns` -> `3.81e6 ns`, `0` allocs before and after

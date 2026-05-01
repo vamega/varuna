@@ -50,7 +50,7 @@ This document tracks which syscalls the `varuna` **daemon** uses, which are rout
 | `openat+read+close` | `app.zig` -- `.torrent` file read | Once at startup | Low value |
 | `openat+write+close` | `app.zig` -- `.torrent` file creation | Once per `varuna create` | Low value |
 | `uname` | `probe.zig` -- kernel detection | Once at startup | No equivalent |
-| HTTP stack (multiple) | `announce.zig` via `io/http.zig` | Initial + re-announce | **Resolved**: HTTP I/O goes through io_uring. DNS resolution runs on background threads with TTL-based caching (`io/dns.zig`). |
+| HTTP stack (multiple) | `announce.zig` via `io/http_executor.zig` | Initial + re-announce | **Resolved**: HTTP I/O goes through io_uring. DNS resolution runs on background threads with TTL-based caching (`io/dns.zig`). |
 | ~~`std.Thread.sleep`~~ | ~~`client.zig` progress loop~~ | ~~2s polling~~ | **Resolved**: replaced with condvar + timedWait |
 | ~~`std.Thread.sleep`~~ | ~~`torrent_session.zig` announce jitter~~ | ~~Startup delay~~ | **Resolved**: replaced with timerfd on event loop |
 | ~~blocking pread~~ | ~~`recheckExistingData` in verify.zig~~ | ~~Piece verification~~ | **Resolved**: `AsyncRecheck` uses io_uring reads + hasher pool |

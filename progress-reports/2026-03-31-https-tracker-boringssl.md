@@ -22,7 +22,7 @@ Added HTTPS tracker support using vendored BoringSSL, built entirely with Zig's 
 - Server certificate verification enabled (`SSL_VERIFY_PEER`).
 - Conditional compilation: `TlsStreamStub` used when `tls_backend == .none`.
 
-### Phase 3: HTTPS HTTP Client (`src/io/http.zig`)
+### Phase 3: HTTPS HTTP Client
 - `parseUrl` now recognizes `https://` and sets `is_https=true` with default port 443.
 - `getHttps()` method: TCP connect via io_uring, TLS handshake driven via io_uring send/recv, HTTP request/response tunneled through TlsStream.
 - `tlsHandshake()`: loops doHandshake/pendingSend/feedRecv until complete, with max iteration guard.
@@ -59,5 +59,5 @@ Added HTTPS tracker support using vendored BoringSSL, built entirely with Zig's 
 - `build.zig:28-30` -- `-Dtls` build option
 - `build.zig:82-93` -- BoringSSL library linking
 - `src/io/tls.zig` -- TlsStream implementation
-- `src/io/http.zig:112-170` -- HTTPS GET implementation
-- `src/io/http.zig:172-200` -- TLS handshake driver
+- HTTPS GET implementation in the former HTTP client module
+- TLS handshake driver in the former HTTP client module

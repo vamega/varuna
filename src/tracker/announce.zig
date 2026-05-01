@@ -6,57 +6,6 @@ pub const Request = types.Request;
 pub const Peer = types.Peer;
 pub const Response = types.Response;
 
-/// Fetch tracker announce, auto-selecting HTTP or UDP based on URL scheme.
-/// When a DnsResolver is provided, DNS results are cached across requests.
-pub fn fetchAuto(
-    allocator: std.mem.Allocator,
-    request: Request,
-) !Response {
-    return fetchAutoWithDns(allocator, null, request);
-}
-
-/// Fetch tracker announce with an optional shared DNS cache.
-pub fn fetchAutoWithDns(
-    allocator: std.mem.Allocator,
-    dns_resolver: ?*@import("../io/dns.zig").DnsResolver,
-    request: Request,
-) !Response {
-    if (std.mem.startsWith(u8, request.announce_url, "udp://")) {
-        // Synchronous fetchViaUdp is the varuna-ctl path — it is not
-        // used by the daemon (which goes through `UdpTrackerExecutor`
-        // and the daemon-wide `EventLoop.random`). A local
-        // `realRandom()` here is fine: varuna-ctl is short-lived and
-        // not driven by the simulator.
-        var rng = @import("../runtime/random.zig").Random.realRandom();
-        return @import("udp.zig").fetchViaUdp(allocator, &rng, request);
-    }
-    return fetchViaHttp(allocator, dns_resolver, request);
-}
-
-/// Fetch tracker announce using the posix-based HTTP client.
-pub fn fetchViaHttp(
-    allocator: std.mem.Allocator,
-    dns_resolver: ?*@import("../io/dns.zig").DnsResolver,
-    request: Request,
-) !Response {
-    const url = try buildUrl(allocator, request);
-    defer allocator.free(url);
-
-    const http_mod = @import("../io/http_blocking.zig");
-    var http_client = if (dns_resolver) |r|
-        http_mod.HttpClient.initWithDns(allocator, r)
-    else
-        http_mod.HttpClient.init(allocator);
-    var http_response = try http_client.get(url);
-    defer http_response.deinit();
-
-    if (http_response.status != 200) {
-        return error.UnexpectedTrackerStatus;
-    }
-
-    return parseResponse(allocator, http_response.body);
-}
-
 pub fn freeResponse(allocator: std.mem.Allocator, response: Response) void {
     allocator.free(response.peers);
 }

@@ -639,14 +639,14 @@ The daemon-side tracker path still spawned detached announce/scrape threads and 
 Decision:
 - Add a shared `TrackerExecutor` for daemon-side announces and scrapes. It owns one ring, one DNS resolver, and one persistent HTTP client instead of letting each `TorrentSession` lazily create tracker I/O state.
 - Route `SessionManager.forceReannounce`, seed-transition completion announces, and periodic scrapes through that executor. Keep the old per-session detached-thread path only as a fallback when no shared executor is attached.
-- Extend `io/http.zig` with optional plain-HTTP keep-alive reuse, owned by the executor's client. HTTPS and UDP tracker requests still use one-shot transports.
-- Add a real benchmark surface for the production tracker path: `tracker_announce_fresh` versus `tracker_announce_executor`.
+- Extend the HTTP tracker path with optional plain-HTTP keep-alive reuse, owned by the executor's client. HTTPS and UDP tracker requests still use one-shot transports.
+- Add a real benchmark surface for the production tracker path: the former fresh-request path versus `tracker_announce_executor`.
 - Do not move tracker jobs onto the shared peer `EventLoop` ring in this pass.
 
 Reasoning:
 - The real announce-path benchmark improved from `8.49e8 ns` / `8.80e8 ns` fresh to `4.28e8 ns` / `4.50e8 ns` through the shared executor at `2000` requests. That is a repeatable `~1.9x` to `2.0x` win on this host.
 - Sharing tracker I/O state removes the per-session ring ownership model without introducing a general threadpool. There is one worker and one queue for tracker jobs.
-- Using the main peer `EventLoop` ring safely would require turning tracker HTTP/HTTPS/UDP flows into proper asynchronous state machines. The current `HttpClient.get()` API is a synchronous wrapper over io_uring and would stall peer processing if called directly on the shared peer loop thread.
+- Using the main peer `EventLoop` ring safely would require turning tracker HTTP/HTTPS/UDP flows into proper asynchronous state machines. The former synchronous HTTP API would stall peer processing if called directly on the shared peer loop thread.
 
 Follow-up triggers:
 - If HTTP tracker reuse still matters after this pass, teach the executor-owned client to pool more than the current small set of plain HTTP endpoints and measure mixed-tracker workloads.

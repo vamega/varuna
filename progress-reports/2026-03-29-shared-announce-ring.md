@@ -14,7 +14,7 @@ Three call sites were changed:
 
 ## Key design decisions
 
-- **Background thread is correct**: The HTTP client (`src/io/http.zig`) uses blocking ring operations (`submit_and_wait(1)`) and DNS resolution spawns its own thread. These cannot run on the main event loop ring without blocking peer I/O. A dedicated announce ring on a background thread is the right approach.
+- **Background thread is correct**: the former synchronous HTTP path used blocking ring operations (`submit_and_wait(1)`) and DNS resolution spawned its own thread. These cannot run on the main event loop ring without blocking peer I/O. A dedicated announce ring on a background thread is the right approach.
 
 - **Atomic flag instead of thread handle**: Replaced `announce_thread: ?std.Thread` with `announcing: std.atomic.Value(bool)`. This avoids needing to join threads (which requires tracking lifetime) and cleanly prevents double-announcing. The `deinit` and `stop` methods spin-wait for in-flight announces to complete before tearing down the ring.
 

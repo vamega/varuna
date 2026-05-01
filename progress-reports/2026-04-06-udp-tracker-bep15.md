@@ -73,5 +73,5 @@ Replaced the duplicated UDP scrape protocol code in `scrape.zig` with a single d
 
 ## Remaining work
 
-- **Multi-tracker UDP support**: The current implementation handles the primary announce URL. For announce-list (BEP 12) with mixed HTTP/UDP tiers, the `multi_announce.zig` already uses `fetchAuto()` which dispatches to UDP or HTTP. The daemon path handles the primary URL; multi-tier daemon announces could be extended.
+- **Multi-tracker UDP support**: The current implementation handles the primary announce URL. For announce-list (BEP 12) with mixed HTTP/UDP tiers, the multi-announce path already dispatched by URL scheme. The daemon path handles the primary URL; multi-tier daemon announces could be extended.
 - **IPv6 UDP peers**: The UDP announce response only returns compact IPv4 peers (6 bytes each). BEP 15 doesn't define an IPv6 peer format in announce responses. Some trackers may return IPv6 peers in a non-standard way.

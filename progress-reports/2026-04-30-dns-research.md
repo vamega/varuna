@@ -17,8 +17,7 @@ call-sites:
 3. `src/daemon/udp_tracker_executor.zig:327` — `DnsResolver.resolveAsync` for
    UDP tracker (BEP 15).
 4. `src/tracker/udp.zig:419` — blocking `getAddressList` (legacy magnet-peer-collection path).
-5. `src/io/http_blocking.zig:174,323` — blocking `DnsResolver.resolve`
-   (legacy `HttpClient`).
+5. Former synchronous HTTP module — blocking `DnsResolver.resolve`.
 
 Plus the threadpool worker (`src/io/dns_threadpool.zig`) and the c-ares
 backend (`src/io/dns_cares.zig`).

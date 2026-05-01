@@ -71,7 +71,7 @@ test "parseUrl http default port" {
 // ── HTTP response parsing ─────────────────────────────────
 //
 // Pure functions for parsing HTTP/1.1 response headers and status lines.
-// Used by both HttpExecutor (daemon, io_uring) and HttpClient (CLI, blocking).
+// Used by HttpExecutor plus parser-focused tests and benchmarks.
 
 /// Find the start of the HTTP response body (after the \r\n\r\n separator).
 pub fn findBodyStart(data: []const u8) ?usize {

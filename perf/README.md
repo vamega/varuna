@@ -298,7 +298,7 @@ Measured against a tracker-like loopback HTTP server:
 
 | Scenario | Result |
 |----------|--------|
-| `tracker_http_fresh --iterations=2000` | `730731535 ns`, `704347260 ns` |
+| Former fresh HTTP benchmark, `--iterations=2000` | `730731535 ns`, `704347260 ns` |
 | `tracker_http_reuse_potential --iterations=2000` | `282904495 ns`, `272008017 ns` |
 
 Interpretation:
@@ -312,7 +312,7 @@ Measured against the real tracker announce path, including request URL building 
 
 | Scenario | Result |
 |----------|--------|
-| `tracker_announce_fresh --iterations=2000` | `849301098 ns`, `879521023 ns` |
+| Former fresh announce benchmark, `--iterations=2000` | `849301098 ns`, `879521023 ns` |
 | `tracker_announce_executor --iterations=2000` | `427559358 ns`, `449506041 ns` |
 
 Interpretation:

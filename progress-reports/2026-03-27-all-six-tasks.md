@@ -28,7 +28,7 @@
 
 ### 5. UDP tracker support (BEP 15)
 - Full connect + announce protocol over UDP via io_uring
-- Auto-detection: fetchAuto() selects HTTP or UDP by URL scheme
+- Auto-detection: the announce helper selected HTTP or UDP by URL scheme
 - URL parsing for udp://host:port/path
 
 ### 6. Choking algorithm (tit-for-tat)

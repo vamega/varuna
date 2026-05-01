@@ -234,12 +234,12 @@ AGENTS.md io_uring policy.
   the blocking syscalls used (`posix.connect` / `posix.read` /
   `posix.write`). Single internal test caller updated.
 
-- `src/io/http_blocking.zig`: docstring-only treatment. The file
+- Former synchronous HTTP module: docstring-only treatment. The file
   header "BLOCKING HTTP CLIENT" note was already there; expanded
   into "DO NOT USE FROM THE DAEMON EVENT LOOP" and citing
   AGENTS.md and the `HttpExecutor` alternative. Added per-method
   blocking-syscall warnings to `get` / `getWithHeaders` /
-  `getRange` and to the `HttpClient` struct doc-comment. *Did NOT*
+  `getRange` and to the client struct doc-comment. *Did NOT*
   rename methods — the threadpool DNS test
   (`src/io/dns_threadpool.zig:762` calls `client.get(...)`) is
   owned by the dns-phase-f-and-flakes-engineer per the file-
@@ -289,7 +289,7 @@ the simhasher-engineer's round will handle it cleanly.
 
 **The blocking-helper rename has an asymmetry between same-team and
 cross-team callers.** `metadata_fetch.zig` was internally-called by
-one test in the same file — full rename was free. `http_blocking.zig`
+one test in the same file — full rename was free. The former synchronous HTTP module
 had a caller in DNS-engineer territory — a method rename would have
 created merge conflict for them. Docstring warnings on the same
 method names are weaker but lower-friction. The right answer is
@@ -346,7 +346,7 @@ under-rename.
 - `src/io/peer_policy.zig:2400-2569` — `V2Fixture` and three
   v2-completion tests.
 - `src/net/metadata_fetch.zig:10-35` — file-header policy warning.
-- `src/io/http_blocking.zig:1-30` — file-header policy warning.
+- Former synchronous HTTP module header — file-header policy warning.
 
 ## Test count delta
 

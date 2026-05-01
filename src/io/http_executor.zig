@@ -1086,6 +1086,74 @@ pub fn HttpExecutorOf(comptime IO: type) type {
 
         // ── Tests ────────────────────────────────────────────────
 
+        test "connect failure invalidates cached DNS entry" {
+            const allocator = std.testing.allocator;
+            const host = "varuna-dns-fixes-regression.test";
+
+            var slots = try allocator.alloc(RequestSlot, 1);
+            defer allocator.free(slots);
+            slots[0] = .{};
+
+            var self = Self{
+                .allocator = allocator,
+                .io = undefined,
+                .dns_event_fd = -1,
+                .pending_jobs = std.ArrayList(Job).empty,
+                .slots = slots,
+                .free_slot_count = 0,
+                .max_concurrent = 1,
+                .max_per_host = 1,
+                .dns_resolver = try DnsResolver.init(allocator, .{}),
+                .deferred_jobs = std.ArrayList(Job).empty,
+            };
+            defer {
+                var iter = self.host_active.keyIterator();
+                while (iter.next()) |key| allocator.free(key.*);
+                self.host_active.deinit(allocator);
+                self.dns_resolver.deinit(allocator);
+                self.pending_jobs.deinit(allocator);
+                self.deferred_jobs.deinit(allocator);
+            }
+
+            const cached_addr = std.net.Address.initIp4(.{ 127, 0, 0, 1 }, 80);
+            self.dns_resolver.cacheResult(allocator, host, cached_addr);
+            try std.testing.expectEqual(@as(u32, 1), self.dns_resolver.cache.count());
+
+            const CallbackState = struct {
+                called: bool = false,
+                err: ?anyerror = null,
+
+                fn complete(ctx: *anyopaque, result: RequestResult) void {
+                    const state: *@This() = @ptrCast(@alignCast(ctx));
+                    state.called = true;
+                    state.err = result.err;
+                }
+            };
+
+            var callback_state = CallbackState{};
+            self.active_count = 1;
+            self.incrementHostActive(host);
+
+            slots[0].state = .connecting;
+            slots[0].job = .{
+                .context = &callback_state,
+                .on_complete = CallbackState.complete,
+                .host_len = @intCast(host.len),
+            };
+            @memcpy(slots[0].job.host[0..host.len], host);
+
+            const action = httpConnectComplete(
+                &self,
+                &slots[0].completion,
+                .{ .connect = error.ConnectionRefused },
+            );
+
+            try std.testing.expectEqual(io_interface.CallbackAction.disarm, action);
+            try std.testing.expect(callback_state.called);
+            try std.testing.expectEqual(error.ConnectionRefused, callback_state.err.?);
+            try std.testing.expectEqual(@as(u32, 0), self.dns_resolver.cache.count());
+        }
+
         test "target_buf receives correct body data for multi-piece range" {
             // Simulate an HTTP 206 response being received in chunks and
             // verify that the body bytes end up at the correct position in

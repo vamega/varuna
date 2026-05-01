@@ -15,7 +15,7 @@ const rpc_scratch = varuna.rpc.scratch;
 const sync_mod = varuna.rpc.sync;
 const event_loop_mod = varuna.io.event_loop;
 const peer_handler = varuna.io.peer_handler;
-const http_mod = varuna.io.http_blocking;
+const http_parse = varuna.io.http_parse;
 const IoUring = linux.IoUring;
 const mse_mod = varuna.crypto.mse;
 const tracker_announce = varuna.tracker.announce;
@@ -59,9 +59,7 @@ pub const Scenario = enum {
     api_get_burst,
     api_get_seq,
     api_upload_burst,
-    tracker_http_fresh,
     tracker_http_reuse_potential,
-    tracker_announce_fresh,
     tracker_announce_executor,
     extension_decode,
     ut_metadata_decode,
@@ -105,9 +103,7 @@ pub fn run(
         .api_get_burst => runApiBurst(allocator, alloc_counter, iterations, config, .get),
         .api_get_seq => runApiSequentialGet(allocator, alloc_counter, iterations, config),
         .api_upload_burst => runApiBurst(allocator, alloc_counter, iterations, config, .upload),
-        .tracker_http_fresh => runTrackerHttpSeries(allocator, alloc_counter, iterations, .fresh),
-        .tracker_http_reuse_potential => runTrackerHttpSeries(allocator, alloc_counter, iterations, .reuse_potential),
-        .tracker_announce_fresh => runTrackerAnnounceFresh(allocator, alloc_counter, iterations),
+        .tracker_http_reuse_potential => runTrackerHttpReusePotential(alloc_counter, iterations),
         .tracker_announce_executor => runTrackerAnnounceExecutor(allocator, alloc_counter, iterations),
         .extension_decode => runExtensionDecode(allocator, alloc_counter, iterations),
         .ut_metadata_decode => runUtMetadataDecode(allocator, alloc_counter, iterations),
@@ -1099,9 +1095,9 @@ fn readOneHttpResponse(fd: posix.fd_t, buffer: []u8) !usize {
         total += n;
 
         if (body_start == null) {
-            if (http_mod.findBodyStart(buffer[0..total])) |start| {
+            if (http_parse.findBodyStart(buffer[0..total])) |start| {
                 body_start = start;
-                content_length = http_mod.parseContentLength(buffer[0..start]);
+                content_length = http_parse.parseContentLength(buffer[0..start]);
                 if (content_length == null) return error.MissingContentLength;
             }
         }
@@ -1122,21 +1118,14 @@ fn isRetryableSocketError(err: anyerror) bool {
         err == error.NotOpenForWriting;
 }
 
-const TrackerHttpMode = enum {
-    fresh,
-    reuse_potential,
-};
-
 const TrackerServerState = struct {
     listen_fd: posix.fd_t,
     running: std.atomic.Value(bool) = std.atomic.Value(bool).init(true),
 };
 
-fn runTrackerHttpSeries(
-    allocator: std.mem.Allocator,
+fn runTrackerHttpReusePotential(
     alloc_counter: *CountingAllocator,
     iterations: usize,
-    mode: TrackerHttpMode,
 ) !Result {
     const listen_fd = try createLoopbackListener();
     defer posix.close(listen_fd);
@@ -1150,41 +1139,25 @@ fn runTrackerHttpSeries(
         server_thread.join();
     }
 
-    const url = try std.fmt.allocPrint(allocator, "http://127.0.0.1:{}/announce?info_hash=abc", .{port});
-    defer allocator.free(url);
-
     std.Thread.sleep(10 * std.time.ns_per_ms);
     alloc_counter.stats = .{};
     var timer = try std.time.Timer.start();
     var checksum: u64 = 0;
 
-    switch (mode) {
-        .fresh => {
-            var client = http_mod.HttpClient.init(allocator);
-            for (0..iterations) |_| {
-                var response = try client.get(url);
-                checksum +%= response.status;
-                checksum +%= std.hash.Wyhash.hash(0, response.body);
-                response.deinit();
-            }
-        },
-        .reuse_potential => {
-            const address = try std.net.Address.parseIp4("127.0.0.1", port);
-            const fd = try connectLoopback(address);
-            defer posix.close(fd);
+    const address = try std.net.Address.parseIp4("127.0.0.1", port);
+    const fd = try connectLoopback(address);
+    defer posix.close(fd);
 
-            const request = "GET /announce?info_hash=abc HTTP/1.1\r\nHost: localhost\r\nConnection: keep-alive\r\n\r\n";
-            var response_buf: [4096]u8 = undefined;
-            for (0..iterations) |_| {
-                try writeAll(fd, request);
-                const n = try readOneHttpResponse(fd, &response_buf);
-                checksum +%= std.hash.Wyhash.hash(0, response_buf[0..n]);
-            }
-        },
+    const request = "GET /announce?info_hash=abc HTTP/1.1\r\nHost: localhost\r\nConnection: keep-alive\r\n\r\n";
+    var response_buf: [4096]u8 = undefined;
+    for (0..iterations) |_| {
+        try writeAll(fd, request);
+        const n = try readOneHttpResponse(fd, &response_buf);
+        checksum +%= std.hash.Wyhash.hash(0, response_buf[0..n]);
     }
 
     return makeResult(
-        if (mode == .fresh) "tracker_http_fresh" else "tracker_http_reuse_potential",
+        "tracker_http_reuse_potential",
         iterations,
         &timer,
         checksum,
@@ -1201,41 +1174,6 @@ fn makeTrackerAnnounceRequest(allocator: std.mem.Allocator, port: u16) !tracker_
         .left = 0,
         .event = null,
     };
-}
-
-fn runTrackerAnnounceFresh(
-    allocator: std.mem.Allocator,
-    alloc_counter: *CountingAllocator,
-    iterations: usize,
-) !Result {
-    const listen_fd = try createLoopbackListener();
-    defer posix.close(listen_fd);
-
-    const port = try getListenPort(listen_fd);
-    var server_state = TrackerServerState{ .listen_fd = listen_fd };
-    const server_thread = try std.Thread.spawn(.{}, trackerServerWorker, .{&server_state});
-    defer {
-        server_state.running.store(false, .release);
-        wakeTrackerServer(port) catch {};
-        server_thread.join();
-    }
-
-    const request = try makeTrackerAnnounceRequest(allocator, port);
-    defer allocator.free(request.announce_url);
-
-    std.Thread.sleep(10 * std.time.ns_per_ms);
-    alloc_counter.stats = .{};
-    var timer = try std.time.Timer.start();
-    var checksum: u64 = 0;
-
-    for (0..iterations) |_| {
-        const response = try tracker_announce.fetchAuto(allocator, request);
-        defer tracker_announce.freeResponse(allocator, response);
-        checksum +%= response.interval;
-        checksum +%= response.peers.len;
-    }
-
-    return makeResult("tracker_announce_fresh", iterations, &timer, checksum, alloc_counter);
 }
 
 const TrackerExecutorBenchState = struct {
@@ -1280,7 +1218,7 @@ fn runTrackerAnnounceExecutor(
 
     const url = try tracker_announce.buildUrl(allocator, state.request);
     defer allocator.free(url);
-    const parsed = try http_mod.parseUrl(url);
+    const parsed = try http_parse.parseUrl(url);
 
     alloc_counter.stats = .{};
     var timer = try std.time.Timer.start();

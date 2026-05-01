@@ -298,7 +298,7 @@ CREATE TABLE IF NOT EXISTS dht_nodes (
 ### 1.11 Interaction with Existing Peer Discovery
 
 The existing codebase has three peer discovery mechanisms:
-1. **HTTP tracker** (`src/tracker/announce.zig`, `src/io/http.zig`)
+1. **HTTP tracker** (`src/tracker/announce.zig`, `src/io/http_executor.zig`)
 2. **UDP tracker** (`src/tracker/udp.zig`)
 3. **PEX** (`src/net/extensions.zig` -- BEP 10 ut_pex)
 

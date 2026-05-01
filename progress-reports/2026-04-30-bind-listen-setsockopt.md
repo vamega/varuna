@@ -113,7 +113,7 @@ to advance to the next port.
 **`src/perf/workloads.zig`** — perf benchmarks; explicitly allowed
 posix per AGENTS.md.
 
-**`src/tracker/udp.zig`, `src/io/http_blocking.zig`,
+**`src/tracker/udp.zig`, former synchronous HTTP module,
 `src/net/metadata_fetch.zig`** — flagged DO-NOT-TOUCH per
 file-ownership instructions for this round (TrackerExecutor /
 metadata fetch are being restructured by other engineers).

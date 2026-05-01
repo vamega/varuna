@@ -45,7 +45,7 @@ For magnet links, metadata fetch becomes a state machine on the event loop (conn
 | `src/io/types.zig` | **Modify** | Add OpType variants for recheck reads and timerfd |
 | `src/io/metadata_handler.zig` | **Create** | Async BEP 9 metadata fetch state machine on the event loop (connect, handshake, piece request/receive via ring) |
 | `src/tracker/multi_announce.zig` | **Delete** | Replaced by TrackerExecutor/UdpTrackerExecutor which are already ring-integrated |
-| `src/tracker/announce.zig` | **Modify** | Remove `fetchViaHttp`, `fetchViaHttpClient`, `fetchAutoWith*` blocking functions. Keep `parseResponse`, `buildUrl`, and types |
+| `src/tracker/announce.zig` | **Modify** | Remove synchronous HTTP fetch helpers. Keep `parseResponse`, `buildUrl`, and types |
 | `src/tracker/scrape.zig` | **Modify** | Remove blocking `scrapeHttp*` functions. Scrape already goes through TrackerExecutor |
 | `src/net/metadata_fetch.zig` | **Modify** | Extract protocol logic (handshake building, piece assembly, BEP 9 message parsing) into reusable helpers; remove blocking socket I/O |
 | `src/storage/verify.zig` | **Modify** | Extract `planPieceVerification` and `verifyPieceBuffer` as the pure/compute parts; remove `recheckExistingData` blocking loop |
@@ -364,7 +364,7 @@ io: add async BEP 9 metadata fetch state machine on event loop
 
 **Files:**
 - Delete: `src/tracker/multi_announce.zig`
-- Modify: `src/tracker/announce.zig` -- remove `fetchViaHttp`, `fetchViaHttpClient`, `fetchAuto`, `fetchAutoWithDns`, `fetchAutoWithHttpClient`; keep `parseResponse`, `buildUrl`, types
+- Modify: `src/tracker/announce.zig` -- remove synchronous HTTP fetch helpers; keep `parseResponse`, `buildUrl`, types
 - Modify: `src/tracker/scrape.zig` -- remove blocking scrape functions
 - Modify: `src/tracker/udp.zig` -- remove `fetchViaUdp`, `scrapeViaUdp` blocking functions; keep packet codec types (`AnnounceResponse`, `ScrapeResponse`, `ConnectionCache`, etc.)
 - Modify: `src/tracker/root.zig` -- remove `multi_announce` export
@@ -375,7 +375,7 @@ io: add async BEP 9 metadata fetch state machine on event loop
 
 Search for:
 - `multi_announce.announceParallel` -- should be zero after Task 3
-- `announce.fetchAuto`, `announce.fetchViaHttp`, etc. -- should be zero after Task 3
+- announce-layer synchronous HTTP fetch helpers -- should be zero after Task 3
 - `announce.fetch` -- already removed (dead code cleanup)
 - `scrape.scrapeHttp*`, `scrape.scrapeAuto*` -- should be zero
 - `udp.fetchViaUdp`, `udp.scrapeViaUdp` -- should be zero
@@ -386,7 +386,7 @@ Search for:
 
 Keep: `parseResponse`, `buildUrl`, `appendQueryParam`, types, `parseCompactPeers/6` in types.zig, packet codecs in udp.zig.
 
-Remove: all `fetch*`, `scrape*` functions that create sockets or use `HttpClient`.
+Remove: all `fetch*` and `scrape*` functions that create sockets.
 
 - [ ] **Step 4: Update root.zig**
 
@@ -480,7 +480,8 @@ Task 6 is independent and can be done at any point.
 - **SQLite** stays on background threads (required by SQLite's threading model and the io_uring policy)
 - **Hasher thread pool** stays (CPU-bound SHA hashing)
 - **DNS thread pool** stays when c-ares is not available (getaddrinfo is blocking)
-- **`io/http.zig` blocking HttpClient** stays for `varuna-ctl` and `varuna-tools` (non-daemon)
+- The former synchronous HTTP network client has since been removed; CLI and
+  daemon HTTP callers use the async executor path.
 - **`PieceStore.init`** file creation stays blocking (one-time setup, allowed exception)
 - **TrackerExecutor / UdpTrackerExecutor** stay as-is (already ring-based, this plan feeds them better)
 

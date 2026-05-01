@@ -20,7 +20,7 @@ See §6 for the full justification.
 ### Call-site inventory
 
 `grep -n 'getAddrList\|getAddressList\|c_ares\|cares\|DnsResolver\|resolveAsync\|resolveOnce' src/`
-turns up exactly five places where a hostname becomes an `std.net.Address`:
+turns up exactly four places where a hostname becomes an `std.net.Address`:
 
 | # | File:line | Caller / code path | Hostname source | Sync vs async | Where it runs | Notes |
 |---|-----------|--------------------|-----------------|---------------|---------------|-------|
@@ -28,7 +28,6 @@ turns up exactly five places where a hostname becomes an `std.net.Address`:
 | 2 | `src/io/http_executor.zig:437` | Tracker HTTP / HTTPS announces + web seed range fetches | tracker URL host or BEP 19 web-seed URL host | **`DnsResolver.resolveAsync`** with eventfd notify | event-loop thread (the threadpool runs on background threads, eventfd wakes the ring) | One shared `DnsResolver` per `HttpExecutor`. Cached results re-used by every announce / scrape / web-seed range. |
 | 3 | `src/daemon/udp_tracker_executor.zig:327` | UDP tracker (BEP 15) connect + announce + scrape | UDP tracker URL host | **`DnsResolver.resolveAsync`** with eventfd notify | event-loop thread (same shape as HttpExecutor) | One `DnsResolver` per `UdpTrackerExecutor`. |
 | 4 | `src/tracker/udp.zig:419` | Legacy `fetchViaUdp` blocking path | UDP tracker URL host | **blocking `getAddressList`** | background thread (magnet peer collection) | Comment notes "the daemon uses the io_uring-based UdpTrackerExecutor instead". This path is the magnet-peer-collection fallback and `varuna-tools` use. |
-| 5 | `src/io/http_blocking.zig:174,323` | Legacy blocking `HttpClient` | tracker / web seed URL host | **`DnsResolver.resolve`** (synchronous wrapper around the threadpool) | background threads only | Shares the `DnsResolver` from the daemon when initialised with `initWithDns`. |
 
 Plus the threadpool's worker function itself
 (`src/io/dns_threadpool.zig:358`) and the one-shot helper

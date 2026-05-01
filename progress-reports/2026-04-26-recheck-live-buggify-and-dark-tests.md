@@ -145,7 +145,7 @@ Reverted the break. Final state: 704/704 tests pass.
 | sim_io.zig | 8 | ✓ (this round) |
 | peer_policy.zig | 24 | ✗ |
 | protocol.zig | 23 | ✗ |
-| http_blocking.zig | 17 | ✗ |
+| Former synchronous HTTP module | 17 | x |
 | rate_limiter.zig | 14 | ✗ |
 | dns_cares.zig | 13 | ✗ |
 | dns_threadpool.zig | 13 | ✗ |

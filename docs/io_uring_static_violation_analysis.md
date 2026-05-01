@@ -34,7 +34,7 @@ Major clusters:
 
 - `src/daemon/tracker_executor.zig` — lines 159, 188, 204, 250, 454, 595, 834
 - `src/io/event_loop.zig` — lines 382, 389, 393, 1965
-- `src/io/http.zig` — lines 63, 110, 148, 276, 288, 362
+- `src/io/http_executor.zig` — close paths now ride through the async HTTP executor
 - `src/rpc/server.zig` — lines 74, 83, 164
 - `src/io/metadata_handler.zig` — line 727
 
@@ -118,21 +118,12 @@ should go through the ring.
 These are entire subsystems using blocking I/O patterns that need to be
 redesigned as async ring-driven state machines.
 
-### 9. `src/io/http.zig` — the entire `HttpClient`
+### 9. HTTP tracker / web-seed client — resolved
 
-This is the biggest single violator. The whole HTTP client uses blocking posix
-calls:
-
-- Line 160: `posix.socket()` — socket creation
-- Line 171: `posix.connect()` — blocking TCP connect
-- Line 213, 395, 455: `posix.read()` — blocking recv in a loop
-- Line 486: `posix.write()` — blocking send in a loop
-
-The client is used for HTTP tracker announces and web seed downloads. Replacing
-this requires converting `HttpClient` into an async state machine that submits
-connect/send/recv SQEs and processes completions through the event loop. The
-`tracker_executor.zig` already does ring-based HTTP for some tracker paths, so
-this is partly the "old" blocking client that hasn't been migrated.
+The former synchronous HTTP network path has been removed. Production HTTP
+tracker announces and web-seed range requests now run through `HttpExecutor`,
+which submits socket, connect, send, recv, and TLS progress work through the
+event-loop I/O contract.
 
 ### 10. `src/tracker/udp.zig` — `fetchViaUdp` (lines 440-590)
 
@@ -210,8 +201,8 @@ These are explicitly allowed by `AGENTS.md`:
 |---|---|---|
 | Easy (drop-in op swap) | ~40 call sites (socket, close, fdatasync) | Hours each |
 | Moderate (function refactor) | ~15 call sites (pread/pwrite, eventfd reads, file copy, hasher read split) | Days each |
-| Significant (subsystem redesign) | 4 subsystems (HttpClient, UDP tracker, metadata_fetch, dns_cares) + 2 Thread.sleep sites | Weeks each |
+| Significant (subsystem redesign) | 3 remaining subsystems (UDP tracker, metadata_fetch, dns_cares) + 2 Thread.sleep sites | Weeks each |
 
-The highest-value targets are the **storage writer** (pread/pwrite on the piece
-I/O hot path) and the **HTTP client** (used for every tracker announce). The
-dns_cares epoll replacement is the most architecturally complex.
+The highest-value target is the **storage writer** (pread/pwrite on the piece
+I/O hot path). The dns_cares epoll replacement is the most architecturally
+complex.

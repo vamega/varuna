@@ -10,7 +10,7 @@ Added a thread-safe DNS resolver (`src/io/dns.zig`) with TTL-based caching to el
 
 `getaddrinfo()` has no io_uring equivalent and was being called during tracker announce and scrape operations. While these calls already ran on background threads (not the event loop thread), two issues remained:
 
-1. **HTTP path** (`src/io/http.zig`): spawned a new OS thread per DNS lookup -- wasteful when the same tracker hostname is resolved every 30-60 minutes.
+1. **HTTP path**: spawned a new OS thread per DNS lookup -- wasteful when the same tracker hostname is resolved every 30-60 minutes.
 2. **UDP path** (`src/tracker/udp.zig`): called `getaddrinfo()` inline with no timeout, risking indefinite blocking if DNS was slow.
 3. **No caching**: every tracker request re-resolved DNS, even though tracker hostnames rarely change.
 
@@ -31,7 +31,7 @@ Integrated into the daemon:
 ### Key files changed
 
 - `src/io/dns.zig` (new) -- `DnsResolver` and `resolveOnce()`, 13 tests
-- `src/io/http.zig` -- removed inline DNS code, uses `dns.zig` via optional `DnsResolver`
+- HTTP path -- removed inline DNS code, uses `dns.zig` via optional `DnsResolver`
 - `src/tracker/announce.zig` -- added `fetchAutoWithDns` accepting optional resolver
 - `src/tracker/scrape.zig` -- added `scrapeAutoWithDns` and `scrapeHttpWithDns`
 - `src/tracker/udp.zig` -- `resolveAddress` now delegates to `dns.resolveOnce()`

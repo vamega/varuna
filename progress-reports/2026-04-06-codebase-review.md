@@ -32,7 +32,7 @@ Total codebase: **50,915 lines** in 95 `.zig` files under `src/`.
 | `src/torrent/piece_tracker.zig` | 848 | ~600 | ~248 |
 | `src/rpc/server.zig` | 837 | ~700 | ~137 |
 | `src/net/metadata_fetch.zig` | 799 | ~700 | ~99 |
-| `src/io/http.zig` | 782 | ~650 | ~132 |
+| Former synchronous HTTP module | 782 | ~650 | ~132 |
 | `src/dht/krpc.zig` | 782 | ~500 | ~282 |
 | `src/io/utp_handler.zig` | 703 | ~650 | ~53 |
 | `src/net/web_seed.zig` | 695 | ~600 | ~95 |
