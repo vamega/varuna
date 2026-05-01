@@ -415,7 +415,6 @@ pub fn handleUtMetadata(self: anytype, slot: u16, ext_payload: []const u8) void 
                 };
 
                 self.submitPendingSend(ps) catch {
-                    // Send failed; the buffer will be freed when pending_sends is cleaned up
                     self.freeOnePendingSend(slot, send_id);
                     return;
                 };
@@ -523,6 +522,7 @@ pub fn submitMessage(self: anytype, slot: u16, id: u8, payload: []const u8) !voi
         peer.crypto.encryptBuf(stack_buf[0..total_len]);
 
         const ps = try self.trackPendingSendCopy(slot, send_id, stack_buf[0..total_len]);
+        errdefer self.freeOnePendingSend(slot, send_id);
         try self.submitPendingSend(ps);
     } else {
         const send_buf = try self.allocator.alloc(u8, total_len);
@@ -533,6 +533,7 @@ pub fn submitMessage(self: anytype, slot: u16, id: u8, payload: []const u8) !voi
         peer.crypto.encryptBuf(send_buf);
 
         const ps = try self.trackPendingSendOwned(slot, send_id, send_buf);
+        errdefer self.freeOnePendingSend(slot, send_id);
         try self.submitPendingSend(ps);
     }
 }
@@ -577,6 +578,7 @@ pub fn submitExtensionHandshake(self: anytype, slot: u16) !void {
     // Track for cleanup with unique send_id
     const send_id = self.nextSendId();
     const ps = try self.trackPendingSendOwned(slot, send_id, frame);
+    errdefer self.freeOnePendingSend(slot, send_id);
     try self.submitPendingSend(ps);
 }
 
@@ -675,6 +677,7 @@ pub fn submitPexMessage(self: anytype, slot: u16) !void {
 
     const send_id = self.nextSendId();
     const ps = try self.trackPendingSendOwned(slot, send_id, frame);
+    errdefer self.freeOnePendingSend(slot, send_id);
     try self.submitPendingSend(ps);
     peer_pex.last_pex_time = self.clock.now();
 

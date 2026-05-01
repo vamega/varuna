@@ -960,8 +960,8 @@ test "AsyncMetadataFetch SlotState defaults" {
 }
 
 test "AsyncMetadataFetch create and destroy with no peers" {
-    // We need a real io_uring for the create call but won't submit anything
-    var io = try RealIO.init(.{ .entries = 4 });
+    // Use the selected backend for the create call; this test does not submit IO.
+    var io = try backend.initWithCapacity(std.testing.allocator, 4);
     defer io.deinit();
 
     const peers = [_]std.net.Address{};
@@ -982,7 +982,7 @@ test "AsyncMetadataFetch create and destroy with no peers" {
 }
 
 test "AsyncMetadataFetch create and destroy with peers" {
-    var io = try RealIO.init(.{ .entries = 4 });
+    var io = try backend.initWithCapacity(std.testing.allocator, 4);
     defer io.deinit();
 
     const peers = [_]std.net.Address{
@@ -1008,7 +1008,7 @@ test "AsyncMetadataFetch create and destroy with peers" {
 }
 
 test "AsyncMetadataFetch start with no peers calls finish" {
-    var io = try RealIO.init(.{ .entries = 4 });
+    var io = try backend.initWithCapacity(std.testing.allocator, 4);
     defer io.deinit();
 
     const TestCtx = struct {

@@ -113,17 +113,17 @@ test "EpollPosixIO multi-tick send/recv round-trip on real socketpair" {
     try io.recv(.{ .fd = fds[1], .buf = &counter.recv_buf }, &recv_c, &counter, recvCb);
     try testing.expectEqual(@as(u32, 0), counter.received);
 
-    // Now submit a send. The socket buffer is empty; send should succeed
-    // immediately (or partially), the data lands on fds[1]'s receive side,
-    // and a subsequent tick should fire the recv callback.
+    // Now submit a send. The readiness backend reports the send completion
+    // from tick(), so callers observe async ordering like io_uring even when
+    // the socket is already writable.
     var send_c = Completion{};
     try io.send(.{ .fd = fds[0], .buf = "epoll-mvp" }, &send_c, &counter, sendCb);
-    try testing.expectEqual(@as(u32, 1), counter.sent);
 
     var attempts: u32 = 0;
-    while (counter.received < 1 and attempts < 100) : (attempts += 1) {
+    while ((counter.sent < 1 or counter.received < 1) and attempts < 100) : (attempts += 1) {
         try io.tick(1);
     }
+    try testing.expectEqual(@as(u32, 1), counter.sent);
     try testing.expectEqual(@as(u32, 1), counter.received);
     try testing.expectEqual(@as(usize, 9), counter.bytes_sent);
     try testing.expectEqual(@as(usize, 9), counter.bytes_received);

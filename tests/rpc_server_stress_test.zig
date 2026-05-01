@@ -1,11 +1,11 @@
 //! Integration stress test for the post-Track-B `ApiServer` lifecycle
 //! (Track C). Drives many seeds × randomised connect/disconnect/
 //! request-size patterns against the real `ApiServer` running on
-//! `RealIO`, asserting safety properties — no leaks, no UAF, no
+//! the selected production IO backend, asserting safety properties — no leaks, no UAF, no
 //! kernel-side crashes, and that successful responses match the
 //! handler output.
 //!
-//! The `ApiServer` is concrete-typed against `*RealIO` so this test
+//! The `ApiServer` is concrete-typed against the selected backend so this test
 //! cannot be driven under `SimIO` directly. Instead it perturbs
 //! timing via random poll budgets and random disconnect points: a
 //! client may close after writing only the request line, after the
@@ -35,7 +35,7 @@ const rpc_server = varuna.rpc.server;
 const rpc_handlers = varuna.rpc.handlers;
 const rpc_sync = varuna.rpc.sync;
 const SessionManager = varuna.daemon.session_manager.SessionManager;
-const RealIO = varuna.io.real_io.RealIO;
+const backend = varuna.io.backend;
 
 fn echoHandler(allocator: std.mem.Allocator, request: rpc_server.Request) rpc_server.Response {
     // Allocate a body from the per-slot arena allocator. Length
@@ -157,7 +157,7 @@ fn driveClient(server: *rpc_server.ApiServer, port: u16, strategy: CloseStrategy
 }
 
 test "ApiServer: 32 seeds × random close-mid-flight strategies" {
-    var test_io = RealIO.init(.{ .entries = 64 }) catch return error.SkipZigTest;
+    var test_io = backend.initWithCapacity(std.testing.allocator, 64) catch return error.SkipZigTest;
     defer test_io.deinit();
     var server = rpc_server.ApiServer.init(std.testing.allocator, &test_io, "127.0.0.1", 0) catch return error.SkipZigTest;
     defer server.deinit();
@@ -196,7 +196,7 @@ test "ApiServer: rapid connect-reconnect exercises generation filter on slot reu
     // exists to ensure the embedded `recv_op`/`send_op` (Pattern #1
     // in `STYLE.md`) interact correctly with the generation counter
     // under churn.
-    var test_io = RealIO.init(.{ .entries = 64 }) catch return error.SkipZigTest;
+    var test_io = backend.initWithCapacity(std.testing.allocator, 64) catch return error.SkipZigTest;
     defer test_io.deinit();
     var server = rpc_server.ApiServer.init(std.testing.allocator, &test_io, "127.0.0.1", 0) catch return error.SkipZigTest;
     defer server.deinit();
@@ -227,7 +227,7 @@ test "ApiServer: rapid connect-reconnect exercises generation filter on slot reu
 // extraction, body delivery) shows up here, while the handler-only
 // tests in `tests/api_endpoints_test.zig` would still pass.
 //
-// The `ApiServer` is concrete-typed against `*RealIO`, so we cannot
+// The `ApiServer` is concrete-typed against the selected backend, so we cannot
 // drive it with `SimIO`; we instead use a real listening socket on
 // `127.0.0.1` and synchronously poll between writes/reads from the
 // same thread. The handler is bound via a file-scope global because
@@ -242,8 +242,8 @@ fn routingHandlerEntrypoint(allocator: std.mem.Allocator, request: rpc_server.Re
 }
 
 const RoutingTestCtx = struct {
-    test_io: RealIO,
-    server: rpc_server.ApiServer,
+    test_io: *backend.RealIO,
+    server: *rpc_server.ApiServer,
     sm: *SessionManager,
     handler: *rpc_handlers.ApiHandler,
     port: u16,
@@ -268,9 +268,14 @@ const RoutingTestCtx = struct {
             handler.peer_sync_state.deinit();
         }
 
-        var test_io = try RealIO.init(.{ .entries = 64 });
+        const test_io = try allocator.create(backend.RealIO);
+        errdefer allocator.destroy(test_io);
+        test_io.* = try backend.initWithCapacity(allocator, 64);
         errdefer test_io.deinit();
-        var server = try rpc_server.ApiServer.init(allocator, &test_io, "127.0.0.1", 0);
+
+        const server = try allocator.create(rpc_server.ApiServer);
+        errdefer allocator.destroy(server);
+        server.* = try rpc_server.ApiServer.init(allocator, test_io, "127.0.0.1", 0);
         errdefer server.deinit();
 
         // Wire the global ahead of the handler firing so a CQE that
@@ -297,9 +302,11 @@ const RoutingTestCtx = struct {
     fn deinit(self: *RoutingTestCtx) void {
         const allocator = std.testing.allocator;
         // Drain any in-flight CQEs before tearing down.
-        pollFor(&self.server, 200);
+        pollFor(self.server, 200);
         self.server.deinit();
+        allocator.destroy(self.server);
         self.test_io.deinit();
+        allocator.destroy(self.test_io);
         self.handler.sync_state.deinit();
         self.handler.peer_sync_state.deinit();
         allocator.destroy(self.handler);
@@ -428,7 +435,7 @@ test "ApiServer routing: GET /api/v2/auth/login is reachable without auth" {
     var ctx = RoutingTestCtx.init() catch return error.SkipZigTest;
     defer ctx.deinit();
 
-    var resp = try doRequest(&ctx.server, ctx.port, "POST", "/api/v2/auth/login", "Content-Type: application/x-www-form-urlencoded\r\n", "username=admin&password=adminadmin");
+    var resp = try doRequest(ctx.server, ctx.port, "POST", "/api/v2/auth/login", "Content-Type: application/x-www-form-urlencoded\r\n", "username=admin&password=adminadmin");
     defer resp.deinit(std.testing.allocator);
 
     try std.testing.expectEqual(@as(u16, 200), resp.status);
@@ -445,7 +452,7 @@ test "ApiServer routing: unauthenticated app/version returns 403" {
     var ctx = RoutingTestCtx.init() catch return error.SkipZigTest;
     defer ctx.deinit();
 
-    var resp = try doRequest(&ctx.server, ctx.port, "GET", "/api/v2/app/version", "", "");
+    var resp = try doRequest(ctx.server, ctx.port, "GET", "/api/v2/app/version", "", "");
     defer resp.deinit(std.testing.allocator);
 
     try std.testing.expectEqual(@as(u16, 403), resp.status);
@@ -456,7 +463,7 @@ test "ApiServer routing: authed app/version, app/buildInfo, app/defaultSavePath 
     defer ctx.deinit();
 
     // Login.
-    var login = try doRequest(&ctx.server, ctx.port, "POST", "/api/v2/auth/login", "Content-Type: application/x-www-form-urlencoded\r\n", "username=admin&password=adminadmin");
+    var login = try doRequest(ctx.server, ctx.port, "POST", "/api/v2/auth/login", "Content-Type: application/x-www-form-urlencoded\r\n", "username=admin&password=adminadmin");
     defer login.deinit(std.testing.allocator);
     const sid = extractCookieSid(login.raw) orelse return error.NoCookieSet;
 
@@ -464,20 +471,20 @@ test "ApiServer routing: authed app/version, app/buildInfo, app/defaultSavePath 
     const cookie_hdr = try std.fmt.bufPrint(&cookie_buf, "Cookie: SID={s}\r\n", .{sid});
 
     {
-        var resp = try doRequest(&ctx.server, ctx.port, "GET", "/api/v2/app/version", cookie_hdr, "");
+        var resp = try doRequest(ctx.server, ctx.port, "GET", "/api/v2/app/version", cookie_hdr, "");
         defer resp.deinit(std.testing.allocator);
         try std.testing.expectEqual(@as(u16, 200), resp.status);
         try std.testing.expectEqualStrings("v5.0.0", resp.body);
     }
     {
-        var resp = try doRequest(&ctx.server, ctx.port, "GET", "/api/v2/app/buildInfo", cookie_hdr, "");
+        var resp = try doRequest(ctx.server, ctx.port, "GET", "/api/v2/app/buildInfo", cookie_hdr, "");
         defer resp.deinit(std.testing.allocator);
         try std.testing.expectEqual(@as(u16, 200), resp.status);
         // Body is JSON; check for one stable key.
         try std.testing.expect(std.mem.indexOf(u8, resp.body, "\"bitness\":64") != null);
     }
     {
-        var resp = try doRequest(&ctx.server, ctx.port, "GET", "/api/v2/app/defaultSavePath", cookie_hdr, "");
+        var resp = try doRequest(ctx.server, ctx.port, "GET", "/api/v2/app/defaultSavePath", cookie_hdr, "");
         defer resp.deinit(std.testing.allocator);
         try std.testing.expectEqual(@as(u16, 200), resp.status);
         try std.testing.expectEqualStrings("/tmp/varuna-routing-test", resp.body);
@@ -488,14 +495,14 @@ test "ApiServer routing: torrents/info returns empty array via real handler" {
     var ctx = RoutingTestCtx.init() catch return error.SkipZigTest;
     defer ctx.deinit();
 
-    var login = try doRequest(&ctx.server, ctx.port, "POST", "/api/v2/auth/login", "Content-Type: application/x-www-form-urlencoded\r\n", "username=admin&password=adminadmin");
+    var login = try doRequest(ctx.server, ctx.port, "POST", "/api/v2/auth/login", "Content-Type: application/x-www-form-urlencoded\r\n", "username=admin&password=adminadmin");
     defer login.deinit(std.testing.allocator);
     const sid = extractCookieSid(login.raw) orelse return error.NoCookieSet;
 
     var cookie_buf: [128]u8 = undefined;
     const cookie_hdr = try std.fmt.bufPrint(&cookie_buf, "Cookie: SID={s}\r\n", .{sid});
 
-    var resp = try doRequest(&ctx.server, ctx.port, "GET", "/api/v2/torrents/info", cookie_hdr, "");
+    var resp = try doRequest(ctx.server, ctx.port, "GET", "/api/v2/torrents/info", cookie_hdr, "");
     defer resp.deinit(std.testing.allocator);
 
     try std.testing.expectEqual(@as(u16, 200), resp.status);
@@ -509,7 +516,7 @@ test "ApiServer routing: torrents/categories starts empty, createCategory POST s
     var ctx = RoutingTestCtx.init() catch return error.SkipZigTest;
     defer ctx.deinit();
 
-    var login = try doRequest(&ctx.server, ctx.port, "POST", "/api/v2/auth/login", "Content-Type: application/x-www-form-urlencoded\r\n", "username=admin&password=adminadmin");
+    var login = try doRequest(ctx.server, ctx.port, "POST", "/api/v2/auth/login", "Content-Type: application/x-www-form-urlencoded\r\n", "username=admin&password=adminadmin");
     defer login.deinit(std.testing.allocator);
     const sid = extractCookieSid(login.raw) orelse return error.NoCookieSet;
 
@@ -518,7 +525,7 @@ test "ApiServer routing: torrents/categories starts empty, createCategory POST s
 
     // 1. Empty list before any create.
     {
-        var resp = try doRequest(&ctx.server, ctx.port, "GET", "/api/v2/torrents/categories", cookie_hdr, "");
+        var resp = try doRequest(ctx.server, ctx.port, "GET", "/api/v2/torrents/categories", cookie_hdr, "");
         defer resp.deinit(std.testing.allocator);
         try std.testing.expectEqual(@as(u16, 200), resp.status);
         try std.testing.expectEqualStrings("{}", resp.body);
@@ -528,14 +535,14 @@ test "ApiServer routing: torrents/categories starts empty, createCategory POST s
     var create_hdr_buf: [256]u8 = undefined;
     const create_hdr = try std.fmt.bufPrint(&create_hdr_buf, "Content-Type: application/x-www-form-urlencoded\r\n{s}", .{cookie_hdr});
     {
-        var resp = try doRequest(&ctx.server, ctx.port, "POST", "/api/v2/torrents/createCategory", create_hdr, "category=movies&savePath=/srv/movies");
+        var resp = try doRequest(ctx.server, ctx.port, "POST", "/api/v2/torrents/createCategory", create_hdr, "category=movies&savePath=/srv/movies");
         defer resp.deinit(std.testing.allocator);
         try std.testing.expectEqual(@as(u16, 200), resp.status);
     }
 
     // 3. List shows the new category.
     {
-        var resp = try doRequest(&ctx.server, ctx.port, "GET", "/api/v2/torrents/categories", cookie_hdr, "");
+        var resp = try doRequest(ctx.server, ctx.port, "GET", "/api/v2/torrents/categories", cookie_hdr, "");
         defer resp.deinit(std.testing.allocator);
         try std.testing.expectEqual(@as(u16, 200), resp.status);
         try std.testing.expect(std.mem.indexOf(u8, resp.body, "\"movies\"") != null);
@@ -552,14 +559,14 @@ test "ApiServer routing: unknown path returns 404 from handler (not socket-level
     var ctx = RoutingTestCtx.init() catch return error.SkipZigTest;
     defer ctx.deinit();
 
-    var login = try doRequest(&ctx.server, ctx.port, "POST", "/api/v2/auth/login", "Content-Type: application/x-www-form-urlencoded\r\n", "username=admin&password=adminadmin");
+    var login = try doRequest(ctx.server, ctx.port, "POST", "/api/v2/auth/login", "Content-Type: application/x-www-form-urlencoded\r\n", "username=admin&password=adminadmin");
     defer login.deinit(std.testing.allocator);
     const sid = extractCookieSid(login.raw) orelse return error.NoCookieSet;
 
     var cookie_buf: [128]u8 = undefined;
     const cookie_hdr = try std.fmt.bufPrint(&cookie_buf, "Cookie: SID={s}\r\n", .{sid});
 
-    var resp = try doRequest(&ctx.server, ctx.port, "GET", "/api/v2/this/is/not/a/route", cookie_hdr, "");
+    var resp = try doRequest(ctx.server, ctx.port, "GET", "/api/v2/this/is/not/a/route", cookie_hdr, "");
     defer resp.deinit(std.testing.allocator);
     try std.testing.expectEqual(@as(u16, 404), resp.status);
     // Generic-router 404 says `not found`; ApiHandler emits JSON.

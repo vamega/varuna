@@ -44,8 +44,9 @@ pub fn peerAcceptCompleteFor(comptime EL: type) io_interface.Callback {
                     // the pending accept; other errors are worth surfacing.
                     if (err != error.OperationCanceled) {
                         log.warn("accept failed: {s}", .{@errorName(err)});
+                        return .rearm;
                     }
-                    return .rearm;
+                    return .disarm;
                 },
                 else => return .disarm,
             };
@@ -782,12 +783,12 @@ fn handleRecvResult(self: anytype, slot: u16, recv_res: i32) void {
 
             if (peer.extensions_supported) {
                 // Send extension handshake first, then bitfield/interested on send completion
+                peer.state = .extension_handshake_send;
                 protocol.submitExtensionHandshake(self, slot) catch {
                     // Extension handshake failed; fall through to bitfield+interested
                     protocol.sendOutboundBitfieldThenInterested(self, slot);
                     return;
                 };
-                peer.state = .extension_handshake_send;
                 // Don't start header recv yet — sendOutboundBitfieldThenInterested
                 // (via the .extension_handshake_send send completion) will do it.
             } else {
@@ -1034,7 +1035,7 @@ fn handleDiskWriteResult(self: anytype, write_id: u32, res: i32) void {
         const piece_index = pending_w.piece_index;
         // Check for write errors (disk full, I/O error, etc.)
         if (res < 0) {
-            log.err("disk write failed for piece {d} torrent {d}: errno={d}", .{
+            log.warn("disk write failed for piece {d} torrent {d}: errno={d}", .{
                 piece_index, pending_w.torrent_id, -res,
             });
             // Mark as failed but do NOT free the buffer yet -- other spans

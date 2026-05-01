@@ -1,4 +1,5 @@
 const std = @import("std");
+const io_backend = @import("io/backend.zig");
 const runtime = @import("runtime/root.zig");
 const torrent = @import("torrent/root.zig");
 
@@ -289,7 +290,7 @@ fn runVerify(
     const session = try torrent.session.Session.load(allocator, torrent_bytes, target_root);
     defer session.deinit(allocator);
 
-    var verify_io = try @import("io/real_io.zig").RealIO.init(.{ .entries = 16 });
+    var verify_io = try io_backend.initWithCapacity(allocator, 16);
     defer verify_io.deinit();
 
     var store = try @import("storage/root.zig").writer.PieceStore.init(allocator, &session, &verify_io);

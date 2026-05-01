@@ -104,7 +104,7 @@ test "VirtualPeer seeder transfers a piece to EventLoop downloader" {
     defer session.deinit(allocator);
 
     // ── 3. Create the PieceStore (downloader starts with no data) ─
-    var store_init_io = try varuna.io.real_io.RealIO.init(.{ .entries = 16 });
+    var store_init_io = try varuna.io.backend.initWithCapacity(allocator, 16);
     defer store_init_io.deinit();
     var store = try PieceStore.init(allocator, &session, &store_init_io);
     defer store.deinit();

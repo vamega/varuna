@@ -68,10 +68,18 @@ const CallbackAction = ifc.CallbackAction;
 
 const sentinel_index: u32 = std.math.maxInt(u32);
 
+const FdInterest = enum(u8) {
+    none,
+    read,
+    write,
+    poll,
+};
+
 pub const EpollState = struct {
     in_flight: bool = false,
     epoll_registered: bool = false,
     accept_multishot: bool = false,
+    interest: FdInterest = .none,
     registered_fd: posix.fd_t = -1,
     deadline_ns: u64 = 0,
     timer_heap_index: u32 = sentinel_index,
@@ -100,6 +108,21 @@ const MmapEntry = struct {
     ptr: [*]u8,
     /// Size of the mapping in bytes.
     size: usize,
+};
+
+const FdRegistration = struct {
+    read: ?*Completion = null,
+    write: ?*Completion = null,
+    poll: ?*Completion = null,
+
+    fn isEmpty(self: FdRegistration) bool {
+        return self.read == null and self.write == null and self.poll == null;
+    }
+};
+
+const MmapCompleted = struct {
+    completion: *Completion,
+    result: Result,
 };
 
 // ── Timer heap ────────────────────────────────────────────
@@ -167,6 +190,9 @@ pub const EpollMmapIO = struct {
     cached_now_ns: u64 = 0,
     /// Per-fd mmap state. Populated lazily on first file op against `fd`.
     file_mappings: std.AutoHashMap(posix.fd_t, MmapEntry),
+    mmap_completed: std.ArrayListUnmanaged(MmapCompleted) = .{},
+    mmap_completed_swap: std.ArrayListUnmanaged(MmapCompleted) = .{},
+    fd_registrations: std.AutoHashMap(posix.fd_t, FdRegistration),
 
     pub fn init(allocator: std.mem.Allocator, config: Config) !EpollMmapIO {
         const epoll_rc = linux.epoll_create1(linux.EPOLL.CLOEXEC);
@@ -208,6 +234,7 @@ pub const EpollMmapIO = struct {
             .wakeup_fd = wakeup_fd,
             .timers = try TimerHeap.init(allocator, config.max_completions),
             .file_mappings = std.AutoHashMap(posix.fd_t, MmapEntry).init(allocator),
+            .fd_registrations = std.AutoHashMap(posix.fd_t, FdRegistration).init(allocator),
         };
     }
 
@@ -218,6 +245,9 @@ pub const EpollMmapIO = struct {
             posix.munmap(@alignCast(entry.ptr[0..entry.size]));
         }
         self.file_mappings.deinit();
+        self.mmap_completed.deinit(self.allocator);
+        self.mmap_completed_swap.deinit(self.allocator);
+        self.fd_registrations.deinit();
         self.timers.deinit();
         posix.close(self.wakeup_fd);
         posix.close(self.epoll_fd);
@@ -230,6 +260,11 @@ pub const EpollMmapIO = struct {
     pub fn closeSocket(self: *EpollMmapIO, fd: posix.fd_t) void {
         self.unmapFile(fd);
         _ = linux.epoll_ctl(self.epoll_fd, linux.EPOLL.CTL_DEL, fd, null);
+        if (self.fd_registrations.fetchRemove(fd)) |entry| {
+            if (entry.value.read) |c| self.clearRegisteredCompletion(c);
+            if (entry.value.write) |c| self.clearRegisteredCompletion(c);
+            if (entry.value.poll) |c| self.clearRegisteredCompletion(c);
+        }
         posix.close(fd);
     }
 
@@ -240,8 +275,10 @@ pub const EpollMmapIO = struct {
 
         var fired: u32 = 0;
         try self.fireExpiredTimers(&fired);
+        try self.drainMmapCompletions(&fired);
 
-        if (self.active == 0 and (wait_at_least == 0 or fired >= wait_at_least)) return;
+        if (self.active == 0) return;
+        if (wait_at_least != 0 and fired >= wait_at_least) return;
 
         const timeout_ms: i32 = self.computeEpollTimeout(wait_at_least, fired);
 
@@ -261,11 +298,50 @@ pub const EpollMmapIO = struct {
                 _ = posix.read(self.wakeup_fd, std.mem.asBytes(&buf)) catch {};
                 continue;
             }
-            const c: *Completion = @ptrFromInt(@as(usize, @intCast(ev.data.ptr)));
-            try self.dispatchReady(c, ev.events);
+            try self.dispatchFdReady(ev.data.fd, ev.events);
         }
 
         try self.fireExpiredTimers(&fired);
+        try self.drainMmapCompletions(&fired);
+    }
+
+    fn drainMmapCompletions(self: *EpollMmapIO, fired: *u32) !void {
+        if (self.mmap_completed.items.len == 0) return;
+
+        std.mem.swap(
+            std.ArrayListUnmanaged(MmapCompleted),
+            &self.mmap_completed,
+            &self.mmap_completed_swap,
+        );
+        defer self.mmap_completed_swap.clearRetainingCapacity();
+
+        for (self.mmap_completed_swap.items) |entry| {
+            try self.dispatchMmapEntry(entry, fired);
+        }
+    }
+
+    fn dispatchMmapEntry(self: *EpollMmapIO, entry: MmapCompleted, fired: *u32) !void {
+        const c = entry.completion;
+        const st = epollState(c);
+        st.in_flight = false;
+        self.active -|= 1;
+        fired.* += 1;
+
+        const cb = c.callback orelse return;
+        const action = cb(c.userdata, c, entry.result);
+        switch (action) {
+            .disarm => {},
+            .rearm => switch (c.op) {
+                .read => |op| try self.read(op, c, c.userdata, cb),
+                .write => |op| try self.write(op, c, c.userdata, cb),
+                .fsync => |op| try self.fsync(op, c, c.userdata, cb),
+                .fallocate => |op| try self.fallocate(op, c, c.userdata, cb),
+                .truncate => |op| try self.truncate(op, c, c.userdata, cb),
+                .splice => |op| try self.splice(op, c, c.userdata, cb),
+                .copy_file_range => |op| try self.copy_file_range(op, c, c.userdata, cb),
+                else => {},
+            },
+        }
     }
 
     fn computeEpollTimeout(self: *EpollMmapIO, wait_at_least: u32, fired: u32) i32 {
@@ -322,16 +398,51 @@ pub const EpollMmapIO = struct {
         }
     }
 
-    fn dispatchReady(self: *EpollMmapIO, c: *Completion, events: u32) !void {
+    fn dispatchFdReady(self: *EpollMmapIO, fd: posix.fd_t, events: u32) !void {
+        const reg = self.fd_registrations.getPtr(fd) orelse return;
+
+        var write_c: ?*Completion = null;
+        var read_c: ?*Completion = null;
+        var poll_c: ?*Completion = null;
+
+        if (reg.write) |c| {
+            if ((events & (linux.EPOLL.OUT | linux.EPOLL.ERR | linux.EPOLL.HUP | linux.EPOLL.RDHUP)) != 0) {
+                write_c = c;
+                reg.write = null;
+                self.clearRegisteredCompletion(c);
+            }
+        }
+        if (reg.read) |c| {
+            if ((events & (linux.EPOLL.IN | linux.EPOLL.ERR | linux.EPOLL.HUP | linux.EPOLL.RDHUP)) != 0) {
+                read_c = c;
+                reg.read = null;
+                self.clearRegisteredCompletion(c);
+            }
+        }
+        if (reg.poll) |c| {
+            const poll_events = switch (c.op) {
+                .poll => |op| op.events,
+                else => 0,
+            };
+            if ((events & (poll_events | linux.EPOLL.ERR | linux.EPOLL.HUP | linux.EPOLL.RDHUP)) != 0) {
+                poll_c = c;
+                reg.poll = null;
+                self.clearRegisteredCompletion(c);
+            }
+        }
+
+        try self.updateFdRegistration(fd);
+
+        if (write_c) |c| try self.dispatchReadyCompletion(c, events);
+        if (read_c) |c| try self.dispatchReadyCompletion(c, events);
+        if (poll_c) |c| try self.dispatchReadyCompletion(c, events);
+    }
+
+    fn dispatchReadyCompletion(self: *EpollMmapIO, c: *Completion, events: u32) !void {
         const st = epollState(c);
         const cb = c.callback orelse return;
-
-        if (st.epoll_registered) {
-            _ = linux.epoll_ctl(self.epoll_fd, linux.EPOLL.CTL_DEL, st.registered_fd, null);
-            st.epoll_registered = false;
-        }
-        st.in_flight = false;
-        self.active -|= 1;
+        std.debug.assert(!st.epoll_registered);
+        std.debug.assert(!st.in_flight);
 
         const result = performInline(c, events);
         const action = cb(c.userdata, c, result);
@@ -397,15 +508,8 @@ pub const EpollMmapIO = struct {
         try self.armCompletion(c, .{ .connect = op }, ud, cb);
         const addrlen = op.addr.getOsSockLen();
         if (posix.connect(op.fd, &op.addr.any, addrlen)) {
-            const action = try self.deliverInline(c, .{ .connect = {} });
-            switch (action) {
-                .disarm => return,
-                .rearm => switch (c.op) {
-                    .connect => |new_op| try self.connect(new_op, c, ud, cb),
-                    else => return,
-                },
-            }
-            return;
+            // Completed immediately; still report completion from tick so
+            // callers observe the same ordering as io_uring.
         } else |err| switch (err) {
             error.WouldBlock => {},
             else => {
@@ -427,145 +531,27 @@ pub const EpollMmapIO = struct {
     pub fn accept(self: *EpollMmapIO, op: ifc.AcceptOp, c: *Completion, ud: ?*anyopaque, cb: Callback) !void {
         try self.armCompletion(c, .{ .accept = op }, ud, cb);
         epollState(c).accept_multishot = op.multishot;
-        if (doAccept(op.fd)) |accepted| {
-            const action = try self.deliverInline(c, .{ .accept = accepted });
-            switch (action) {
-                .disarm => return,
-                .rearm => switch (c.op) {
-                    .accept => |new_op| try self.accept(new_op, c, ud, cb),
-                    else => return,
-                },
-            }
-            return;
-        } else |err| switch (err) {
-            error.WouldBlock => {},
-            else => {
-                const action = try self.deliverInline(c, .{ .accept = err });
-                switch (action) {
-                    .disarm => return,
-                    .rearm => switch (c.op) {
-                        .accept => |new_op| try self.accept(new_op, c, ud, cb),
-                        else => return,
-                    },
-                }
-                return;
-            },
-        }
         try self.registerFd(c, op.fd, linux.EPOLL.IN);
     }
 
     pub fn recv(self: *EpollMmapIO, op_in: ifc.RecvOp, c: *Completion, ud: ?*anyopaque, cb: Callback) !void {
-        var op = op_in;
-        while (true) {
-            try self.armCompletion(c, .{ .recv = op }, ud, cb);
-            const result: Result = res: {
-                if (posix.recv(op.fd, op.buf, op.flags)) |n| {
-                    break :res .{ .recv = n };
-                } else |err| {
-                    if (err == error.WouldBlock) {
-                        try self.registerFd(c, op.fd, linux.EPOLL.IN);
-                        return;
-                    }
-                    break :res .{ .recv = err };
-                }
-            };
-            switch (try self.deliverInline(c, result)) {
-                .disarm => return,
-                .rearm => switch (c.op) {
-                    .recv => |new_op| {
-                        op = new_op;
-                        continue;
-                    },
-                    else => return,
-                },
-            }
-        }
+        try self.armCompletion(c, .{ .recv = op_in }, ud, cb);
+        try self.registerFd(c, op_in.fd, linux.EPOLL.IN);
     }
 
     pub fn send(self: *EpollMmapIO, op_in: ifc.SendOp, c: *Completion, ud: ?*anyopaque, cb: Callback) !void {
-        var op = op_in;
-        while (true) {
-            try self.armCompletion(c, .{ .send = op }, ud, cb);
-            const result: Result = res: {
-                if (posix.send(op.fd, op.buf, op.flags)) |n| {
-                    break :res .{ .send = n };
-                } else |err| {
-                    if (err == error.WouldBlock) {
-                        try self.registerFd(c, op.fd, linux.EPOLL.OUT);
-                        return;
-                    }
-                    break :res .{ .send = err };
-                }
-            };
-            switch (try self.deliverInline(c, result)) {
-                .disarm => return,
-                .rearm => switch (c.op) {
-                    .send => |new_op| {
-                        op = new_op;
-                        continue;
-                    },
-                    else => return,
-                },
-            }
-        }
+        try self.armCompletion(c, .{ .send = op_in }, ud, cb);
+        try self.registerFd(c, op_in.fd, linux.EPOLL.OUT);
     }
 
     pub fn recvmsg(self: *EpollMmapIO, op_in: ifc.RecvmsgOp, c: *Completion, ud: ?*anyopaque, cb: Callback) !void {
-        var op = op_in;
-        while (true) {
-            try self.armCompletion(c, .{ .recvmsg = op }, ud, cb);
-            const result: Result = res: {
-                const n = doRecvmsg(op);
-                if (n) |bytes| {
-                    break :res .{ .recvmsg = bytes };
-                } else |err| {
-                    if (err == error.WouldBlock) {
-                        try self.registerFd(c, op.fd, linux.EPOLL.IN);
-                        return;
-                    }
-                    break :res .{ .recvmsg = err };
-                }
-            };
-            switch (try self.deliverInline(c, result)) {
-                .disarm => return,
-                .rearm => switch (c.op) {
-                    .recvmsg => |new_op| {
-                        op = new_op;
-                        continue;
-                    },
-                    else => return,
-                },
-            }
-        }
+        try self.armCompletion(c, .{ .recvmsg = op_in }, ud, cb);
+        try self.registerFd(c, op_in.fd, linux.EPOLL.IN);
     }
 
     pub fn sendmsg(self: *EpollMmapIO, op_in: ifc.SendmsgOp, c: *Completion, ud: ?*anyopaque, cb: Callback) !void {
-        var op = op_in;
-        while (true) {
-            try self.armCompletion(c, .{ .sendmsg = op }, ud, cb);
-            const result: Result = res: {
-                const n = doSendmsg(op);
-                if (n) |bytes| {
-                    break :res .{ .sendmsg = bytes };
-                } else |err| {
-                    if (err == error.WouldBlock) {
-                        try self.registerFd(c, op.fd, linux.EPOLL.OUT);
-                        return;
-                    }
-                    break :res .{ .sendmsg = err };
-                }
-            };
-            switch (try self.deliverInline(c, result)) {
-                .disarm => return,
-                .rearm => switch (c.op) {
-                    .sendmsg => |new_op| {
-                        op = new_op;
-                        continue;
-                    },
-                    else => return,
-                },
-            }
-        }
+        try self.armCompletion(c, .{ .sendmsg = op_in }, ud, cb);
+        try self.registerFd(c, op_in.fd, linux.EPOLL.OUT);
     }
 
     /// Synchronous fallback. Same shape as `EpollPosixIO.bind`.
@@ -672,11 +658,7 @@ pub const EpollMmapIO = struct {
         }
 
         if (!found and tst.epoll_registered) {
-            _ = linux.epoll_ctl(self.epoll_fd, linux.EPOLL.CTL_DEL, tst.registered_fd, null);
-            tst.epoll_registered = false;
-            tst.registered_fd = -1;
-            tst.in_flight = false;
-            self.active -|= 1;
+            _ = try self.unregisterCompletion(target);
             found = true;
 
             if (target.callback) |target_cb| {
@@ -727,7 +709,7 @@ pub const EpollMmapIO = struct {
             @memcpy(op.buf[0..n], entry.ptr[offset_us..][0..n]);
             break :blk .{ .read = n };
         };
-        _ = try self.deliverInline(c, result);
+        try self.enqueueMmapCompletion(c, result);
     }
 
     pub fn write(self: *EpollMmapIO, op: ifc.WriteOp, c: *Completion, ud: ?*anyopaque, cb: Callback) !void {
@@ -752,7 +734,7 @@ pub const EpollMmapIO = struct {
             @memcpy(entry.ptr[offset_us..][0..op.buf.len], op.buf);
             break :blk .{ .write = op.buf.len };
         };
-        _ = try self.deliverInline(c, result);
+        try self.enqueueMmapCompletion(c, result);
     }
 
     pub fn fsync(self: *EpollMmapIO, op: ifc.FsyncOp, c: *Completion, ud: ?*anyopaque, cb: Callback) !void {
@@ -778,7 +760,7 @@ pub const EpollMmapIO = struct {
                 else => |e| break :blk .{ .fsync = posix.unexpectedErrno(e) },
             }
         };
-        _ = try self.deliverInline(c, result);
+        try self.enqueueMmapCompletion(c, result);
     }
 
     pub fn fallocate(self: *EpollMmapIO, op: ifc.FallocateOp, c: *Completion, ud: ?*anyopaque, cb: Callback) !void {
@@ -801,7 +783,7 @@ pub const EpollMmapIO = struct {
                 else => |e| break :blk .{ .fallocate = posix.unexpectedErrno(e) },
             }
         };
-        _ = try self.deliverInline(c, result);
+        try self.enqueueMmapCompletion(c, result);
     }
 
     pub fn truncate(self: *EpollMmapIO, op: ifc.TruncateOp, c: *Completion, ud: ?*anyopaque, cb: Callback) !void {
@@ -811,7 +793,7 @@ pub const EpollMmapIO = struct {
             posix.ftruncate(op.fd, op.length) catch |err| break :blk .{ .truncate = err };
             break :blk .{ .truncate = {} };
         };
-        _ = try self.deliverInline(c, result);
+        try self.enqueueMmapCompletion(c, result);
     }
 
     pub fn splice(self: *EpollMmapIO, op: ifc.SpliceOp, c: *Completion, ud: ?*anyopaque, cb: Callback) !void {
@@ -847,7 +829,7 @@ pub const EpollMmapIO = struct {
                 else => |e| break :blk .{ .splice = posix.unexpectedErrno(e) },
             }
         };
-        _ = try self.deliverInline(c, result);
+        try self.enqueueMmapCompletion(c, result);
     }
 
     pub fn copy_file_range(self: *EpollMmapIO, op: ifc.CopyFileRangeOp, c: *Completion, ud: ?*anyopaque, cb: Callback) !void {
@@ -868,7 +850,7 @@ pub const EpollMmapIO = struct {
                 else => |e| break :blk .{ .copy_file_range = posix.unexpectedErrno(e) },
             }
         };
-        _ = try self.deliverInline(c, result);
+        try self.enqueueMmapCompletion(c, result);
     }
 
     // ── Mmap helpers ──────────────────────────────────────
@@ -935,28 +917,143 @@ pub const EpollMmapIO = struct {
     }
 
     fn registerFd(self: *EpollMmapIO, c: *Completion, fd: posix.fd_t, events: u32) !void {
-        var ev: linux.epoll_event = .{
-            .events = events | linux.EPOLL.ONESHOT | linux.EPOLL.RDHUP,
-            .data = .{ .ptr = @intFromPtr(c) },
+        _ = events;
+        const interest = fdInterestForCompletion(c);
+        const gop = try self.fd_registrations.getOrPut(fd);
+        if (!gop.found_existing) gop.value_ptr.* = .{};
+        const reg = gop.value_ptr;
+        const lane: *?*Completion = switch (interest) {
+            .read => &reg.read,
+            .write => &reg.write,
+            .poll => &reg.poll,
+            .none => return error.UnsupportedOperation,
         };
-        const rc = linux.epoll_ctl(self.epoll_fd, linux.EPOLL.CTL_ADD, fd, &ev);
-        switch (linux.E.init(rc)) {
+        if (lane.* != null and lane.* != c) {
+            epollState(c).in_flight = false;
+            return error.AlreadyInFlight;
+        }
+        lane.* = c;
+
+        self.updateFdRegistration(fd) catch |err| {
+            if (lane.* == c) lane.* = null;
+            if (reg.isEmpty()) _ = self.fd_registrations.remove(fd);
+            const st = epollState(c);
+            st.in_flight = false;
+            st.epoll_registered = false;
+            st.registered_fd = -1;
+            st.interest = .none;
+            return err;
+        };
+
+        const st = epollState(c);
+        st.epoll_registered = true;
+        st.registered_fd = fd;
+        st.interest = interest;
+        self.active += 1;
+    }
+
+    fn updateFdRegistration(self: *EpollMmapIO, fd: posix.fd_t) !void {
+        const reg = self.fd_registrations.get(fd) orelse return;
+        if (reg.isEmpty()) {
+            _ = linux.epoll_ctl(self.epoll_fd, linux.EPOLL.CTL_DEL, fd, null);
+            _ = self.fd_registrations.remove(fd);
+            return;
+        }
+
+        var ev: linux.epoll_event = .{
+            .events = fdRegistrationEvents(reg),
+            .data = .{ .fd = fd },
+        };
+        const mod_rc = linux.epoll_ctl(self.epoll_fd, linux.EPOLL.CTL_MOD, fd, &ev);
+        switch (linux.E.init(mod_rc)) {
+            .SUCCESS => return,
+            .NOENT => {},
+            .BADF => return error.FileDescriptorInvalid,
+            .PERM => return error.FileDescriptorIncompatibleWithEpoll,
+            else => |e| return posix.unexpectedErrno(e),
+        }
+
+        const add_rc = linux.epoll_ctl(self.epoll_fd, linux.EPOLL.CTL_ADD, fd, &ev);
+        switch (linux.E.init(add_rc)) {
             .SUCCESS => {},
             .EXIST => {
-                const mod_rc = linux.epoll_ctl(self.epoll_fd, linux.EPOLL.CTL_MOD, fd, &ev);
-                switch (linux.E.init(mod_rc)) {
+                const retry_rc = linux.epoll_ctl(self.epoll_fd, linux.EPOLL.CTL_MOD, fd, &ev);
+                switch (linux.E.init(retry_rc)) {
                     .SUCCESS => {},
                     else => |e| return posix.unexpectedErrno(e),
                 }
             },
             .NOMEM, .NOSPC => return error.SystemResources,
             .PERM => return error.FileDescriptorIncompatibleWithEpoll,
+            .BADF => return error.FileDescriptorInvalid,
             else => |e| return posix.unexpectedErrno(e),
         }
+    }
+
+    fn unregisterCompletion(self: *EpollMmapIO, c: *Completion) !bool {
         const st = epollState(c);
-        st.epoll_registered = true;
-        st.registered_fd = fd;
+        if (!st.epoll_registered) return false;
+        const fd = st.registered_fd;
+        if (self.fd_registrations.getPtr(fd)) |reg| {
+            switch (st.interest) {
+                .read => {
+                    if (reg.read == c) reg.read = null;
+                },
+                .write => {
+                    if (reg.write == c) reg.write = null;
+                },
+                .poll => {
+                    if (reg.poll == c) reg.poll = null;
+                },
+                .none => {},
+            }
+        }
+        self.clearRegisteredCompletion(c);
+        try self.updateFdRegistration(fd);
+        return true;
+    }
+
+    fn clearRegisteredCompletion(self: *EpollMmapIO, c: *Completion) void {
+        const st = epollState(c);
+        st.in_flight = false;
+        st.epoll_registered = false;
+        st.registered_fd = -1;
+        st.interest = .none;
+        self.active -|= 1;
+    }
+
+    fn fdInterestForCompletion(c: *const Completion) FdInterest {
+        return switch (c.op) {
+            .recv, .recvmsg, .accept => .read,
+            .send, .sendmsg, .connect => .write,
+            .poll => .poll,
+            else => .none,
+        };
+    }
+
+    fn fdRegistrationEvents(reg: FdRegistration) u32 {
+        var events: u32 = linux.EPOLL.ONESHOT | linux.EPOLL.RDHUP;
+        if (reg.read != null) events |= linux.EPOLL.IN;
+        if (reg.write != null) events |= linux.EPOLL.OUT;
+        if (reg.poll) |c| {
+            events |= switch (c.op) {
+                .poll => |op| op.events,
+                else => 0,
+            };
+        }
+        return events;
+    }
+
+    fn enqueueMmapCompletion(self: *EpollMmapIO, c: *Completion, result: Result) !void {
         self.active += 1;
+        self.mmap_completed.append(self.allocator, .{
+            .completion = c,
+            .result = result,
+        }) catch |err| {
+            self.active -|= 1;
+            epollState(c).in_flight = false;
+            return err;
+        };
     }
 
     fn deliverInline(self: *EpollMmapIO, c: *Completion, result: Result) !CallbackAction {
@@ -975,9 +1072,12 @@ fn doRecvmsg(op: ifc.RecvmsgOp) anyerror!usize {
     switch (linux.E.init(rc)) {
         .SUCCESS => return @intCast(rc),
         .AGAIN => return error.WouldBlock,
+        .BADF => return error.FileDescriptorInvalid,
         .CONNREFUSED => return error.ConnectionRefused,
         .CONNRESET => return error.ConnectionResetByPeer,
         .INTR => return error.Interrupted,
+        .NOTCONN => return error.SocketNotConnected,
+        .TIMEDOUT => return error.ConnectionTimedOut,
         else => |e| return posix.unexpectedErrno(e),
     }
 }
@@ -987,9 +1087,40 @@ fn doSendmsg(op: ifc.SendmsgOp) anyerror!usize {
     switch (linux.E.init(rc)) {
         .SUCCESS => return @intCast(rc),
         .AGAIN => return error.WouldBlock,
+        .BADF => return error.FileDescriptorInvalid,
         .PIPE => return error.BrokenPipe,
         .CONNRESET => return error.ConnectionResetByPeer,
         .INTR => return error.Interrupted,
+        .NOTCONN => return error.SocketNotConnected,
+        else => |e| return posix.unexpectedErrno(e),
+    }
+}
+
+fn doRecv(op: ifc.RecvOp) anyerror!usize {
+    const rc = posix.system.recvfrom(op.fd, op.buf.ptr, op.buf.len, op.flags, null, null);
+    switch (posix.errno(rc)) {
+        .SUCCESS => return @intCast(rc),
+        .AGAIN => return error.WouldBlock,
+        .BADF => return error.FileDescriptorInvalid,
+        .CONNREFUSED => return error.ConnectionRefused,
+        .CONNRESET => return error.ConnectionResetByPeer,
+        .INTR => return error.Interrupted,
+        .NOTCONN => return error.SocketNotConnected,
+        .TIMEDOUT => return error.ConnectionTimedOut,
+        else => |e| return posix.unexpectedErrno(e),
+    }
+}
+
+fn doSend(op: ifc.SendOp) anyerror!usize {
+    const rc = posix.system.sendto(op.fd, op.buf.ptr, op.buf.len, op.flags, null, 0);
+    switch (posix.errno(rc)) {
+        .SUCCESS => return @intCast(rc),
+        .AGAIN => return error.WouldBlock,
+        .BADF => return error.FileDescriptorInvalid,
+        .PIPE => return error.BrokenPipe,
+        .CONNRESET => return error.ConnectionResetByPeer,
+        .INTR => return error.Interrupted,
+        .NOTCONN => return error.SocketNotConnected,
         else => |e| return posix.unexpectedErrno(e),
     }
 }
@@ -1027,8 +1158,8 @@ fn doAccept(listen_fd: posix.fd_t) anyerror!ifc.Accepted {
 
 fn performInline(c: *Completion, events: u32) Result {
     return switch (c.op) {
-        .recv => |op| .{ .recv = posix.recv(op.fd, op.buf, op.flags) },
-        .send => |op| .{ .send = posix.send(op.fd, op.buf, op.flags) },
+        .recv => |op| .{ .recv = doRecv(op) },
+        .send => |op| .{ .send = doSend(op) },
         .recvmsg => |op| .{ .recvmsg = doRecvmsg(op) },
         .sendmsg => |op| .{ .sendmsg = doSendmsg(op) },
         .connect => |op| .{ .connect = doConnectComplete(op.fd) },
@@ -1230,6 +1361,7 @@ test "EpollMmapIO mmap-backed pwrite + pread round-trip" {
     var fa_c = Completion{};
     var fa_ctx = TestCtx{};
     try io.fallocate(.{ .fd = file.handle, .offset = 0, .len = 4096 }, &fa_c, &fa_ctx, testCallback);
+    try io.tick(1);
     try testing.expectEqual(@as(u32, 1), fa_ctx.calls);
     switch (fa_ctx.last_result.?) {
         .fallocate => |r| try r,
@@ -1240,6 +1372,7 @@ test "EpollMmapIO mmap-backed pwrite + pread round-trip" {
     var w_c = Completion{};
     var w_ctx = TestCtx{};
     try io.write(.{ .fd = file.handle, .buf = "varuna-mmap", .offset = 100 }, &w_c, &w_ctx, testCallback);
+    try io.tick(1);
     try testing.expectEqual(@as(u32, 1), w_ctx.calls);
     switch (w_ctx.last_result.?) {
         .write => |r| try testing.expectEqual(@as(usize, 11), try r),
@@ -1251,6 +1384,7 @@ test "EpollMmapIO mmap-backed pwrite + pread round-trip" {
     var r_c = Completion{};
     var r_ctx = TestCtx{};
     try io.read(.{ .fd = file.handle, .buf = &read_buf, .offset = 100 }, &r_c, &r_ctx, testCallback);
+    try io.tick(1);
     try testing.expectEqual(@as(u32, 1), r_ctx.calls);
     switch (r_ctx.last_result.?) {
         .read => |r| {
@@ -1265,6 +1399,7 @@ test "EpollMmapIO mmap-backed pwrite + pread round-trip" {
     var s_c = Completion{};
     var s_ctx = TestCtx{};
     try io.fsync(.{ .fd = file.handle, .datasync = true }, &s_c, &s_ctx, testCallback);
+    try io.tick(1);
     try testing.expectEqual(@as(u32, 1), s_ctx.calls);
     switch (s_ctx.last_result.?) {
         .fsync => |r| try r,
@@ -1286,6 +1421,7 @@ test "EpollMmapIO read past EOF returns zero bytes" {
     var t_c = Completion{};
     var t_ctx = TestCtx{};
     try io.truncate(.{ .fd = file.handle, .length = 64 }, &t_c, &t_ctx, testCallback);
+    try io.tick(1);
     switch (t_ctx.last_result.?) {
         .truncate => |r| try r,
         else => try testing.expect(false),
@@ -1296,6 +1432,7 @@ test "EpollMmapIO read past EOF returns zero bytes" {
     var r_c = Completion{};
     var r_ctx = TestCtx{};
     try io.read(.{ .fd = file.handle, .buf = &buf, .offset = 1000 }, &r_c, &r_ctx, testCallback);
+    try io.tick(1);
     switch (r_ctx.last_result.?) {
         .read => |r| try testing.expectEqual(@as(usize, 0), try r),
         else => try testing.expect(false),

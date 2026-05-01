@@ -153,7 +153,7 @@ fn runOneSeedAgainstEventLoop(seed: u64, opts: BuggifyOpts) !SeedOutcome {
     // against actual files in `data_root`; the EventLoop below runs
     // SimIO for the protocol-level simulation. So we use a one-shot
     // RealIO here to satisfy PieceStore's IO contract.
-    var store_init_io = try varuna.io.real_io.RealIO.init(.{ .entries = 16 });
+    var store_init_io = try varuna.io.backend.initWithCapacity(allocator, 16);
     defer store_init_io.deinit();
     var store = try PieceStore.init(allocator, &session, &store_init_io);
     defer store.deinit();

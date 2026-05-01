@@ -15,7 +15,7 @@ const posix = std.posix;
 const varuna = @import("varuna");
 const rpc_server = varuna.rpc.server;
 const scratch = varuna.rpc.scratch;
-const RealIO = varuna.io.real_io.RealIO;
+const backend = varuna.io.backend;
 
 // ── 1. Algorithm tests ────────────────────────────────────
 
@@ -153,7 +153,7 @@ fn listenPort(server: *const rpc_server.ApiServer) !u16 {
 test "ApiServer routes handler allocations through per-slot arena" {
     HandlerProbe.reset();
 
-    var test_io = RealIO.init(.{ .entries = 64 }) catch return error.SkipZigTest;
+    var test_io = backend.initWithCapacity(std.testing.allocator, 64) catch return error.SkipZigTest;
     defer test_io.deinit();
     var server = rpc_server.ApiServer.init(std.testing.allocator, &test_io, "127.0.0.1", 0) catch return error.SkipZigTest;
     defer server.deinit();
@@ -230,7 +230,7 @@ fn oversizeHandler(allocator: std.mem.Allocator, request: rpc_server.Request) rp
 }
 
 test "ApiServer surfaces 500 on arena cap exceeded — no leak" {
-    var test_io = RealIO.init(.{ .entries = 64 }) catch return error.SkipZigTest;
+    var test_io = backend.initWithCapacity(std.testing.allocator, 64) catch return error.SkipZigTest;
     defer test_io.deinit();
     var server = rpc_server.ApiServer.init(std.testing.allocator, &test_io, "127.0.0.1", 0) catch return error.SkipZigTest;
     defer server.deinit();

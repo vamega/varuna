@@ -264,6 +264,8 @@ pub fn build(b: *std.Build) void {
     });
     const run_peer_mode_tests = b.addRunArtifact(peer_mode_tests);
     test_step.dependOn(&run_peer_mode_tests.step);
+    const test_peer_mode_step = b.step("test-peer-mode-regression", "Run peer mode protocol regression tests");
+    test_peer_mode_step.dependOn(&run_peer_mode_tests.step);
 
     const peer_policy_tests = b.addTest(.{
         .root_module = varuna_mod,
@@ -272,6 +274,14 @@ pub fn build(b: *std.Build) void {
     const run_peer_policy_tests = b.addRunArtifact(peer_policy_tests);
     const test_peer_policy_step = b.step("test-peer-policy", "Run peer policy ownership and scheduling tests");
     test_peer_policy_step.dependOn(&run_peer_policy_tests.step);
+
+    const peer_unchoke_tests = b.addTest(.{
+        .root_module = varuna_mod,
+        .filters = &.{"recalculateUnchokes"},
+    });
+    const run_peer_unchoke_tests = b.addRunArtifact(peer_unchoke_tests);
+    const test_peer_unchoke_step = b.step("test-peer-unchoke", "Run peer unchoke scheduling tests");
+    test_peer_unchoke_step.dependOn(&run_peer_unchoke_tests.step);
 
     const private_tracker_tests = b.addTest(.{
         .root_module = b.createModule(.{

@@ -40,10 +40,10 @@
 //! `src/io/http_executor.zig`, `src/rpc/server.zig`,
 //! `src/tracker/executor.zig`, `src/tracker/udp_executor.zig`,
 //! `src/daemon/torrent_session.zig`) reach the chosen backend through
-//! the `RealIO` alias here. Standalone CLI tools (`src/app.zig`,
-//! `src/storage/verify.zig`) and benchmarks (`src/perf/workloads.zig`)
-//! still hard-import `real_io.zig` per the AGENTS.md exemption — those
-//! are out-of-scope for the io_uring policy.
+//! the `RealIO` alias here. Standalone CLI tools and benchmarks are
+//! out-of-scope for the io_uring policy, but tests and utility commands
+//! that exercise daemon storage can still use the selected backend through
+//! the one-shot helpers below.
 //!
 //! Sites that need a one-shot ring (e.g. `PieceStore.init`'s per-torrent
 //! fallocate drain) call `initOneshot(allocator)` instead of branching
@@ -135,15 +135,20 @@ pub const SelectedBackend = enum {
 /// that want a SimIO construct it directly with their own seeded fault
 /// config. There's no sensible default `SimIO.init` shape we could pick
 /// here that would match what tests actually want.
-pub fn initOneshot(allocator: std.mem.Allocator) !RealIO {
+pub fn initWithCapacity(allocator: std.mem.Allocator, capacity: u32) !RealIO {
+    const entries: u16 = @intCast(@min(capacity, std.math.maxInt(u16)));
     return switch (selected) {
-        .io_uring => RealIO.init(.{ .entries = 16 }),
-        .epoll_posix => RealIO.init(allocator, .{ .max_completions = 16, .file_pool_workers = 4 }),
-        .epoll_mmap => RealIO.init(allocator, .{ .max_completions = 16 }),
-        .kqueue_posix => RealIO.init(allocator, .{ .timer_capacity = 16, .file_pool_workers = 4 }),
-        .kqueue_mmap => RealIO.init(allocator, .{ .timer_capacity = 16 }),
+        .io_uring => RealIO.init(.{ .entries = entries }),
+        .epoll_posix => RealIO.init(allocator, .{ .max_completions = capacity, .file_pool_workers = 4 }),
+        .epoll_mmap => RealIO.init(allocator, .{ .max_completions = capacity }),
+        .kqueue_posix => RealIO.init(allocator, .{ .timer_capacity = capacity, .pending_capacity = @max(capacity, 256), .file_pool_workers = 4 }),
+        .kqueue_mmap => RealIO.init(allocator, .{ .timer_capacity = capacity, .pending_capacity = @max(capacity, 256) }),
         .sim => @compileError("backend.initOneshot is not available under -Dio=sim; sim instances are caller-constructed for tests"),
     };
+}
+
+pub fn initOneshot(allocator: std.mem.Allocator) !RealIO {
+    return initWithCapacity(allocator, 16);
 }
 
 /// Construct a long-lived production-sized instance of the selected

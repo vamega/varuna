@@ -99,7 +99,7 @@ test "single-piece transfer between seeder and downloader on shared event loop" 
     const session = try Session.load(allocator, torrent_bytes, data_root);
     defer session.deinit(allocator);
 
-    var store_init_io = varuna.io.real_io.RealIO.init(.{ .entries = 16 }) catch return error.SkipZigTest;
+    var store_init_io = varuna.io.backend.initWithCapacity(allocator, 16) catch return error.SkipZigTest;
     defer store_init_io.deinit();
     var store = try PieceStore.init(allocator, &session, &store_init_io);
     defer store.deinit();

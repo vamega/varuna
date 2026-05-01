@@ -2,6 +2,7 @@ const std = @import("std");
 const crypto = @import("../crypto/root.zig");
 const Sha1 = crypto.Sha1;
 const Sha256 = crypto.Sha256;
+const io_backend = @import("../io/backend.zig");
 const torrent = @import("../torrent/root.zig");
 const writer = @import("writer.zig");
 
@@ -671,7 +672,7 @@ test "recheck existing on-disk pieces" {
     const session = try torrent.session.Session.load(std.testing.allocator, input, target_root);
     defer session.deinit(std.testing.allocator);
 
-    var verify_io = try @import("../io/real_io.zig").RealIO.init(.{ .entries = 16 });
+    var verify_io = try io_backend.initWithCapacity(std.testing.allocator, 16);
     defer verify_io.deinit();
     var store = try writer.PieceStore.init(std.testing.allocator, &session, &verify_io);
     defer store.deinit();

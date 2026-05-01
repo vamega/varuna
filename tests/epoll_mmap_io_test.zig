@@ -163,12 +163,13 @@ test "EpollMmapIO multi-tick send/recv round-trip on real socketpair" {
 
     var send_c = Completion{};
     try io.send(.{ .fd = fds[0], .buf = "epoll-mmap" }, &send_c, &counter, sendCb);
-    try testing.expectEqual(@as(u32, 1), counter.sent);
+    try testing.expectEqual(@as(u32, 0), counter.sent);
 
     var attempts: u32 = 0;
-    while (counter.received < 1 and attempts < 100) : (attempts += 1) {
+    while ((counter.sent < 1 or counter.received < 1) and attempts < 100) : (attempts += 1) {
         try io.tick(1);
     }
+    try testing.expectEqual(@as(u32, 1), counter.sent);
     try testing.expectEqual(@as(u32, 1), counter.received);
     try testing.expectEqual(@as(usize, 10), counter.bytes_sent);
     try testing.expectEqual(@as(usize, 10), counter.bytes_received);
@@ -189,6 +190,7 @@ test "EpollMmapIO mmap-backed write triggers remap on file growth" {
     var counter = Counter{};
     var fa1_c = Completion{};
     try io.fallocate(.{ .fd = file.handle, .offset = 0, .len = 1024 }, &fa1_c, &counter, fallocateCb);
+    try io.tick(1);
     try testing.expectEqual(@as(u32, 1), counter.file_calls);
     try testing.expectEqual(@as(?anyerror, null), counter.last_err);
 
@@ -196,6 +198,7 @@ test "EpollMmapIO mmap-backed write triggers remap on file growth" {
     var w1_c = Completion{};
     counter.file_calls = 0;
     try io.write(.{ .fd = file.handle, .buf = "near-end", .offset = 1000 }, &w1_c, &counter, writeCb);
+    try io.tick(1);
     try testing.expectEqual(@as(usize, 8), counter.file_bytes);
     try testing.expectEqual(@as(?anyerror, null), counter.last_err);
 
@@ -203,6 +206,7 @@ test "EpollMmapIO mmap-backed write triggers remap on file growth" {
     var fa2_c = Completion{};
     counter.file_calls = 0;
     try io.fallocate(.{ .fd = file.handle, .offset = 0, .len = 8192 }, &fa2_c, &counter, fallocateCb);
+    try io.tick(1);
     try testing.expectEqual(@as(?anyerror, null), counter.last_err);
 
     // Write past the original mapping — should trigger a remap and succeed.
@@ -210,6 +214,7 @@ test "EpollMmapIO mmap-backed write triggers remap on file growth" {
     counter.file_calls = 0;
     counter.file_bytes = 0;
     try io.write(.{ .fd = file.handle, .buf = "past-old-mapping-edge", .offset = 4096 }, &w2_c, &counter, writeCb);
+    try io.tick(1);
     try testing.expectEqual(@as(usize, 21), counter.file_bytes);
     try testing.expectEqual(@as(?anyerror, null), counter.last_err);
 
@@ -219,6 +224,7 @@ test "EpollMmapIO mmap-backed write triggers remap on file growth" {
     counter.file_calls = 0;
     counter.file_bytes = 0;
     try io.read(.{ .fd = file.handle, .buf = &read_buf, .offset = 4096 }, &r_c, &counter, readCb);
+    try io.tick(1);
     try testing.expectEqual(@as(usize, 21), counter.file_bytes);
     try testing.expectEqualStrings("past-old-mapping-edge", &read_buf);
 }
@@ -235,11 +241,13 @@ test "EpollMmapIO fsync (msync) on a populated mapping succeeds" {
     var counter = Counter{};
     var fa_c = Completion{};
     try io.fallocate(.{ .fd = file.handle, .offset = 0, .len = 4096 }, &fa_c, &counter, fallocateCb);
+    try io.tick(1);
     try testing.expectEqual(@as(?anyerror, null), counter.last_err);
 
     var w_c = Completion{};
     counter.file_calls = 0;
     try io.write(.{ .fd = file.handle, .buf = "fsync-me", .offset = 0 }, &w_c, &counter, writeCb);
+    try io.tick(1);
     try testing.expectEqual(@as(usize, 8), counter.file_bytes);
 
     // fsync goes through msync(MS_SYNC) since a mapping is established.
@@ -247,6 +255,7 @@ test "EpollMmapIO fsync (msync) on a populated mapping succeeds" {
     counter.file_calls = 0;
     counter.last_err = null;
     try io.fsync(.{ .fd = file.handle, .datasync = true }, &s_c, &counter, fsyncCb);
+    try io.tick(1);
     try testing.expectEqual(@as(u32, 1), counter.file_calls);
     try testing.expectEqual(@as(?anyerror, null), counter.last_err);
 }
@@ -264,6 +273,7 @@ test "EpollMmapIO truncate invalidates mapping; next read reflects new size" {
     var counter = Counter{};
     var t1_c = Completion{};
     try io.truncate(.{ .fd = file.handle, .length = 256 }, &t1_c, &counter, truncateCb);
+    try io.tick(1);
     try testing.expectEqual(@as(?anyerror, null), counter.last_err);
 
     // Read at offset 200 — within range, should return 16 bytes (zeroed).
@@ -272,6 +282,7 @@ test "EpollMmapIO truncate invalidates mapping; next read reflects new size" {
     counter.file_calls = 0;
     counter.file_bytes = 0;
     try io.read(.{ .fd = file.handle, .buf = &read_buf, .offset = 200 }, &r1_c, &counter, readCb);
+    try io.tick(1);
     try testing.expectEqual(@as(usize, 16), counter.file_bytes);
 
     // Truncate down to 100 bytes — invalidates the existing 256-byte
@@ -280,12 +291,14 @@ test "EpollMmapIO truncate invalidates mapping; next read reflects new size" {
     counter.file_calls = 0;
     counter.last_err = null;
     try io.truncate(.{ .fd = file.handle, .length = 100 }, &t2_c, &counter, truncateCb);
+    try io.tick(1);
     try testing.expectEqual(@as(?anyerror, null), counter.last_err);
 
     var r2_c = Completion{};
     counter.file_calls = 0;
     counter.file_bytes = 999; // sentinel: detect "didn't get called"
     try io.read(.{ .fd = file.handle, .buf = &read_buf, .offset = 200 }, &r2_c, &counter, readCb);
+    try io.tick(1);
     // After truncate to 100, offset 200 is past EOF -> zero bytes.
     try testing.expectEqual(@as(usize, 0), counter.file_bytes);
 }

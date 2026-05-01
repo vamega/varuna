@@ -186,9 +186,8 @@ test "max_piece_count covers BEP-9-cap-class metadata" {
 
 test "AsyncMetadataFetch with shared buffers: assembler routes through shared path" {
     const metadata_handler = varuna.io.metadata_handler;
-    const RealIO = varuna.io.real_io.RealIO;
 
-    var io = try RealIO.init(.{ .entries = 4 });
+    var io = try varuna.io.backend.initWithCapacity(testing.allocator, 4);
     defer io.deinit();
 
     const buf = try testing.allocator.alloc(u8, ut_metadata.max_metadata_size);
@@ -221,9 +220,8 @@ test "AsyncMetadataFetch with shared buffers: assembler routes through shared pa
 
 test "AsyncMetadataFetch without shared buffers: assembler owns storage" {
     const metadata_handler = varuna.io.metadata_handler;
-    const RealIO = varuna.io.real_io.RealIO;
 
-    var io = try RealIO.init(.{ .entries = 4 });
+    var io = try varuna.io.backend.initWithCapacity(testing.allocator, 4);
     defer io.deinit();
 
     const peers = [_]std.net.Address{};

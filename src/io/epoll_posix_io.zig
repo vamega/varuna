@@ -91,16 +91,25 @@ const PoolCompleted = posix_file_pool.Completed;
 //   * `registered_fd`     — fd to remove from epoll on disarm/cancel; we
 //                           store it explicitly because the op union may be
 //                           rewritten by a callback before we read it.
+//   * `interest`          — which per-fd readiness lane owns this completion.
 //   * `accept_multishot`  — sticky flag for multishot-accept drain-loop.
 //   * `deadline_ns`       — absolute monotonic nanoseconds for timers.
 //   * `timer_heap_index`  — sentinel-tagged index into the timer heap.
 
 const sentinel_index: u32 = std.math.maxInt(u32);
 
+const FdInterest = enum(u8) {
+    none,
+    read,
+    write,
+    poll,
+};
+
 pub const EpollState = struct {
     in_flight: bool = false,
     epoll_registered: bool = false,
     accept_multishot: bool = false,
+    interest: FdInterest = .none,
     /// fd we registered in the epoll set, if any. Stored separately from
     /// `c.op` because the callback may rearm with a different op; we still
     /// need to know which fd to `EPOLL_CTL_DEL` on disarm.
@@ -120,6 +129,16 @@ comptime {
 inline fn epollState(c: *Completion) *EpollState {
     return c.backendStateAs(EpollState);
 }
+
+const FdRegistration = struct {
+    read: ?*Completion = null,
+    write: ?*Completion = null,
+    poll: ?*Completion = null,
+
+    fn isEmpty(self: FdRegistration) bool {
+        return self.read == null and self.write == null and self.poll == null;
+    }
+};
 
 // ── Configuration ─────────────────────────────────────────
 
@@ -204,6 +223,7 @@ const TimerHeap = struct {
 pub const EpollPosixIO = struct {
     allocator: std.mem.Allocator,
     epoll_fd: posix.fd_t,
+    wakeup_ctx: *posix.fd_t,
     /// Cross-thread wakeup primitive. The file-op thread pool writes a
     /// `u64` to this fd whenever a worker pushes a result; we read it
     /// inside `tick` to drain accumulated wake counts (eventfd semantics
@@ -226,6 +246,7 @@ pub const EpollPosixIO = struct {
     /// ticks; sized lazily as the pool grows. Owned by EpollPosixIO so
     /// no allocation churn on hot ticks.
     pool_swap: std.ArrayListUnmanaged(PoolCompleted) = .{},
+    fd_registrations: std.AutoHashMap(posix.fd_t, FdRegistration),
 
     pub fn init(allocator: std.mem.Allocator, config: Config) !EpollPosixIO {
         const epoll_rc = linux.epoll_create1(linux.EPOLL.CLOEXEC);
@@ -251,6 +272,10 @@ pub const EpollPosixIO = struct {
         const wakeup_fd: posix.fd_t = @intCast(efd_rc);
         errdefer posix.close(wakeup_fd);
 
+        const wakeup_ctx = try allocator.create(posix.fd_t);
+        errdefer allocator.destroy(wakeup_ctx);
+        wakeup_ctx.* = wakeup_fd;
+
         var ev: linux.epoll_event = .{
             .events = linux.EPOLL.IN,
             .data = .{ .fd = wakeup_fd },
@@ -269,29 +294,25 @@ pub const EpollPosixIO = struct {
             .pending_capacity = config.file_pool_pending_capacity,
         });
         errdefer pool.deinit();
-
-        // Stash `wakeup_fd` on the pool's wake context. We can't use
-        // `&self` here (init returns the value), so the wake hook
-        // resolves the fd via the EpollPosixIO pointer wired up after
-        // the struct is constructed below.
-        // (We complete the wiring before returning.)
+        pool.setWakeup(wakeup_ctx, wakeFromPool);
 
         return .{
             .allocator = allocator,
             .epoll_fd = epoll_fd,
+            .wakeup_ctx = wakeup_ctx,
             .wakeup_fd = wakeup_fd,
             .timers = timers,
             .pool = pool,
+            .fd_registrations = std.AutoHashMap(posix.fd_t, FdRegistration).init(allocator),
         };
     }
 
-    /// Finishes init by binding the pool's wakeup callback to this
-    /// EpollPosixIO. Call right after `init` returns, before submitting
-    /// any file ops. Separated from `init` because the wake function
-    /// needs a stable `*EpollPosixIO` and `init` returns a value (not a
-    /// pointer).
+    /// Compatibility no-op for older direct tests that called this
+    /// after `init`. The wake context is now bound during `init` using a
+    /// heap-stable fd pointer, so by-value backend construction through
+    /// `backend.initOneshot` and `backend.initEventLoop` is safe.
     pub fn bindWakeup(self: *EpollPosixIO) void {
-        self.pool.setWakeup(self, wakeFromPool);
+        self.pool.setWakeup(self.wakeup_ctx, wakeFromPool);
     }
 
     pub fn deinit(self: *EpollPosixIO) void {
@@ -300,7 +321,9 @@ pub const EpollPosixIO = struct {
         // eventfd stays open until we close it below.
         self.pool.deinit();
         self.pool_swap.deinit(self.allocator);
+        self.fd_registrations.deinit();
         self.timers.deinit();
+        self.allocator.destroy(self.wakeup_ctx);
         posix.close(self.wakeup_fd);
         posix.close(self.epoll_fd);
         self.* = undefined;
@@ -313,9 +336,9 @@ pub const EpollPosixIO = struct {
     /// effectively impossible) means the next tick will pick the
     /// result up via `pool.drainCompletedInto` regardless.
     fn wakeFromPool(ctx: ?*anyopaque) void {
-        const self: *EpollPosixIO = @ptrCast(@alignCast(ctx.?));
+        const wakeup_fd: *const posix.fd_t = @ptrCast(@alignCast(ctx.?));
         const val: u64 = 1;
-        _ = posix.write(self.wakeup_fd, std.mem.asBytes(&val)) catch {};
+        _ = posix.write(wakeup_fd.*, std.mem.asBytes(&val)) catch {};
     }
 
     /// Synchronously close a file descriptor. Mirrors `RealIO.closeSocket`.
@@ -325,6 +348,11 @@ pub const EpollPosixIO = struct {
     /// registered.
     pub fn closeSocket(self: *EpollPosixIO, fd: posix.fd_t) void {
         _ = linux.epoll_ctl(self.epoll_fd, linux.EPOLL.CTL_DEL, fd, null);
+        if (self.fd_registrations.fetchRemove(fd)) |entry| {
+            if (entry.value.read) |c| self.clearRegisteredCompletion(c);
+            if (entry.value.write) |c| self.clearRegisteredCompletion(c);
+            if (entry.value.poll) |c| self.clearRegisteredCompletion(c);
+        }
         posix.close(fd);
     }
 
@@ -340,7 +368,8 @@ pub const EpollPosixIO = struct {
         try self.fireExpiredTimers(&fired);
         try self.drainPool(&fired);
 
-        if (self.active == 0 and (wait_at_least == 0 or fired >= wait_at_least)) return;
+        if (self.active == 0) return;
+        if (wait_at_least != 0 and fired >= wait_at_least) return;
 
         const timeout_ms: i32 = self.computeEpollTimeout(wait_at_least, fired);
 
@@ -360,8 +389,7 @@ pub const EpollPosixIO = struct {
                 _ = posix.read(self.wakeup_fd, std.mem.asBytes(&buf)) catch {};
                 continue;
             }
-            const c: *Completion = @ptrFromInt(@as(usize, @intCast(ev.data.ptr)));
-            try self.dispatchReady(c, ev.events);
+            try self.dispatchFdReady(ev.data.fd, ev.events);
         }
 
         try self.fireExpiredTimers(&fired);
@@ -459,25 +487,62 @@ pub const EpollPosixIO = struct {
         }
     }
 
-    /// Dispatch a ready fd from the epoll wait loop. Clears the
-    /// completion's epoll registration (EPOLLONESHOT is already
-    /// auto-disabled by the kernel; we just clean up state) and re-runs
-    /// the operation through the resubmit path. The submission method
-    /// retries the syscall and either delivers the result inline or
-    /// re-registers if EAGAIN comes back.
-    fn dispatchReady(self: *EpollPosixIO, c: *Completion, events: u32) !void {
+    /// Dispatch all completions interested in the ready event for `fd`.
+    /// epoll only stores one user-data value per fd, but io_uring callers
+    /// routinely keep an independent recv and send in flight on the same
+    /// socket. We therefore demultiplex the fd readiness into read/write
+    /// lanes and deliver the matching caller-owned completions.
+    fn dispatchFdReady(self: *EpollPosixIO, fd: posix.fd_t, events: u32) !void {
+        const reg = self.fd_registrations.getPtr(fd) orelse return;
+
+        var write_c: ?*Completion = null;
+        var read_c: ?*Completion = null;
+        var poll_c: ?*Completion = null;
+
+        if (reg.write) |c| {
+            if ((events & (linux.EPOLL.OUT | linux.EPOLL.ERR | linux.EPOLL.HUP | linux.EPOLL.RDHUP)) != 0) {
+                write_c = c;
+                reg.write = null;
+                self.clearRegisteredCompletion(c);
+            }
+        }
+        if (reg.read) |c| {
+            if ((events & (linux.EPOLL.IN | linux.EPOLL.ERR | linux.EPOLL.HUP | linux.EPOLL.RDHUP)) != 0) {
+                read_c = c;
+                reg.read = null;
+                self.clearRegisteredCompletion(c);
+            }
+        }
+        if (reg.poll) |c| {
+            const poll_events = switch (c.op) {
+                .poll => |op| op.events,
+                else => 0,
+            };
+            if ((events & (poll_events | linux.EPOLL.ERR | linux.EPOLL.HUP | linux.EPOLL.RDHUP)) != 0) {
+                poll_c = c;
+                reg.poll = null;
+                self.clearRegisteredCompletion(c);
+            }
+        }
+
+        try self.updateFdRegistration(fd);
+
+        // Deliver write-side completions first. Tracked sends can be
+        // heap-backed; a recv callback may disconnect the peer and free
+        // those buffers, while the embedded recv completion remains stable
+        // if a send callback disconnects first.
+        if (write_c) |c| try self.dispatchReadyCompletion(c, events);
+        if (read_c) |c| try self.dispatchReadyCompletion(c, events);
+        if (poll_c) |c| try self.dispatchReadyCompletion(c, events);
+    }
+
+    /// Dispatch one ready completion. The fd registration has already been
+    /// removed from the per-fd table before this is called.
+    fn dispatchReadyCompletion(self: *EpollPosixIO, c: *Completion, events: u32) !void {
         const st = epollState(c);
         const cb = c.callback orelse return;
-
-        // Clean up the epoll registration. EPOLLONESHOT means the kernel
-        // has already disabled this fd's interest — but we still need to
-        // EPOLL_CTL_DEL to tear down state for re-add later.
-        if (st.epoll_registered) {
-            _ = linux.epoll_ctl(self.epoll_fd, linux.EPOLL.CTL_DEL, st.registered_fd, null);
-            st.epoll_registered = false;
-        }
-        st.in_flight = false;
-        self.active -|= 1;
+        std.debug.assert(!st.epoll_registered);
+        std.debug.assert(!st.in_flight);
 
         // Build the result by retrying the operation. If retry returns
         // EAGAIN (rare under EPOLLONESHOT), we'll re-register via the
@@ -563,16 +628,8 @@ pub const EpollPosixIO = struct {
 
         const addrlen = op.addr.getOsSockLen();
         if (posix.connect(op.fd, &op.addr.any, addrlen)) {
-            // Connect completed synchronously (e.g. AF_UNIX).
-            const action = try self.deliverInline(c, .{ .connect = {} });
-            switch (action) {
-                .disarm => return,
-                .rearm => switch (c.op) {
-                    .connect => |new_op| try self.connect(new_op, c, ud, cb),
-                    else => return,
-                },
-            }
-            return;
+            // Completed immediately. Still route completion through epoll so
+            // callers observe async ordering consistent with io_uring.
         } else |err| switch (err) {
             error.WouldBlock => {},
             else => {
@@ -598,157 +655,27 @@ pub const EpollPosixIO = struct {
     pub fn accept(self: *EpollPosixIO, op: ifc.AcceptOp, c: *Completion, ud: ?*anyopaque, cb: Callback) !void {
         try self.armCompletion(c, .{ .accept = op }, ud, cb);
         epollState(c).accept_multishot = op.multishot;
-
-        // Try once before parking — there may already be a pending
-        // connection. If accept returns EAGAIN we register and wait.
-        if (doAccept(op.fd)) |accepted| {
-            const action = try self.deliverInline(c, .{ .accept = accepted });
-            switch (action) {
-                .disarm => return,
-                .rearm => switch (c.op) {
-                    .accept => |new_op| try self.accept(new_op, c, ud, cb),
-                    else => return,
-                },
-            }
-            return;
-        } else |err| switch (err) {
-            error.WouldBlock => {},
-            else => {
-                const action = try self.deliverInline(c, .{ .accept = err });
-                switch (action) {
-                    .disarm => return,
-                    .rearm => switch (c.op) {
-                        .accept => |new_op| try self.accept(new_op, c, ud, cb),
-                        else => return,
-                    },
-                }
-                return;
-            },
-        }
-
         try self.registerFd(c, op.fd, linux.EPOLL.IN);
     }
 
     pub fn recv(self: *EpollPosixIO, op_in: ifc.RecvOp, c: *Completion, ud: ?*anyopaque, cb: Callback) !void {
-        var op = op_in;
-        while (true) {
-            try self.armCompletion(c, .{ .recv = op }, ud, cb);
-
-            const result: Result = res: {
-                if (posix.recv(op.fd, op.buf, op.flags)) |n| {
-                    break :res .{ .recv = n };
-                } else |err| {
-                    if (err == error.WouldBlock) {
-                        try self.registerFd(c, op.fd, linux.EPOLL.IN);
-                        return;
-                    }
-                    break :res .{ .recv = err };
-                }
-            };
-
-            switch (try self.deliverInline(c, result)) {
-                .disarm => return,
-                .rearm => switch (c.op) {
-                    .recv => |new_op| {
-                        op = new_op;
-                        continue;
-                    },
-                    else => return,
-                },
-            }
-        }
+        try self.armCompletion(c, .{ .recv = op_in }, ud, cb);
+        try self.registerFd(c, op_in.fd, linux.EPOLL.IN);
     }
 
     pub fn send(self: *EpollPosixIO, op_in: ifc.SendOp, c: *Completion, ud: ?*anyopaque, cb: Callback) !void {
-        var op = op_in;
-        while (true) {
-            try self.armCompletion(c, .{ .send = op }, ud, cb);
-
-            const result: Result = res: {
-                if (posix.send(op.fd, op.buf, op.flags)) |n| {
-                    break :res .{ .send = n };
-                } else |err| {
-                    if (err == error.WouldBlock) {
-                        try self.registerFd(c, op.fd, linux.EPOLL.OUT);
-                        return;
-                    }
-                    break :res .{ .send = err };
-                }
-            };
-
-            switch (try self.deliverInline(c, result)) {
-                .disarm => return,
-                .rearm => switch (c.op) {
-                    .send => |new_op| {
-                        op = new_op;
-                        continue;
-                    },
-                    else => return,
-                },
-            }
-        }
+        try self.armCompletion(c, .{ .send = op_in }, ud, cb);
+        try self.registerFd(c, op_in.fd, linux.EPOLL.OUT);
     }
 
     pub fn recvmsg(self: *EpollPosixIO, op_in: ifc.RecvmsgOp, c: *Completion, ud: ?*anyopaque, cb: Callback) !void {
-        var op = op_in;
-        while (true) {
-            try self.armCompletion(c, .{ .recvmsg = op }, ud, cb);
-
-            const result: Result = res: {
-                const n = doRecvmsg(op);
-                if (n) |bytes| {
-                    break :res .{ .recvmsg = bytes };
-                } else |err| {
-                    if (err == error.WouldBlock) {
-                        try self.registerFd(c, op.fd, linux.EPOLL.IN);
-                        return;
-                    }
-                    break :res .{ .recvmsg = err };
-                }
-            };
-
-            switch (try self.deliverInline(c, result)) {
-                .disarm => return,
-                .rearm => switch (c.op) {
-                    .recvmsg => |new_op| {
-                        op = new_op;
-                        continue;
-                    },
-                    else => return,
-                },
-            }
-        }
+        try self.armCompletion(c, .{ .recvmsg = op_in }, ud, cb);
+        try self.registerFd(c, op_in.fd, linux.EPOLL.IN);
     }
 
     pub fn sendmsg(self: *EpollPosixIO, op_in: ifc.SendmsgOp, c: *Completion, ud: ?*anyopaque, cb: Callback) !void {
-        var op = op_in;
-        while (true) {
-            try self.armCompletion(c, .{ .sendmsg = op }, ud, cb);
-
-            const result: Result = res: {
-                const n = doSendmsg(op);
-                if (n) |bytes| {
-                    break :res .{ .sendmsg = bytes };
-                } else |err| {
-                    if (err == error.WouldBlock) {
-                        try self.registerFd(c, op.fd, linux.EPOLL.OUT);
-                        return;
-                    }
-                    break :res .{ .sendmsg = err };
-                }
-            };
-
-            switch (try self.deliverInline(c, result)) {
-                .disarm => return,
-                .rearm => switch (c.op) {
-                    .sendmsg => |new_op| {
-                        op = new_op;
-                        continue;
-                    },
-                    else => return,
-                },
-            }
-        }
+        try self.armCompletion(c, .{ .sendmsg = op_in }, ud, cb);
+        try self.registerFd(c, op_in.fd, linux.EPOLL.OUT);
     }
 
     /// Synchronous fallback. Epoll has no equivalent of
@@ -869,11 +796,7 @@ pub const EpollPosixIO = struct {
 
         // Registered with epoll?
         if (!found and tst.epoll_registered) {
-            _ = linux.epoll_ctl(self.epoll_fd, linux.EPOLL.CTL_DEL, tst.registered_fd, null);
-            tst.epoll_registered = false;
-            tst.registered_fd = -1;
-            tst.in_flight = false;
-            self.active -|= 1;
+            _ = try self.unregisterCompletion(target);
             found = true;
 
             if (target.callback) |target_cb| {
@@ -990,30 +913,131 @@ pub const EpollPosixIO = struct {
     }
 
     fn registerFd(self: *EpollPosixIO, c: *Completion, fd: posix.fd_t, events: u32) !void {
-        var ev: linux.epoll_event = .{
-            .events = events | linux.EPOLL.ONESHOT | linux.EPOLL.RDHUP,
-            .data = .{ .ptr = @intFromPtr(c) },
+        _ = events;
+        const interest = fdInterestForCompletion(c);
+        const gop = try self.fd_registrations.getOrPut(fd);
+        if (!gop.found_existing) gop.value_ptr.* = .{};
+        const reg = gop.value_ptr;
+        const lane: *?*Completion = switch (interest) {
+            .read => &reg.read,
+            .write => &reg.write,
+            .poll => &reg.poll,
+            .none => return error.UnsupportedOperation,
         };
-        const rc = linux.epoll_ctl(self.epoll_fd, linux.EPOLL.CTL_ADD, fd, &ev);
-        switch (linux.E.init(rc)) {
+        if (lane.* != null and lane.* != c) {
+            epollState(c).in_flight = false;
+            return error.AlreadyInFlight;
+        }
+        lane.* = c;
+
+        self.updateFdRegistration(fd) catch |err| {
+            if (lane.* == c) lane.* = null;
+            if (reg.isEmpty()) _ = self.fd_registrations.remove(fd);
+            const st = epollState(c);
+            st.in_flight = false;
+            st.epoll_registered = false;
+            st.registered_fd = -1;
+            st.interest = .none;
+            return err;
+        };
+
+        const st = epollState(c);
+        st.epoll_registered = true;
+        st.registered_fd = fd;
+        st.interest = interest;
+        self.active += 1;
+    }
+
+    fn updateFdRegistration(self: *EpollPosixIO, fd: posix.fd_t) !void {
+        const reg = self.fd_registrations.get(fd) orelse return;
+        if (reg.isEmpty()) {
+            _ = linux.epoll_ctl(self.epoll_fd, linux.EPOLL.CTL_DEL, fd, null);
+            _ = self.fd_registrations.remove(fd);
+            return;
+        }
+
+        var ev: linux.epoll_event = .{
+            .events = fdRegistrationEvents(reg),
+            .data = .{ .fd = fd },
+        };
+        const mod_rc = linux.epoll_ctl(self.epoll_fd, linux.EPOLL.CTL_MOD, fd, &ev);
+        switch (linux.E.init(mod_rc)) {
+            .SUCCESS => return,
+            .NOENT => {},
+            .BADF => return error.FileDescriptorInvalid,
+            .PERM => return error.FileDescriptorIncompatibleWithEpoll,
+            else => |e| return posix.unexpectedErrno(e),
+        }
+
+        const add_rc = linux.epoll_ctl(self.epoll_fd, linux.EPOLL.CTL_ADD, fd, &ev);
+        switch (linux.E.init(add_rc)) {
             .SUCCESS => {},
             .EXIST => {
-                // Already registered (e.g. previous EPOLLONESHOT armed but
-                // not yet fired) — modify instead.
-                const mod_rc = linux.epoll_ctl(self.epoll_fd, linux.EPOLL.CTL_MOD, fd, &ev);
-                switch (linux.E.init(mod_rc)) {
+                const retry_rc = linux.epoll_ctl(self.epoll_fd, linux.EPOLL.CTL_MOD, fd, &ev);
+                switch (linux.E.init(retry_rc)) {
                     .SUCCESS => {},
                     else => |e| return posix.unexpectedErrno(e),
                 }
             },
             .NOMEM, .NOSPC => return error.SystemResources,
             .PERM => return error.FileDescriptorIncompatibleWithEpoll,
+            .BADF => return error.FileDescriptorInvalid,
             else => |e| return posix.unexpectedErrno(e),
         }
+    }
+
+    fn unregisterCompletion(self: *EpollPosixIO, c: *Completion) !bool {
         const st = epollState(c);
-        st.epoll_registered = true;
-        st.registered_fd = fd;
-        self.active += 1;
+        if (!st.epoll_registered) return false;
+        const fd = st.registered_fd;
+        if (self.fd_registrations.getPtr(fd)) |reg| {
+            switch (st.interest) {
+                .read => {
+                    if (reg.read == c) reg.read = null;
+                },
+                .write => {
+                    if (reg.write == c) reg.write = null;
+                },
+                .poll => {
+                    if (reg.poll == c) reg.poll = null;
+                },
+                .none => {},
+            }
+        }
+        self.clearRegisteredCompletion(c);
+        try self.updateFdRegistration(fd);
+        return true;
+    }
+
+    fn clearRegisteredCompletion(self: *EpollPosixIO, c: *Completion) void {
+        const st = epollState(c);
+        st.in_flight = false;
+        st.epoll_registered = false;
+        st.registered_fd = -1;
+        st.interest = .none;
+        self.active -|= 1;
+    }
+
+    fn fdInterestForCompletion(c: *const Completion) FdInterest {
+        return switch (c.op) {
+            .recv, .recvmsg, .accept => .read,
+            .send, .sendmsg, .connect => .write,
+            .poll => .poll,
+            else => .none,
+        };
+    }
+
+    fn fdRegistrationEvents(reg: FdRegistration) u32 {
+        var events: u32 = linux.EPOLL.ONESHOT | linux.EPOLL.RDHUP;
+        if (reg.read != null) events |= linux.EPOLL.IN;
+        if (reg.write != null) events |= linux.EPOLL.OUT;
+        if (reg.poll) |c| {
+            events |= switch (c.op) {
+                .poll => |op| op.events,
+                else => 0,
+            };
+        }
+        return events;
     }
 
     /// Deliver a synchronous-completion result by clearing in_flight and
@@ -1056,6 +1080,35 @@ fn doSendmsg(op: ifc.SendmsgOp) anyerror!usize {
     }
 }
 
+fn doRecv(op: ifc.RecvOp) anyerror!usize {
+    const rc = posix.system.recvfrom(op.fd, op.buf.ptr, op.buf.len, op.flags, null, null);
+    switch (posix.errno(rc)) {
+        .SUCCESS => return @intCast(rc),
+        .AGAIN => return error.WouldBlock,
+        .BADF => return error.FileDescriptorInvalid,
+        .CONNREFUSED => return error.ConnectionRefused,
+        .CONNRESET => return error.ConnectionResetByPeer,
+        .INTR => return error.Interrupted,
+        .NOTCONN => return error.SocketNotConnected,
+        .TIMEDOUT => return error.ConnectionTimedOut,
+        else => |e| return posix.unexpectedErrno(e),
+    }
+}
+
+fn doSend(op: ifc.SendOp) anyerror!usize {
+    const rc = posix.system.sendto(op.fd, op.buf.ptr, op.buf.len, op.flags, null, 0);
+    switch (posix.errno(rc)) {
+        .SUCCESS => return @intCast(rc),
+        .AGAIN => return error.WouldBlock,
+        .BADF => return error.FileDescriptorInvalid,
+        .PIPE => return error.BrokenPipe,
+        .CONNRESET => return error.ConnectionResetByPeer,
+        .INTR => return error.Interrupted,
+        .NOTCONN => return error.SocketNotConnected,
+        else => |e| return posix.unexpectedErrno(e),
+    }
+}
+
 fn doConnectComplete(fd: posix.fd_t) anyerror!void {
     var err_val: u32 = 0;
     var err_len: posix.socklen_t = @sizeOf(u32);
@@ -1093,8 +1146,8 @@ fn doAccept(listen_fd: posix.fd_t) anyerror!ifc.Accepted {
 /// raced).
 fn performInline(c: *Completion, events: u32) Result {
     return switch (c.op) {
-        .recv => |op| .{ .recv = posix.recv(op.fd, op.buf, op.flags) },
-        .send => |op| .{ .send = posix.send(op.fd, op.buf, op.flags) },
+        .recv => |op| .{ .recv = doRecv(op) },
+        .send => |op| .{ .send = doSend(op) },
         .recvmsg => |op| .{ .recvmsg = doRecvmsg(op) },
         .sendmsg => |op| .{ .sendmsg = doSendmsg(op) },
         .connect => |op| .{ .connect = doConnectComplete(op.fd) },
@@ -1273,6 +1326,79 @@ test "EpollPosixIO send + recv round-trip on socketpair" {
     var recv_c = Completion{};
     try io.recv(.{ .fd = fds[1], .buf = &both.recv_buf }, &recv_c, &both, recv_cb);
     try io.send(.{ .fd = fds[0], .buf = "varuna" }, &send_c, &both, send_cb);
+
+    var attempts: u32 = 0;
+    while ((both.sent < 1 or both.received < 1) and attempts < 100) : (attempts += 1) {
+        try io.tick(1);
+    }
+
+    try testing.expectEqual(@as(usize, 6), both.bytes_sent);
+    try testing.expectEqual(@as(usize, 6), both.bytes_received);
+    try testing.expectEqualStrings("varuna", both.recv_buf[0..6]);
+}
+
+test "EpollPosixIO sendmsg + recv round-trip on socketpair" {
+    var io = try skipIfUnavailable();
+    defer io.deinit();
+
+    var fds: [2]i32 = undefined;
+    const rc = linux.socketpair(posix.AF.UNIX, posix.SOCK.STREAM, 0, &fds);
+    if (linux.E.init(rc) != .SUCCESS) return error.SkipZigTest;
+    defer posix.close(fds[0]);
+    defer posix.close(fds[1]);
+
+    try makeNonBlocking(fds[0]);
+    try makeNonBlocking(fds[1]);
+
+    const Both = struct {
+        sent: u32 = 0,
+        received: u32 = 0,
+        bytes_sent: usize = 0,
+        bytes_received: usize = 0,
+        recv_buf: [32]u8 = undefined,
+        iov: [2]posix.iovec_const = undefined,
+        msg: posix.msghdr_const = undefined,
+    };
+    var both = Both{};
+    both.iov[0] = .{ .base = "var".ptr, .len = 3 };
+    both.iov[1] = .{ .base = "una".ptr, .len = 3 };
+    both.msg = .{
+        .name = null,
+        .namelen = 0,
+        .iov = &both.iov,
+        .iovlen = both.iov.len,
+        .control = null,
+        .controllen = 0,
+        .flags = 0,
+    };
+
+    const send_cb = struct {
+        fn cb(ud: ?*anyopaque, _: *Completion, result: Result) CallbackAction {
+            const s: *Both = @ptrCast(@alignCast(ud.?));
+            s.sent += 1;
+            switch (result) {
+                .sendmsg => |r| s.bytes_sent = r catch 0,
+                else => {},
+            }
+            return .disarm;
+        }
+    }.cb;
+    const recv_cb = struct {
+        fn cb(ud: ?*anyopaque, _: *Completion, result: Result) CallbackAction {
+            const s: *Both = @ptrCast(@alignCast(ud.?));
+            s.received += 1;
+            switch (result) {
+                .recv => |r| s.bytes_received = r catch 0,
+                else => {},
+            }
+            return .disarm;
+        }
+    }.cb;
+
+    var send_c = Completion{};
+    var recv_c = Completion{};
+    try io.recv(.{ .fd = fds[1], .buf = &both.recv_buf }, &recv_c, &both, recv_cb);
+    try io.sendmsg(.{ .fd = fds[0], .msg = &both.msg }, &send_c, &both, send_cb);
 
     var attempts: u32 = 0;
     while ((both.sent < 1 or both.received < 1) and attempts < 100) : (attempts += 1) {

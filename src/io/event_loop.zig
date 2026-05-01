@@ -621,6 +621,15 @@ pub fn EventLoopOf(comptime IO: type) type {
             // pending io_uring operations that reference our buffers.
             // Do NOT free buffers yet -- the kernel may still be
             // completing cancelled SQEs that reference them.
+            if (self.listen_fd >= 0) {
+                self.listen_fd = -1;
+                self.io.cancel(
+                    .{ .target = &self.accept_completion },
+                    &self.accept_cancel_completion,
+                    null,
+                    ignoredCancelComplete,
+                ) catch {};
+            }
             for (self.peers) |*peer| {
                 // Clean up uTP slot state
                 if (peer.transport == .utp) {
@@ -2871,6 +2880,13 @@ pub fn EventLoopOf(comptime IO: type) type {
             return false;
         }
 
+        fn hasPendingSendForSlotExcept(self: *const Self, slot: u16, excluded: *const PendingSend) bool {
+            for (self.pending_sends.items) |ps| {
+                if (ps != excluded and ps.slot == slot) return true;
+            }
+            return false;
+        }
+
         fn releaseVectoredSendState(self: *Self, state: *VectoredSendState) void {
             for (state.piece_buffers) |piece_buffer| {
                 self.releasePieceBuffer(piece_buffer);
@@ -2955,23 +2971,29 @@ pub fn EventLoopOf(comptime IO: type) type {
         /// freed by `freeOnePendingSend(slot, send_id)` after the CQE arrives.
         pub fn submitPendingSend(self: *Self, ps: *PendingSend) !void {
             const peer = &self.peers[ps.slot];
+            peer.send_pending = true;
             switch (ps.storage) {
-                .owned => |owned| try self.io.send(
+                .owned => |owned| self.io.send(
                     .{ .fd = peer.fd, .buf = owned.buf },
                     &ps.completion,
                     self,
                     peer_handler.pendingSendCompleteFor(Self),
-                ),
-                .vectored => |state| try self.io.sendmsg(
+                ) catch |err| {
+                    peer.send_pending = peer.untracked_send_pending or self.hasPendingSendForSlotExcept(ps.slot, ps);
+                    return err;
+                },
+                .vectored => |state| self.io.sendmsg(
                     .{ .fd = peer.fd, .msg = &state.msg },
                     &ps.completion,
                     self,
                     peer_handler.pendingSendCompleteFor(Self),
-                ),
+                ) catch |err| {
+                    peer.send_pending = peer.untracked_send_pending or self.hasPendingSendForSlotExcept(ps.slot, ps);
+                    return err;
+                },
                 .ghost => unreachable, // submitPendingSend is called only on freshly-claimed slots; ghost is a post-removal state
                 .free => unreachable, // active PendingSend can't be in `free` state
             }
-            peer.send_pending = true;
         }
 
         pub fn trackPendingSendCopy(self: *Self, slot: u16, send_id: u32, data: []const u8) !*PendingSend {
