@@ -12,6 +12,7 @@ pub const SQLITE_OPEN_FULLMUTEX = 0x00010000;
 
 pub const Db = opaque {};
 pub const Stmt = opaque {};
+pub const Destructor = ?*align(1) const fn (?*anyopaque) callconv(.c) void;
 
 pub extern "sqlite3" fn sqlite3_open_v2(
     filename: [*:0]const u8,
@@ -47,7 +48,7 @@ pub extern "sqlite3" fn sqlite3_bind_blob(
     col: c_int,
     value: [*]const u8,
     n: c_int,
-    destructor: ?*const fn (?*anyopaque) callconv(.c) void,
+    destructor: Destructor,
 ) c_int;
 
 pub extern "sqlite3" fn sqlite3_bind_int(stmt: *Stmt, col: c_int, value: c_int) c_int;
@@ -63,7 +64,7 @@ pub extern "sqlite3" fn sqlite3_bind_text(
     col: c_int,
     value: [*]const u8,
     n: c_int,
-    destructor: ?*const fn (?*anyopaque) callconv(.c) void,
+    destructor: Destructor,
 ) c_int;
 
 pub extern "sqlite3" fn sqlite3_column_blob(stmt: *Stmt, col: c_int) ?[*]const u8;
@@ -73,4 +74,6 @@ pub extern "sqlite3" fn sqlite3_column_text(stmt: *Stmt, col: c_int) ?[*:0]const
 pub extern "sqlite3" fn sqlite3_errmsg(db: *Db) [*:0]const u8;
 pub extern "sqlite3" fn sqlite3_free(ptr: ?*anyopaque) void;
 
-pub const SQLITE_TRANSIENT: ?*const fn (?*anyopaque) callconv(.c) void = @ptrFromInt(@as(usize, std.math.maxInt(usize)));
+/// SQLite's C API defines this as `(sqlite3_destructor_type)-1`, a sentinel
+/// value that asks SQLite to copy the bytes before `sqlite3_bind_*` returns.
+pub const SQLITE_TRANSIENT: Destructor = @ptrFromInt(@as(usize, std.math.maxInt(usize)));
