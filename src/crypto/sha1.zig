@@ -702,8 +702,8 @@ inline fn arm_sha1c(abcd: @Vector(4, u32), e: u32, wk: @Vector(4, u32)) @Vector(
     // Qd = hash_abcd (input/output), Sn = hash_e (scalar in low 32 of Sn),
     // Vm = wk (scheduled words + constant)
     return asm (
-        \\dup v3.4s, %w[e]
-        \\sha1c %[abcd].4s, v3, %[wk].4s
+        \\dup v3.4s, %[e:w]
+        \\sha1c %[abcd:q], s3, %[wk].4s
         : [abcd] "=w" (-> @Vector(4, u32)),
         : [_] "0" (abcd),
           [e] "r" (e),
@@ -715,8 +715,8 @@ inline fn arm_sha1c(abcd: @Vector(4, u32), e: u32, wk: @Vector(4, u32)) @Vector(
 inline fn arm_sha1p(abcd: @Vector(4, u32), e: u32, wk: @Vector(4, u32)) @Vector(4, u32) {
     if (builtin.cpu.arch != .aarch64) @compileError("arm_sha1p requires aarch64");
     return asm (
-        \\dup v3.4s, %w[e]
-        \\sha1p %[abcd].4s, v3, %[wk].4s
+        \\dup v3.4s, %[e:w]
+        \\sha1p %[abcd:q], s3, %[wk].4s
         : [abcd] "=w" (-> @Vector(4, u32)),
         : [_] "0" (abcd),
           [e] "r" (e),
@@ -728,8 +728,8 @@ inline fn arm_sha1p(abcd: @Vector(4, u32), e: u32, wk: @Vector(4, u32)) @Vector(
 inline fn arm_sha1m(abcd: @Vector(4, u32), e: u32, wk: @Vector(4, u32)) @Vector(4, u32) {
     if (builtin.cpu.arch != .aarch64) @compileError("arm_sha1m requires aarch64");
     return asm (
-        \\dup v3.4s, %w[e]
-        \\sha1m %[abcd].4s, v3, %[wk].4s
+        \\dup v3.4s, %[e:w]
+        \\sha1m %[abcd:q], s3, %[wk].4s
         : [abcd] "=w" (-> @Vector(4, u32)),
         : [_] "0" (abcd),
           [e] "r" (e),
@@ -741,9 +741,9 @@ inline fn arm_sha1m(abcd: @Vector(4, u32), e: u32, wk: @Vector(4, u32)) @Vector(
 inline fn arm_sha1h(val: u32) u32 {
     if (builtin.cpu.arch != .aarch64) @compileError("arm_sha1h requires aarch64");
     return asm (
-        \\fmov s4, %w[val]
+        \\fmov s4, %[val:w]
         \\sha1h s4, s4
-        \\fmov %w[out], s4
+        \\fmov %[out:w], s4
         : [out] "=r" (-> u32),
         : [val] "r" (val),
         : .{ .v4 = true });

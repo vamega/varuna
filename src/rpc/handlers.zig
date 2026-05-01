@@ -35,7 +35,24 @@ pub const ApiHandler = struct {
         return r;
     }
 
-    pub fn handle(self: *ApiHandler, allocator: std.mem.Allocator, request: server.Request) server.Response {
+    pub fn handle(self: *ApiHandler, allocator: std.mem.Allocator, request_arg: server.Request) server.Response {
+        var request = request_arg;
+        var owned_path: ?[]u8 = null;
+        defer if (owned_path) |path| allocator.free(path);
+        var owned_body: ?[]u8 = null;
+        defer if (owned_body) |body| allocator.free(body);
+
+        if (request.path.len > 0) {
+            owned_path = allocator.dupe(u8, request.path) catch
+                return withCors(.{ .status = 500, .body = "{\"error\":\"internal\"}" });
+            request.path = owned_path.?;
+        }
+        if (request.body.len > 0) {
+            owned_body = allocator.dupe(u8, request.body) catch
+                return withCors(.{ .status = 500, .body = "{\"error\":\"internal\"}" });
+            request.body = owned_body.?;
+        }
+
         // CORS preflight
         if (std.mem.eql(u8, request.method, "OPTIONS")) {
             return .{
@@ -2482,6 +2499,9 @@ fn extractParamMut(body: []const u8, key: []const u8) ?[]const u8 {
         if (std.mem.indexOfScalar(u8, pair, '=')) |eq| {
             if (std.mem.eql(u8, pair[0..eq], key)) {
                 const raw_value = pair[eq + 1 ..];
+                if (std.mem.indexOfAny(u8, raw_value, "%+") == null) {
+                    return raw_value;
+                }
                 const decoded_len = urlDecodeComponentInPlace(@constCast(raw_value));
                 return raw_value[0..decoded_len];
             }
