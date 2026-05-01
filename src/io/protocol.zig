@@ -1102,6 +1102,10 @@ fn setupTestPeer(el: *EventLoop) !u16 {
     return slot;
 }
 
+fn setSmallTestBody(peer: *Peer, len: usize) void {
+    peer.body_buf = peer.small_body_buf[0..len];
+}
+
 fn setupTestTorrent(el: *EventLoop, piece_tracker: ?*PieceTracker) !void {
     const empty_fds = [_]std.posix.fd_t{};
     _ = try el.addTorrentContext(.{
@@ -1126,7 +1130,7 @@ test "choke sets peer_choking to true" {
 
     // Build choke message: body = [id=0]
     peer.small_body_buf[0] = 0; // choke
-    peer.body_buf = &peer.small_body_buf;
+    setSmallTestBody(peer, 1);
 
     processMessage(&el, slot);
 
@@ -1146,7 +1150,7 @@ test "choke clears inflight_requests" {
     peer.pipeline_sent = 7;
 
     peer.small_body_buf[0] = 0;
-    peer.body_buf = &peer.small_body_buf;
+    setSmallTestBody(peer, 1);
 
     processMessage(&el, slot);
 
@@ -1180,7 +1184,7 @@ test "choke releases and frees next_piece" {
     peer.next_pipeline_sent = 2;
 
     peer.small_body_buf[0] = 0;
-    peer.body_buf = &peer.small_body_buf;
+    setSmallTestBody(peer, 1);
 
     processMessage(&el, slot);
 
@@ -1212,7 +1216,7 @@ test "choke removes peer from idle list" {
     peer.idle_peer_index = 0;
 
     peer.small_body_buf[0] = 0;
-    peer.body_buf = &peer.small_body_buf;
+    setSmallTestBody(peer, 1);
 
     processMessage(&el, slot);
 
@@ -1232,7 +1236,7 @@ test "unchoke sets peer_choking to false" {
     try testing.expect(peer.peer_choking);
 
     peer.small_body_buf[0] = 1; // unchoke
-    peer.body_buf = &peer.small_body_buf;
+    setSmallTestBody(peer, 1);
 
     processMessage(&el, slot);
 
@@ -1251,7 +1255,7 @@ test "interested sets peer_interested to true" {
     try testing.expect(!peer.peer_interested);
 
     peer.small_body_buf[0] = 2; // interested
-    peer.body_buf = &peer.small_body_buf;
+    setSmallTestBody(peer, 1);
 
     processMessage(&el, slot);
 
@@ -1270,7 +1274,7 @@ test "not interested sets peer_interested to false" {
     peer.peer_interested = true;
 
     peer.small_body_buf[0] = 3; // not interested
-    peer.body_buf = &peer.small_body_buf;
+    setSmallTestBody(peer, 1);
 
     processMessage(&el, slot);
 
@@ -1298,7 +1302,7 @@ test "have updates availability bitfield" {
     // Build HAVE message: body = [id=4, piece_index=3 (big-endian)]
     peer.small_body_buf[0] = 4;
     std.mem.writeInt(u32, peer.small_body_buf[1..5], 3, .big);
-    peer.body_buf = &peer.small_body_buf;
+    setSmallTestBody(peer, 5);
 
     processMessage(&el, slot);
 
@@ -1330,7 +1334,7 @@ test "have with out-of-range piece index does not crash" {
     // Send HAVE for piece index 999 (way out of range for 4-piece torrent)
     peer.small_body_buf[0] = 4;
     std.mem.writeInt(u32, peer.small_body_buf[1..5], 999, .big);
-    peer.body_buf = &peer.small_body_buf;
+    setSmallTestBody(peer, 5);
 
     // Should not crash or panic
     processMessage(&el, slot);
@@ -1384,7 +1388,7 @@ test "have creates availability bitfield lazily when session exists" {
     // HAVE message for piece 2
     peer.small_body_buf[0] = 4;
     std.mem.writeInt(u32, peer.small_body_buf[1..5], 2, .big);
-    peer.body_buf = &peer.small_body_buf;
+    setSmallTestBody(peer, 5);
 
     processMessage(&el, slot);
 
@@ -1799,7 +1803,7 @@ test "cancel removes matching queued response" {
     std.mem.writeInt(u32, peer.small_body_buf[1..5], 10, .big); // piece_index
     std.mem.writeInt(u32, peer.small_body_buf[5..9], 0, .big); // offset
     std.mem.writeInt(u32, peer.small_body_buf[9..13], 16384, .big); // length
-    peer.body_buf = &peer.small_body_buf;
+    setSmallTestBody(peer, 13);
 
     processMessage(&el, slot);
 
@@ -1835,7 +1839,7 @@ test "cancel does not remove non-matching queued response" {
     std.mem.writeInt(u32, peer.small_body_buf[1..5], 10, .big);
     std.mem.writeInt(u32, peer.small_body_buf[5..9], 16384, .big); // different offset
     std.mem.writeInt(u32, peer.small_body_buf[9..13], 16384, .big);
-    peer.body_buf = &peer.small_body_buf;
+    setSmallTestBody(peer, 13);
 
     processMessage(&el, slot);
 
@@ -1894,7 +1898,7 @@ test "unknown message ID is silently ignored" {
     const peer = &el.peers[slot];
 
     peer.small_body_buf[0] = 255; // unknown message ID
-    peer.body_buf = &peer.small_body_buf;
+    setSmallTestBody(peer, 1);
 
     const choking_before = peer.peer_choking;
     const interested_before = peer.peer_interested;
