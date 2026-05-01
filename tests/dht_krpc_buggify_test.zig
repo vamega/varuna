@@ -1125,6 +1125,24 @@ test "txn-id length != 2 is harmless" {
 
 const dht = varuna.dht;
 
+test "DHT search registry accepts registrations beyond the old fixed cap" {
+    var engine = dht.DhtEngine.init(testing.allocator, &test_rng, testNodeId());
+    defer engine.deinit();
+
+    var hashes: [20][20]u8 = undefined;
+    for (&hashes, 0..) |*hash, i| {
+        hash.* = [_]u8{0} ** 20;
+        hash.*[0] = @intCast(i);
+        hash.*[19] = 0xA5;
+        engine.requestPeers(hash.*, null);
+    }
+
+    try testing.expectEqual(@as(usize, hashes.len), engine.registeredSearchCount());
+    try testing.expectEqualSlices(u8, &hashes[0], &engine.pending_searches.items[0].hash);
+    try testing.expectEqualSlices(u8, &hashes[16], &engine.pending_searches.items[16].hash);
+    try testing.expectEqualSlices(u8, &hashes[19], &engine.pending_searches.items[19].hash);
+}
+
 /// Drain all outbound packets on the engine and free the slice.
 fn drainAndFree(engine: *dht.DhtEngine) void {
     const pkts = engine.drainSendQueue();
@@ -1381,6 +1399,52 @@ test "R3: announce_peer with invalid token does not store" {
     engine.handleIncoming(ap_buf[0..ap_len], announcer);
 
     // No peer stored.
+    try testing.expectEqual(@as(usize, 0), engine.peer_store.peerCount(info_hash));
+}
+
+test "R3: IPv6 announce token is bound to the full address, not just /32" {
+    var engine = dht.DhtEngine.init(testing.allocator, &test_rng, testNodeId());
+    defer engine.deinit();
+    defer drainAndFree(&engine);
+
+    var info_hash: [20]u8 = undefined;
+    @memset(&info_hash, 0x6A);
+
+    const first = std.net.Address.initIp6(.{
+        0x20, 0x01, 0x0d, 0xb8,
+        0x00, 0x01, 0x00, 0x02,
+        0x00, 0x03, 0x00, 0x04,
+        0x00, 0x05, 0x00, 0x06,
+    }, 6000, 0, 0);
+    const same_prefix_different_host = std.net.Address.initIp6(.{
+        0x20, 0x01, 0x0d, 0xb8,
+        0xaa, 0xbb, 0xcc, 0xdd,
+        0xee, 0xff, 0x10, 0x20,
+        0x30, 0x40, 0x50, 0x60,
+    }, 6000, 0, 0);
+
+    const tok_slice = try primeTokenFor(&engine, first, info_hash);
+    var tok_buf: [32]u8 = undefined;
+    @memcpy(tok_buf[0..tok_slice.len], tok_slice);
+    const tok = tok_buf[0..tok_slice.len];
+
+    const out0 = engine.drainSendQueue();
+    if (out0.len > 0) testing.allocator.free(out0);
+
+    var ap_buf: [512]u8 = undefined;
+    var sid: NodeId = undefined;
+    @memset(&sid, 0x6B);
+    const ap_len = try krpc.encodeAnnouncePeerQuery(
+        &ap_buf,
+        0x006A,
+        sid,
+        info_hash,
+        51413,
+        tok,
+        true,
+    );
+    engine.handleIncoming(ap_buf[0..ap_len], same_prefix_different_host);
+
     try testing.expectEqual(@as(usize, 0), engine.peer_store.peerCount(info_hash));
 }
 

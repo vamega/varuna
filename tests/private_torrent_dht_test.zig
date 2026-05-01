@@ -114,12 +114,12 @@ test "private torrent does not register DHT requestPeers" {
 
     const engine = try createEngine(allocator);
     defer destroyEngine(allocator, engine);
-    try std.testing.expectEqual(@as(u8, 0), engine.pending_search_count);
+    try std.testing.expectEqual(@as(usize, 0), engine.registeredSearchCount());
 
     const did_register = sess.dhtRegisterPeers(engine);
 
     try std.testing.expect(!did_register);
-    try std.testing.expectEqual(@as(u8, 0), engine.pending_search_count);
+    try std.testing.expectEqual(@as(usize, 0), engine.registeredSearchCount());
 }
 
 test "public torrent does register DHT requestPeers" {
@@ -133,16 +133,16 @@ test "public torrent does register DHT requestPeers" {
 
     const engine = try createEngine(allocator);
     defer destroyEngine(allocator, engine);
-    try std.testing.expectEqual(@as(u8, 0), engine.pending_search_count);
+    try std.testing.expectEqual(@as(usize, 0), engine.registeredSearchCount());
 
     const did_register = sess.dhtRegisterPeers(engine);
 
     try std.testing.expect(did_register);
-    try std.testing.expectEqual(@as(u8, 1), engine.pending_search_count);
+    try std.testing.expectEqual(@as(usize, 1), engine.registeredSearchCount());
     try std.testing.expectEqualSlices(
         u8,
         &sess.info_hash,
-        &engine.pending_searches[0],
+        &engine.pending_searches.items[0].hash,
     );
 }
 
@@ -163,7 +163,7 @@ test "private torrent does not forceRequery the DHT" {
     const did_requery = sess.dhtForceRequery(engine);
 
     try std.testing.expect(!did_requery);
-    try std.testing.expectEqual(@as(u8, 0), engine.pending_search_count);
+    try std.testing.expectEqual(@as(usize, 0), engine.registeredSearchCount());
 }
 
 test "public torrent does forceRequery the DHT" {
@@ -182,8 +182,8 @@ test "public torrent does forceRequery the DHT" {
 
     try std.testing.expect(did_requery);
     // forceRequery on an unknown hash registers it fresh.
-    try std.testing.expectEqual(@as(u8, 1), engine.pending_search_count);
-    try std.testing.expect(!engine.pending_search_done[0]);
+    try std.testing.expectEqual(@as(usize, 1), engine.registeredSearchCount());
+    try std.testing.expect(!engine.pending_searches.items[0].done);
 }
 
 // ── T2.3: announcePeer gating ──────────────────────────────────
@@ -258,7 +258,7 @@ test "private hybrid (v2) torrent's truncated v2 hash also gated" {
     _ = sess.dhtForceRequery(engine);
     _ = sess.dhtAnnouncePeer(engine);
 
-    try std.testing.expectEqual(@as(u8, 0), engine.pending_search_count);
+    try std.testing.expectEqual(@as(usize, 0), engine.registeredSearchCount());
 }
 
 test "public hybrid (v2) torrent registers BOTH v1 and v2 hashes" {
@@ -279,11 +279,11 @@ test "public hybrid (v2) torrent registers BOTH v1 and v2 hashes" {
     defer destroyEngine(allocator, engine);
 
     try std.testing.expect(sess.dhtRegisterPeers(engine));
-    try std.testing.expectEqual(@as(u8, 2), engine.pending_search_count);
+    try std.testing.expectEqual(@as(usize, 2), engine.registeredSearchCount());
 
     var truncated_v2: [20]u8 = undefined;
     @memcpy(&truncated_v2, sess.info_hash_v2.?[0..20]);
 
-    try std.testing.expectEqualSlices(u8, &sess.info_hash, &engine.pending_searches[0]);
-    try std.testing.expectEqualSlices(u8, &truncated_v2, &engine.pending_searches[1]);
+    try std.testing.expectEqualSlices(u8, &sess.info_hash, &engine.pending_searches.items[0].hash);
+    try std.testing.expectEqualSlices(u8, &truncated_v2, &engine.pending_searches.items[1].hash);
 }

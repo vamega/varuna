@@ -17,6 +17,11 @@ const Random = @import("../runtime/random.zig").Random;
 /// Maximum number of concurrent lookups.
 const max_lookups: usize = 16;
 
+/// Maximum registered auto-search hashes. This is dynamic storage, not
+/// the old fixed 16-hash slate; the cap is a defensive ceiling so an
+/// unbounded number of public torrents cannot grow DHT memory forever.
+const max_registered_searches: usize = 4096;
+
 /// Maximum pending outbound queries.
 const max_pending: usize = 256;
 
@@ -40,6 +45,11 @@ const PendingQuery = struct {
     sent_at: i64,
     lookup_idx: ?usize = null, // index into active_lookups
     method: krpc.Method,
+};
+
+const SearchRegistration = struct {
+    hash: [20]u8,
+    done: bool = false,
 };
 
 /// An outbound packet queued for sending via io_uring.
@@ -266,10 +276,7 @@ pub const DhtEngine = struct {
     bootstrap_pending: bool = false,
     /// Auto-search: info hashes to search for once bootstrapped.
     /// get_peers will be called for each once the routing table has nodes.
-    pending_searches: [16][20]u8 = undefined,
-    pending_search_count: u8 = 0,
-    /// Per-hash flag: true once get_peers has been called at least once.
-    pending_search_done: [16]bool = [_]bool{false} ** 16,
+    pending_searches: std.ArrayListUnmanaged(SearchRegistration),
     last_requery_time: i64 = 0,
     /// Timing.
     last_refresh_check: i64 = 0,
@@ -316,6 +323,7 @@ pub const DhtEngine = struct {
             .send_queue = std.ArrayList(OutboundPacket).empty,
             .peer_results = std.ArrayList(PeerResult).empty,
             .peer_store = PeerStore.init(allocator),
+            .pending_searches = .empty,
         };
     }
 
@@ -352,8 +360,7 @@ pub const DhtEngine = struct {
         self.listen_port = 6881;
         self.bootstrapped = false;
         self.bootstrap_pending = false;
-        self.pending_search_count = 0;
-        self.pending_search_done = [_]bool{false} ** 16;
+        self.pending_searches = .empty;
         self.last_requery_time = 0;
         self.last_refresh_check = 0;
         self.last_save_time = 0;
@@ -367,6 +374,7 @@ pub const DhtEngine = struct {
         }
         self.peer_results.deinit(self.allocator);
         self.send_queue.deinit(self.allocator);
+        self.pending_searches.deinit(self.allocator);
         self.peer_store.deinit(self.allocator);
     }
 
@@ -432,16 +440,16 @@ pub const DhtEngine = struct {
 
         // Start pending searches once bootstrapped, and re-query every 5 minutes
         const requery_interval: i64 = 5 * 60;
-        if (self.bootstrapped and self.pending_search_count > 0) {
+        if (self.bootstrapped and self.pending_searches.items.len > 0) {
             const should_requery = (now - self.last_requery_time >= requery_interval);
-            for (0..self.pending_search_count) |i| {
+            for (self.pending_searches.items) |*search| {
                 // Start new searches immediately; requery old ones on the interval
-                if (!self.pending_search_done[i] or should_requery) {
-                    self.getPeers(self.pending_searches[i]) catch |err| {
-                        log.debug("getPeers for {x} failed: {s}", .{ self.pending_searches[i][0..4].*, @errorName(err) });
+                if (!search.done or should_requery) {
+                    self.getPeers(search.hash) catch |err| {
+                        log.debug("getPeers for {x} failed: {s}", .{ search.hash[0..4].*, @errorName(err) });
                         continue;
                     };
-                    self.pending_search_done[i] = true;
+                    search.done = true;
                 }
             }
             if (should_requery) self.last_requery_time = now;
@@ -482,22 +490,33 @@ pub const DhtEngine = struct {
 
     /// Append a single hash to the pending-search slate. Idempotent.
     fn registerSearch(self: *DhtEngine, hash: [20]u8) void {
-        for (0..self.pending_search_count) |i| {
-            if (std.mem.eql(u8, &self.pending_searches[i], &hash)) return;
+        for (self.pending_searches.items) |search| {
+            if (std.mem.eql(u8, &search.hash, &hash)) return;
         }
-        if (self.pending_search_count >= self.pending_searches.len) return;
-        const idx = self.pending_search_count;
-        @memcpy(&self.pending_searches[idx], &hash);
-        self.pending_search_done[idx] = false; // new hash — search on next tick
-        self.pending_search_count += 1;
+        if (self.pending_searches.items.len >= max_registered_searches) {
+            log.warn("DHT search registry full at {d} hashes; dropping search for {x}", .{
+                max_registered_searches,
+                hash[0..4].*,
+            });
+            return;
+        }
+        self.pending_searches.append(self.allocator, .{
+            .hash = hash,
+            .done = false,
+        }) catch |err| {
+            log.warn("DHT search registry allocation failed for {x}: {s}", .{
+                hash[0..4].*,
+                @errorName(err),
+            });
+        };
     }
 
     /// Mark a previously-registered hash as needing immediate requery, or
     /// register it fresh if absent.
     fn requerySearch(self: *DhtEngine, hash: [20]u8) void {
-        for (0..self.pending_search_count) |i| {
-            if (std.mem.eql(u8, &self.pending_searches[i], &hash)) {
-                self.pending_search_done[i] = false; // triggers immediate search on next tick
+        for (self.pending_searches.items) |*search| {
+            if (std.mem.eql(u8, &search.hash, &hash)) {
+                search.done = false; // triggers immediate search on next tick
                 return;
             }
         }
@@ -597,6 +616,11 @@ pub const DhtEngine = struct {
         return self.table.nodeCount();
     }
 
+    /// Number of auto-search hashes registered for periodic get_peers.
+    pub fn registeredSearchCount(self: *const DhtEngine) usize {
+        return self.pending_searches.items.len;
+    }
+
     // ── Query handling ──────────────────────────────────
 
     fn handleQuery(self: *DhtEngine, q: krpc.Query, sender: std.net.Address) void {
@@ -668,8 +692,8 @@ pub const DhtEngine = struct {
         const info_hash = q.target orelse return;
 
         // Generate token for this querier
-        const ip_bytes = addressToBytes(sender);
-        const peer_token = self.tokens.generateToken(&ip_bytes);
+        const ip_bytes = addressTokenBytes(sender);
+        const peer_token = self.tokens.generateToken(ip_bytes.slice());
 
         // Per BEP 5 the response carries either `values` (announced peers
         // we know about) or a fallback list of closest nodes — and BEP 32
@@ -736,8 +760,8 @@ pub const DhtEngine = struct {
             return;
         };
 
-        const ip_bytes = addressToBytes(sender);
-        if (!self.tokens.validateToken(announce_token, &ip_bytes)) {
+        const ip_bytes = addressTokenBytes(sender);
+        if (!self.tokens.validateToken(announce_token, ip_bytes.slice())) {
             self.sendError(q.transaction_id, @intFromEnum(krpc.ErrorCode.protocol), "invalid token", sender);
             return;
         }
@@ -1150,15 +1174,33 @@ pub const DhtEngine = struct {
     }
 };
 
-/// Return a stable byte representation of an address for token generation.
-/// For IPv4, returns the 4-byte address. For IPv6, returns the first 4 bytes
-/// of the 16-byte address (sufficient for anti-spoofing token use).
-fn addressToBytes(addr: std.net.Address) [4]u8 {
-    return switch (addr.any.family) {
-        std.posix.AF.INET => @bitCast(addr.in.sa.addr),
-        std.posix.AF.INET6 => addr.in6.sa.addr[0..4].*,
-        else => [4]u8{ 0, 0, 0, 0 },
-    };
+const AddressTokenBytes = struct {
+    bytes: [16]u8 = [_]u8{0} ** 16,
+    len: u8 = 0,
+
+    fn slice(self: *const AddressTokenBytes) []const u8 {
+        return self.bytes[0..self.len];
+    }
+};
+
+/// Return the stable on-wire address bytes used for announce tokens.
+/// IPv4 binds 4 bytes. IPv6 binds all 16 bytes so two peers sharing a
+/// /32 cannot replay each other's get_peers token.
+fn addressTokenBytes(addr: std.net.Address) AddressTokenBytes {
+    var result = AddressTokenBytes{};
+    switch (addr.any.family) {
+        std.posix.AF.INET => {
+            const addr_bytes: [4]u8 = @bitCast(addr.in.sa.addr);
+            @memcpy(result.bytes[0..4], &addr_bytes);
+            result.len = 4;
+        },
+        std.posix.AF.INET6 => {
+            @memcpy(result.bytes[0..16], &addr.in6.sa.addr);
+            result.len = 16;
+        },
+        else => {},
+    }
+    return result;
 }
 
 const PeerWire = enum { v4, v6 };
@@ -1353,13 +1395,13 @@ test "DhtEngine requestPeers registers both v1 and v2 hashes for hybrid torrents
     const v2_truncated: [20]u8 = [_]u8{0xBB} ** 20;
 
     engine.requestPeers(v1_hash, v2_truncated);
-    try std.testing.expectEqual(@as(u8, 2), engine.pending_search_count);
-    try std.testing.expectEqualSlices(u8, &v1_hash, &engine.pending_searches[0]);
-    try std.testing.expectEqualSlices(u8, &v2_truncated, &engine.pending_searches[1]);
+    try std.testing.expectEqual(@as(usize, 2), engine.registeredSearchCount());
+    try std.testing.expectEqualSlices(u8, &v1_hash, &engine.pending_searches.items[0].hash);
+    try std.testing.expectEqualSlices(u8, &v2_truncated, &engine.pending_searches.items[1].hash);
 
     // Re-registering is idempotent.
     engine.requestPeers(v1_hash, v2_truncated);
-    try std.testing.expectEqual(@as(u8, 2), engine.pending_search_count);
+    try std.testing.expectEqual(@as(usize, 2), engine.registeredSearchCount());
 }
 
 test "DhtEngine requestPeers v1-only (null v2) registers only one hash" {
@@ -1370,8 +1412,8 @@ test "DhtEngine requestPeers v1-only (null v2) registers only one hash" {
 
     const v1_hash: [20]u8 = [_]u8{0xAA} ** 20;
     engine.requestPeers(v1_hash, null);
-    try std.testing.expectEqual(@as(u8, 1), engine.pending_search_count);
-    try std.testing.expectEqualSlices(u8, &v1_hash, &engine.pending_searches[0]);
+    try std.testing.expectEqual(@as(usize, 1), engine.registeredSearchCount());
+    try std.testing.expectEqualSlices(u8, &v1_hash, &engine.pending_searches.items[0].hash);
 }
 
 test "DhtEngine forceRequery toggles search-done flag for both hashes" {
@@ -1385,12 +1427,12 @@ test "DhtEngine forceRequery toggles search-done flag for both hashes" {
 
     engine.requestPeers(v1_hash, v2_truncated);
     // Pretend both have already been queried at least once.
-    engine.pending_search_done[0] = true;
-    engine.pending_search_done[1] = true;
+    engine.pending_searches.items[0].done = true;
+    engine.pending_searches.items[1].done = true;
 
     engine.forceRequery(v1_hash, v2_truncated);
-    try std.testing.expect(!engine.pending_search_done[0]);
-    try std.testing.expect(!engine.pending_search_done[1]);
+    try std.testing.expect(!engine.pending_searches.items[0].done);
+    try std.testing.expect(!engine.pending_searches.items[1].done);
 }
 
 test "DhtEngine announcePeer fans out to v1 and v2 hashes" {
