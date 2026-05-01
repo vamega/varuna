@@ -265,6 +265,14 @@ pub fn build(b: *std.Build) void {
     const run_peer_mode_tests = b.addRunArtifact(peer_mode_tests);
     test_step.dependOn(&run_peer_mode_tests.step);
 
+    const peer_policy_tests = b.addTest(.{
+        .root_module = varuna_mod,
+        .filters = &.{"detachAllPeersExcept"},
+    });
+    const run_peer_policy_tests = b.addRunArtifact(peer_policy_tests);
+    const test_peer_policy_step = b.step("test-peer-policy", "Run peer policy ownership and scheduling tests");
+    test_peer_policy_step.dependOn(&run_peer_policy_tests.step);
+
     const private_tracker_tests = b.addTest(.{
         .root_module = b.createModule(.{
             .root_source_file = b.path("tests/private_tracker_test.zig"),

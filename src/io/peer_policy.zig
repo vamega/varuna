@@ -1052,8 +1052,8 @@ fn completeV2PieceDownload(
 fn detachAllPeersExcept(self: anytype, dp: *DownloadingPiece, except_slot: u16) void {
     for (self.peers, 0..) |*p, i| {
         const s: u16 = @intCast(i);
-        if (s == except_slot) continue;
-        if (p.downloading_piece == dp) {
+        const is_except_slot = s == except_slot;
+        if (!is_except_slot and p.downloading_piece == dp) {
             p.downloading_piece = null;
             p.piece_buf = null;
             p.current_piece = null;
@@ -1989,6 +1989,44 @@ test "promoteNextPieceOrMarkIdle marks idle when no next piece" {
 
     // Should be in idle list since there is no next piece
     try std.testing.expect(peer.idle_peer_index != null);
+}
+
+test "detachAllPeersExcept clears next alias on completing slot" {
+    var el = try EventLoop.initBare(std.testing.allocator, 0);
+    defer el.deinit();
+
+    const dp = try dp_mod.createDownloadingPiece(std.testing.allocator, 3, 0, 64, 4);
+    const slot: u16 = 0;
+    const peer = &el.peers[slot];
+    defer {
+        peer.downloading_piece = null;
+        peer.piece_buf = null;
+        peer.current_piece = null;
+        peer.next_downloading_piece = null;
+        peer.next_piece_buf = null;
+        peer.next_piece = null;
+        dp_mod.destroyDownloadingPieceFull(std.testing.allocator, dp);
+    }
+
+    peer.downloading_piece = dp;
+    peer.piece_buf = dp.buf;
+    peer.current_piece = dp.piece_index;
+    peer.next_downloading_piece = dp;
+    peer.next_piece_buf = dp.buf;
+    peer.next_piece = dp.piece_index;
+    peer.next_blocks_expected = dp.blocks_total;
+    peer.next_blocks_received = dp.blocks_total;
+    peer.next_pipeline_sent = dp.blocks_total;
+
+    detachAllPeersExcept(&el, dp, slot);
+
+    try std.testing.expect(peer.downloading_piece == dp);
+    try std.testing.expectEqual(@as(?*DownloadingPiece, null), peer.next_downloading_piece);
+    try std.testing.expectEqual(@as(?[]u8, null), peer.next_piece_buf);
+    try std.testing.expectEqual(@as(?u32, null), peer.next_piece);
+    try std.testing.expectEqual(@as(u32, 0), peer.next_blocks_expected);
+    try std.testing.expectEqual(@as(u32, 0), peer.next_blocks_received);
+    try std.testing.expectEqual(@as(u32, 0), peer.next_pipeline_sent);
 }
 
 test "recalculateUnchokes unchokes top peers by download speed" {
