@@ -142,9 +142,17 @@ pub fn UdpTrackerExecutorOf(comptime IO: type) type {
             // Deadline for the overall request
             deadline: i64 = 0,
 
-            /// Caller-owned completion for the slot's in-flight io op.
-            /// One op at a time per slot (socket → send → recv loop).
-            completion: io_interface.Completion = .{},
+            socket_completion: io_interface.Completion = .{},
+            connect_completion: io_interface.Completion = .{},
+            send_completion: io_interface.Completion = .{},
+            recv_completion: io_interface.Completion = .{},
+
+            socket_in_flight: bool = false,
+            connect_in_flight: bool = false,
+            send_in_flight: bool = false,
+            recv_in_flight: bool = false,
+            closing: bool = false,
+            completed: bool = false,
 
             const State = enum {
                 free,
@@ -159,12 +167,7 @@ pub fn UdpTrackerExecutorOf(comptime IO: type) type {
                     job.release();
                     self.dns_job = null;
                 }
-                if (self.fd >= 0) {
-                    posix.close(self.fd);
-                    self.fd = -1;
-                }
-                self.state = .free;
-                self.attempt = 0;
+                self.* = .{};
             }
         };
 
@@ -204,6 +207,11 @@ pub fn UdpTrackerExecutorOf(comptime IO: type) type {
 
             for (self.slots) |*slot| {
                 if (slot.state != .free) {
+                    if (slot.fd >= 0) {
+                        const fd = slot.fd;
+                        slot.fd = -1;
+                        self.io.closeSocket(fd);
+                    }
                     slot.reset();
                 }
             }
@@ -262,13 +270,43 @@ pub fn UdpTrackerExecutorOf(comptime IO: type) type {
             result: io_interface.Result,
         ) io_interface.CallbackAction {
             const self: *Self = @ptrCast(@alignCast(userdata.?));
-            const slot: *RequestSlot = @fieldParentPtr("completion", completion);
+            const slot: *RequestSlot = @fieldParentPtr("socket_completion", completion);
+            slot.socket_in_flight = false;
             const slot_idx = self.slotIdxFor(slot);
+            if (slot.closing or slot.completed or slot.state == .free) {
+                self.tryResetSlot(slot_idx);
+                return .disarm;
+            }
             const fake_cqe = makeFakeCqe(switch (result) {
                 .socket => |r| if (r) |fd| @intCast(fd) else |_| -1,
                 else => -1,
             });
             self.handleSocketCreated(slot, slot_idx, fake_cqe);
+            return .disarm;
+        }
+
+        fn udpConnectComplete(
+            userdata: ?*anyopaque,
+            completion: *io_interface.Completion,
+            result: io_interface.Result,
+        ) io_interface.CallbackAction {
+            const self: *Self = @ptrCast(@alignCast(userdata.?));
+            const slot: *RequestSlot = @fieldParentPtr("connect_completion", completion);
+            slot.connect_in_flight = false;
+            const slot_idx = self.slotIdxFor(slot);
+            if (slot.closing or slot.completed or slot.state == .free) {
+                self.tryResetSlot(slot_idx);
+                return .disarm;
+            }
+            const ok = switch (result) {
+                .connect => |r| if (r) |_| true else |_| false,
+                else => false,
+            };
+            if (!ok) {
+                self.completeSlot(slot_idx, .{ .err = error.ConnectionRefused });
+                return .disarm;
+            }
+            self.handleSocketConnected(slot, slot_idx);
             return .disarm;
         }
 
@@ -278,8 +316,13 @@ pub fn UdpTrackerExecutorOf(comptime IO: type) type {
             result: io_interface.Result,
         ) io_interface.CallbackAction {
             const self: *Self = @ptrCast(@alignCast(userdata.?));
-            const slot: *RequestSlot = @fieldParentPtr("completion", completion);
+            const slot: *RequestSlot = @fieldParentPtr("send_completion", completion);
+            slot.send_in_flight = false;
             const slot_idx = self.slotIdxFor(slot);
+            if (slot.closing or slot.completed or slot.state == .free) {
+                self.tryResetSlot(slot_idx);
+                return .disarm;
+            }
             const fake_cqe = makeFakeCqe(switch (result) {
                 .sendmsg => |r| if (r) |n|
                     std.math.cast(i32, n) orelse std.math.maxInt(i32)
@@ -297,8 +340,13 @@ pub fn UdpTrackerExecutorOf(comptime IO: type) type {
             result: io_interface.Result,
         ) io_interface.CallbackAction {
             const self: *Self = @ptrCast(@alignCast(userdata.?));
-            const slot: *RequestSlot = @fieldParentPtr("completion", completion);
+            const slot: *RequestSlot = @fieldParentPtr("recv_completion", completion);
+            slot.recv_in_flight = false;
             const slot_idx = self.slotIdxFor(slot);
+            if (slot.closing or slot.completed or slot.state == .free) {
+                self.tryResetSlot(slot_idx);
+                return .disarm;
+            }
             const fake_cqe = makeFakeCqe(switch (result) {
                 .recvmsg => |r| if (r) |n|
                     std.math.cast(i32, n) orelse std.math.maxInt(i32)
@@ -402,12 +450,14 @@ pub fn UdpTrackerExecutorOf(comptime IO: type) type {
             // will set the destination and start the BEP 15 flow.
             const family: u32 = slot.address.any.family;
             slot.state = .connecting;
+            slot.socket_in_flight = true;
             self.io.socket(
                 .{ .domain = family, .sock_type = posix.SOCK.DGRAM | posix.SOCK.CLOEXEC | posix.SOCK.NONBLOCK, .protocol = posix.IPPROTO.UDP },
-                &slot.completion,
+                &slot.socket_completion,
                 self,
                 udpSocketComplete,
             ) catch {
+                slot.socket_in_flight = false;
                 self.completeSlot(slot_idx, .{ .err = error.SocketCreateFailed });
                 return;
             };
@@ -423,13 +473,22 @@ pub fn UdpTrackerExecutorOf(comptime IO: type) type {
             const fd: posix.fd_t = @intCast(cqe.res);
             slot.fd = fd;
 
-            // Connect the UDP socket so we can use send/recv instead of sendto/recvfrom.
-            // UDP connect just sets the destination address — no network I/O, always instant.
-            posix.connect(fd, &slot.address.any, slot.address.getOsSockLen()) catch {
+            // UDP connect just sets the destination address, but route it through
+            // the IO contract so alternate backends and SimIO see the same shape.
+            slot.connect_in_flight = true;
+            self.io.connect(
+                .{ .fd = fd, .addr = slot.address },
+                &slot.connect_completion,
+                self,
+                udpConnectComplete,
+            ) catch {
+                slot.connect_in_flight = false;
                 self.completeSlot(slot_idx, .{ .err = error.ConnectionRefused });
                 return;
             };
+        }
 
+        fn handleSocketConnected(self: *Self, slot: *RequestSlot, slot_idx: u16) void {
             // Check connection ID cache
             if (self.conn_cache.get(slot.job.hostSlice(), slot.job.port)) |conn_id| {
                 slot.connection_id = conn_id;
@@ -503,6 +562,7 @@ pub fn UdpTrackerExecutorOf(comptime IO: type) type {
         // ── io_uring sendmsg/recvmsg ─────────────────────────────
 
         fn submitSendmsg(self: *Self, slot: *RequestSlot, slot_idx: u16) void {
+            if (slot.send_in_flight or slot.closing or slot.completed) return;
             slot.send_addr = slot.address;
             slot.send_iov[0] = .{
                 .base = @ptrCast(&slot.send_buf),
@@ -518,17 +578,20 @@ pub fn UdpTrackerExecutorOf(comptime IO: type) type {
                 .flags = 0,
             };
 
+            slot.send_in_flight = true;
             self.io.sendmsg(
                 .{ .fd = slot.fd, .msg = &slot.send_msg },
-                &slot.completion,
+                &slot.send_completion,
                 self,
                 udpSendComplete,
             ) catch {
+                slot.send_in_flight = false;
                 self.completeSlot(slot_idx, .{ .err = error.SubmitFailed });
             };
         }
 
         fn submitRecvmsg(self: *Self, slot: *RequestSlot, slot_idx: u16) void {
+            if (slot.recv_in_flight or slot.closing or slot.completed) return;
             slot.recv_addr = std.mem.zeroes(std.net.Address);
             slot.recv_iov[0] = .{
                 .base = @ptrCast(&slot.recv_buf),
@@ -544,12 +607,14 @@ pub fn UdpTrackerExecutorOf(comptime IO: type) type {
                 .flags = 0,
             };
 
+            slot.recv_in_flight = true;
             self.io.recvmsg(
                 .{ .fd = slot.fd, .msg = &slot.recv_msg },
-                &slot.completion,
+                &slot.recv_completion,
                 self,
                 udpRecvComplete,
             ) catch {
+                slot.recv_in_flight = false;
                 self.completeSlot(slot_idx, .{ .err = error.SubmitFailed });
             };
         }
@@ -723,13 +788,39 @@ pub fn UdpTrackerExecutorOf(comptime IO: type) type {
 
         fn completeSlot(self: *Self, slot_idx: u16, result: RequestResult) void {
             const slot = &self.slots[slot_idx];
-            if (slot.state == .free) return;
+            if (slot.state == .free or slot.completed) return;
 
             const job = slot.job;
-            slot.reset();
+            slot.completed = true;
+            slot.closing = true;
+
+            if (slot.dns_job) |dns_job| {
+                dns_job.release();
+                slot.dns_job = null;
+            }
+            if (slot.fd >= 0) {
+                const fd = slot.fd;
+                slot.fd = -1;
+                self.io.closeSocket(fd);
+            }
 
             // Invoke callback
             job.on_complete(job.context, result);
+
+            self.tryResetSlot(slot_idx);
+        }
+
+        fn tryResetSlot(self: *Self, slot_idx: u16) void {
+            const slot = &self.slots[slot_idx];
+            if (!slot.closing and !slot.completed) return;
+            if (slot.socket_in_flight or
+                slot.connect_in_flight or
+                slot.send_in_flight or
+                slot.recv_in_flight)
+            {
+                return;
+            }
+            slot.reset();
         }
     };
 }
@@ -738,3 +829,66 @@ pub fn UdpTrackerExecutorOf(comptime IO: type) type {
 /// executor. Sim tests instantiate `UdpTrackerExecutorOf(SimIO)` directly;
 /// production code references this alias unchanged.
 pub const UdpTrackerExecutor = UdpTrackerExecutorOf(RealIO);
+
+test "UdpTrackerExecutor uses independent send and recv completions" {
+    const sim_io_mod = @import("../io/sim_io.zig");
+    const SimIO = sim_io_mod.SimIO;
+    const Executor = UdpTrackerExecutorOf(SimIO);
+
+    const allocator = std.testing.allocator;
+    var io = try SimIO.init(allocator, .{ .seed = 0x715 });
+    defer io.deinit();
+
+    var random = Random.simRandom(0x715);
+    var slots = [_]Executor.RequestSlot{.{}} ** 1;
+    var executor = Executor{
+        .allocator = allocator,
+        .io = &io,
+        .random = &random,
+        .dns_event_fd = -1,
+        .pending_jobs = .empty,
+        .slots = slots[0..],
+        .max_slots = 1,
+        .dns_resolver = try DnsResolver.init(allocator, .{}),
+    };
+    defer executor.dns_resolver.deinit(allocator);
+
+    const Ctx = struct {
+        completed: bool = false,
+        err: ?anyerror = null,
+
+        fn onComplete(context: *anyopaque, result: Executor.RequestResult) void {
+            const self: *@This() = @ptrCast(@alignCast(context));
+            self.completed = true;
+            self.err = result.err;
+        }
+    };
+    var ctx = Ctx{};
+
+    var job = Executor.Job{
+        .context = @ptrCast(&ctx),
+        .on_complete = Ctx.onComplete,
+        .port = 6969,
+    };
+    const host = "127.0.0.1";
+    @memcpy(job.host[0..host.len], host);
+    job.host_len = host.len;
+
+    const slot = &executor.slots[0];
+    slot.* = .{
+        .state = .connecting,
+        .fd = -1,
+        .job = job,
+        .address = std.net.Address.initIp4(.{ 127, 0, 0, 1 }, 6969),
+    };
+
+    executor.startConnect(slot, 0);
+
+    try std.testing.expect(!ctx.completed);
+    try std.testing.expect(slot.send_in_flight);
+    try std.testing.expect(slot.recv_in_flight);
+
+    slot.closing = true;
+    slot.completed = true;
+    try io.tick(0);
+}

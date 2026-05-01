@@ -9,11 +9,11 @@ pub const udp_executor = @import("udp_executor.zig");
 // Mirrors the pattern in `src/io/root.zig` and `src/dht/root.zig`. Wired
 // into `mod_tests` via `_ = tracker;` in `src/root.zig`'s test block.
 //
-// `executor.zig` and `udp_executor.zig` have no inline tests today;
-// they're exercised via `tests/udp_tracker_test.zig` and
-// `tests/torrent_session_test.zig`.
+// `executor.zig` is exercised via `tests/torrent_session_test.zig`;
+// UDP executor also has source-side IO-contract tests below.
 test {
     _ = announce;
     _ = scrape;
     _ = udp;
+    _ = udp_executor;
 }
