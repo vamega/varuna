@@ -545,11 +545,16 @@ pub const RealHasher = struct {
 /// ## Fault injection
 ///
 /// `FaultConfig.merkle_pread_fault_prob` lets tests simulate pread
-/// failures during Merkle tree building. Verification jobs can't fail
-/// independently of the data (a wrong hash IS the failure), so fault
-/// injection is scoped to the I/O path.  The knob is consulted by a
-/// caller-supplied seeded `runtime.Random`-style PRNG so two test runs
-/// with the same seed produce the same fault sequence.
+/// failures during Merkle tree building. Verification jobs can also be
+/// delayed by drain ticks, so tests can force late hash completions
+/// after other simulated I/O events have advanced. The knobs are
+/// consulted by a caller-supplied seeded `runtime.Random`-style PRNG
+/// so two test runs with the same seed produce the same fault sequence.
+const DelayedVerifyResult = struct {
+    ready_drain_tick: u64,
+    result: RealHasher.Result,
+};
+
 pub const SimHasher = struct {
     allocator: std.mem.Allocator,
 
@@ -557,6 +562,11 @@ pub const SimHasher = struct {
     /// tick via `drainResultsInto`. Submitted synchronously, so this
     /// list grows during a single tick and shrinks at the next drain.
     completed_results: std.ArrayList(RealHasher.Result),
+
+    /// Verification results intentionally held back for fault-injection
+    /// scenarios. They promote to `completed_results` once the drain
+    /// tick reaches `ready_drain_tick`.
+    delayed_results: std.ArrayList(DelayedVerifyResult),
 
     /// Pending Merkle results — same lifecycle as `completed_results`,
     /// drained via `drainMerkleResultsInto`.
@@ -571,12 +581,22 @@ pub const SimHasher = struct {
     /// `init` or `setSeed` before running the test.
     rng: std.Random.DefaultPrng = std.Random.DefaultPrng.init(0),
 
+    /// Logical drain tick for delayed verification results. Incremented
+    /// once per `drainResultsInto` call.
+    drain_tick: u64 = 0,
+
     pub const FaultConfig = struct {
         /// Probability ([0.0, 1.0]) that a given pread call inside a
         /// Merkle build job is treated as failed. The job returns
         /// `piece_hashes = null` in the result, mirroring the real
         /// hasher's behaviour when a pread fails. 0 disables.
         merkle_pread_fault_prob: f32 = 0.0,
+
+        /// Inclusive min/max drain-tick delay for verification
+        /// completions. With the defaults, verify results are available
+        /// on the next drain exactly as before.
+        verify_result_delay_ticks_min: u32 = 0,
+        verify_result_delay_ticks_max: u32 = 0,
     };
 
     /// Initialise a heap-allocated SimHasher. Heap allocation matches
@@ -588,6 +608,7 @@ pub const SimHasher = struct {
         self.* = .{
             .allocator = allocator,
             .completed_results = .empty,
+            .delayed_results = .empty,
             .merkle_results = .empty,
             .rng = std.Random.DefaultPrng.init(seed),
         };
@@ -601,6 +622,11 @@ pub const SimHasher = struct {
             self.allocator.free(result.piece_buf);
         }
         self.completed_results.deinit(self.allocator);
+
+        for (self.delayed_results.items) |delayed| {
+            self.allocator.free(delayed.result.piece_buf);
+        }
+        self.delayed_results.deinit(self.allocator);
 
         for (self.merkle_results.items) |result| {
             if (result.piece_hashes) |hashes| {
@@ -655,14 +681,24 @@ pub const SimHasher = struct {
             .is_recheck = opts.is_recheck,
         };
         const valid = RealHasher.computeValid(job);
-        try self.completed_results.append(self.allocator, .{
+        const result = RealHasher.Result{
             .slot = slot,
             .piece_index = piece_index,
             .piece_buf = piece_buf,
             .valid = valid,
             .torrent_id = torrent_id,
             .is_recheck = opts.is_recheck,
-        });
+        };
+
+        const delay_ticks = self.verifyResultDelayTicks();
+        if (delay_ticks == 0) {
+            try self.completed_results.append(self.allocator, result);
+        } else {
+            try self.delayed_results.append(self.allocator, .{
+                .ready_drain_tick = self.drain_tick + delay_ticks,
+                .result = result,
+            });
+        }
     }
 
     pub fn submitMerkleJob(
@@ -781,10 +817,33 @@ pub const SimHasher = struct {
         return roll < self.faults.merkle_pread_fault_prob;
     }
 
+    fn verifyResultDelayTicks(self: *SimHasher) u32 {
+        const min = self.faults.verify_result_delay_ticks_min;
+        const max = self.faults.verify_result_delay_ticks_max;
+        if (max <= min) return min;
+        const span = max - min;
+        return min + self.rng.random().uintLessThan(u32, span + 1);
+    }
+
+    fn promoteReadyVerifyResults(self: *SimHasher) void {
+        self.drain_tick += 1;
+
+        var i: usize = 0;
+        while (i < self.delayed_results.items.len) {
+            if (self.delayed_results.items[i].ready_drain_tick <= self.drain_tick) {
+                const delayed = self.delayed_results.orderedRemove(i);
+                self.completed_results.append(self.allocator, delayed.result) catch unreachable;
+            } else {
+                i += 1;
+            }
+        }
+    }
+
     pub fn drainResultsInto(
         self: *SimHasher,
         swap_buf: *std.ArrayList(RealHasher.Result),
     ) []const RealHasher.Result {
+        self.promoteReadyVerifyResults();
         const tmp = self.completed_results;
         self.completed_results = swap_buf.*;
         swap_buf.* = tmp;
@@ -803,6 +862,7 @@ pub const SimHasher = struct {
 
     pub fn hasPendingWork(self: *SimHasher) bool {
         return self.completed_results.items.len > 0 or
+            self.delayed_results.items.len > 0 or
             self.merkle_results.items.len > 0;
     }
 
@@ -1309,6 +1369,47 @@ test "SimHasher: results visible on next drain (queue lifecycle)" {
     try std.testing.expect(hasher.hasPendingWork());
 
     // Drain — result is visible, queue empties.
+    {
+        const results = hasher.drainResultsInto(&swap_buf);
+        try std.testing.expectEqual(@as(usize, 1), results.len);
+        try std.testing.expect(results[0].valid);
+        allocator.free(results[0].piece_buf);
+    }
+    swap_buf.clearRetainingCapacity();
+    try std.testing.expect(!hasher.hasPendingWork());
+}
+
+test "SimHasher: verify results can be delayed by drain ticks" {
+    const allocator = std.testing.allocator;
+
+    var hasher = try SimHasher.create(allocator, 1);
+    defer {
+        hasher.deinit();
+        allocator.destroy(hasher);
+    }
+    hasher.setFaults(.{
+        .verify_result_delay_ticks_min = 2,
+        .verify_result_delay_ticks_max = 2,
+    });
+
+    var swap_buf = std.ArrayList(RealHasher.Result).empty;
+    defer swap_buf.deinit(allocator);
+
+    const data = try allocator.alloc(u8, 4);
+    @memcpy(data, "spam");
+    var expected: [20]u8 = undefined;
+    Sha1.hash("spam", &expected, .{});
+    try hasher.submitVerify(0, 0, data, expected, 0);
+
+    try std.testing.expect(hasher.hasPendingWork());
+
+    {
+        const results = hasher.drainResultsInto(&swap_buf);
+        try std.testing.expectEqual(@as(usize, 0), results.len);
+    }
+    swap_buf.clearRetainingCapacity();
+    try std.testing.expect(hasher.hasPendingWork());
+
     {
         const results = hasher.drainResultsInto(&swap_buf);
         try std.testing.expectEqual(@as(usize, 1), results.len);
