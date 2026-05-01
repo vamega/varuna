@@ -244,6 +244,34 @@ test "setCategory clears category when given empty value" {
     }
 }
 
+test "setCategory with hashes=all applies to every torrent" {
+    var ctx = TestCtx.init();
+    defer ctx.deinit();
+
+    const a = try ctx.insertTorrent("all-category-a.bin");
+    const b = try ctx.insertTorrent("all-category-b.bin");
+
+    {
+        const resp = ctx.handle("POST", "/api/v2/torrents/createCategory", "category=batch&savePath=/srv/batch");
+        defer freeBody(resp);
+        try std.testing.expectEqual(@as(u16, 200), resp.status);
+    }
+
+    {
+        const resp = ctx.handle("POST", "/api/v2/torrents/setCategory", "hashes=all&category=batch");
+        defer freeBody(resp);
+        try std.testing.expectEqual(@as(u16, 200), resp.status);
+    }
+
+    ctx.sm.mutex.lock();
+    defer ctx.sm.mutex.unlock();
+    inline for (.{ a, b }) |hash| {
+        const session = ctx.sm.sessions.get(&hash) orelse return error.SessionMissing;
+        try std.testing.expect(session.category != null);
+        try std.testing.expectEqualStrings("batch", session.category.?);
+    }
+}
+
 // ── Tags: create → add to torrent → list → remove → delete ─────
 
 test "tags happy-path: createTags, addTags, list, removeTags, deleteTags" {
@@ -313,6 +341,98 @@ test "tags happy-path: createTags, addTags, list, removeTags, deleteTags" {
         const session = ctx.sm.sessions.get(&hash) orelse return error.SessionMissing;
         try std.testing.expectEqual(@as(usize, 0), session.tags.items.len);
     }
+}
+
+test "addTags with pipe-separated hashes applies to each selected torrent" {
+    var ctx = TestCtx.init();
+    defer ctx.deinit();
+
+    const a = try ctx.insertTorrent("pipe-tags-a.bin");
+    const b = try ctx.insertTorrent("pipe-tags-b.bin");
+    const c = try ctx.insertTorrent("pipe-tags-c.bin");
+
+    var body_buf: [512]u8 = undefined;
+    const body = try std.fmt.bufPrint(&body_buf, "hashes={s}|{s}&tags=selected", .{ a, b });
+    {
+        const resp = ctx.handle("POST", "/api/v2/torrents/addTags", body);
+        defer freeBody(resp);
+        try std.testing.expectEqual(@as(u16, 200), resp.status);
+    }
+
+    ctx.sm.mutex.lock();
+    defer ctx.sm.mutex.unlock();
+    const session_a = ctx.sm.sessions.get(&a) orelse return error.SessionMissing;
+    const session_b = ctx.sm.sessions.get(&b) orelse return error.SessionMissing;
+    const session_c = ctx.sm.sessions.get(&c) orelse return error.SessionMissing;
+    try std.testing.expectEqual(@as(usize, 1), session_a.tags.items.len);
+    try std.testing.expectEqual(@as(usize, 1), session_b.tags.items.len);
+    try std.testing.expectEqual(@as(usize, 0), session_c.tags.items.len);
+    try std.testing.expectEqualStrings("selected", session_a.tags.items[0]);
+    try std.testing.expectEqualStrings("selected", session_b.tags.items[0]);
+}
+
+test "torrents info filters by hashes category tag and state" {
+    var ctx = TestCtx.init();
+    defer ctx.deinit();
+
+    const linux = try ctx.insertTorrent("linux.iso");
+    const movie = try ctx.insertTorrent("movie.mkv");
+    const book = try ctx.insertTorrent("book.epub");
+
+    {
+        const resp = ctx.handle("POST", "/api/v2/torrents/createCategory", "category=media&savePath=/srv/media");
+        defer freeBody(resp);
+        try std.testing.expectEqual(@as(u16, 200), resp.status);
+    }
+    {
+        var body_buf: [256]u8 = undefined;
+        const body = try std.fmt.bufPrint(&body_buf, "hashes={s}&category=media", .{movie});
+        const resp = ctx.handle("POST", "/api/v2/torrents/setCategory", body);
+        defer freeBody(resp);
+        try std.testing.expectEqual(@as(u16, 200), resp.status);
+    }
+    {
+        var body_buf: [256]u8 = undefined;
+        const body = try std.fmt.bufPrint(&body_buf, "hashes={s}&tags=favorite", .{movie});
+        const resp = ctx.handle("POST", "/api/v2/torrents/addTags", body);
+        defer freeBody(resp);
+        try std.testing.expectEqual(@as(u16, 200), resp.status);
+    }
+    {
+        ctx.sm.mutex.lock();
+        defer ctx.sm.mutex.unlock();
+        const session = ctx.sm.sessions.get(&movie) orelse return error.SessionMissing;
+        session.state = .paused;
+    }
+
+    var path_buf: [512]u8 = undefined;
+    const path = try std.fmt.bufPrint(
+        &path_buf,
+        "/api/v2/torrents/info?hashes={s}|{s}&category=media&tag=favorite&filter=paused",
+        .{ linux, movie },
+    );
+    const resp = ctx.handle("GET", path, "");
+    defer freeBody(resp);
+    try std.testing.expectEqual(@as(u16, 200), resp.status);
+    try std.testing.expect(std.mem.indexOf(u8, resp.body, &movie) != null);
+    try std.testing.expect(std.mem.indexOf(u8, resp.body, &linux) == null);
+    try std.testing.expect(std.mem.indexOf(u8, resp.body, &book) == null);
+}
+
+test "torrents info sorts then applies offset and limit" {
+    var ctx = TestCtx.init();
+    defer ctx.deinit();
+
+    const zed = try ctx.insertTorrent("zed.bin");
+    const alpha = try ctx.insertTorrent("alpha.bin");
+    const middle = try ctx.insertTorrent("middle.bin");
+
+    const resp = ctx.handle("GET", "/api/v2/torrents/info?sort=name&offset=1&limit=1", "");
+    defer freeBody(resp);
+    try std.testing.expectEqual(@as(u16, 200), resp.status);
+    try std.testing.expect(std.mem.indexOf(u8, resp.body, &middle) != null);
+    try std.testing.expect(std.mem.indexOf(u8, resp.body, &alpha) == null);
+    try std.testing.expect(std.mem.indexOf(u8, resp.body, &zed) == null);
 }
 
 test "addTags is idempotent (re-adding an existing tag is a no-op)" {

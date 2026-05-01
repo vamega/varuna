@@ -213,7 +213,7 @@ pub const ApiHandler = struct {
         const params = if (body.len > 0) body else query;
 
         if (std.mem.eql(u8, action_name, "info")) {
-            return self.handleTorrentsInfo(allocator);
+            return self.handleTorrentsInfo(allocator, params);
         }
 
         if (std.mem.eql(u8, action_name, "addTrackers") and std.mem.eql(u8, method, "POST")) {
@@ -410,16 +410,48 @@ pub const ApiHandler = struct {
         return .{ .status = 404, .body = "{\"error\":\"unknown action\"}" };
     }
 
-    fn handleTorrentsInfo(self: *const ApiHandler, allocator: std.mem.Allocator) server.Response {
+    fn handleTorrentsInfo(self: *const ApiHandler, allocator: std.mem.Allocator, params: []const u8) server.Response {
         const stats = self.session_manager.getAllStats(allocator) catch
             return .{ .status = 500, .body = "{\"error\":\"internal\"}" };
         defer allocator.free(stats);
+
+        var selected_hashes: ?[]const [40]u8 = null;
+        if (requireHashes(params)) |hashes_param| {
+            selected_hashes = resolveHashesOrAll(self, allocator, hashes_param) catch |err| {
+                return hashSelectionErrorResponse(allocator, err);
+            };
+        }
+        defer if (selected_hashes) |hashes| allocator.free(hashes);
+
+        const filter = extractParamMut(params, "filter") orelse "all";
+        const category = extractParamMut(params, "category");
+        const tag = extractParamMut(params, "tag");
+        const sort_key = extractParamMut(params, "sort");
+        const reverse = parseBoolLoose(extractParamMut(params, "reverse") orelse "false");
+        const limit = parseOptionalI64(params, "limit") orelse -1;
+        const offset = parseOptionalI64(params, "offset") orelse 0;
+
+        var filtered = std.ArrayList(TorrentSession.Stats).empty;
+        defer filtered.deinit(allocator);
+        for (stats) |stat| {
+            if (!matchesHashSelection(selected_hashes, stat.info_hash_hex)) continue;
+            if (!matchesInfoFilter(stat, filter)) continue;
+            if (!matchesCategory(stat, category)) continue;
+            if (!matchesTag(stat, tag)) continue;
+            filtered.append(allocator, stat) catch return .{ .status = 500, .body = "{\"error\":\"internal\"}" };
+        }
+
+        if (sort_key) |key| {
+            sortTorrentStats(filtered.items, key, reverse);
+        }
+
+        const window = pagedWindow(filtered.items.len, offset, limit);
 
         var json = std.ArrayList(u8).empty;
         defer json.deinit(allocator);
 
         json.append(allocator, '[') catch return .{ .status = 500, .body = "[]" };
-        for (stats, 0..) |stat, i| {
+        for (filtered.items[window.start..window.end], 0..) |stat, i| {
             if (i > 0) json.append(allocator, ',') catch {};
             serializeTorrentInfo(allocator, &json, stat) catch {};
         }
@@ -507,39 +539,57 @@ pub const ApiHandler = struct {
 
     fn handleTorrentsDelete(self: *const ApiHandler, allocator: std.mem.Allocator, body: []const u8) server.Response {
         // Expect hash in body as form param: hashes=<hash>&deleteFiles=true
-        const hash = requireHashes(body) orelse
+        const hashes_param = requireHashes(body) orelse
             return .{ .status = 400, .body = "{\"error\":\"missing hashes\"}" };
+        const hashes = resolveHashesOrAll(self, allocator, hashes_param) catch |err| {
+            return hashSelectionErrorResponse(allocator, err);
+        };
+        defer allocator.free(hashes);
 
         const delete_files = if (extractParamMut(body, "deleteFiles")) |v|
             std.mem.eql(u8, v, "true")
         else
             false;
 
-        self.session_manager.removeTorrentEx(hash, delete_files) catch |err| {
-            return errorResponse(allocator, 404, err);
-        };
+        for (hashes) |hash| {
+            self.session_manager.removeTorrentEx(hash[0..], delete_files) catch |err| {
+                return errorResponse(allocator, 404, err);
+            };
+        }
 
         return .{ .body = "{\"status\":\"ok\"}" };
     }
 
     fn handleTorrentsPause(self: *const ApiHandler, allocator: std.mem.Allocator, body: []const u8) server.Response {
-        const hash = requireHashes(body) orelse
+        const hashes_param = requireHashes(body) orelse
             return .{ .status = 400, .body = "{\"error\":\"missing hashes\"}" };
-
-        self.session_manager.pauseTorrent(hash) catch |err| {
-            return errorResponse(allocator, 404, err);
+        const hashes = resolveHashesOrAll(self, allocator, hashes_param) catch |err| {
+            return hashSelectionErrorResponse(allocator, err);
         };
+        defer allocator.free(hashes);
+
+        for (hashes) |hash| {
+            self.session_manager.pauseTorrent(hash[0..]) catch |err| {
+                return errorResponse(allocator, 404, err);
+            };
+        }
 
         return .{ .body = "{\"status\":\"ok\"}" };
     }
 
     fn handleTorrentsResume(self: *const ApiHandler, allocator: std.mem.Allocator, body: []const u8) server.Response {
-        const hash = requireHashes(body) orelse
+        const hashes_param = requireHashes(body) orelse
             return .{ .status = 400, .body = "{\"error\":\"missing hashes\"}" };
-
-        self.session_manager.resumeTorrent(hash) catch |err| {
-            return errorResponse(allocator, 404, err);
+        const hashes = resolveHashesOrAll(self, allocator, hashes_param) catch |err| {
+            return hashSelectionErrorResponse(allocator, err);
         };
+        defer allocator.free(hashes);
+
+        for (hashes) |hash| {
+            self.session_manager.resumeTorrent(hash[0..]) catch |err| {
+                return errorResponse(allocator, 404, err);
+            };
+        }
 
         return .{ .body = "{\"status\":\"ok\"}" };
     }
@@ -837,30 +887,42 @@ pub const ApiHandler = struct {
     }
 
     fn handleSetTorrentDlLimit(self: *const ApiHandler, allocator: std.mem.Allocator, body: []const u8) server.Response {
-        const hash = requireHashes(body) orelse
+        const hashes_param = requireHashes(body) orelse
             return .{ .status = 400, .body = "{\"error\":\"missing hashes\"}" };
+        const hashes = resolveHashesOrAll(self, allocator, hashes_param) catch |err| {
+            return hashSelectionErrorResponse(allocator, err);
+        };
+        defer allocator.free(hashes);
         const limit_str = extractParamMut(body, "limit") orelse
             return .{ .status = 400, .body = "{\"error\":\"missing limit\"}" };
         const limit = std.fmt.parseInt(u64, limit_str, 10) catch
             return .{ .status = 400, .body = "{\"error\":\"invalid limit\"}" };
 
-        self.session_manager.setTorrentDlLimit(hash, limit) catch |err| {
-            return errorResponse(allocator, 404, err);
-        };
+        for (hashes) |hash| {
+            self.session_manager.setTorrentDlLimit(hash[0..], limit) catch |err| {
+                return errorResponse(allocator, 404, err);
+            };
+        }
         return .{ .body = "{\"status\":\"ok\"}" };
     }
 
     fn handleSetTorrentUlLimit(self: *const ApiHandler, allocator: std.mem.Allocator, body: []const u8) server.Response {
-        const hash = requireHashes(body) orelse
+        const hashes_param = requireHashes(body) orelse
             return .{ .status = 400, .body = "{\"error\":\"missing hashes\"}" };
+        const hashes = resolveHashesOrAll(self, allocator, hashes_param) catch |err| {
+            return hashSelectionErrorResponse(allocator, err);
+        };
+        defer allocator.free(hashes);
         const limit_str = extractParamMut(body, "limit") orelse
             return .{ .status = 400, .body = "{\"error\":\"missing limit\"}" };
         const limit = std.fmt.parseInt(u64, limit_str, 10) catch
             return .{ .status = 400, .body = "{\"error\":\"invalid limit\"}" };
 
-        self.session_manager.setTorrentUlLimit(hash, limit) catch |err| {
-            return errorResponse(allocator, 404, err);
-        };
+        for (hashes) |hash| {
+            self.session_manager.setTorrentUlLimit(hash[0..], limit) catch |err| {
+                return errorResponse(allocator, 404, err);
+            };
+        }
         return .{ .body = "{\"status\":\"ok\"}" };
     }
 
@@ -1070,31 +1132,43 @@ pub const ApiHandler = struct {
     }
 
     fn handleTorrentsSetSequentialDownload(self: *const ApiHandler, allocator: std.mem.Allocator, body: []const u8) server.Response {
-        const hash = extractParamMut(body, "hash") orelse
-            return .{ .status = 400, .body = "{\"error\":\"missing hash\"}" };
+        const hashes_param = requireHashes(body) orelse
+            return .{ .status = 400, .body = "{\"error\":\"missing hashes\"}" };
+        const hashes = resolveHashesOrAll(self, allocator, hashes_param) catch |err| {
+            return hashSelectionErrorResponse(allocator, err);
+        };
+        defer allocator.free(hashes);
         const value_str = extractParamMut(body, "value") orelse
             return .{ .status = 400, .body = "{\"error\":\"missing value\"}" };
 
         const enabled = std.mem.eql(u8, value_str, "true");
 
-        self.session_manager.setSequentialDownload(hash, enabled) catch |err| {
-            return errorResponse(allocator, 404, err);
-        };
+        for (hashes) |hash| {
+            self.session_manager.setSequentialDownload(hash[0..], enabled) catch |err| {
+                return errorResponse(allocator, 404, err);
+            };
+        }
 
         return .{ .body = "{\"status\":\"ok\"}" };
     }
 
     fn handleTorrentsSetSuperSeeding(self: *const ApiHandler, allocator: std.mem.Allocator, body: []const u8) server.Response {
-        const hash = requireHashes(body) orelse
+        const hashes_param = requireHashes(body) orelse
             return .{ .status = 400, .body = "{\"error\":\"missing hash\"}" };
+        const hashes = resolveHashesOrAll(self, allocator, hashes_param) catch |err| {
+            return hashSelectionErrorResponse(allocator, err);
+        };
+        defer allocator.free(hashes);
         const value_str = extractParamMut(body, "value") orelse
             return .{ .status = 400, .body = "{\"error\":\"missing value\"}" };
 
         const enabled = std.mem.eql(u8, value_str, "true");
 
-        self.session_manager.setSuperSeeding(hash, enabled) catch |err| {
-            return errorResponse(allocator, 404, err);
-        };
+        for (hashes) |hash| {
+            self.session_manager.setSuperSeeding(hash[0..], enabled) catch |err| {
+                return errorResponse(allocator, 404, err);
+            };
+        }
 
         return .{ .body = "{\"status\":\"ok\"}" };
     }
@@ -1180,23 +1254,35 @@ pub const ApiHandler = struct {
     }
 
     fn handleTorrentsForceReannounce(self: *const ApiHandler, allocator: std.mem.Allocator, body: []const u8) server.Response {
-        const hash = requireHashes(body) orelse
+        const hashes_param = requireHashes(body) orelse
             return .{ .status = 400, .body = "{\"error\":\"missing hashes\"}" };
-
-        self.session_manager.forceReannounce(hash) catch |err| {
-            return errorResponse(allocator, 404, err);
+        const hashes = resolveHashesOrAll(self, allocator, hashes_param) catch |err| {
+            return hashSelectionErrorResponse(allocator, err);
         };
+        defer allocator.free(hashes);
+
+        for (hashes) |hash| {
+            self.session_manager.forceReannounce(hash[0..]) catch |err| {
+                return errorResponse(allocator, 404, err);
+            };
+        }
 
         return .{ .body = "{\"status\":\"ok\"}" };
     }
 
     fn handleTorrentsRecheck(self: *const ApiHandler, allocator: std.mem.Allocator, body: []const u8) server.Response {
-        const hash = requireHashes(body) orelse
+        const hashes_param = requireHashes(body) orelse
             return .{ .status = 400, .body = "{\"error\":\"missing hashes\"}" };
-
-        self.session_manager.forceRecheck(hash) catch |err| {
-            return errorResponse(allocator, 404, err);
+        const hashes = resolveHashesOrAll(self, allocator, hashes_param) catch |err| {
+            return hashSelectionErrorResponse(allocator, err);
         };
+        defer allocator.free(hashes);
+
+        for (hashes) |hash| {
+            self.session_manager.forceRecheck(hash[0..]) catch |err| {
+                return errorResponse(allocator, 404, err);
+            };
+        }
 
         return .{ .body = "{\"status\":\"ok\"}" };
     }
@@ -1381,8 +1467,12 @@ pub const ApiHandler = struct {
 
     fn handleSetShareLimits(self: *const ApiHandler, allocator: std.mem.Allocator, body: []const u8) server.Response {
         // hashes=<hash1>|<hash2>&ratioLimit=<float>&seedingTimeLimit=<int>
-        const hashes_str = requireHashes(body) orelse
+        const hashes_param = requireHashes(body) orelse
             return .{ .status = 400, .body = "{\"error\":\"missing hashes\"}" };
+        const hashes = resolveHashesOrAll(self, allocator, hashes_param) catch |err| {
+            return hashSelectionErrorResponse(allocator, err);
+        };
+        defer allocator.free(hashes);
 
         // Parse ratio limit (-2 = use global, -1 = no limit, >=0 = specific)
         const ratio_limit: f64 = if (extractParamMut(body, "ratioLimit")) |v|
@@ -1396,11 +1486,8 @@ pub const ApiHandler = struct {
         else
             -2;
 
-        // Apply to each hash (pipe-separated)
-        var hash_iter = std.mem.splitScalar(u8, hashes_str, '|');
-        while (hash_iter.next()) |hash| {
-            if (hash.len == 0) continue;
-            self.session_manager.setShareLimits(hash, ratio_limit, seeding_time_limit) catch |err| {
+        for (hashes) |hash| {
+            self.session_manager.setShareLimits(hash[0..], ratio_limit, seeding_time_limit) catch |err| {
                 return errorResponse(allocator, 404, err);
             };
         }
@@ -1517,13 +1604,19 @@ pub const ApiHandler = struct {
     }
 
     fn handleSetCategory(self: *const ApiHandler, allocator: std.mem.Allocator, params: []const u8) server.Response {
-        const hash = requireHashes(params) orelse
+        const hashes_param = requireHashes(params) orelse
             return .{ .status = 400, .body = "{\"error\":\"missing hashes\"}" };
+        const hashes = resolveHashesOrAll(self, allocator, hashes_param) catch |err| {
+            return hashSelectionErrorResponse(allocator, err);
+        };
+        defer allocator.free(hashes);
         const category = extractParamMut(params, "category") orelse "";
 
-        self.session_manager.setTorrentCategory(hash, category) catch |err| {
-            return errorResponse(allocator, 404, err);
-        };
+        for (hashes) |hash| {
+            self.session_manager.setTorrentCategory(hash[0..], category) catch |err| {
+                return errorResponse(allocator, 404, err);
+            };
+        }
 
         return .{ .body = "{\"status\":\"ok\"}" };
     }
@@ -1597,27 +1690,39 @@ pub const ApiHandler = struct {
     }
 
     fn handleAddTags(self: *const ApiHandler, allocator: std.mem.Allocator, params: []const u8) server.Response {
-        const hash = requireHashes(params) orelse
+        const hashes_param = requireHashes(params) orelse
             return .{ .status = 400, .body = "{\"error\":\"missing hashes\"}" };
+        const hashes = resolveHashesOrAll(self, allocator, hashes_param) catch |err| {
+            return hashSelectionErrorResponse(allocator, err);
+        };
+        defer allocator.free(hashes);
         const tags_str = extractParamMut(params, "tags") orelse
             return .{ .status = 400, .body = "{\"error\":\"missing tags\"}" };
 
-        self.session_manager.addTorrentTags(hash, tags_str) catch |err| {
-            return errorResponse(allocator, 404, err);
-        };
+        for (hashes) |hash| {
+            self.session_manager.addTorrentTags(hash[0..], tags_str) catch |err| {
+                return errorResponse(allocator, 404, err);
+            };
+        }
 
         return .{ .body = "{\"status\":\"ok\"}" };
     }
 
     fn handleRemoveTags(self: *const ApiHandler, allocator: std.mem.Allocator, params: []const u8) server.Response {
-        const hash = requireHashes(params) orelse
+        const hashes_param = requireHashes(params) orelse
             return .{ .status = 400, .body = "{\"error\":\"missing hashes\"}" };
+        const hashes = resolveHashesOrAll(self, allocator, hashes_param) catch |err| {
+            return hashSelectionErrorResponse(allocator, err);
+        };
+        defer allocator.free(hashes);
         const tags_str = extractParamMut(params, "tags") orelse
             return .{ .status = 400, .body = "{\"error\":\"missing tags\"}" };
 
-        self.session_manager.removeTorrentTags(hash, tags_str) catch |err| {
-            return errorResponse(allocator, 404, err);
-        };
+        for (hashes) |hash| {
+            self.session_manager.removeTorrentTags(hash[0..], tags_str) catch |err| {
+                return errorResponse(allocator, 404, err);
+            };
+        }
 
         return .{ .body = "{\"status\":\"ok\"}" };
     }
@@ -1843,18 +1948,19 @@ pub const ApiHandler = struct {
     const QueueAction = enum { increase, decrease, top, bottom };
 
     fn handleQueuePrioAction(self: *const ApiHandler, allocator: std.mem.Allocator, body: []const u8, action: QueueAction) server.Response {
-        const hashes_str = requireHashes(body) orelse
+        const hashes_param = requireHashes(body) orelse
             return .{ .status = 400, .body = "{\"error\":\"missing hashes\"}" };
+        const hashes = resolveHashesOrAll(self, allocator, hashes_param) catch |err| {
+            return hashSelectionErrorResponse(allocator, err);
+        };
+        defer allocator.free(hashes);
 
-        // Support multiple hashes separated by |
-        var iter = std.mem.splitScalar(u8, hashes_str, '|');
-        while (iter.next()) |hash| {
-            if (hash.len == 0) continue;
+        for (hashes) |hash| {
             const result = switch (action) {
-                .increase => self.session_manager.queueIncreasePrio(hash),
-                .decrease => self.session_manager.queueDecreasePrio(hash),
-                .top => self.session_manager.queueTopPrio(hash),
-                .bottom => self.session_manager.queueBottomPrio(hash),
+                .increase => self.session_manager.queueIncreasePrio(hash[0..]),
+                .decrease => self.session_manager.queueDecreasePrio(hash[0..]),
+                .top => self.session_manager.queueTopPrio(hash[0..]),
+                .bottom => self.session_manager.queueBottomPrio(hash[0..]),
             };
             result catch |err| {
                 return errorResponse(allocator, 404, err);
@@ -1986,13 +2092,15 @@ pub const ApiHandler = struct {
 
     /// POST /api/v2/torrents/toggleSequentialDownload -- toggle sequential download mode.
     fn handleTorrentsToggleSequentialDownload(self: *const ApiHandler, allocator: std.mem.Allocator, body: []const u8) server.Response {
-        const hashes_str = requireHashes(body) orelse
+        const hashes_param = requireHashes(body) orelse
             return .{ .status = 400, .body = "{\"error\":\"missing hashes\"}" };
+        const hashes = resolveHashesOrAll(self, allocator, hashes_param) catch |err| {
+            return hashSelectionErrorResponse(allocator, err);
+        };
+        defer allocator.free(hashes);
 
-        var iter = std.mem.splitScalar(u8, hashes_str, '|');
-        while (iter.next()) |hash| {
-            if (hash.len == 0) continue;
-            self.session_manager.toggleSequentialDownload(hash) catch |err| {
+        for (hashes) |hash| {
+            self.session_manager.toggleSequentialDownload(hash[0..]) catch |err| {
                 return errorResponse(allocator, 404, err);
             };
         }
@@ -2016,13 +2124,15 @@ pub const ApiHandler = struct {
 
     /// POST /api/v2/torrents/setForceStart -- force-start torrents bypassing queue limits.
     fn handleTorrentsSetForceStart(self: *const ApiHandler, allocator: std.mem.Allocator, body: []const u8) server.Response {
-        const hashes_str = requireHashes(body) orelse
+        const hashes_param = requireHashes(body) orelse
             return .{ .status = 400, .body = "{\"error\":\"missing hashes\"}" };
+        const hashes = resolveHashesOrAll(self, allocator, hashes_param) catch |err| {
+            return hashSelectionErrorResponse(allocator, err);
+        };
+        defer allocator.free(hashes);
 
-        var iter = std.mem.splitScalar(u8, hashes_str, '|');
-        while (iter.next()) |hash| {
-            if (hash.len == 0) continue;
-            self.session_manager.forceStartTorrent(hash) catch |err| {
+        for (hashes) |hash| {
+            self.session_manager.forceStartTorrent(hash[0..]) catch |err| {
                 return errorResponse(allocator, 404, err);
             };
         }
@@ -2131,15 +2241,17 @@ pub const ApiHandler = struct {
 
     /// POST /api/v2/torrents/addPeers -- manually add peers to a torrent.
     fn handleTorrentsAddPeers(self: *const ApiHandler, allocator: std.mem.Allocator, body: []const u8) server.Response {
-        const hashes_str = requireHashes(body) orelse
+        const hashes_param = requireHashes(body) orelse
             return .{ .status = 400, .body = "{\"error\":\"missing hashes\"}" };
+        const hashes = resolveHashesOrAll(self, allocator, hashes_param) catch |err| {
+            return hashSelectionErrorResponse(allocator, err);
+        };
+        defer allocator.free(hashes);
         const peers_str = extractParamMut(body, "peers") orelse
             return .{ .status = 400, .body = "{\"error\":\"missing peers\"}" };
 
-        var iter = std.mem.splitScalar(u8, hashes_str, '|');
-        while (iter.next()) |hash| {
-            if (hash.len == 0) continue;
-            self.session_manager.addManualPeers(hash, peers_str) catch |err| {
+        for (hashes) |hash| {
+            self.session_manager.addManualPeers(hash[0..], peers_str) catch |err| {
                 return errorResponse(allocator, 404, err);
             };
         }
@@ -2191,6 +2303,165 @@ fn errorResponse(allocator: std.mem.Allocator, status: u16, err: anyerror) serve
 /// the single-torrent `hash` key.
 fn requireHashes(body: []const u8) ?[]const u8 {
     return extractParamMut(body, "hashes") orelse extractParamMut(body, "hash");
+}
+
+fn resolveHashesOrAll(self: *const ApiHandler, allocator: std.mem.Allocator, hashes_param: []const u8) ![]const [40]u8 {
+    const trimmed = std.mem.trim(u8, hashes_param, " \t\r\n");
+    if (std.ascii.eqlIgnoreCase(trimmed, "all")) {
+        const stats = try self.session_manager.getAllStats(allocator);
+        defer allocator.free(stats);
+
+        const hashes = try allocator.alloc([40]u8, stats.len);
+        for (stats, 0..) |stat, i| {
+            hashes[i] = stat.info_hash_hex;
+        }
+        return hashes;
+    }
+
+    var hashes = std.ArrayList([40]u8).empty;
+    errdefer hashes.deinit(allocator);
+
+    var iter = std.mem.splitScalar(u8, trimmed, '|');
+    while (iter.next()) |raw_hash| {
+        const hash_str = std.mem.trim(u8, raw_hash, " \t\r\n");
+        if (hash_str.len == 0) continue;
+        if (hash_str.len != 40) return error.InvalidHash;
+
+        var hash: [40]u8 = undefined;
+        @memcpy(hash[0..], hash_str[0..40]);
+        try hashes.append(allocator, hash);
+    }
+
+    return hashes.toOwnedSlice(allocator);
+}
+
+fn hashSelectionErrorResponse(allocator: std.mem.Allocator, err: anyerror) server.Response {
+    return switch (err) {
+        error.InvalidHash => .{ .status = 400, .body = "{\"error\":\"invalid hashes\"}" },
+        error.OutOfMemory => .{ .status = 500, .body = "{\"error\":\"internal\"}" },
+        else => errorResponse(allocator, 500, err),
+    };
+}
+
+fn matchesHashSelection(selected_hashes: ?[]const [40]u8, hash: [40]u8) bool {
+    const hashes = selected_hashes orelse return true;
+    for (hashes) |selected| {
+        if (std.mem.eql(u8, selected[0..], hash[0..])) return true;
+    }
+    return false;
+}
+
+fn matchesInfoFilter(stat: TorrentSession.Stats, filter: []const u8) bool {
+    if (filter.len == 0 or std.ascii.eqlIgnoreCase(filter, "all")) return true;
+    if (std.ascii.eqlIgnoreCase(filter, "downloading")) return stat.state == .downloading or stat.state == .metadata_fetching;
+    if (std.ascii.eqlIgnoreCase(filter, "seeding") or std.ascii.eqlIgnoreCase(filter, "uploading")) return stat.state == .seeding;
+    if (std.ascii.eqlIgnoreCase(filter, "completed")) return stat.progress >= 1.0;
+    if (std.ascii.eqlIgnoreCase(filter, "paused")) return stat.state == .paused or stat.state == .stopped;
+    if (std.ascii.eqlIgnoreCase(filter, "resumed")) return stat.state != .paused and stat.state != .stopped;
+    if (std.ascii.eqlIgnoreCase(filter, "active")) return stat.download_speed > 0 or stat.upload_speed > 0;
+    if (std.ascii.eqlIgnoreCase(filter, "inactive")) return stat.download_speed == 0 and stat.upload_speed == 0;
+    if (std.ascii.eqlIgnoreCase(filter, "stalled")) return (stat.state == .downloading or stat.state == .seeding) and stat.download_speed == 0 and stat.upload_speed == 0;
+    if (std.ascii.eqlIgnoreCase(filter, "stalled_downloading") or std.ascii.eqlIgnoreCase(filter, "stalledDL")) return stat.state == .downloading and stat.download_speed == 0;
+    if (std.ascii.eqlIgnoreCase(filter, "stalled_uploading") or std.ascii.eqlIgnoreCase(filter, "stalledUP")) return stat.state == .seeding and stat.upload_speed == 0;
+    if (std.ascii.eqlIgnoreCase(filter, "errored") or std.ascii.eqlIgnoreCase(filter, "error")) return stat.state == .@"error";
+    if (std.ascii.eqlIgnoreCase(filter, "checking")) return stat.state == .checking;
+    if (std.ascii.eqlIgnoreCase(filter, "queued")) return stat.state == .queued;
+
+    const qbt_state = compat.torrentStateString(stat.state, stat.progress);
+    return std.ascii.eqlIgnoreCase(filter, qbt_state);
+}
+
+fn matchesCategory(stat: TorrentSession.Stats, category: ?[]const u8) bool {
+    const wanted = category orelse return true;
+    if (std.ascii.eqlIgnoreCase(wanted, "all")) return true;
+    return std.mem.eql(u8, stat.category, wanted);
+}
+
+fn matchesTag(stat: TorrentSession.Stats, tag: ?[]const u8) bool {
+    const wanted = tag orelse return true;
+    if (std.ascii.eqlIgnoreCase(wanted, "all")) return true;
+    if (wanted.len == 0 or std.ascii.eqlIgnoreCase(wanted, "untagged")) return stat.tags.len == 0;
+
+    var iter = std.mem.splitScalar(u8, stat.tags, ',');
+    while (iter.next()) |raw_tag| {
+        const current = std.mem.trim(u8, raw_tag, " ");
+        if (std.mem.eql(u8, current, wanted)) return true;
+    }
+    return false;
+}
+
+fn parseOptionalI64(params: []const u8, key: []const u8) ?i64 {
+    const value = extractParamMut(params, key) orelse return null;
+    return std.fmt.parseInt(i64, value, 10) catch null;
+}
+
+fn parseBoolLoose(value: []const u8) bool {
+    return parseBoolPreference(value) catch false;
+}
+
+const PageWindow = struct {
+    start: usize,
+    end: usize,
+};
+
+fn pagedWindow(len: usize, offset: i64, limit: i64) PageWindow {
+    var start: usize = 0;
+    if (offset > 0) {
+        start = @min(len, @as(usize, @intCast(offset)));
+    } else if (offset < 0) {
+        const from_end: usize = @intCast(-offset);
+        start = if (from_end >= len) 0 else len - from_end;
+    }
+
+    var end = len;
+    if (limit >= 0) {
+        end = @min(len, start + @as(usize, @intCast(limit)));
+    }
+    if (end < start) end = start;
+    return .{ .start = start, .end = end };
+}
+
+fn sortTorrentStats(items: []TorrentSession.Stats, key: []const u8, reverse: bool) void {
+    if (key.len == 0) return;
+
+    const SortCtx = struct {
+        key: []const u8,
+        reverse: bool,
+
+        fn lessThan(ctx: @This(), lhs: TorrentSession.Stats, rhs: TorrentSession.Stats) bool {
+            var order = compareTorrentStats(ctx.key, lhs, rhs);
+            if (order == .eq) order = std.mem.order(u8, lhs.info_hash_hex[0..], rhs.info_hash_hex[0..]);
+            return if (ctx.reverse) order == .gt else order == .lt;
+        }
+    };
+
+    std.mem.sort(TorrentSession.Stats, items, SortCtx{ .key = key, .reverse = reverse }, SortCtx.lessThan);
+}
+
+fn compareTorrentStats(key: []const u8, lhs: TorrentSession.Stats, rhs: TorrentSession.Stats) std.math.Order {
+    if (std.ascii.eqlIgnoreCase(key, "name")) return std.mem.order(u8, lhs.name, rhs.name);
+    if (std.ascii.eqlIgnoreCase(key, "hash")) return std.mem.order(u8, lhs.info_hash_hex[0..], rhs.info_hash_hex[0..]);
+    if (std.ascii.eqlIgnoreCase(key, "state")) return std.mem.order(
+        u8,
+        compat.torrentStateString(lhs.state, lhs.progress),
+        compat.torrentStateString(rhs.state, rhs.progress),
+    );
+    if (std.ascii.eqlIgnoreCase(key, "category")) return std.mem.order(u8, lhs.category, rhs.category);
+    if (std.ascii.eqlIgnoreCase(key, "tags")) return std.mem.order(u8, lhs.tags, rhs.tags);
+    if (std.ascii.eqlIgnoreCase(key, "save_path")) return std.mem.order(u8, lhs.save_path, rhs.save_path);
+    if (std.ascii.eqlIgnoreCase(key, "size") or std.ascii.eqlIgnoreCase(key, "total_size")) return std.math.order(lhs.total_size, rhs.total_size);
+    if (std.ascii.eqlIgnoreCase(key, "progress")) return std.math.order(lhs.progress, rhs.progress);
+    if (std.ascii.eqlIgnoreCase(key, "dlspeed")) return std.math.order(lhs.download_speed, rhs.download_speed);
+    if (std.ascii.eqlIgnoreCase(key, "upspeed")) return std.math.order(lhs.upload_speed, rhs.upload_speed);
+    if (std.ascii.eqlIgnoreCase(key, "ratio")) return std.math.order(lhs.ratio, rhs.ratio);
+    if (std.ascii.eqlIgnoreCase(key, "added_on")) return std.math.order(lhs.added_on, rhs.added_on);
+    if (std.ascii.eqlIgnoreCase(key, "completion_on")) return std.math.order(lhs.completion_on, rhs.completion_on);
+    if (std.ascii.eqlIgnoreCase(key, "eta")) return std.math.order(lhs.eta, rhs.eta);
+    if (std.ascii.eqlIgnoreCase(key, "num_seeds")) return std.math.order(lhs.scrape_complete, rhs.scrape_complete);
+    if (std.ascii.eqlIgnoreCase(key, "num_leechs")) return std.math.order(lhs.scrape_incomplete, rhs.scrape_incomplete);
+    if (std.ascii.eqlIgnoreCase(key, "downloaded")) return std.math.order(lhs.bytes_downloaded, rhs.bytes_downloaded);
+    if (std.ascii.eqlIgnoreCase(key, "uploaded")) return std.math.order(lhs.bytes_uploaded, rhs.bytes_uploaded);
+    return .eq;
 }
 
 fn bodyLooksLikeJson(body: []const u8) bool {
