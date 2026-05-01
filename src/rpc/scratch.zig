@@ -171,8 +171,28 @@ pub const TieredArena = struct {
         if (slice.len == 0) return false;
         const buf = self.backing;
         const buf_start = @intFromPtr(buf.ptr);
-        const slice_start = @intFromPtr(slice.ptr);
-        return slice_start >= buf_start and slice_start + slice.len <= buf_start + buf.len;
+        return rangeContains(buf_start, buf.len, slice);
+    }
+
+    /// Returns true when a non-empty response slice lies wholly inside the
+    /// arena's slab backing or one currently tracked spill allocation.
+    /// Empty slices return false because they carry no useful ownership
+    /// provenance and must not suppress parent-allocator frees.
+    pub fn ownsSlice(self: *const TieredArena, slice: []const u8) bool {
+        if (slice.len == 0) return false;
+        if (self.slabContains(slice)) return true;
+
+        var cur = self.spill_head;
+        while (cur) |node| {
+            const node_addr = @intFromPtr(node);
+            const eff_align: std.mem.Alignment = @enumFromInt(node.log2_align);
+            const header_size = std.mem.alignForward(usize, @sizeOf(SpillNode), eff_align.toByteUnits());
+            const user_start = std.math.add(usize, node_addr, header_size) catch return false;
+            const user_len = node.total_len - header_size;
+            if (rangeContains(user_start, user_len, slice)) return true;
+            cur = node.next;
+        }
+        return false;
     }
 
     fn freeSpill(self: *TieredArena) void {
@@ -190,6 +210,14 @@ pub const TieredArena = struct {
             cur = next;
         }
         self.spill_head = null;
+    }
+
+    fn rangeContains(range_start: usize, range_len: usize, slice: []const u8) bool {
+        if (slice.len == 0) return false;
+        const slice_start = @intFromPtr(slice.ptr);
+        const slice_end = std.math.add(usize, slice_start, slice.len) catch return false;
+        const range_end = std.math.add(usize, range_start, range_len) catch return false;
+        return slice_start >= range_start and slice_end <= range_end;
     }
 
     const vtable: Allocator.VTable = .{
@@ -345,6 +373,25 @@ test "TieredArena spills past the slab and frees on reset" {
     // Allocate again — slab should be reusable.
     const a3 = try a.alloc(u8, 128);
     try std.testing.expect(arena.slabContains(a3));
+}
+
+test "TieredArena ownsSlice covers slab and spill allocations" {
+    var arena = try TieredArena.init(std.testing.allocator, 256, 64 * 1024);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    const slab = try a.alloc(u8, 64);
+    const spill = try a.alloc(u8, 8 * 1024);
+    const parent = try std.testing.allocator.alloc(u8, 32);
+    defer std.testing.allocator.free(parent);
+
+    try std.testing.expect(arena.ownsSlice(slab));
+    try std.testing.expect(arena.ownsSlice(slab[8..24]));
+    try std.testing.expect(arena.ownsSlice(spill));
+    try std.testing.expect(arena.ownsSlice(spill[128..256]));
+    try std.testing.expect(!arena.ownsSlice(slab[0..0]));
+    try std.testing.expect(!arena.ownsSlice(spill[0..0]));
+    try std.testing.expect(!arena.ownsSlice(parent));
 }
 
 test "TieredArena enforces hard cap across slab+spill" {

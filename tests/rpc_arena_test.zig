@@ -124,6 +124,69 @@ const HandlerProbe = struct {
     }
 };
 
+const CountingAllocator = struct {
+    parent: std.mem.Allocator,
+    active_allocations: usize = 0,
+    active_bytes: usize = 0,
+    total_allocations: usize = 0,
+
+    fn allocator(self: *CountingAllocator) std.mem.Allocator {
+        return .{
+            .ptr = self,
+            .vtable = &.{
+                .alloc = vtableAlloc,
+                .resize = vtableResize,
+                .remap = vtableRemap,
+                .free = vtableFree,
+            },
+        };
+    }
+
+    fn vtableAlloc(ctx: *anyopaque, len: usize, alignment: std.mem.Alignment, ret_addr: usize) ?[*]u8 {
+        const self: *CountingAllocator = @ptrCast(@alignCast(ctx));
+        const ptr = self.parent.rawAlloc(len, alignment, ret_addr) orelse return null;
+        self.active_allocations += 1;
+        self.active_bytes += len;
+        self.total_allocations += 1;
+        return ptr;
+    }
+
+    fn vtableResize(ctx: *anyopaque, buf: []u8, alignment: std.mem.Alignment, new_len: usize, ret_addr: usize) bool {
+        const self: *CountingAllocator = @ptrCast(@alignCast(ctx));
+        const ok = self.parent.rawResize(buf, alignment, new_len, ret_addr);
+        if (ok) {
+            if (new_len > buf.len) {
+                self.active_bytes += new_len - buf.len;
+            } else {
+                self.active_bytes -= buf.len - new_len;
+            }
+        }
+        return ok;
+    }
+
+    fn vtableRemap(ctx: *anyopaque, buf: []u8, alignment: std.mem.Alignment, new_len: usize, ret_addr: usize) ?[*]u8 {
+        const self: *CountingAllocator = @ptrCast(@alignCast(ctx));
+        const ptr = self.parent.rawRemap(buf, alignment, new_len, ret_addr) orelse return null;
+        if (new_len > buf.len) {
+            self.active_bytes += new_len - buf.len;
+        } else {
+            self.active_bytes -= buf.len - new_len;
+        }
+        return ptr;
+    }
+
+    fn vtableFree(ctx: *anyopaque, buf: []u8, alignment: std.mem.Alignment, ret_addr: usize) void {
+        const self: *CountingAllocator = @ptrCast(@alignCast(ctx));
+        self.active_allocations -= 1;
+        self.active_bytes -= buf.len;
+        self.parent.rawFree(buf, alignment, ret_addr);
+    }
+};
+
+const ParentOwnedProbe = struct {
+    var allocator: std.mem.Allocator = undefined;
+};
+
 fn arenaProbeHandler(allocator: std.mem.Allocator, request: rpc_server.Request) rpc_server.Response {
     HandlerProbe.calls += 1;
     const body = std.fmt.allocPrint(allocator, "{{\"path\":\"{s}\",\"call\":{}}}", .{
@@ -133,6 +196,25 @@ fn arenaProbeHandler(allocator: std.mem.Allocator, request: rpc_server.Request) 
     HandlerProbe.last_body_ptr = @intFromPtr(body.ptr);
     HandlerProbe.last_body_len = body.len;
     return .{ .body = body, .owned_body = body };
+}
+
+fn parentOwnedResponseHandler(allocator: std.mem.Allocator, request: rpc_server.Request) rpc_server.Response {
+    _ = allocator;
+    _ = request;
+
+    const parent = ParentOwnedProbe.allocator;
+    const body = parent.dupe(u8, "{\"source\":\"parent\"}") catch
+        return .{ .status = 500, .body = "{\"error\":\"body_alloc\"}" };
+    const headers = parent.dupe(u8, "X-Varuna-Test: parent-owned\r\n") catch {
+        parent.free(body);
+        return .{ .status = 500, .body = "{\"error\":\"header_alloc\"}" };
+    };
+    return .{
+        .body = body,
+        .owned_body = body,
+        .extra_headers = headers,
+        .owned_extra_headers = headers,
+    };
 }
 
 fn pollFor(server: *rpc_server.ApiServer, ms: u32) void {
@@ -208,14 +290,56 @@ test "ApiServer routes handler allocations through per-slot arena" {
     try std.testing.expect(std.mem.startsWith(u8, resp_buf[0..n2], "HTTP/1.1 200 OK"));
     try std.testing.expect(std.mem.indexOf(u8, resp_buf[0..n2], "\"call\":2") != null);
 
-    // Drain pending ops before deinit so the heap-allocated `ClientOp`
-    // tracker for the next-request recv is destroyed (recv completion
-    // path runs `allocator.destroy(op)`). Closing the socket gives the
-    // pending recv an EOF, which the server processes during the poll
-    // tail.
+    // Drain the pending embedded recv op by closing the socket and polling
+    // once more so the recv completion observes EOF before deinit.
     posix.close(client_fd);
     client_closed = true;
     pollFor(&server, 200);
+}
+
+test "ApiServer frees parent-owned response allocations while arena exists" {
+    var test_io = backend.initWithCapacity(std.testing.allocator, 64) catch return error.SkipZigTest;
+    defer test_io.deinit();
+    var counting_parent: CountingAllocator = .{ .parent = std.testing.allocator };
+    ParentOwnedProbe.allocator = counting_parent.allocator();
+
+    var server = rpc_server.ApiServer.init(ParentOwnedProbe.allocator, &test_io, "127.0.0.1", 0) catch return error.SkipZigTest;
+    defer server.deinit();
+    server.setHandler(parentOwnedResponseHandler);
+    server.submitAccept() catch return;
+
+    var preallocated_arenas: usize = 0;
+    for (server.clients) |client| {
+        if (client.request_arena != null) preallocated_arenas += 1;
+    }
+    try std.testing.expect(preallocated_arenas > 0);
+    const baseline_allocations = counting_parent.active_allocations;
+    const baseline_bytes = counting_parent.active_bytes;
+
+    const port = try listenPort(&server);
+
+    const client_fd = try posix.socket(posix.AF.INET, posix.SOCK.STREAM | posix.SOCK.CLOEXEC, posix.IPPROTO.TCP);
+    var client_closed = false;
+    defer if (!client_closed) posix.close(client_fd);
+    const connect_addr = try std.net.Address.parseIp4("127.0.0.1", port);
+    try posix.connect(client_fd, &connect_addr.any, connect_addr.getOsSockLen());
+
+    _ = try posix.write(client_fd, "GET /parent-owned HTTP/1.1\r\nHost: localhost\r\n\r\n");
+    pollFor(&server, 500);
+
+    var resp_buf: [2048]u8 = undefined;
+    const n = try posix.read(client_fd, &resp_buf);
+    const resp = resp_buf[0..n];
+    try std.testing.expect(std.mem.startsWith(u8, resp, "HTTP/1.1 200 OK"));
+    try std.testing.expect(std.mem.indexOf(u8, resp, "X-Varuna-Test: parent-owned") != null);
+    try std.testing.expect(std.mem.indexOf(u8, resp, "{\"source\":\"parent\"}") != null);
+
+    posix.close(client_fd);
+    client_closed = true;
+    pollFor(&server, 200);
+
+    try std.testing.expectEqual(baseline_allocations, counting_parent.active_allocations);
+    try std.testing.expectEqual(baseline_bytes, counting_parent.active_bytes);
 }
 
 // ── 3. Safety-under-fault: oversize response ──────────────
@@ -254,8 +378,7 @@ test "ApiServer surfaces 500 on arena cap exceeded — no leak" {
     try std.testing.expect(std.mem.indexOf(u8, resp, "HTTP/1.1 500") != null);
     try std.testing.expect(std.mem.indexOf(u8, resp, "too_big") != null);
 
-    // Drain pending recv ClientOp by closing the socket and polling once
-    // more so the recv completion runs `allocator.destroy(op)`.
+    // Drain the pending embedded recv op before deinit.
     posix.close(client_fd);
     client_closed = true;
     pollFor(&server, 200);

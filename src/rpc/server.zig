@@ -49,8 +49,8 @@ const ClientOp = struct {
 /// HTTP API server running on the shared io_interface backend.
 /// Accept, recv, parse, route, send -- all via `io.*` ops with caller-
 /// owned Completions. Each in-flight per-client op carries a generation
-/// counter via a heap-allocated ClientOp tracker so stale CQEs after
-/// slot reuse are filtered cheaply.
+/// counter in an embedded ClientOp tracker so stale CQEs after slot reuse
+/// are filtered cheaply.
 pub fn ApiServerOf(comptime IO: type) type {
     return struct {
         const Self = @This();
@@ -746,17 +746,14 @@ fn ensureRequestArena(self: anytype, client: *ApiClient) !std.mem.Allocator {
     return client.request_arena.?.allocator();
 }
 
-/// True if `slice` is owned by the slot arena (slab or spill chain).
-/// Used to keep `releaseOwnedResponseBody` from double-freeing arena
-/// memory through the parent allocator. Conservative: when the
-/// `request_arena` is present we treat any owned response body as
-/// arena-managed, since handlers in this codebase always allocate from
-/// the allocator the server passes in (the arena's). The arena's reset
-/// reclaims slab and spill in a single sweep; the parent allocator
-/// must never see arena-region pointers.
+/// True if `slice` is owned by the slot arena (slab or live spill chain).
+/// Arena-owned slices are reclaimed by `arena.reset()`; non-arena owned
+/// response memory is assumed to belong to the server parent allocator.
 fn ownedBodyManagedByArena(client: *const ApiClient, slice: []const u8) bool {
-    _ = slice;
-    return client.request_arena != null;
+    if (client.request_arena) |arena| {
+        return arena.ownsSlice(slice);
+    }
+    return false;
 }
 
 fn releaseOwnedResponseBody(allocator: std.mem.Allocator, client: *ApiClient) void {
