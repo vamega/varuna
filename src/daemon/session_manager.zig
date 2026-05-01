@@ -77,11 +77,13 @@ pub const SessionManager = struct {
     /// Monotonic counter assigning the next `MoveJobId`. Starts at 1
     /// so 0 is a valid sentinel ("no job").
     next_move_job_id: MoveJobId = 1,
-    /// Maps `info_hash_hex` → currently-active `MoveJobId`. Prevents
+    /// Maps `info_hash_hex` → currently-active `MoveJobId`. The fixed
+    /// array key is stored by value so entries do not borrow from a
+    /// `TorrentSession`. Prevents
     /// concurrent moves of the same torrent (the relocating_torrents
     /// guard catches this for the legacy path; this is the new
     /// equivalent).
-    torrent_move_jobs: std.StringHashMap(MoveJobId) = undefined,
+    torrent_move_jobs: std.AutoHashMap([40]u8, MoveJobId) = undefined,
 
     /// Shared resume DB for category/tag persistence. Opened once, shared
     /// with all sessions. null if no resume_db_path is configured.
@@ -107,7 +109,7 @@ pub const SessionManager = struct {
             .queue_manager = QueueManager.init(allocator),
             .relocating_torrents = std.AutoHashMap([40]u8, void).init(allocator),
             .move_jobs = std.AutoHashMap(MoveJobId, *MoveJob).init(allocator),
-            .torrent_move_jobs = std.StringHashMap(MoveJobId).init(allocator),
+            .torrent_move_jobs = std.AutoHashMap([40]u8, MoveJobId).init(allocator),
         };
     }
 
@@ -997,7 +999,7 @@ pub const SessionManager = struct {
         defer self.mutex.unlock();
 
         const session = self.sessions.get(hash) orelse return error.TorrentNotFound;
-        if (self.torrent_move_jobs.contains(&session.info_hash_hex)) {
+        if (self.torrent_move_jobs.contains(session.info_hash_hex)) {
             return error.TorrentBusy;
         }
         if (self.relocating_torrents.contains(session.info_hash_hex)) {
@@ -1021,8 +1023,8 @@ pub const SessionManager = struct {
 
         try self.move_jobs.put(id, job);
         errdefer _ = self.move_jobs.remove(id);
-        try self.torrent_move_jobs.put(&session.info_hash_hex, id);
-        errdefer _ = self.torrent_move_jobs.remove(&session.info_hash_hex);
+        try self.torrent_move_jobs.put(session.info_hash_hex, id);
+        errdefer _ = self.torrent_move_jobs.remove(session.info_hash_hex);
 
         // Pause the torrent so the move doesn't race ongoing writes.
         const was_active = session.state == .downloading or session.state == .seeding;
@@ -1076,7 +1078,7 @@ pub const SessionManager = struct {
         while (iter.next()) |entry| {
             if (entry.value_ptr.* == id) {
                 const hash = entry.key_ptr.*;
-                const session = self.sessions.get(hash) orelse return error.TorrentNotFound;
+                const session = self.sessions.get(hash[0..]) orelse return error.TorrentNotFound;
                 const was_active = session.state == .paused;
 
                 const owned_new_path = try self.allocator.dupe(u8, job.dst_root);
@@ -2032,6 +2034,21 @@ test "checkTorrentShareLimit ratio enforcement" {
     // Change action to remove
     sm.max_ratio_act = 1;
     try std.testing.expectEqual(SessionManager.ShareLimitAction.remove, sm.checkTorrentShareLimit(&session, stats));
+}
+
+test "move job reverse map owns hash key bytes" {
+    var sm = SessionManager.init(std.testing.allocator);
+    defer sm.deinit();
+
+    const original_hash = [_]u8{'a'} ** 40;
+    var mutable_hash = original_hash;
+    try sm.torrent_move_jobs.put(mutable_hash, 41);
+
+    mutable_hash = [_]u8{'b'} ** 40;
+
+    const got = sm.torrent_move_jobs.get(original_hash) orelse return error.MissingOwnedMoveJobKey;
+    try std.testing.expectEqual(@as(MoveJobId, 41), got);
+    try std.testing.expect(!sm.torrent_move_jobs.contains(mutable_hash));
 }
 
 test "checkTorrentShareLimit seeding time enforcement" {

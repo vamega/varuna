@@ -97,6 +97,9 @@ pub const CompletionCallback = *const fn (
 // ── MoveJob ───────────────────────────────────────────────
 
 pub const MoveJob = struct {
+    const SpawnThreadFn = *const fn (*MoveJob) anyerror!std.Thread;
+    const FsyncFn = *const fn (posix.fd_t) anyerror!void;
+
     id: JobId,
     allocator: std.mem.Allocator,
 
@@ -171,6 +174,15 @@ pub const MoveJob = struct {
         completion_ctx: ?*anyopaque,
         completion_cb: ?CompletionCallback,
     ) !void {
+        try self.startWithSpawner(completion_ctx, completion_cb, spawnWorkerThread);
+    }
+
+    fn startWithSpawner(
+        self: *MoveJob,
+        completion_ctx: ?*anyopaque,
+        completion_cb: ?CompletionCallback,
+        spawn_thread: SpawnThreadFn,
+    ) !void {
         const prev = self.state_atomic.cmpxchgStrong(
             @intFromEnum(State.created),
             @intFromEnum(State.running),
@@ -181,7 +193,13 @@ pub const MoveJob = struct {
 
         self.completion_ctx = completion_ctx;
         self.completion_cb = completion_cb;
-        self.thread = try std.Thread.spawn(.{}, workerEntry, .{self});
+        const thread = spawn_thread(self) catch |err| {
+            self.completion_ctx = null;
+            self.completion_cb = null;
+            self.state_atomic.store(@intFromEnum(State.created), .release);
+            return err;
+        };
+        self.thread = thread;
     }
 
     /// Request cancellation. Idempotent. The worker observes this between
@@ -376,6 +394,15 @@ pub const MoveJob = struct {
     }
 
     fn copyOneFile(self: *MoveJob, src_path: []const u8, dst_path: []const u8) !void {
+        try self.copyOneFileWithFsync(src_path, dst_path, fsyncFd);
+    }
+
+    fn copyOneFileWithFsync(
+        self: *MoveJob,
+        src_path: []const u8,
+        dst_path: []const u8,
+        fsync_fn: FsyncFn,
+    ) !void {
         // Open both files. We pass NOFOLLOW on the source to refuse
         // following symlinks (matches qBittorrent's safety stance —
         // we wouldn't want a hostile symlink in the data dir to make
@@ -420,13 +447,21 @@ pub const MoveJob = struct {
         // file. We skip fsync on cancel since the file is incomplete
         // and will be cleaned up by the user's retry.
         if (!self.cancel_requested.load(.acquire)) {
-            posix.fsync(dst_fd) catch {};
+            try fsync_fn(dst_fd);
         }
 
         if (!self.cancel_requested.load(.acquire) and copied == total) {
             posix.unlink(src_path) catch {};
             _ = self.files_done.fetchAdd(1, .acq_rel);
         }
+    }
+
+    fn spawnWorkerThread(self: *MoveJob) !std.Thread {
+        return try std.Thread.spawn(.{}, workerEntry, .{self});
+    }
+
+    fn fsyncFd(fd: posix.fd_t) !void {
+        try posix.fsync(fd);
     }
 };
 
@@ -648,6 +683,74 @@ test "MoveJob: requestCancel before start has no effect on a fresh job" {
     job.requestCancel();
     // Without a start() call, state stays `.created`.
     try testing.expectEqual(State.created, job.progress().state);
+}
+
+test "MoveJob: spawn failure restores created state" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.makeDir("src");
+
+    var src_buf: [4096]u8 = undefined;
+    var root_buf: [4096]u8 = undefined;
+    const src_abs = try tmp.dir.realpath("src", &src_buf);
+    const tmp_root = try tmp.dir.realpath(".", &root_buf);
+    const dst_abs = try std.fmt.allocPrint(testing.allocator, "{s}/dst", .{tmp_root});
+    defer testing.allocator.free(dst_abs);
+
+    const Hooks = struct {
+        fn failSpawn(_: *MoveJob) anyerror!std.Thread {
+            return error.TestSpawnFailed;
+        }
+    };
+
+    var job = try MoveJob.create(testing.allocator, 6, src_abs, dst_abs);
+    defer job.destroy();
+
+    try testing.expectError(error.TestSpawnFailed, job.startWithSpawner(null, null, Hooks.failSpawn));
+    try testing.expectEqual(State.created, job.progress().state);
+
+    try job.start(null, null);
+    try expectEventuallyState(job, .succeeded, 5000);
+}
+
+test "MoveJob: fsync failure keeps source file" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.makePath("src");
+    try tmp.dir.makePath("dst");
+    {
+        const f = try tmp.dir.createFile("src/leaf.txt", .{});
+        defer f.close();
+        try f.writeAll("payload");
+    }
+
+    var src_dir_buf: [4096]u8 = undefined;
+    var dst_dir_buf: [4096]u8 = undefined;
+    var src_file_buf: [4096]u8 = undefined;
+    var root_buf: [4096]u8 = undefined;
+    const src_abs = try tmp.dir.realpath("src", &src_dir_buf);
+    const dst_abs = try tmp.dir.realpath("dst", &dst_dir_buf);
+    const src_file_abs = try tmp.dir.realpath("src/leaf.txt", &src_file_buf);
+    const tmp_root = try tmp.dir.realpath(".", &root_buf);
+    const dst_file_abs = try std.fmt.allocPrint(testing.allocator, "{s}/dst/leaf.txt", .{tmp_root});
+    defer testing.allocator.free(dst_file_abs);
+
+    const Hooks = struct {
+        fn failFsync(_: posix.fd_t) anyerror!void {
+            return error.TestFsyncFailure;
+        }
+    };
+
+    var job = try MoveJob.create(testing.allocator, 7, src_abs, dst_abs);
+    defer job.destroy();
+
+    try testing.expectError(error.TestFsyncFailure, job.copyOneFileWithFsync(src_file_abs, dst_file_abs, Hooks.failFsync));
+    const source = try tmp.dir.openFile("src/leaf.txt", .{});
+    defer @constCast(&source).close();
+    var read_buf: [16]u8 = undefined;
+    const n = try source.readAll(&read_buf);
+    try testing.expectEqualStrings("payload", read_buf[0..n]);
+    try testing.expectEqual(@as(u32, 0), job.files_done.load(.acquire));
 }
 
 test "MoveJob: source files are unlinked after rename succeeds" {
