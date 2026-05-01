@@ -261,9 +261,9 @@ pub const EpollMmapIO = struct {
         self.unmapFile(fd);
         _ = linux.epoll_ctl(self.epoll_fd, linux.EPOLL.CTL_DEL, fd, null);
         if (self.fd_registrations.fetchRemove(fd)) |entry| {
-            if (entry.value.read) |c| self.clearRegisteredCompletion(c);
-            if (entry.value.write) |c| self.clearRegisteredCompletion(c);
-            if (entry.value.poll) |c| self.clearRegisteredCompletion(c);
+            self.cancelRegisteredCompletion(entry.value.read);
+            self.cancelRegisteredCompletion(entry.value.write);
+            self.cancelRegisteredCompletion(entry.value.poll);
         }
         posix.close(fd);
     }
@@ -662,17 +662,7 @@ pub const EpollMmapIO = struct {
             found = true;
 
             if (target.callback) |target_cb| {
-                const cancel_result: Result = switch (target.op) {
-                    .recv => .{ .recv = error.OperationCanceled },
-                    .send => .{ .send = error.OperationCanceled },
-                    .recvmsg => .{ .recvmsg = error.OperationCanceled },
-                    .sendmsg => .{ .sendmsg = error.OperationCanceled },
-                    .connect => .{ .connect = error.OperationCanceled },
-                    .accept => .{ .accept = error.OperationCanceled },
-                    .poll => .{ .poll = error.OperationCanceled },
-                    else => .{ .timeout = error.OperationCanceled },
-                };
-                _ = target_cb(target.userdata, target, cancel_result);
+                _ = target_cb(target.userdata, target, makeCancelledResult(target.op));
             }
         }
 
@@ -1013,6 +1003,14 @@ pub const EpollMmapIO = struct {
         return true;
     }
 
+    fn cancelRegisteredCompletion(self: *EpollMmapIO, c: ?*Completion) void {
+        const completion = c orelse return;
+        self.clearRegisteredCompletion(completion);
+        if (completion.callback) |cb| {
+            _ = cb(completion.userdata, completion, makeCancelledResult(completion.op));
+        }
+    }
+
     fn clearRegisteredCompletion(self: *EpollMmapIO, c: *Completion) void {
         const st = epollState(c);
         st.in_flight = false;
@@ -1066,6 +1064,32 @@ pub const EpollMmapIO = struct {
 };
 
 // ── Per-op syscall helpers ────────────────────────────────
+
+fn makeCancelledResult(op: Operation) Result {
+    return switch (op) {
+        .none => .{ .timeout = error.OperationCanceled },
+        .recv => .{ .recv = error.OperationCanceled },
+        .send => .{ .send = error.OperationCanceled },
+        .recvmsg => .{ .recvmsg = error.OperationCanceled },
+        .sendmsg => .{ .sendmsg = error.OperationCanceled },
+        .read => .{ .read = error.OperationCanceled },
+        .write => .{ .write = error.OperationCanceled },
+        .fsync => .{ .fsync = error.OperationCanceled },
+        .fallocate => .{ .fallocate = error.OperationCanceled },
+        .truncate => .{ .truncate = error.OperationCanceled },
+        .splice => .{ .splice = error.OperationCanceled },
+        .copy_file_range => .{ .copy_file_range = error.OperationCanceled },
+        .socket => .{ .socket = error.OperationCanceled },
+        .connect => .{ .connect = error.OperationCanceled },
+        .accept => .{ .accept = error.OperationCanceled },
+        .bind => .{ .bind = error.OperationCanceled },
+        .listen => .{ .listen = error.OperationCanceled },
+        .setsockopt => .{ .setsockopt = error.OperationCanceled },
+        .timeout => .{ .timeout = error.OperationCanceled },
+        .poll => .{ .poll = error.OperationCanceled },
+        .cancel => .{ .cancel = error.OperationCanceled },
+    };
+}
 
 fn doRecvmsg(op: ifc.RecvmsgOp) anyerror!usize {
     const rc = linux.recvmsg(op.fd, op.msg, op.flags);

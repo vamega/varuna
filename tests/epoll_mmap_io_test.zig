@@ -61,7 +61,11 @@ fn sendCb(ud: ?*anyopaque, _: *Completion, result: Result) CallbackAction {
     const c: *Counter = @ptrCast(@alignCast(ud.?));
     c.sent += 1;
     switch (result) {
-        .send => |r| c.bytes_sent += r catch 0,
+        .send => |r| if (r) |n| {
+            c.bytes_sent += n;
+        } else |err| {
+            c.last_err = err;
+        },
         else => {},
     }
     return .disarm;
@@ -174,6 +178,24 @@ test "EpollMmapIO multi-tick send/recv round-trip on real socketpair" {
     try testing.expectEqual(@as(usize, 10), counter.bytes_sent);
     try testing.expectEqual(@as(usize, 10), counter.bytes_received);
     try testing.expectEqualStrings("epoll-mmap", counter.recv_buf[0..10]);
+}
+
+test "EpollMmapIO closeSocket cancels parked send callback" {
+    var io = try skipIfUnavailable();
+    defer io.deinit();
+
+    const fds = (try makeSocketpairNonBlocking()) orelse return error.SkipZigTest;
+    defer posix.close(fds[1]);
+
+    var counter = Counter{};
+    var send_c = Completion{};
+    try io.send(.{ .fd = fds[0], .buf = "pending-close" }, &send_c, &counter, sendCb);
+    try testing.expectEqual(@as(u32, 0), counter.sent);
+
+    io.closeSocket(fds[0]);
+
+    try testing.expectEqual(@as(u32, 1), counter.sent);
+    try testing.expectEqual(error.OperationCanceled, counter.last_err.?);
 }
 
 test "EpollMmapIO mmap-backed write triggers remap on file growth" {

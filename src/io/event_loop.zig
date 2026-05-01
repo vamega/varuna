@@ -630,7 +630,7 @@ pub fn EventLoopOf(comptime IO: type) type {
                     ignoredCancelComplete,
                 ) catch {};
             }
-            for (self.peers) |*peer| {
+            for (self.peers, 0..) |*peer, slot_index| {
                 // Clean up uTP slot state
                 if (peer.transport == .utp) {
                     if (peer.utp_slot) |utp_slot| {
@@ -641,8 +641,16 @@ pub fn EventLoopOf(comptime IO: type) type {
                     }
                 }
                 if (peer.fd >= 0) {
-                    self.io.closeSocket(peer.fd);
+                    const slot: u16 = @intCast(slot_index);
+                    self.freeAllPendingSends(slot);
+                    const embedded_completions = peerEmbeddedCompletionCount(peer);
+                    if (embedded_completions > 0 and peer.state != .disconnecting) {
+                        peer.state = .disconnecting;
+                        peer.disconnecting_completions = embedded_completions;
+                    }
+                    const fd = peer.fd;
                     peer.fd = -1;
+                    self.io.closeSocket(fd);
                 }
             }
             // Note: listen_fd is NOT closed here -- it is owned by the caller
@@ -1779,15 +1787,17 @@ pub fn EventLoopOf(comptime IO: type) type {
             const torrent_id = peer.torrent_id;
             const embedded_completions = peerEmbeddedCompletionCount(peer);
             if (embedded_completions > 0) {
-                if (peer.fd >= 0) {
-                    if (peer.transport == .tcp) {
-                        self.shutdownPeerFd(peer.fd);
-                    }
-                    self.io.closeSocket(peer.fd);
-                    peer.fd = -1;
-                }
+                const fd = peer.fd;
+                const transport = peer.transport;
                 peer.state = .disconnecting;
                 peer.disconnecting_completions = embedded_completions;
+                if (fd >= 0) {
+                    if (transport == .tcp) {
+                        self.shutdownPeerFd(fd);
+                    }
+                    peer.fd = -1;
+                    self.io.closeSocket(fd);
+                }
             } else {
                 self.cleanupPeer(peer);
                 peer.* = Peer{};
