@@ -1228,6 +1228,13 @@ pub fn processHashResults(self: anytype) void {
                             // Phase 1: also fire the piece-hash lifecycle hook
                             // here so do_not_download torrents free hashes too.
                             if (first_completion) {
+                                self.markPieceDurableForResume(torrent_id, result.piece_index) catch |err| {
+                                    log.warn("piece {d} torrent {d}: durable resume tracking failed: {s}", .{
+                                        result.piece_index,
+                                        torrent_id,
+                                        @errorName(err),
+                                    });
+                                };
                                 onPieceVerifiedAndPersisted(self, torrent_id, result.piece_index);
                             }
                         }
