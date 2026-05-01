@@ -272,6 +272,45 @@ test "explicit recheck after fast resume works" {
     el.cancelAllRechecks();
 }
 
+test "AsyncRecheckOf(SimIO): cancel drains delayed read before freeing recheck" {
+    const allocator = std.testing.allocator;
+    const EL_SimIO = event_loop_mod.EventLoopOf(SimIO);
+
+    var piece_data: [piece_data_len]u8 = undefined;
+    for (&piece_data, 0..) |*b, i| b.* = @truncate(i *% 71);
+    var piece_hash: [20]u8 = undefined;
+    Sha1.hash(&piece_data, &piece_hash, .{});
+
+    const torrent_bytes = try buildTorrentBytes(allocator, piece_hash, "cancel.bin");
+    defer allocator.free(torrent_bytes);
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const save_path = try tmp.dir.realpathAlloc(allocator, ".");
+    defer allocator.free(save_path);
+    const session = try Session.load(allocator, torrent_bytes, save_path);
+    defer session.deinit(allocator);
+
+    const sim_io = try SimIO.init(allocator, .{ .seed = 0xCACE_7EAD });
+    var el = EL_SimIO.initBareWithIO(allocator, sim_io, 1) catch |err| {
+        if (err == error.SystemResources) return error.SkipZigTest;
+        return err;
+    };
+    defer el.deinit();
+
+    const synthetic_fd: posix.fd_t = 50;
+    try el.io.setFileBytes(synthetic_fd, &piece_data);
+    const fds = [_]posix.fd_t{synthetic_fd};
+
+    try el.startRecheck(&session, &fds, 7, null, null, null);
+    try std.testing.expectEqual(@as(usize, 1), el.rechecks.items.len);
+
+    el.cancelRecheckForTorrent(7);
+    try std.testing.expectEqual(@as(usize, 0), el.rechecks.items.len);
+
+    try el.io.tick(0);
+}
+
 // ── Test 4: Fast resume with resume_pieces should NOT start recheck ──
 //
 // When a torrent restarts with resume data (resume_pieces is non-null),

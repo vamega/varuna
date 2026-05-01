@@ -63,6 +63,8 @@ pub fn AsyncRecheckOf(comptime IO: type) type {
 
         // Completion
         done: bool = false,
+        destroy_requested: bool = false,
+        lifecycle_depth: u32 = 0,
         on_complete: ?*const fn (*Self) void = null,
         /// Opaque context pointer passed to the caller (e.g. TorrentSession).
         /// The on_complete callback can use this to find its parent object.
@@ -77,6 +79,8 @@ pub fn AsyncRecheckOf(comptime IO: type) type {
             buf: ?[]u8 = null,
             reads_remaining: u32 = 0,
             read_failed: bool = false,
+            read_ops: std.ArrayList(*ReadOp) = .empty,
+            closing: bool = false,
 
             pub const SlotState = enum { free, reading, hashing };
         };
@@ -122,8 +126,12 @@ pub fn AsyncRecheckOf(comptime IO: type) type {
         /// hot-path.
         const ReadOp = struct {
             completion: io_interface.Completion = .{},
+            cancel_completion: io_interface.Completion = .{},
             parent: *Self,
             slot_idx: u16,
+            read_in_flight: bool = false,
+            cancel_in_flight: bool = false,
+            attached: bool = false,
         };
 
         /// Callback bound to a `ReadOp.completion`. Translates the async
@@ -135,6 +143,20 @@ pub fn AsyncRecheckOf(comptime IO: type) type {
             result: io_interface.Result,
         ) io_interface.CallbackAction {
             const op: *ReadOp = @ptrCast(@alignCast(userdata.?));
+            const parent = op.parent;
+            parent.enterLifecycle();
+            defer parent.leaveLifecycle();
+
+            op.read_in_flight = false;
+            const slot_idx = op.slot_idx;
+
+            if (parent.destroy_requested) {
+                if (parent.in_flight_reads > 0) parent.in_flight_reads -= 1;
+                parent.finishReadOp(op);
+                parent.tryCompleteClosingSlot(slot_idx);
+                return .disarm;
+            }
+
             const res: i32 = switch (result) {
                 .read => |r| if (r) |n|
                     std.math.cast(i32, n) orelse std.math.maxInt(i32)
@@ -142,10 +164,25 @@ pub fn AsyncRecheckOf(comptime IO: type) type {
                     -1,
                 else => -1,
             };
-            const parent = op.parent;
-            const slot_idx = op.slot_idx;
-            parent.allocator.destroy(op);
+            parent.finishReadOp(op);
             parent.handleReadCqe(slot_idx, res);
+            return .disarm;
+        }
+
+        fn recheckReadCancelComplete(
+            userdata: ?*anyopaque,
+            _: *io_interface.Completion,
+            _: io_interface.Result,
+        ) io_interface.CallbackAction {
+            const op: *ReadOp = @ptrCast(@alignCast(userdata.?));
+            const parent = op.parent;
+            parent.enterLifecycle();
+            defer parent.leaveLifecycle();
+
+            op.cancel_in_flight = false;
+            const slot_idx = op.slot_idx;
+            parent.finishReadOp(op);
+            parent.tryCompleteClosingSlot(slot_idx);
             return .disarm;
         }
 
@@ -175,8 +212,9 @@ pub fn AsyncRecheckOf(comptime IO: type) type {
         /// completion arrives. Decrements the outstanding read count for the
         /// slot and, when all reads for a piece complete, submits to the hasher.
         pub fn handleReadCqe(self: *Self, slot_idx: u16, res: i32) void {
+            if (self.destroy_requested) return;
             if (slot_idx >= max_in_flight) return;
-            var slot = &self.slots[slot_idx];
+            const slot = &self.slots[slot_idx];
             if (slot.state != .reading) return;
 
             self.in_flight_reads -= 1;
@@ -250,6 +288,11 @@ pub fn AsyncRecheckOf(comptime IO: type) type {
         /// Called when a hasher result arrives for a recheck piece.
         /// Updates the complete_pieces bitfield and advances the pipeline.
         pub fn handleHashResult(self: *Self, piece_index: u32, valid: bool, piece_buf: []u8) void {
+            if (self.destroy_requested) {
+                self.allocator.free(piece_buf);
+                return;
+            }
+
             // Find the slot for this piece
             var slot_idx: ?u16 = null;
             for (&self.slots, 0..) |*slot, i| {
@@ -283,8 +326,9 @@ pub fn AsyncRecheckOf(comptime IO: type) type {
             }
         }
 
-        /// Free all resources. The caller must ensure no CQEs or hash results
-        /// referencing this recheck are still in flight.
+        /// Request recheck teardown. Reads that still have CQEs pending are
+        /// cancelled and drained before their buffers, ReadOps, and parent
+        /// recheck storage are freed.
         ///
         /// `slot.buf` is freed only for slots in `.reading` state (and on
         /// the OOM path before the read submit) — for `.hashing` slots the
@@ -294,16 +338,115 @@ pub fn AsyncRecheckOf(comptime IO: type) type {
         /// it. Freeing it here would double-free against `hasher.deinit`'s
         /// pending-job sweep during `EventLoop.deinit`.
         pub fn destroy(self: *Self) void {
-            for (&self.slots) |*slot| {
-                if (slot.plan) |plan| plan.deinit(self.allocator);
-                if (slot.buf) |buf| self.allocator.free(buf);
-                slot.* = .{};
+            self.enterLifecycle();
+            defer self.leaveLifecycle();
+
+            if (self.destroy_requested) return;
+            self.destroy_requested = true;
+            self.done = true;
+            self.on_complete = null;
+
+            for (&self.slots, 0..) |*slot, i| {
+                switch (slot.state) {
+                    .free => {},
+                    .reading => {
+                        slot.closing = true;
+                        var read_idx: usize = 0;
+                        while (read_idx < slot.read_ops.items.len) {
+                            const op = slot.read_ops.items[read_idx];
+                            self.cancelReadOp(op);
+                            if (read_idx < slot.read_ops.items.len and slot.read_ops.items[read_idx] == op) {
+                                read_idx += 1;
+                            }
+                        }
+                        self.tryCompleteClosingSlot(@intCast(i));
+                    },
+                    .hashing => self.clearSlot(@intCast(i)),
+                }
             }
+        }
+
+        // ── Internal helpers ─────────────────────────────────────
+
+        fn enterLifecycle(self: *Self) void {
+            self.lifecycle_depth += 1;
+        }
+
+        fn leaveLifecycle(self: *Self) void {
+            std.debug.assert(self.lifecycle_depth > 0);
+            self.lifecycle_depth -= 1;
+            if (self.lifecycle_depth == 0) {
+                self.maybeFinalizeDestroy();
+            }
+        }
+
+        fn maybeFinalizeDestroy(self: *Self) void {
+            if (!self.destroy_requested) return;
+            if (self.lifecycle_depth != 0) return;
+            if (!self.allSlotsFree()) return;
+
             self.complete_pieces.deinit(self.allocator);
             self.allocator.destroy(self);
         }
 
-        // ── Internal helpers ─────────────────────────────────────
+        fn detachReadOp(self: *Self, op: *ReadOp) void {
+            if (!op.attached) return;
+            if (op.slot_idx < max_in_flight) {
+                const slot = &self.slots[op.slot_idx];
+                for (slot.read_ops.items, 0..) |candidate, i| {
+                    if (candidate == op) {
+                        _ = slot.read_ops.swapRemove(i);
+                        break;
+                    }
+                }
+            }
+            op.attached = false;
+        }
+
+        fn finishReadOp(self: *Self, op: *ReadOp) void {
+            if (op.read_in_flight or op.cancel_in_flight) return;
+            self.detachReadOp(op);
+            self.allocator.destroy(op);
+        }
+
+        fn cancelReadOp(self: *Self, op: *ReadOp) void {
+            if (!op.read_in_flight or op.cancel_in_flight) return;
+            op.cancel_in_flight = true;
+            self.io.cancel(
+                .{ .target = &op.completion },
+                &op.cancel_completion,
+                op,
+                recheckReadCancelComplete,
+            ) catch {
+                op.cancel_in_flight = false;
+            };
+        }
+
+        fn tryCompleteClosingSlot(self: *Self, slot_idx: u16) void {
+            if (slot_idx >= max_in_flight) return;
+            const slot = &self.slots[slot_idx];
+            if (!slot.closing) return;
+            if (slot.read_ops.items.len != 0) return;
+            self.clearSlot(slot_idx);
+        }
+
+        fn clearSlot(self: *Self, slot_idx: u16) void {
+            if (slot_idx >= max_in_flight) return;
+            var slot = &self.slots[slot_idx];
+            if (slot.state == .free and slot.read_ops.items.len == 0) return;
+            std.debug.assert(slot.read_ops.items.len == 0);
+
+            if (slot.plan) |plan| {
+                plan.deinit(self.allocator);
+                slot.plan = null;
+            }
+            if (slot.buf) |buf| {
+                self.allocator.free(buf);
+                slot.buf = null;
+            }
+            slot.read_ops.deinit(self.allocator);
+            slot.* = .{};
+        }
 
         /// Find a free slot, get the next piece that needs verification,
         /// and submit io_uring reads for each span. Returns true if a piece
@@ -379,6 +522,14 @@ pub fn AsyncRecheckOf(comptime IO: type) type {
                     continue;
                 };
                 op.* = .{ .parent = self, .slot_idx = slot_idx };
+                slot.read_ops.append(self.allocator, op) catch |err| {
+                    log.warn("recheck: ReadOp track for piece {d}: {s}", .{ piece_index, @errorName(err) });
+                    self.allocator.destroy(op);
+                    slot.read_failed = true;
+                    continue;
+                };
+                op.attached = true;
+                op.read_in_flight = true;
                 self.io.read(
                     .{ .fd = fd, .buf = target, .offset = span.file_offset },
                     &op.completion,
@@ -386,7 +537,8 @@ pub fn AsyncRecheckOf(comptime IO: type) type {
                     recheckReadComplete,
                 ) catch |err| {
                     log.warn("recheck: io read submit for piece {d}: {s}", .{ piece_index, @errorName(err) });
-                    self.allocator.destroy(op);
+                    op.read_in_flight = false;
+                    self.finishReadOp(op);
                     slot.read_failed = true;
                     continue;
                 };
@@ -421,29 +573,19 @@ pub fn AsyncRecheckOf(comptime IO: type) type {
         /// Finish processing a slot: free resources, mark piece done,
         /// submit more work, and check for overall completion.
         fn finishSlot(self: *Self, slot_idx: u16, valid: bool) void {
-            var slot = &self.slots[slot_idx];
+            const slot = &self.slots[slot_idx];
 
             if (valid) {
                 self.markPieceComplete(slot.piece_index);
             }
 
-            // Free plan
-            if (slot.plan) |plan| {
-                plan.deinit(self.allocator);
-                slot.plan = null;
-            }
-
-            // Free buffer (if hasher didn't take ownership)
-            if (slot.buf) |buf| {
-                self.allocator.free(buf);
-                slot.buf = null;
-            }
-
-            slot.state = .free;
+            self.clearSlot(slot_idx);
             self.pieces_done += 1;
 
             // Try to fill the pipeline with another piece
-            _ = self.submitNextPiece();
+            if (!self.destroy_requested) {
+                _ = self.submitNextPiece();
+            }
 
             self.checkComplete();
         }
