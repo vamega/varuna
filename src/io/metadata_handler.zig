@@ -58,6 +58,8 @@ pub fn AsyncMetadataFetchOf(comptime IO: type) type {
         active_slots: u8 = 0,
 
         done: bool = false,
+        destroy_requested: bool = false,
+        lifecycle_depth: u32 = 0,
         result_bytes: ?[]const u8 = null,
         on_complete: ?*const fn (*Self) void = null,
         caller_ctx: ?*anyopaque = null,
@@ -115,6 +117,10 @@ pub fn AsyncMetadataFetchOf(comptime IO: type) type {
             /// Only one op is in flight per slot at a time (the state
             /// machine is fully serial), so a single completion suffices.
             completion: io_interface.Completion = .{},
+            cancel_completion: io_interface.Completion = .{},
+            op_in_flight: bool = false,
+            cancel_in_flight: bool = false,
+            closing: bool = false,
         };
 
         /// Create a heap-allocated AsyncMetadataFetch.
@@ -202,9 +208,17 @@ pub fn AsyncMetadataFetchOf(comptime IO: type) type {
             result: io_interface.Result,
         ) io_interface.CallbackAction {
             const self: *Self = @ptrCast(@alignCast(userdata.?));
+            self.enterLifecycle();
+            defer self.leaveLifecycle();
+
             const slot: *Slot = @fieldParentPtr("completion", completion);
-            if (self.done or slot.state == .free) return .disarm;
+            slot.op_in_flight = false;
+            if (slot.state == .free) return .disarm;
             const slot_idx = self.slotIdxFor(slot);
+            if (self.done or self.destroy_requested or slot.closing) {
+                self.releaseSlot(slot_idx);
+                return .disarm;
+            }
             const fd = switch (result) {
                 .socket => |r| r catch {
                     log.debug(
@@ -233,12 +247,14 @@ pub fn AsyncMetadataFetchOf(comptime IO: type) type {
             }
 
             slot.state = .connecting;
+            slot.op_in_flight = true;
             self.io.connect(
                 .{ .fd = fd, .addr = self.peers[slot.peer_idx] },
                 &slot.completion,
                 self,
                 metadataConnectComplete,
             ) catch {
+                slot.op_in_flight = false;
                 self.releaseSlot(slot_idx);
                 self.tryNextPeer(slot_idx);
             };
@@ -251,9 +267,17 @@ pub fn AsyncMetadataFetchOf(comptime IO: type) type {
             result: io_interface.Result,
         ) io_interface.CallbackAction {
             const self: *Self = @ptrCast(@alignCast(userdata.?));
+            self.enterLifecycle();
+            defer self.leaveLifecycle();
+
             const slot: *Slot = @fieldParentPtr("completion", completion);
-            if (self.done or slot.state == .free) return .disarm;
+            slot.op_in_flight = false;
+            if (slot.state == .free) return .disarm;
             const slot_idx = self.slotIdxFor(slot);
+            if (self.done or self.destroy_requested or slot.closing) {
+                self.releaseSlot(slot_idx);
+                return .disarm;
+            }
             const ok = switch (result) {
                 .connect => |r| if (r) |_| true else |_| false,
                 else => false,
@@ -268,9 +292,17 @@ pub fn AsyncMetadataFetchOf(comptime IO: type) type {
             result: io_interface.Result,
         ) io_interface.CallbackAction {
             const self: *Self = @ptrCast(@alignCast(userdata.?));
+            self.enterLifecycle();
+            defer self.leaveLifecycle();
+
             const slot: *Slot = @fieldParentPtr("completion", completion);
-            if (self.done or slot.state == .free) return .disarm;
+            slot.op_in_flight = false;
+            if (slot.state == .free) return .disarm;
             const slot_idx = self.slotIdxFor(slot);
+            if (self.done or self.destroy_requested or slot.closing) {
+                self.releaseSlot(slot_idx);
+                return .disarm;
+            }
             const res: i32 = switch (result) {
                 .send => |r| if (r) |n|
                     std.math.cast(i32, n) orelse std.math.maxInt(i32)
@@ -288,9 +320,17 @@ pub fn AsyncMetadataFetchOf(comptime IO: type) type {
             result: io_interface.Result,
         ) io_interface.CallbackAction {
             const self: *Self = @ptrCast(@alignCast(userdata.?));
+            self.enterLifecycle();
+            defer self.leaveLifecycle();
+
             const slot: *Slot = @fieldParentPtr("completion", completion);
-            if (self.done or slot.state == .free) return .disarm;
+            slot.op_in_flight = false;
+            if (slot.state == .free) return .disarm;
             const slot_idx = self.slotIdxFor(slot);
+            if (self.done or self.destroy_requested or slot.closing) {
+                self.releaseSlot(slot_idx);
+                return .disarm;
+            }
             const res: i32 = switch (result) {
                 .recv => |r| if (r) |n|
                     std.math.cast(i32, n) orelse std.math.maxInt(i32)
@@ -299,6 +339,25 @@ pub fn AsyncMetadataFetchOf(comptime IO: type) type {
                 else => -1,
             };
             self.onRecvComplete(slot, slot_idx, res);
+            return .disarm;
+        }
+
+        fn metadataCancelComplete(
+            userdata: ?*anyopaque,
+            completion: *io_interface.Completion,
+            _: io_interface.Result,
+        ) io_interface.CallbackAction {
+            const self: *Self = @ptrCast(@alignCast(userdata.?));
+            self.enterLifecycle();
+            defer self.leaveLifecycle();
+
+            const slot: *Slot = @fieldParentPtr("cancel_completion", completion);
+            slot.cancel_in_flight = false;
+            if (slot.state == .free) return .disarm;
+            const slot_idx = self.slotIdxFor(slot);
+            if (slot.closing or self.destroy_requested or self.done) {
+                self.completeSlotRelease(slot_idx);
+            }
             return .disarm;
         }
 
@@ -342,6 +401,7 @@ pub fn AsyncMetadataFetchOf(comptime IO: type) type {
             // posix.socket() so SimIO can drive the fetch end-to-end.
             // metadataSocketComplete chains the connect once the fd is
             // available.
+            slot.op_in_flight = true;
             self.io.socket(
                 .{
                     .domain = family,
@@ -352,6 +412,7 @@ pub fn AsyncMetadataFetchOf(comptime IO: type) type {
                 self,
                 metadataSocketComplete,
             ) catch {
+                slot.op_in_flight = false;
                 self.releaseSlot(slot_idx);
                 self.tryNextPeer(slot_idx);
                 return;
@@ -856,9 +917,35 @@ pub fn AsyncMetadataFetchOf(comptime IO: type) type {
             const slot = &self.slots[slot_idx];
             if (slot.state == .free) return;
 
-            if (slot.fd >= 0) {
-                self.io.closeSocket(slot.fd);
+            slot.closing = true;
+            if (slot.op_in_flight and !slot.cancel_in_flight) {
+                slot.cancel_in_flight = true;
+                self.io.cancel(
+                    .{ .target = &slot.completion },
+                    &slot.cancel_completion,
+                    self,
+                    metadataCancelComplete,
+                ) catch {
+                    slot.cancel_in_flight = false;
+                };
+                if (slot.state == .free) return;
             }
+
+            if (slot.fd >= 0) {
+                const fd = slot.fd;
+                slot.fd = -1;
+                self.io.closeSocket(fd);
+                if (slot.state == .free) return;
+            }
+
+            self.completeSlotRelease(slot_idx);
+        }
+
+        fn completeSlotRelease(self: *Self, slot_idx: u8) void {
+            const slot = &self.slots[slot_idx];
+            if (slot.state == .free) return;
+            if (slot.op_in_flight or slot.cancel_in_flight) return;
+
             if (slot.send_buf) |buf| self.allocator.free(buf);
             if (slot.recv_buf) |buf| self.allocator.free(buf);
 
@@ -896,12 +983,14 @@ pub fn AsyncMetadataFetchOf(comptime IO: type) type {
                 return;
             };
 
+            slot.op_in_flight = true;
             self.io.send(
                 .{ .fd = slot.fd, .buf = send_buf[0..slot.send_len] },
                 &slot.completion,
                 self,
                 metadataSendComplete,
             ) catch {
+                slot.op_in_flight = false;
                 self.releaseSlot(slot_idx);
                 self.tryNextPeer(slot_idx);
                 return;
@@ -915,12 +1004,14 @@ pub fn AsyncMetadataFetchOf(comptime IO: type) type {
                 return;
             };
 
+            slot.op_in_flight = true;
             self.io.recv(
                 .{ .fd = slot.fd, .buf = recv_buf[slot.recv_len..slot.recv_expected] },
                 &slot.completion,
                 self,
                 metadataRecvComplete,
             ) catch {
+                slot.op_in_flight = false;
                 self.releaseSlot(slot_idx);
                 self.tryNextPeer(slot_idx);
                 return;
@@ -929,16 +1020,43 @@ pub fn AsyncMetadataFetchOf(comptime IO: type) type {
 
         // ── Cleanup ───────────────────────────────────────────
 
+        fn enterLifecycle(self: *Self) void {
+            self.lifecycle_depth += 1;
+        }
+
+        fn leaveLifecycle(self: *Self) void {
+            std.debug.assert(self.lifecycle_depth > 0);
+            self.lifecycle_depth -= 1;
+            if (self.lifecycle_depth == 0) {
+                self.maybeFinalizeDestroy();
+            }
+        }
+
+        fn maybeFinalizeDestroy(self: *Self) void {
+            if (!self.destroy_requested) return;
+            if (self.lifecycle_depth != 0) return;
+            if (self.active_slots != 0) return;
+
+            self.assembler.deinit();
+            self.allocator.free(self.peers);
+            self.allocator.destroy(self);
+        }
+
         pub fn destroy(self: *Self) void {
+            self.enterLifecycle();
+            defer self.leaveLifecycle();
+
+            if (self.destroy_requested) return;
+            self.destroy_requested = true;
+            self.done = true;
+            self.on_complete = null;
+
             // Close any open fds and free slot buffers
             for (0..max_slots) |i| {
                 if (self.slots[i].state != .free) {
                     self.releaseSlot(@intCast(i));
                 }
             }
-            self.assembler.deinit();
-            self.allocator.free(self.peers);
-            self.allocator.destroy(self);
         }
     };
 }

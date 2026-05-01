@@ -213,6 +213,59 @@ test "AsyncMetadataFetchOf(SimIO): legacy-fd send path causes all peers to fail"
     el.cancelMetadataFetch();
 }
 
+test "AsyncMetadataFetchOf(SimIO): cancel drains parked recv before freeing fetch" {
+    const allocator = std.testing.allocator;
+
+    const EL_SimIO = event_loop_mod.EventLoopOf(SimIO);
+    var sim_io = try SimIO.init(allocator, .{
+        .seed = 0xCACE_1A7E,
+        .faults = .{
+            .delayed_close_cqe_min_ticks = 1,
+            .delayed_close_cqe_max_ticks = 1,
+        },
+        .max_ops_per_tick = 1,
+    });
+
+    const pair = try sim_io.createSocketpair();
+    try sim_io.enqueueSocketResult(pair[0]);
+
+    var el = EL_SimIO.initBareWithIO(allocator, sim_io, 0) catch |err| {
+        if (err == error.SystemResources) return error.SkipZigTest;
+        return err;
+    };
+    defer el.deinit();
+
+    const peers = [_]std.net.Address{
+        std.net.Address.initIp4(.{ 127, 0, 0, 1 }, 6881),
+    };
+
+    try el.startMetadataFetch(
+        [_]u8{0xAA} ** 20,
+        [_]u8{0xBB} ** 20,
+        6881,
+        false,
+        &peers,
+        null,
+        null,
+    );
+
+    var ticks: u32 = 0;
+    while (ticks < tick_budget) : (ticks += 1) {
+        const mf = el.metadata_fetch orelse return error.UnexpectedMetadataFetchEnd;
+        if (mf.slots[0].state == .handshake_recv) break;
+        try el.io.tick(0);
+    }
+    try std.testing.expect(ticks < tick_budget);
+
+    el.cancelMetadataFetch();
+    try std.testing.expect(el.metadata_fetch == null);
+
+    var drain_ticks: u32 = 0;
+    while (drain_ticks < 4) : (drain_ticks += 1) {
+        try el.io.tick(0);
+    }
+}
+
 // ── Helper: build a scripted peer's response stream ──────────
 //
 // The metadata fetcher sees the peer as an opaque byte stream.
@@ -373,4 +426,96 @@ test "AsyncMetadataFetchOf(SimIO): happy-path scripted peer delivers verified in
     try std.testing.expectEqual(info_bytes[info_bytes.len - 1], ctx.result_last_byte);
 
     el.cancelMetadataFetch();
+}
+
+test "AsyncMetadataFetchOf(SimIO): completion drains parked peers after callback destroys fetch" {
+    const allocator = std.testing.allocator;
+
+    const EL_SimIO = event_loop_mod.EventLoopOf(SimIO);
+
+    var info_bytes: [256]u8 = undefined;
+    for (&info_bytes, 0..) |*b, i| b.* = @intCast(i & 0xff);
+    var info_hash: [20]u8 = undefined;
+    Sha1.hash(&info_bytes, &info_hash, .{});
+
+    const peer_handshake_id = [_]u8{0xCC} ** 20;
+    const scripted = try buildScriptedPeerResponses(
+        allocator,
+        info_hash,
+        peer_handshake_id,
+        &info_bytes,
+    );
+    defer allocator.free(scripted);
+
+    var sim_io = try SimIO.init(allocator, .{
+        .seed = 0xD3F3_44ED,
+        .faults = .{
+            .delayed_close_cqe_min_ticks = 1,
+            .delayed_close_cqe_max_ticks = 1,
+        },
+        .max_ops_per_tick = 1,
+    });
+
+    const fast_pair = try sim_io.createSocketpair();
+    try sim_io.enqueueSocketResult(fast_pair[0]);
+    try sim_io.pushSocketRecvBytes(fast_pair[0], scripted);
+
+    const slow_pair_a = try sim_io.createSocketpair();
+    try sim_io.enqueueSocketResult(slow_pair_a[0]);
+
+    const slow_pair_b = try sim_io.createSocketpair();
+    try sim_io.enqueueSocketResult(slow_pair_b[0]);
+
+    var el = EL_SimIO.initBareWithIO(allocator, sim_io, 0) catch |err| {
+        if (err == error.SystemResources) return error.SkipZigTest;
+        return err;
+    };
+    defer el.deinit();
+
+    const Ctx = struct {
+        completed: bool = false,
+        had_metadata: bool = false,
+        destroyed_in_callback: bool = false,
+    };
+    var ctx = Ctx{};
+
+    const peers = [_]std.net.Address{
+        std.net.Address.initIp4(.{ 127, 0, 0, 1 }, 6881),
+        std.net.Address.initIp4(.{ 127, 0, 0, 2 }, 6882),
+        std.net.Address.initIp4(.{ 127, 0, 0, 3 }, 6883),
+    };
+
+    try el.startMetadataFetch(
+        info_hash,
+        [_]u8{0xBB} ** 20,
+        6881,
+        false,
+        &peers,
+        struct {
+            fn cb(mf: *EL_SimIO.AsyncMetadataFetch) void {
+                const c: *Ctx = @ptrCast(@alignCast(mf.caller_ctx.?));
+                c.completed = true;
+                c.had_metadata = mf.result_bytes != null;
+                mf.destroy();
+                c.destroyed_in_callback = true;
+            }
+        }.cb,
+        @ptrCast(&ctx),
+    );
+
+    var ticks: u32 = 0;
+    while (ticks < tick_budget and !ctx.completed) : (ticks += 1) {
+        try el.io.tick(0);
+    }
+
+    try std.testing.expect(ctx.completed);
+    try std.testing.expect(ctx.had_metadata);
+    try std.testing.expect(ctx.destroyed_in_callback);
+
+    el.metadata_fetch = null;
+
+    var drain_ticks: u32 = 0;
+    while (drain_ticks < 8) : (drain_ticks += 1) {
+        try el.io.tick(0);
+    }
 }
