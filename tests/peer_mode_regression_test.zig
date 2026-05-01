@@ -53,7 +53,7 @@ test "INTERESTED auto-unchokes an outbound-mode peer (regression: large-20m-64k)
     peer.torrent_id = 0;
     peer.mode = .outbound;
     peer.am_choking = true;
-    peer.body_buf = &peer.small_body_buf;
+    peer.body_buf = peer.small_body_buf[0..1];
     peer.body_expected = 0;
     peer.body_offset = 0;
 
