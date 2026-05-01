@@ -267,6 +267,137 @@ const socket_fd_base: i32 = 1000;
 /// range so legacy callers never collide with sim-socket fds.
 const synthetic_fd_base: i32 = 100_000;
 
+// ── Sim file state (durability model) ─────────────────────
+//
+// Two byte-level layers per fd:
+//
+//   - `durable`: bytes that have been fsynced. Survives `crash()`.
+//   - `pending`: bytes accepted by `write` but not yet fsynced. Dropped
+//     by `crash()`.
+//   - `pending_dirty`: bit-per-byte mask. Bit `i` set means `pending[i]`
+//     is an overlay (returned by reads in preference to `durable[i]`);
+//     clear means `durable[i]` wins.
+//
+// `read` returns `durable[i]` when `pending_dirty[i] == 0` and
+// `pending[i]` when `pending_dirty[i] == 1`. `fsync` copies each set bit
+// from `pending` into `durable` (extending `durable` if needed) then
+// clears those bits. `crash()` clears all bits and resets `pending_len`.
+//
+// All three buffers grow as needed when a `write` extends past their
+// current length; bytes added by growth are zeroed and marked
+// non-dirty (pending bits clear).
+pub const SimFile = struct {
+    durable: std.ArrayListUnmanaged(u8) = .{},
+    pending: std.ArrayListUnmanaged(u8) = .{},
+    pending_dirty: std.DynamicBitSetUnmanaged = .{},
+
+    fn deinit(self: *SimFile, allocator: std.mem.Allocator) void {
+        self.durable.deinit(allocator);
+        self.pending.deinit(allocator);
+        self.pending_dirty.deinit(allocator);
+    }
+
+    /// Length the durable layer claims (post-fsync content size).
+    fn durableLen(self: *const SimFile) usize {
+        return self.durable.items.len;
+    }
+
+    /// Length the union (durable + pending overlay) claims. Equals
+    /// `max(durable.len, pending.len)`.
+    fn visibleLen(self: *const SimFile) usize {
+        return @max(self.durable.items.len, self.pending.items.len);
+    }
+
+    /// Grow `pending` and `pending_dirty` so they cover at least `n`
+    /// bytes. Newly-grown bytes are zeroed and marked clean.
+    fn ensurePending(
+        self: *SimFile,
+        allocator: std.mem.Allocator,
+        n: usize,
+    ) !void {
+        if (self.pending.items.len < n) {
+            const old_len = self.pending.items.len;
+            try self.pending.resize(allocator, n);
+            @memset(self.pending.items[old_len..], 0);
+        }
+        if (self.pending_dirty.bit_length < n) {
+            try self.pending_dirty.resize(allocator, n, false);
+        }
+    }
+
+    /// Read the union of durable+pending into `dst`, starting at file
+    /// offset `off`. Returns the number of bytes written into `dst`.
+    /// Bytes past the visible length read as zero, mirroring real
+    /// pread behaviour against a sparse file (we treat unwritten
+    /// regions as zero-filled, matching what mmap or a fresh
+    /// fallocate'd file would expose).
+    fn readUnion(self: *const SimFile, off: usize, dst: []u8) usize {
+        const visible = self.visibleLen();
+        if (off >= visible) return 0;
+        const available: usize = visible - off;
+        const n: usize = @min(dst.len, available);
+
+        var i: usize = 0;
+        while (i < n) : (i += 1) {
+            const file_idx = off + i;
+            const dirty = file_idx < self.pending_dirty.bit_length and
+                self.pending_dirty.isSet(file_idx);
+            if (dirty) {
+                dst[i] = self.pending.items[file_idx];
+            } else if (file_idx < self.durable.items.len) {
+                dst[i] = self.durable.items[file_idx];
+            } else {
+                dst[i] = 0;
+            }
+        }
+        return n;
+    }
+
+    /// Promote every dirty byte in `pending` into `durable`, then clear
+    /// the dirty mask. Grows `durable` if a dirty byte sits past its
+    /// current length (newly grown bytes are zeroed first; then the
+    /// dirty bytes overwrite). After the call, `pending` retains its
+    /// buffer (so the next write doesn't have to grow from zero) but
+    /// no bit in `pending_dirty` is set.
+    fn promotePending(
+        self: *SimFile,
+        allocator: std.mem.Allocator,
+    ) !void {
+        if (self.pending_dirty.bit_length == 0) return;
+        // Grow durable to cover the highest dirty bit, if any.
+        var max_idx: usize = 0;
+        var found: bool = false;
+        var it = self.pending_dirty.iterator(.{});
+        while (it.next()) |idx| {
+            max_idx = idx;
+            found = true;
+        }
+        if (!found) return;
+        const need = max_idx + 1;
+        if (self.durable.items.len < need) {
+            const old_len = self.durable.items.len;
+            try self.durable.resize(allocator, need);
+            @memset(self.durable.items[old_len..], 0);
+        }
+        var it2 = self.pending_dirty.iterator(.{});
+        while (it2.next()) |idx| {
+            self.durable.items[idx] = self.pending.items[idx];
+        }
+        // Clear the dirty mask in one shot. We keep the bit-set
+        // capacity around; the next write will set bits again.
+        self.pending_dirty.unsetAll();
+    }
+
+    /// Drop every dirty bit (i.e. forget all pending writes). The
+    /// pending buffer is shrunk-in-place but its capacity is retained
+    /// — a subsequent write reuses the allocation. Mirrors a
+    /// power-loss between write CQE and fsync CQE.
+    fn dropPending(self: *SimFile) void {
+        self.pending_dirty.unsetAll();
+        self.pending.clearRetainingCapacity();
+    }
+};
+
 // ── SimIO ─────────────────────────────────────────────────
 
 pub const SimIO = struct {
@@ -299,19 +430,34 @@ pub const SimIO = struct {
     /// Head of the free-list of unallocated socket slots.
     free_socket_head: u32 = sentinel_index,
 
-    /// Optional per-fd content registered via `setFileBytes`. When a
-    /// `read` op targets a registered fd, SimIO returns
-    /// `bytes[offset..][0..min(buf.len, len - offset)]` instead of the
-    /// default zero-byte success. Used by recheck/disk tests that need
-    /// reads to reflect "what's on disk" rather than always returning
-    /// zero. The map is empty by default; production data-path reads
-    /// (which never go through `setFileBytes`) hit the legacy zero path
-    /// unchanged.
+    /// Optional per-fd file state, populated by `setFileBytes` (seed)
+    /// and by subsequent `write` / `fsync` ops (durability model). When
+    /// a `read` op targets a registered fd, SimIO returns the union of
+    /// `durable` overlaid with `pending` (most-recent byte wins) instead
+    /// of the default zero-byte success.
     ///
-    /// Slices are caller-owned: `setFileBytes` records the pointer and
-    /// length, but does not copy. The caller must keep the underlying
-    /// memory alive for as long as reads against `fd` may fire.
-    file_content: std.AutoHashMap(posix.fd_t, []const u8),
+    /// Used by recheck/disk tests *and* by durability-aware tests that
+    /// model the kernel's pagecache barrier:
+    ///   * `write(buf, offset)` extends `pending` (sized to cover
+    ///     offset+len) and marks the affected bytes dirty.
+    ///   * `fsync` (success path) promotes the dirty pending region
+    ///     into `durable` and clears the dirty mask.
+    ///   * `crash()` drops every fd's pending bytes, leaving only
+    ///     durable. Models a power-loss between write CQE and fsync
+    ///     CQE.
+    ///
+    /// The map is empty by default; production data-path reads against
+    /// fds that were never seeded or written still hit the legacy
+    /// zero-byte path.
+    ///
+    /// Tradeoff: flat `ArrayListUnmanaged(u8)` per layer plus a
+    /// `pending_dirty` bit-per-byte mask. Simpler than a sparse-extent
+    /// representation and good enough for the test piece sizes (KB to a
+    /// few MB). If a future test wants to model a multi-GB sparse file
+    /// the storage shape can switch to extents without changing the
+    /// public API. Bytes are owned by SimIO (`setFileBytes` copies); the
+    /// caller may free its source slice immediately after the call.
+    file_state: std.AutoHashMap(posix.fd_t, SimFile),
 
     /// FIFO of pre-prepared fds returned by future `socket()` calls.
     /// Each `socket` submission consumes one entry; if the queue is
@@ -376,12 +522,14 @@ pub const SimIO = struct {
             .sockets = sockets,
             .recv_queue_pool = queue_buf,
             .free_socket_head = head,
-            .file_content = std.AutoHashMap(posix.fd_t, []const u8).init(allocator),
+            .file_state = std.AutoHashMap(posix.fd_t, SimFile).init(allocator),
         };
     }
 
     pub fn deinit(self: *SimIO) void {
-        self.file_content.deinit();
+        var it = self.file_state.iterator();
+        while (it.next()) |entry| entry.value_ptr.deinit(self.allocator);
+        self.file_state.deinit();
         self.prepared_socket_fds.deinit(self.allocator);
         self.allocator.free(self.pending);
         self.allocator.free(self.recv_queue_pool);
@@ -389,14 +537,39 @@ pub const SimIO = struct {
         self.* = undefined;
     }
 
-    /// Register byte content for `fd`. Subsequent `read` submissions on
-    /// `fd` return slices of `bytes` at the requested offset (zero-byte
-    /// success when offset >= bytes.len). Used by recheck/disk tests that
-    /// need the read result to reflect "what's on disk" rather than
-    /// always returning zero. The slice is caller-owned; SimIO does not
-    /// copy. Calling twice with the same fd replaces the registration.
+    /// Seed durable byte content for `fd`. Subsequent `read` submissions
+    /// on `fd` see these bytes overlaid with any pending (un-fsynced)
+    /// writes. Used by recheck/disk tests that need the read result to
+    /// reflect "what's on disk" rather than always returning zero.
+    ///
+    /// SimIO copies `bytes` into an owned buffer, so the caller may free
+    /// or reuse its slice immediately. (This differs from the original
+    /// no-copy contract; the new durability model needs to own + grow
+    /// the byte storage, so the slice can no longer be aliased.)
+    ///
+    /// Calling twice with the same fd replaces the durable layer and
+    /// drops any pending bytes.
     pub fn setFileBytes(self: *SimIO, fd: posix.fd_t, bytes: []const u8) !void {
-        try self.file_content.put(fd, bytes);
+        const gop = try self.file_state.getOrPut(fd);
+        if (!gop.found_existing) {
+            gop.value_ptr.* = .{};
+        } else {
+            gop.value_ptr.deinit(self.allocator);
+            gop.value_ptr.* = .{};
+        }
+        var owned = std.ArrayListUnmanaged(u8){};
+        errdefer owned.deinit(self.allocator);
+        try owned.appendSlice(self.allocator, bytes);
+        gop.value_ptr.durable = owned;
+    }
+
+    /// Drop every fd's pending (un-fsynced) bytes; durable bytes stay.
+    /// Models a power-loss / kernel-panic between a write CQE and the
+    /// matching fsync CQE. Subsequent reads see only durable content.
+    /// Test-only — the public daemon code never calls this.
+    pub fn crash(self: *SimIO) void {
+        var it = self.file_state.iterator();
+        while (it.next()) |entry| entry.value_ptr.dropPending();
     }
 
     /// Enqueue `fd` so the next `socket()` submission returns it
@@ -920,18 +1093,13 @@ pub const SimIO = struct {
             return self.schedule(c, .{ .read = error.InputOutput }, 0);
         }
 
-        // If content was registered via setFileBytes, return bytes from
-        // the requested offset; otherwise fall through to the legacy
-        // zero-byte success behaviour for callers that don't care about
-        // disk content.
-        if (self.file_content.get(op.fd)) |content| {
-            const off = op.offset;
-            if (off >= content.len) {
-                return self.schedule(c, .{ .read = @as(usize, 0) }, 0);
-            }
-            const available: usize = content.len - @as(usize, @intCast(off));
-            const n: usize = @min(op.buf.len, available);
-            @memcpy(op.buf[0..n], content[@as(usize, @intCast(off))..][0..n]);
+        // If content was registered via setFileBytes (or grown by prior
+        // writes), return the union of durable+pending at the requested
+        // offset. Otherwise fall through to the legacy zero-byte
+        // success for callers that don't care about disk content.
+        if (self.file_state.getPtr(op.fd)) |sf| {
+            const off: usize = @intCast(op.offset);
+            const n = sf.readUnion(off, op.buf);
             return self.schedule(c, .{ .read = n }, 0);
         }
 
@@ -944,6 +1112,31 @@ pub const SimIO = struct {
         if (r.float(f32) < self.config.faults.write_error_probability) {
             return self.schedule(c, .{ .write = error.NoSpaceLeft }, self.config.faults.write_latency_ns);
         }
+
+        // Apply the write into the per-fd pending layer (auto-creating
+        // the SimFile entry if missing). This models pagecache acceptance
+        // — bytes are visible to subsequent reads but are NOT durable
+        // until an fsync CQE lands. `crash()` will drop them.
+        //
+        // We populate the SimFile even when the caller has not previously
+        // called `setFileBytes` so that a fully-write-driven test still
+        // exercises the durability model end-to-end.
+        const off: usize = @intCast(op.offset);
+        const end: usize = off + op.buf.len;
+        const gop = self.file_state.getOrPut(op.fd) catch {
+            // Out of memory while creating the entry — surface as EIO
+            // through the normal completion path so the caller's error
+            // handling fires.
+            return self.schedule(c, .{ .write = error.NoSpaceLeft }, self.config.faults.write_latency_ns);
+        };
+        if (!gop.found_existing) gop.value_ptr.* = .{};
+        gop.value_ptr.ensurePending(self.allocator, end) catch {
+            return self.schedule(c, .{ .write = error.NoSpaceLeft }, self.config.faults.write_latency_ns);
+        };
+        @memcpy(gop.value_ptr.pending.items[off..end], op.buf);
+        var i: usize = off;
+        while (i < end) : (i += 1) gop.value_ptr.pending_dirty.set(i);
+
         // Real `write(2)` / `IORING_OP_WRITE` returns the number of bytes
         // accepted, normally the full buffer length on regular files.
         // Returning the full length lets `PieceStoreOf(SimIO).writePiece`
@@ -957,7 +1150,21 @@ pub const SimIO = struct {
         try self.armCompletion(c, .{ .fsync = op }, ud, cb);
         const r = self.rng.random();
         if (r.float(f32) < self.config.faults.fsync_error_probability) {
+            // Fault path: pending is left untouched, modelling a real
+            // fsync that surfaced EIO before the journal flushed. The
+            // bytes are still in pagecache but not durable; a subsequent
+            // crash drops them.
             return self.schedule(c, .{ .fsync = error.InputOutput }, 0);
+        }
+        // Success: promote dirty pending bytes into durable. This is
+        // the kernel-pagecache barrier the daemon is supposed to wait
+        // for before recording resume-DB completions.
+        if (self.file_state.getPtr(op.fd)) |sf| {
+            sf.promotePending(self.allocator) catch {
+                // Allocation failure during promotePending — surface as
+                // EIO so the caller's error path runs.
+                return self.schedule(c, .{ .fsync = error.InputOutput }, 0);
+            };
         }
         return self.schedule(c, .{ .fsync = {} }, 0);
     }

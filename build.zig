@@ -617,6 +617,30 @@ pub fn build(b: *std.Build) void {
     test_sim_io_step.dependOn(&run_sim_io_tests.step);
     test_step.dependOn(&run_sim_io_tests.step);
 
+    // ── SimIO durability (write/fsync/crash) tests ────────
+    //
+    // Algorithm-level tests for the per-fd dirty/durable byte model
+    // added to SimIO so simulator tests can faithfully reproduce a
+    // crash between a write CQE and the matching fsync CQE. Sits
+    // alongside the broader sim-io tests but is wired separately so
+    // the durability surface can be iterated without rerunning the
+    // whole socketpair / parking suite.
+    const sim_io_durability_tests = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("tests/sim_io_durability_test.zig"),
+            .target = target,
+            .optimize = optimize,
+            .imports = &varuna_import,
+        }),
+    });
+    const run_sim_io_durability_tests = b.addRunArtifact(sim_io_durability_tests);
+    const test_sim_io_durability_step = b.step(
+        "test-sim-io-durability",
+        "Run SimIO durability model tests (write/fsync/crash byte-layer semantics)",
+    );
+    test_sim_io_durability_step.dependOn(&run_sim_io_durability_tests.step);
+    test_step.dependOn(&run_sim_io_durability_tests.step);
+
     // ── SimPeer protocol tests ─────────────────────────────
     const sim_peer_tests = b.addTest(.{
         .root_module = b.createModule(.{
