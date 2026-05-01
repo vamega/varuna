@@ -1087,18 +1087,73 @@ pub fn EventLoopOf(comptime IO: type) type {
             return .tcp;
         }
 
+        fn contextDefaultOutboundSwarmHash(tc: *const TorrentContext) [20]u8 {
+            if (tc.info_hash_v2) |v2_hash| {
+                if (tc.session) |session| {
+                    if (session.metainfo.version == .v2) return v2_hash;
+                }
+            }
+            return tc.info_hash;
+        }
+
+        fn contextHasSwarmHash(tc: *const TorrentContext, swarm_hash: [20]u8) bool {
+            if (std.mem.eql(u8, swarm_hash[0..], tc.info_hash[0..])) return true;
+            if (tc.info_hash_v2) |v2_hash| {
+                return std.mem.eql(u8, swarm_hash[0..], v2_hash[0..]);
+            }
+            return false;
+        }
+
+        fn storePeerSwarmHash(_: *const Self, peer: *Peer, swarm_hash: [20]u8) void {
+            @memcpy(peer.handshake_buf[28..48], &swarm_hash);
+        }
+
+        pub fn defaultOutboundSwarmHash(self: *const Self, torrent_id: TorrentId) ![20]u8 {
+            const tc = self.getTorrentContextConst(torrent_id) orelse return error.TorrentNotFound;
+            return contextDefaultOutboundSwarmHash(tc);
+        }
+
+        pub fn normalizeOutboundSwarmHash(self: *const Self, torrent_id: TorrentId, swarm_hash: [20]u8) ![20]u8 {
+            const tc = self.getTorrentContextConst(torrent_id) orelse return error.TorrentNotFound;
+            if (!contextHasSwarmHash(tc, swarm_hash)) return error.InvalidSwarmHash;
+            return swarm_hash;
+        }
+
+        pub fn selectedPeerSwarmHash(self: *const Self, peer: *const Peer) [20]u8 {
+            var selected: [20]u8 = undefined;
+            @memcpy(&selected, peer.handshake_buf[28..48]);
+
+            const tc = self.getTorrentContextConst(peer.torrent_id) orelse return selected;
+            if (contextHasSwarmHash(tc, selected)) return selected;
+            return contextDefaultOutboundSwarmHash(tc);
+        }
+
         /// Add a peer using the transport selected by `selectTransport()`.
         /// When uTP is selected but the connection fails (e.g. no UDP socket),
         /// falls back to TCP transparently.
         pub fn addPeerAutoTransport(self: *Self, address: std.net.Address, torrent_id: TorrentId) !u16 {
+            const swarm_hash = try self.defaultOutboundSwarmHash(torrent_id);
+            return self.addPeerAutoTransportWithSwarmHash(address, torrent_id, swarm_hash);
+        }
+
+        /// Add a peer using a caller-selected 20-byte swarm hash. DHT v2
+        /// lookups use this to preserve the selected v2 truncated SHA-256
+        /// hash through transport selection and into the outbound handshake.
+        pub fn addPeerAutoTransportWithSwarmHash(
+            self: *Self,
+            address: std.net.Address,
+            torrent_id: TorrentId,
+            swarm_hash: [20]u8,
+        ) !u16 {
+            const selected_hash = try self.normalizeOutboundSwarmHash(torrent_id, swarm_hash);
             const transport = self.selectTransport();
             if (transport == .utp) {
-                return self.addUtpPeer(address, torrent_id) catch |err| switch (err) {
-                    error.NoUtpManager, error.UtpConnectFailed => return self.addPeerForTorrent(address, torrent_id),
+                return self.addUtpPeerWithSwarmHash(address, torrent_id, selected_hash) catch |err| switch (err) {
+                    error.NoUtpManager, error.UtpConnectFailed => return self.addPeerForTorrentWithSwarmHash(address, torrent_id, selected_hash),
                     else => return err,
                 };
             }
-            return self.addPeerForTorrent(address, torrent_id);
+            return self.addPeerForTorrentWithSwarmHash(address, torrent_id, selected_hash);
         }
 
         pub fn addPeer(self: *Self, address: std.net.Address) !u16 {
@@ -1106,6 +1161,16 @@ pub fn EventLoopOf(comptime IO: type) type {
         }
 
         pub fn addPeerForTorrent(self: *Self, address: std.net.Address, torrent_id: TorrentId) !u16 {
+            const swarm_hash = try self.defaultOutboundSwarmHash(torrent_id);
+            return self.addPeerForTorrentWithSwarmHash(address, torrent_id, swarm_hash);
+        }
+
+        pub fn addPeerForTorrentWithSwarmHash(
+            self: *Self,
+            address: std.net.Address,
+            torrent_id: TorrentId,
+            swarm_hash: [20]u8,
+        ) !u16 {
             // Reject new outbound connections during graceful shutdown drain
             if (self.draining) return error.ShuttingDown;
 
@@ -1122,7 +1187,7 @@ pub fn EventLoopOf(comptime IO: type) type {
                 }
             }
 
-            if (self.getTorrentContext(torrent_id) == null) return error.TorrentNotFound;
+            const selected_hash = try self.normalizeOutboundSwarmHash(torrent_id, swarm_hash);
 
             // Enforce global connection limit
             if (self.peer_count >= self.max_connections) {
@@ -1158,6 +1223,7 @@ pub fn EventLoopOf(comptime IO: type) type {
                 .torrent_id = torrent_id,
                 .address = address,
             };
+            self.storePeerSwarmHash(peer, selected_hash);
 
             // Submit async socket creation via io_interface. The callback
             // (peer_handler.peerSocketCompleteFor(Self)) configures the fd
@@ -1194,7 +1260,18 @@ pub fn EventLoopOf(comptime IO: type) type {
             torrent_id: TorrentId,
             address_opt: ?std.net.Address,
         ) !u16 {
-            if (self.getTorrentContext(torrent_id) == null) return error.TorrentNotFound;
+            const swarm_hash = try self.defaultOutboundSwarmHash(torrent_id);
+            return self.addConnectedPeerWithSwarmHash(fd, torrent_id, address_opt, swarm_hash);
+        }
+
+        pub fn addConnectedPeerWithSwarmHash(
+            self: *Self,
+            fd: posix.fd_t,
+            torrent_id: TorrentId,
+            address_opt: ?std.net.Address,
+            swarm_hash: [20]u8,
+        ) !u16 {
+            const selected_hash = try self.normalizeOutboundSwarmHash(torrent_id, swarm_hash);
             if (self.peer_count >= self.max_connections) return error.ConnectionLimitReached;
 
             const slot = self.allocSlot() orelse return error.TooManyPeers;
@@ -1206,6 +1283,7 @@ pub fn EventLoopOf(comptime IO: type) type {
                 .torrent_id = torrent_id,
                 .address = address_opt orelse std.net.Address.initIp4(.{ 127, 0, 0, 1 }, 0),
             };
+            self.storePeerSwarmHash(peer, selected_hash);
             peer.last_activity = self.clock.now();
 
             self.peer_count += 1;
@@ -1349,8 +1427,19 @@ pub fn EventLoopOf(comptime IO: type) type {
         /// socket via the UtpManager, sends the SYN packet, and allocates a
         /// peer slot in the event loop.
         pub fn addUtpPeer(self: *Self, address: std.net.Address, torrent_id: TorrentId) !u16 {
+            const swarm_hash = try self.defaultOutboundSwarmHash(torrent_id);
+            return self.addUtpPeerWithSwarmHash(address, torrent_id, swarm_hash);
+        }
+
+        pub fn addUtpPeerWithSwarmHash(
+            self: *Self,
+            address: std.net.Address,
+            torrent_id: TorrentId,
+            swarm_hash: [20]u8,
+        ) !u16 {
             // Reject new outbound connections during graceful shutdown drain
             if (self.draining) return error.ShuttingDown;
+            const selected_hash = try self.normalizeOutboundSwarmHash(torrent_id, swarm_hash);
 
             // Check ban list before allocating uTP socket
             if (self.ban_list) |bl| {
@@ -1396,6 +1485,7 @@ pub fn EventLoopOf(comptime IO: type) type {
                 .utp_slot = conn.slot,
                 .address = address,
             };
+            self.storePeerSwarmHash(peer, selected_hash);
             self.peer_count += 1;
             self.half_open_count += 1;
             self.markActivePeer(peer_slot);

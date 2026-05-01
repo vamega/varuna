@@ -258,6 +258,7 @@ fn checkOutboundUtpConnect(self: anytype, utp_slot: u16, mgr: *utp_mgr.UtpManage
         self.removePeer(peer_slot);
         return;
     };
+    const swarm_hash = self.selectedPeerSwarmHash(peer);
     var buf: [68]u8 = undefined;
     buf[0] = pw.protocol_length;
     @memcpy(buf[1 .. 1 + pw.protocol_string.len], pw.protocol_string);
@@ -267,7 +268,7 @@ fn checkOutboundUtpConnect(self: anytype, utp_slot: u16, mgr: *utp_mgr.UtpManage
     if (tc.info_hash_v2 != null) {
         buf[20 + pw.v2_reserved_byte] |= pw.v2_reserved_mask;
     }
-    @memcpy(buf[28..48], &tc.info_hash);
+    @memcpy(buf[28..48], &swarm_hash);
     @memcpy(buf[48..68], &tc.peer_id);
 
     utpSendData(self, peer_slot, &buf) catch {
@@ -515,6 +516,8 @@ fn processUtpInboundHandshake(self: anytype, peer_slot: u16) void {
     };
 
     const inbound_hash = peer.handshake_buf[28..48];
+    var response_hash: [20]u8 = undefined;
+    @memcpy(&response_hash, inbound_hash);
 
     // Match info_hash against all registered torrents.
     // BEP 52: also match on the truncated v2 info-hash for hybrid torrents.
@@ -546,7 +549,7 @@ fn processUtpInboundHandshake(self: anytype, peer_slot: u16) void {
     if (tc.info_hash_v2 != null) {
         buf[20 + pw.v2_reserved_byte] |= pw.v2_reserved_mask;
     }
-    @memcpy(buf[28..48], &tc.info_hash);
+    @memcpy(buf[28..48], &response_hash);
     @memcpy(buf[48..68], &tc.peer_id);
 
     utpSendData(self, peer_slot, &buf) catch {

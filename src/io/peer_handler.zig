@@ -279,11 +279,12 @@ fn handleConnectResult(self: anytype, slot: u16, res: i32) void {
 /// Start the async MSE initiator handshake for an outbound peer.
 fn startMseInitiator(self: anytype, slot: u16) !void {
     const peer = &self.peers[slot];
-    const tc = self.getTorrentContext(peer.torrent_id) orelse return error.TorrentNotFound;
+    _ = self.getTorrentContext(peer.torrent_id) orelse return error.TorrentNotFound;
+    const swarm_hash = self.selectedPeerSwarmHash(peer);
 
     // Allocate MSE initiator state
     const mi = try self.allocator.create(mse.MseInitiatorHandshake);
-    mi.* = mse.MseInitiatorHandshake.init(&self.random, tc.info_hash, self.encryption_mode);
+    mi.* = mse.MseInitiatorHandshake.init(&self.random, swarm_hash, self.encryption_mode);
     peer.mse_initiator = mi;
 
     // Get first action (send DH key)
@@ -327,6 +328,7 @@ pub fn sendBtHandshake(self: anytype, slot: u16) void {
         self.removePeer(slot);
         return;
     };
+    const swarm_hash = self.selectedPeerSwarmHash(peer);
     peer.state = .handshake_send;
 
     var buf: [68]u8 = undefined;
@@ -339,7 +341,7 @@ pub fn sendBtHandshake(self: anytype, slot: u16) void {
     if (tc.info_hash_v2 != null) {
         buf[20 + pw.v2_reserved_byte] |= pw.v2_reserved_mask;
     }
-    @memcpy(buf[28..48], tc.info_hash[0..]);
+    @memcpy(buf[28..48], &swarm_hash);
     @memcpy(buf[48..68], tc.peer_id[0..]);
     @memcpy(peer.handshake_buf[0..68], &buf);
     // MSE/PE: encrypt handshake before sending (if MSE was negotiated)
@@ -770,6 +772,8 @@ fn handleRecvResult(self: anytype, slot: u16, recv_res: i32) void {
             // BEP 52: for hybrid torrents, also match on the truncated v2 info-hash
             // since v2-capable peers may use the SHA-256 info-hash in the handshake.
             const inbound_hash = peer.handshake_buf[28..48];
+            var response_hash: [20]u8 = undefined;
+            @memcpy(&response_hash, inbound_hash);
             const resp_tid = self.findTorrentIdByInfoHash(inbound_hash) orelse {
                 self.removePeer(slot);
                 return;
@@ -798,7 +802,7 @@ fn handleRecvResult(self: anytype, slot: u16, recv_res: i32) void {
             if (resp_tc.info_hash_v2 != null) {
                 buf[20 + pw.v2_reserved_byte] |= pw.v2_reserved_mask;
             }
-            @memcpy(buf[28..48], &resp_tc.info_hash);
+            @memcpy(buf[28..48], &response_hash);
             @memcpy(buf[48..68], &resp_tc.peer_id);
             @memcpy(peer.handshake_buf[0..68], &buf);
             // MSE/PE: encrypt handshake before sending

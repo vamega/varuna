@@ -77,9 +77,9 @@ fn drainDhtPeerResults(self: anytype) void {
             }
             if (already_connected) continue;
 
-            // Initiate connection via the standard peer pipeline.
-            // When uTP is enabled, alternate between TCP and uTP transports.
-            _ = self.addPeerAutoTransport(peer_addr, tid) catch continue;
+            // Preserve the DHT lookup target as the outbound handshake hash,
+            // so v2 lookups connect to the v2 swarm even for hybrid torrents.
+            _ = self.addPeerAutoTransportWithSwarmHash(peer_addr, tid, result.info_hash) catch continue;
         }
 
         log.info("DHT: fed {d} peers for torrent {x}", .{
