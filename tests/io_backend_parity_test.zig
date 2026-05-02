@@ -16,6 +16,10 @@ const varuna = @import("varuna");
 const ifc = varuna.io.io_interface;
 const RealIO = varuna.io.real_io.RealIO;
 const SimIO = varuna.io.sim_io.SimIO;
+const EpollPosixIO = varuna.io.epoll_posix_io.EpollPosixIO;
+const EpollMmapIO = varuna.io.epoll_mmap_io.EpollMmapIO;
+const KqueuePosixIO = varuna.io.kqueue_posix_io.KqueuePosixIO;
+const KqueueMmapIO = varuna.io.kqueue_mmap_io.KqueueMmapIO;
 
 const Completion = ifc.Completion;
 const Result = ifc.Result;
@@ -29,14 +33,21 @@ const CallbackAction = ifc.CallbackAction;
 fn requireBackendMethods(comptime IO: type) void {
     comptime {
         const required = [_][]const u8{
-            "init",     "deinit",   "tick",
-            "recv",     "send",     "recvmsg",
-            "sendmsg",  "read",     "write",
-            "fsync",    "openat",   "mkdirat",
-            "renameat", "unlinkat", "statx",
-            "getdents", "socket",   "connect",
-            "accept",   "timeout",  "poll",
-            "cancel",
+            "init",            "deinit",
+            "tick",            "closeSocket",
+            "recv",            "send",
+            "recvmsg",         "sendmsg",
+            "read",            "write",
+            "fsync",           "fallocate",
+            "truncate",        "openat",
+            "mkdirat",         "renameat",
+            "unlinkat",        "statx",
+            "getdents",        "splice",
+            "copy_file_range", "socket",
+            "connect",         "accept",
+            "bind",            "listen",
+            "setsockopt",      "timeout",
+            "poll",            "cancel",
         };
         for (required) |name| {
             if (!@hasDecl(IO, name)) {
@@ -49,6 +60,10 @@ fn requireBackendMethods(comptime IO: type) void {
 comptime {
     requireBackendMethods(RealIO);
     requireBackendMethods(SimIO);
+    requireBackendMethods(EpollPosixIO);
+    requireBackendMethods(EpollMmapIO);
+    requireBackendMethods(KqueuePosixIO);
+    requireBackendMethods(KqueueMmapIO);
 }
 
 // ── Shared test bodies ────────────────────────────────────
@@ -258,7 +273,7 @@ fn runDirectoryOpsRoundTrip(
         var offset: usize = 0;
         while (offset < bytes) {
             const entry: *align(1) linux.dirent64 = @ptrCast(&dir_buf[offset]);
-            const name = std.mem.sliceTo(@as([*:0]const u8, @ptrCast(&entry.name)), 0);
+            const name = ifc.direntName(entry);
             if (std.mem.eql(u8, name, "file.dat")) {
                 saw_file = true;
                 try testing.expectEqual(linux.DT.REG, entry.type);
@@ -266,6 +281,17 @@ fn runDirectoryOpsRoundTrip(
             offset += entry.reclen;
         }
         try testing.expect(saw_file);
+
+        var eof = Completion{};
+        var eof_counter = Counter{};
+        try io.getdents(.{ .fd = dir_fd, .buf = &dir_buf }, &eof, &eof_counter, counterCallback);
+        if (eof_counter.fires == 0) try drain_fn(io);
+        try testing.expectEqual(@as(u32, 1), eof_counter.fires);
+        const eof_bytes = switch (eof_counter.last_result.?) {
+            .getdents => |r| try r,
+            else => return error.UnexpectedResult,
+        };
+        try testing.expectEqual(@as(usize, 0), eof_bytes);
     }
 
     {
