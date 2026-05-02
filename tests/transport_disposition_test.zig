@@ -1,4 +1,5 @@
 const std = @import("std");
+const posix = std.posix;
 const varuna = @import("varuna");
 const config_mod = varuna.config;
 const TransportDisposition = config_mod.TransportDisposition;
@@ -127,6 +128,37 @@ test "disposition with no outgoing falls back to tcp" {
 
     try std.testing.expect(!el.transport_disposition.canConnectOutbound());
     try std.testing.expect(el.transport_disposition.canAcceptInbound());
+}
+
+test "utp_only auto transport does not fall back to tcp when utp setup is unavailable" {
+    var el = EventLoop.initBare(std.testing.allocator, 0) catch |err| {
+        if (err == error.SystemResources) return error.SkipZigTest;
+        return err;
+    };
+    defer el.deinit();
+
+    const fake_udp_fd = posix.socket(
+        posix.AF.INET,
+        posix.SOCK.DGRAM | posix.SOCK.CLOEXEC | posix.SOCK.NONBLOCK,
+        posix.IPPROTO.UDP,
+    ) catch |err| {
+        if (err == error.SystemResources) return error.SkipZigTest;
+        return err;
+    };
+    el.udp_fd = fake_udp_fd;
+    el.utp_manager = null;
+    el.transport_disposition = TransportDisposition.utp_only;
+
+    const empty_fds = [_]posix.fd_t{};
+    const tid = try el.addTorrentContext(.{
+        .shared_fds = empty_fds[0..],
+        .info_hash = [_]u8{0x42} ** 20,
+        .peer_id = "-VR0001-test00000001".*,
+    });
+    const addr = try std.net.Address.parseIp4("127.0.0.1", 6881);
+
+    try std.testing.expectError(error.NoUtpManager, el.addPeerAutoTransport(addr, tid));
+    try std.testing.expectEqual(@as(u32, 0), el.peer_count);
 }
 
 // ── Test 4: Runtime toggle via API ───────────────────────────

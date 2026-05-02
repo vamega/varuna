@@ -679,7 +679,7 @@ pub fn TorrentSessionOf(comptime IO: type) type {
             var added: u32 = 0;
             for (peers) |addr| {
                 self.conn_attempts += 1;
-                _ = sel.addPeerForTorrent(addr, tid) catch {
+                _ = sel.addPeerAutoTransport(addr, tid) catch {
                     self.conn_failures += 1;
                     continue;
                 };
