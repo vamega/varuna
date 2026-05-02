@@ -6,6 +6,10 @@ const Header = utp.Header;
 const State = utp.State;
 const PacketType = utp.PacketType;
 const Random = varuna.runtime.Random;
+const event_loop_mod = varuna.io.event_loop;
+const utp_handler = varuna.io.utp_handler;
+const utp_mgr = varuna.net.utp_manager;
+const SimIO = varuna.io.sim_io.SimIO;
 
 /// File-scoped sim-seeded CSPRNG for the uTP byte-stream tests.
 var bytestream_test_rng: Random = Random.simRandom(0xb71);
@@ -282,4 +286,71 @@ test "fragmented PIECE message over uTP" {
 
     try std.testing.expect(packets_sent >= 2); // should need at least 2 packets
     std.debug.print("\nuTP fragmented PIECE ({d} bytes, {d} packets): PASSED\n", .{ piece_data.len, packets_sent });
+}
+
+test "uTP sender resumes window-limited byte stream after ACK" {
+    const allocator = std.testing.allocator;
+    const EL = event_loop_mod.EventLoopOf(SimIO);
+
+    const sim_io = try SimIO.init(allocator, .{ .seed = 0x757470 });
+    var el = try EL.initBareWithIO(allocator, sim_io, 0);
+    defer el.deinit();
+    el.random = event_loop_mod.Random.simRandom(0x75747001);
+
+    const mgr = try allocator.create(utp_mgr.UtpManager);
+    mgr.* = utp_mgr.UtpManager.init(allocator);
+    el.utp_manager = mgr;
+
+    const remote = std.net.Address.initIp4(.{ 127, 0, 0, 1 }, 6881);
+    const conn = try mgr.connect(&el.random, remote, 1_000_000);
+    const sock = mgr.getSocket(conn.slot).?;
+
+    const syn_ack = (Header{
+        .packet_type = .st_state,
+        .extension = .none,
+        .connection_id = sock.recv_id,
+        .timestamp_us = 1_001_000,
+        .timestamp_diff_us = 1_000,
+        .wnd_size = utp.default_recv_window,
+        .seq_nr = 1,
+        .ack_nr = 1,
+    }).encode();
+    _ = mgr.processPacket(&syn_ack, remote, 1_002_000);
+    try std.testing.expectEqual(State.connected, sock.state);
+    try std.testing.expectEqual(@as(u16, 0), sock.out_buf_count);
+
+    const peer_slot: u16 = 0;
+    el.peers[peer_slot] = event_loop_mod.Peer{
+        .fd = -1,
+        .state = .active_recv_header,
+        .mode = .inbound,
+        .transport = .utp,
+        .address = remote,
+        .utp_slot = conn.slot,
+    };
+    el.peer_count = 1;
+    el.markActivePeer(peer_slot);
+
+    var payload: [utp.max_payload * 4]u8 = undefined;
+    for (&payload, 0..) |*byte, i| byte.* = @truncate(i);
+
+    try utp_handler.utpSendData(&el, peer_slot, &payload);
+    const seq_after_first_send = sock.seq_nr;
+    try std.testing.expect(sock.bytesInFlight() < payload.len);
+
+    const ack = (Header{
+        .packet_type = .st_state,
+        .extension = .none,
+        .connection_id = sock.recv_id,
+        .timestamp_us = 1_003_000,
+        .timestamp_diff_us = 1_000,
+        .wnd_size = utp.default_recv_window,
+        .seq_nr = 1,
+        .ack_nr = seq_after_first_send -% 1,
+    }).encode();
+    _ = mgr.processPacket(&ack, remote, 1_004_000);
+
+    try utp_handler.utpSendData(&el, peer_slot, &.{});
+
+    try std.testing.expect(sock.seq_nr > seq_after_first_send);
 }
