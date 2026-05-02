@@ -83,6 +83,8 @@ pub const Operation = union(enum) {
     mkdirat: MkdirAtOp,
     renameat: RenameAtOp,
     unlinkat: UnlinkAtOp,
+    statx: StatxOp,
+    getdents: GetdentsOp,
     splice: SpliceOp,
     copy_file_range: CopyFileRangeOp,
 
@@ -208,6 +210,32 @@ pub const UnlinkAtOp = struct {
     dir_fd: posix.fd_t,
     path: [:0]const u8,
     flags: u32 = 0,
+};
+
+/// `statx(2)` — fd-relative metadata lookup.
+///
+/// `path` and `buf` are caller-owned and must stay alive until the
+/// completion fires. `flags` and `mask` map directly to the Linux statx
+/// arguments (`linux.AT.*`, `linux.STATX_*`). The result variant is void on
+/// success because the kernel fills `buf` asynchronously.
+pub const StatxOp = struct {
+    dir_fd: posix.fd_t,
+    path: [:0]const u8,
+    flags: u32 = 0,
+    mask: u32 = linux.STATX_BASIC_STATS,
+    buf: *linux.Statx,
+};
+
+/// `getdents64(2)`-shaped directory enumeration.
+///
+/// The buffer receives packed `linux.dirent64` records and the result is the
+/// byte count written, or `0` at end-of-directory. RealIO uses the Linux
+/// syscall directly because there is no stable io_uring getdents op exposed
+/// by Zig 0.15.2; simulator and portability backends synthesize the same
+/// Linux-shaped records so callers can share one parser.
+pub const GetdentsOp = struct {
+    fd: posix.fd_t,
+    buf: []align(@alignOf(linux.dirent64)) u8,
 };
 
 /// `splice(2)` — zero-copy move of up to `len` bytes between two fds.
@@ -345,6 +373,8 @@ pub const Result = union(enum) {
     mkdirat: anyerror!void,
     renameat: anyerror!void,
     unlinkat: anyerror!void,
+    statx: anyerror!void,
+    getdents: anyerror!usize,
     /// Bytes spliced. `0` means EOF on the input side (mirrors `splice(2)`).
     splice: anyerror!usize,
     /// Bytes copied. `0` means EOF on the input side (mirrors `copy_file_range(2)`).
@@ -451,6 +481,73 @@ pub const Completion = struct {
     }
 };
 
+/// Return a name slice from one packed `linux.dirent64` record.
+pub fn direntName(entry: *align(1) const linux.dirent64) []const u8 {
+    return std.mem.sliceTo(@as([*:0]const u8, @ptrCast(&entry.name)), 0);
+}
+
+/// Append one Linux-shaped dirent64 record to `buf`.
+///
+/// Returns the new byte offset, or null when the record does not fit.
+pub fn appendDirent64(
+    buf: []align(@alignOf(linux.dirent64)) u8,
+    offset: usize,
+    ino: u64,
+    next_off: u64,
+    entry_type: u8,
+    name: []const u8,
+) ?usize {
+    if (name.len == 0) return null;
+    const min_len = @offsetOf(linux.dirent64, "name") + name.len + 1;
+    const reclen_usize = std.mem.alignForward(usize, min_len, @alignOf(linux.dirent64));
+    if (reclen_usize > std.math.maxInt(u16)) return null;
+    if (offset + reclen_usize > buf.len) return null;
+
+    const entry: *align(1) linux.dirent64 = @ptrCast(&buf[offset]);
+    entry.ino = ino;
+    entry.off = next_off;
+    entry.reclen = @intCast(reclen_usize);
+    entry.type = entry_type;
+    const name_ptr: [*]u8 = @ptrCast(&entry.name);
+    @memcpy(name_ptr[0..name.len], name);
+    name_ptr[name.len] = 0;
+    @memset(buf[offset + min_len .. offset + reclen_usize], 0);
+    return offset + reclen_usize;
+}
+
+/// Shared errno mapping for Linux syscall-shaped fallback paths in IO
+/// backends.
+pub fn linuxErrnoToError(e: linux.E) anyerror {
+    return switch (e) {
+        .SUCCESS => unreachable,
+        .CONNREFUSED => error.ConnectionRefused,
+        .CONNRESET => error.ConnectionResetByPeer,
+        .NETUNREACH => error.NetworkUnreachable,
+        .HOSTUNREACH => error.HostUnreachable,
+        .TIMEDOUT => error.ConnectionTimedOut,
+        .PIPE => error.BrokenPipe,
+        .CONNABORTED => error.ConnectionAborted,
+        .CANCELED => error.OperationCanceled,
+        .NOENT => error.FileNotFound,
+        .EXIST => error.PathAlreadyExists,
+        .NOTDIR => error.NotDir,
+        .ALREADY => error.AlreadyCompleted,
+        .ADDRINUSE => error.AddressInUse,
+        .ADDRNOTAVAIL => error.AddressNotAvailable,
+        .AGAIN => error.WouldBlock,
+        .BADF => error.BadFileDescriptor,
+        .INTR => error.Interrupted,
+        .INVAL => error.InvalidArgument,
+        .IO => error.InputOutput,
+        .NOSPC => error.NoSpaceLeft,
+        .NOSYS => error.OperationNotSupported,
+        .ISDIR => error.IsDir,
+        .MFILE => error.ProcessFdQuotaExceeded,
+        .NFILE => error.SystemFdQuotaExceeded,
+        else => posix.unexpectedErrno(e),
+    };
+}
+
 comptime {
     // Catch accidental size regressions in the public ABI.
     std.debug.assert(@alignOf(Completion) >= backend_state_align);
@@ -488,6 +585,8 @@ comptime {
 //   pub fn mkdirat  (self: *@This(), op: MkdirAtOp,  c: *Completion, ud: ?*anyopaque, cb: Callback) !void;
 //   pub fn renameat (self: *@This(), op: RenameAtOp, c: *Completion, ud: ?*anyopaque, cb: Callback) !void;
 //   pub fn unlinkat (self: *@This(), op: UnlinkAtOp, c: *Completion, ud: ?*anyopaque, cb: Callback) !void;
+//   pub fn statx    (self: *@This(), op: StatxOp,    c: *Completion, ud: ?*anyopaque, cb: Callback) !void;
+//   pub fn getdents (self: *@This(), op: GetdentsOp, c: *Completion, ud: ?*anyopaque, cb: Callback) !void;
 //   pub fn socket   (self: *@This(), op: SocketOp,   c: *Completion, ud: ?*anyopaque, cb: Callback) !void;
 //   pub fn connect  (self: *@This(), op: ConnectOp,  c: *Completion, ud: ?*anyopaque, cb: Callback) !void;
 //   pub fn accept   (self: *@This(), op: AcceptOp,   c: *Completion, ud: ?*anyopaque, cb: Callback) !void;

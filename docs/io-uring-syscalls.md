@@ -39,10 +39,11 @@ This document tracks which syscalls the `varuna` **daemon** uses, which are rout
 
 | Syscall | Where | Why conventional | Could move to io_uring? |
 |---------|-------|-----------------|------------------------|
-| `openat()` | `PieceStore.init` -- file creation | One-time setup | Yes (`IORING_OP_OPENAT`, kernel 5.6) |
-| `mkdirat()` | `PieceStore.init` -- directory creation | One-time setup | Yes (`IORING_OP_MKDIRAT`, kernel 5.15) |
+| `openat()` | `PieceStore.init` -- file creation | One-time setup | IO contract + RealIO SQE exist; caller migration remains |
+| `mkdirat()` | `PieceStore.init` -- directory creation | One-time setup | IO contract + RealIO SQE exist; caller migration remains |
 | `ftruncate()` | `PieceStore.init` -- pre-allocate file size | One-time setup | Yes (`IORING_OP_FTRUNCATE`, kernel 6.2) |
 | `close()` | `PieceStore.deinit`, peer socket cleanup | Cleanup path | Yes (`IORING_OP_CLOSE`, kernel 5.6) |
+| `getdents64()` | Directory enumeration contract for future MoveJob v2 | Zig 0.15.2 exposes no stable io_uring getdents helper/op | Contract exists with Linux-shaped records; native SQE blocked on toolchain/kernel surface |
 | `openat+read+close` | `app.zig` -- reading `.torrent` file | Once at startup | Low value |
 | `socket+bind+listen` | `main.zig` listen socket, `rpc/server.zig` API server, `event_loop.zig` UDP listener | Once at startup, `bind`/`listen` need kernel 6.11+ (`IORING_OP_BIND`/`LISTEN`) | `socket` done; `bind`/`listen` blocked on kernel 6.11 |
 | ~~HTTP stack~~ | ~~`std.http.Client` in `announce.zig`~~ | ~~Tracker announce~~ | **Resolved**: blocking tracker functions removed; all tracker I/O through ring-based executors |
@@ -93,6 +94,7 @@ This document tracks which syscalls the `varuna` **daemon** uses, which are rout
 | `renameat()` | `IORING_OP_RENAMEAT` | 5.11 | Finalizing completed downloads |
 | `unlinkat()` | `IORING_OP_UNLINKAT` | 5.11 | Deleting files/partial downloads |
 | `mkdirat()` | `IORING_OP_MKDIRAT` | 5.15 | Creating directory structure |
+| `getdents64()` | No stable exposed op in Zig 0.15.2 | N/A | Enumerating directory contents for file moves |
 | `madvise()` | `IORING_OP_MADVISE` | 5.6 | Hinting huge page usage on cache |
 | `splice()` | `IORING_OP_SPLICE` | 5.7 | Zero-copy between fds |
 

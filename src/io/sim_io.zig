@@ -30,6 +30,7 @@
 const std = @import("std");
 const builtin = @import("builtin");
 const posix = std.posix;
+const linux = std.os.linux;
 const assert = std.debug.assert;
 
 const ifc = @import("io_interface.zig");
@@ -128,6 +129,8 @@ pub const FaultConfig = struct {
     mkdirat_error_probability: f32 = 0.0,
     renameat_error_probability: f32 = 0.0,
     unlinkat_error_probability: f32 = 0.0,
+    statx_error_probability: f32 = 0.0,
+    getdents_error_probability: f32 = 0.0,
     /// Probability that an fsync completes with `error.InputOutput`
     /// (disk failure mid-flush). Distinct from
     /// `write_error_probability` so BUGGIFY can target sync-only paths.
@@ -497,6 +500,7 @@ pub const SimIO = struct {
     /// `openat` store an owned copy in `fd_paths`.
     fs_nodes: std.StringHashMapUnmanaged(SimFsKind) = .{},
     fd_paths: std.AutoHashMap(posix.fd_t, []u8),
+    fd_dir_offsets: std.AutoHashMap(posix.fd_t, usize),
 
     /// FIFO of pre-prepared fds returned by future `socket()` calls.
     /// Each `socket` submission consumes one entry; if the queue is
@@ -563,6 +567,7 @@ pub const SimIO = struct {
             .free_socket_head = head,
             .file_state = std.AutoHashMap(posix.fd_t, SimFile).init(allocator),
             .fd_paths = std.AutoHashMap(posix.fd_t, []u8).init(allocator),
+            .fd_dir_offsets = std.AutoHashMap(posix.fd_t, usize).init(allocator),
         };
         errdefer self.deinit();
 
@@ -581,6 +586,7 @@ pub const SimIO = struct {
         var fd_it = self.fd_paths.iterator();
         while (fd_it.next()) |entry| self.allocator.free(entry.value_ptr.*);
         self.fd_paths.deinit();
+        self.fd_dir_offsets.deinit();
         self.prepared_socket_fds.deinit(self.allocator);
         self.allocator.free(self.pending);
         self.allocator.free(self.recv_queue_pool);
@@ -770,6 +776,8 @@ pub const SimIO = struct {
             .mkdirat => |op| try self.mkdirat(op, c, ud, cb),
             .renameat => |op| try self.renameat(op, c, ud, cb),
             .unlinkat => |op| try self.unlinkat(op, c, ud, cb),
+            .statx => |op| try self.statx(op, c, ud, cb),
+            .getdents => |op| try self.getdents(op, c, ud, cb),
             .splice => |op| try self.splice(op, c, ud, cb),
             .copy_file_range => |op| try self.copy_file_range(op, c, ud, cb),
             .socket => |op| try self.socket(op, c, ud, cb),
@@ -1008,6 +1016,36 @@ pub const SimIO = struct {
         return false;
     }
 
+    fn directChildName(dir_path: []const u8, child_path: []const u8) ?[]const u8 {
+        if (std.mem.eql(u8, child_path, dir_path)) return null;
+
+        if (std.mem.eql(u8, dir_path, ".")) {
+            if (std.mem.indexOfScalar(u8, child_path, '/') != null) return null;
+            return child_path;
+        }
+
+        if (std.mem.eql(u8, dir_path, "/")) {
+            if (child_path.len <= 1 or child_path[0] != '/') return null;
+            const rest = child_path[1..];
+            if (std.mem.indexOfScalar(u8, rest, '/') != null) return null;
+            return rest;
+        }
+
+        if (child_path.len <= dir_path.len + 1) return null;
+        if (!std.mem.startsWith(u8, child_path, dir_path)) return null;
+        if (child_path[dir_path.len] != '/') return null;
+        const rest = child_path[dir_path.len + 1 ..];
+        if (std.mem.indexOfScalar(u8, rest, '/') != null) return null;
+        return rest;
+    }
+
+    fn direntType(kind: SimFsKind) u8 {
+        return switch (kind) {
+            .file => linux.DT.REG,
+            .dir => linux.DT.DIR,
+        };
+    }
+
     // ── Socket pool helpers ───────────────────────────────
 
     fn allocSocketSlot(self: *SimIO) !u32 {
@@ -1077,6 +1115,7 @@ pub const SimIO = struct {
     pub fn closeSocket(self: *SimIO, fd: posix.fd_t) void {
         if (self.fd_paths.fetchRemove(fd)) |kv| {
             self.allocator.free(kv.value);
+            _ = self.fd_dir_offsets.remove(fd);
             return;
         }
 
@@ -1408,6 +1447,15 @@ pub const SimIO = struct {
             self.allocator.free(owned);
             return self.schedule(c, .{ .openat = error.NoSpaceLeft }, 0);
         };
+        if (self.fs_nodes.get(path)) |opened_kind| {
+            if (opened_kind == .dir) {
+                self.fd_dir_offsets.put(fd, 0) catch {
+                    _ = self.fd_paths.remove(fd);
+                    self.allocator.free(owned);
+                    return self.schedule(c, .{ .openat = error.NoSpaceLeft }, 0);
+                };
+            }
+        }
         return self.schedule(c, .{ .openat = fd }, 0);
     }
 
@@ -1480,6 +1528,85 @@ pub const SimIO = struct {
 
         self.removeFsNode(path);
         return self.schedule(c, .{ .unlinkat = {} }, 0);
+    }
+
+    pub fn statx(self: *SimIO, op: ifc.StatxOp, c: *Completion, ud: ?*anyopaque, cb: Callback) !void {
+        try self.armCompletion(c, .{ .statx = op }, ud, cb);
+        const r = self.rng.random();
+        if (r.float(f32) < self.config.faults.statx_error_probability) {
+            return self.schedule(c, .{ .statx = error.InputOutput }, 0);
+        }
+
+        const path = self.resolveAt(op.dir_fd, op.path) catch |err| {
+            return self.schedule(c, .{ .statx = err }, 0);
+        };
+        defer self.allocator.free(path);
+
+        const kind = self.fs_nodes.get(path) orelse {
+            return self.schedule(c, .{ .statx = error.FileNotFound }, 0);
+        };
+
+        op.buf.* = std.mem.zeroes(linux.Statx);
+        op.buf.mask = op.mask & linux.STATX_BASIC_STATS;
+        op.buf.blksize = 4096;
+        op.buf.nlink = 1;
+        op.buf.mode = switch (kind) {
+            .file => linux.S.IFREG | 0o644,
+            .dir => linux.S.IFDIR | 0o755,
+        };
+        op.buf.size = 0;
+        return self.schedule(c, .{ .statx = {} }, 0);
+    }
+
+    pub fn getdents(self: *SimIO, op: ifc.GetdentsOp, c: *Completion, ud: ?*anyopaque, cb: Callback) !void {
+        try self.armCompletion(c, .{ .getdents = op }, ud, cb);
+        const r = self.rng.random();
+        if (r.float(f32) < self.config.faults.getdents_error_probability) {
+            return self.schedule(c, .{ .getdents = error.InputOutput }, 0);
+        }
+
+        const dir_path = self.fd_paths.get(op.fd) orelse {
+            return self.schedule(c, .{ .getdents = error.BadFileDescriptor }, 0);
+        };
+        if (!self.hasDir(dir_path)) {
+            return self.schedule(c, .{ .getdents = error.NotDir }, 0);
+        }
+
+        const start_index = self.fd_dir_offsets.get(op.fd) orelse 0;
+        var seen: usize = 0;
+        var emitted: usize = 0;
+        var out: usize = 0;
+        var iter = self.fs_nodes.iterator();
+        while (iter.next()) |entry| {
+            const child_path = entry.key_ptr.*;
+            const name = directChildName(dir_path, child_path) orelse continue;
+            if (seen < start_index) {
+                seen += 1;
+                continue;
+            }
+
+            const next = ifc.appendDirent64(
+                op.buf,
+                out,
+                @as(u64, 1 + seen),
+                @as(u64, seen + 1),
+                direntType(entry.value_ptr.*),
+                name,
+            ) orelse {
+                if (out == 0) {
+                    return self.schedule(c, .{ .getdents = error.InvalidArgument }, 0);
+                }
+                break;
+            };
+            out = next;
+            seen += 1;
+            emitted += 1;
+        }
+
+        self.fd_dir_offsets.put(op.fd, start_index + emitted) catch {
+            return self.schedule(c, .{ .getdents = error.NoSpaceLeft }, 0);
+        };
+        return self.schedule(c, .{ .getdents = out }, 0);
     }
 
     pub fn socket(self: *SimIO, op: ifc.SocketOp, c: *Completion, ud: ?*anyopaque, cb: Callback) !void {
@@ -1639,6 +1766,8 @@ fn cancelResultFor(op: Operation) Result {
         .mkdirat => .{ .mkdirat = error.OperationCanceled },
         .renameat => .{ .renameat = error.OperationCanceled },
         .unlinkat => .{ .unlinkat = error.OperationCanceled },
+        .statx => .{ .statx = error.OperationCanceled },
+        .getdents => .{ .getdents = error.OperationCanceled },
         .splice => .{ .splice = error.OperationCanceled },
         .copy_file_range => .{ .copy_file_range = error.OperationCanceled },
         .socket => .{ .socket = error.OperationCanceled },
@@ -1672,6 +1801,8 @@ fn buggifyResultFor(op: Operation) Result {
         .mkdirat => .{ .mkdirat = error.InputOutput },
         .renameat => .{ .renameat = error.InputOutput },
         .unlinkat => .{ .unlinkat = error.InputOutput },
+        .statx => .{ .statx = error.InputOutput },
+        .getdents => .{ .getdents = error.InputOutput },
         .splice => .{ .splice = error.InputOutput },
         .copy_file_range => .{ .copy_file_range = error.InputOutput },
         .socket => .{ .socket = error.ProcessFdQuotaExceeded },

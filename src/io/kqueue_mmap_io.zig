@@ -57,6 +57,7 @@
 const std = @import("std");
 const builtin = @import("builtin");
 const posix = std.posix;
+const linux = std.os.linux;
 const assert = std.debug.assert;
 
 const ifc = @import("io_interface.zig");
@@ -102,6 +103,19 @@ comptime {
 
 inline fn kqueueState(c: *Completion) *KqueueState {
     return c.backendStateAs(KqueueState);
+}
+
+fn fileKindToDirentType(kind: std.fs.File.Kind) u8 {
+    return switch (kind) {
+        .block_device => linux.DT.BLK,
+        .character_device => linux.DT.CHR,
+        .directory => linux.DT.DIR,
+        .named_pipe => linux.DT.FIFO,
+        .sym_link => linux.DT.LNK,
+        .file => linux.DT.REG,
+        .unix_domain_socket => linux.DT.SOCK,
+        else => linux.DT.UNKNOWN,
+    };
 }
 
 const sentinel_index: u32 = std.math.maxInt(u32);
@@ -348,6 +362,8 @@ pub const KqueueMmapIO = struct {
             .mkdirat => |op| try self.mkdirat(op, c, ud, cb),
             .renameat => |op| try self.renameat(op, c, ud, cb),
             .unlinkat => |op| try self.unlinkat(op, c, ud, cb),
+            .statx => |op| try self.statx(op, c, ud, cb),
+            .getdents => |op| try self.getdents(op, c, ud, cb),
             .bind => |op| try self.bind(op, c, ud, cb),
             .listen => |op| try self.listen(op, c, ud, cb),
             .setsockopt => |op| try self.setsockopt(op, c, ud, cb),
@@ -693,6 +709,45 @@ pub const KqueueMmapIO = struct {
             .{ .unlinkat = {} }
         else |err|
             .{ .unlinkat = err };
+        self.pushCompleted(c, result);
+    }
+
+    pub fn statx(self: *KqueueMmapIO, op: ifc.StatxOp, c: *Completion, ud: ?*anyopaque, cb: Callback) !void {
+        try self.armCompletion(c, .{ .statx = op }, ud, cb);
+        const result: Result = if (posix.fstatatZ(op.dir_fd, op.path, op.flags)) |st| blk: {
+            op.buf.* = std.mem.zeroes(linux.Statx);
+            op.buf.mask = op.mask & linux.STATX_BASIC_STATS;
+            op.buf.blksize = @intCast(@max(st.blksize, 0));
+            op.buf.nlink = @intCast(@max(st.nlink, 0));
+            op.buf.uid = @intCast(st.uid);
+            op.buf.gid = @intCast(st.gid);
+            op.buf.mode = @intCast(st.mode);
+            op.buf.ino = @intCast(@max(st.ino, 0));
+            op.buf.size = @intCast(@max(st.size, 0));
+            op.buf.blocks = @intCast(@max(st.blocks, 0));
+            break :blk .{ .statx = {} };
+        } else |err| .{ .statx = err };
+        self.pushCompleted(c, result);
+    }
+
+    pub fn getdents(self: *KqueueMmapIO, op: ifc.GetdentsOp, c: *Completion, ud: ?*anyopaque, cb: Callback) !void {
+        try self.armCompletion(c, .{ .getdents = op }, ud, cb);
+        var dir: std.fs.Dir = .{ .fd = op.fd };
+        var iter = dir.iterateAssumeFirstIteration();
+        var out: usize = 0;
+        var index: usize = 0;
+        const result: Result = blk: {
+            while (true) {
+                const maybe_entry = iter.next() catch |err| break :blk .{ .getdents = err };
+                const entry = maybe_entry orelse break :blk .{ .getdents = out };
+                const next = ifc.appendDirent64(op.buf, out, @as(u64, index + 1), @as(u64, index + 1), fileKindToDirentType(entry.kind), entry.name) orelse {
+                    if (out == 0) break :blk .{ .getdents = error.InvalidArgument };
+                    break :blk .{ .getdents = out };
+                };
+                out = next;
+                index += 1;
+            }
+        };
         self.pushCompleted(c, result);
     }
 
@@ -1059,6 +1114,8 @@ fn makeCancelledResult(op: Operation) Result {
         .mkdirat => .{ .mkdirat = error.OperationCanceled },
         .renameat => .{ .renameat = error.OperationCanceled },
         .unlinkat => .{ .unlinkat = error.OperationCanceled },
+        .statx => .{ .statx = error.OperationCanceled },
+        .getdents => .{ .getdents = error.OperationCanceled },
         .bind => .{ .bind = error.OperationCanceled },
         .listen => .{ .listen = error.OperationCanceled },
         .setsockopt => .{ .setsockopt = error.OperationCanceled },

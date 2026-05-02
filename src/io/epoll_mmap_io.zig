@@ -470,6 +470,8 @@ pub const EpollMmapIO = struct {
             .mkdirat => |op| try self.mkdirat(op, c, userdata, callback),
             .renameat => |op| try self.renameat(op, c, userdata, callback),
             .unlinkat => |op| try self.unlinkat(op, c, userdata, callback),
+            .statx => |op| try self.statx(op, c, userdata, callback),
+            .getdents => |op| try self.getdents(op, c, userdata, callback),
             .splice => |op| try self.splice(op, c, userdata, callback),
             .copy_file_range => |op| try self.copy_file_range(op, c, userdata, callback),
             .socket => |op| try self.socket(op, c, userdata, callback),
@@ -712,6 +714,50 @@ pub const EpollMmapIO = struct {
                 .disarm => return,
                 .rearm => switch (c.op) {
                     .unlinkat => |new_op| {
+                        op = new_op;
+                        continue;
+                    },
+                    else => return,
+                },
+            }
+        }
+    }
+
+    pub fn statx(self: *EpollMmapIO, op_in: ifc.StatxOp, c: *Completion, ud: ?*anyopaque, cb: Callback) !void {
+        var op = op_in;
+        while (true) {
+            try self.armCompletion(c, .{ .statx = op }, ud, cb);
+            const rc = linux.statx(op.dir_fd, op.path, op.flags, op.mask, op.buf);
+            const result: Result = switch (linux.E.init(rc)) {
+                .SUCCESS => .{ .statx = {} },
+                else => |err| .{ .statx = ifc.linuxErrnoToError(err) },
+            };
+            switch (try self.deliverInline(c, result)) {
+                .disarm => return,
+                .rearm => switch (c.op) {
+                    .statx => |new_op| {
+                        op = new_op;
+                        continue;
+                    },
+                    else => return,
+                },
+            }
+        }
+    }
+
+    pub fn getdents(self: *EpollMmapIO, op_in: ifc.GetdentsOp, c: *Completion, ud: ?*anyopaque, cb: Callback) !void {
+        var op = op_in;
+        while (true) {
+            try self.armCompletion(c, .{ .getdents = op }, ud, cb);
+            const rc = linux.getdents64(op.fd, op.buf.ptr, op.buf.len);
+            const result: Result = switch (linux.E.init(rc)) {
+                .SUCCESS => .{ .getdents = rc },
+                else => |err| .{ .getdents = ifc.linuxErrnoToError(err) },
+            };
+            switch (try self.deliverInline(c, result)) {
+                .disarm => return,
+                .rearm => switch (c.op) {
+                    .getdents => |new_op| {
                         op = new_op;
                         continue;
                     },
@@ -1178,6 +1224,8 @@ fn makeCancelledResult(op: Operation) Result {
         .mkdirat => .{ .mkdirat = error.OperationCanceled },
         .renameat => .{ .renameat = error.OperationCanceled },
         .unlinkat => .{ .unlinkat = error.OperationCanceled },
+        .statx => .{ .statx = error.OperationCanceled },
+        .getdents => .{ .getdents = error.OperationCanceled },
         .splice => .{ .splice = error.OperationCanceled },
         .copy_file_range => .{ .copy_file_range = error.OperationCanceled },
         .socket => .{ .socket = error.OperationCanceled },

@@ -183,6 +183,8 @@ pub const RealIO = struct {
             .mkdirat => |op| try self.mkdirat(op, c, userdata, callback),
             .renameat => |op| try self.renameat(op, c, userdata, callback),
             .unlinkat => |op| try self.unlinkat(op, c, userdata, callback),
+            .statx => |op| try self.statx(op, c, userdata, callback),
+            .getdents => |op| try self.getdents(op, c, userdata, callback),
             .splice => |op| try self.splice(op, c, userdata, callback),
             .copy_file_range => |op| try self.copy_file_range(op, c, userdata, callback),
             .socket => |op| try self.socket(op, c, userdata, callback),
@@ -441,6 +443,65 @@ pub const RealIO = struct {
                 .disarm => return,
                 .rearm => switch (c.op) {
                     .unlinkat => |new_op| op = new_op,
+                    else => return,
+                },
+            }
+        }
+    }
+
+    pub fn statx(self: *RealIO, op_in: ifc.StatxOp, c: *Completion, ud: ?*anyopaque, cb: Callback) !void {
+        if (self.feature_support.supports_statx) {
+            try self.armCompletion(c, .{ .statx = op_in }, ud, cb);
+            const stored = &c.op.statx;
+            const sqe = try self.ring.statx(
+                @intFromPtr(c),
+                stored.dir_fd,
+                stored.path,
+                stored.flags,
+                stored.mask,
+                stored.buf,
+            );
+            _ = sqe;
+            return;
+        }
+
+        var op = op_in;
+        while (true) {
+            try self.armCompletion(c, .{ .statx = op }, ud, cb);
+            const rc = linux.statx(op.dir_fd, op.path, op.flags, op.mask, op.buf);
+            const result: Result = switch (linux.E.init(rc)) {
+                .SUCCESS => .{ .statx = {} },
+                else => |err| .{ .statx = errnoToError(err) },
+            };
+
+            realState(c).in_flight = false;
+            const action = cb(ud, c, result);
+            switch (action) {
+                .disarm => return,
+                .rearm => switch (c.op) {
+                    .statx => |new_op| op = new_op,
+                    else => return,
+                },
+            }
+        }
+    }
+
+    pub fn getdents(self: *RealIO, op_in: ifc.GetdentsOp, c: *Completion, ud: ?*anyopaque, cb: Callback) !void {
+        var op = op_in;
+        while (true) {
+            try self.armCompletion(c, .{ .getdents = op }, ud, cb);
+            const rc = linux.getdents64(op.fd, op.buf.ptr, op.buf.len);
+            const result: Result = switch (linux.E.init(rc)) {
+                .SUCCESS => .{ .getdents = rc },
+                else => |err| .{ .getdents = errnoToError(err) },
+            };
+
+            realState(c).in_flight = false;
+            const action = cb(ud, c, result);
+            switch (action) {
+                .disarm => return,
+                .rearm => switch (c.op) {
+                    .getdents => |new_op| op = new_op,
                     else => return,
                 },
             }
@@ -751,6 +812,10 @@ fn buildResult(op: Operation, cqe: linux.io_uring_cqe) Result {
         .mkdirat => .{ .mkdirat = voidOrError(cqe) },
         .renameat => .{ .renameat = voidOrError(cqe) },
         .unlinkat => .{ .unlinkat = voidOrError(cqe) },
+        .statx => .{ .statx = voidOrError(cqe) },
+        // getdents completes synchronously inside `RealIO.getdents` because
+        // Zig 0.15.2 exposes no io_uring getdents helper/op.
+        .getdents => .{ .getdents = countOrError(cqe) },
         .splice => .{ .splice = countOrError(cqe) },
         // copy_file_range completes synchronously inside `RealIO.copy_file_range`
         // and never reaches `dispatchCqe`; keep a shaped variant for
@@ -834,6 +899,8 @@ fn errnoToError(e: linux.E) anyerror {
         .CONNABORTED => error.ConnectionAborted,
         .CANCELED => error.OperationCanceled,
         .NOENT => error.FileNotFound,
+        .EXIST => error.PathAlreadyExists,
+        .NOTDIR => error.NotDir,
         .ALREADY => error.AlreadyCompleted,
         .ADDRINUSE => error.AddressInUse,
         .ADDRNOTAVAIL => error.AddressNotAvailable,
@@ -843,6 +910,7 @@ fn errnoToError(e: linux.E) anyerror {
         .INVAL => error.InvalidArgument,
         .IO => error.InputOutput,
         .NOSPC => error.NoSpaceLeft,
+        .NOSYS => error.OperationNotSupported,
         .ISDIR => error.IsDir,
         .MFILE => error.ProcessFdQuotaExceeded,
         .NFILE => error.SystemFdQuotaExceeded,

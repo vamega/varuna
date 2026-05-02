@@ -33,9 +33,10 @@ fn requireBackendMethods(comptime IO: type) void {
             "recv",     "send",     "recvmsg",
             "sendmsg",  "read",     "write",
             "fsync",    "openat",   "mkdirat",
-            "renameat", "unlinkat", "socket",
-            "connect",  "accept",   "timeout",
-            "poll",     "cancel",
+            "renameat", "unlinkat", "statx",
+            "getdents", "socket",   "connect",
+            "accept",   "timeout",  "poll",
+            "cancel",
         };
         for (required) |name| {
             if (!@hasDecl(IO, name)) {
@@ -147,6 +148,34 @@ fn runDirectoryOpsRoundTrip(
     }
 
     {
+        var st: linux.Statx = undefined;
+        var c = Completion{};
+        var counter = Counter{};
+        try io.statx(
+            .{
+                .dir_fd = root_fd,
+                .path = "stage/file.tmp",
+                .flags = linux.AT.SYMLINK_NOFOLLOW,
+                .mask = linux.STATX_TYPE | linux.STATX_SIZE,
+                .buf = &st,
+            },
+            &c,
+            &counter,
+            counterCallback,
+        );
+        if (counter.fires == 0) try drain_fn(io);
+        try testing.expectEqual(@as(u32, 1), counter.fires);
+        switch (counter.last_result.?) {
+            .statx => |r| try r,
+            else => try testing.expect(false),
+        }
+        try testing.expect(st.mask & linux.STATX_TYPE != 0);
+        try testing.expect(st.mask & linux.STATX_SIZE != 0);
+        try testing.expectEqual(@as(u64, 0), st.size);
+        try testing.expect((st.mode & linux.S.IFMT) == linux.S.IFREG);
+    }
+
+    {
         var c = Completion{};
         var counter = Counter{};
         try io.renameat(
@@ -189,6 +218,54 @@ fn runDirectoryOpsRoundTrip(
             else => return error.UnexpectedResult,
         };
         io.closeSocket(fd);
+    }
+
+    {
+        var c = Completion{};
+        var counter = Counter{};
+        try io.openat(
+            .{
+                .dir_fd = root_fd,
+                .path = "stage",
+                .flags = .{ .ACCMODE = .RDONLY, .DIRECTORY = true },
+                .mode = 0,
+            },
+            &c,
+            &counter,
+            counterCallback,
+        );
+        if (counter.fires == 0) try drain_fn(io);
+        try testing.expectEqual(@as(u32, 1), counter.fires);
+        const dir_fd = switch (counter.last_result.?) {
+            .openat => |r| try r,
+            else => return error.UnexpectedResult,
+        };
+        defer io.closeSocket(dir_fd);
+
+        var dir_buf: [512]u8 align(@alignOf(linux.dirent64)) = undefined;
+        var dents = Completion{};
+        var dents_counter = Counter{};
+        try io.getdents(.{ .fd = dir_fd, .buf = &dir_buf }, &dents, &dents_counter, counterCallback);
+        if (dents_counter.fires == 0) try drain_fn(io);
+        try testing.expectEqual(@as(u32, 1), dents_counter.fires);
+        const bytes = switch (dents_counter.last_result.?) {
+            .getdents => |r| try r,
+            else => return error.UnexpectedResult,
+        };
+        try testing.expect(bytes > 0);
+
+        var saw_file = false;
+        var offset: usize = 0;
+        while (offset < bytes) {
+            const entry: *align(1) linux.dirent64 = @ptrCast(&dir_buf[offset]);
+            const name = std.mem.sliceTo(@as([*:0]const u8, @ptrCast(&entry.name)), 0);
+            if (std.mem.eql(u8, name, "file.dat")) {
+                saw_file = true;
+                try testing.expectEqual(linux.DT.REG, entry.type);
+            }
+            offset += entry.reclen;
+        }
+        try testing.expect(saw_file);
     }
 
     {

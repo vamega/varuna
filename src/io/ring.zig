@@ -167,6 +167,7 @@ pub const FeatureSupport = struct {
     supports_mkdirat: bool = false,
     supports_renameat: bool = false,
     supports_unlinkat: bool = false,
+    supports_statx: bool = false,
 
     /// All-false sentinel used when the probe register itself isn't
     /// supported (kernel <5.6) or fails for any other reason. Every op
@@ -196,6 +197,7 @@ pub fn probeFeatures(ring: *linux.IoUring) FeatureSupport {
         .supports_mkdirat = p.is_supported(.MKDIRAT),
         .supports_renameat = p.is_supported(.RENAMEAT),
         .supports_unlinkat = p.is_supported(.UNLINKAT),
+        .supports_statx = p.is_supported(.STATX),
     };
 }
 
@@ -231,6 +233,7 @@ test "probeFeatures FeatureSupport.none has every flag false" {
     try std.testing.expectEqual(false, none.supports_mkdirat);
     try std.testing.expectEqual(false, none.supports_renameat);
     try std.testing.expectEqual(false, none.supports_unlinkat);
+    try std.testing.expectEqual(false, none.supports_statx);
 }
 
 test "probeFeatures optional op flags are bool-typed and queryable" {
@@ -247,18 +250,20 @@ test "probeFeatures optional op flags are bool-typed and queryable" {
     // Compile-time assertion that the field types are bool.
     const _b: bool = features.supports_bind;
     const _l: bool = features.supports_listen;
-    const _s: bool = features.supports_setsockopt;
+    const _set: bool = features.supports_setsockopt;
     const _o: bool = features.supports_openat;
     const _m: bool = features.supports_mkdirat;
     const _r: bool = features.supports_renameat;
     const _u: bool = features.supports_unlinkat;
+    const _stat: bool = features.supports_statx;
     _ = _b;
     _ = _l;
-    _ = _s;
+    _ = _set;
     _ = _o;
     _ = _m;
     _ = _r;
     _ = _u;
+    _ = _stat;
 }
 
 test "init and deinit ring" {
