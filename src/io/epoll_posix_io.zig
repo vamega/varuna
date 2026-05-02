@@ -132,13 +132,59 @@ inline fn epollState(c: *Completion) *EpollState {
 
 const FdRegistration = struct {
     read: ?*Completion = null,
-    write: ?*Completion = null,
+    write_head: ?*Completion = null,
+    write_tail: ?*Completion = null,
     poll: ?*Completion = null,
 
     fn isEmpty(self: FdRegistration) bool {
-        return self.read == null and self.write == null and self.poll == null;
+        return self.read == null and self.write_head == null and self.poll == null;
     }
 };
+
+fn writeQueueAppend(reg: *FdRegistration, c: *Completion) void {
+    c.next = null;
+    if (reg.write_tail) |tail| {
+        tail.next = c;
+    } else {
+        reg.write_head = c;
+    }
+    reg.write_tail = c;
+}
+
+fn writeQueuePrepend(reg: *FdRegistration, c: *Completion) void {
+    c.next = reg.write_head;
+    reg.write_head = c;
+    if (reg.write_tail == null) reg.write_tail = c;
+}
+
+fn writeQueuePop(reg: *FdRegistration) ?*Completion {
+    const head = reg.write_head orelse return null;
+    reg.write_head = head.next;
+    if (reg.write_head == null) reg.write_tail = null;
+    head.next = null;
+    return head;
+}
+
+fn writeQueueRemove(reg: *FdRegistration, c: *Completion) bool {
+    var prev: ?*Completion = null;
+    var cur = reg.write_head;
+    while (cur) |entry| {
+        if (entry == c) {
+            const next = entry.next;
+            if (prev) |p| {
+                p.next = next;
+            } else {
+                reg.write_head = next;
+            }
+            if (reg.write_tail == entry) reg.write_tail = prev;
+            entry.next = null;
+            return true;
+        }
+        prev = entry;
+        cur = entry.next;
+    }
+    return false;
+}
 
 // ── Configuration ─────────────────────────────────────────
 
@@ -247,6 +293,11 @@ pub const EpollPosixIO = struct {
     /// no allocation churn on hot ticks.
     pool_swap: std.ArrayListUnmanaged(PoolCompleted) = .{},
     fd_registrations: std.AutoHashMap(posix.fd_t, FdRegistration),
+    /// Completion currently being dispatched on the write lane. If its
+    /// callback submits the same completion again (partial send), queue it
+    /// at the front so later same-fd sends cannot interleave into the TCP
+    /// byte stream.
+    requeue_write_front: ?*Completion = null,
 
     pub fn init(allocator: std.mem.Allocator, config: Config) !EpollPosixIO {
         const epoll_rc = linux.epoll_create1(linux.EPOLL.CLOEXEC);
@@ -350,7 +401,7 @@ pub const EpollPosixIO = struct {
         _ = linux.epoll_ctl(self.epoll_fd, linux.EPOLL.CTL_DEL, fd, null);
         if (self.fd_registrations.fetchRemove(fd)) |entry| {
             self.cancelRegisteredCompletion(entry.value.read);
-            self.cancelRegisteredCompletion(entry.value.write);
+            self.cancelWriteQueue(entry.value.write_head);
             self.cancelRegisteredCompletion(entry.value.poll);
         }
         posix.close(fd);
@@ -499,11 +550,10 @@ pub const EpollPosixIO = struct {
         var read_c: ?*Completion = null;
         var poll_c: ?*Completion = null;
 
-        if (reg.write) |c| {
+        if (reg.write_head != null) {
             if ((events & (linux.EPOLL.OUT | linux.EPOLL.ERR | linux.EPOLL.HUP | linux.EPOLL.RDHUP)) != 0) {
-                write_c = c;
-                reg.write = null;
-                self.clearRegisteredCompletion(c);
+                write_c = writeQueuePop(reg);
+                if (write_c) |c| self.clearRegisteredCompletion(c);
             }
         }
         if (reg.read) |c| {
@@ -548,6 +598,12 @@ pub const EpollPosixIO = struct {
         // EAGAIN (rare under EPOLLONESHOT), we'll re-register via the
         // submission method's own path — but for our common case the retry
         // succeeds.
+        const prioritize_requeue = fdInterestForCompletion(c) == .write;
+        if (prioritize_requeue) self.requeue_write_front = c;
+        defer if (prioritize_requeue and self.requeue_write_front == c) {
+            self.requeue_write_front = null;
+        };
+
         const result = performInline(c, events);
         const action = cb(c.userdata, c, result);
         switch (action) {
@@ -1051,20 +1107,44 @@ pub const EpollPosixIO = struct {
         const gop = try self.fd_registrations.getOrPut(fd);
         if (!gop.found_existing) gop.value_ptr.* = .{};
         const reg = gop.value_ptr;
-        const lane: *?*Completion = switch (interest) {
-            .read => &reg.read,
-            .write => &reg.write,
-            .poll => &reg.poll,
-            .none => return error.UnsupportedOperation,
-        };
-        if (lane.* != null and lane.* != c) {
-            epollState(c).in_flight = false;
-            return error.AlreadyInFlight;
+
+        switch (interest) {
+            .read, .poll => {
+                const lane: *?*Completion = switch (interest) {
+                    .read => &reg.read,
+                    .poll => &reg.poll,
+                    else => unreachable,
+                };
+                if (lane.* != null and lane.* != c) {
+                    epollState(c).in_flight = false;
+                    return error.AlreadyInFlight;
+                }
+                lane.* = c;
+            },
+            .write => {
+                if (self.requeue_write_front == c) {
+                    writeQueuePrepend(reg, c);
+                } else {
+                    writeQueueAppend(reg, c);
+                }
+            },
+            .none => {
+                epollState(c).in_flight = false;
+                return error.UnsupportedOperation;
+            },
         }
-        lane.* = c;
 
         self.updateFdRegistration(fd) catch |err| {
-            if (lane.* == c) lane.* = null;
+            switch (interest) {
+                .read => {
+                    if (reg.read == c) reg.read = null;
+                },
+                .write => _ = writeQueueRemove(reg, c),
+                .poll => {
+                    if (reg.poll == c) reg.poll = null;
+                },
+                .none => {},
+            }
             if (reg.isEmpty()) _ = self.fd_registrations.remove(fd);
             const st = epollState(c);
             st.in_flight = false;
@@ -1129,7 +1209,7 @@ pub const EpollPosixIO = struct {
                     if (reg.read == c) reg.read = null;
                 },
                 .write => {
-                    if (reg.write == c) reg.write = null;
+                    _ = writeQueueRemove(reg, c);
                 },
                 .poll => {
                     if (reg.poll == c) reg.poll = null;
@@ -1145,8 +1225,18 @@ pub const EpollPosixIO = struct {
     fn cancelRegisteredCompletion(self: *EpollPosixIO, c: ?*Completion) void {
         const completion = c orelse return;
         self.clearRegisteredCompletion(completion);
+        completion.next = null;
         if (completion.callback) |cb| {
             _ = cb(completion.userdata, completion, makeCancelledResult(completion.op));
+        }
+    }
+
+    fn cancelWriteQueue(self: *EpollPosixIO, head: ?*Completion) void {
+        var cur = head;
+        while (cur) |completion| {
+            const next = completion.next;
+            self.cancelRegisteredCompletion(completion);
+            cur = next;
         }
     }
 
@@ -1171,7 +1261,7 @@ pub const EpollPosixIO = struct {
     fn fdRegistrationEvents(reg: FdRegistration) u32 {
         var events: u32 = linux.EPOLL.ONESHOT | linux.EPOLL.RDHUP;
         if (reg.read != null) events |= linux.EPOLL.IN;
-        if (reg.write != null) events |= linux.EPOLL.OUT;
+        if (reg.write_head != null) events |= linux.EPOLL.OUT;
         if (reg.poll) |c| {
             events |= switch (c.op) {
                 .poll => |op| op.events,
