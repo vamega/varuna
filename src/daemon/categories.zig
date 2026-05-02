@@ -76,28 +76,34 @@ pub const CategoryStore = struct {
         var json = std.ArrayList(u8).empty;
         errdefer json.deinit(self.allocator);
 
-        try json.append(self.allocator, '{');
-        var first = true;
-        var iter = self.categories.iterator();
-        while (iter.next()) |entry| {
-            if (!first) try json.append(self.allocator, ',');
-            first = false;
-            try json.print(self.allocator, "\"{s}\":{{\"name\":\"{s}\",\"savePath\":\"{s}\"}}", .{
-                entry.value_ptr.name,
-                entry.value_ptr.name,
-                entry.value_ptr.save_path,
-            });
-        }
-        try json.append(self.allocator, '}');
-
+        try self.appendJson(self.allocator, &json);
         self.cached_json = try json.toOwnedSlice(self.allocator);
         return self.cached_json.?;
     }
 
     /// Serialize all categories as JSON: {"name":{"name":"...","savePath":"..."},...}
     pub fn serializeJson(self: *CategoryStore, allocator: std.mem.Allocator) ![]u8 {
-        const cached = try self.cachedJson();
-        return allocator.dupe(u8, cached);
+        var json = std.ArrayList(u8).empty;
+        errdefer json.deinit(allocator);
+
+        try self.appendJson(allocator, &json);
+        return json.toOwnedSlice(allocator);
+    }
+
+    fn appendJson(self: *CategoryStore, allocator: std.mem.Allocator, json: *std.ArrayList(u8)) !void {
+        try json.append(allocator, '{');
+        var first = true;
+        var iter = self.categories.iterator();
+        while (iter.next()) |entry| {
+            if (!first) try json.append(allocator, ',');
+            first = false;
+            try json.print(allocator, "\"{s}\":{{\"name\":\"{s}\",\"savePath\":\"{s}\"}}", .{
+                entry.value_ptr.name,
+                entry.value_ptr.name,
+                entry.value_ptr.save_path,
+            });
+        }
+        try json.append(allocator, '}');
     }
 
     fn invalidateCache(self: *CategoryStore) void {
@@ -158,24 +164,30 @@ pub const TagStore = struct {
         var json = std.ArrayList(u8).empty;
         errdefer json.deinit(self.allocator);
 
-        try json.append(self.allocator, '[');
-        var first = true;
-        var iter = self.tags.iterator();
-        while (iter.next()) |entry| {
-            if (!first) try json.append(self.allocator, ',');
-            first = false;
-            try json.print(self.allocator, "\"{s}\"", .{entry.key_ptr.*});
-        }
-        try json.append(self.allocator, ']');
-
+        try self.appendJson(self.allocator, &json);
         self.cached_json = try json.toOwnedSlice(self.allocator);
         return self.cached_json.?;
     }
 
     /// Serialize all tags as JSON array: ["tag1","tag2",...]
     pub fn serializeJson(self: *TagStore, allocator: std.mem.Allocator) ![]u8 {
-        const cached = try self.cachedJson();
-        return allocator.dupe(u8, cached);
+        var json = std.ArrayList(u8).empty;
+        errdefer json.deinit(allocator);
+
+        try self.appendJson(allocator, &json);
+        return json.toOwnedSlice(allocator);
+    }
+
+    fn appendJson(self: *TagStore, allocator: std.mem.Allocator, json: *std.ArrayList(u8)) !void {
+        try json.append(allocator, '[');
+        var first = true;
+        var iter = self.tags.iterator();
+        while (iter.next()) |entry| {
+            if (!first) try json.append(allocator, ',');
+            first = false;
+            try json.print(allocator, "\"{s}\"", .{entry.key_ptr.*});
+        }
+        try json.append(allocator, ']');
     }
 
     fn invalidateCache(self: *TagStore) void {

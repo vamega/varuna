@@ -14,8 +14,12 @@ const linux = std.os.linux;
 const posix = std.posix;
 const varuna = @import("varuna");
 const rpc_server = varuna.rpc.server;
+const rpc_handlers = varuna.rpc.handlers;
+const rpc_sync = varuna.rpc.sync;
 const scratch = varuna.rpc.scratch;
 const backend = varuna.io.backend;
+const SessionManager = varuna.daemon.session_manager.SessionManager;
+const Random = varuna.runtime.Random;
 
 // ── 1. Algorithm tests ────────────────────────────────────
 
@@ -340,6 +344,65 @@ test "ApiServer frees parent-owned response allocations while arena exists" {
 
     try std.testing.expectEqual(baseline_allocations, counting_parent.active_allocations);
     try std.testing.expectEqual(baseline_bytes, counting_parent.active_bytes);
+}
+
+test "ApiHandler category and tag list responses stay in request arena when cache is dirty" {
+    var counting_parent: CountingAllocator = .{ .parent = std.testing.allocator };
+    const parent = counting_parent.allocator();
+
+    var sm = SessionManager.init(parent);
+    defer sm.deinit();
+    try sm.category_store.create("movies", "/srv/movies");
+    try sm.tag_store.create("linux");
+
+    var handler = rpc_handlers.ApiHandler{
+        .session_manager = &sm,
+        .sync_state = rpc_sync.SyncState.init(parent),
+        .peer_sync_state = rpc_sync.PeerSyncState.init(parent),
+    };
+    defer handler.sync_state.deinit();
+    defer handler.peer_sync_state.deinit();
+
+    var rng = Random.simRandom(0x5176);
+    const sid = handler.session_store.createSession(&rng);
+
+    var arena = try scratch.TieredArena.init(parent, rpc_server.request_arena_slab, rpc_server.request_arena_capacity);
+    defer arena.deinit();
+
+    const baseline_allocations = counting_parent.active_allocations;
+    const baseline_bytes = counting_parent.active_bytes;
+
+    {
+        arena.reset();
+        const resp = handler.handle(arena.allocator(), .{
+            .method = "GET",
+            .path = "/api/v2/torrents/categories",
+            .cookie_sid = &sid,
+        });
+        try std.testing.expectEqual(@as(u16, 200), resp.status);
+        try std.testing.expect(std.mem.indexOf(u8, resp.body, "\"movies\"") != null);
+        try std.testing.expect(resp.owned_body != null);
+        try std.testing.expect(arena.ownsSlice(resp.owned_body.?));
+        arena.reset();
+        try std.testing.expectEqual(baseline_allocations, counting_parent.active_allocations);
+        try std.testing.expectEqual(baseline_bytes, counting_parent.active_bytes);
+    }
+
+    {
+        arena.reset();
+        const resp = handler.handle(arena.allocator(), .{
+            .method = "GET",
+            .path = "/api/v2/torrents/tags",
+            .cookie_sid = &sid,
+        });
+        try std.testing.expectEqual(@as(u16, 200), resp.status);
+        try std.testing.expect(std.mem.indexOf(u8, resp.body, "\"linux\"") != null);
+        try std.testing.expect(resp.owned_body != null);
+        try std.testing.expect(arena.ownsSlice(resp.owned_body.?));
+        arena.reset();
+        try std.testing.expectEqual(baseline_allocations, counting_parent.active_allocations);
+        try std.testing.expectEqual(baseline_bytes, counting_parent.active_bytes);
+    }
 }
 
 // ── 3. Safety-under-fault: oversize response ──────────────
