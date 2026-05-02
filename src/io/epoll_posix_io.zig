@@ -1300,6 +1300,7 @@ fn doConnectComplete(fd: posix.fd_t) anyerror!void {
         .TIMEDOUT => error.ConnectionTimedOut,
         .ADDRINUSE => error.AddressInUse,
         .ADDRNOTAVAIL => error.AddressNotAvailable,
+        .AFNOSUPPORT => error.AddressFamilyNotSupported,
         else => posix.unexpectedErrno(e),
     };
 }

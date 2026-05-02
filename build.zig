@@ -269,7 +269,7 @@ pub fn build(b: *std.Build) void {
 
     const peer_policy_tests = b.addTest(.{
         .root_module = varuna_mod,
-        .filters = &.{"detachAllPeersExcept"},
+        .filters = &.{ "detachAllPeersExcept", "checkReannounce" },
     });
     const run_peer_policy_tests = b.addRunArtifact(peer_policy_tests);
     const test_peer_policy_step = b.step("test-peer-policy", "Run peer policy ownership and scheduling tests");

@@ -1508,28 +1508,13 @@ pub fn checkReannounce(self: anytype) void {
             var drained = owned_results;
             drained.deinit(self.allocator);
         }
-        // Precompute our own listen address so we can skip self-announces.
-        // Trackers routinely return the announcing client itself in the peer
-        // list. Connecting to ourselves creates two slot entries (outbound
-        // initiator + inbound accept) pointing at the same listen socket,
-        // with no possible data transfer but real state-machine cost — on
-        // larger tests the self-loop has been observed to correlate with
-        // the downloader-stall flake (windesk 20231be).
-        const self_address: ?std.net.Address = blk: {
-            const bind_str = self.bind_address orelse "0.0.0.0";
-            if (std.net.Address.parseIp4(bind_str, self.port)) |a| break :blk a else |_| {}
-            if (std.net.Address.parseIp6(bind_str, self.port)) |a| break :blk a else |_| {}
-            break :blk null;
-        };
         for (owned_results.items) |result| {
             const tc = self.getTorrentContext(result.torrent_id) orelse continue;
             for (result.peers) |addr| {
                 if (self.peer_count >= self.max_connections) break;
 
                 // Skip self: the tracker echoes our own announce back.
-                if (self_address) |own| {
-                    if (addr_mod.addressEql(&own, &addr)) continue;
-                }
+                if (addr_mod.isSelfAnnounceEndpoint(self.bind_address, self.port, &addr)) continue;
 
                 // Deduplicate: skip addresses we already have a peer for.
                 // Tracker responses frequently include the announcing client
@@ -1939,6 +1924,54 @@ test "writeRequestMsg encodes max u32 values" {
     try std.testing.expectEqual(max, std.mem.readInt(u32, buf[5..9], .big));
     try std.testing.expectEqual(max, std.mem.readInt(u32, buf[9..13], .big));
     try std.testing.expectEqual(max, std.mem.readInt(u32, buf[13..17], .big));
+}
+
+test "checkReannounce skips loopback self peer when bound to wildcard" {
+    var el = try EventLoop.initBare(std.testing.allocator, 0);
+    defer el.deinit();
+
+    const empty_fds = [_]posix.fd_t{};
+    const tid = try el.addTorrentContext(.{
+        .shared_fds = empty_fds[0..],
+        .info_hash = [_]u8{0xAA} ** 20,
+        .peer_id = [_]u8{0xBB} ** 20,
+    });
+
+    el.port = 6881;
+    el.bind_address = null;
+
+    const peers = try std.testing.allocator.alloc(std.net.Address, 1);
+    peers[0] = try std.net.Address.parseIp4("127.0.0.1", 6881);
+    try el.enqueueAnnounceResult(tid, peers);
+
+    checkReannounce(&el);
+
+    try std.testing.expectEqual(@as(usize, 0), el.peer_count);
+    try std.testing.expectEqual(@as(usize, 0), el.getTorrentContext(tid).?.peer_slots.items.len);
+}
+
+test "checkReannounce keeps loopback peer on a different port" {
+    var el = try EventLoop.initBare(std.testing.allocator, 0);
+    defer el.deinit();
+
+    const empty_fds = [_]posix.fd_t{};
+    const tid = try el.addTorrentContext(.{
+        .shared_fds = empty_fds[0..],
+        .info_hash = [_]u8{0xCC} ** 20,
+        .peer_id = [_]u8{0xDD} ** 20,
+    });
+
+    el.port = 6881;
+    el.bind_address = null;
+
+    const peers = try std.testing.allocator.alloc(std.net.Address, 1);
+    peers[0] = try std.net.Address.parseIp4("127.0.0.1", 6882);
+    try el.enqueueAnnounceResult(tid, peers);
+
+    checkReannounce(&el);
+
+    try std.testing.expectEqual(@as(usize, 1), el.peer_count);
+    try std.testing.expectEqual(@as(usize, 1), el.getTorrentContext(tid).?.peer_slots.items.len);
 }
 
 test "promoteNextPieceOrMarkIdle promotes next piece to current" {

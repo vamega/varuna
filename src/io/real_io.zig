@@ -904,6 +904,7 @@ fn errnoToError(e: linux.E) anyerror {
         .ALREADY => error.AlreadyCompleted,
         .ADDRINUSE => error.AddressInUse,
         .ADDRNOTAVAIL => error.AddressNotAvailable,
+        .AFNOSUPPORT => error.AddressFamilyNotSupported,
         .AGAIN => error.WouldBlock,
         .BADF => error.BadFileDescriptor,
         .INTR => error.Interrupted,

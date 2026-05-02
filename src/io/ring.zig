@@ -84,6 +84,7 @@ pub fn checkCqe(cqe: linux.io_uring_cqe) !void {
         .PIPE => return error.BrokenPipe,
         .CONNABORTED => return error.ConnectionAborted,
         .CANCELED => return error.OperationCanceled,
+        .AFNOSUPPORT => return error.AddressFamilyNotSupported,
         else => return posix.unexpectedErrno(e),
     }
 }
