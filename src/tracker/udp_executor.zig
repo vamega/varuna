@@ -3,9 +3,9 @@ const posix = std.posix;
 const linux = std.os.linux;
 const udp = @import("udp.zig");
 const dns_mod = @import("../io/dns.zig");
-const DnsResolver = dns_mod.DnsResolver;
-const DnsJob = @import("../io/dns_threadpool.zig").DnsJob;
+const ThreadpoolDnsJob = @import("../io/dns_threadpool.zig").DnsJob;
 const Random = @import("../runtime/random.zig").Random;
+const build_options = @import("build_options");
 
 const io_interface = @import("../io/io_interface.zig");
 const backend = @import("../io/backend.zig");
@@ -32,6 +32,11 @@ const log = std.log.scoped(.udp_tracker_executor);
 pub fn UdpTrackerExecutorOf(comptime IO: type) type {
     return struct {
         const Self = @This();
+        const use_custom_dns = build_options.dns_backend == .custom;
+        const CustomDnsResolver = dns_mod.dns_custom.resolver.DnsResolverOf(IO);
+        const DnsResolver = if (use_custom_dns) CustomDnsResolver else dns_mod.DnsResolver;
+        const DnsJob = if (use_custom_dns) CustomDnsResolver.ResolveJob else ThreadpoolDnsJob;
+        const RetiredDnsJobs = if (use_custom_dns) std.ArrayList(*DnsJob) else void;
 
         allocator: std.mem.Allocator,
         running: std.atomic.Value(bool) = std.atomic.Value(bool).init(true),
@@ -56,6 +61,7 @@ pub fn UdpTrackerExecutorOf(comptime IO: type) type {
         conn_cache: udp.ConnectionCache = .{},
 
         dns_resolver: DnsResolver,
+        retired_dns_jobs: RetiredDnsJobs,
 
         const max_response_size: usize = udp.max_response_size;
 
@@ -106,6 +112,18 @@ pub fn UdpTrackerExecutorOf(comptime IO: type) type {
             /// apply it; see `src/io/dns_threadpool.zig`). The slice
             /// lifetime must outlive the executor.
             bind_device: ?[]const u8 = null,
+            /// Custom-DNS-only resolver override used by deterministic tests.
+            /// Production callers leave this null to read `/etc/resolv.conf`.
+            dns_servers: ?[]const std.net.Address = null,
+            /// Custom-DNS-only deterministic transaction-id override for tests.
+            dns_test_txid_override: ?u16 = null,
+        };
+
+        const CustomDnsContext = struct {
+            allocator: std.mem.Allocator,
+            executor: ?*Self,
+            slot_idx: u16,
+            generation: u32,
         };
 
         const RequestSlot = struct {
@@ -114,6 +132,8 @@ pub fn UdpTrackerExecutorOf(comptime IO: type) type {
             job: Job = undefined,
             address: std.net.Address = undefined,
             dns_job: ?*DnsJob = null,
+            dns_ctx: ?*CustomDnsContext = null,
+            generation: u32 = 0,
 
             // Transaction IDs for connect and announce/scrape phases
             connect_txid: u32 = 0,
@@ -163,11 +183,18 @@ pub fn UdpTrackerExecutorOf(comptime IO: type) type {
             };
 
             fn reset(self: *RequestSlot) void {
-                if (self.dns_job) |job| {
-                    job.release();
+                if (comptime use_custom_dns) {
                     self.dns_job = null;
+                    self.dns_ctx = null;
+                } else {
+                    if (self.dns_job) |job| {
+                        job.release();
+                        self.dns_job = null;
+                    }
                 }
+                const next_generation = self.generation +% 1;
                 self.* = .{};
+                self.generation = next_generation;
             }
         };
 
@@ -177,8 +204,11 @@ pub fn UdpTrackerExecutorOf(comptime IO: type) type {
             const self = try allocator.create(Self);
             errdefer allocator.destroy(self);
 
-            const dns_event_fd = try posix.eventfd(0, linux.EFD.NONBLOCK | linux.EFD.CLOEXEC);
-            errdefer posix.close(dns_event_fd);
+            const dns_event_fd = if (use_custom_dns)
+                -1
+            else
+                try posix.eventfd(0, linux.EFD.NONBLOCK | linux.EFD.CLOEXEC);
+            errdefer if (dns_event_fd >= 0) posix.close(dns_event_fd);
 
             self.* = .{
                 .allocator = allocator,
@@ -187,7 +217,8 @@ pub fn UdpTrackerExecutorOf(comptime IO: type) type {
                 .dns_event_fd = dns_event_fd,
                 .pending_jobs = std.ArrayList(Job).empty,
                 .max_slots = config.max_slots,
-                .dns_resolver = try DnsResolver.init(allocator, .{ .bind_device = config.bind_device }),
+                .dns_resolver = try initDnsResolver(allocator, io, config),
+                .retired_dns_jobs = if (use_custom_dns) std.ArrayList(*DnsJob).empty else {},
                 .slots = undefined,
             };
             errdefer self.dns_resolver.deinit(allocator);
@@ -196,10 +227,22 @@ pub fn UdpTrackerExecutorOf(comptime IO: type) type {
             errdefer allocator.free(self.slots);
             for (self.slots) |*slot| slot.* = .{};
 
-            // Register DNS eventfd poll on the shared ring
-            self.submitDnsPoll();
+            // Register DNS eventfd poll for the threadpool-compatible facade.
+            // Custom DNS resolves through IO-backed callbacks directly.
+            if (!use_custom_dns) self.submitDnsPoll();
 
             return self;
+        }
+
+        fn initDnsResolver(allocator: std.mem.Allocator, io: *IO, config: Config) !DnsResolver {
+            if (comptime use_custom_dns) {
+                return DnsResolver.init(allocator, io, .{
+                    .servers = config.dns_servers,
+                    .bind_device = config.bind_device,
+                    .test_txid_override = config.dns_test_txid_override,
+                });
+            }
+            return DnsResolver.init(allocator, .{ .bind_device = config.bind_device });
         }
 
         pub fn destroy(self: *Self) void {
@@ -212,13 +255,16 @@ pub fn UdpTrackerExecutorOf(comptime IO: type) type {
                         slot.fd = -1;
                         self.io.closeSocket(fd);
                     }
+                    self.detachDnsJob(slot, true);
                     slot.reset();
                 }
             }
             self.allocator.free(self.slots);
 
-            posix.close(self.dns_event_fd);
+            if (self.dns_event_fd >= 0) posix.close(self.dns_event_fd);
             self.dns_resolver.deinit(self.allocator);
+            self.reapRetiredDnsJobs();
+            if (comptime use_custom_dns) self.retired_dns_jobs.deinit(self.allocator);
             self.pending_jobs.deinit(self.allocator);
             self.allocator.destroy(self);
         }
@@ -234,11 +280,13 @@ pub fn UdpTrackerExecutorOf(comptime IO: type) type {
         // ── Tick (called from event loop) ────────────────────────
 
         pub fn tick(self: *Self) void {
+            self.reapRetiredDnsJobs();
             self.drainJobQueue();
             self.checkTimeoutsAndRetransmit();
         }
 
         fn submitDnsPoll(self: *Self) void {
+            if (comptime use_custom_dns) return;
             self.io.poll(
                 .{ .fd = self.dns_event_fd, .events = linux.POLL.IN },
                 &self.dns_poll_completion,
@@ -393,30 +441,122 @@ pub fn UdpTrackerExecutorOf(comptime IO: type) type {
 
             // Resolve DNS (async)
             const host = job.hostSlice();
+            if (comptime use_custom_dns) {
+                self.startCustomDnsResolve(slot, slot_idx, host);
+            } else {
+                const result = self.dns_resolver.resolveAsync(
+                    host,
+                    job.port,
+                    self.dns_event_fd,
+                ) catch {
+                    self.completeSlot(slot_idx, .{ .err = error.DnsResolutionFailed });
+                    return;
+                };
+
+                switch (result) {
+                    .resolved => |addr| {
+                        slot.address = addr;
+                        self.startUdpRequest(slot, slot_idx);
+                    },
+                    .pending => |dns_job| {
+                        slot.dns_job = dns_job;
+                        slot.state = .dns_resolving;
+                    },
+                }
+            }
+        }
+
+        // ── DNS completion ───────────────────────────────────────
+
+        fn startCustomDnsResolve(self: *Self, slot: *RequestSlot, slot_idx: u16, host: []const u8) void {
+            const ctx = self.allocator.create(CustomDnsContext) catch {
+                self.completeSlot(slot_idx, .{ .err = error.OutOfMemory });
+                return;
+            };
+            ctx.* = .{
+                .allocator = self.allocator,
+                .executor = self,
+                .slot_idx = slot_idx,
+                .generation = slot.generation,
+            };
+
             const result = self.dns_resolver.resolveAsync(
                 host,
-                job.port,
-                self.dns_event_fd,
+                slot.job.port,
+                ctx,
+                customDnsComplete,
             ) catch {
+                self.allocator.destroy(ctx);
                 self.completeSlot(slot_idx, .{ .err = error.DnsResolutionFailed });
                 return;
             };
 
             switch (result) {
                 .resolved => |addr| {
+                    self.allocator.destroy(ctx);
                     slot.address = addr;
                     self.startUdpRequest(slot, slot_idx);
                 },
+                .nx_domain => {
+                    self.allocator.destroy(ctx);
+                    self.completeSlot(slot_idx, .{ .err = error.DnsResolutionFailed });
+                },
+                .failed => |err| {
+                    self.allocator.destroy(ctx);
+                    self.completeSlot(slot_idx, .{ .err = err });
+                },
                 .pending => |dns_job| {
                     slot.dns_job = dns_job;
+                    slot.dns_ctx = ctx;
                     slot.state = .dns_resolving;
                 },
             }
         }
 
-        // ── DNS completion ───────────────────────────────────────
+        fn customDnsComplete(
+            userdata: ?*anyopaque,
+            dns_job: *DnsJob,
+            result: dns_mod.dns_custom.resolver.ResolveResult,
+        ) void {
+            const ctx: *CustomDnsContext = @ptrCast(@alignCast(userdata.?));
+            const maybe_self = ctx.executor;
+            if (maybe_self == null) {
+                // Executor teardown can abandon in-flight DNS. Full query
+                // cancellation is still a custom-DNS follow-up; leaking the
+                // completed job is safer than freeing query-owned completions
+                // while an IO backend may still deliver cancel CQEs.
+                ctx.allocator.destroy(ctx);
+                return;
+            }
+
+            const self = maybe_self.?;
+            defer self.allocator.destroy(ctx);
+            defer self.retireCompletedDnsJob(dns_job);
+
+            if (ctx.slot_idx >= self.slots.len) return;
+            const slot = &self.slots[ctx.slot_idx];
+            if (slot.state != .dns_resolving or
+                slot.generation != ctx.generation or
+                slot.dns_job != dns_job)
+            {
+                return;
+            }
+
+            slot.dns_job = null;
+            slot.dns_ctx = null;
+
+            switch (result) {
+                .resolved => |addr| {
+                    slot.address = addr;
+                    self.startUdpRequest(slot, ctx.slot_idx);
+                },
+                .nx_domain => self.completeSlot(ctx.slot_idx, .{ .err = error.DnsResolutionFailed }),
+                .failed => |err| self.completeSlot(ctx.slot_idx, .{ .err = err }),
+            }
+        }
 
         fn processDnsCompletions(self: *Self) void {
+            if (comptime use_custom_dns) return;
             for (self.slots, 0..) |*slot, i| {
                 if (slot.state != .dns_resolving) continue;
                 const dns_job = slot.dns_job orelse continue;
@@ -440,6 +580,40 @@ pub fn UdpTrackerExecutorOf(comptime IO: type) type {
                 } else {
                     self.completeSlot(@intCast(i), .{ .err = error.DnsResolutionFailed });
                 }
+            }
+        }
+
+        fn detachDnsJob(self: *Self, slot: *RequestSlot, destroying_executor: bool) void {
+            if (comptime use_custom_dns) {
+                if (slot.dns_ctx) |ctx| {
+                    if (destroying_executor) ctx.executor = null;
+                    slot.dns_ctx = null;
+                }
+                slot.dns_job = null;
+            } else {
+                if (slot.dns_job) |dns_job| {
+                    dns_job.release();
+                    slot.dns_job = null;
+                }
+            }
+            _ = self;
+        }
+
+        fn retireCompletedDnsJob(self: *Self, dns_job: *DnsJob) void {
+            if (comptime use_custom_dns) {
+                self.retired_dns_jobs.append(self.allocator, dns_job) catch {
+                    std.log.scoped(.udp_tracker_executor).warn(
+                        "custom DNS retired-job queue OOM; leaking completed DNS job",
+                        .{},
+                    );
+                };
+            } else {}
+        }
+
+        fn reapRetiredDnsJobs(self: *Self) void {
+            if (comptime use_custom_dns) {
+                for (self.retired_dns_jobs.items) |dns_job| dns_job.destroy();
+                self.retired_dns_jobs.clearRetainingCapacity();
             }
         }
 
@@ -794,10 +968,13 @@ pub fn UdpTrackerExecutorOf(comptime IO: type) type {
             slot.completed = true;
             slot.closing = true;
 
-            if (slot.dns_job) |dns_job| {
-                dns_job.release();
-                slot.dns_job = null;
+            if (comptime !use_custom_dns) {
+                if (slot.dns_job) |dns_job| {
+                    dns_job.release();
+                    slot.dns_job = null;
+                }
             }
+            self.detachDnsJob(slot, false);
             if (slot.fd >= 0) {
                 const fd = slot.fd;
                 slot.fd = -1;
@@ -849,9 +1026,14 @@ test "UdpTrackerExecutor uses independent send and recv completions" {
         .pending_jobs = .empty,
         .slots = slots[0..],
         .max_slots = 1,
-        .dns_resolver = try DnsResolver.init(allocator, .{}),
+        .dns_resolver = try Executor.initDnsResolver(allocator, &io, .{}),
+        .retired_dns_jobs = if (Executor.use_custom_dns) std.ArrayList(*Executor.DnsJob).empty else {},
     };
-    defer executor.dns_resolver.deinit(allocator);
+    defer {
+        executor.dns_resolver.deinit(allocator);
+        executor.reapRetiredDnsJobs();
+        if (Executor.use_custom_dns) executor.retired_dns_jobs.deinit(allocator);
+    }
 
     const Ctx = struct {
         completed: bool = false,

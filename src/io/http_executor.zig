@@ -3,8 +3,7 @@ const posix = std.posix;
 const linux = std.os.linux;
 const ring_mod = @import("ring.zig");
 const dns_mod = @import("dns.zig");
-const DnsResolver = dns_mod.DnsResolver;
-const DnsJob = @import("../io/dns_threadpool.zig").DnsJob;
+const ThreadpoolDnsJob = @import("../io/dns_threadpool.zig").DnsJob;
 const http = @import("http_parse.zig");
 const TlsStream = @import("tls.zig").TlsStream;
 const build_options = @import("build_options");
@@ -35,6 +34,11 @@ const log = std.log.scoped(.http_executor);
 pub fn HttpExecutorOf(comptime IO: type) type {
     return struct {
         const Self = @This();
+        const use_custom_dns = build_options.dns_backend == .custom;
+        const CustomDnsResolver = dns_mod.dns_custom.resolver.DnsResolverOf(IO);
+        const DnsResolver = if (use_custom_dns) CustomDnsResolver else dns_mod.DnsResolver;
+        const DnsJob = if (use_custom_dns) CustomDnsResolver.ResolveJob else ThreadpoolDnsJob;
+        const RetiredDnsJobs = if (use_custom_dns) std.ArrayList(*DnsJob) else void;
 
         allocator: std.mem.Allocator,
         running: std.atomic.Value(bool) = std.atomic.Value(bool).init(true),
@@ -61,6 +65,7 @@ pub fn HttpExecutorOf(comptime IO: type) type {
         max_per_host: u16,
 
         dns_resolver: DnsResolver,
+        retired_dns_jobs: RetiredDnsJobs,
         pool: ConnectionPool = .{},
 
         // Periodic timeout tracking.
@@ -146,6 +151,18 @@ pub fn HttpExecutorOf(comptime IO: type) type {
             /// apply it; see `src/io/dns_threadpool.zig`). The slice
             /// lifetime must outlive the executor.
             bind_device: ?[]const u8 = null,
+            /// Custom-DNS-only resolver override used by deterministic tests.
+            /// Production callers leave this null to read `/etc/resolv.conf`.
+            dns_servers: ?[]const std.net.Address = null,
+            /// Custom-DNS-only deterministic transaction-id override for tests.
+            dns_test_txid_override: ?u16 = null,
+        };
+
+        const CustomDnsContext = struct {
+            allocator: std.mem.Allocator,
+            executor: ?*Self,
+            slot_idx: u16,
+            generation: u32,
         };
 
         const RequestSlot = struct {
@@ -155,6 +172,8 @@ pub fn HttpExecutorOf(comptime IO: type) type {
             parsed: http.ParsedUrl = undefined,
             address: std.net.Address = undefined,
             dns_job: ?*DnsJob = null,
+            dns_ctx: ?*CustomDnsContext = null,
+            generation: u32 = 0,
             tls_stream: ?TlsStream = null,
             send_buf: std.ArrayList(u8) = std.ArrayList(u8).empty,
             send_offset: usize = 0,
@@ -182,9 +201,14 @@ pub fn HttpExecutorOf(comptime IO: type) type {
             };
 
             fn reset(self: *RequestSlot, allocator: std.mem.Allocator) void {
-                if (self.dns_job) |job| {
-                    job.release();
+                if (comptime use_custom_dns) {
                     self.dns_job = null;
+                    self.dns_ctx = null;
+                } else {
+                    if (self.dns_job) |job| {
+                        job.release();
+                        self.dns_job = null;
+                    }
                 }
                 if (self.tls_stream) |*tls| {
                     tls.deinit();
@@ -197,6 +221,7 @@ pub fn HttpExecutorOf(comptime IO: type) type {
                 self.recv_buf = std.ArrayList(u8).empty;
                 self.fd = -1;
                 self.state = .free;
+                self.generation +%= 1;
                 self.pooled = false;
                 self.target_written = 0;
                 self.headers_done = false;
@@ -279,8 +304,11 @@ pub fn HttpExecutorOf(comptime IO: type) type {
             const self = try allocator.create(Self);
             errdefer allocator.destroy(self);
 
-            const dns_event_fd = try posix.eventfd(0, linux.EFD.NONBLOCK | linux.EFD.CLOEXEC);
-            errdefer posix.close(dns_event_fd);
+            const dns_event_fd = if (use_custom_dns)
+                -1
+            else
+                try posix.eventfd(0, linux.EFD.NONBLOCK | linux.EFD.CLOEXEC);
+            errdefer if (dns_event_fd >= 0) posix.close(dns_event_fd);
 
             self.* = .{
                 .allocator = allocator,
@@ -290,7 +318,8 @@ pub fn HttpExecutorOf(comptime IO: type) type {
                 .deferred_jobs = std.ArrayList(Job).empty,
                 .max_concurrent = config.max_concurrent,
                 .max_per_host = config.max_per_host,
-                .dns_resolver = try DnsResolver.init(allocator, .{ .bind_device = config.bind_device }),
+                .dns_resolver = try initDnsResolver(allocator, io, config),
+                .retired_dns_jobs = if (use_custom_dns) std.ArrayList(*DnsJob).empty else {},
                 .slots = undefined,
                 .free_slot_count = config.max_concurrent,
             };
@@ -300,10 +329,23 @@ pub fn HttpExecutorOf(comptime IO: type) type {
             errdefer allocator.free(self.slots);
             for (self.slots) |*slot| slot.* = .{};
 
-            // Register DNS eventfd poll on the io_interface ring.
-            self.submitDnsPoll();
+            // Register DNS eventfd poll on the io_interface ring for the
+            // threadpool-compatible public resolver facade. Custom DNS
+            // completions arrive directly through ResolveJob callbacks.
+            if (!use_custom_dns) self.submitDnsPoll();
 
             return self;
+        }
+
+        fn initDnsResolver(allocator: std.mem.Allocator, io: *IO, config: Config) !DnsResolver {
+            if (comptime use_custom_dns) {
+                return DnsResolver.init(allocator, io, .{
+                    .servers = config.dns_servers,
+                    .bind_device = config.bind_device,
+                    .test_txid_override = config.dns_test_txid_override,
+                });
+            }
+            return DnsResolver.init(allocator, .{ .bind_device = config.bind_device });
         }
 
         pub fn destroy(self: *Self) void {
@@ -313,6 +355,7 @@ pub fn HttpExecutorOf(comptime IO: type) type {
             for (self.slots) |*slot| {
                 if (slot.state != .free) {
                     if (slot.fd >= 0) posix.close(slot.fd);
+                    self.detachDnsJob(slot, true);
                     slot.reset(self.allocator);
                 }
             }
@@ -325,8 +368,10 @@ pub fn HttpExecutorOf(comptime IO: type) type {
             self.host_active.deinit(self.allocator);
 
             // Ring is shared, not owned
-            posix.close(self.dns_event_fd);
+            if (self.dns_event_fd >= 0) posix.close(self.dns_event_fd);
             self.dns_resolver.deinit(self.allocator);
+            self.reapRetiredDnsJobs();
+            if (comptime use_custom_dns) self.retired_dns_jobs.deinit(self.allocator);
             self.pending_jobs.deinit(self.allocator);
             self.deferred_jobs.deinit(self.allocator);
             self.allocator.destroy(self);
@@ -349,12 +394,14 @@ pub fn HttpExecutorOf(comptime IO: type) type {
         /// Called from the main event loop's tick(). DNS completions come via
         /// CQEs on the shared ring (dns_event_fd polled with POLL_ADD).
         pub fn tick(self: *Self) void {
+            self.reapRetiredDnsJobs();
             self.drainJobQueue();
             self.startDeferredJobs();
             self.checkTimeouts();
         }
 
         fn submitDnsPoll(self: *Self) void {
+            if (comptime use_custom_dns) return;
             self.io.poll(
                 .{ .fd = self.dns_event_fd, .events = linux.POLL.IN },
                 &self.dns_poll_completion,
@@ -449,24 +496,28 @@ pub fn HttpExecutorOf(comptime IO: type) type {
             }
 
             // Resolve DNS (async).
-            const result = self.dns_resolver.resolveAsync(
-                host,
-                slot.parsed.port,
-                self.dns_event_fd,
-            ) catch {
-                self.completeSlot(slot_idx, .{ .err = error.DnsResolutionFailed });
-                return true;
-            };
+            if (comptime use_custom_dns) {
+                self.startCustomDnsResolve(slot, slot_idx, host);
+            } else {
+                const result = self.dns_resolver.resolveAsync(
+                    host,
+                    slot.parsed.port,
+                    self.dns_event_fd,
+                ) catch {
+                    self.completeSlot(slot_idx, .{ .err = error.DnsResolutionFailed });
+                    return true;
+                };
 
-            switch (result) {
-                .resolved => |addr| {
-                    slot.address = addr;
-                    self.startConnect(slot, slot_idx);
-                },
-                .pending => |dns_job| {
-                    slot.dns_job = dns_job;
-                    slot.state = .dns_resolving;
-                },
+                switch (result) {
+                    .resolved => |addr| {
+                        slot.address = addr;
+                        self.startConnect(slot, slot_idx);
+                    },
+                    .pending => |dns_job| {
+                        slot.dns_job = dns_job;
+                        slot.state = .dns_resolving;
+                    },
+                }
             }
 
             return true;
@@ -474,7 +525,95 @@ pub fn HttpExecutorOf(comptime IO: type) type {
 
         // ── DNS completion ───────────────────────────────────────
 
+        fn startCustomDnsResolve(self: *Self, slot: *RequestSlot, slot_idx: u16, host: []const u8) void {
+            const ctx = self.allocator.create(CustomDnsContext) catch {
+                self.completeSlot(slot_idx, .{ .err = error.OutOfMemory });
+                return;
+            };
+            ctx.* = .{
+                .allocator = self.allocator,
+                .executor = self,
+                .slot_idx = slot_idx,
+                .generation = slot.generation,
+            };
+
+            const result = self.dns_resolver.resolveAsync(
+                host,
+                slot.parsed.port,
+                ctx,
+                customDnsComplete,
+            ) catch {
+                self.allocator.destroy(ctx);
+                self.completeSlot(slot_idx, .{ .err = error.DnsResolutionFailed });
+                return;
+            };
+
+            switch (result) {
+                .resolved => |addr| {
+                    self.allocator.destroy(ctx);
+                    slot.address = addr;
+                    self.startConnect(slot, slot_idx);
+                },
+                .nx_domain => {
+                    self.allocator.destroy(ctx);
+                    self.completeSlot(slot_idx, .{ .err = error.DnsResolutionFailed });
+                },
+                .failed => |err| {
+                    self.allocator.destroy(ctx);
+                    self.completeSlot(slot_idx, .{ .err = err });
+                },
+                .pending => |dns_job| {
+                    slot.dns_job = dns_job;
+                    slot.dns_ctx = ctx;
+                    slot.state = .dns_resolving;
+                },
+            }
+        }
+
+        fn customDnsComplete(
+            userdata: ?*anyopaque,
+            dns_job: *DnsJob,
+            result: dns_mod.dns_custom.resolver.ResolveResult,
+        ) void {
+            const ctx: *CustomDnsContext = @ptrCast(@alignCast(userdata.?));
+            const maybe_self = ctx.executor;
+            if (maybe_self == null) {
+                // Executor teardown can abandon in-flight DNS. Full query
+                // cancellation is still a custom-DNS follow-up; leaking the
+                // completed job is safer than freeing query-owned completions
+                // while an IO backend may still deliver cancel CQEs.
+                ctx.allocator.destroy(ctx);
+                return;
+            }
+
+            const self = maybe_self.?;
+            defer self.allocator.destroy(ctx);
+            defer self.retireCompletedDnsJob(dns_job);
+
+            if (ctx.slot_idx >= self.slots.len) return;
+            const slot = &self.slots[ctx.slot_idx];
+            if (slot.state != .dns_resolving or
+                slot.generation != ctx.generation or
+                slot.dns_job != dns_job)
+            {
+                return;
+            }
+
+            slot.dns_job = null;
+            slot.dns_ctx = null;
+
+            switch (result) {
+                .resolved => |addr| {
+                    slot.address = addr;
+                    self.startConnect(slot, ctx.slot_idx);
+                },
+                .nx_domain => self.completeSlot(ctx.slot_idx, .{ .err = error.DnsResolutionFailed }),
+                .failed => |err| self.completeSlot(ctx.slot_idx, .{ .err = err }),
+            }
+        }
+
         fn processDnsCompletions(self: *Self) void {
+            if (comptime use_custom_dns) return;
             for (self.slots, 0..) |*slot, i| {
                 if (slot.state != .dns_resolving) continue;
                 const dns_job = slot.dns_job orelse continue;
@@ -501,6 +640,40 @@ pub fn HttpExecutorOf(comptime IO: type) type {
                 } else {
                     self.completeSlot(@intCast(i), .{ .err = error.DnsResolutionFailed });
                 }
+            }
+        }
+
+        fn detachDnsJob(self: *Self, slot: *RequestSlot, destroying_executor: bool) void {
+            if (comptime use_custom_dns) {
+                if (slot.dns_ctx) |ctx| {
+                    if (destroying_executor) ctx.executor = null;
+                    slot.dns_ctx = null;
+                }
+                slot.dns_job = null;
+            } else {
+                if (slot.dns_job) |dns_job| {
+                    dns_job.release();
+                    slot.dns_job = null;
+                }
+            }
+            _ = self;
+        }
+
+        fn retireCompletedDnsJob(self: *Self, dns_job: *DnsJob) void {
+            if (comptime use_custom_dns) {
+                self.retired_dns_jobs.append(self.allocator, dns_job) catch {
+                    std.log.scoped(.http_executor).warn(
+                        "custom DNS retired-job queue OOM; leaking completed DNS job",
+                        .{},
+                    );
+                };
+            } else {}
+        }
+
+        fn reapRetiredDnsJobs(self: *Self) void {
+            if (comptime use_custom_dns) {
+                for (self.retired_dns_jobs.items) |dns_job| dns_job.destroy();
+                self.retired_dns_jobs.clearRetainingCapacity();
             }
         }
 
@@ -1053,6 +1226,7 @@ pub fn HttpExecutorOf(comptime IO: type) type {
             if (slot.fd >= 0) {
                 posix.close(slot.fd);
             }
+            self.detachDnsJob(slot, false);
             slot.reset(self.allocator);
 
             self.active_count -= 1;
@@ -1087,6 +1261,8 @@ pub fn HttpExecutorOf(comptime IO: type) type {
         // ── Tests ────────────────────────────────────────────────
 
         test "connect failure invalidates cached DNS entry" {
+            if (comptime use_custom_dns) return error.SkipZigTest;
+
             const allocator = std.testing.allocator;
             const host = "varuna-dns-fixes-regression.test";
 
@@ -1104,6 +1280,7 @@ pub fn HttpExecutorOf(comptime IO: type) type {
                 .max_concurrent = 1,
                 .max_per_host = 1,
                 .dns_resolver = try DnsResolver.init(allocator, .{}),
+                .retired_dns_jobs = {},
                 .deferred_jobs = std.ArrayList(Job).empty,
             };
             defer {

@@ -1542,13 +1542,10 @@ const DnsBackend = enum {
     /// generic over the IO contract so SimIO tests can drive scripted
     /// DNS responses deterministically.
     ///
-    /// **Phase F status:** the dispatch in `src/io/dns.zig` exposes a
-    /// transitional facade — the `init/deinit/cacheResult/invalidate/
-    /// clearAll/bind_device` cache surface and the standalone
-    /// `resolveOnce` helper run through the custom library; the
-    /// daemon's `HttpExecutor` / `UdpTrackerExecutor` `resolveAsync`
-    /// path retains threadpool semantics until the executor refactor
-    /// lands. See `progress-reports/2026-04-30-dns-phase-f.md`.
+    /// HTTP and UDP tracker executors instantiate
+    /// `DnsResolverOf(IO).resolveAsync()` directly when this backend is
+    /// selected. The legacy public `DnsResolver` facade remains available for
+    /// non-executor callers that still expect the threadpool-compatible shape.
     custom,
 };
 

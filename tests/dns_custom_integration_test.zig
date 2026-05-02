@@ -82,7 +82,9 @@ const ScriptedIo = struct {
         setsockopt,
         connect,
         send,
+        sendmsg,
         recv,
+        recvmsg,
         timeout,
         cancel,
         close_socket,
@@ -125,6 +127,14 @@ const ScriptedIo = struct {
             if (op == kind) return i;
         }
         return null;
+    }
+
+    fn operationCount(self: *const ScriptedIo, kind: OperationKind) usize {
+        var count: usize = 0;
+        for (self.operation_log.items) |op| {
+            if (op == kind) count += 1;
+        }
+        return count;
     }
 
     /// Push scripted bytes that the next `recv()` will consume. Test
@@ -252,6 +262,30 @@ const ScriptedIo = struct {
         try self.pending.append(self.allocator, .{
             .completion = c,
             .result = .{ .recv = want },
+        });
+    }
+
+    pub fn sendmsg(self: *ScriptedIo, op: ifc.SendmsgOp, c: *Completion, ud: ?*anyopaque, cb: Callback) !void {
+        try self.record(.sendmsg);
+        c.userdata = ud;
+        c.callback = cb;
+
+        var sent: usize = 0;
+        for (op.msg.iov[0..op.msg.iovlen]) |iov| sent += iov.len;
+        try self.pending.append(self.allocator, .{
+            .completion = c,
+            .result = .{ .sendmsg = sent },
+        });
+    }
+
+    pub fn recvmsg(self: *ScriptedIo, op: ifc.RecvmsgOp, c: *Completion, ud: ?*anyopaque, cb: Callback) !void {
+        _ = op;
+        try self.record(.recvmsg);
+        c.userdata = ud;
+        c.callback = cb;
+        try self.pending.append(self.allocator, .{
+            .completion = c,
+            .result = .{ .recvmsg = error.ConnectionResetByPeer },
         });
     }
 
@@ -611,6 +645,113 @@ test "DnsResolverOf.resolveAsync: A query resolves and caches answer" {
         .resolved => |addr| try testing.expectEqual(@as(u16, 9090), addr.getPort()),
         else => return error.UnexpectedNonResolved,
     }
+}
+
+test "HttpExecutorOf custom DNS consumes resolver callback path" {
+    if (comptime dns.backend_tag != .custom) return error.SkipZigTest;
+
+    var io = ScriptedIo.init(testing.allocator);
+    defer io.deinit();
+
+    const host = "http-executor.varuna.local";
+    const expected_v4 = [4]u8{ 198, 51, 100, 55 };
+    const txid: u16 = 0x4854;
+    var resp_buf: [512]u8 = undefined;
+    const resp_len = try buildAResponse(&resp_buf, txid, host, expected_v4, 180);
+    try io.pushRecv(resp_buf[0..resp_len]);
+
+    const HttpExecutor = varuna.io.http_executor.HttpExecutorOf(ScriptedIo);
+    var executor = try HttpExecutor.create(testing.allocator, &io, .{
+        .max_concurrent = 1,
+        .max_per_host = 1,
+        .dns_servers = &.{std.net.Address.initIp4(.{ 9, 9, 9, 9 }, 53)},
+        .dns_test_txid_override = txid,
+    });
+    defer executor.destroy();
+
+    const CallbackState = struct {
+        called: bool = false,
+        err: ?anyerror = null,
+
+        fn complete(ctx: *anyopaque, result: HttpExecutor.RequestResult) void {
+            const self: *@This() = @ptrCast(@alignCast(ctx));
+            self.called = true;
+            self.err = result.err;
+        }
+    };
+    var callback_state = CallbackState{};
+
+    var job = HttpExecutor.Job{
+        .context = &callback_state,
+        .on_complete = CallbackState.complete,
+    };
+    const url = "http://http-executor.varuna.local/announce";
+    @memcpy(job.url[0..url.len], url);
+    job.url_len = url.len;
+    @memcpy(job.host[0..host.len], host);
+    job.host_len = host.len;
+
+    try executor.submit(job);
+    executor.tick();
+    try io.tick(128);
+
+    try testing.expect(io.firstOperationIndex(.send) != null);
+    try testing.expect(io.firstOperationIndex(.recv) != null);
+    try testing.expectEqual(@as(usize, 0), io.operationCount(.sendmsg));
+    try testing.expectEqual(@as(usize, 2), io.operationCount(.socket));
+}
+
+test "UdpTrackerExecutorOf custom DNS consumes resolver callback path" {
+    if (comptime dns.backend_tag != .custom) return error.SkipZigTest;
+
+    var io = ScriptedIo.init(testing.allocator);
+    defer io.deinit();
+
+    const host = "udp-executor.varuna.local";
+    const expected_v4 = [4]u8{ 203, 0, 113, 88 };
+    const txid: u16 = 0x5544;
+    var resp_buf: [512]u8 = undefined;
+    const resp_len = try buildAResponse(&resp_buf, txid, host, expected_v4, 180);
+    try io.pushRecv(resp_buf[0..resp_len]);
+
+    const UdpExecutor = varuna.tracker.udp_executor.UdpTrackerExecutorOf(ScriptedIo);
+    var random = varuna.runtime.random.Random.simRandom(0x5544);
+    var executor = try UdpExecutor.create(testing.allocator, &io, &random, .{
+        .max_slots = 1,
+        .dns_servers = &.{std.net.Address.initIp4(.{ 1, 1, 1, 1 }, 53)},
+        .dns_test_txid_override = txid,
+    });
+    defer executor.destroy();
+
+    const CallbackState = struct {
+        called: bool = false,
+        err: ?anyerror = null,
+
+        fn complete(ctx: *anyopaque, result: UdpExecutor.RequestResult) void {
+            const self: *@This() = @ptrCast(@alignCast(ctx));
+            self.called = true;
+            self.err = result.err;
+        }
+    };
+    var callback_state = CallbackState{};
+
+    var job = UdpExecutor.Job{
+        .context = &callback_state,
+        .on_complete = CallbackState.complete,
+        .port = 6969,
+    };
+    @memcpy(job.host[0..host.len], host);
+    job.host_len = host.len;
+
+    try executor.submit(job);
+    executor.tick();
+    try io.tick(128);
+
+    try testing.expect(io.firstOperationIndex(.send) != null);
+    try testing.expect(io.firstOperationIndex(.recv) != null);
+    try testing.expect(io.firstOperationIndex(.sendmsg) != null);
+    try testing.expect(io.firstOperationIndex(.recvmsg) != null);
+    try testing.expectEqual(@as(usize, 2), io.operationCount(.socket));
 }
 
 test "QueryOf(ScriptedIo): wrong-txid response is dropped (re-arms recv)" {

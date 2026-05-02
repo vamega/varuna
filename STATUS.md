@@ -318,7 +318,7 @@ See `progress-reports/2026-04-25-stage2-event-loop-migration.md` for the Stage 2
 
 ## Known Issues
 
-- **`bind_device` is silently bypassed by the threadpool DNS backend (the build default).** `network.bind_device = "wg0"` is correctly applied to peer connections (TCP listen + connect), uTP / DHT UDP listener, RPC server accept, HTTP tracker client, and UDP tracker client — but DNS queries via the default `-Ddns=threadpool` backend leak out the default route. `getaddrinfo` owns its own UDP socket internally and offers no hook for the application to apply `SO_BINDTODEVICE`. Workaround: build with `-Ddns=c_ares`, which registers an `ares_set_socket_callback` on the c-ares channel that calls `applyBindDevice` for every UDP/TCP socket the channel opens — closes the gap fully on that backend. The plumbing is now an explicit `bind_device` field on `dns.Config`, threaded from `cfg.network.bind_device` through `SessionManager.bind_device` → `HttpExecutor.Config.bind_device` / `UdpTrackerExecutor.Config.bind_device` → `DnsResolver.init`. The custom resolver library now has an IO-contract `DnsResolverOf(IO).resolveAsync()` path that owns DNS UDP sockets and applies `SO_BINDTODEVICE` through `io.setsockopt` before DNS connect/send, but the daemon's HTTP and UDP tracker executors are not yet wired to that path. Full fix is the executor refactor tracked in `docs/custom-dns-design-round2.md` §1. (Updated 2026-05-01)
+- **`bind_device` is silently bypassed by the threadpool DNS backend (the build default).** `network.bind_device = "wg0"` is correctly applied to peer connections (TCP listen + connect), uTP / DHT UDP listener, RPC server accept, HTTP tracker client, and UDP tracker client — but DNS queries via the default `-Ddns=threadpool` backend leak out the default route. `getaddrinfo` owns its own UDP socket internally and offers no hook for the application to apply `SO_BINDTODEVICE`. Workaround: build with `-Ddns=c_ares`, which registers an `ares_set_socket_callback` on the c-ares channel that calls `applyBindDevice` for every UDP/TCP socket the channel opens, or build with `-Ddns=custom`, where `HttpExecutorOf(IO)` and `UdpTrackerExecutorOf(IO)` now use `DnsResolverOf(IO).resolveAsync()` and apply bind_device through `io.setsockopt` before DNS connect/send. The default threadpool leak remains tracked because it is still the build default. (Updated 2026-05-02)
 - The packaged Ubuntu `opentracker` build requires explicit info-hash whitelisting (`--whitelist-hash`).
 - On WSL2, `perf stat`/`perf record` require kernel-matched `linux-tools` package; many hardware counters report `<not supported>`.
 - `zig build test-torrent-session` intermittently hits Zig cache/toolchain failures (`manifest_create Unexpected`).
@@ -821,10 +821,11 @@ production path (`progress-reports/2026-05-01-custom-dns-resolver-slice.md`):
   sequenced before DNS connect and that resolver-level A lookup resolves and
   caches through the custom path.
 
-The daemon-facing `src/io/dns.zig` `-Ddns=custom` facade is still transitional:
-HTTP tracker, HTTPS tracker/web-seed, and UDP tracker executors continue to use
-the threadpool-compatible public `DnsResolver` shape until they are refactored
-from eventfd DNS jobs to the custom callback API.
+The daemon-facing `src/io/dns.zig` `-Ddns=custom` facade still leaves the legacy
+public `DnsResolver` alias on the threadpool implementation for non-executor
+callers, but HTTP tracker, HTTPS tracker/web-seed, and UDP tracker executors now
+instantiate `DnsResolverOf(IO)` directly and consume the custom resolver callback
+API instead of eventfd DNS jobs.
 
 Verification under Zig 0.15.2 via Nix: `zig build test-dns-custom --summary
 failures`, `zig build test-dns-custom -Ddns=custom --summary failures`,
