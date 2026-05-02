@@ -336,19 +336,25 @@ test "uTP sender resumes window-limited byte stream after ACK" {
 
     try utp_handler.utpSendData(&el, peer_slot, &payload);
     const seq_after_first_send = sock.seq_nr;
-    try std.testing.expect(sock.bytesInFlight() < payload.len);
+    const bytes_in_flight = sock.bytesInFlight();
+    try std.testing.expect(bytes_in_flight > 0);
+    try std.testing.expect(bytes_in_flight < payload.len);
 
+    // `utpSendData` uses the handler's wall-clock uTP timestamp. Keep the
+    // synthetic ACK on that same clock so RTT sampling sees a small positive
+    // delta instead of a wrapped timestamp.
+    const ack_now = sock.last_send_time_us +% 1_000;
     const ack = (Header{
         .packet_type = .st_state,
         .extension = .none,
         .connection_id = sock.recv_id,
-        .timestamp_us = 1_003_000,
+        .timestamp_us = ack_now -% 500,
         .timestamp_diff_us = 1_000,
         .wnd_size = utp.default_recv_window,
         .seq_nr = 1,
         .ack_nr = seq_after_first_send -% 1,
     }).encode();
-    _ = mgr.processPacket(&ack, remote, 1_004_000);
+    _ = mgr.processPacket(&ack, remote, ack_now);
 
     try utp_handler.utpSendData(&el, peer_slot, &.{});
 
