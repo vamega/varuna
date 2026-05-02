@@ -20,9 +20,11 @@ PAYLOAD_BYTES="${PAYLOAD_BYTES:-}"
 TIMEOUT="${TIMEOUT:-60}"
 SKIP_BUILD="${SKIP_BUILD:-0}"
 ZIG_BUILD_EXTRA_ARGS="${ZIG_BUILD_EXTRA_ARGS:-}"
+VARUNA_STRACE_DIR="${VARUNA_STRACE_DIR:-}"
 TRACKER_PID=""
 SEED_DAEMON_PID=""
 DOWNLOAD_DAEMON_PID=""
+LAUNCHED_PID=""
 
 VARUNA="$ROOT_DIR/zig-out/bin/varuna"
 VARUNA_TOOLS="$ROOT_DIR/zig-out/bin/varuna-tools"
@@ -87,6 +89,55 @@ api_get_progress() {
     | sed 's/.*"progress":\([0-9.]*\).*/\1/'
 }
 
+auto_piece_length() {
+  local total_size="$1"
+  local target_pieces=1500
+  local ideal=$((total_size / target_pieces))
+  local piece_length=$((16 * 1024))
+  local max_piece_length=$((16 * 1024 * 1024))
+
+  if [[ "$total_size" -eq 0 ]]; then
+    echo $((256 * 1024))
+    return
+  fi
+
+  while [[ "$piece_length" -lt "$max_piece_length" && "$piece_length" -lt "$ideal" ]]; do
+    piece_length=$((piece_length * 2))
+  done
+  echo "$piece_length"
+}
+
+write_piece_markers() {
+  local payload_path="$1"
+  local payload_bytes="$2"
+  local piece_length
+  piece_length="$(auto_piece_length "$payload_bytes")"
+
+  local offset=0
+  while [[ "$offset" -lt "$payload_bytes" ]]; do
+    printf '\001' | dd of="$payload_path" bs=1 seek="$offset" conv=notrunc status=none
+    offset=$((offset + piece_length))
+  done
+}
+
+launch_varuna_daemon() {
+  local label="$1"
+  local daemon_dir="$2"
+  local daemon_log="$3"
+
+  if [[ -n "$VARUNA_STRACE_DIR" ]]; then
+    local trace_dir
+    mkdir -p "$VARUNA_STRACE_DIR"
+    trace_dir="$(cd "$VARUNA_STRACE_DIR" && pwd)"
+    (cd "$daemon_dir" && exec strace -f -qq -yy \
+      -e trace=io_uring_setup,io_uring_enter,io_uring_register,epoll_pwait,read,write,pread64,pwrite64,recvfrom,sendto,recvmsg,sendmsg,connect,accept4,futex \
+      -o "$trace_dir/${label}.trace" "$VARUNA") >"$daemon_log" 2>&1 &
+  else
+    (cd "$daemon_dir" && exec "$VARUNA") >"$daemon_log" 2>&1 &
+  fi
+  LAUNCHED_PID="$!"
+}
+
 mkdir -p "$WORK_DIR/seed-root" "$WORK_DIR/download-root"
 PAYLOAD_PATH="$WORK_DIR/seed-root/fixture.bin"
 TORRENT_PATH="$WORK_DIR/fixture.torrent"
@@ -100,6 +151,7 @@ if [[ -n "$PAYLOAD_BYTES" ]]; then
     exit 1
   fi
   dd if=/dev/zero of="$PAYLOAD_PATH" bs=1 count=0 seek="$PAYLOAD_BYTES" status=none
+  write_piece_markers "$PAYLOAD_PATH" "$PAYLOAD_BYTES"
 else
   printf 'hello from varuna swarm demo\n' >"$PAYLOAD_PATH"
 fi
@@ -189,8 +241,8 @@ enable_utp = true
 EOF
 
 # ── Start seeder daemon ─────────────────────────────────
-(cd "$WORK_DIR/seed-daemon" && exec "$VARUNA") >"$SEED_LOG" 2>&1 &
-SEED_DAEMON_PID="$!"
+launch_varuna_daemon seed "$WORK_DIR/seed-daemon" "$SEED_LOG"
+SEED_DAEMON_PID="$LAUNCHED_PID"
 wait_for_tcp 127.0.0.1 "$SEED_API_PORT"
 
 # Add the torrent to the seeder
@@ -208,8 +260,8 @@ curl -s -b "SID=${SEED_SID}" \
 sleep 2
 
 # ── Start downloader daemon ─────────────────────────────
-(cd "$WORK_DIR/download-daemon" && exec "$VARUNA") >"$DOWNLOAD_LOG" 2>&1 &
-DOWNLOAD_DAEMON_PID="$!"
+launch_varuna_daemon download "$WORK_DIR/download-daemon" "$DOWNLOAD_LOG"
+DOWNLOAD_DAEMON_PID="$LAUNCHED_PID"
 wait_for_tcp 127.0.0.1 "$DOWNLOAD_API_PORT"
 
 # Add the torrent to the downloader
