@@ -42,6 +42,7 @@ pub fn HttpExecutorOf(comptime IO: type) type {
 
         allocator: std.mem.Allocator,
         running: std.atomic.Value(bool) = std.atomic.Value(bool).init(true),
+        destroying: bool = false,
 
         io: *IO,
         dns_event_fd: posix.fd_t,
@@ -66,6 +67,8 @@ pub fn HttpExecutorOf(comptime IO: type) type {
 
         dns_resolver: DnsResolver,
         retired_dns_jobs: RetiredDnsJobs,
+        custom_dns_pending: usize = 0,
+        custom_destroy_completion: io_interface.Completion = .{},
         pool: ConnectionPool = .{},
 
         // Periodic timeout tracking.
@@ -350,6 +353,18 @@ pub fn HttpExecutorOf(comptime IO: type) type {
 
         pub fn destroy(self: *Self) void {
             self.running.store(false, .release);
+            if (comptime use_custom_dns) {
+                self.destroying = true;
+                if (self.custom_dns_pending > 0) {
+                    return;
+                }
+            }
+
+            self.finishDestroy();
+        }
+
+        fn finishDestroy(self: *Self) void {
+            std.debug.assert(!use_custom_dns or self.custom_dns_pending == 0);
 
             // Clean up in-flight slots.
             for (self.slots) |*slot| {
@@ -375,6 +390,30 @@ pub fn HttpExecutorOf(comptime IO: type) type {
             self.pending_jobs.deinit(self.allocator);
             self.deferred_jobs.deinit(self.allocator);
             self.allocator.destroy(self);
+        }
+
+        fn scheduleCustomDestroyReap(self: *Self) void {
+            if (comptime !use_custom_dns) return;
+            self.io.timeout(
+                .{ .ns = 0 },
+                &self.custom_destroy_completion,
+                self,
+                customDestroyReapComplete,
+            ) catch {
+                self.reapRetiredDnsJobs();
+                self.finishDestroy();
+            };
+        }
+
+        fn customDestroyReapComplete(
+            userdata: ?*anyopaque,
+            _: *io_interface.Completion,
+            _: io_interface.Result,
+        ) io_interface.CallbackAction {
+            const self: *Self = @ptrCast(@alignCast(userdata.?));
+            self.reapRetiredDnsJobs();
+            self.finishDestroy();
+            return .disarm;
         }
 
         /// Submit an HTTP(S) GET request. Thread-safe.
@@ -563,6 +602,7 @@ pub fn HttpExecutorOf(comptime IO: type) type {
                     self.completeSlot(slot_idx, .{ .err = err });
                 },
                 .pending => |dns_job| {
+                    self.custom_dns_pending += 1;
                     slot.dns_job = dns_job;
                     slot.dns_ctx = ctx;
                     slot.state = .dns_resolving;
@@ -592,15 +632,26 @@ pub fn HttpExecutorOf(comptime IO: type) type {
 
             if (ctx.slot_idx >= self.slots.len) return;
             const slot = &self.slots[ctx.slot_idx];
+            if (self.custom_dns_pending > 0) self.custom_dns_pending -= 1;
             if (slot.state != .dns_resolving or
                 slot.generation != ctx.generation or
                 slot.dns_job != dns_job)
             {
+                if (self.destroying and self.custom_dns_pending == 0) {
+                    self.scheduleCustomDestroyReap();
+                }
                 return;
             }
 
             slot.dns_job = null;
             slot.dns_ctx = null;
+
+            if (self.destroying) {
+                if (self.custom_dns_pending == 0) {
+                    self.scheduleCustomDestroyReap();
+                }
+                return;
+            }
 
             switch (result) {
                 .resolved => |addr| {

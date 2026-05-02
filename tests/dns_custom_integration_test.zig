@@ -754,6 +754,102 @@ test "UdpTrackerExecutorOf custom DNS consumes resolver callback path" {
     try testing.expectEqual(@as(usize, 2), io.operationCount(.socket));
 }
 
+test "HttpExecutorOf custom DNS destroy while pending DNS is safe" {
+    if (comptime dns.backend_tag != .custom) return error.SkipZigTest;
+
+    var io = ScriptedIo.init(testing.allocator);
+    defer io.deinit();
+
+    const host = "http-destroy-pending.varuna.local";
+    const txid: u16 = 0x4844;
+    var resp_buf: [512]u8 = undefined;
+    const resp_len = try buildAResponse(&resp_buf, txid, host, .{ 198, 51, 100, 77 }, 180);
+    try io.pushRecv(resp_buf[0..resp_len]);
+
+    const HttpExecutor = varuna.io.http_executor.HttpExecutorOf(ScriptedIo);
+    var executor = try HttpExecutor.create(testing.allocator, &io, .{
+        .max_concurrent = 1,
+        .max_per_host = 1,
+        .dns_servers = &.{std.net.Address.initIp4(.{ 9, 9, 9, 9 }, 53)},
+        .dns_test_txid_override = txid,
+    });
+
+    const CallbackState = struct {
+        called: bool = false,
+
+        fn complete(ctx: *anyopaque, _: HttpExecutor.RequestResult) void {
+            const self: *@This() = @ptrCast(@alignCast(ctx));
+            self.called = true;
+        }
+    };
+    var callback_state = CallbackState{};
+
+    var job = HttpExecutor.Job{
+        .context = &callback_state,
+        .on_complete = CallbackState.complete,
+    };
+    const url = "http://http-destroy-pending.varuna.local/announce";
+    @memcpy(job.url[0..url.len], url);
+    job.url_len = url.len;
+    @memcpy(job.host[0..host.len], host);
+    job.host_len = host.len;
+
+    try executor.submit(job);
+    executor.tick();
+    executor.destroy();
+
+    try io.tick(128);
+    try io.fireTimers(128);
+    try testing.expect(!callback_state.called);
+}
+
+test "UdpTrackerExecutorOf custom DNS destroy while pending DNS is safe" {
+    if (comptime dns.backend_tag != .custom) return error.SkipZigTest;
+
+    var io = ScriptedIo.init(testing.allocator);
+    defer io.deinit();
+
+    const host = "udp-destroy-pending.varuna.local";
+    const txid: u16 = 0x5545;
+    var resp_buf: [512]u8 = undefined;
+    const resp_len = try buildAResponse(&resp_buf, txid, host, .{ 203, 0, 113, 99 }, 180);
+    try io.pushRecv(resp_buf[0..resp_len]);
+
+    const UdpExecutor = varuna.tracker.udp_executor.UdpTrackerExecutorOf(ScriptedIo);
+    var random = varuna.runtime.random.Random.simRandom(0x5545);
+    var executor = try UdpExecutor.create(testing.allocator, &io, &random, .{
+        .max_slots = 1,
+        .dns_servers = &.{std.net.Address.initIp4(.{ 1, 1, 1, 1 }, 53)},
+        .dns_test_txid_override = txid,
+    });
+
+    const CallbackState = struct {
+        called: bool = false,
+
+        fn complete(ctx: *anyopaque, _: UdpExecutor.RequestResult) void {
+            const self: *@This() = @ptrCast(@alignCast(ctx));
+            self.called = true;
+        }
+    };
+    var callback_state = CallbackState{};
+
+    var job = UdpExecutor.Job{
+        .context = &callback_state,
+        .on_complete = CallbackState.complete,
+        .port = 6969,
+    };
+    @memcpy(job.host[0..host.len], host);
+    job.host_len = host.len;
+
+    try executor.submit(job);
+    executor.tick();
+    executor.destroy();
+
+    try io.tick(128);
+    try io.fireTimers(128);
+    try testing.expect(!callback_state.called);
+}
+
 test "QueryOf(ScriptedIo): wrong-txid response is dropped (re-arms recv)" {
     // Off-path attacker scenario: a response with a txid that
     // doesn't match the query's is silently dropped and recv is

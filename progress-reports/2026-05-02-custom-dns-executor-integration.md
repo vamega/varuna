@@ -15,12 +15,15 @@ resolver when built with `-Ddns=custom`.
   do not resume a recycled slot.
 - Completed custom DNS jobs are retired and destroyed on the next executor
   tick/destroy. If an executor is destroyed while a DNS query is still in
-  flight, the context detaches from the executor; full IO cancellation remains a
-  follow-up because query-owned cancel completions can still fire after
-  delivery.
+  flight, final executor destruction is now deferred until the custom resolver
+  callback fires and the scripted timer/cancel completions have a chance to
+  drain. This keeps the resolver storage alive for `ResolveJob.onQueryComplete`
+  instead of leaving the job with a dangling `resolver` pointer.
 - Added deterministic executor-level tests that prove HTTP and UDP tracker
   executors consume the custom resolver callback path with scripted DNS instead
   of relying on the threadpool/eventfd path.
+- Added destroy-while-DNS-pending regression coverage for both HTTP and UDP
+  tracker executors.
 
 ## What was learned
 
@@ -33,13 +36,14 @@ use `DnsResolverOf(IO)` directly.
 `ResolveJob.destroy()` is still safest after the event loop has had a chance to
 drain cancel completions submitted by completed `QueryOf(IO)` jobs. The executor
 therefore retires completed custom DNS jobs instead of destroying them inline in
-the callback.
+the callback. For executor teardown, the executor itself must also remain alive
+until the DNS callback because the job stores a pointer to the resolver.
 
 ## Remaining issues / follow-up
 
 - Implement true custom DNS query cancellation for abandoned executor slots so
-  teardown can actively cancel in-flight resolver IO instead of detaching the
-  callback context.
+  teardown can actively cancel in-flight resolver IO instead of waiting for the
+  pending DNS job to complete before final executor destruction.
 - The legacy public `dns.DnsResolver` alias still uses the threadpool facade in
   `-Ddns=custom`; current daemon HTTP/UDP tracker executors bypass it, but other
   future daemon DNS users should either use `DnsResolverOf(IO)` or get an
@@ -77,13 +81,19 @@ c-ares probes attempted:
 - `src/io/http_executor.zig:528` - HTTP custom DNS `resolveAsync()` adapter.
 - `src/io/http_executor.zig:573` - HTTP custom DNS callback and slot-generation
   guard.
+- `src/io/http_executor.zig:351` - HTTP deferred custom-DNS destroy path.
 - `src/tracker/udp_executor.zig:35` - UDP tracker custom-vs-facade DNS type
   selection.
 - `src/tracker/udp_executor.zig:237` - UDP custom resolver initialization.
 - `src/tracker/udp_executor.zig:471` - UDP custom DNS `resolveAsync()` adapter.
 - `src/tracker/udp_executor.zig:516` - UDP custom DNS callback and
   slot-generation guard.
+- `src/tracker/udp_executor.zig:248` - UDP deferred custom-DNS destroy path.
 - `tests/dns_custom_integration_test.zig:650` - HTTP executor custom DNS
   regression test.
 - `tests/dns_custom_integration_test.zig:704` - UDP tracker executor custom DNS
+  regression test.
+- `tests/dns_custom_integration_test.zig:757` - HTTP destroy-while-DNS-pending
+  regression test.
+- `tests/dns_custom_integration_test.zig:804` - UDP destroy-while-DNS-pending
   regression test.
