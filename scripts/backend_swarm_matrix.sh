@@ -60,6 +60,7 @@ if [[ -z "${BACKENDS// }" ]]; then
   echo "BACKENDS must include at least one backend" >&2
   exit 1
 fi
+BACKEND_COUNT="$(wc -w <<<"$BACKENDS" | tr -d ' ')"
 
 if [[ "$SWARM_MATRIX_MODE" == "perf" ]]; then
   printf "run\tbackend\tstatus\telapsed_seconds\ttransfer_seconds\tpayload_bytes\tthroughput_mib_s\twork_dir\tlog\n" >"$SUMMARY"
@@ -83,6 +84,17 @@ for run in $(seq 1 "$RUNS"); do
     download_port=$((tracker_port + 3))
     download_api_port=$((tracker_port + 4))
     run_log="$backend_dir/run.log"
+    backend_skip_build="${SKIP_BUILD:-0}"
+
+    # A single prebuilt daemon binary cannot represent multiple comptime IO
+    # backends. `zig build perf-swarm-backends` installs the default binary
+    # before invoking this script with SKIP_BUILD=1, so force per-backend
+    # rebuilds for multi-backend matrices to keep labels honest.
+    if [[ "$backend_skip_build" == "1" && "$BACKEND_COUNT" -gt 1 ]]; then
+      backend_skip_build=0
+      printf "matrix: overriding SKIP_BUILD=1 for backend %s in a %s-backend run\n" \
+        "$backend" "$BACKEND_COUNT" >"$run_log"
+    fi
 
     start_ns="$(date +%s%N)"
     status="pass"
@@ -96,9 +108,9 @@ for run in $(seq 1 "$RUNS"); do
         DOWNLOAD_API_PORT="$download_api_port" \
         PAYLOAD_BYTES="$PAYLOAD_BYTES" \
         TIMEOUT="$TIMEOUT" \
-        SKIP_BUILD="${SKIP_BUILD:-0}" \
+        SKIP_BUILD="$backend_skip_build" \
         ZIG_BUILD_EXTRA_ARGS="${ZIG_BUILD_EXTRA_ARGS:-}" \
-        bash "$DEMO_SWARM_SCRIPT" >"$run_log" 2>&1; then
+        bash "$DEMO_SWARM_SCRIPT" >>"$run_log" 2>&1; then
       status="fail"
     fi
     end_ns="$(date +%s%N)"

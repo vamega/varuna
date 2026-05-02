@@ -66,6 +66,21 @@ run	backend	status	elapsed_seconds	transfer_seconds	payload_bytes	throughput_mib
 Interpret `throughput_mib_s` as `payload_bytes / transfer_seconds`, where `transfer_seconds` is measured by `demo_swarm.sh` from downloader add until completed progress is observed.
 Small payloads are dominated by startup and one-second polling granularity; use larger payloads and multiple `RUNS` for backend deltas that are close together.
 
+### Post-Stall Live Swarm Snapshot (2026-05-02)
+
+After fixing the sparse-payload false-complete artifact and tracker self-peer stall, a ReleaseFast live matrix with real marked payloads produced these local results:
+
+| Payload | Backend | Status | Transfer seconds | Throughput MiB/s | Notes |
+|---------|---------|--------|------------------|------------------|-------|
+| 256 MiB | `io_uring` | pass | 23.933 | 10.697 | Complete matrix run, `RUNS=1` |
+| 256 MiB | `epoll_posix` | pass | 18.886 | 13.555 | Complete matrix run, `RUNS=1` |
+| 256 MiB | `epoll_mmap` | pass | 28.273 | 9.055 | Complete matrix run, `RUNS=1` |
+| 1 GiB | `io_uring` | pass | 42.728 | 23.966 | Larger payload reduced startup/polling skew |
+| 1 GiB | `epoll_posix` | fail | N/A | N/A | Timed out after 480s at progress 0.0039 |
+| 1 GiB | `epoll_mmap` | fail | N/A | N/A | Timed out after 480s at progress 0.0586 |
+
+The 1 GiB readiness-backend failures reached MSE handshake and started from a valid empty downloader recheck, so the next bottleneck investigation should focus on large-transfer request/piece progress after handshake in the epoll-backed paths.
+
 ## Synthetic Workloads
 
 Use `varuna-perf` when you need deterministic allocator and cache comparisons without a real swarm or API client.
