@@ -422,7 +422,7 @@ pub fn ApiHandlerOf(comptime IO: type) type {
             }
 
             if (std.mem.eql(u8, action_name, "export")) {
-                return self.handleTorrentsExport(params);
+                return self.handleTorrentsExport(allocator, params);
             }
 
             if (std.mem.eql(u8, action_name, "addPeers") and std.mem.eql(u8, method, "POST")) {
@@ -2244,7 +2244,7 @@ pub fn ApiHandlerOf(comptime IO: type) type {
         }
 
         /// GET /api/v2/torrents/export -- export .torrent file bytes.
-        fn handleTorrentsExport(self: *const Self, params: []const u8) server.Response {
+        fn handleTorrentsExport(self: *const Self, allocator: std.mem.Allocator, params: []const u8) server.Response {
             const hash = extractParamMut(params, "hash") orelse
                 return .{ .status = 400, .body = "{\"error\":\"missing hash\"}" };
 
@@ -2258,7 +2258,9 @@ pub fn ApiHandlerOf(comptime IO: type) type {
                 return .{ .status = 409, .body = "{\"error\":\"no torrent file available (magnet link)\"}" };
             }
 
-            return .{ .body = session.torrent_bytes, .content_type = "application/x-bittorrent" };
+            const body = allocator.dupe(u8, session.torrent_bytes) catch
+                return .{ .status = 500, .body = "{\"error\":\"internal\"}" };
+            return .{ .body = body, .owned_body = body, .content_type = "application/x-bittorrent" };
         }
 
         /// POST /api/v2/torrents/addPeers -- manually add peers to a torrent.

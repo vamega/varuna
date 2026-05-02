@@ -19,6 +19,7 @@ const rpc_sync = varuna.rpc.sync;
 const scratch = varuna.rpc.scratch;
 const backend = varuna.io.backend;
 const SessionManager = varuna.daemon.session_manager.SessionManager;
+const TorrentSession = varuna.daemon.torrent_session.TorrentSession;
 const Random = varuna.runtime.Random;
 
 // ── 1. Algorithm tests ────────────────────────────────────
@@ -403,6 +404,169 @@ test "ApiHandler category and tag list responses stay in request arena when cach
         try std.testing.expectEqual(baseline_allocations, counting_parent.active_allocations);
         try std.testing.expectEqual(baseline_bytes, counting_parent.active_bytes);
     }
+}
+
+fn buildMetainfo(allocator: std.mem.Allocator, name: []const u8) ![]u8 {
+    var buf = std.ArrayList(u8).empty;
+    defer buf.deinit(allocator);
+
+    try buf.appendSlice(allocator, "d4:infod");
+    try buf.appendSlice(allocator, "6:lengthi1024e");
+    try buf.writer(allocator).print("4:name{d}:{s}", .{ name.len, name });
+    try buf.appendSlice(allocator, "12:piece lengthi1024e");
+    try buf.appendSlice(allocator, "6:pieces20:abcdefghijklmnopqrst");
+    try buf.appendSlice(allocator, "ee");
+
+    return buf.toOwnedSlice(allocator);
+}
+
+fn insertArenaProbeTorrent(
+    allocator: std.mem.Allocator,
+    sm: *SessionManager,
+    rng: *Random,
+    name: []const u8,
+) !struct {
+    hash: [40]u8,
+    metainfo: []u8,
+} {
+    const meta = try buildMetainfo(allocator, name);
+    defer allocator.free(meta);
+    const meta_copy = try allocator.dupe(u8, meta);
+    errdefer allocator.free(meta_copy);
+
+    const session = try allocator.create(TorrentSession);
+    errdefer allocator.destroy(session);
+    session.* = try TorrentSession.create(allocator, rng, meta, "/tmp/varuna-rpc-arena-test", null);
+    errdefer session.deinit();
+
+    const hash = session.info_hash_hex;
+    try sm.sessions.put(&session.info_hash_hex, session);
+    return .{ .hash = hash, .metainfo = meta_copy };
+}
+
+test "ApiHandler dynamic endpoint responses stay in request arena" {
+    var counting_parent: CountingAllocator = .{ .parent = std.testing.allocator };
+    const parent = counting_parent.allocator();
+
+    var sm = SessionManager.init(parent);
+    defer sm.deinit();
+
+    var rng = Random.simRandom(0xA4E6A);
+    const inserted = try insertArenaProbeTorrent(parent, &sm, &rng, "export.bin");
+    defer parent.free(inserted.metainfo);
+
+    var handler = rpc_handlers.ApiHandler{
+        .session_manager = &sm,
+        .sync_state = rpc_sync.SyncState.init(parent),
+        .peer_sync_state = rpc_sync.PeerSyncState.init(parent),
+    };
+    defer handler.sync_state.deinit();
+    defer handler.peer_sync_state.deinit();
+
+    const sid = handler.session_store.createSession(&rng);
+
+    var arena = try scratch.TieredArena.init(parent, rpc_server.request_arena_slab, rpc_server.request_arena_capacity);
+    defer arena.deinit();
+
+    const baseline_allocations = counting_parent.active_allocations;
+    const baseline_bytes = counting_parent.active_bytes;
+
+    const DynamicProbe = struct {
+        fn expectBodyInArena(
+            h: *rpc_handlers.ApiHandler,
+            a: *scratch.TieredArena,
+            method: []const u8,
+            path: []const u8,
+            body: []const u8,
+            cookie_sid: ?[]const u8,
+            expected_status: u16,
+            needle: []const u8,
+        ) !void {
+            a.reset();
+            const resp = h.handle(a.allocator(), .{
+                .method = method,
+                .path = path,
+                .body = body,
+                .cookie_sid = cookie_sid,
+            });
+            try std.testing.expectEqual(expected_status, resp.status);
+            try std.testing.expect(std.mem.indexOf(u8, resp.body, needle) != null);
+            try std.testing.expect(resp.owned_body != null);
+            try std.testing.expect(a.ownsSlice(resp.owned_body.?));
+        }
+
+        fn expectHeadersInArena(
+            h: *rpc_handlers.ApiHandler,
+            a: *scratch.TieredArena,
+            method: []const u8,
+            path: []const u8,
+            body: []const u8,
+            needle: []const u8,
+        ) !void {
+            a.reset();
+            const resp = h.handle(a.allocator(), .{
+                .method = method,
+                .path = path,
+                .body = body,
+            });
+            try std.testing.expectEqual(@as(u16, 200), resp.status);
+            try std.testing.expect(resp.owned_extra_headers != null);
+            try std.testing.expect(a.ownsSlice(resp.owned_extra_headers.?));
+            try std.testing.expect(resp.extra_headers != null);
+            try std.testing.expect(std.mem.indexOf(u8, resp.extra_headers.?, needle) != null);
+        }
+    };
+
+    try DynamicProbe.expectHeadersInArena(
+        &handler,
+        &arena,
+        "POST",
+        "/api/v2/auth/login",
+        "username=admin&password=adminadmin",
+        "Set-Cookie: SID=",
+    );
+
+    try DynamicProbe.expectBodyInArena(
+        &handler,
+        &arena,
+        "GET",
+        "/api/v2/app/preferences",
+        "",
+        &sid,
+        200,
+        "\"save_path\"",
+    );
+
+    try DynamicProbe.expectBodyInArena(
+        &handler,
+        &arena,
+        "GET",
+        "/api/v2/transfer/info",
+        "",
+        &sid,
+        200,
+        "\"connection_status\"",
+    );
+
+    {
+        arena.reset();
+        var path_buf: [128]u8 = undefined;
+        const path = try std.fmt.bufPrint(&path_buf, "/api/v2/torrents/export?hash={s}", .{inserted.hash});
+        const resp = handler.handle(arena.allocator(), .{
+            .method = "GET",
+            .path = path,
+            .cookie_sid = &sid,
+        });
+        try std.testing.expectEqual(@as(u16, 200), resp.status);
+        try std.testing.expectEqualStrings("application/x-bittorrent", resp.content_type);
+        try std.testing.expectEqualStrings(inserted.metainfo, resp.body);
+        try std.testing.expect(resp.owned_body != null);
+        try std.testing.expect(arena.ownsSlice(resp.owned_body.?));
+    }
+
+    arena.reset();
+    try std.testing.expectEqual(baseline_allocations, counting_parent.active_allocations);
+    try std.testing.expectEqual(baseline_bytes, counting_parent.active_bytes);
 }
 
 // ── 3. Safety-under-fault: oversize response ──────────────
