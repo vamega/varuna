@@ -215,6 +215,10 @@ fn handleUtpRecvResult(self: anytype, recv_res: i32) void {
         checkOutboundUtpConnect(self, result.slot, mgr);
     }
 
+    flushUtpPendingData(self, result.slot) catch |err| {
+        log.debug("uTP pending send drain failed for slot {d}: {s}", .{ result.slot, @errorName(err) });
+    };
+
     // Handle delivered data for existing connections.
     if (result.data) |utp_data| {
         deliverUtpData(self, result.slot, utp_data);
@@ -575,22 +579,29 @@ pub fn utpSendData(self: anytype, peer_slot: u16, data: []const u8) !void {
     const peer = &self.peers[peer_slot];
     const utp_slot = peer.utp_slot orelse return error.NotUtpPeer;
     const mgr = self.utp_manager orelse return error.NoUtpManager;
-    const remote = mgr.getRemoteAddress(utp_slot) orelse return error.NoRemoteAddress;
+    const sock = mgr.getSocket(utp_slot) orelse return error.NoSocket;
 
-    const now_us = utpNowUs();
+    try sock.queueSendBytes(data);
+    try flushUtpPendingData(self, utp_slot);
+}
+
+fn flushUtpPendingData(self: anytype, utp_slot: u16) !void {
+    const mgr = self.utp_manager orelse return error.NoUtpManager;
+    const remote = mgr.getRemoteAddress(utp_slot) orelse return error.NoRemoteAddress;
+    const sock = mgr.getSocket(utp_slot) orelse return error.NoSocket;
 
     // Fragment data into MTU-sized uTP DATA packets.
     // Each packet carries at most (MTU - uTP header) bytes of payload.
     const max_payload = 1400 - utp_mod.Header.size; // conservative MTU
-    var offset: usize = 0;
-    while (offset < data.len) {
-        const chunk_len = @min(data.len - offset, max_payload);
+    while (sock.hasPendingSend()) {
+        const now_us = utpNowUs();
+        const pending = sock.pendingSendSlice();
+        const chunk_len = @min(pending.len, max_payload);
 
         const hdr_bytes = mgr.createDataPacket(utp_slot, @intCast(chunk_len), now_us) orelse {
-            // Congestion window full — we'll retry on the next tick.
-            // Partial sends are OK; the peer will request missing blocks.
-            if (offset > 0) return; // sent some data, that's progress
-            return error.WindowFull;
+            // Congestion/receive window full. The unsent tail stays in
+            // `UtpSocket.pending_send` and will be retried on the next ACK.
+            return;
         };
 
         const pkt_seq_nr = std.mem.readInt(u16, hdr_bytes[16..18], .big);
@@ -598,13 +609,12 @@ pub fn utpSendData(self: anytype, peer_slot: u16, data: []const u8) !void {
         var send_buf: [1400]u8 = undefined;
         const total = utp_mod.Header.size + chunk_len;
         @memcpy(send_buf[0..utp_mod.Header.size], &hdr_bytes);
-        @memcpy(send_buf[utp_mod.Header.size..][0..chunk_len], data[offset..][0..chunk_len]);
+        @memcpy(send_buf[utp_mod.Header.size..][0..chunk_len], pending[0..chunk_len]);
 
-        const sock = mgr.getSocket(utp_slot) orelse return error.NoSocket;
         sock.bufferSentPacket(pkt_seq_nr, send_buf[0..total], @intCast(chunk_len), now_us);
 
         utpSendPacket(self, send_buf[0..total], remote);
-        offset += chunk_len;
+        sock.consumePendingSend(chunk_len);
     }
 }
 

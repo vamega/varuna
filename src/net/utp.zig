@@ -279,6 +279,13 @@ pub const UtpSocket = struct {
     delivered_payloads: [max_reorder_buf]?[]u8 = [_]?[]u8{null} ** max_reorder_buf,
     delivered_count: u16 = 0,
 
+    /// Ordered application byte-stream data waiting for congestion/window
+    /// space. `utp_handler` drains this into DATA packets as ACKs open
+    /// capacity; keeping it here preserves uTP stream ordering across
+    /// multiple peer-wire messages.
+    pending_send: std.ArrayList(u8) = std.ArrayList(u8).empty,
+    pending_send_offset: usize = 0,
+
     /// Duplicate ACK counter for fast retransmit.
     dup_ack_count: u8 = 0,
 
@@ -311,6 +318,8 @@ pub const UtpSocket = struct {
             if (maybe) |buf| alloc.free(buf);
         }
         self.delivered_count = 0;
+        self.pending_send.deinit(alloc);
+        self.pending_send_offset = 0;
     }
 
     /// Begin an outbound connection. Generates a SYN packet and stores
@@ -492,6 +501,29 @@ pub const UtpSocket = struct {
     /// This stores an owned copy so the original buffer can be reused.
     pub fn bufferSentPacket(self: *UtpSocket, seq_nr: u16, datagram: []const u8, payload_len: u16, now_us: u32) void {
         self.bufferOutPacket(seq_nr, datagram, payload_len, now_us);
+    }
+
+    /// Append bytes to the ordered application send queue.
+    pub fn queueSendBytes(self: *UtpSocket, data: []const u8) !void {
+        if (data.len == 0) return;
+        const alloc = self.allocator orelse return error.NoAllocator;
+        self.compactPendingSend();
+        try self.pending_send.appendSlice(alloc, data);
+    }
+
+    /// Return the not-yet-packetized application bytes.
+    pub fn pendingSendSlice(self: *const UtpSocket) []const u8 {
+        return self.pending_send.items[self.pending_send_offset..];
+    }
+
+    /// Mark bytes as packetized into uTP DATA packets.
+    pub fn consumePendingSend(self: *UtpSocket, amount: usize) void {
+        self.pending_send_offset += @min(amount, self.pendingSendSlice().len);
+        self.compactPendingSend();
+    }
+
+    pub fn hasPendingSend(self: *const UtpSocket) bool {
+        return self.pending_send_offset < self.pending_send.items.len;
     }
 
     /// Create a FIN packet to initiate graceful shutdown.
@@ -711,6 +743,22 @@ pub const UtpSocket = struct {
             .send_time_us = now_us,
         };
         self.out_buf_count += 1;
+    }
+
+    fn compactPendingSend(self: *UtpSocket) void {
+        if (self.pending_send_offset == 0) return;
+        if (self.pending_send_offset >= self.pending_send.items.len) {
+            self.pending_send.clearRetainingCapacity();
+            self.pending_send_offset = 0;
+            return;
+        }
+        if (self.pending_send_offset < 64 * 1024 and self.pending_send_offset * 2 < self.pending_send.items.len) {
+            return;
+        }
+        const remaining = self.pending_send.items[self.pending_send_offset..];
+        std.mem.copyForwards(u8, self.pending_send.items[0..remaining.len], remaining);
+        self.pending_send.shrinkRetainingCapacity(remaining.len);
+        self.pending_send_offset = 0;
     }
 
     fn bufferReorder(self: *UtpSocket, seq: u16, data: []const u8) void {
