@@ -643,7 +643,7 @@ pub fn EventLoopOf(comptime IO: type) type {
                 if (peer.transport == .utp) {
                     if (peer.utp_slot) |utp_slot| {
                         if (self.utp_manager) |mgr| {
-                            const now_us = @import("utp_handler.zig").utpNowUs();
+                            const now_us = self.clock.nowUs32();
                             _ = mgr.reset(utp_slot, now_us);
                         }
                     }
@@ -1502,7 +1502,7 @@ pub fn EventLoopOf(comptime IO: type) type {
                 return error.HalfOpenLimitReached;
             }
 
-            const now_us = utp_handler.utpNowUs();
+            const now_us = self.clock.nowUs32();
             const conn = mgr.connect(&self.random, address, now_us) catch |err| {
                 log.warn("uTP connect failed: {s}", .{@errorName(err)});
                 return error.UtpConnectFailed;
@@ -3165,7 +3165,7 @@ pub fn EventLoopOf(comptime IO: type) type {
             if (peer.transport == .utp) {
                 if (peer.utp_slot) |utp_slot| {
                     if (self.utp_manager) |mgr| {
-                        const now_us = utp_handler.utpNowUs();
+                        const now_us = self.clock.nowUs32();
                         _ = mgr.reset(utp_slot, now_us);
                     }
                 }

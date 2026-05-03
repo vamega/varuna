@@ -194,7 +194,7 @@ fn handleUtpRecvResult(self: anytype, recv_res: i32) void {
     if (datagram_len < utp_mod.Header.size) return; // too short for a uTP header
 
     // Get microsecond timestamp for uTP
-    const now_us = utpNowUs();
+    const now_us = self.clock.nowUs32();
 
     // Process the packet through the UtpManager
     const result = mgr.processPacket(data, remote, now_us) orelse return;
@@ -298,7 +298,7 @@ fn acceptUtpConnection(self: anytype, mgr: *utp_mgr.UtpManager) void {
         // Reject inbound uTP connections during graceful shutdown drain
         if (self.draining) {
             log.debug("rejected inbound uTP connection: shutting down", .{});
-            const now_us = utpNowUs();
+            const now_us = self.clock.nowUs32();
             if (mgr.reset(utp_slot, now_us)) |rst| {
                 const remote = mgr.getRemoteAddress(utp_slot) orelse continue;
                 utpSendPacket(self, &rst, remote);
@@ -309,7 +309,7 @@ fn acceptUtpConnection(self: anytype, mgr: *utp_mgr.UtpManager) void {
         // Reject inbound uTP if transport disposition disables it
         if (!self.transport_disposition.incoming_utp) {
             log.debug("rejected inbound uTP connection: incoming_utp disabled", .{});
-            const now_us = utpNowUs();
+            const now_us = self.clock.nowUs32();
             if (mgr.reset(utp_slot, now_us)) |rst| {
                 const remote = mgr.getRemoteAddress(utp_slot) orelse continue;
                 utpSendPacket(self, &rst, remote);
@@ -320,7 +320,7 @@ fn acceptUtpConnection(self: anytype, mgr: *utp_mgr.UtpManager) void {
         // Enforce global connection limit
         if (self.peer_count >= self.max_connections) {
             log.warn("rejecting inbound uTP connection: global limit reached", .{});
-            const now_us = utpNowUs();
+            const now_us = self.clock.nowUs32();
             if (mgr.reset(utp_slot, now_us)) |rst| {
                 const remote = mgr.getRemoteAddress(utp_slot) orelse continue;
                 utpSendPacket(self, &rst, remote);
@@ -330,7 +330,7 @@ fn acceptUtpConnection(self: anytype, mgr: *utp_mgr.UtpManager) void {
 
         const peer_slot = self.allocSlot() orelse {
             log.warn("rejecting inbound uTP connection: no peer slots", .{});
-            const now_us = utpNowUs();
+            const now_us = self.clock.nowUs32();
             if (mgr.reset(utp_slot, now_us)) |rst| {
                 const remote = mgr.getRemoteAddress(utp_slot) orelse continue;
                 utpSendPacket(self, &rst, remote);
@@ -594,7 +594,7 @@ fn flushUtpPendingData(self: anytype, utp_slot: u16) !void {
     // Each packet carries at most (MTU - uTP header) bytes of payload.
     const max_payload = 1400 - utp_mod.Header.size; // conservative MTU
     while (sock.hasPendingSend()) {
-        const now_us = utpNowUs();
+        const now_us = self.clock.nowUs32();
         const pending = sock.pendingSendSlice();
         const chunk_len = @min(pending.len, max_payload);
 
@@ -754,7 +754,7 @@ pub fn findPeerByUtpSlot(self: anytype, utp_slot: u16) ?u16 {
 /// that have timed out and closes connections that have backed off too much.
 pub fn utpTick(self: anytype) void {
     const mgr = self.utp_manager orelse return;
-    const now_us = utpNowUs();
+    const now_us = self.clock.nowUs32();
 
     var timeout_buf: [64]u16 = undefined;
     const timeout_count = mgr.checkTimeouts(now_us, &timeout_buf);
@@ -781,12 +781,6 @@ pub fn utpTick(self: anytype) void {
     for (retransmit_buf[0..retransmit_count]) |entry| {
         utpSendPacket(self, entry.data, entry.remote);
     }
-}
-
-/// Get current time in microseconds (wrapping u32 for uTP timestamps).
-pub fn utpNowUs() u32 {
-    const ts = std.time.microTimestamp();
-    return @truncate(@as(u64, @intCast(ts)));
 }
 
 test "uTP handshake delivery rejects invalid protocol prefix" {

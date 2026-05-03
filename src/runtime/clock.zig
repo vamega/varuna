@@ -108,6 +108,13 @@ pub const Clock = union(enum) {
         };
     }
 
+    /// Wrapping 32-bit microseconds for protocol timestamps such as uTP.
+    /// Do not use this for absolute deadlines, persistence, or ordering
+    /// across long intervals; it wraps about every 71 minutes.
+    pub fn nowUs32(self: Clock) u32 {
+        return @truncate(self.nowNs() / std.time.ns_per_us);
+    }
+
     /// Advance the simulated clock by `secs` seconds (negative jumps
     /// backward, saturating at 0). No-op for `.real`.
     pub fn advance(self: *Clock, secs: i64) void {
@@ -233,6 +240,13 @@ test "sim clock initialised at ns preserves sub-millisecond precision" {
     try testing.expectEqual(@as(i64, 0), c.now());
     try testing.expectEqual(@as(i64, 1), c.nowMs());
     try testing.expectEqual(@as(u64, 1_500_000), c.nowNs());
+    try testing.expectEqual(@as(u32, 1_500), c.nowUs32());
+}
+
+test "sim clock nowUs32 is a wrapping microsecond timestamp" {
+    const micros = @as(u64, std.math.maxInt(u32)) + 3;
+    const c = Clock.simAtNs(micros * std.time.ns_per_us + 999);
+    try testing.expectEqual(@as(u32, 2), c.nowUs32());
 }
 
 test "sim clock advanceSecs adds seconds" {

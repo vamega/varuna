@@ -295,6 +295,7 @@ test "uTP sender resumes window-limited byte stream after ACK" {
     const sim_io = try SimIO.init(allocator, .{ .seed = 0x757470 });
     var el = try EL.initBareWithIO(allocator, sim_io, 0);
     defer el.deinit();
+    el.clock = varuna.runtime.Clock.simAtNs(5_000_000_123);
     el.random = event_loop_mod.Random.simRandom(0x75747001);
 
     const mgr = try allocator.create(utp_mgr.UtpManager);
@@ -335,14 +336,14 @@ test "uTP sender resumes window-limited byte stream after ACK" {
     for (&payload, 0..) |*byte, i| byte.* = @truncate(i);
 
     try utp_handler.utpSendData(&el, peer_slot, &payload);
+    try std.testing.expectEqual(@as(u32, 5_000_000), sock.last_send_time_us);
     const seq_after_first_send = sock.seq_nr;
     const bytes_in_flight = sock.bytesInFlight();
     try std.testing.expect(bytes_in_flight > 0);
     try std.testing.expect(bytes_in_flight < payload.len);
 
-    // `utpSendData` uses the handler's wall-clock uTP timestamp. Keep the
-    // synthetic ACK on that same clock so RTT sampling sees a small positive
-    // delta instead of a wrapped timestamp.
+    // Keep the synthetic ACK on the sender's uTP clock so RTT sampling sees
+    // a small positive delta instead of a wrapped timestamp.
     const ack_now = sock.last_send_time_us +% 1_000;
     const ack = (Header{
         .packet_type = .st_state,
