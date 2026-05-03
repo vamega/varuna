@@ -1,5 +1,6 @@
 const std = @import("std");
 const dns = @import("dns.zig");
+const dns_cache = @import("dns_custom/cache.zig");
 const TtlBounds = dns.TtlBounds;
 const Config = dns.Config;
 
@@ -36,7 +37,7 @@ const Config = dns.Config;
 /// Thread safety: all public methods are safe to call from any thread.
 /// The internal cache is protected by a mutex; the job queue has its own lock.
 pub const DnsResolver = struct {
-    cache: Cache,
+    cache: dns_cache.Cache,
     cache_mutex: std.Thread.Mutex = .{},
     pool: *ThreadPool,
     ttl_bounds: TtlBounds = TtlBounds.default,
@@ -50,19 +51,11 @@ pub const DnsResolver = struct {
 
     /// Maximum number of cached entries. Small because a typical torrent
     /// client talks to only a handful of tracker hostnames.
-    const max_entries = 64;
-
-    const Cache = std.StringHashMapUnmanaged(CacheEntry);
-
-    const CacheEntry = struct {
-        address: std.net.Address,
-        /// Timestamp (seconds since epoch) when this entry expires.
-        expires_at: i64,
-    };
+    const max_entries = dns_cache.Cache.default_capacity;
 
     pub fn init(allocator: std.mem.Allocator, config: Config) !DnsResolver {
         return .{
-            .cache = .{},
+            .cache = dns_cache.Cache.init(max_entries),
             .pool = try ThreadPool.create(allocator),
             .ttl_bounds = config.ttl_bounds,
             .bind_device = config.bind_device,
@@ -75,10 +68,6 @@ pub const DnsResolver = struct {
         self.cache_mutex.lock();
         defer self.cache_mutex.unlock();
 
-        var iter = self.cache.keyIterator();
-        while (iter.next()) |key| {
-            allocator.free(key.*);
-        }
         self.cache.deinit(allocator);
     }
 
@@ -103,14 +92,16 @@ pub const DnsResolver = struct {
             self.cache_mutex.lock();
             defer self.cache_mutex.unlock();
 
-            if (self.cache.get(host)) |entry| {
-                if (entry.expires_at > now) {
-                    // Cache hit -- return with the requested port
-                    var addr = entry.address;
-                    addr.setPort(port);
-                    return addr;
+            if (self.cache.get(host, now)) |entry| {
+                switch (entry) {
+                    .positive => |positive| {
+                        // Cache hit -- return with the requested port
+                        var addr = positive.address;
+                        addr.setPort(port);
+                        return addr;
+                    },
+                    .negative => return error.DnsResolutionFailed,
                 }
-                // Expired -- will be overwritten below
             }
         }
 
@@ -149,11 +140,14 @@ pub const DnsResolver = struct {
             self.cache_mutex.lock();
             defer self.cache_mutex.unlock();
 
-            if (self.cache.get(host)) |entry| {
-                if (entry.expires_at > now) {
-                    var addr = entry.address;
-                    addr.setPort(port);
-                    return .{ .resolved = addr };
+            if (self.cache.get(host, now)) |entry| {
+                switch (entry) {
+                    .positive => |positive| {
+                        var addr = positive.address;
+                        addr.setPort(port);
+                        return .{ .resolved = addr };
+                    },
+                    .negative => return error.DnsResolutionFailed,
                 }
             }
         }
@@ -201,9 +195,7 @@ pub const DnsResolver = struct {
         self.cache_mutex.lock();
         defer self.cache_mutex.unlock();
 
-        if (self.cache.fetchRemove(host)) |kv| {
-            allocator.free(kv.key);
-        }
+        self.cache.invalidate(allocator, host);
     }
 
     /// Clear all cached entries.
@@ -211,55 +203,14 @@ pub const DnsResolver = struct {
         self.cache_mutex.lock();
         defer self.cache_mutex.unlock();
 
-        var iter = self.cache.keyIterator();
-        while (iter.next()) |key| {
-            allocator.free(key.*);
-        }
-        self.cache.clearRetainingCapacity();
+        self.cache.clearAll(allocator);
     }
 
     fn put(self: *DnsResolver, allocator: std.mem.Allocator, host: []const u8, address: std.net.Address, expires_at: i64) void {
         self.cache_mutex.lock();
         defer self.cache_mutex.unlock();
 
-        // If the key already exists, just update the value
-        if (self.cache.getPtr(host)) |entry| {
-            entry.* = .{ .address = address, .expires_at = expires_at };
-            return;
-        }
-
-        // Evict if at capacity
-        if (self.cache.count() >= max_entries) {
-            self.evictOldest(allocator);
-        }
-
-        const owned_key = allocator.dupe(u8, host) catch return;
-        self.cache.put(allocator, owned_key, .{
-            .address = address,
-            .expires_at = expires_at,
-        }) catch {
-            allocator.free(owned_key);
-        };
-    }
-
-    fn evictOldest(self: *DnsResolver, allocator: std.mem.Allocator) void {
-        var oldest_key: ?[]const u8 = null;
-        var oldest_time: i64 = std.math.maxInt(i64);
-
-        var iter = self.cache.iterator();
-        while (iter.next()) |entry| {
-            if (entry.value_ptr.expires_at < oldest_time) {
-                oldest_time = entry.value_ptr.expires_at;
-                oldest_key = entry.key_ptr.*;
-            }
-        }
-
-        if (oldest_key) |key| {
-            // Need to dupe the key since fetchRemove will invalidate it
-            if (self.cache.fetchRemove(key)) |kv| {
-                allocator.free(kv.key);
-            }
-        }
+        self.cache.putPositiveUntil(allocator, host, address, expires_at) catch return;
     }
 };
 
@@ -629,9 +580,9 @@ test "threadpool cache evicts oldest when full" {
     try std.testing.expectEqual(@as(u32, DnsResolver.max_entries), resolver.cache.count());
 
     // The oldest entry (host-0.test) should be evicted
-    try std.testing.expect(resolver.cache.get("host-0.test") == null);
+    try std.testing.expect(resolver.cache.get("host-0.test", now) == null);
     // The new entry should be present
-    try std.testing.expect(resolver.cache.get("overflow.test") != null);
+    try std.testing.expect(resolver.cache.get("overflow.test", now) != null);
 }
 
 test "threadpool cache updates existing entry without duplication" {
@@ -649,8 +600,11 @@ test "threadpool cache updates existing entry without duplication" {
     try std.testing.expectEqual(@as(u32, 1), resolver.cache.count());
 
     // Should have the updated address
-    const entry = resolver.cache.get("update.test").?;
-    try std.testing.expectEqual(@as(i64, now + 200), entry.expires_at);
+    const entry = resolver.cache.get("update.test", now).?;
+    switch (entry) {
+        .positive => |positive| try std.testing.expectEqual(@as(i64, now + 200), positive.expires_at),
+        .negative => return error.UnexpectedNegativeCacheEntry,
+    }
 }
 
 test "threadpool resolve localhost via real DNS" {
@@ -704,11 +658,16 @@ test "threadpool cacheResult uses configured TTL cap (1 hour default)" {
     resolver.cacheResult(std.testing.allocator, "ttl-cap.test", addr);
     const after = std.time.timestamp();
 
-    const entry = resolver.cache.get("ttl-cap.test").?;
+    const entry = resolver.cache.get("ttl-cap.test", before).?;
     // Entry expires roughly `cap_s` after now (allow ±1 s for the
     // timestamp call between before/after).
-    try std.testing.expect(entry.expires_at >= before + 3600);
-    try std.testing.expect(entry.expires_at <= after + 3600);
+    switch (entry) {
+        .positive => |positive| {
+            try std.testing.expect(positive.expires_at >= before + 3600);
+            try std.testing.expect(positive.expires_at <= after + 3600);
+        },
+        .negative => return error.UnexpectedNegativeCacheEntry,
+    }
 }
 
 test "threadpool ttl_bounds.cap_s is configurable" {
@@ -721,7 +680,12 @@ test "threadpool ttl_bounds.cap_s is configurable" {
     const addr = std.net.Address.initIp4(.{ 1, 2, 3, 4 }, 80);
     resolver.cacheResult(std.testing.allocator, "tight-cap.test", addr);
 
-    const entry = resolver.cache.get("tight-cap.test").?;
-    try std.testing.expect(entry.expires_at >= before + 60);
-    try std.testing.expect(entry.expires_at <= before + 62);
+    const entry = resolver.cache.get("tight-cap.test", before).?;
+    switch (entry) {
+        .positive => |positive| {
+            try std.testing.expect(positive.expires_at >= before + 60);
+            try std.testing.expect(positive.expires_at <= before + 62);
+        },
+        .negative => return error.UnexpectedNegativeCacheEntry,
+    }
 }

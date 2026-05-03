@@ -113,13 +113,12 @@ Implemented in `src/daemon/systemd.zig`. Checks `$LISTEN_FDS` and `$LISTEN_PID` 
 
 ## 6. ~~UDP tracker support (BEP 15)~~ (DONE)
 
-Implemented in `src/tracker/udp.zig` (protocol encode/decode, blocking client) and `src/daemon/udp_tracker_executor.zig` (io_uring-based async executor).
+Implemented in `src/tracker/udp.zig` (protocol encode/decode and connection-cache primitives) and `src/tracker/udp_executor.zig` (io_uring-based async executor).
 
 - **Protocol layer**: Full BEP 15 packet encode/decode for connect, announce, scrape, and error responses. Transaction ID generation, connection ID caching with 2-minute TTL, compact peer parsing (IPv4 + IPv6).
-- **Blocking client** (`fetchViaUdp`, `scrapeViaUdp`): Used by `varuna-ctl`, multi-announce workers, and metadata fetching. Exponential backoff retries (15 * 2^n seconds, up to 8 retries per BEP 15). Connection ID reuse across announces. Error response handling with automatic re-connect on stale connection IDs.
 - **io_uring executor** (`UdpTrackerExecutor`): Async state machine for the daemon. Uses `IORING_OP_SENDMSG` / `IORING_OP_RECVMSG` on the shared ring. DNS offloaded to background threads. Retransmission timer with BEP 15 exponential backoff. Connection ID cache shared across requests.
 - **Daemon integration**: `UdpTrackerExecutor` wired into the event loop (`udp_tracker_send` / `udp_tracker_recv` OpTypes). Torrent sessions auto-detect `udp://` URLs and route announces and scrapes through the UDP executor. HTTP URLs continue through the existing `TrackerExecutor`.
-- **Tests**: 35+ unit tests (packet encode/decode, connection cache, retransmission timeouts, error responses). Integration tests with mock UDP servers over real loopback sockets (connect->announce, connect->scrape, error handling, connection ID reuse).
+- **Tests**: unit tests cover packet encode/decode, connection cache, retransmission timeouts, error responses, and compact peer parsing; async executor tests cover the live network state machine.
 
 ## 7. DHT (BEP 5) and PEX (BEP 11) Follow-up
 

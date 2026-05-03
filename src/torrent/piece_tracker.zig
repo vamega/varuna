@@ -900,6 +900,86 @@ test "isPartialSeed transitions to false when all pieces complete" {
     try std.testing.expect(!tracker.isPartialSeed());
 }
 
+test "wanted_completed_count cache stays consistent across complete and setWanted" {
+    var bf = try Bitfield.init(std.testing.allocator, 8);
+    defer bf.deinit(std.testing.allocator);
+
+    var tracker = try PieceTracker.init(std.testing.allocator, 8, 4, 32, &bf, 0);
+    defer tracker.deinit(std.testing.allocator);
+
+    try std.testing.expectEqual(@as(u32, 0), tracker.wantedCompletedCount());
+    try std.testing.expect(!tracker.isPartialSeed());
+
+    try std.testing.expect(tracker.completePiece(0, 4));
+    try std.testing.expectEqual(@as(u32, 1), tracker.wantedCompletedCount());
+
+    var wanted = try Bitfield.init(std.testing.allocator, 8);
+    try wanted.set(0);
+    try wanted.set(1);
+    try wanted.set(2);
+    tracker.setWanted(wanted);
+    try std.testing.expectEqual(@as(u32, 1), tracker.wantedCompletedCount());
+
+    try std.testing.expect(tracker.completePiece(1, 4));
+    try std.testing.expectEqual(@as(u32, 2), tracker.wantedCompletedCount());
+
+    try std.testing.expect(tracker.completePiece(5, 4));
+    try std.testing.expectEqual(@as(u32, 2), tracker.wantedCompletedCount());
+
+    try std.testing.expect(tracker.completePiece(2, 4));
+    try std.testing.expectEqual(@as(u32, 3), tracker.wantedCompletedCount());
+    try std.testing.expect(tracker.isPartialSeed());
+
+    var wider = try Bitfield.init(std.testing.allocator, 8);
+    try wider.set(0);
+    try wider.set(1);
+    try wider.set(2);
+    try wider.set(5);
+    try wider.set(6);
+    if (tracker.swapWanted(wider)) |old| {
+        var old_mut = old;
+        old_mut.deinit(std.testing.allocator);
+    }
+    try std.testing.expectEqual(@as(u32, 4), tracker.wantedCompletedCount());
+    try std.testing.expect(!tracker.isPartialSeed());
+}
+
+test "wanted_completed_count cache initialised from initial_complete" {
+    var bf = try Bitfield.init(std.testing.allocator, 8);
+    defer bf.deinit(std.testing.allocator);
+    try bf.set(0);
+    try bf.set(2);
+    try bf.set(4);
+
+    var tracker = try PieceTracker.init(std.testing.allocator, 8, 4, 32, &bf, 12);
+    defer tracker.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(u32, 3), tracker.wantedCompletedCount());
+}
+
+test "wanted_completed_count cache resets when wanted mask is removed" {
+    var bf = try Bitfield.init(std.testing.allocator, 8);
+    defer bf.deinit(std.testing.allocator);
+
+    var tracker = try PieceTracker.init(std.testing.allocator, 8, 4, 32, &bf, 0);
+    defer tracker.deinit(std.testing.allocator);
+
+    var wanted = try Bitfield.init(std.testing.allocator, 8);
+    try wanted.set(0);
+    try wanted.set(1);
+    tracker.setWanted(wanted);
+
+    try std.testing.expect(tracker.completePiece(0, 4));
+    try std.testing.expect(tracker.completePiece(1, 4));
+    try std.testing.expect(tracker.completePiece(5, 4));
+    try std.testing.expectEqual(@as(u32, 2), tracker.wantedCompletedCount());
+
+    if (tracker.swapWanted(null)) |old| {
+        var old_mut = old;
+        old_mut.deinit(std.testing.allocator);
+    }
+    try std.testing.expectEqual(@as(u32, 3), tracker.wantedCompletedCount());
+}
+
 // ── completePiece clears in_progress ─────────────────────
 
 test "completePiece clears in_progress bit" {

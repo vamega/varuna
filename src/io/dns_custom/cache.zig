@@ -1,9 +1,10 @@
 //! Bounded TTL cache for DNS lookup results.
 //!
-//! Mirrors the cache shape in `dns_threadpool.zig`
-//! (`StringHashMapUnmanaged(CacheEntry)`, `max_entries=64`, evict-by-
-//! earliest-expiry-on-insert) but with two refinements taken from the
-//! design doc:
+//! Shared by the threadpool, c-ares, and custom resolver backends.
+//! Keeps one implementation of the bounded map, key ownership, expiry
+//! checks, and oldest-entry eviction policy. The custom resolver adds
+//! two DNS-specific refinements on top of the original threadpool cache
+//! shape:
 //!
 //! 1. **Per-record TTL** — every entry carries the authoritative TTL
 //!    from the response, clamped into `TtlBounds.[floor_s, cap_s]`.
@@ -89,6 +90,22 @@ pub const Cache = struct {
     ) std.mem.Allocator.Error!void {
         const ttl = bounds.clamp(answer_ttl_s);
         const expires_at = now + @as(i64, ttl);
+        try self.put(allocator, host, .{ .positive = .{
+            .address = address,
+            .expires_at = expires_at,
+        } });
+    }
+
+    /// Insert or update a positive result using an already-computed
+    /// absolute expiry timestamp. Used by resolver tests and by
+    /// backends whose public API already stores absolute expirations.
+    pub fn putPositiveUntil(
+        self: *Cache,
+        allocator: std.mem.Allocator,
+        host: []const u8,
+        address: std.net.Address,
+        expires_at: i64,
+    ) std.mem.Allocator.Error!void {
         try self.put(allocator, host, .{ .positive = .{
             .address = address,
             .expires_at = expires_at,

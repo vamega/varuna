@@ -306,10 +306,8 @@ fn runScenario(seed: u64, opts: ScenarioOpts) !void {
 
     // ── 7. Liveness + safety assertions ────────────────────────
     //
-    // Live: piece verifies, no honest peer banned. The distribution-
-    // proportion assertions are gated under `multi_source_landed`
-    // below — flipped on after the late-peer block-stealing change
-    // lands (Task #23).
+    // Live: piece verifies, no honest peer banned, and multiple peers
+    // contribute to the same piece.
     try testing.expect(el.isPieceComplete(tid, 0));
 
     // Safety invariant — holds under both clean runs and BUGGIFY
@@ -330,18 +328,15 @@ fn runScenario(seed: u64, opts: ScenarioOpts) !void {
     // `tryJoinExistingPiece` keeps the BUGGIFY smart-ban safety
     // invariant intact (no honest peer falsely framed by
     // cross-DP join).
-    const multi_source_landed: bool = true;
-    if (multi_source_landed) {
-        // ≥ 2 peers contributed bytes — the meaningful "not serialised
-        // on one peer" invariant.
-        try testing.expect(peers_with_contribs >= 2);
+    // At least two peers contributed bytes — the meaningful "not
+    // serialised on one peer" invariant.
+    try testing.expect(peers_with_contribs >= 2);
 
-        // No peer monopolises (≤ 90% of total). Looser bound for the
-        // disconnect scenario where survivors absorb the displaced
-        // peer's blocks and naturally dominate.
-        if (opts.disconnect_peer_after == null) {
-            try testing.expect(max_contrib * 10 <= total_contrib * 9);
-        }
+    // No peer monopolises (≤ 90% of total). Looser bound for the
+    // disconnect scenario where survivors absorb the displaced
+    // peer's blocks and naturally dominate.
+    if (opts.disconnect_peer_after == null) {
+        try testing.expect(max_contrib * 10 <= total_contrib * 9);
     }
 
     // TODO(phase 2A follow-up): per-block attribution assertion via
@@ -394,14 +389,11 @@ test "multi-source: peer disconnect mid-piece, survivors complete (8 seeds)" {
     // the "everyone connects at tick 0" scenario from the
     // picker-spreads-load test above is more synthetic than this one.
     //
-    // The `runScenario` drain phase + `multi_source_landed = false`
-    // gate combine to keep this test stable: the drain runs before
-    // `el.deinit` so residual late piece-block recvs flow through
-    // controlled CQE handling rather than the more fragile
-    // `drainRemainingCqes`. Liveness + safety assertions are live
-    // (piece verifies, no honest peer banned); distribution-
-    // proportion assertions stay gated until late-peer block-stealing
-    // (Task #23) lands.
+    // The `runScenario` drain phase keeps this test stable: the drain
+    // runs before `el.deinit` so residual late piece-block recvs flow
+    // through controlled CQE handling rather than the more fragile
+    // `drainRemainingCqes`. Liveness, safety, and multi-source
+    // contribution assertions are all live.
     const seeds = [_]u64{
         0x0000_0001, 0xDEAD_BEEF, 0xFEED_FACE, 0xCAFE_BABE,
         0x0F0F_0F0F, 0x1234_5678, 0xABCD_EF01, 0x9876_5432,

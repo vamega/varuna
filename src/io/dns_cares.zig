@@ -2,6 +2,7 @@ const std = @import("std");
 const posix = std.posix;
 const linux = std.os.linux;
 const dns = @import("dns.zig");
+const dns_cache = @import("dns_custom/cache.zig");
 const TtlBounds = dns.TtlBounds;
 const Config = dns.Config;
 const applyBindDevice = @import("../net/socket.zig").applyBindDevice;
@@ -33,7 +34,7 @@ const c = @cImport({
 /// Thread safety: all public methods are safe to call from any thread.
 /// The internal cache and c-ares channel are protected by a mutex.
 pub const DnsResolver = struct {
-    cache: Cache,
+    cache: dns_cache.Cache,
     mutex: std.Thread.Mutex = .{},
     channel: ?*c.ares_channel_t = null,
     allocator: std.mem.Allocator,
@@ -54,21 +55,13 @@ pub const DnsResolver = struct {
     bind_device_cell: ?*BindDeviceCell = null,
 
     /// Maximum number of cached entries.
-    const max_entries = 64;
+    const max_entries = dns_cache.Cache.default_capacity;
 
     /// Maximum number of c-ares fds we can poll simultaneously.
     const max_ares_fds = 16;
 
     /// c-ares query timeout in milliseconds.
     const query_timeout_ms: c_int = 5000;
-
-    const Cache = std.StringHashMapUnmanaged(CacheEntry);
-
-    const CacheEntry = struct {
-        address: std.net.Address,
-        /// Timestamp (seconds since epoch) when this entry expires.
-        expires_at: i64,
-    };
 
     /// Result passed between the c-ares callback and the waiting caller.
     const QueryResult = struct {
@@ -122,7 +115,7 @@ pub const DnsResolver = struct {
         }
 
         return .{
-            .cache = .{},
+            .cache = dns_cache.Cache.init(max_entries),
             .channel = channel,
             .allocator = allocator,
             .ttl_bounds = config.ttl_bounds,
@@ -184,10 +177,6 @@ pub const DnsResolver = struct {
             self.bind_device_cell = null;
         }
 
-        var iter = self.cache.keyIterator();
-        while (iter.next()) |key| {
-            allocator.free(key.*);
-        }
         self.cache.deinit(allocator);
     }
 
@@ -210,11 +199,14 @@ pub const DnsResolver = struct {
             self.mutex.lock();
             defer self.mutex.unlock();
 
-            if (self.cache.get(host)) |entry| {
-                if (entry.expires_at > now) {
-                    var addr = entry.address;
-                    addr.setPort(port);
-                    return addr;
+            if (self.cache.get(host, now)) |entry| {
+                switch (entry) {
+                    .positive => |positive| {
+                        var addr = positive.address;
+                        addr.setPort(port);
+                        return addr;
+                    },
+                    .negative => return error.DnsResolutionFailed,
                 }
             }
         }
@@ -236,9 +228,7 @@ pub const DnsResolver = struct {
         self.mutex.lock();
         defer self.mutex.unlock();
 
-        if (self.cache.fetchRemove(host)) |kv| {
-            allocator.free(kv.key);
-        }
+        self.cache.invalidate(allocator, host);
     }
 
     /// Clear all cached entries.
@@ -246,52 +236,14 @@ pub const DnsResolver = struct {
         self.mutex.lock();
         defer self.mutex.unlock();
 
-        var iter = self.cache.keyIterator();
-        while (iter.next()) |key| {
-            allocator.free(key.*);
-        }
-        self.cache.clearRetainingCapacity();
+        self.cache.clearAll(allocator);
     }
 
     fn put(self: *DnsResolver, allocator: std.mem.Allocator, host: []const u8, address: std.net.Address, expires_at: i64) void {
         self.mutex.lock();
         defer self.mutex.unlock();
 
-        if (self.cache.getPtr(host)) |entry| {
-            entry.* = .{ .address = address, .expires_at = expires_at };
-            return;
-        }
-
-        if (self.cache.count() >= max_entries) {
-            self.evictOldest(allocator);
-        }
-
-        const owned_key = allocator.dupe(u8, host) catch return;
-        self.cache.put(allocator, owned_key, .{
-            .address = address,
-            .expires_at = expires_at,
-        }) catch {
-            allocator.free(owned_key);
-        };
-    }
-
-    fn evictOldest(self: *DnsResolver, allocator: std.mem.Allocator) void {
-        var oldest_key: ?[]const u8 = null;
-        var oldest_time: i64 = std.math.maxInt(i64);
-
-        var iter = self.cache.iterator();
-        while (iter.next()) |entry| {
-            if (entry.value_ptr.expires_at < oldest_time) {
-                oldest_time = entry.value_ptr.expires_at;
-                oldest_key = entry.key_ptr.*;
-            }
-        }
-
-        if (oldest_key) |key| {
-            if (self.cache.fetchRemove(key)) |kv| {
-                allocator.free(kv.key);
-            }
-        }
+        self.cache.putPositiveUntil(allocator, host, address, expires_at) catch return;
     }
 
     /// Perform a c-ares DNS lookup. Uses epoll to wait on c-ares's fds.
@@ -661,8 +613,8 @@ test "c-ares cache evicts oldest when full" {
     resolver.put(std.testing.allocator, "overflow.test", addr, now + 9999);
     try std.testing.expectEqual(@as(u32, DnsResolver.max_entries), resolver.cache.count());
 
-    try std.testing.expect(resolver.cache.get("host-0.test") == null);
-    try std.testing.expect(resolver.cache.get("overflow.test") != null);
+    try std.testing.expect(resolver.cache.get("host-0.test", now) == null);
+    try std.testing.expect(resolver.cache.get("overflow.test", now) != null);
 }
 
 test "c-ares cache updates existing entry without duplication" {
@@ -679,8 +631,11 @@ test "c-ares cache updates existing entry without duplication" {
     resolver.put(std.testing.allocator, "update.test", addr2, now + 200);
     try std.testing.expectEqual(@as(u32, 1), resolver.cache.count());
 
-    const entry = resolver.cache.get("update.test").?;
-    try std.testing.expectEqual(@as(i64, now + 200), entry.expires_at);
+    const entry = resolver.cache.get("update.test", now).?;
+    switch (entry) {
+        .positive => |positive| try std.testing.expectEqual(@as(i64, now + 200), positive.expires_at),
+        .negative => return error.UnexpectedNegativeCacheEntry,
+    }
 }
 
 test "c-ares cache respects port override on hit" {

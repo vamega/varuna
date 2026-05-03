@@ -5,7 +5,7 @@ pub const bencode_scanner = @import("bencode_scanner.zig");
 pub const extensions = @import("extensions.zig");
 pub const hash_exchange = @import("hash_exchange.zig");
 pub const ipfilter_parser = @import("ipfilter_parser.zig");
-pub const metadata_fetch = @import("metadata_fetch.zig");
+pub const metadata_progress = @import("metadata_progress.zig");
 pub const peer_id = @import("peer_id.zig");
 pub const peer_wire = @import("peer_wire.zig");
 pub const pex = @import("pex.zig");
@@ -28,7 +28,7 @@ test {
     _ = hash_exchange;
     _ = ipfilter_parser;
     _ = ledbat;
-    _ = metadata_fetch;
+    _ = metadata_progress;
     _ = peer_id;
     _ = peer_wire;
     _ = pex;

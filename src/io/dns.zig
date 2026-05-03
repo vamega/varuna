@@ -68,7 +68,7 @@ const backend = switch (build_options.dns_backend) {
 ///
 /// Both backends have identical semantics:
 /// - Numeric IPs (IPv4/IPv6) are parsed inline with no syscall
-/// - Hostnames are cached with a 5-minute TTL, up to 64 entries
+/// - Hostnames are cached with bounded TTLs, up to 64 entries
 /// - Cache misses trigger resolution with a 5-second timeout
 /// - Thread-safe via mutex-protected cache
 pub const DnsResolver = backend.DnsResolver;

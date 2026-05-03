@@ -9,11 +9,11 @@ single-source download). Read that first for the EL test surface basics
 (`addInboundPeer` / `getPeerView` / `isPieceComplete`); this doc covers
 only the new surface.
 
-The plan follows `STYLE.md > Layered Testing Strategy`: each behaviour
-lands as three tests (algorithm → integration → safety-under-faults).
-The test scaffolds land first, gated behind `if (false)` until
-migration-engineer's production code lands; then the gates flip and
-the scaffolds light up. Same playbook as the smart-ban EL light-up.
+The plan followed `STYLE.md > Layered Testing Strategy`: each behaviour
+landed as algorithm → integration → safety-under-faults coverage where
+that split had real discriminating power. The original scaffold-first
+coordination notes remain below as historical context; current live
+status is tracked in `STATUS.md` and the test files themselves.
 
 ---
 

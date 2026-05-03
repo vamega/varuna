@@ -208,7 +208,7 @@ pub const max_piece_count: u32 =
 /// Two ownership models for the assembly storage:
 ///   * `init` — assembler owns its allocator, allocates `buffer` and
 ///     `received` lazily on `setSize` and frees them on `deinit`. Used
-///     by tests and the legacy blocking `MetadataFetcher`.
+///     by tests and the async metadata fetch state machine.
 ///   * `initShared` — the caller passes in pre-allocated `buffer` and
 ///     `received` slices sized to the BEP 9 worst case. The assembler
 ///     uses prefixes of those slices and never frees them. Used by the

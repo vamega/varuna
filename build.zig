@@ -793,7 +793,7 @@ pub fn build(b: *std.Build) void {
     test_sim_multi_source_protocol_step.dependOn(&run_sim_multi_source_protocol_tests.step);
     test_step.dependOn(&run_sim_multi_source_protocol_tests.step);
 
-    // ── Phase 2A multi-source EventLoop integration scaffold ─────
+    // ── Phase 2A multi-source EventLoop integration ──────────────
     const sim_multi_source_eventloop_tests = b.addTest(.{
         .root_module = b.createModule(.{
             .root_source_file = b.path("tests/sim_multi_source_eventloop_test.zig"),
@@ -803,11 +803,11 @@ pub fn build(b: *std.Build) void {
         }),
     });
     const run_sim_multi_source_eventloop_tests = b.addRunArtifact(sim_multi_source_eventloop_tests);
-    const test_sim_multi_source_eventloop_step = b.step("test-sim-multi-source-eventloop", "Run multi-source piece assembly EventLoop integration (scaffold; lights up with getBlockAttribution)");
+    const test_sim_multi_source_eventloop_step = b.step("test-sim-multi-source-eventloop", "Run multi-source piece assembly EventLoop integration");
     test_sim_multi_source_eventloop_step.dependOn(&run_sim_multi_source_eventloop_tests.step);
     test_step.dependOn(&run_sim_multi_source_eventloop_tests.step);
 
-    // ── Phase 2B smart-ban Phase 1-2 EventLoop integration scaffold ─
+    // ── Phase 2B smart-ban Phase 1-2 EventLoop integration ───────
     const sim_smart_ban_phase12_tests = b.addTest(.{
         .root_module = b.createModule(.{
             .root_source_file = b.path("tests/sim_smart_ban_phase12_eventloop_test.zig"),
@@ -817,7 +817,7 @@ pub fn build(b: *std.Build) void {
         }),
     });
     const run_sim_smart_ban_phase12_tests = b.addRunArtifact(sim_smart_ban_phase12_tests);
-    const test_sim_smart_ban_phase12_step = b.step("test-sim-smart-ban-phase12", "Run smart-ban Phase 1-2 per-block attribution EventLoop integration (scaffold)");
+    const test_sim_smart_ban_phase12_step = b.step("test-sim-smart-ban-phase12", "Run smart-ban Phase 1-2 per-block attribution EventLoop integration");
     test_sim_smart_ban_phase12_step.dependOn(&run_sim_smart_ban_phase12_tests.step);
     test_step.dependOn(&run_sim_smart_ban_phase12_tests.step);
 
@@ -1065,20 +1065,6 @@ pub fn build(b: *std.Build) void {
     const test_rpc_arena_step = b.step("test-rpc-arena", "Run Stage 2 RPC bump arena tests");
     test_rpc_arena_step.dependOn(&run_rpc_arena_tests.step);
     test_step.dependOn(&run_rpc_arena_tests.step);
-
-    // ── Piece tracker cache tests (Task #5 tick_sparse_torrents fix) ──
-    const piece_tracker_cache_tests = b.addTest(.{
-        .root_module = b.createModule(.{
-            .root_source_file = b.path("tests/piece_tracker_cache_test.zig"),
-            .target = target,
-            .optimize = optimize,
-            .imports = &varuna_import,
-        }),
-    });
-    const run_piece_tracker_cache_tests = b.addRunArtifact(piece_tracker_cache_tests);
-    const test_piece_tracker_cache_step = b.step("test-piece-tracker-cache", "Run wanted_completed_count cache regression tests");
-    test_piece_tracker_cache_step.dependOn(&run_piece_tracker_cache_tests.step);
-    test_step.dependOn(&run_piece_tracker_cache_tests.step);
 
     // ── RPC arena BUGGIFY tests (Track C: fault-injection coverage) ──
     const rpc_arena_buggify_tests = b.addTest(.{

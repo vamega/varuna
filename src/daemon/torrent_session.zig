@@ -12,7 +12,7 @@ const FilePriority = file_priority.FilePriority;
 const peer_id_mod = @import("../torrent/peer_id.zig");
 const magnet_mod = @import("../torrent/magnet.zig");
 const ut_metadata = @import("../net/ut_metadata.zig");
-const metadata_fetch = @import("../net/metadata_fetch.zig");
+const metadata_progress = @import("../net/metadata_progress.zig");
 const ResumeWriter = storage.resume_state.ResumeWriter;
 const ResumeDb = storage.resume_state.ResumeDb;
 const DhtEngine = @import("../dht/dht.zig").DhtEngine;
@@ -295,7 +295,7 @@ pub fn TorrentSessionOf(comptime IO: type) type {
         magnet_trackers: ?[]const []const u8 = null,
         metadata_assembler: ?ut_metadata.MetadataAssembler = null,
         /// Latest metadata fetch progress snapshot (updated during fetch).
-        metadata_fetch_progress: ?metadata_fetch.FetchProgress = null,
+        metadata_fetch_progress: ?metadata_progress.FetchProgress = null,
 
         pub fn createFromMagnet(
             allocator: std.mem.Allocator,

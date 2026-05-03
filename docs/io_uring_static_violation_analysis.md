@@ -125,28 +125,18 @@ tracker announces and web-seed range requests now run through `HttpExecutor`,
 which submits socket, connect, send, recv, and TLS progress work through the
 event-loop I/O contract.
 
-### 10. `src/tracker/udp.zig` — `fetchViaUdp` (lines 440-590)
+### 10. UDP tracker blocking client — resolved
 
-The entire UDP tracker flow is blocking:
+The former `src/tracker/udp.zig:fetchViaUdp` blocking client has been removed.
+`src/tracker/udp.zig` now keeps BEP 15 packet codecs and connection-cache
+primitives only; live UDP tracker I/O runs through `UdpTrackerExecutor` on the
+event-loop I/O contract.
 
-- Line 450: `posix.socket()` — socket creation
-- Line 458: `posix.connect()` — blocking UDP "connect"
-- Lines 495, 517, 562: `posix.recv()` — blocking recv with `SO_RCVTIMEO`
-- Line 586: `posix.send()` — blocking send
+### 11. BEP 9 metadata fetch blocking client — resolved
 
-This needs to become an async state machine integrated with the ring, similar to
-what `udp_tracker_executor.zig` is building. The retry/backoff logic with
-`SO_RCVTIMEO` timeouts needs to be converted to ring-based recv with
-timerfd-based deadlines.
-
-### 11. `src/net/metadata_fetch.zig` — `MetadataFetcher.fetchFromPeer` (lines 301-464)
-
-This is a fully blocking TCP client for BEP 9 metadata fetching:
-
-- Line 306: `posix.socket()`
-- Line 318: `posix.connect()` — blocking connect
-- Lines 331, 354, 413, 456: `peer_wire.sendAll()` -> `posix.write()` loops
-- Lines 335, 363, 370, 420, 427: `peer_wire.recvExact()` -> `posix.read()` loops
+The former `src/net/metadata_fetch.zig` blocking TCP client has been removed.
+Metadata download is handled by the event-loop `AsyncMetadataFetch` state
+machine; the remaining shared progress DTOs live in `src/net/metadata_progress.zig`.
 
 `peer_wire.zig` (lines 5-19) provides `sendAll`/`recvExact` as thin blocking
 wrappers around `posix.write`/`posix.read`. The metadata handler in
@@ -201,7 +191,7 @@ These are explicitly allowed by `AGENTS.md`:
 |---|---|---|
 | Easy (drop-in op swap) | ~40 call sites (socket, close, fdatasync) | Hours each |
 | Moderate (function refactor) | ~15 call sites (pread/pwrite, eventfd reads, file copy, hasher read split) | Days each |
-| Significant (subsystem redesign) | 3 remaining subsystems (UDP tracker, metadata_fetch, dns_cares) + 2 Thread.sleep sites | Weeks each |
+| Significant (subsystem redesign) | dns_cares epoll integration + 2 Thread.sleep sites | Weeks each |
 
 The highest-value target is the **storage writer** (pread/pwrite on the piece
 I/O hot path). The dns_cares epoll replacement is the most architecturally

@@ -40,28 +40,25 @@
 //!    each corrupt one block, deliver, disconnect. Peer 2 absorbs.
 //!    After re-download, both 0 and 1 are banned; peer 2 not.
 //!
-//! 3. **Steady-state honest co-located peer (gated on Task #23)**:
+//! 3. **Steady-state honest co-located peer (deferred)**:
 //!    peers 0 and 1 stay connected through piece completion, share
 //!    block delivery on the same piece, peer 0 corrupts one block.
 //!    Hash fails on first attempt; re-download. Peer 0 banned, peer 1
 //!    not banned. Tests Phase 2's discriminating power without
-//!    relying on disconnect.
+//!    relying on disconnect. This remains deferred until the harness
+//!    can force deterministic same-piece co-contribution in that shape.
 //!
 //! ## Status
 //!
-//! Today's scaffold:
-//!   * Sanity tests prove the file compiles + EL instantiates.
-//!   * `runScenario` infrastructure supports staged-connect (peer
-//!     ordering control) and per-peer corrupt_blocks config.
-//!   * Real-scenario test bodies are gated behind two flags:
-//!     - `phase2_attribution_survives_disconnect`: depends on
-//!       migration-engineer's `BlockInfo.delivered_address` fix
-//!       (Task #26). With the fix, attribution survives peer slot
-//!       freeing → onPieceFailed records survive → onPiecePassed
-//!       can identify the disconnected corruptor.
-//!     - `multi_source_landed`: depends on Task #23 (block-stealing).
-//!       With it, scenario 3 (steady-state co-located honest peer)
-//!       can fire deterministically.
+//! Live coverage:
+//!   * `runScenario` drives staged-connect ordering and per-peer
+//!     corrupt_blocks config through `EventLoopOf(SimIO)`.
+//!   * The disconnect-rejoin one-corrupt-block scenario is live and
+//!     proves attribution survives peer-slot freeing via
+//!     `BlockInfo.delivered_address`.
+//!   * The remaining deferred scenarios need deterministic
+//!     same-piece co-contribution from multiple corruptors or
+//!     co-located honest peers, not just generic multi-source liveness.
 //!
 //! See `docs/multi-source-test-setup.md` for the full Phase 2B
 //! scope.
@@ -85,10 +82,9 @@ const Bitfield = varuna.bitfield.Bitfield;
 const BanList = varuna.net.ban_list.BanList;
 const SmartBan = varuna.net.smart_ban.SmartBan;
 
-// Gate flags. Flip to `true` when the matching production-side fix
-// lands and the corresponding scenarios become deterministic.
-const phase2_attribution_survives_disconnect: bool = true; // Task #26 — fixed in commit 371582d
-const multi_source_landed: bool = false; // Task #23
+// The remaining Phase 2B scenarios are deferred until the harness can
+// force deterministic same-piece co-contribution for their shapes.
+const deterministic_same_piece_contribution: bool = false;
 
 const num_peers: u8 = 3;
 const piece_count: u32 = 1;
@@ -363,23 +359,7 @@ fn runScenario(seed: u64, specs: [num_peers]PeerSpec) !ScenarioResult {
     return result;
 }
 
-// ── Sanity tests (always live) ──────────────────────────────
-
-test "phase 2B: SimPeer corrupt_blocks variant compiles" {
-    const corrupt: SimPeerBehavior = .{ .corrupt_blocks = .{ .indices = &.{5} } };
-    switch (corrupt) {
-        .corrupt_blocks => |params| try testing.expectEqual(@as(usize, 1), params.indices.len),
-        else => return error.WrongBehaviorVariant,
-    }
-}
-
-test "phase 2B: EventLoopOf(SimIO) instantiates with Phase 2B settings" {
-    const EL_SimIO = event_loop_mod.EventLoopOf(SimIO);
-    const sim_io = try SimIO.init(testing.allocator, .{ .socket_capacity = 8 });
-    var el = try EL_SimIO.initBareWithIO(testing.allocator, sim_io, 0);
-    defer el.deinit();
-    _ = el.peers.len;
-}
+// ── Harness smoke ──────────────────────────────────────────
 
 test "phase 2B: scenario harness constructs three peers cleanly (smoke)" {
     // Pure smoke test: drive `runScenario` with all-honest, all-eager
@@ -396,9 +376,9 @@ test "phase 2B: scenario harness constructs three peers cleanly (smoke)" {
     for (result.banned) |b| try testing.expect(!b);
 }
 
-// ── Phase 2B real scenarios (gated) ─────────────────────────
+// ── Phase 2B scenarios ──────────────────────────────────────
 
-test "phase 2B: disconnect-rejoin one-corrupt-block (gated on Task #26)" {
+test "phase 2B: disconnect-rejoin one-corrupt-block bans corruptor only" {
     // Disconnect-rejoin Phase 2B scenario:
     // - Peer 0 corrupts block 5; connects at tick 0; disconnects at
     //   tick ~30 (after delivering several blocks including block 5).
@@ -409,23 +389,15 @@ test "phase 2B: disconnect-rejoin one-corrupt-block (gated on Task #26)" {
     // - First piece-completion fails hash. SmartBan.onPieceFailed
     //   records per-block hashes attributed to peer 0 (for blocks
     //   peer 0 delivered) and peer 1/2 (for blocks they delivered).
-    // - Crucially: with Task #26 fix in place, peer 0's attribution
-    //   survives peer 0's slot-free via the block_info.delivered_address
-    //   field captured at receive time.
+    // - Crucially: peer 0's attribution survives peer 0's slot-free
+    //   via the block_info.delivered_address field captured at
+    //   receive time.
     // - Piece released; tryAssignPieces re-claims from peers 1, 2.
     // - Re-download passes hash. SmartBan.onPiecePassed compares per-
     //   block hashes against the records.
     // - Block 5's stored hash (peer 0's corrupt 0xcc bytes) differs
     //   from the actual block 5 hash → peer 0's address banned.
     // - Other blocks match → peers 1, 2 NOT banned.
-    if (!phase2_attribution_survives_disconnect) {
-        // Gate active. Sanity-check the scenario shape compiles by
-        // running the harness with a placeholder all-honest spec; the
-        // real behaviour assertion below is gated. When Task #26 lands,
-        // flip `phase2_attribution_survives_disconnect = true`.
-        return;
-    }
-
     const specs: [num_peers]PeerSpec = .{
         .{
             .add_at_tick = 0,
@@ -454,27 +426,17 @@ test "phase 2B: disconnect-rejoin one-corrupt-block (gated on Task #26)" {
     }
 }
 
-test "phase 2B: disconnect-rejoin two-peer-corruption (gated on Task #23)" {
+test "phase 2B: disconnect-rejoin two-peer-corruption (deferred)" {
     // Two corruptors, one acquittee. Peers 0 and 1 each corrupt one
     // block then disconnect. Peer 2 absorbs all released blocks.
     // After re-download, peers 0 AND 1 are banned; peer 2 is not.
     //
-    // **Blocked on Task #23, not #26**: even though Task #26 makes
-    // attribution survive disconnect, this scenario depends on BOTH
-    // peer 0 AND peer 1 actually delivering their corrupted blocks
-    // before disconnect. With today's picker (no late-peer block-
-    // stealing), peer 0 claims all blocks at tryFillPipeline time;
-    // peer 1 has nothing to deliver because peer 0 monopolised the
-    // picker. Peer 0's corrupted block 5 lands; peer 1's corrupted
-    // block 9 never makes it onto the wire. Result: only peer 0 is
-    // banned (correctly, by Phase 2 via attribution-survives-
-    // disconnect). Empirically verified: `result.banned = [true,
-    // false, false]` instead of `[true, true, false]`.
-    //
-    // With Task #23 in place, peer 1 would steal some of peer 0's
-    // claimed blocks (including block 9) → peer 1 actually delivers
-    // → block 9's corruption is captured → Phase 2 bans peer 1 too.
-    if (!multi_source_landed) return;
+    // Deferred until the harness can deterministically force both
+    // corruptors to put their corrupted blocks on the wire before the
+    // first hash failure. Otherwise the assertion can pass or fail
+    // because one corruptor never actually contributed to the failed
+    // piece.
+    if (!deterministic_same_piece_contribution) return;
 
     const specs: [num_peers]PeerSpec = .{
         .{
@@ -499,7 +461,7 @@ test "phase 2B: disconnect-rejoin two-peer-corruption (gated on Task #23)" {
     }
 }
 
-test "phase 2B: steady-state honest-co-located-peer (gated on Task #23)" {
+test "phase 2B: steady-state honest-co-located-peer (deferred)" {
     // Phase 2's archetypal discriminating-power case: peers 0 and 1
     // both stay connected through the failed piece's first
     // completion. Peer 0 corrupts block 5; peer 1 honest. After hash
@@ -507,26 +469,11 @@ test "phase 2B: steady-state honest-co-located-peer (gated on Task #23)" {
     // peer 1 is NOT banned despite contributing blocks to the same
     // piece that peer 0 corrupted.
     //
-    // **Gating reason — discriminating-power non-vacuity**: this
-    // scenario doesn't need Task #26 (no disconnect → snapshot
-    // captures both peers cleanly), but it DOES need Task #23 to
-    // force peer 1 onto the wire as a co-contributor — not just
-    // for distribution proportion, but for the discriminating-power
-    // assertion to be non-vacuous. Without #23, peer 0 monopolises
-    // tryFillPipeline at piece-claim time → peer 1 contributes 0
-    // blocks → peer 1 has no `delivered_address` entries → peer 1
-    // is trivially absent from the per-block compare → "acquittal"
-    // becomes "peer 1 was never in the picture" (same as scenario
-    // 1's peer 2). Phase 2 didn't actually exercise its
-    // discriminator.
-    //
-    // For peer 1 to be a meaningful co-contributor, the picker
-    // needs to spread blocks across both peers (which is what #23
-    // unlocks for the steady-state path). Until then, scenario 3
-    // is either redundant with scenario 1 (peer 1 idle) or needs
-    // the disconnect-rejoin shape to force multi-source. Stays
-    // gated.
-    if (!multi_source_landed) return;
+    // Deferred for discriminating-power non-vacuity: peer 1 must
+    // actually contribute honest blocks to the same failed piece.
+    // Otherwise the "not banned" assertion only proves peer 1 was
+    // absent from the per-block compare.
+    if (!deterministic_same_piece_contribution) return;
 
     const specs: [num_peers]PeerSpec = .{
         .{
