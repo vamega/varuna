@@ -39,6 +39,9 @@ pub const PiecePlan = struct {
     v2_piece_in_file: u32 = 0,
     /// Total number of pieces in the file this piece belongs to.
     v2_file_piece_count: u32 = 0,
+    /// True when a pure-v2 piece belongs to a multi-piece file and must be
+    /// accepted only after the complete file Merkle root verifies.
+    requires_v2_merkle_verification: bool = false,
 
     pub fn deinit(self: PiecePlan, allocator: std.mem.Allocator) void {
         if (self.spans_owned) allocator.free(self.spans);
@@ -129,23 +132,22 @@ pub fn planPieceVerificationWithScratch(
         // Pure v2: use SHA-256 and Merkle tree verification
         const v2_result = try findV2PieceHash(session, piece_index);
         // For single-piece files, pieces_root is the direct SHA-256 hash of the piece.
-        // For multi-piece files, we set expected_hash_v2 to all zeros as a sentinel;
-        // the actual verification uses the Merkle root via verifyPieceBuffer.
-        const expected_v2 = if (v2_result.file_piece_count <= 1)
-            v2_result.pieces_root
-        else
-            [_]u8{0} ** 32; // sentinel: Merkle verification needed
+        // For multi-piece files, keep the real pieces_root in the plan and use
+        // requires_v2_merkle_verification to defer acceptance until the caller
+        // verifies the complete file root.
+        const requires_merkle = v2_result.file_piece_count > 1;
         return .{
             .piece_index = piece_spans.piece_index,
             .piece_length = piece_spans.piece_length,
             .expected_hash = [_]u8{0} ** 20,
-            .expected_hash_v2 = expected_v2,
+            .expected_hash_v2 = v2_result.pieces_root,
             .hash_type = .sha256,
             .spans = piece_spans.spans,
             .spans_owned = piece_spans.spans_owned,
             .v2_pieces_root = v2_result.pieces_root,
             .v2_piece_in_file = v2_result.piece_in_file,
             .v2_file_piece_count = v2_result.file_piece_count,
+            .requires_v2_merkle_verification = requires_merkle,
         };
     }
 
@@ -173,9 +175,9 @@ pub fn planPieceVerificationWithScratch(
 /// The verification strategy for multi-piece v2 files:
 ///   1. The piece hash (SHA-256 of piece data) is computed during verification.
 ///   2. For single-piece files: compare directly against pieces_root.
-///   3. For multi-piece files: the expected_hash_v2 is set to a sentinel,
-///      and the PiecePlan includes the file's pieces_root and the piece's
-///      position within the file so the caller can verify via Merkle proof.
+///   3. For multi-piece files: the PiecePlan carries the file's pieces_root,
+///      the piece's position within the file, and an explicit marker that
+///      acceptance must be deferred until the complete file root is verified.
 fn findV2PieceHash(
     session: *const torrent.session.Session,
     piece_index: u32,
@@ -226,12 +228,10 @@ pub fn verifyPieceBuffer(plan: PiecePlan, piece_data: []const u8) !bool {
         var actual: [32]u8 = undefined;
         Sha256.hash(piece_data, &actual, .{});
 
-        // For single-piece files, expected_hash_v2 is the direct SHA-256 hash.
-        // For multi-piece files, expected_hash_v2 is all zeros (sentinel) and
-        // a stand-alone piece cannot be trusted here because we do not have the
-        // per-piece Merkle proof. Callers must defer acceptance until they can
-        // verify the complete file Merkle root.
-        if (plan.v2_file_piece_count > 1) {
+        // A stand-alone piece from a multi-piece v2 file cannot be trusted here
+        // because this path does not have a per-piece Merkle proof. Callers must
+        // defer acceptance until they can verify the complete file Merkle root.
+        if (plan.requires_v2_merkle_verification or plan.v2_file_piece_count > 1) {
             return error.DeferredMerkleVerificationRequired;
         }
 
@@ -575,19 +575,62 @@ test "verify v2 single-piece file uses direct SHA-256 comparison" {
 }
 
 test "verify v2 multi-piece file requires deferred Merkle verification" {
+    const pieces_root = [_]u8{0xAA} ** 32;
     const plan = PiecePlan{
         .piece_index = 0,
         .piece_length = 4,
         .expected_hash = [_]u8{0} ** 20,
-        .expected_hash_v2 = [_]u8{0} ** 32, // sentinel for multi-piece
+        .expected_hash_v2 = pieces_root,
         .hash_type = .sha256,
         .spans = &.{},
-        .v2_pieces_root = [_]u8{0xAA} ** 32,
+        .v2_pieces_root = pieces_root,
         .v2_piece_in_file = 0,
         .v2_file_piece_count = 3,
+        .requires_v2_merkle_verification = true,
     };
 
     try std.testing.expectError(error.DeferredMerkleVerificationRequired, verifyPieceBuffer(plan, "data"));
+}
+
+fn buildV2PlanTestTorrent(
+    allocator: std.mem.Allocator,
+    pieces_root: [32]u8,
+    name: []const u8,
+    total_len: u64,
+    piece_len: u32,
+) ![]u8 {
+    var buf = std.ArrayList(u8).empty;
+    defer buf.deinit(allocator);
+
+    try buf.appendSlice(allocator, "d4:infod9:file treed");
+    try buf.writer(allocator).print("{d}:{s}", .{ name.len, name });
+    try buf.appendSlice(allocator, "d0:d6:lengthi");
+    try buf.writer(allocator).print("{d}", .{total_len});
+    try buf.appendSlice(allocator, "e11:pieces root32:");
+    try buf.appendSlice(allocator, &pieces_root);
+    try buf.appendSlice(allocator, "eee4:name");
+    try buf.writer(allocator).print("{d}:{s}", .{ name.len, name });
+    try buf.appendSlice(allocator, "12:piece lengthi");
+    try buf.writer(allocator).print("{d}", .{piece_len});
+    try buf.appendSlice(allocator, "eee");
+
+    return buf.toOwnedSlice(allocator);
+}
+
+test "plan verification for v2 multi-piece file exposes deferred Merkle marker" {
+    const pieces_root = [_]u8{0xA7} ** 32;
+    const input = try buildV2PlanTestTorrent(std.testing.allocator, pieces_root, "plan.bin", 8, 4);
+    defer std.testing.allocator.free(input);
+
+    const loaded = try torrent.session.Session.load(std.testing.allocator, input, "/srv/torrents");
+    defer loaded.deinit(std.testing.allocator);
+
+    const plan = try planPieceVerification(std.testing.allocator, &loaded, 0);
+    defer freePiecePlan(std.testing.allocator, plan);
+
+    try std.testing.expect(plan.requires_v2_merkle_verification);
+    try std.testing.expectEqualSlices(u8, &pieces_root, &plan.expected_hash_v2);
+    try std.testing.expectEqual(@as(u32, 2), plan.v2_file_piece_count);
 }
 
 test "verifyV2MerkleRoot matches correct piece hashes" {
