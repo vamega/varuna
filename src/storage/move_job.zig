@@ -123,9 +123,15 @@ pub const MoveJob = struct {
         open_dst,
         copy_file_range,
         fsync_dst_file,
+        close_src_file,
+        close_dst_file,
         unlink_src_file,
         open_fsync_dir,
         fsync_dir,
+        close_dir,
+        cleanup_src_file,
+        cleanup_dst_file,
+        cleanup_dir,
         finish_file,
         done,
     };
@@ -188,6 +194,7 @@ pub const MoveJob = struct {
     dir_fd: posix.fd_t = -1,
     copy_offset: u64 = 0,
     pending_dir_sync: DirectorySyncKind = .dst_parent,
+    cleanup_terminal: State = .failed,
 
     // ── Optional completion callback ──────────────────────
     completion_ctx: ?*anyopaque = null,
@@ -350,7 +357,7 @@ pub const MoveJob = struct {
     fn tickOnEventLoopInternal(self: *MoveJob, io: anytype) !void {
         if (self.io_result) |result| {
             self.io_result = null;
-            try self.handleEventLoopResult(io, result);
+            try self.handleEventLoopResult(result);
         }
         if (self.progress().state != .running or self.io_pending) return;
 
@@ -368,9 +375,13 @@ pub const MoveJob = struct {
             .open_dst => try self.submitOpenDestination(io),
             .copy_file_range => try self.submitCopyFileRange(io),
             .fsync_dst_file => try self.submitFsyncDestinationFile(io),
+            .close_src_file => try self.submitCloseSourceFile(io),
+            .close_dst_file => try self.submitCloseDestinationFile(io),
             .unlink_src_file => try self.submitUnlinkSource(io),
             .open_fsync_dir => try self.submitOpenDirectoryForFsync(io),
             .fsync_dir => try self.submitFsyncDirectory(io),
+            .close_dir => try self.submitCloseDirectory(io),
+            .cleanup_src_file, .cleanup_dst_file, .cleanup_dir => try self.submitNextCleanupClose(io),
             .finish_file => try self.finishCurrentEventLoopFile(),
             .done => self.completeEventLoop(.succeeded),
         }
@@ -421,7 +432,7 @@ pub const MoveJob = struct {
         self.event_stage = .mkdir_next;
     }
 
-    fn handleEventLoopResult(self: *MoveJob, io: anytype, result: ifc.Result) !void {
+    fn handleEventLoopResult(self: *MoveJob, result: ifc.Result) !void {
         switch (self.event_stage) {
             .mkdir_next => {
                 switch (result) {
@@ -485,7 +496,24 @@ pub const MoveJob = struct {
                     .fsync => |r| try r,
                     else => return error.UnexpectedMoveJobCompletion,
                 }
-                self.closeOpenFileFds(io);
+                self.event_stage = .close_src_file;
+            },
+            .close_src_file => {
+                const r = switch (result) {
+                    .close => |r| r,
+                    else => return error.UnexpectedMoveJobCompletion,
+                };
+                self.src_fd = -1;
+                try r;
+                self.event_stage = .close_dst_file;
+            },
+            .close_dst_file => {
+                const r = switch (result) {
+                    .close => |r| r,
+                    else => return error.UnexpectedMoveJobCompletion,
+                };
+                self.dst_fd = -1;
+                try r;
                 self.event_stage = .unlink_src_file;
             },
             .unlink_src_file => {
@@ -511,13 +539,46 @@ pub const MoveJob = struct {
                     .fsync => |r| try r,
                     else => return error.UnexpectedMoveJobCompletion,
                 }
-                self.closeOpenDirFd(io);
+                self.event_stage = .close_dir;
+            },
+            .close_dir => {
+                const r = switch (result) {
+                    .close => |r| r,
+                    else => return error.UnexpectedMoveJobCompletion,
+                };
+                self.dir_fd = -1;
+                try r;
                 switch (self.pending_dir_sync) {
                     .dst_parent => {
                         self.pending_dir_sync = .src_parent;
                         self.event_stage = .open_fsync_dir;
                     },
                     .src_parent => self.event_stage = .finish_file,
+                }
+            },
+            .cleanup_src_file, .cleanup_dst_file, .cleanup_dir => {
+                const r = switch (result) {
+                    .close => |r| r,
+                    else => return error.UnexpectedMoveJobCompletion,
+                };
+                switch (self.event_stage) {
+                    .cleanup_src_file => self.src_fd = -1,
+                    .cleanup_dst_file => self.dst_fd = -1,
+                    .cleanup_dir => self.dir_fd = -1,
+                    else => unreachable,
+                }
+                r catch |err| {
+                    self.recordErrorIfNone(err);
+                    self.cleanup_terminal = .failed;
+                };
+                self.event_stage = switch (self.event_stage) {
+                    .cleanup_src_file => .cleanup_dst_file,
+                    .cleanup_dst_file => .cleanup_dir,
+                    .cleanup_dir => .done,
+                    else => unreachable,
+                };
+                if (self.event_stage == .done) {
+                    self.completeEventLoop(self.cleanup_terminal);
                 }
             },
             else => return error.UnexpectedMoveJobCompletion,
@@ -583,8 +644,7 @@ pub const MoveJob = struct {
 
     fn submitCopyFileRange(self: *MoveJob, io: anytype) !void {
         if (self.cancel_requested.load(.acquire)) {
-            self.closeOpenFileFds(io);
-            self.completeEventLoop(.canceled);
+            self.beginEventLoopCleanup(io, .canceled);
             return;
         }
         const file = self.files[self.current_file_index];
@@ -617,6 +677,22 @@ pub const MoveJob = struct {
             self.io_pending = false;
             return err;
         };
+    }
+
+    fn submitCloseSourceFile(self: *MoveJob, io: anytype) !void {
+        if (self.src_fd < 0) {
+            self.event_stage = .close_dst_file;
+            return;
+        }
+        try self.submitCloseFd(io, self.src_fd);
+    }
+
+    fn submitCloseDestinationFile(self: *MoveJob, io: anytype) !void {
+        if (self.dst_fd < 0) {
+            self.event_stage = .unlink_src_file;
+            return;
+        }
+        try self.submitCloseFd(io, self.dst_fd);
     }
 
     fn submitUnlinkSource(self: *MoveJob, io: anytype) !void {
@@ -659,6 +735,51 @@ pub const MoveJob = struct {
         };
     }
 
+    fn submitCloseDirectory(self: *MoveJob, io: anytype) !void {
+        if (self.dir_fd < 0) {
+            self.event_stage = switch (self.pending_dir_sync) {
+                .dst_parent => blk: {
+                    self.pending_dir_sync = .src_parent;
+                    break :blk .open_fsync_dir;
+                },
+                .src_parent => .finish_file,
+            };
+            return;
+        }
+        try self.submitCloseFd(io, self.dir_fd);
+    }
+
+    fn submitCloseFd(self: *MoveJob, io: anytype, fd: posix.fd_t) !void {
+        self.io_pending = true;
+        io.close(.{
+            .fd = fd,
+        }, &self.io_completion, self, eventLoopCallback) catch |err| {
+            self.io_pending = false;
+            return err;
+        };
+    }
+
+    fn submitNextCleanupClose(self: *MoveJob, io: anytype) !void {
+        while (true) {
+            switch (self.event_stage) {
+                .cleanup_src_file => {
+                    if (self.src_fd >= 0) return self.submitCloseFd(io, self.src_fd);
+                    self.event_stage = .cleanup_dst_file;
+                },
+                .cleanup_dst_file => {
+                    if (self.dst_fd >= 0) return self.submitCloseFd(io, self.dst_fd);
+                    self.event_stage = .cleanup_dir;
+                },
+                .cleanup_dir => {
+                    if (self.dir_fd >= 0) return self.submitCloseFd(io, self.dir_fd);
+                    self.completeEventLoop(self.cleanup_terminal);
+                    return;
+                },
+                else => unreachable,
+            }
+        }
+    }
+
     fn finishCurrentEventLoopFile(self: *MoveJob) !void {
         _ = self.files_done.fetchAdd(1, .acq_rel);
         self.current_file_index += 1;
@@ -679,27 +800,19 @@ pub const MoveJob = struct {
 
     fn failEventLoop(self: *MoveJob, io: anytype, err: anyerror) void {
         self.recordError(err);
-        self.closeOpenFileFds(io);
-        self.closeOpenDirFd(io);
-        self.completeEventLoop(.failed);
+        self.beginEventLoopCleanup(io, .failed);
     }
 
-    fn closeOpenFileFds(self: *MoveJob, io: anytype) void {
-        if (self.src_fd >= 0) {
-            io.closeSocket(self.src_fd);
+    fn beginEventLoopCleanup(self: *MoveJob, io: anytype, terminal: State) void {
+        self.cleanup_terminal = terminal;
+        self.event_stage = .cleanup_src_file;
+        self.submitNextCleanupClose(io) catch |err| {
+            self.recordErrorIfNone(err);
             self.src_fd = -1;
-        }
-        if (self.dst_fd >= 0) {
-            io.closeSocket(self.dst_fd);
             self.dst_fd = -1;
-        }
-    }
-
-    fn closeOpenDirFd(self: *MoveJob, io: anytype) void {
-        if (self.dir_fd >= 0) {
-            io.closeSocket(self.dir_fd);
             self.dir_fd = -1;
-        }
+            self.completeEventLoop(.failed);
+        };
     }
 
     fn freeEventLoopFileState(self: *MoveJob) void {
@@ -839,6 +952,17 @@ pub const MoveJob = struct {
         self.error_mutex.lock();
         defer self.error_mutex.unlock();
         if (self.error_message) |m| self.allocator.free(m);
+        self.error_message = std.fmt.allocPrint(
+            self.allocator,
+            "{s}",
+            .{@errorName(err)},
+        ) catch null;
+    }
+
+    fn recordErrorIfNone(self: *MoveJob, err: anyerror) void {
+        self.error_mutex.lock();
+        defer self.error_mutex.unlock();
+        if (self.error_message != null) return;
         self.error_message = std.fmt.allocPrint(
             self.allocator,
             "{s}",
@@ -1745,8 +1869,41 @@ test "MoveJob: event-loop copy fallback keeps source when destination fsync fail
 
     const p = job.progress();
     try testing.expectEqual(State.failed, p.state);
+    try testing.expectEqualStrings("InputOutput", p.error_message.?);
     try testing.expectEqual(@as(u32, 0), p.files_done);
 
+    var src_buf: [16]u8 = undefined;
+    const src_n = try simReadPath(&io, "/src/torrent/piece.bin", &src_buf);
+    try testing.expectEqualStrings("payload", src_buf[0..src_n]);
+}
+
+test "MoveJob: event-loop copy fallback keeps source when file close fails" {
+    var io = try SimIO.init(testing.allocator, .{
+        .faults = .{ .renameat_exdev_probability = 1.0 },
+    });
+    defer io.deinit();
+
+    try simMkdir(&io, "/src");
+    try simMkdir(&io, "/src/torrent");
+    try simSeedFile(&io, "/src/torrent/piece.bin", "payload");
+    io.config.faults.close_error_probability = 1.0;
+
+    var files = [_]MoveJob.File{.{
+        .relative_path = "torrent/piece.bin",
+        .length = 7,
+    }};
+    var job = try MoveJob.createForFiles(testing.allocator, 12, "/src", "/dst", &files);
+    defer job.destroy();
+
+    try job.startOnEventLoop(null, null);
+    try expectSimEventLoopEventuallyState(job, &io, .failed, 200);
+
+    const p = job.progress();
+    try testing.expectEqual(State.failed, p.state);
+    try testing.expectEqualStrings("InputOutput", p.error_message.?);
+    try testing.expectEqual(@as(u32, 0), p.files_done);
+
+    io.config.faults.close_error_probability = 0.0;
     var src_buf: [16]u8 = undefined;
     const src_n = try simReadPath(&io, "/src/torrent/piece.bin", &src_buf);
     try testing.expectEqualStrings("payload", src_buf[0..src_n]);
@@ -1756,9 +1913,9 @@ test "MoveJob: scheduler policy submits one operation per active job tick" {
     var files_a = [_]MoveJob.File{.{ .relative_path = "a.bin", .length = 1 }};
     var files_b = [_]MoveJob.File{.{ .relative_path = "b.bin", .length = 1 }};
 
-    var job_a = try MoveJob.createForFiles(testing.allocator, 12, "/src-a", "/dst-a", &files_a);
+    var job_a = try MoveJob.createForFiles(testing.allocator, 13, "/src-a", "/dst-a", &files_a);
     defer job_a.destroy();
-    var job_b = try MoveJob.createForFiles(testing.allocator, 13, "/src-b", "/dst-b", &files_b);
+    var job_b = try MoveJob.createForFiles(testing.allocator, 14, "/src-b", "/dst-b", &files_b);
     defer job_b.destroy();
 
     try job_a.startOnEventLoop(null, null);
