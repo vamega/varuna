@@ -765,21 +765,7 @@ pub fn build(b: *std.Build) void {
     test_sim_smart_ban_step.dependOn(&run_sim_smart_ban_tests.step);
     test_step.dependOn(&run_sim_smart_ban_tests.step);
 
-    // ── Smart-ban swarm test (pre-scaffolded for EventLoop swap) ─
-    const sim_smart_ban_swarm_tests = b.addTest(.{
-        .root_module = b.createModule(.{
-            .root_source_file = b.path("tests/sim_smart_ban_swarm_test.zig"),
-            .target = target,
-            .optimize = optimize,
-            .imports = &varuna_import,
-        }),
-    });
-    const run_sim_smart_ban_swarm_tests = b.addRunArtifact(sim_smart_ban_swarm_tests);
-    const test_sim_smart_ban_swarm_step = b.step("test-sim-smart-ban-swarm", "Run smart-ban swarm test (8 seeds, EventLoop-shaped)");
-    test_sim_smart_ban_swarm_step.dependOn(&run_sim_smart_ban_swarm_tests.step);
-    test_step.dependOn(&run_sim_smart_ban_swarm_tests.step);
-
-    // ── Smart-ban EventLoop integration test (scaffold only today) ─
+    // ── Smart-ban EventLoop integration test ────────────────────
     const sim_smart_ban_eventloop_tests = b.addTest(.{
         .root_module = b.createModule(.{
             .root_source_file = b.path("tests/sim_smart_ban_eventloop_test.zig"),
@@ -789,7 +775,7 @@ pub fn build(b: *std.Build) void {
         }),
     });
     const run_sim_smart_ban_eventloop_tests = b.addRunArtifact(sim_smart_ban_eventloop_tests);
-    const test_sim_smart_ban_eventloop_step = b.step("test-sim-smart-ban-eventloop", "Run smart-ban EventLoop integration (scaffold; lights up after Stage 2 #12)");
+    const test_sim_smart_ban_eventloop_step = b.step("test-sim-smart-ban-eventloop", "Run smart-ban EventLoop integration tests");
     test_sim_smart_ban_eventloop_step.dependOn(&run_sim_smart_ban_eventloop_tests.step);
     test_step.dependOn(&run_sim_smart_ban_eventloop_tests.step);
 

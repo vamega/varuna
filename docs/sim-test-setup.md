@@ -259,11 +259,10 @@ test "smart-ban swarm vs. real EventLoop" {
 }
 ```
 
-The same shape lives in `tests/sim_smart_ban_swarm_test.zig` today
-against a hand-rolled `Downloader` stub — when this design lands, the
-hand-rolled side is replaced with the EventLoop driver, and the
-assertions move from `downloader.links[i].banned` to
-`sim.driver.getPeerView(slots[i]).?.is_banned`. Nothing else changes.
+The production EventLoop version now lives in
+`tests/sim_smart_ban_eventloop_test.zig`. It replaced the earlier
+hand-rolled downloader scaffold and should be the smart-ban swarm
+integration reference going forward.
 
 ---
 
