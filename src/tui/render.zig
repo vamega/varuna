@@ -13,7 +13,7 @@ const Style = enum { reset, dim, bright, accent, blue, green, marked, inverse };
 
 pub fn renderFrame(allocator: std.mem.Allocator, state: *const model.AppState, options: RenderOptions) ![]u8 {
     const width: usize = @max(options.width, 82);
-    const height: usize = @max(options.height, 24);
+    const height: usize = @max(options.height, 5);
     const color = options.color;
     const main_h: usize = height - 5;
 
@@ -31,12 +31,13 @@ pub fn renderFrame(allocator: std.mem.Allocator, state: *const model.AppState, o
     const modal_top = if (main_h > modal_h) (main_h - modal_h) / 2 else 0;
 
     try appendPanelRule(&out, allocator, left_w, center_w, right_w, .top);
+    const modal_open = state.add_torrent_open or state.filter_open;
     var row: usize = 0;
     while (row < main_h) : (row += 1) {
-        if (state.add_torrent_open and row >= modal_top and row < modal_top + modal_h) {
+        if (modal_open and row >= modal_top and row < modal_top + modal_h) {
             try renderModalOverlayRow(&out, allocator, state, row - modal_top, width, modal_w, color);
         } else {
-            try renderMainRow(&out, allocator, state, row, left_w, center_w, right_w, color);
+            try renderMainRow(&out, allocator, state, row, main_h, left_w, center_w, right_w, color);
         }
     }
     try appendPanelRule(&out, allocator, left_w, center_w, right_w, .bottom);
@@ -67,6 +68,7 @@ fn renderMainRow(
     allocator: std.mem.Allocator,
     state: *const model.AppState,
     row: usize,
+    main_h: usize,
     left_w: usize,
     center_w: usize,
     right_w: usize,
@@ -75,9 +77,9 @@ fn renderMainRow(
     try out.appendSlice(allocator, "│");
     try renderLeftCell(out, allocator, state, row, left_w, color);
     try out.appendSlice(allocator, "│");
-    try renderTorrentCell(out, allocator, state, row, center_w, color);
+    try renderTorrentCell(out, allocator, state, row, main_h, center_w, color);
     try out.appendSlice(allocator, "│");
-    try renderDetailCell(out, allocator, state, row, right_w, color);
+    try renderDetailCell(out, allocator, state, row, main_h, right_w, color);
     try out.appendSlice(allocator, "│\n");
 }
 
@@ -106,16 +108,18 @@ fn renderLeftCell(out: *std.ArrayList(u8), allocator: std.mem.Allocator, state: 
     try appendPadded(out, allocator, cell.items, width);
 }
 
-fn renderTorrentCell(out: *std.ArrayList(u8), allocator: std.mem.Allocator, state: *const model.AppState, row: usize, width: usize, color: bool) !void {
+fn renderTorrentCell(out: *std.ArrayList(u8), allocator: std.mem.Allocator, state: *const model.AppState, row: usize, main_h: usize, width: usize, color: bool) !void {
     var cell = std.ArrayList(u8).empty;
     defer cell.deinit(allocator);
     if (row == 0) {
         try panelTitle(&cell, allocator, "Torrents [2]", state.active_pane == .torrents, color);
-        try cell.print(allocator, "  {d}", .{state.visibleTorrentCount()});
+        try cell.print(allocator, "  {d}  sort {s}{s}", .{ state.visibleTorrentCount(), state.sort_key.label(), state.sort_direction.symbol() });
+        if (state.filterQuery().len > 0) try cell.print(allocator, "  filter {s}", .{state.filterQuery()});
     } else if (row == 1) {
         try appendTorrentHeader(&cell, allocator, width, color);
     } else {
-        const visible_row = row - 2;
+        const visible_rows = main_h -| 2;
+        const visible_row = state.effectiveTorrentScrollOffset(visible_rows) + row - 2;
         if (state.visibleTorrentIndexAt(visible_row)) |idx| {
             try appendTorrentRow(&cell, allocator, &state.torrents[idx], idx == state.selected_index, state.marked[idx], width, color);
         }
@@ -123,7 +127,7 @@ fn renderTorrentCell(out: *std.ArrayList(u8), allocator: std.mem.Allocator, stat
     try appendPadded(out, allocator, cell.items, width);
 }
 
-fn renderDetailCell(out: *std.ArrayList(u8), allocator: std.mem.Allocator, state: *const model.AppState, row: usize, width: usize, color: bool) !void {
+fn renderDetailCell(out: *std.ArrayList(u8), allocator: std.mem.Allocator, state: *const model.AppState, row: usize, main_h: usize, width: usize, color: bool) !void {
     var cell = std.ArrayList(u8).empty;
     defer cell.deinit(allocator);
     const torrent = state.selectedTorrentConst();
@@ -139,11 +143,17 @@ fn renderDetailCell(out: *std.ArrayList(u8), allocator: std.mem.Allocator, state
     } else if (row == 3) {
         try progressBar(&cell, allocator, torrent.progress, @min(width, @as(usize, 28)), torrent.status);
     } else {
-        switch (state.detail_tab) {
-            .files => try renderFilesDetail(&cell, allocator, torrent, row - 4, color),
-            .peers => try renderPeersDetail(&cell, allocator, torrent, row - 4, color),
-            .trackers => try renderTrackersDetail(&cell, allocator, torrent, row - 4),
-            .info => try renderInfoDetail(&cell, allocator, torrent, row - 4),
+        const visible_rows = main_h -| 4;
+        const detail_row = state.effectiveDetailScrollOffset(visible_rows) + row - 4;
+        if (detail_row < state.detailItemCount()) {
+            const selected = state.active_pane == .detail and detail_row == state.detail_selected_row;
+            try cell.appendSlice(allocator, if (selected) "▶ " else "  ");
+            switch (state.detail_tab) {
+                .files => try renderFilesDetail(&cell, allocator, torrent, detail_row, color),
+                .peers => try renderPeersDetail(&cell, allocator, torrent, detail_row, color),
+                .trackers => try renderTrackersDetail(&cell, allocator, torrent, detail_row),
+                .info => try renderInfoDetail(&cell, allocator, torrent, detail_row),
+            }
         }
     }
     try appendPadded(out, allocator, cell.items, width);
@@ -232,6 +242,11 @@ fn renderInfoDetail(out: *std.ArrayList(u8), allocator: std.mem.Allocator, torre
 fn renderModalOverlayRow(out: *std.ArrayList(u8), allocator: std.mem.Allocator, state: *const model.AppState, row: usize, width: usize, modal_w: usize, color: bool) !void {
     const left_pad = (width - modal_w) / 2;
     const right_pad = width - modal_w - left_pad;
+    const title = if (state.add_torrent_open) "Add torrent" else "Filter torrents";
+    const subtitle = if (state.add_torrent_open) "Paste a magnet link, info hash, or .torrent path" else "Match name, tracker, category, or status";
+    const help = if (state.add_torrent_open) "Enter adds mock torrent   Esc cancels" else "Enter applies filter   Esc closes   Ctrl-U clears";
+    const input_text = if (state.add_torrent_open) state.addTorrentInput() else state.filterQuery();
+    const placeholder = if (state.add_torrent_open) "magnet:?xt=urn:btih:..." else "linuxtracker, seeding, #linux...";
     try appendRepeat(out, allocator, ' ', left_pad);
     switch (row) {
         0 => {
@@ -239,19 +254,19 @@ fn renderModalOverlayRow(out: *std.ArrayList(u8), allocator: std.mem.Allocator, 
             try appendGlyphRepeat(out, allocator, "─", modal_w - 2);
             try out.appendSlice(allocator, "╮");
         },
-        1 => try renderModalLine(out, allocator, "Add torrent", modal_w, .accent, color),
-        2 => try renderModalLine(out, allocator, "Paste a magnet link, info hash, or .torrent path", modal_w, .bright, color),
+        1 => try renderModalLine(out, allocator, title, modal_w, .accent, color),
+        2 => try renderModalLine(out, allocator, subtitle, modal_w, .bright, color),
         3 => {
             var input = std.ArrayList(u8).empty;
             defer input.deinit(allocator);
             try style(&input, allocator, "› ", .accent, color);
-            try input.appendSlice(allocator, state.addTorrentInput());
-            if (state.addTorrentInput().len == 0) {
-                try style(&input, allocator, "magnet:?xt=urn:btih:...", .dim, color);
+            try input.appendSlice(allocator, input_text);
+            if (input_text.len == 0) {
+                try style(&input, allocator, placeholder, .dim, color);
             }
             try renderModalLine(out, allocator, input.items, modal_w, .reset, false);
         },
-        4 => try renderModalLine(out, allocator, "Enter adds mock torrent   Esc cancels", modal_w, .dim, color),
+        4 => try renderModalLine(out, allocator, help, modal_w, .dim, color),
         5 => try renderModalLine(out, allocator, "", modal_w, .reset, color),
         else => {
             try out.appendSlice(allocator, "╰");
@@ -307,6 +322,7 @@ fn renderFooter(out: *std.ArrayList(u8), allocator: std.mem.Allocator, width: us
     try key(&footer, allocator, "space", "pause", color);
     try key(&footer, allocator, "m", "mark", color);
     try key(&footer, allocator, "a", "add", color);
+    try key(&footer, allocator, "s/S", "sort", color);
     try key(&footer, allocator, "[/]", "tab", color);
     try key(&footer, allocator, "/", "filter", color);
     try key(&footer, allocator, "d", "remove", color);

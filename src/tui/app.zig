@@ -41,14 +41,17 @@ pub const Model = struct {
         if (self.state.add_torrent_open) {
             return self.handleAddTorrentKey(key);
         }
+        if (self.state.filter_open) {
+            return self.handleFilterKey(key);
+        }
 
         switch (key.key) {
             .char => |ch| switch (ch) {
                 'q' => return .quit,
                 'j' => self.state.moveActiveSelection(1),
                 'k' => self.state.moveActiveSelection(-1),
-                'g' => self.state.selected_index = 0,
-                'G' => self.state.selected_index = self.state.torrents.len - 1,
+                'g' => self.state.selectFirstVisible(),
+                'G' => self.state.selectLastVisible(),
                 'h' => self.state.prevPane(),
                 'l' => self.state.nextPane(),
                 '1' => self.state.active_pane = .filters,
@@ -57,10 +60,12 @@ pub const Model = struct {
                 '[' => self.state.prevDetailTab(),
                 ']' => self.state.nextDetailTab(),
                 '?' => self.state.show_help = !self.state.show_help,
-                '/' => self.state.filter_open = true,
+                '/' => self.state.openFilterModal(),
                 'd' => self.state.show_remove_confirm = true,
                 'a' => self.state.openAddTorrentModal(),
                 'm' => self.state.toggleMarkSelected(),
+                's' => self.state.cycleSortKey(),
+                'S' => self.state.toggleSortDirection(),
                 else => {},
             },
             .space => self.state.togglePauseSelected(),
@@ -68,12 +73,12 @@ pub const Model = struct {
             .down => self.state.moveActiveSelection(1),
             .left => self.state.prevPane(),
             .right => self.state.nextPane(),
-            .home => self.state.selected_index = 0,
-            .end => self.state.selected_index = self.state.torrents.len - 1,
+            .home => self.state.selectFirstVisible(),
+            .end => self.state.selectLastVisible(),
             .escape => {
                 self.state.show_help = false;
                 self.state.show_remove_confirm = false;
-                self.state.filter_open = false;
+                self.state.closeFilterModal();
             },
             else => {},
         }
@@ -87,6 +92,24 @@ pub const Model = struct {
             .backspace => self.state.backspaceAddTorrentText(),
             .space => self.state.appendAddTorrentChar(' '),
             .char => |ch| if (!key.modifiers.ctrl and !key.modifiers.alt) self.state.appendAddTorrentChar(ch),
+            else => {},
+        }
+        return .none;
+    }
+
+    fn handleFilterKey(self: *Model, key: zz.msg.Key) zz.Cmd(Msg) {
+        switch (key.key) {
+            .enter => self.state.closeFilterModal(),
+            .escape => self.state.closeFilterModal(),
+            .backspace => self.state.backspaceFilterQuery(),
+            .space => self.state.appendFilterChar(' '),
+            .char => |ch| {
+                if (key.modifiers.ctrl and ch == 'u') {
+                    self.state.clearFilterQuery();
+                } else if (!key.modifiers.ctrl and !key.modifiers.alt) {
+                    self.state.appendFilterChar(ch);
+                }
+            },
             else => {},
         }
         return .none;

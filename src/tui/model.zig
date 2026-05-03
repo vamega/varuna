@@ -87,6 +87,62 @@ pub const Filter = enum {
     }
 };
 
+pub const SortKey = enum {
+    queue,
+    name,
+    progress,
+    down,
+    up,
+    peers,
+    ratio,
+    status,
+
+    pub fn label(self: SortKey) []const u8 {
+        return switch (self) {
+            .queue => "queue",
+            .name => "name",
+            .progress => "progress",
+            .down => "down",
+            .up => "up",
+            .peers => "peers",
+            .ratio => "ratio",
+            .status => "status",
+        };
+    }
+
+    pub fn next(self: SortKey) SortKey {
+        return switch (self) {
+            .queue => .name,
+            .name => .progress,
+            .progress => .down,
+            .down => .up,
+            .up => .peers,
+            .peers => .ratio,
+            .ratio => .status,
+            .status => .queue,
+        };
+    }
+};
+
+pub const SortDirection = enum {
+    asc,
+    desc,
+
+    pub fn toggle(self: SortDirection) SortDirection {
+        return switch (self) {
+            .asc => .desc,
+            .desc => .asc,
+        };
+    }
+
+    pub fn symbol(self: SortDirection) []const u8 {
+        return switch (self) {
+            .asc => "↑",
+            .desc => "↓",
+        };
+    }
+};
+
 pub const AppState = struct {
     torrents: [mock_data.initial_torrents.len]mock_data.Torrent,
     marked: [mock_data.initial_torrents.len]bool = [_]bool{false} ** mock_data.initial_torrents.len,
@@ -94,6 +150,13 @@ pub const AppState = struct {
     filter_index: usize = 0,
     active_pane: Pane = .torrents,
     detail_tab: DetailTab = .files,
+    detail_selected_row: usize = 0,
+    torrent_scroll_offset: usize = 0,
+    detail_scroll_offset: usize = 0,
+    sort_key: SortKey = .queue,
+    sort_direction: SortDirection = .asc,
+    filter_query: [128]u8 = undefined,
+    filter_query_len: usize = 0,
     show_help: bool = false,
     show_remove_confirm: bool = false,
     filter_open: bool = false,
@@ -117,17 +180,11 @@ pub const AppState = struct {
 
     pub fn moveSelection(self: *AppState, delta: isize) void {
         self.ensureSelectedVisible();
-        if (delta < 0) {
-            var steps: usize = @intCast(-delta);
-            while (steps > 0) : (steps -= 1) {
-                self.selected_index = self.previousVisibleTorrentIndex(self.selected_index) orelse self.selected_index;
-            }
-        } else {
-            var steps: usize = @intCast(delta);
-            while (steps > 0) : (steps -= 1) {
-                self.selected_index = self.nextVisibleTorrentIndex(self.selected_index) orelse self.selected_index;
-            }
-        }
+        const count = self.visibleTorrentCount();
+        if (count == 0) return;
+        const current = self.visiblePositionOf(self.selected_index) orelse 0;
+        const target = addClamped(current, delta, count - 1);
+        self.selected_index = self.visibleTorrentIndexAt(target) orelse self.selected_index;
     }
 
     pub fn moveActiveSelection(self: *AppState, delta: isize) void {
@@ -149,16 +206,17 @@ pub const AppState = struct {
             self.filter_index = @min(Filter.values.len - 1, self.filter_index + @as(usize, @intCast(delta)));
         }
         self.ensureSelectedVisible();
+        self.torrent_scroll_offset = 0;
     }
 
     pub fn moveDetailSelection(self: *AppState, delta: isize) void {
-        if (delta < 0) {
-            var steps: usize = @intCast(-delta);
-            while (steps > 0) : (steps -= 1) self.prevDetailTab();
-        } else {
-            var steps: usize = @intCast(delta);
-            while (steps > 0) : (steps -= 1) self.nextDetailTab();
+        const count = self.detailItemCount();
+        if (count == 0) {
+            self.detail_selected_row = 0;
+            self.detail_scroll_offset = 0;
+            return;
         }
+        self.detail_selected_row = addClamped(@min(self.detail_selected_row, count - 1), delta, count - 1);
     }
 
     pub fn nextPane(self: *AppState) void {
@@ -171,10 +229,12 @@ pub const AppState = struct {
 
     pub fn nextDetailTab(self: *AppState) void {
         self.detail_tab = self.detail_tab.next();
+        self.resetDetailScroll();
     }
 
     pub fn prevDetailTab(self: *AppState) void {
         self.detail_tab = self.detail_tab.prev();
+        self.resetDetailScroll();
     }
 
     pub fn togglePauseSelected(self: *AppState) void {
@@ -194,21 +254,133 @@ pub const AppState = struct {
     }
 
     pub fn visibleTorrentIndexAt(self: *const AppState, visible_row: usize) ?usize {
-        var visible: usize = 0;
-        for (self.torrents, 0..) |torrent, i| {
-            if (!self.selectedFilter().matches(torrent)) continue;
-            if (visible == visible_row) return i;
-            visible += 1;
-        }
-        return null;
+        var indexes: [mock_data.initial_torrents.len]usize = undefined;
+        const count = self.sortedVisibleIndexes(&indexes);
+        if (visible_row >= count) return null;
+        return indexes[visible_row];
     }
 
     pub fn visibleTorrentCount(self: *const AppState) usize {
         var count: usize = 0;
-        for (self.torrents) |torrent| {
-            if (self.selectedFilter().matches(torrent)) count += 1;
+        for (self.torrents, 0..) |_, i| {
+            if (self.torrentMatchesVisibleFilters(i)) count += 1;
         }
         return count;
+    }
+
+    pub fn ensureTorrentVisible(self: *AppState, view_rows: usize) void {
+        self.torrent_scroll_offset = self.effectiveTorrentScrollOffset(view_rows);
+    }
+
+    pub fn effectiveTorrentScrollOffset(self: *const AppState, view_rows: usize) usize {
+        if (view_rows == 0) return 0;
+        const count = self.visibleTorrentCount();
+        if (count <= view_rows) return 0;
+
+        const offset = @min(self.torrent_scroll_offset, count - view_rows);
+        const selected_position = self.visiblePositionOf(self.visibleSelectedIndex()) orelse 0;
+        if (selected_position < offset) return selected_position;
+        if (selected_position >= offset + view_rows) return selected_position - view_rows + 1;
+        return offset;
+    }
+
+    pub fn detailItemCount(self: *const AppState) usize {
+        const torrent = self.selectedTorrentConst();
+        return switch (self.detail_tab) {
+            .files => torrent.files.len,
+            .peers => torrent.peers_list.len,
+            .trackers => 3,
+            .info => 5,
+        };
+    }
+
+    pub fn ensureDetailVisible(self: *AppState, view_rows: usize) void {
+        self.detail_scroll_offset = self.effectiveDetailScrollOffset(view_rows);
+    }
+
+    pub fn effectiveDetailScrollOffset(self: *const AppState, view_rows: usize) usize {
+        if (view_rows == 0) return 0;
+        const count = self.detailItemCount();
+        if (count <= view_rows) return 0;
+
+        const offset = @min(self.detail_scroll_offset, count - view_rows);
+        const selected_row = @min(self.detail_selected_row, count - 1);
+        if (selected_row < offset) return selected_row;
+        if (selected_row >= offset + view_rows) return selected_row - view_rows + 1;
+        return offset;
+    }
+
+    pub fn selectFirstVisible(self: *AppState) void {
+        if (self.visibleTorrentIndexAt(0)) |idx| self.selected_index = idx;
+        self.torrent_scroll_offset = 0;
+    }
+
+    pub fn selectLastVisible(self: *AppState) void {
+        const count = self.visibleTorrentCount();
+        if (count == 0) return;
+        if (self.visibleTorrentIndexAt(count - 1)) |idx| self.selected_index = idx;
+    }
+
+    pub fn setSort(self: *AppState, key: SortKey, direction: SortDirection) void {
+        self.sort_key = key;
+        self.sort_direction = direction;
+        self.ensureSelectedVisible();
+    }
+
+    pub fn cycleSortKey(self: *AppState) void {
+        self.setSort(self.sort_key.next(), self.sort_direction);
+    }
+
+    pub fn toggleSortDirection(self: *AppState) void {
+        self.setSort(self.sort_key, self.sort_direction.toggle());
+    }
+
+    pub fn filterQuery(self: *const AppState) []const u8 {
+        return self.filter_query[0..self.filter_query_len];
+    }
+
+    pub fn openFilterModal(self: *AppState) void {
+        self.filter_open = true;
+    }
+
+    pub fn closeFilterModal(self: *AppState) void {
+        self.filter_open = false;
+        self.ensureSelectedVisible();
+    }
+
+    pub fn setFilterQuery(self: *AppState, text: []const u8) void {
+        self.filter_query_len = 0;
+        self.appendFilterText(text);
+        self.ensureSelectedVisible();
+        self.torrent_scroll_offset = 0;
+    }
+
+    pub fn appendFilterText(self: *AppState, text: []const u8) void {
+        const available = self.filter_query.len - self.filter_query_len;
+        const n = @min(available, text.len);
+        @memcpy(self.filter_query[self.filter_query_len..][0..n], text[0..n]);
+        self.filter_query_len += n;
+        self.ensureSelectedVisible();
+    }
+
+    pub fn appendFilterChar(self: *AppState, ch: u21) void {
+        var buf: [4]u8 = undefined;
+        const len = std.unicode.utf8Encode(ch, &buf) catch return;
+        self.appendFilterText(buf[0..len]);
+    }
+
+    pub fn backspaceFilterQuery(self: *AppState) void {
+        if (self.filter_query_len == 0) return;
+        self.filter_query_len -= 1;
+        while (self.filter_query_len > 0 and (self.filter_query[self.filter_query_len] & 0xc0) == 0x80) {
+            self.filter_query_len -= 1;
+        }
+        self.ensureSelectedVisible();
+    }
+
+    pub fn clearFilterQuery(self: *AppState) void {
+        self.filter_query_len = 0;
+        self.ensureSelectedVisible();
     }
 
     pub fn openAddTorrentModal(self: *AppState) void {
@@ -261,41 +433,151 @@ pub const AppState = struct {
         }
     }
 
+    pub fn torrentMatchesVisibleFilters(self: *const AppState, index: usize) bool {
+        const torrent = self.torrents[index];
+        if (!self.selectedFilter().matches(torrent)) return false;
+        const query = self.filterQuery();
+        if (query.len == 0) return true;
+        return containsAsciiIgnoreCase(torrent.name, query) or
+            containsAsciiIgnoreCase(torrent.tracker, query) or
+            containsAsciiIgnoreCase(torrent.category, query) or
+            containsAsciiIgnoreCase(torrent.status.label(), query);
+    }
+
     fn ensureSelectedVisible(self: *AppState) void {
-        if (self.selectedFilter().matches(self.torrents[self.selected_index])) return;
+        if (self.torrentMatchesVisibleFilters(self.selected_index)) return;
         if (self.firstVisibleTorrentIndex()) |idx| self.selected_index = idx;
+        self.resetDetailScroll();
     }
 
     fn visibleSelectedIndex(self: *const AppState) usize {
-        if (self.selectedFilter().matches(self.torrents[self.selected_index])) return self.selected_index;
+        if (self.torrentMatchesVisibleFilters(self.selected_index)) return self.selected_index;
         return self.firstVisibleTorrentIndex() orelse self.selected_index;
     }
 
     fn firstVisibleTorrentIndex(self: *const AppState) ?usize {
-        for (self.torrents, 0..) |torrent, i| {
-            if (self.selectedFilter().matches(torrent)) return i;
-        }
-        return null;
+        return self.visibleTorrentIndexAt(0);
     }
 
     fn previousVisibleTorrentIndex(self: *const AppState, from: usize) ?usize {
-        if (from == 0) return null;
-        var i = from;
-        while (i > 0) {
-            i -= 1;
-            if (self.selectedFilter().matches(self.torrents[i])) return i;
+        const position = self.visiblePositionOf(from) orelse return self.firstVisibleTorrentIndex();
+        if (position == 0) return null;
+        return self.visibleTorrentIndexAt(position - 1);
+    }
+
+    fn nextVisibleTorrentIndex(self: *const AppState, from: usize) ?usize {
+        const position = self.visiblePositionOf(from) orelse return self.firstVisibleTorrentIndex();
+        return self.visibleTorrentIndexAt(position + 1);
+    }
+
+    fn resetDetailScroll(self: *AppState) void {
+        self.detail_selected_row = 0;
+        self.detail_scroll_offset = 0;
+    }
+
+    fn visiblePositionOf(self: *const AppState, torrent_index: usize) ?usize {
+        var indexes: [mock_data.initial_torrents.len]usize = undefined;
+        const count = self.sortedVisibleIndexes(&indexes);
+        for (indexes[0..count], 0..) |idx, position| {
+            if (idx == torrent_index) return position;
         }
         return null;
     }
 
-    fn nextVisibleTorrentIndex(self: *const AppState, from: usize) ?usize {
-        var i = from + 1;
-        while (i < self.torrents.len) : (i += 1) {
-            if (self.selectedFilter().matches(self.torrents[i])) return i;
+    fn sortedVisibleIndexes(self: *const AppState, out: *[mock_data.initial_torrents.len]usize) usize {
+        var count: usize = 0;
+        for (self.torrents, 0..) |_, idx| {
+            if (!self.torrentMatchesVisibleFilters(idx)) continue;
+            out[count] = idx;
+            count += 1;
         }
-        return null;
+
+        var i: usize = 1;
+        while (i < count) : (i += 1) {
+            const value = out[i];
+            var j = i;
+            while (j > 0 and self.lessTorrentIndex(value, out[j - 1])) : (j -= 1) {
+                out[j] = out[j - 1];
+            }
+            out[j] = value;
+        }
+        return count;
+    }
+
+    fn lessTorrentIndex(self: *const AppState, left: usize, right: usize) bool {
+        const cmp = self.compareTorrentIndex(left, right);
+        if (cmp == 0) return left < right;
+        return switch (self.sort_direction) {
+            .asc => cmp < 0,
+            .desc => cmp > 0,
+        };
+    }
+
+    fn compareTorrentIndex(self: *const AppState, left: usize, right: usize) i8 {
+        const a = self.torrents[left];
+        const b = self.torrents[right];
+        return switch (self.sort_key) {
+            .queue => compareUsize(left, right),
+            .name => compareAsciiIgnoreCase(a.name, b.name),
+            .progress => compareFloat(a.progress, b.progress),
+            .down => compareFloat(a.down_mib, b.down_mib),
+            .up => compareFloat(a.up_mib, b.up_mib),
+            .peers => compareU32(@as(u32, a.seeds) + @as(u32, a.peers), @as(u32, b.seeds) + @as(u32, b.peers)),
+            .ratio => compareFloat(a.ratio, b.ratio),
+            .status => compareAsciiIgnoreCase(a.status.label(), b.status.label()),
+        };
     }
 };
+
+fn addClamped(value: usize, delta: isize, max_value: usize) usize {
+    if (delta < 0) return value -| @as(usize, @intCast(-delta));
+    return @min(max_value, value + @as(usize, @intCast(delta)));
+}
+
+fn compareUsize(left: usize, right: usize) i8 {
+    if (left < right) return -1;
+    if (left > right) return 1;
+    return 0;
+}
+
+fn compareU32(left: u32, right: u32) i8 {
+    if (left < right) return -1;
+    if (left > right) return 1;
+    return 0;
+}
+
+fn compareFloat(left: f64, right: f64) i8 {
+    if (left < right) return -1;
+    if (left > right) return 1;
+    return 0;
+}
+
+fn compareAsciiIgnoreCase(left: []const u8, right: []const u8) i8 {
+    const n = @min(left.len, right.len);
+    var i: usize = 0;
+    while (i < n) : (i += 1) {
+        const a = std.ascii.toLower(left[i]);
+        const b = std.ascii.toLower(right[i]);
+        if (a < b) return -1;
+        if (a > b) return 1;
+    }
+    return compareUsize(left.len, right.len);
+}
+
+fn containsAsciiIgnoreCase(haystack: []const u8, needle: []const u8) bool {
+    if (needle.len == 0) return true;
+    if (needle.len > haystack.len) return false;
+
+    var start: usize = 0;
+    while (start + needle.len <= haystack.len) : (start += 1) {
+        var i: usize = 0;
+        while (i < needle.len) : (i += 1) {
+            if (std.ascii.toLower(haystack[start + i]) != std.ascii.toLower(needle[i])) break;
+        }
+        if (i == needle.len) return true;
+    }
+    return false;
+}
 
 pub fn handleKey(state: *AppState, input: []const u8) bool {
     if (input.len == 0) return true;
@@ -339,8 +621,13 @@ pub fn handleKey(state: *AppState, input: []const u8) bool {
         }
         if (state.filter_open) {
             switch (ch) {
-                27, 13, 'q' => state.filter_open = false,
-                else => {},
+                13, 27 => state.closeFilterModal(),
+                8, 127 => state.backspaceFilterQuery(),
+                21 => state.clearFilterQuery(),
+                else => if (ch >= 32 and ch < 127) {
+                    const one = [_]u8{ch};
+                    state.appendFilterText(one[0..]);
+                },
             }
             continue;
         }
@@ -349,8 +636,8 @@ pub fn handleKey(state: *AppState, input: []const u8) bool {
             'q' => return false,
             'j' => state.moveActiveSelection(1),
             'k' => state.moveActiveSelection(-1),
-            'g' => state.selected_index = 0,
-            'G' => state.selected_index = state.torrents.len - 1,
+            'g' => state.selectFirstVisible(),
+            'G' => state.selectLastVisible(),
             'h' => state.prevPane(),
             'l' => state.nextPane(),
             '1' => state.active_pane = .filters,
@@ -362,7 +649,9 @@ pub fn handleKey(state: *AppState, input: []const u8) bool {
             'a' => state.openAddTorrentModal(),
             'm' => state.toggleMarkSelected(),
             '?' => state.show_help = !state.show_help,
-            '/' => state.filter_open = true,
+            '/' => state.openFilterModal(),
+            's' => state.cycleSortKey(),
+            'S' => state.toggleSortDirection(),
             'd' => state.show_remove_confirm = true,
             27 => state.show_help = false,
             else => {},
