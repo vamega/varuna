@@ -73,7 +73,18 @@ pub fn main() !void {
     const command = args[cmd_start];
     _ = output_format;
 
-    if (std.mem.eql(u8, command, "list")) {
+    const diagnostic_request = cli.parseDiagnosticRequest(args, cmd_start) catch |err| {
+        try stdout.print("error: invalid diagnostic command ({s})\n", .{@errorName(err)});
+        try printDiagnosticUsage(stdout);
+        try stdout.flush();
+        return;
+    };
+
+    if (diagnostic_request) |request| {
+        var path_buf = try cli.buildDebugGetPath(allocator, request.view, request.hash, request.rid);
+        defer path_buf.deinit(allocator);
+        try doGet(allocator, stdout, api_host, api_port, path_buf.items, sid);
+    } else if (std.mem.eql(u8, command, "list")) {
         try doGet(allocator, stdout, api_host, api_port, "/api/v2/torrents/info", sid);
     } else if (std.mem.eql(u8, command, "status")) {
         if (cmd_start + 1 >= args.len) {
@@ -296,15 +307,6 @@ pub fn main() !void {
             defer path_buf.deinit(allocator);
             try path_buf.print(allocator, "/api/v2/varuna/torrents/move/{s}/commit", .{args[cmd_start + 1]});
             try doPost(allocator, stdout, api_host, api_port, path_buf.items, "", sid);
-        }
-    } else if (std.mem.eql(u8, command, "conn-diag")) {
-        if (cmd_start + 1 >= args.len) {
-            try stdout.print("usage: varuna-ctl conn-diag <hash>\n", .{});
-        } else {
-            var path_buf = std.ArrayList(u8).empty;
-            defer path_buf.deinit(allocator);
-            try path_buf.print(allocator, "/api/v2/torrents/connDiagnostics?hash={s}", .{args[cmd_start + 1]});
-            try doGet(allocator, stdout, api_host, api_port, path_buf.items, sid);
         }
     } else if (std.mem.eql(u8, command, "add-tracker")) {
         if (cmd_start + 2 >= args.len) {
@@ -578,7 +580,12 @@ fn printUsage(stdout: *std.Io.Writer, host: []const u8, port: u16) !void {
     try stdout.print("  get-dl-limit <hash|global>     get download limit\n", .{});
     try stdout.print("  get-ul-limit <hash|global>     get upload limit\n", .{});
     try stdout.print("  move <hash> <path>             move torrent data to new path\n", .{});
-    try stdout.print("  conn-diag <hash>               connection diagnostics\n", .{});
+    try stdout.print("  peers <hash> [--rid N]         torrent peer delta snapshot\n", .{});
+    try stdout.print("  conn-diagnostics <hash>        connection diagnostics\n", .{});
+    try stdout.print("  diagnostics <hash>             alias for conn-diagnostics\n", .{});
+    try stdout.print("  trackers <hash>                torrent trackers\n", .{});
+    try stdout.print("  properties <hash>              torrent properties\n", .{});
+    try stdout.print("  maindata [--rid N]             sync maindata snapshot\n", .{});
     try stdout.print("  add-tracker <hash> <url> ...    add tracker URL(s)\n", .{});
     try stdout.print("  remove-tracker <hash> <url> ... remove tracker URL(s)\n", .{});
     try stdout.print("  edit-tracker <hash> <old> <new> replace a tracker URL\n", .{});
@@ -598,4 +605,13 @@ fn printUsage(stdout: *std.Io.Writer, host: []const u8, port: u16) !void {
     try stdout.print("  api get <path>                 GET an API path\n", .{});
     try stdout.print("  api post <path> [body]         POST an API path\n", .{});
     try stdout.print("\ndaemon: http://{s}:{}\n", .{ host, port });
+}
+
+fn printDiagnosticUsage(stdout: *std.Io.Writer) !void {
+    try stdout.print("usage: varuna-ctl peers <hash> [--rid N]\n", .{});
+    try stdout.print("       varuna-ctl conn-diagnostics <hash>\n", .{});
+    try stdout.print("       varuna-ctl diagnostics <hash>\n", .{});
+    try stdout.print("       varuna-ctl trackers <hash>\n", .{});
+    try stdout.print("       varuna-ctl properties <hash>\n", .{});
+    try stdout.print("       varuna-ctl maindata [--rid N]\n", .{});
 }
