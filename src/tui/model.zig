@@ -143,6 +143,49 @@ pub const SortDirection = enum {
     }
 };
 
+pub const SymbolSet = enum {
+    unicode,
+    nerd_font,
+
+    pub fn label(self: SymbolSet) []const u8 {
+        return switch (self) {
+            .unicode => "Unicode",
+            .nerd_font => "Nerd Font",
+        };
+    }
+
+    pub fn next(self: SymbolSet) SymbolSet {
+        return switch (self) {
+            .unicode => .nerd_font,
+            .nerd_font => .unicode,
+        };
+    }
+};
+
+pub const Theme = enum {
+    btop_dark,
+
+    pub fn label(self: Theme) []const u8 {
+        return switch (self) {
+            .btop_dark => "btop dark",
+        };
+    }
+};
+
+pub const SettingsItem = enum {
+    symbols,
+    theme,
+
+    pub const values = [_]SettingsItem{ .symbols, .theme };
+
+    pub fn label(self: SettingsItem) []const u8 {
+        return switch (self) {
+            .symbols => "Symbol set",
+            .theme => "Theme",
+        };
+    }
+};
+
 pub const AppState = struct {
     torrents: [mock_data.initial_torrents.len]mock_data.Torrent,
     marked: [mock_data.initial_torrents.len]bool = [_]bool{false} ** mock_data.initial_torrents.len,
@@ -155,6 +198,10 @@ pub const AppState = struct {
     detail_scroll_offset: usize = 0,
     sort_key: SortKey = .queue,
     sort_direction: SortDirection = .asc,
+    symbol_set: SymbolSet = .unicode,
+    theme: Theme = .btop_dark,
+    settings_open: bool = false,
+    settings_index: usize = 0,
     filter_query: [128]u8 = undefined,
     filter_query_len: usize = 0,
     show_help: bool = false,
@@ -333,6 +380,34 @@ pub const AppState = struct {
 
     pub fn toggleSortDirection(self: *AppState) void {
         self.setSort(self.sort_key, self.sort_direction.toggle());
+    }
+
+    pub fn openSettingsModal(self: *AppState) void {
+        self.settings_open = true;
+        self.settings_index = 0;
+    }
+
+    pub fn closeSettingsModal(self: *AppState) void {
+        self.settings_open = false;
+    }
+
+    pub fn selectedSetting(self: *const AppState) SettingsItem {
+        return SettingsItem.values[self.settings_index];
+    }
+
+    pub fn moveSettingsSelection(self: *AppState, delta: isize) void {
+        if (delta < 0) {
+            self.settings_index -|= @as(usize, @intCast(-delta));
+        } else {
+            self.settings_index = @min(SettingsItem.values.len - 1, self.settings_index + @as(usize, @intCast(delta)));
+        }
+    }
+
+    pub fn toggleSelectedSetting(self: *AppState) void {
+        switch (self.selectedSetting()) {
+            .symbols => self.symbol_set = self.symbol_set.next(),
+            .theme => self.theme = .btop_dark,
+        }
     }
 
     pub fn filterQuery(self: *const AppState) []const u8 {
@@ -582,23 +657,33 @@ fn containsAsciiIgnoreCase(haystack: []const u8, needle: []const u8) bool {
 pub fn handleKey(state: *AppState, input: []const u8) bool {
     if (input.len == 0) return true;
     if (std.mem.eql(u8, input, "\x1b[A")) {
-        state.moveActiveSelection(-1);
+        if (state.settings_open) state.moveSettingsSelection(-1) else state.moveActiveSelection(-1);
         return true;
     }
     if (std.mem.eql(u8, input, "\x1b[B")) {
-        state.moveActiveSelection(1);
+        if (state.settings_open) state.moveSettingsSelection(1) else state.moveActiveSelection(1);
         return true;
     }
     if (std.mem.eql(u8, input, "\x1b[C")) {
-        state.nextPane();
+        if (state.settings_open) state.toggleSelectedSetting() else state.nextPane();
         return true;
     }
     if (std.mem.eql(u8, input, "\x1b[D")) {
-        state.prevPane();
+        if (state.settings_open) state.toggleSelectedSetting() else state.prevPane();
         return true;
     }
 
     for (input) |ch| {
+        if (state.settings_open) {
+            switch (ch) {
+                13, 27, 'q', ',' => state.closeSettingsModal(),
+                'j' => state.moveSettingsSelection(1),
+                'k' => state.moveSettingsSelection(-1),
+                'h', 'l', ' ' => state.toggleSelectedSetting(),
+                else => {},
+            }
+            continue;
+        }
         if (state.add_torrent_open) {
             switch (ch) {
                 13 => state.submitAddTorrentModal(),
@@ -649,6 +734,7 @@ pub fn handleKey(state: *AppState, input: []const u8) bool {
             'a' => state.openAddTorrentModal(),
             'm' => state.toggleMarkSelected(),
             '?' => state.show_help = !state.show_help,
+            ',' => state.openSettingsModal(),
             '/' => state.openFilterModal(),
             's' => state.cycleSortKey(),
             'S' => state.toggleSortDirection(),

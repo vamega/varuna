@@ -1,7 +1,29 @@
 const std = @import("std");
 const zz = @import("zigzag");
+const ui = @import("components.zig");
 const model = @import("model.zig");
 const mock_data = @import("mock_data.zig");
+
+const Style = ui.Style;
+const Symbols = ui.Symbols;
+const appendBoxRule = ui.appendBoxRule;
+const appendGlyphRepeat = ui.appendGlyphRepeat;
+const appendHRule = ui.appendHRule;
+const appendLeftPad = ui.appendLeftPad;
+const appendMiniProgress = ui.miniProgress;
+const appendPadded = ui.appendPadded;
+const appendPanelRule = ui.appendPanelRule;
+const appendPeers = ui.appendPeers;
+const appendRate = ui.appendRate;
+const appendRepeat = ui.appendRepeat;
+const filterRow = ui.filterRow;
+const key = ui.key;
+const panelTitle = ui.panelTitle;
+const progressBar = ui.progressBar;
+const renderModalLine = ui.modalLine;
+const statusGlyph = ui.statusGlyph;
+const statusStyle = ui.statusStyle;
+const style = ui.style;
 
 pub const RenderOptions = struct {
     width: u16 = 120,
@@ -9,18 +31,17 @@ pub const RenderOptions = struct {
     color: bool = true,
 };
 
-const Style = enum { reset, dim, bright, accent, blue, green, marked, inverse };
-
 pub fn renderFrame(allocator: std.mem.Allocator, state: *const model.AppState, options: RenderOptions) ![]u8 {
     const width: usize = @max(options.width, 82);
     const height: usize = @max(options.height, 5);
     const color = options.color;
     const main_h: usize = height - 5;
+    const symbols = ui.symbolsFor(state.symbol_set);
 
     var out = std.ArrayList(u8).empty;
     errdefer out.deinit(allocator);
 
-    try renderTop(&out, allocator, state, width, color);
+    try renderTop(&out, allocator, state, symbols, width, color);
     try appendHRule(&out, allocator, width);
 
     const left_w = clamp(width / 6, 22, 30);
@@ -31,13 +52,13 @@ pub fn renderFrame(allocator: std.mem.Allocator, state: *const model.AppState, o
     const modal_top = if (main_h > modal_h) (main_h - modal_h) / 2 else 0;
 
     try appendPanelRule(&out, allocator, left_w, center_w, right_w, .top);
-    const modal_open = state.add_torrent_open or state.filter_open;
+    const modal_open = state.add_torrent_open or state.filter_open or state.settings_open;
     var row: usize = 0;
     while (row < main_h) : (row += 1) {
         if (modal_open and row >= modal_top and row < modal_top + modal_h) {
-            try renderModalOverlayRow(&out, allocator, state, row - modal_top, width, modal_w, color);
+            try renderModalOverlayRow(&out, allocator, state, symbols, row - modal_top, width, modal_w, color);
         } else {
-            try renderMainRow(&out, allocator, state, row, main_h, left_w, center_w, right_w, color);
+            try renderMainRow(&out, allocator, state, symbols, row, main_h, left_w, center_w, right_w, color);
         }
     }
     try appendPanelRule(&out, allocator, left_w, center_w, right_w, .bottom);
@@ -46,19 +67,30 @@ pub fn renderFrame(allocator: std.mem.Allocator, state: *const model.AppState, o
     return out.toOwnedSlice(allocator);
 }
 
-fn renderTop(out: *std.ArrayList(u8), allocator: std.mem.Allocator, state: *const model.AppState, width: usize, color: bool) !void {
+fn renderTop(out: *std.ArrayList(u8), allocator: std.mem.Allocator, state: *const model.AppState, symbols: Symbols, width: usize, color: bool) !void {
     var line = std.ArrayList(u8).empty;
     defer line.deinit(allocator);
 
     const totals = computeTotals(state);
-    try style(&line, allocator, " varuna ", .accent, color);
-    try line.appendSlice(allocator, "v0.1 mock  ");
-    try style(&line, allocator, "UP ", .green, color);
+    try style(&line, allocator, symbols.brand, .accent, color);
+    try style(&line, allocator, " varuna ", .bright, color);
+    try style(&line, allocator, "v0.1 mock", .dim, color);
+    try line.appendSlice(allocator, "  ·  ");
+    try style(&line, allocator, symbols.up, .green, color);
+    try line.append(allocator, ' ');
     try line.print(allocator, "{d:.1} MiB/s  ", .{totals.up});
-    try style(&line, allocator, "DN ", .blue, color);
+    try style(&line, allocator, symbols.down, .blue, color);
+    try line.append(allocator, ' ');
     try line.print(allocator, "{d:.1} MiB/s  ", .{totals.down});
-    try line.print(allocator, "{d} seeding  {d} downloading  {d} paused", .{ totals.seeding, totals.downloading, totals.paused });
-    try line.print(allocator, "  selected: {s}", .{state.selectedTorrentConst().name});
+    try style(&line, allocator, symbols.seed, .green, color);
+    try line.print(allocator, " {d} seeding  ", .{totals.seeding});
+    try style(&line, allocator, symbols.down, .blue, color);
+    try line.print(allocator, " {d} dn  ", .{totals.downloading});
+    try style(&line, allocator, symbols.pause, .yellow, color);
+    try line.print(allocator, " {d} paused  ", .{totals.paused});
+    try style(&line, allocator, symbols.settings, .accent, color);
+    try line.print(allocator, " {s}", .{state.symbol_set.label()});
+    try line.print(allocator, "  ·  selected: {s}", .{state.selectedTorrentConst().name});
     try appendPadded(out, allocator, line.items, width);
     try out.append(allocator, '\n');
 }
@@ -67,6 +99,7 @@ fn renderMainRow(
     out: *std.ArrayList(u8),
     allocator: std.mem.Allocator,
     state: *const model.AppState,
+    symbols: Symbols,
     row: usize,
     main_h: usize,
     left_w: usize,
@@ -77,9 +110,9 @@ fn renderMainRow(
     try out.appendSlice(allocator, "│");
     try renderLeftCell(out, allocator, state, row, left_w, color);
     try out.appendSlice(allocator, "│");
-    try renderTorrentCell(out, allocator, state, row, main_h, center_w, color);
+    try renderTorrentCell(out, allocator, state, symbols, row, main_h, center_w, color);
     try out.appendSlice(allocator, "│");
-    try renderDetailCell(out, allocator, state, row, main_h, right_w, color);
+    try renderDetailCell(out, allocator, state, symbols, row, main_h, right_w, color);
     try out.appendSlice(allocator, "│\n");
 }
 
@@ -108,7 +141,7 @@ fn renderLeftCell(out: *std.ArrayList(u8), allocator: std.mem.Allocator, state: 
     try appendPadded(out, allocator, cell.items, width);
 }
 
-fn renderTorrentCell(out: *std.ArrayList(u8), allocator: std.mem.Allocator, state: *const model.AppState, row: usize, main_h: usize, width: usize, color: bool) !void {
+fn renderTorrentCell(out: *std.ArrayList(u8), allocator: std.mem.Allocator, state: *const model.AppState, symbols: Symbols, row: usize, main_h: usize, width: usize, color: bool) !void {
     var cell = std.ArrayList(u8).empty;
     defer cell.deinit(allocator);
     if (row == 0) {
@@ -121,13 +154,13 @@ fn renderTorrentCell(out: *std.ArrayList(u8), allocator: std.mem.Allocator, stat
         const visible_rows = main_h -| 2;
         const visible_row = state.effectiveTorrentScrollOffset(visible_rows) + row - 2;
         if (state.visibleTorrentIndexAt(visible_row)) |idx| {
-            try appendTorrentRow(&cell, allocator, &state.torrents[idx], idx == state.selected_index, state.marked[idx], width, color);
+            try appendTorrentRow(&cell, allocator, &state.torrents[idx], symbols, idx == state.selected_index, state.marked[idx], width, color);
         }
     }
     try appendPadded(out, allocator, cell.items, width);
 }
 
-fn renderDetailCell(out: *std.ArrayList(u8), allocator: std.mem.Allocator, state: *const model.AppState, row: usize, main_h: usize, width: usize, color: bool) !void {
+fn renderDetailCell(out: *std.ArrayList(u8), allocator: std.mem.Allocator, state: *const model.AppState, symbols: Symbols, row: usize, main_h: usize, width: usize, color: bool) !void {
     var cell = std.ArrayList(u8).empty;
     defer cell.deinit(allocator);
     const torrent = state.selectedTorrentConst();
@@ -141,16 +174,17 @@ fn renderDetailCell(out: *std.ArrayList(u8), allocator: std.mem.Allocator, state
     } else if (row == 2) {
         try cell.print(allocator, "{s}  {d:.0}%  ratio {d:.2}", .{ torrent.status.label(), torrent.progress * 100.0, torrent.ratio });
     } else if (row == 3) {
-        try progressBar(&cell, allocator, torrent.progress, @min(width, @as(usize, 28)), torrent.status);
+        try progressBar(&cell, allocator, torrent.progress, @min(width, @as(usize, 28)), torrent.status, color);
     } else {
         const visible_rows = main_h -| 4;
         const detail_row = state.effectiveDetailScrollOffset(visible_rows) + row - 4;
         if (detail_row < state.detailItemCount()) {
             const selected = state.active_pane == .detail and detail_row == state.detail_selected_row;
-            try cell.appendSlice(allocator, if (selected) "▶ " else "  ");
+            try cell.appendSlice(allocator, if (selected) symbols.selected else " ");
+            try cell.append(allocator, ' ');
             switch (state.detail_tab) {
-                .files => try renderFilesDetail(&cell, allocator, torrent, detail_row, color),
-                .peers => try renderPeersDetail(&cell, allocator, torrent, detail_row, color),
+                .files => try renderFilesDetail(&cell, allocator, torrent, symbols, detail_row, color),
+                .peers => try renderPeersDetail(&cell, allocator, torrent, symbols, detail_row, color),
                 .trackers => try renderTrackersDetail(&cell, allocator, torrent, detail_row),
                 .info => try renderInfoDetail(&cell, allocator, torrent, detail_row),
             }
@@ -161,11 +195,11 @@ fn renderDetailCell(out: *std.ArrayList(u8), allocator: std.mem.Allocator, state
 
 fn appendTorrentHeader(out: *std.ArrayList(u8), allocator: std.mem.Allocator, width: usize, color: bool) !void {
     const name_w = torrentNameWidth(width);
-    try appendPadded(out, allocator, "M ST", 5);
+    try appendPadded(out, allocator, "M  ST", 8);
     try out.append(allocator, ' ');
     try appendPadded(out, allocator, "NAME", name_w);
     try out.append(allocator, ' ');
-    try appendLeftPad(out, allocator, "DONE", 6);
+    try appendLeftPad(out, allocator, "PROGRESS", 12);
     try out.append(allocator, ' ');
     try appendLeftPad(out, allocator, "DN", 7);
     try out.append(allocator, ' ');
@@ -174,17 +208,22 @@ fn appendTorrentHeader(out: *std.ArrayList(u8), allocator: std.mem.Allocator, wi
     try style(out, allocator, "PEERS", .dim, color);
 }
 
-fn appendTorrentRow(out: *std.ArrayList(u8), allocator: std.mem.Allocator, torrent: *const mock_data.Torrent, selected: bool, marked: bool, width: usize, color: bool) !void {
+fn appendTorrentRow(out: *std.ArrayList(u8), allocator: std.mem.Allocator, torrent: *const mock_data.Torrent, symbols: Symbols, selected: bool, marked: bool, width: usize, color: bool) !void {
     var row = std.ArrayList(u8).empty;
     defer row.deinit(allocator);
     const name_w = torrentNameWidth(width);
-    try row.appendSlice(allocator, if (selected) "▶" else " ");
-    try row.appendSlice(allocator, if (marked) "●" else " ");
+    try row.appendSlice(allocator, if (selected) symbols.selected else " ");
+    try row.appendSlice(allocator, if (marked) symbols.marked else " ");
+    try row.append(allocator, ' ');
+    try row.appendSlice(allocator, statusGlyph(torrent, symbols));
+    try row.append(allocator, ' ');
     try row.appendSlice(allocator, torrent.status.short());
+    const prefix_width = zz.measure.width(row.items);
+    if (prefix_width < 8) try appendRepeat(&row, allocator, ' ', 8 - prefix_width);
     try row.append(allocator, ' ');
     try appendPadded(&row, allocator, torrent.name, name_w);
     try row.append(allocator, ' ');
-    try appendPercent(&row, allocator, torrent.progress, 6);
+    try appendMiniProgress(&row, allocator, torrent.progress, 12, torrent.status, false);
     try row.append(allocator, ' ');
     try appendRate(&row, allocator, torrent.down_mib, 7);
     try row.append(allocator, ' ');
@@ -199,22 +238,64 @@ fn appendTorrentRow(out: *std.ArrayList(u8), allocator: std.mem.Allocator, torre
         try style(out, allocator, row.items, .marked, color);
         const row_width = zz.measure.width(row.items);
         if (row_width < width) try appendRepeat(out, allocator, ' ', width - row_width);
+    } else if (color) {
+        try appendTorrentRowStyled(out, allocator, torrent, symbols, width, color);
     } else {
         try appendPadded(out, allocator, row.items, width);
     }
 }
 
-fn renderFilesDetail(out: *std.ArrayList(u8), allocator: std.mem.Allocator, torrent: *const mock_data.Torrent, row: usize, color: bool) !void {
+fn appendTorrentRowStyled(out: *std.ArrayList(u8), allocator: std.mem.Allocator, torrent: *const mock_data.Torrent, symbols: Symbols, width: usize, color: bool) !void {
+    const name_w = torrentNameWidth(width);
+    try appendPadded(out, allocator, "  ", 2);
+    try out.append(allocator, ' ');
+    try style(out, allocator, statusGlyph(torrent, symbols), statusStyle(torrent.status), color);
+    try out.append(allocator, ' ');
+    try style(out, allocator, torrent.status.short(), statusStyle(torrent.status), color);
+    const prefix_width = 2 + 1 + zz.measure.width(statusGlyph(torrent, symbols)) + 1 + zz.measure.width(torrent.status.short());
+    if (prefix_width < 8) try appendRepeat(out, allocator, ' ', 8 - prefix_width);
+    try out.append(allocator, ' ');
+    try appendPadded(out, allocator, torrent.name, name_w);
+    try out.append(allocator, ' ');
+    try appendMiniProgress(out, allocator, torrent.progress, 12, torrent.status, color);
+    try out.append(allocator, ' ');
+    try appendStyledRate(out, allocator, torrent.down_mib, 7, .blue, color);
+    try out.append(allocator, ' ');
+    try appendStyledRate(out, allocator, torrent.up_mib, 7, .green, color);
+    try out.append(allocator, ' ');
+    try appendStyledPeers(out, allocator, torrent.seeds, torrent.peers, 7, .dim, color);
+    const row_width = zz.measure.width(out.items);
+    if (row_width < width) try appendRepeat(out, allocator, ' ', width - row_width);
+}
+
+fn appendStyledRate(out: *std.ArrayList(u8), allocator: std.mem.Allocator, value: f64, width: usize, s: Style, color: bool) !void {
+    var text = std.ArrayList(u8).empty;
+    defer text.deinit(allocator);
+    try appendRate(&text, allocator, value, width);
+    try style(out, allocator, text.items, s, color);
+}
+
+fn appendStyledPeers(out: *std.ArrayList(u8), allocator: std.mem.Allocator, seeds: u32, peers: u32, width: usize, s: Style, color: bool) !void {
+    var text = std.ArrayList(u8).empty;
+    defer text.deinit(allocator);
+    try appendPeers(&text, allocator, seeds, peers, width);
+    try style(out, allocator, text.items, s, color);
+}
+
+fn renderFilesDetail(out: *std.ArrayList(u8), allocator: std.mem.Allocator, torrent: *const mock_data.Torrent, symbols: Symbols, row: usize, color: bool) !void {
     if (row >= torrent.files.len) return;
     const file = torrent.files[row];
-    try style(out, allocator, if (file.skipped) "skip " else "ok   ", if (file.skipped) .dim else .green, color);
+    try style(out, allocator, if (file.skipped) symbols.file_skip else symbols.file_ok, if (file.skipped) .dim else .green, color);
+    try out.append(allocator, ' ');
     try out.appendSlice(allocator, file.path);
     try out.print(allocator, "  {d:.2} GiB", .{file.size_gib});
 }
 
-fn renderPeersDetail(out: *std.ArrayList(u8), allocator: std.mem.Allocator, torrent: *const mock_data.Torrent, row: usize, color: bool) !void {
+fn renderPeersDetail(out: *std.ArrayList(u8), allocator: std.mem.Allocator, torrent: *const mock_data.Torrent, symbols: Symbols, row: usize, color: bool) !void {
     if (row >= torrent.peers_list.len) return;
     const peer = torrent.peers_list[row];
+    try style(out, allocator, symbols.peer, .cyan, color);
+    try out.append(allocator, ' ');
     try style(out, allocator, peer.address, .blue, color);
     try out.print(allocator, "  {s}  dn {d:.1} up {d:.1}  {d:.0}%", .{ peer.client, peer.down_mib, peer.up_mib, peer.progress * 100.0 });
 }
@@ -239,7 +320,9 @@ fn renderInfoDetail(out: *std.ArrayList(u8), allocator: std.mem.Allocator, torre
     }
 }
 
-fn renderModalOverlayRow(out: *std.ArrayList(u8), allocator: std.mem.Allocator, state: *const model.AppState, row: usize, width: usize, modal_w: usize, color: bool) !void {
+fn renderModalOverlayRow(out: *std.ArrayList(u8), allocator: std.mem.Allocator, state: *const model.AppState, symbols: Symbols, row: usize, width: usize, modal_w: usize, color: bool) !void {
+    if (state.settings_open) return renderSettingsModalOverlayRow(out, allocator, state, symbols, row, width, modal_w, color);
+
     const left_pad = (width - modal_w) / 2;
     const right_pad = width - modal_w - left_pad;
     const title = if (state.add_torrent_open) "Add torrent" else "Filter torrents";
@@ -278,13 +361,51 @@ fn renderModalOverlayRow(out: *std.ArrayList(u8), allocator: std.mem.Allocator, 
     try out.append(allocator, '\n');
 }
 
-fn renderModalLine(out: *std.ArrayList(u8), allocator: std.mem.Allocator, text: []const u8, width: usize, text_style: Style, color: bool) !void {
-    try out.appendSlice(allocator, "│ ");
+fn renderSettingsModalOverlayRow(out: *std.ArrayList(u8), allocator: std.mem.Allocator, state: *const model.AppState, symbols: Symbols, row: usize, width: usize, modal_w: usize, color: bool) !void {
+    const left_pad = (width - modal_w) / 2;
+    const right_pad = width - modal_w - left_pad;
+    try appendRepeat(out, allocator, ' ', left_pad);
+    switch (row) {
+        0 => {
+            try out.appendSlice(allocator, "╭");
+            try appendGlyphRepeat(out, allocator, "─", modal_w - 2);
+            try out.appendSlice(allocator, "╮");
+        },
+        1 => {
+            var title = std.ArrayList(u8).empty;
+            defer title.deinit(allocator);
+            try style(&title, allocator, symbols.settings, .accent, color);
+            try title.appendSlice(allocator, " Settings");
+            try renderModalLine(out, allocator, title.items, modal_w, .reset, false);
+        },
+        2 => try renderSettingLine(out, allocator, state, model.SettingsItem.symbols, modal_w, color),
+        3 => try renderSettingLine(out, allocator, state, model.SettingsItem.theme, modal_w, color),
+        4 => try renderModalLine(out, allocator, "j/k select   h/l or space change   Enter closes", modal_w, .dim, color),
+        5 => try renderModalLine(out, allocator, "Nerd Font mode uses private-use glyphs; switch back if your terminal lacks them.", modal_w, .dim, color),
+        else => {
+            try out.appendSlice(allocator, "╰");
+            try appendGlyphRepeat(out, allocator, "─", modal_w - 2);
+            try out.appendSlice(allocator, "╯");
+        },
+    }
+    try appendRepeat(out, allocator, ' ', right_pad);
+    try out.append(allocator, '\n');
+}
+
+fn renderSettingLine(out: *std.ArrayList(u8), allocator: std.mem.Allocator, state: *const model.AppState, item: model.SettingsItem, modal_w: usize, color: bool) !void {
     var line = std.ArrayList(u8).empty;
     defer line.deinit(allocator);
-    try style(&line, allocator, text, text_style, color);
-    try appendPadded(out, allocator, line.items, width - 4);
-    try out.appendSlice(allocator, " │");
+    const selected = state.selectedSetting() == item;
+    try style(&line, allocator, if (selected) "› " else "  ", if (selected) .accent else .dim, color);
+    try line.appendSlice(allocator, item.label());
+    const label_width = zz.measure.width(line.items);
+    if (label_width < 22) try appendRepeat(&line, allocator, ' ', 22 - label_width);
+    const value = switch (item) {
+        .symbols => state.symbol_set.label(),
+        .theme => state.theme.label(),
+    };
+    try style(&line, allocator, value, if (selected) .green else .bright, color);
+    try renderModalLine(out, allocator, line.items, modal_w, .reset, false);
 }
 
 fn renderNetwork(out: *std.ArrayList(u8), allocator: std.mem.Allocator, state: *const model.AppState, width: usize, height: usize, color: bool) !void {
@@ -319,6 +440,8 @@ fn renderFooter(out: *std.ArrayList(u8), allocator: std.mem.Allocator, width: us
     defer footer.deinit(allocator);
     try key(&footer, allocator, "j/k", "nav", color);
     try key(&footer, allocator, "h/l", "pane", color);
+    try key(&footer, allocator, ",", "settings", color);
+    try key(&footer, allocator, "q", "quit", color);
     try key(&footer, allocator, "space", "pause", color);
     try key(&footer, allocator, "m", "mark", color);
     try key(&footer, allocator, "a", "add", color);
@@ -327,144 +450,8 @@ fn renderFooter(out: *std.ArrayList(u8), allocator: std.mem.Allocator, width: us
     try key(&footer, allocator, "/", "filter", color);
     try key(&footer, allocator, "d", "remove", color);
     try key(&footer, allocator, "?", "help", color);
-    try key(&footer, allocator, "q", "quit", color);
     try appendPadded(out, allocator, footer.items, width);
     try out.append(allocator, '\n');
-}
-
-fn panelTitle(out: *std.ArrayList(u8), allocator: std.mem.Allocator, title: []const u8, active: bool, color: bool) !void {
-    try style(out, allocator, title, if (active) .accent else .bright, color);
-}
-
-fn filterRow(out: *std.ArrayList(u8), allocator: std.mem.Allocator, label: []const u8, count: usize, active: bool, color: bool) !void {
-    if (active) try style(out, allocator, "> ", .accent, color) else try out.appendSlice(allocator, "  ");
-    try out.appendSlice(allocator, label);
-    try out.print(allocator, " {d}", .{count});
-}
-
-fn key(out: *std.ArrayList(u8), allocator: std.mem.Allocator, lhs: []const u8, rhs: []const u8, color: bool) !void {
-    try style(out, allocator, lhs, .accent, color);
-    try out.append(allocator, ' ');
-    try style(out, allocator, rhs, .dim, color);
-    try out.appendSlice(allocator, "  ");
-}
-
-fn progressBar(out: *std.ArrayList(u8), allocator: std.mem.Allocator, progress: f64, width: usize, status: mock_data.TorrentStatus) !void {
-    const fill: usize = @intFromFloat(@floor(@max(0, @min(1, progress)) * @as(f64, @floatFromInt(width))));
-    const fill_glyph = switch (status) {
-        .paused => "▒",
-        .errored => "▓",
-        else => "█",
-    };
-    try out.appendSlice(allocator, "▕");
-    try appendGlyphRepeat(out, allocator, fill_glyph, fill);
-    try appendGlyphRepeat(out, allocator, "░", width - fill);
-    try out.appendSlice(allocator, "▏");
-}
-
-fn style(out: *std.ArrayList(u8), allocator: std.mem.Allocator, text: []const u8, s: Style, enabled: bool) !void {
-    if (!enabled or text.len == 0) {
-        try out.appendSlice(allocator, text);
-        return;
-    }
-
-    const styled = styleFor(s);
-    const rendered = try styled.render(allocator, text);
-    defer allocator.free(rendered);
-    try out.appendSlice(allocator, rendered);
-}
-
-fn styleFor(s: Style) zz.Style {
-    return switch (s) {
-        .reset => zz.Style{},
-        .dim => (zz.Style{}).fg(zz.Color.brightBlack()).dim(true),
-        .bright => (zz.Style{}).fg(zz.Color.brightWhite()).bold(true),
-        .accent => (zz.Style{}).fg(zz.Color.brightMagenta()).bold(true),
-        .blue => (zz.Style{}).fg(zz.Color.brightBlue()).bold(true),
-        .green => (zz.Style{}).fg(zz.Color.brightGreen()).bold(true),
-        .marked => (zz.Style{}).fg(zz.Color.brightYellow()).bold(true),
-        .inverse => (zz.Style{}).reverse(true),
-    };
-}
-
-fn appendRate(out: *std.ArrayList(u8), allocator: std.mem.Allocator, value: f64, width: usize) !void {
-    var buf: [32]u8 = undefined;
-    const text = if (value <= 0.05) "-" else std.fmt.bufPrint(&buf, "{d:.1}M", .{value}) catch "-";
-    try appendLeftPad(out, allocator, text, width);
-}
-
-fn appendPercent(out: *std.ArrayList(u8), allocator: std.mem.Allocator, value: f64, width: usize) !void {
-    var buf: [16]u8 = undefined;
-    const text = std.fmt.bufPrint(&buf, "{d:.0}%", .{@max(0, @min(100, value * 100.0))}) catch "-";
-    try appendLeftPad(out, allocator, text, width);
-}
-
-fn appendPeers(out: *std.ArrayList(u8), allocator: std.mem.Allocator, seeds: u32, peers: u32, width: usize) !void {
-    var buf: [32]u8 = undefined;
-    const text = std.fmt.bufPrint(&buf, "{d}/{d}", .{ seeds, peers }) catch "-";
-    try appendLeftPad(out, allocator, text, width);
-}
-
-fn appendPadded(out: *std.ArrayList(u8), allocator: std.mem.Allocator, text: []const u8, width: usize) !void {
-    const visible_width = zz.measure.width(text);
-    if (visible_width >= width) {
-        const clipped = try zz.measure.truncate(allocator, text, width);
-        defer allocator.free(clipped);
-        try out.appendSlice(allocator, clipped);
-        return;
-    }
-    try out.appendSlice(allocator, text);
-    try appendRepeat(out, allocator, ' ', width - visible_width);
-}
-
-fn appendLeftPad(out: *std.ArrayList(u8), allocator: std.mem.Allocator, text: []const u8, width: usize) !void {
-    const visible_width = zz.measure.width(text);
-    if (visible_width >= width) {
-        const clipped = try zz.measure.truncate(allocator, text, width);
-        defer allocator.free(clipped);
-        try out.appendSlice(allocator, clipped);
-        return;
-    }
-    try appendRepeat(out, allocator, ' ', width - visible_width);
-    try out.appendSlice(allocator, text);
-}
-
-fn appendRepeat(out: *std.ArrayList(u8), allocator: std.mem.Allocator, ch: u8, count: usize) !void {
-    var i: usize = 0;
-    while (i < count) : (i += 1) try out.append(allocator, ch);
-}
-
-fn appendGlyphRepeat(out: *std.ArrayList(u8), allocator: std.mem.Allocator, glyph: []const u8, count: usize) !void {
-    var i: usize = 0;
-    while (i < count) : (i += 1) try out.appendSlice(allocator, glyph);
-}
-
-fn appendHRule(out: *std.ArrayList(u8), allocator: std.mem.Allocator, width: usize) !void {
-    try appendGlyphRepeat(out, allocator, "─", width);
-    try out.append(allocator, '\n');
-}
-
-const PanelRule = enum { top, bottom };
-
-fn appendPanelRule(out: *std.ArrayList(u8), allocator: std.mem.Allocator, left_w: usize, center_w: usize, right_w: usize, rule: PanelRule) !void {
-    const chars = switch (rule) {
-        .top => .{ "┌", "┬", "┐" },
-        .bottom => .{ "└", "┴", "┘" },
-    };
-    try out.appendSlice(allocator, chars[0]);
-    try appendGlyphRepeat(out, allocator, "─", left_w);
-    try out.appendSlice(allocator, chars[1]);
-    try appendGlyphRepeat(out, allocator, "─", center_w);
-    try out.appendSlice(allocator, chars[1]);
-    try appendGlyphRepeat(out, allocator, "─", right_w);
-    try out.appendSlice(allocator, chars[2]);
-    try out.append(allocator, '\n');
-}
-
-fn appendBoxRule(out: *std.ArrayList(u8), allocator: std.mem.Allocator, width: usize) !void {
-    try out.appendSlice(allocator, "┌");
-    try appendGlyphRepeat(out, allocator, "─", width - 2);
-    try out.appendSlice(allocator, "┐\n");
 }
 
 fn torrentNameWidth(width: usize) usize {

@@ -16,7 +16,7 @@ test "mock TUI render includes lazygit-style panes and selected torrent" {
     try std.testing.expect(std.mem.indexOf(u8, frame, "Torrents [2]") != null);
     try std.testing.expect(std.mem.indexOf(u8, frame, "Detail [3]") != null);
     try std.testing.expect(std.mem.indexOf(u8, frame, "LibreOffice.25.2.5.Linux.x86-64.tar.gz") != null);
-    try std.testing.expect(std.mem.indexOf(u8, frame, "j/k nav") != null);
+    try std.testing.expect(std.mem.indexOf(u8, frame, "j/k") != null);
     try std.testing.expect(std.mem.indexOf(u8, frame, "Network") == null);
 }
 
@@ -41,7 +41,7 @@ test "mock TUI styled view emits ANSI color and Unicode UI characters" {
     try std.testing.expect(std.mem.indexOf(u8, frame, "\x1b[") != null);
     try std.testing.expect(std.mem.indexOf(u8, frame, "┌") != null);
     try std.testing.expect(std.mem.indexOf(u8, frame, "▶") != null);
-    try std.testing.expect(std.mem.indexOf(u8, frame, "█") != null);
+    try std.testing.expect(std.mem.indexOf(u8, frame, "▰") != null);
 }
 
 test "mock TUI model navigation clamps and pause toggles selected torrent" {
@@ -93,8 +93,52 @@ test "marked torrents render with marker and styled highlight" {
     defer std.testing.allocator.free(frame);
 
     try std.testing.expect(state.marked[0]);
-    try std.testing.expect(std.mem.indexOf(u8, frame, "●DN") != null);
+    try std.testing.expect(std.mem.indexOf(u8, frame, "●") != null);
+    try std.testing.expect(std.mem.indexOf(u8, frame, "DN") != null);
     try std.testing.expect(std.mem.indexOf(u8, frame, "\x1b[") != null);
+}
+
+test "settings modal toggles symbol set" {
+    var state = tui.model.AppState.init();
+
+    try std.testing.expectEqual(tui.model.SymbolSet.unicode, state.symbol_set);
+    state.openSettingsModal();
+    state.toggleSelectedSetting();
+    try std.testing.expectEqual(tui.model.SymbolSet.nerd_font, state.symbol_set);
+
+    const frame = try tui.render.renderFrame(std.testing.allocator, &state, .{
+        .width = 120,
+        .height = 36,
+        .color = false,
+    });
+    defer std.testing.allocator.free(frame);
+
+    try std.testing.expect(std.mem.indexOf(u8, frame, "Settings") != null);
+    try std.testing.expect(std.mem.indexOf(u8, frame, "Nerd Font") != null);
+}
+
+test "renderer emits richer unicode and nerd font symbols" {
+    var state = tui.model.AppState.init();
+
+    const unicode_frame = try tui.render.renderFrame(std.testing.allocator, &state, .{
+        .width = 120,
+        .height = 36,
+        .color = false,
+    });
+    defer std.testing.allocator.free(unicode_frame);
+    try std.testing.expect(std.mem.indexOf(u8, unicode_frame, "↓") != null);
+    try std.testing.expect(std.mem.indexOf(u8, unicode_frame, "▰") != null);
+    try std.testing.expect(std.mem.indexOf(u8, unicode_frame, "⚙") != null);
+
+    state.symbol_set = .nerd_font;
+    const nerd_frame = try tui.render.renderFrame(std.testing.allocator, &state, .{
+        .width = 120,
+        .height = 36,
+        .color = false,
+    });
+    defer std.testing.allocator.free(nerd_frame);
+    try std.testing.expect(std.mem.indexOf(u8, nerd_frame, "\u{f019}") != null);
+    try std.testing.expect(std.mem.indexOf(u8, nerd_frame, "\u{f013}") != null);
 }
 
 test "active pane movement changes filters and detail rows" {

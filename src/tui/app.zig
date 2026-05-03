@@ -38,6 +38,9 @@ pub const Model = struct {
     }
 
     fn handleKey(self: *Model, key: zz.msg.Key) zz.Cmd(Msg) {
+        if (self.state.settings_open) {
+            return self.handleSettingsKey(key);
+        }
         if (self.state.add_torrent_open) {
             return self.handleAddTorrentKey(key);
         }
@@ -64,6 +67,7 @@ pub const Model = struct {
                 'd' => self.state.show_remove_confirm = true,
                 'a' => self.state.openAddTorrentModal(),
                 'm' => self.state.toggleMarkSelected(),
+                ',' => self.state.openSettingsModal(),
                 's' => self.state.cycleSortKey(),
                 'S' => self.state.toggleSortDirection(),
                 else => {},
@@ -79,6 +83,27 @@ pub const Model = struct {
                 self.state.show_help = false;
                 self.state.show_remove_confirm = false;
                 self.state.closeFilterModal();
+            },
+            else => {},
+        }
+        return .none;
+    }
+
+    fn handleSettingsKey(self: *Model, key: zz.msg.Key) zz.Cmd(Msg) {
+        switch (key.key) {
+            .enter => self.state.closeSettingsModal(),
+            .escape => self.state.closeSettingsModal(),
+            .space => self.state.toggleSelectedSetting(),
+            .up => self.state.moveSettingsSelection(-1),
+            .down => self.state.moveSettingsSelection(1),
+            .left => self.state.toggleSelectedSetting(),
+            .right => self.state.toggleSelectedSetting(),
+            .char => |ch| switch (ch) {
+                'q', ',' => self.state.closeSettingsModal(),
+                'j' => self.state.moveSettingsSelection(1),
+                'k' => self.state.moveSettingsSelection(-1),
+                'h', 'l' => self.state.toggleSelectedSetting(),
+                else => {},
             },
             else => {},
         }
