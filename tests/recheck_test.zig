@@ -7,6 +7,7 @@ const PieceTracker = varuna.torrent.piece_tracker.PieceTracker;
 const Session = varuna.torrent.session.Session;
 const PieceStore = varuna.storage.writer.PieceStore;
 const Sha1 = varuna.crypto.Sha1;
+const merkle = varuna.torrent.merkle;
 const sim_io_mod = varuna.io.sim_io;
 const SimIO = sim_io_mod.SimIO;
 const recheck_mod = varuna.io.recheck;
@@ -567,6 +568,86 @@ fn buildMultiPieceTorrent(
     return buf.toOwnedSlice(allocator);
 }
 
+fn buildSingleFileV2Torrent(
+    allocator: std.mem.Allocator,
+    pieces_root: [32]u8,
+    name: []const u8,
+    total_len: u64,
+    piece_len: u32,
+) ![]u8 {
+    var buf = std.ArrayList(u8).empty;
+    defer buf.deinit(allocator);
+
+    try buf.appendSlice(allocator, "d4:infod9:file treed");
+    try buf.writer(allocator).print("{d}:{s}", .{ name.len, name });
+    try buf.appendSlice(allocator, "d0:d6:lengthi");
+    try buf.writer(allocator).print("{d}", .{total_len});
+    try buf.appendSlice(allocator, "e11:pieces root32:");
+    try buf.appendSlice(allocator, &pieces_root);
+    try buf.appendSlice(allocator, "eee4:name");
+    try buf.writer(allocator).print("{d}:{s}", .{ name.len, name });
+    try buf.appendSlice(allocator, "12:piece lengthi");
+    try buf.writer(allocator).print("{d}", .{piece_len});
+    try buf.appendSlice(allocator, "eee");
+
+    return buf.toOwnedSlice(allocator);
+}
+
+const V2RecheckResult = struct {
+    completed: bool = false,
+    complete_count: u32 = 0,
+    bytes_complete: u64 = 0,
+};
+
+fn runSingleFileV2SimRecheck(
+    allocator: std.mem.Allocator,
+    torrent_bytes: []const u8,
+    file_bytes: []const u8,
+    known_complete: ?*const Bitfield,
+    seed: u64,
+) !V2RecheckResult {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const data_root = try tmp.dir.realpathAlloc(allocator, ".");
+    defer allocator.free(data_root);
+
+    const session = try Session.load(allocator, torrent_bytes, data_root);
+    defer session.deinit(allocator);
+    try std.testing.expectEqual(.v2, session.layout.version);
+    try std.testing.expectEqual(@as(u32, 2), session.pieceCount());
+
+    const EL_SimIO = event_loop_mod.EventLoopOf(SimIO);
+    const sim_io = try SimIO.init(allocator, .{ .seed = seed });
+    var el = EL_SimIO.initBareWithIO(allocator, sim_io, 0) catch |err| {
+        if (err == error.SystemResources) return error.SkipZigTest;
+        return err;
+    };
+    defer el.deinit();
+    el.hasher = try Hasher.simInit(allocator, seed);
+
+    const synthetic_fd: posix.fd_t = 50;
+    try el.io.setFileBytes(synthetic_fd, file_bytes);
+    const fds = [_]posix.fd_t{synthetic_fd};
+
+    var result = V2RecheckResult{};
+    try el.startRecheck(&session, &fds, 0, known_complete, struct {
+        fn cb(rc: *EL_SimIO.AsyncRecheck) void {
+            const c: *V2RecheckResult = @ptrCast(@alignCast(rc.caller_ctx.?));
+            c.completed = true;
+            c.complete_count = rc.complete_pieces.count;
+            c.bytes_complete = rc.bytes_complete;
+        }
+    }.cb, @ptrCast(&result));
+
+    var ticks: u32 = 0;
+    while (ticks < 128 and !result.completed) : (ticks += 1) {
+        try el.tick();
+    }
+
+    el.cancelAllRechecks();
+    return result;
+}
+
 test "AsyncRecheckOf(SimIO): all pieces verify against registered file content" {
     const allocator = std.testing.allocator;
     var arena = std.heap.ArenaAllocator.init(allocator);
@@ -876,4 +957,82 @@ test "AsyncRecheckOf(SimIO): all-known-complete fast path skips disk reads" {
     try std.testing.expectEqual(sim_piece_count, ctx.complete_count);
 
     el.cancelAllRechecks();
+}
+
+test "AsyncRecheckOf(SimIO): verifies pure-v2 multi-piece file root" {
+    const allocator = std.testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+
+    const v2_piece_len: u32 = 32;
+    var file_bytes: [v2_piece_len * 2]u8 = undefined;
+    for (&file_bytes, 0..) |*b, i| b.* = @as(u8, @intCast((i * 17 + 3) & 0xff));
+
+    const leaf_hashes = [_][32]u8{
+        merkle.hashLeaf(file_bytes[0..v2_piece_len]),
+        merkle.hashLeaf(file_bytes[v2_piece_len..][0..v2_piece_len]),
+    };
+    var tree = try merkle.MerkleTree.fromPieceHashes(allocator, &leaf_hashes);
+    defer tree.deinit();
+
+    const torrent_bytes = try buildSingleFileV2Torrent(
+        arena.allocator(),
+        tree.root(),
+        "v2-recheck.bin",
+        file_bytes.len,
+        v2_piece_len,
+    );
+
+    const result = try runSingleFileV2SimRecheck(
+        allocator,
+        torrent_bytes,
+        &file_bytes,
+        null,
+        0xBEE5_2052,
+    );
+
+    try std.testing.expect(result.completed);
+    try std.testing.expectEqual(@as(u32, 2), result.complete_count);
+    try std.testing.expectEqual(@as(u64, file_bytes.len), result.bytes_complete);
+}
+
+test "AsyncRecheckOf(SimIO): partial known-complete v2 file rehashes whole file" {
+    const allocator = std.testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+
+    const v2_piece_len: u32 = 32;
+    var file_bytes: [v2_piece_len * 2]u8 = undefined;
+    for (&file_bytes, 0..) |*b, i| b.* = @as(u8, @intCast((i * 19 + 11) & 0xff));
+
+    const leaf_hashes = [_][32]u8{
+        merkle.hashLeaf(file_bytes[0..v2_piece_len]),
+        merkle.hashLeaf(file_bytes[v2_piece_len..][0..v2_piece_len]),
+    };
+    var tree = try merkle.MerkleTree.fromPieceHashes(allocator, &leaf_hashes);
+    defer tree.deinit();
+
+    const torrent_bytes = try buildSingleFileV2Torrent(
+        arena.allocator(),
+        tree.root(),
+        "v2-known.bin",
+        file_bytes.len,
+        v2_piece_len,
+    );
+
+    var known = try Bitfield.init(allocator, 2);
+    defer known.deinit(allocator);
+    try known.set(0);
+
+    const result = try runSingleFileV2SimRecheck(
+        allocator,
+        torrent_bytes,
+        &file_bytes,
+        &known,
+        0xBEE5_2053,
+    );
+
+    try std.testing.expect(result.completed);
+    try std.testing.expectEqual(@as(u32, 2), result.complete_count);
+    try std.testing.expectEqual(@as(u64, file_bytes.len), result.bytes_complete);
 }

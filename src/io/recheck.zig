@@ -50,6 +50,7 @@ pub fn AsyncRecheckOf(comptime IO: type) type {
 
         // Resume fast path
         known_complete: ?*const Bitfield,
+        v2_files: ?[]V2FileRecheck = null,
 
         // Pipeline state
         next_piece: u32 = 0, // next piece to submit reads for
@@ -85,6 +86,24 @@ pub fn AsyncRecheckOf(comptime IO: type) type {
             pub const SlotState = enum { free, reading, hashing };
         };
 
+        const V2FileRecheck = struct {
+            active: bool = false,
+            first_piece: u32 = 0,
+            piece_count: u32 = 0,
+            pieces_root: [32]u8 = [_]u8{0} ** 32,
+            piece_hashes: ?[][32]u8 = null,
+            seen: ?[]bool = null,
+            seen_count: u32 = 0,
+            readable: bool = true,
+            root_checked: bool = false,
+
+            fn deinit(self: *V2FileRecheck, allocator: std.mem.Allocator) void {
+                if (self.piece_hashes) |hashes| allocator.free(hashes);
+                if (self.seen) |seen| allocator.free(seen);
+                self.* = .{};
+            }
+        };
+
         /// Create a heap-allocated AsyncRecheck. Must be heap-allocated because
         /// the event loop holds a pointer to it across ticks.
         pub fn create(
@@ -102,6 +121,9 @@ pub fn AsyncRecheckOf(comptime IO: type) type {
             var complete_pieces = try Bitfield.init(allocator, piece_count);
             errdefer complete_pieces.deinit(allocator);
 
+            const v2_files = try initV2FileRechecks(allocator, session);
+            errdefer if (v2_files) |states| deinitV2FileRechecks(allocator, states);
+
             const self = try allocator.create(Self);
             self.* = .{
                 .allocator = allocator,
@@ -112,6 +134,7 @@ pub fn AsyncRecheckOf(comptime IO: type) type {
                 .torrent_id = torrent_id,
                 .complete_pieces = complete_pieces,
                 .known_complete = known_complete,
+                .v2_files = v2_files,
                 .piece_count = piece_count,
                 .on_complete = on_complete,
                 .caller_ctx = caller_ctx,
@@ -287,7 +310,13 @@ pub fn AsyncRecheckOf(comptime IO: type) type {
 
         /// Called when a hasher result arrives for a recheck piece.
         /// Updates the complete_pieces bitfield and advances the pipeline.
-        pub fn handleHashResult(self: *Self, piece_index: u32, valid: bool, piece_buf: []u8) void {
+        pub fn handleHashResult(
+            self: *Self,
+            piece_index: u32,
+            valid: bool,
+            piece_buf: []u8,
+            actual_hash_v2: [32]u8,
+        ) void {
             if (self.destroy_requested) {
                 self.allocator.free(piece_buf);
                 return;
@@ -315,7 +344,11 @@ pub fn AsyncRecheckOf(comptime IO: type) type {
             if (slot_idx) |idx| {
                 // Clear the slot's buf reference so finishSlot does not double-free.
                 self.slots[idx].buf = null;
-                self.finishSlot(idx, valid);
+                if (self.requiresV2MerkleVerificationForSlot(idx)) {
+                    self.finishV2MerkleSlot(idx, actual_hash_v2);
+                } else {
+                    self.finishSlot(idx, valid);
+                }
             } else {
                 // Orphan result
                 if (valid) {
@@ -385,8 +418,62 @@ pub fn AsyncRecheckOf(comptime IO: type) type {
             if (self.lifecycle_depth != 0) return;
             if (!self.allSlotsFree()) return;
 
+            if (self.v2_files) |states| {
+                deinitV2FileRechecks(self.allocator, states);
+                self.v2_files = null;
+            }
             self.complete_pieces.deinit(self.allocator);
             self.allocator.destroy(self);
+        }
+
+        fn initV2FileRechecks(
+            allocator: std.mem.Allocator,
+            session: *const session_mod.Session,
+        ) !?[]V2FileRecheck {
+            if (session.layout.version != .v2) return null;
+            const v2_files = session.metainfo.file_tree_v2 orelse return null;
+            if (session.layout.files.len == 0) return null;
+
+            const states = try allocator.alloc(V2FileRecheck, session.layout.files.len);
+            @memset(states, .{});
+            errdefer deinitV2FileRechecks(allocator, states);
+
+            var any = false;
+            for (session.layout.files, 0..) |file, file_idx| {
+                if (file.length == 0) continue;
+                if (file_idx >= v2_files.len) continue;
+
+                const file_pieces = file.end_piece_exclusive - file.first_piece;
+                if (file_pieces <= 1) continue;
+
+                const piece_hashes = try allocator.alloc([32]u8, file_pieces);
+                const seen = allocator.alloc(bool, file_pieces) catch |err| {
+                    allocator.free(piece_hashes);
+                    return err;
+                };
+                @memset(seen, false);
+
+                states[file_idx] = .{
+                    .active = true,
+                    .first_piece = file.first_piece,
+                    .piece_count = file_pieces,
+                    .pieces_root = v2_files[file_idx].pieces_root,
+                    .piece_hashes = piece_hashes,
+                    .seen = seen,
+                };
+                any = true;
+            }
+
+            if (!any) {
+                allocator.free(states);
+                return null;
+            }
+            return states;
+        }
+
+        fn deinitV2FileRechecks(allocator: std.mem.Allocator, states: []V2FileRecheck) void {
+            for (states) |*state| state.deinit(allocator);
+            allocator.free(states);
         }
 
         fn detachReadOp(self: *Self, op: *ReadOp) void {
@@ -458,7 +545,7 @@ pub fn AsyncRecheckOf(comptime IO: type) type {
             // Skip known-complete pieces
             while (self.next_piece < self.piece_count) {
                 if (self.known_complete) |kc| {
-                    if (kc.has(self.next_piece)) {
+                    if (kc.has(self.next_piece) and self.canTrustKnownCompletePiece(kc, self.next_piece)) {
                         self.markPieceComplete(self.next_piece);
                         self.pieces_done += 1;
                         self.next_piece += 1;
@@ -476,6 +563,7 @@ pub fn AsyncRecheckOf(comptime IO: type) type {
             // Plan the verification
             const plan = verify.planPieceVerification(self.allocator, self.session, piece_index) catch {
                 log.warn("recheck: failed to plan piece {d}", .{piece_index});
+                self.recordV2PieceFailure(piece_index);
                 self.pieces_done += 1;
                 self.checkComplete();
                 return true; // consumed a piece index, try again for next
@@ -484,6 +572,7 @@ pub fn AsyncRecheckOf(comptime IO: type) type {
             // Allocate scratch buffer for the piece data
             const buf = self.allocator.alloc(u8, plan.piece_length) catch {
                 log.warn("recheck: OOM allocating buffer for piece {d}", .{piece_index});
+                self.recordV2PieceFailure(piece_index);
                 plan.deinit(self.allocator);
                 self.pieces_done += 1;
                 self.checkComplete();
@@ -563,11 +652,113 @@ pub fn AsyncRecheckOf(comptime IO: type) type {
             return null;
         }
 
+        fn v2FileStateIndexForPiece(self: *const Self, piece_index: u32) ?usize {
+            const states = self.v2_files orelse return null;
+            for (states, 0..) |state, idx| {
+                if (!state.active) continue;
+                if (piece_index >= state.first_piece and piece_index < state.first_piece + state.piece_count) {
+                    return idx;
+                }
+            }
+            return null;
+        }
+
+        fn canTrustKnownCompletePiece(self: *const Self, known: *const Bitfield, piece_index: u32) bool {
+            const state_idx = self.v2FileStateIndexForPiece(piece_index) orelse return true;
+            const state = &self.v2_files.?[state_idx];
+
+            var pi = state.first_piece;
+            const end = state.first_piece + state.piece_count;
+            while (pi < end) : (pi += 1) {
+                if (!known.has(pi)) return false;
+            }
+            return true;
+        }
+
         /// Mark a piece complete (valid hash) and count its bytes.
         fn markPieceComplete(self: *Self, piece_index: u32) void {
             self.complete_pieces.set(piece_index) catch return;
             const piece_size = self.session.layout.pieceSize(piece_index) catch return;
             self.bytes_complete += piece_size;
+        }
+
+        fn requiresV2MerkleVerificationForSlot(self: *const Self, slot_idx: u16) bool {
+            if (slot_idx >= max_in_flight) return false;
+            const plan = self.slots[slot_idx].plan orelse return false;
+            return plan.hash_type == .sha256 and plan.v2_file_piece_count > 1;
+        }
+
+        fn recordV2PieceFailure(self: *Self, piece_index: u32) void {
+            const state_idx = self.v2FileStateIndexForPiece(piece_index) orelse return;
+            var state = &self.v2_files.?[state_idx];
+            state.readable = false;
+        }
+
+        fn recordV2PieceHash(self: *Self, piece_index: u32, actual_hash_v2: [32]u8) void {
+            const state_idx = self.v2FileStateIndexForPiece(piece_index) orelse {
+                self.recordV2PieceFailure(piece_index);
+                return;
+            };
+            var state = &self.v2_files.?[state_idx];
+            if (!state.active or state.root_checked) return;
+
+            const piece_in_file = piece_index - state.first_piece;
+            if (piece_in_file >= state.piece_count) {
+                state.readable = false;
+                return;
+            }
+
+            const hashes = state.piece_hashes orelse {
+                state.readable = false;
+                return;
+            };
+            const seen = state.seen orelse {
+                state.readable = false;
+                return;
+            };
+
+            hashes[piece_in_file] = actual_hash_v2;
+            if (!seen[piece_in_file]) {
+                seen[piece_in_file] = true;
+                state.seen_count += 1;
+            }
+
+            self.tryFinishV2File(state);
+        }
+
+        fn tryFinishV2File(self: *Self, state: *V2FileRecheck) void {
+            if (state.root_checked) return;
+            if (state.seen_count != state.piece_count) return;
+
+            state.root_checked = true;
+            if (!state.readable) return;
+
+            const hashes = state.piece_hashes orelse return;
+            const valid = verify.verifyV2MerkleRoot(self.allocator, state.pieces_root, hashes) catch |err| {
+                log.warn("recheck: v2 Merkle root verification failed: {s}", .{@errorName(err)});
+                return;
+            };
+            if (!valid) return;
+
+            var piece_index = state.first_piece;
+            const end = state.first_piece + state.piece_count;
+            while (piece_index < end) : (piece_index += 1) {
+                self.markPieceComplete(piece_index);
+            }
+        }
+
+        fn finishV2MerkleSlot(self: *Self, slot_idx: u16, actual_hash_v2: [32]u8) void {
+            const slot = &self.slots[slot_idx];
+            self.recordV2PieceHash(slot.piece_index, actual_hash_v2);
+
+            self.clearSlot(slot_idx);
+            self.pieces_done += 1;
+
+            if (!self.destroy_requested) {
+                _ = self.submitNextPiece();
+            }
+
+            self.checkComplete();
         }
 
         /// Finish processing a slot: free resources, mark piece done,
@@ -577,6 +768,8 @@ pub fn AsyncRecheckOf(comptime IO: type) type {
 
             if (valid) {
                 self.markPieceComplete(slot.piece_index);
+            } else {
+                self.recordV2PieceFailure(slot.piece_index);
             }
 
             self.clearSlot(slot_idx);

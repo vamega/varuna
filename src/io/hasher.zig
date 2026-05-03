@@ -64,6 +64,7 @@ pub const RealHasher = struct {
         piece_index: u32,
         piece_buf: []u8,
         valid: bool,
+        actual_hash_v2: [32]u8 = [_]u8{0} ** 32,
         torrent_id: u32,
         is_recheck: bool = false,
     };
@@ -219,14 +220,15 @@ pub const RealHasher = struct {
             // Process synchronously on the caller's thread and push the
             // result directly. Sim tests drain via `drainResultsInto`
             // on the next tick.
-            const valid = computeValid(job);
+            const outcome = computeOutcome(job);
             self.result_mutex.lock();
             defer self.result_mutex.unlock();
             try self.completed_results.append(self.allocator, .{
                 .slot = job.slot,
                 .piece_index = job.piece_index,
                 .piece_buf = job.piece_buf,
-                .valid = valid,
+                .valid = outcome.valid,
+                .actual_hash_v2 = outcome.actual_hash_v2,
                 .torrent_id = job.torrent_id,
                 .is_recheck = job.is_recheck,
             });
@@ -240,17 +242,31 @@ pub const RealHasher = struct {
         self.queue_cond.signal();
     }
 
+    const VerifyOutcome = struct {
+        valid: bool,
+        actual_hash_v2: [32]u8 = [_]u8{0} ** 32,
+    };
+
     fn computeValid(job: Job) bool {
+        return computeOutcome(job).valid;
+    }
+
+    fn computeOutcome(job: Job) VerifyOutcome {
         return switch (job.hash_type) {
             .sha256 => blk: {
                 var actual_v2: [32]u8 = undefined;
                 Sha256.hash(job.piece_buf[0..job.piece_length], &actual_v2, .{});
-                break :blk std.mem.eql(u8, actual_v2[0..], job.expected_hash_v2[0..]);
+                break :blk .{
+                    .valid = std.mem.eql(u8, actual_v2[0..], job.expected_hash_v2[0..]),
+                    .actual_hash_v2 = actual_v2,
+                };
             },
             .sha1 => blk: {
                 var actual: [20]u8 = undefined;
                 Sha1.hash(job.piece_buf[0..job.piece_length], &actual, .{});
-                break :blk std.mem.eql(u8, actual[0..], job.expected_hash[0..]);
+                break :blk .{
+                    .valid = std.mem.eql(u8, actual[0..], job.expected_hash[0..]),
+                };
             },
         };
     }
@@ -381,7 +397,7 @@ pub const RealHasher = struct {
             self.queue_mutex.unlock();
 
             // Hash the piece (CPU-intensive, runs in parallel across pool)
-            const valid = computeValid(job);
+            const outcome = computeOutcome(job);
 
             // Push result
             self.result_mutex.lock();
@@ -389,7 +405,8 @@ pub const RealHasher = struct {
                 .slot = job.slot,
                 .piece_index = job.piece_index,
                 .piece_buf = job.piece_buf,
-                .valid = valid,
+                .valid = outcome.valid,
+                .actual_hash_v2 = outcome.actual_hash_v2,
                 .torrent_id = job.torrent_id,
                 .is_recheck = job.is_recheck,
             }) catch {
@@ -680,12 +697,13 @@ pub const SimHasher = struct {
             .torrent_id = torrent_id,
             .is_recheck = opts.is_recheck,
         };
-        const valid = RealHasher.computeValid(job);
+        const outcome = RealHasher.computeOutcome(job);
         const result = RealHasher.Result{
             .slot = slot,
             .piece_index = piece_index,
             .piece_buf = piece_buf,
-            .valid = valid,
+            .valid = outcome.valid,
+            .actual_hash_v2 = outcome.actual_hash_v2,
             .torrent_id = torrent_id,
             .is_recheck = opts.is_recheck,
         };

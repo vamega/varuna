@@ -1084,7 +1084,7 @@ pub fn processHashResults(self: anytype) void {
             var found = false;
             for (self.rechecks.items) |rc| {
                 if (rc.torrent_id == result.torrent_id) {
-                    rc.handleHashResult(result.piece_index, result.valid, result.piece_buf);
+                    rc.handleHashResult(result.piece_index, result.valid, result.piece_buf, result.actual_hash_v2);
                     found = true;
                     break;
                 }
