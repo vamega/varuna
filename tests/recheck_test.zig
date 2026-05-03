@@ -12,6 +12,7 @@ const sim_io_mod = varuna.io.sim_io;
 const SimIO = sim_io_mod.SimIO;
 const recheck_mod = varuna.io.recheck;
 const Hasher = varuna.io.hasher.Hasher;
+const verify_mod = varuna.storage.verify;
 const posix = std.posix;
 
 const piece_data_len = 1024;
@@ -593,10 +594,54 @@ fn buildSingleFileV2Torrent(
     return buf.toOwnedSlice(allocator);
 }
 
+fn appendV2FileTreeFile(
+    allocator: std.mem.Allocator,
+    buf: *std.ArrayList(u8),
+    name: []const u8,
+    length: u64,
+    pieces_root: [32]u8,
+) !void {
+    try buf.writer(allocator).print("{d}:{s}", .{ name.len, name });
+    try buf.appendSlice(allocator, "d0:d6:lengthi");
+    try buf.writer(allocator).print("{d}", .{length});
+    try buf.appendSlice(allocator, "e11:pieces root32:");
+    try buf.appendSlice(allocator, &pieces_root);
+    try buf.appendSlice(allocator, "ee");
+}
+
+fn buildTwoFileV2Torrent(
+    allocator: std.mem.Allocator,
+    first_root: [32]u8,
+    second_root: [32]u8,
+    first_name: []const u8,
+    second_name: []const u8,
+    file_len: u64,
+    piece_len: u32,
+) ![]u8 {
+    var buf = std.ArrayList(u8).empty;
+    defer buf.deinit(allocator);
+
+    try buf.appendSlice(allocator, "d4:infod9:file treed");
+    try appendV2FileTreeFile(allocator, &buf, first_name, file_len, first_root);
+    try appendV2FileTreeFile(allocator, &buf, second_name, file_len, second_root);
+    try buf.appendSlice(allocator, "e4:name6:v2root12:piece lengthi");
+    try buf.writer(allocator).print("{d}", .{piece_len});
+    try buf.appendSlice(allocator, "eee");
+
+    return buf.toOwnedSlice(allocator);
+}
+
 const V2RecheckResult = struct {
     completed: bool = false,
     complete_count: u32 = 0,
     bytes_complete: u64 = 0,
+};
+
+const V2MultiFileRecheckResult = struct {
+    completed: bool = false,
+    complete_count: u32 = 0,
+    bytes_complete: u64 = 0,
+    piece_complete: [4]bool = [_]bool{false} ** 4,
 };
 
 fn runSingleFileV2SimRecheck(
@@ -636,6 +681,59 @@ fn runSingleFileV2SimRecheck(
             c.completed = true;
             c.complete_count = rc.complete_pieces.count;
             c.bytes_complete = rc.bytes_complete;
+        }
+    }.cb, @ptrCast(&result));
+
+    var ticks: u32 = 0;
+    while (ticks < 128 and !result.completed) : (ticks += 1) {
+        try el.tick();
+    }
+
+    el.cancelAllRechecks();
+    return result;
+}
+
+fn runTwoFileV2SimRecheck(
+    allocator: std.mem.Allocator,
+    torrent_bytes: []const u8,
+    first_file_bytes: []const u8,
+    second_file_bytes: []const u8,
+    seed: u64,
+) !V2MultiFileRecheckResult {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const data_root = try tmp.dir.realpathAlloc(allocator, ".");
+    defer allocator.free(data_root);
+
+    const session = try Session.load(allocator, torrent_bytes, data_root);
+    defer session.deinit(allocator);
+    try std.testing.expectEqual(.v2, session.layout.version);
+    try std.testing.expectEqual(@as(usize, 2), session.layout.files.len);
+    try std.testing.expectEqual(@as(u32, 4), session.pieceCount());
+
+    const EL_SimIO = event_loop_mod.EventLoopOf(SimIO);
+    const sim_io = try SimIO.init(allocator, .{ .seed = seed });
+    var el = EL_SimIO.initBareWithIO(allocator, sim_io, 0) catch |err| {
+        if (err == error.SystemResources) return error.SkipZigTest;
+        return err;
+    };
+    defer el.deinit();
+    el.hasher = try Hasher.simInit(allocator, seed);
+
+    const fds = [_]posix.fd_t{ 50, 51 };
+    try el.io.setFileBytes(fds[0], first_file_bytes);
+    try el.io.setFileBytes(fds[1], second_file_bytes);
+
+    var result = V2MultiFileRecheckResult{};
+    try el.startRecheck(&session, &fds, 0, null, struct {
+        fn cb(rc: *EL_SimIO.AsyncRecheck) void {
+            const c: *V2MultiFileRecheckResult = @ptrCast(@alignCast(rc.caller_ctx.?));
+            c.completed = true;
+            c.complete_count = rc.complete_pieces.count;
+            c.bytes_complete = rc.bytes_complete;
+            for (&c.piece_complete, 0..) |*complete, piece_index| {
+                complete.* = rc.complete_pieces.has(@intCast(piece_index));
+            }
         }
     }.cb, @ptrCast(&result));
 
@@ -994,6 +1092,101 @@ test "AsyncRecheckOf(SimIO): verifies pure-v2 multi-piece file root" {
     try std.testing.expect(result.completed);
     try std.testing.expectEqual(@as(u32, 2), result.complete_count);
     try std.testing.expectEqual(@as(u64, file_bytes.len), result.bytes_complete);
+}
+
+test "AsyncRecheckOf(SimIO): pure-v2 multi-file Merkle recheck keeps completion file-scoped" {
+    const allocator = std.testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+
+    const v2_piece_len: u32 = 32;
+    var valid_file_bytes: [v2_piece_len * 2]u8 = undefined;
+    var corrupt_file_bytes: [v2_piece_len * 2]u8 = undefined;
+    for (&valid_file_bytes, 0..) |*b, i| b.* = @as(u8, @intCast((i * 23 + 5) & 0xff));
+    for (&corrupt_file_bytes, 0..) |*b, i| b.* = @as(u8, @intCast((i * 29 + 7) & 0xff));
+
+    const valid_leaf_hashes = [_][32]u8{
+        merkle.hashLeaf(valid_file_bytes[0..v2_piece_len]),
+        merkle.hashLeaf(valid_file_bytes[v2_piece_len..][0..v2_piece_len]),
+    };
+    var valid_tree = try merkle.MerkleTree.fromPieceHashes(allocator, &valid_leaf_hashes);
+    defer valid_tree.deinit();
+
+    const corrupt_leaf_hashes = [_][32]u8{
+        merkle.hashLeaf(corrupt_file_bytes[0..v2_piece_len]),
+        merkle.hashLeaf(corrupt_file_bytes[v2_piece_len..][0..v2_piece_len]),
+    };
+    var corrupt_tree = try merkle.MerkleTree.fromPieceHashes(allocator, &corrupt_leaf_hashes);
+    defer corrupt_tree.deinit();
+
+    corrupt_file_bytes[v2_piece_len + 3] ^= 0xA5;
+
+    const torrent_bytes = try buildTwoFileV2Torrent(
+        arena.allocator(),
+        valid_tree.root(),
+        corrupt_tree.root(),
+        "a-valid.bin",
+        "b-corrupt.bin",
+        valid_file_bytes.len,
+        v2_piece_len,
+    );
+
+    const result = try runTwoFileV2SimRecheck(
+        allocator,
+        torrent_bytes,
+        &valid_file_bytes,
+        &corrupt_file_bytes,
+        0xBEE5_2054,
+    );
+
+    try std.testing.expect(result.completed);
+    try std.testing.expectEqual(@as(u32, 2), result.complete_count);
+    try std.testing.expectEqual(@as(u64, valid_file_bytes.len), result.bytes_complete);
+    try std.testing.expect(result.piece_complete[0]);
+    try std.testing.expect(result.piece_complete[1]);
+    try std.testing.expect(!result.piece_complete[2]);
+    try std.testing.expect(!result.piece_complete[3]);
+}
+
+test "pure-v2 multi-piece plan exposes deferred Merkle marker without sentinel hash" {
+    const allocator = std.testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+
+    const v2_piece_len: u32 = 32;
+    var file_bytes: [v2_piece_len * 2]u8 = undefined;
+    for (&file_bytes, 0..) |*b, i| b.* = @as(u8, @intCast((i * 31 + 13) & 0xff));
+
+    const leaf_hashes = [_][32]u8{
+        merkle.hashLeaf(file_bytes[0..v2_piece_len]),
+        merkle.hashLeaf(file_bytes[v2_piece_len..][0..v2_piece_len]),
+    };
+    var tree = try merkle.MerkleTree.fromPieceHashes(allocator, &leaf_hashes);
+    defer tree.deinit();
+    const pieces_root = tree.root();
+
+    const torrent_bytes = try buildSingleFileV2Torrent(
+        arena.allocator(),
+        pieces_root,
+        "v2-plan.bin",
+        file_bytes.len,
+        v2_piece_len,
+    );
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const data_root = try tmp.dir.realpathAlloc(allocator, ".");
+    defer allocator.free(data_root);
+
+    const session = try Session.load(allocator, torrent_bytes, data_root);
+    defer session.deinit(allocator);
+
+    const plan = try verify_mod.planPieceVerification(allocator, &session, 0);
+    defer verify_mod.freePiecePlan(allocator, plan);
+
+    try std.testing.expect(plan.requires_v2_merkle_verification);
+    try std.testing.expectEqualSlices(u8, &pieces_root, &plan.expected_hash_v2);
+    try std.testing.expectEqual(@as(u32, 2), plan.v2_file_piece_count);
 }
 
 test "AsyncRecheckOf(SimIO): partial known-complete v2 file rehashes whole file" {

@@ -685,7 +685,8 @@ pub fn AsyncRecheckOf(comptime IO: type) type {
         fn requiresV2MerkleVerificationForSlot(self: *const Self, slot_idx: u16) bool {
             if (slot_idx >= max_in_flight) return false;
             const plan = self.slots[slot_idx].plan orelse return false;
-            return plan.hash_type == .sha256 and plan.v2_file_piece_count > 1;
+            return plan.hash_type == .sha256 and
+                (plan.requires_v2_merkle_verification or plan.v2_file_piece_count > 1);
         }
 
         fn recordV2PieceFailure(self: *Self, piece_index: u32) void {
