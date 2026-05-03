@@ -424,8 +424,9 @@ fn runDaemonWithBackend(
         // Also tick when the DHT/uTP UDP socket is open so DHT bootstrap
         // messages and incoming datagrams are processed even without TCP peers.
         // Always tick during drain so the drain timeout and completion checks run.
-        const has_io = is_draining or shared_el.peer_count > 0 or shared_el.listen_fd >= 0 or shared_el.udp_fd >= 0 or shared_el.rechecks.items.len > 0 or shared_el.metadata_fetch != null or shared_el.timer_pending;
+        const has_io = is_draining or session_manager.hasActiveMoveJobs() or shared_el.peer_count > 0 or shared_el.listen_fd >= 0 or shared_el.udp_fd >= 0 or shared_el.rechecks.items.len > 0 or shared_el.metadata_fetch != null or shared_el.timer_pending;
         if (has_io) {
+            session_manager.tickMoveJobs();
             shared_el.submitTimeout(100 * std.time.ns_per_ms) catch {};
             shared_el.tick() catch {};
         } else {

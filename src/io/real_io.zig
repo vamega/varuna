@@ -912,6 +912,7 @@ fn errnoToError(e: linux.E) anyerror {
         .IO => error.InputOutput,
         .NOSPC => error.NoSpaceLeft,
         .NOSYS => error.OperationNotSupported,
+        .XDEV => error.RenameAcrossMountPoints,
         .ISDIR => error.IsDir,
         .MFILE => error.ProcessFdQuotaExceeded,
         .NFILE => error.SystemFdQuotaExceeded,

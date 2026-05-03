@@ -239,6 +239,14 @@ pub fn build(b: *std.Build) void {
     test_step.dependOn(&run_mod_tests.step);
     test_step.dependOn(&run_daemon_tests.step);
 
+    const move_job_tests = b.addTest(.{
+        .root_module = varuna_mod,
+        .filters = &.{"MoveJob:"},
+    });
+    const run_move_job_tests = b.addRunArtifact(move_job_tests);
+    const test_move_job_step = b.step("test-move-job", "Run focused MoveJob relocation tests");
+    test_move_job_step.dependOn(&run_move_job_tests.step);
+
     // ── Hardening tests (adversarial peer, private tracker) ─
     const adversarial_tests = b.addTest(.{
         .root_module = b.createModule(.{

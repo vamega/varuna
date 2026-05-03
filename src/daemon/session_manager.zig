@@ -13,6 +13,7 @@ const BanList = @import("../net/ban_list.zig").BanList;
 const SmartBan = @import("../net/smart_ban.zig").SmartBan;
 const tracker_executor_mod = @import("../tracker/executor.zig");
 const udp_tracker_executor_mod = @import("../tracker/udp_executor.zig");
+const session_mod = @import("../torrent/session.zig");
 const move_job_mod = @import("../storage/move_job.zig");
 pub const MoveJob = move_job_mod.MoveJob;
 pub const MoveJobId = move_job_mod.JobId;
@@ -1026,24 +1027,28 @@ pub fn SessionManagerOf(comptime IO: type) type {
             const id = self.next_move_job_id;
             self.next_move_job_id += 1;
 
-            var manifest_files: ?[]MoveJob.File = null;
-            if (session.session) |loaded_session| {
-                const files = try self.allocator.alloc(MoveJob.File, loaded_session.manifest.files.len);
-                errdefer self.allocator.free(files);
-                for (loaded_session.manifest.files, 0..) |file, index| {
-                    files[index] = .{
-                        .relative_path = file.relative_path,
-                        .length = file.length,
-                    };
-                }
-                manifest_files = files;
-            }
-            defer if (manifest_files) |files| self.allocator.free(files);
+            _ = self.shared_event_loop orelse return error.SharedEventLoopNotConfigured;
 
-            const job = if (manifest_files) |files|
-                try MoveJob.createForFiles(self.allocator, id, old_path, new_path, files)
-            else
-                try MoveJob.create(self.allocator, id, old_path, new_path);
+            var fallback_session: ?session_mod.Session = null;
+            defer if (fallback_session) |loaded| loaded.deinit(self.allocator);
+
+            const manifest_files_src = if (session.session) |loaded_session|
+                loaded_session.manifest.files
+            else blk: {
+                fallback_session = try session_mod.Session.loadForSeeding(self.allocator, session.torrent_bytes, old_path);
+                break :blk fallback_session.?.manifest.files;
+            };
+
+            const manifest_files = try self.allocator.alloc(MoveJob.File, manifest_files_src.len);
+            defer self.allocator.free(manifest_files);
+            for (manifest_files_src, 0..) |file, index| {
+                manifest_files[index] = .{
+                    .relative_path = file.relative_path,
+                    .length = file.length,
+                };
+            }
+
+            const job = try MoveJob.createForFiles(self.allocator, id, old_path, new_path, manifest_files);
             // After hand-off MoveJob owns its own copies of the paths.
             errdefer job.destroy();
 
@@ -1056,10 +1061,11 @@ pub fn SessionManagerOf(comptime IO: type) type {
             const was_active = session.state == .downloading or session.state == .seeding;
             if (was_active) session.pause();
 
-            // Spawn the worker. No completion callback — clients poll for
-            // the terminal state and then call commitMoveJob to apply the
-            // save-path update synchronously under the SessionManager mutex.
-            try job.start(null, null);
+            // Start on the shared event loop. No completion callback —
+            // clients poll for the terminal state and then call commitMoveJob
+            // to apply the save-path update synchronously under the
+            // SessionManager mutex.
+            try job.startOnEventLoop(null, null);
 
             // The temporary `old_path` was duped into the job; free our copy.
             self.allocator.free(old_path);
@@ -1138,6 +1144,26 @@ pub fn SessionManagerOf(comptime IO: type) type {
             }
             _ = self.move_jobs.remove(id);
             job.destroy();
+        }
+
+        pub fn hasActiveMoveJobs(self: *Self) bool {
+            self.mutex.lock();
+            defer self.mutex.unlock();
+            var iter = self.move_jobs.iterator();
+            while (iter.next()) |entry| {
+                if (entry.value_ptr.*.isEventLoopRunning()) return true;
+            }
+            return false;
+        }
+
+        pub fn tickMoveJobs(self: *Self) void {
+            self.mutex.lock();
+            defer self.mutex.unlock();
+            const el = self.shared_event_loop orelse return;
+            var iter = self.move_jobs.iterator();
+            while (iter.next()) |entry| {
+                entry.value_ptr.*.tickOnEventLoop(&el.io);
+            }
         }
 
         pub fn count(self: *Self) usize {

@@ -3,21 +3,17 @@
 //! synchronous `setLocation` path that used to block the RPC handler
 //! thread for the duration of a multi-GB cross-filesystem copy.
 //!
-//! ## Why a dedicated thread
+//! ## Event-loop production path
 //!
-//! Recursive directory walks combine many metadata syscalls (opendir,
-//! readdir, openat, fstatat, mkdirat, unlinkat, rmdir) with the actual
-//! data-transfer work (`copy_file_range`). The IO contract now has
-//! first-class `openat` / `mkdirat` / `renameat` / `unlinkat` primitives
-//! that a future MoveJob v2 can use, but this production mover remains
-//! the thread-based v1 until getdents/statx traversal and scheduling
-//! policy are wired into an EL-owned state machine.
+//! Production moves are manifest-scoped and run as an event-loop state
+//! machine through the IO contract (`mkdirat`, `renameat`, `openat`,
+//! `copy_file_range`, `fsync`, `unlinkat`). This keeps daemon relocation
+//! out of ad hoc blocking filesystem threads and lets the main loop
+//! schedule move progress alongside peer, tracker, RPC, and recheck I/O.
 //!
-//! AGENTS.md sanctions a worker-thread for "one-time file creation,
-//! directory setup" — a setLocation move is the prototypical example.
-//! The MoveJob runs entirely on its own `std.Thread`, never touches the
-//! event loop, never blocks the RPC handler, and exposes its progress
-//! through atomics so concurrent `GET /move/{id}` polls are race-free.
+//! The legacy `start()` worker-thread path remains for source-side tests
+//! that exercise the old whole-root mover directly. `SessionManager`
+//! starts real daemon jobs with `startOnEventLoop`.
 //!
 //! ## State machine
 //!
@@ -27,16 +23,16 @@
 //!
 //! Transitions are one-shot and `compareAndSwap`-driven; once a job
 //! reaches a terminal state it stays there until `destroy`. Cancel
-//! requests flip an atomic flag — the worker checks it between files
-//! (the granularity is "one file at a time", not "one chunk at a time",
-//! which is fine for typical torrent file sizes).
+//! requests flip an atomic flag — the event-loop mover observes it between
+//! files and between copy chunks.
 //!
-//! ## Same-FS fast path
+//! ## Same-FS fast path and copy fallback
 //!
-//! `posix.fstatat` on both src and dst returns each path's `dev`. If
-//! they match, the worker uses `renameat(AT_FDCWD, src, AT_FDCWD, dst)`
-//! which is constant-time on every modern Linux filesystem. Cross-FS
-//! falls through to a recursive walk + `copy_file_range` + unlink loop.
+//! Manifest-scoped jobs first try `renameat` for each file. Same-fs moves
+//! complete with one namespace operation per file; cross-fs `EXDEV`
+//! falls back to `openat` + chunked `copy_file_range` + destination fsync
+//! + source unlink. After either route, source and destination parent
+//! directories are fsynced so completed moves survive crashes.
 //!
 //! ## Progress accounting
 //!
@@ -51,6 +47,7 @@ const builtin = @import("builtin");
 const posix = std.posix;
 const linux = std.os.linux;
 const assert = std.debug.assert;
+const ifc = @import("../io/io_interface.zig");
 
 // ── Public types ──────────────────────────────────────────
 
@@ -99,6 +96,36 @@ pub const CompletionCallback = *const fn (
 pub const MoveJob = struct {
     const SpawnThreadFn = *const fn (*MoveJob) anyerror!std.Thread;
     const FsyncFn = *const fn (posix.fd_t) anyerror!void;
+    const at_fdcwd: posix.fd_t = if (builtin.target.os.tag == .linux)
+        linux.AT.FDCWD
+    else
+        -100;
+
+    const Runner = enum {
+        none,
+        thread,
+        event_loop,
+    };
+
+    const EventStage = enum {
+        idle,
+        mkdir_next,
+        rename_file,
+        open_src,
+        open_dst,
+        copy_file_range,
+        fsync_dst_file,
+        unlink_src_file,
+        open_fsync_dir,
+        fsync_dir,
+        finish_file,
+        done,
+    };
+
+    const DirectorySyncKind = enum {
+        dst_parent,
+        src_parent,
+    };
 
     pub const File = struct {
         relative_path: []const u8,
@@ -134,6 +161,25 @@ pub const MoveJob = struct {
 
     // ── Worker thread ─────────────────────────────────────
     thread: ?std.Thread = null,
+    runner: Runner = .none,
+
+    // ── Event-loop move state ─────────────────────────────
+    io_completion: ifc.Completion = .{},
+    io_pending: bool = false,
+    io_result: ?ifc.Result = null,
+    event_stage: EventStage = .idle,
+    current_file_index: usize = 0,
+    mkdir_paths: [][:0]u8 = &.{},
+    mkdir_index: usize = 0,
+    src_path_z: ?[:0]u8 = null,
+    dst_path_z: ?[:0]u8 = null,
+    src_parent_z: ?[:0]u8 = null,
+    dst_parent_z: ?[:0]u8 = null,
+    src_fd: posix.fd_t = -1,
+    dst_fd: posix.fd_t = -1,
+    dir_fd: posix.fd_t = -1,
+    copy_offset: u64 = 0,
+    pending_dir_sync: DirectorySyncKind = .dst_parent,
 
     // ── Optional completion callback ──────────────────────
     completion_ctx: ?*anyopaque = null,
@@ -210,6 +256,7 @@ pub const MoveJob = struct {
             t.join();
             self.thread = null;
         }
+        self.freeEventLoopFileState();
         self.allocator.free(self.src_root);
         self.allocator.free(self.dst_root);
         for (self.files) |file| self.allocator.free(file.relative_path);
@@ -252,6 +299,428 @@ pub const MoveJob = struct {
             return err;
         };
         self.thread = thread;
+        self.runner = .thread;
+    }
+
+    /// Start a manifest-scoped job on the caller's event loop. The caller
+    /// must periodically call `tickOnEventLoop` until the job reaches a
+    /// terminal state.
+    pub fn startOnEventLoop(
+        self: *MoveJob,
+        completion_ctx: ?*anyopaque,
+        completion_cb: ?CompletionCallback,
+    ) !void {
+        if (self.files.len == 0) return error.ManifestRequiredForEventLoopMove;
+        const prev = self.state_atomic.cmpxchgStrong(
+            @intFromEnum(State.created),
+            @intFromEnum(State.running),
+            .acq_rel,
+            .acquire,
+        );
+        if (prev != null) return error.AlreadyStarted;
+
+        self.completion_ctx = completion_ctx;
+        self.completion_cb = completion_cb;
+        self.runner = .event_loop;
+        self.event_stage = .mkdir_next;
+        self.total_files.store(@intCast(self.files.len), .release);
+        var total_bytes: u64 = 0;
+        for (self.files) |file| total_bytes += file.length;
+        self.total_bytes.store(total_bytes, .release);
+    }
+
+    pub fn isEventLoopRunning(self: *MoveJob) bool {
+        return self.runner == .event_loop and self.progress().state == .running;
+    }
+
+    pub fn tickOnEventLoop(self: *MoveJob, io: anytype) void {
+        if (self.runner != .event_loop) return;
+        if (self.progress().state != .running) return;
+        self.tickOnEventLoopInternal(io) catch |err| self.failEventLoop(err);
+    }
+
+    fn tickOnEventLoopInternal(self: *MoveJob, io: anytype) !void {
+        if (self.io_result) |result| {
+            self.io_result = null;
+            try self.handleEventLoopResult(result);
+        }
+        if (self.progress().state != .running or self.io_pending) return;
+
+        if (self.event_stage == .mkdir_next and self.src_path_z == null) {
+            try self.prepareCurrentEventLoopFile();
+        }
+
+        if (self.progress().state != .running or self.io_pending) return;
+
+        switch (self.event_stage) {
+            .idle => {},
+            .mkdir_next => try self.submitMkdir(io),
+            .rename_file => try self.submitRename(io),
+            .open_src => try self.submitOpenSource(io),
+            .open_dst => try self.submitOpenDestination(io),
+            .copy_file_range => try self.submitCopyFileRange(io),
+            .fsync_dst_file => try self.submitFsyncDestinationFile(io),
+            .unlink_src_file => try self.submitUnlinkSource(io),
+            .open_fsync_dir => try self.submitOpenDirectoryForFsync(io),
+            .fsync_dir => try self.submitFsyncDirectory(io),
+            .finish_file => try self.finishCurrentEventLoopFile(),
+            .done => self.completeEventLoop(.succeeded),
+        }
+    }
+
+    fn prepareCurrentEventLoopFile(self: *MoveJob) !void {
+        self.freeEventLoopFileState();
+
+        if (self.cancel_requested.load(.acquire)) {
+            self.completeEventLoop(.canceled);
+            return;
+        }
+
+        if (self.current_file_index >= self.files.len) {
+            self.event_stage = .done;
+            self.completeEventLoop(.succeeded);
+            return;
+        }
+
+        const file = self.files[self.current_file_index];
+        self.src_path_z = try joinPathZ(self.allocator, self.src_root, file.relative_path);
+        errdefer {
+            if (self.src_path_z) |path| self.allocator.free(path);
+            self.src_path_z = null;
+        }
+        self.dst_path_z = try joinPathZ(self.allocator, self.dst_root, file.relative_path);
+        errdefer {
+            if (self.dst_path_z) |path| self.allocator.free(path);
+            self.dst_path_z = null;
+        }
+
+        const src_parent = std.fs.path.dirname(self.src_path_z.?[0..self.src_path_z.?.len]) orelse self.src_root;
+        self.src_parent_z = try self.allocator.dupeZ(u8, src_parent);
+        errdefer {
+            if (self.src_parent_z) |path| self.allocator.free(path);
+            self.src_parent_z = null;
+        }
+        const dst_parent = std.fs.path.dirname(self.dst_path_z.?[0..self.dst_path_z.?.len]) orelse self.dst_root;
+        self.dst_parent_z = try self.allocator.dupeZ(u8, dst_parent);
+        errdefer {
+            if (self.dst_parent_z) |path| self.allocator.free(path);
+            self.dst_parent_z = null;
+        }
+
+        self.mkdir_paths = try buildDirectoryPrefixes(self.allocator, dst_parent);
+        self.mkdir_index = 0;
+        self.copy_offset = 0;
+        self.event_stage = .mkdir_next;
+    }
+
+    fn handleEventLoopResult(self: *MoveJob, result: ifc.Result) !void {
+        switch (self.event_stage) {
+            .mkdir_next => {
+                switch (result) {
+                    .mkdirat => |r| r catch |err| switch (err) {
+                        error.PathAlreadyExists => {},
+                        else => return err,
+                    },
+                    else => return error.UnexpectedMoveJobCompletion,
+                }
+                self.mkdir_index += 1;
+                if (self.mkdir_index >= self.mkdir_paths.len) {
+                    self.event_stage = .rename_file;
+                }
+            },
+            .rename_file => {
+                switch (result) {
+                    .renameat => |r| r catch |err| switch (err) {
+                        error.RenameAcrossMountPoints, error.OperationNotSupported => {
+                            self.event_stage = .open_src;
+                            return;
+                        },
+                        else => return err,
+                    },
+                    else => return error.UnexpectedMoveJobCompletion,
+                }
+                const file = self.files[self.current_file_index];
+                _ = self.bytes_copied.fetchAdd(file.length, .acq_rel);
+                self.used_rename.store(true, .release);
+                self.pending_dir_sync = .dst_parent;
+                self.event_stage = .open_fsync_dir;
+            },
+            .open_src => {
+                switch (result) {
+                    .openat => |r| self.src_fd = try r,
+                    else => return error.UnexpectedMoveJobCompletion,
+                }
+                self.event_stage = .open_dst;
+            },
+            .open_dst => {
+                switch (result) {
+                    .openat => |r| self.dst_fd = try r,
+                    else => return error.UnexpectedMoveJobCompletion,
+                }
+                self.event_stage = .copy_file_range;
+            },
+            .copy_file_range => {
+                const n = switch (result) {
+                    .copy_file_range => |r| try r,
+                    else => return error.UnexpectedMoveJobCompletion,
+                };
+                if (n == 0) return error.UnexpectedEndOfFile;
+                self.copy_offset += n;
+                _ = self.bytes_copied.fetchAdd(n, .acq_rel);
+                const file = self.files[self.current_file_index];
+                if (self.copy_offset >= file.length) {
+                    self.event_stage = .fsync_dst_file;
+                }
+            },
+            .fsync_dst_file => {
+                switch (result) {
+                    .fsync => |r| try r,
+                    else => return error.UnexpectedMoveJobCompletion,
+                }
+                self.closeOpenFileFds();
+                self.event_stage = .unlink_src_file;
+            },
+            .unlink_src_file => {
+                switch (result) {
+                    .unlinkat => |r| r catch |err| switch (err) {
+                        error.FileNotFound => {},
+                        else => return err,
+                    },
+                    else => return error.UnexpectedMoveJobCompletion,
+                }
+                self.pending_dir_sync = .dst_parent;
+                self.event_stage = .open_fsync_dir;
+            },
+            .open_fsync_dir => {
+                switch (result) {
+                    .openat => |r| self.dir_fd = try r,
+                    else => return error.UnexpectedMoveJobCompletion,
+                }
+                self.event_stage = .fsync_dir;
+            },
+            .fsync_dir => {
+                switch (result) {
+                    .fsync => |r| try r,
+                    else => return error.UnexpectedMoveJobCompletion,
+                }
+                self.closeOpenDirFd();
+                switch (self.pending_dir_sync) {
+                    .dst_parent => {
+                        self.pending_dir_sync = .src_parent;
+                        self.event_stage = .open_fsync_dir;
+                    },
+                    .src_parent => self.event_stage = .finish_file,
+                }
+            },
+            else => return error.UnexpectedMoveJobCompletion,
+        }
+    }
+
+    fn submitMkdir(self: *MoveJob, io: anytype) !void {
+        if (self.mkdir_index >= self.mkdir_paths.len) {
+            self.event_stage = .rename_file;
+            return;
+        }
+        const path = self.mkdir_paths[self.mkdir_index];
+        self.io_pending = true;
+        io.mkdirat(.{
+            .dir_fd = at_fdcwd,
+            .path = path,
+            .mode = 0o755,
+        }, &self.io_completion, self, eventLoopCallback) catch |err| {
+            self.io_pending = false;
+            return err;
+        };
+    }
+
+    fn submitRename(self: *MoveJob, io: anytype) !void {
+        self.io_pending = true;
+        io.renameat(.{
+            .old_dir_fd = at_fdcwd,
+            .old_path = self.src_path_z.?,
+            .new_dir_fd = at_fdcwd,
+            .new_path = self.dst_path_z.?,
+            .flags = 0,
+        }, &self.io_completion, self, eventLoopCallback) catch |err| {
+            self.io_pending = false;
+            return err;
+        };
+    }
+
+    fn submitOpenSource(self: *MoveJob, io: anytype) !void {
+        self.io_pending = true;
+        io.openat(.{
+            .dir_fd = at_fdcwd,
+            .path = self.src_path_z.?,
+            .flags = .{ .ACCMODE = .RDONLY, .NOFOLLOW = true },
+            .mode = 0,
+        }, &self.io_completion, self, eventLoopCallback) catch |err| {
+            self.io_pending = false;
+            return err;
+        };
+    }
+
+    fn submitOpenDestination(self: *MoveJob, io: anytype) !void {
+        self.io_pending = true;
+        io.openat(.{
+            .dir_fd = at_fdcwd,
+            .path = self.dst_path_z.?,
+            .flags = .{ .ACCMODE = .WRONLY, .CREAT = true, .TRUNC = true, .NOFOLLOW = true },
+            .mode = 0o644,
+        }, &self.io_completion, self, eventLoopCallback) catch |err| {
+            self.io_pending = false;
+            return err;
+        };
+    }
+
+    fn submitCopyFileRange(self: *MoveJob, io: anytype) !void {
+        if (self.cancel_requested.load(.acquire)) {
+            self.closeOpenFileFds();
+            self.completeEventLoop(.canceled);
+            return;
+        }
+        const file = self.files[self.current_file_index];
+        if (self.copy_offset >= file.length) {
+            self.event_stage = .fsync_dst_file;
+            return;
+        }
+        const remaining = file.length - self.copy_offset;
+        const chunk: usize = @intCast(@min(remaining, 4 * 1024 * 1024));
+        self.io_pending = true;
+        io.copy_file_range(.{
+            .in_fd = self.src_fd,
+            .in_offset = self.copy_offset,
+            .out_fd = self.dst_fd,
+            .out_offset = self.copy_offset,
+            .len = chunk,
+            .flags = 0,
+        }, &self.io_completion, self, eventLoopCallback) catch |err| {
+            self.io_pending = false;
+            return err;
+        };
+    }
+
+    fn submitFsyncDestinationFile(self: *MoveJob, io: anytype) !void {
+        self.io_pending = true;
+        io.fsync(.{
+            .fd = self.dst_fd,
+            .datasync = false,
+        }, &self.io_completion, self, eventLoopCallback) catch |err| {
+            self.io_pending = false;
+            return err;
+        };
+    }
+
+    fn submitUnlinkSource(self: *MoveJob, io: anytype) !void {
+        self.io_pending = true;
+        io.unlinkat(.{
+            .dir_fd = at_fdcwd,
+            .path = self.src_path_z.?,
+            .flags = 0,
+        }, &self.io_completion, self, eventLoopCallback) catch |err| {
+            self.io_pending = false;
+            return err;
+        };
+    }
+
+    fn submitOpenDirectoryForFsync(self: *MoveJob, io: anytype) !void {
+        const path = switch (self.pending_dir_sync) {
+            .dst_parent => self.dst_parent_z.?,
+            .src_parent => self.src_parent_z.?,
+        };
+        self.io_pending = true;
+        io.openat(.{
+            .dir_fd = at_fdcwd,
+            .path = path,
+            .flags = .{ .ACCMODE = .RDONLY, .DIRECTORY = true },
+            .mode = 0,
+        }, &self.io_completion, self, eventLoopCallback) catch |err| {
+            self.io_pending = false;
+            return err;
+        };
+    }
+
+    fn submitFsyncDirectory(self: *MoveJob, io: anytype) !void {
+        self.io_pending = true;
+        io.fsync(.{
+            .fd = self.dir_fd,
+            .datasync = false,
+        }, &self.io_completion, self, eventLoopCallback) catch |err| {
+            self.io_pending = false;
+            return err;
+        };
+    }
+
+    fn finishCurrentEventLoopFile(self: *MoveJob) !void {
+        _ = self.files_done.fetchAdd(1, .acq_rel);
+        self.current_file_index += 1;
+        self.freeEventLoopFileState();
+        if (self.cancel_requested.load(.acquire)) {
+            self.completeEventLoop(.canceled);
+            return;
+        }
+        self.event_stage = .mkdir_next;
+    }
+
+    fn completeEventLoop(self: *MoveJob, terminal: State) void {
+        self.closeOpenFileFds();
+        self.closeOpenDirFd();
+        self.freeEventLoopFileState();
+        self.event_stage = .done;
+        self.state_atomic.store(@intFromEnum(terminal), .release);
+        if (self.completion_cb) |cb| cb(self.completion_ctx, self.id, terminal);
+    }
+
+    fn failEventLoop(self: *MoveJob, err: anyerror) void {
+        self.recordError(err);
+        self.completeEventLoop(.failed);
+    }
+
+    fn closeOpenFileFds(self: *MoveJob) void {
+        if (self.src_fd >= 0) {
+            posix.close(self.src_fd);
+            self.src_fd = -1;
+        }
+        if (self.dst_fd >= 0) {
+            posix.close(self.dst_fd);
+            self.dst_fd = -1;
+        }
+    }
+
+    fn closeOpenDirFd(self: *MoveJob) void {
+        if (self.dir_fd >= 0) {
+            posix.close(self.dir_fd);
+            self.dir_fd = -1;
+        }
+    }
+
+    fn freeEventLoopFileState(self: *MoveJob) void {
+        self.closeOpenFileFds();
+        self.closeOpenDirFd();
+        for (self.mkdir_paths) |path| self.allocator.free(path);
+        if (self.mkdir_paths.len > 0) self.allocator.free(self.mkdir_paths);
+        self.mkdir_paths = &.{};
+        self.mkdir_index = 0;
+        if (self.src_path_z) |path| self.allocator.free(path);
+        if (self.dst_path_z) |path| self.allocator.free(path);
+        if (self.src_parent_z) |path| self.allocator.free(path);
+        if (self.dst_parent_z) |path| self.allocator.free(path);
+        self.src_path_z = null;
+        self.dst_path_z = null;
+        self.src_parent_z = null;
+        self.dst_parent_z = null;
+        self.copy_offset = 0;
+    }
+
+    fn eventLoopCallback(
+        userdata: ?*anyopaque,
+        _: *ifc.Completion,
+        result: ifc.Result,
+    ) ifc.CallbackAction {
+        const self: *MoveJob = @ptrCast(@alignCast(userdata.?));
+        self.io_pending = false;
+        self.io_result = result;
+        return .disarm;
     }
 
     /// Request cancellation. Idempotent. The worker observes this between
@@ -591,6 +1060,33 @@ fn makePathAbsoluteIdempotent(path: []const u8) !void {
     };
 }
 
+fn joinPathZ(allocator: std.mem.Allocator, root: []const u8, relative_path: []const u8) ![:0]u8 {
+    const joined = try std.fs.path.join(allocator, &.{ root, relative_path });
+    defer allocator.free(joined);
+    return try allocator.dupeZ(u8, joined);
+}
+
+fn buildDirectoryPrefixes(allocator: std.mem.Allocator, directory_path: []const u8) ![][:0]u8 {
+    var paths = std.ArrayListUnmanaged([:0]u8){};
+    errdefer {
+        for (paths.items) |path| allocator.free(path);
+        paths.deinit(allocator);
+    }
+
+    if (directory_path.len == 0) return &.{};
+
+    var cursor: usize = if (directory_path[0] == std.fs.path.sep) 1 else 0;
+    while (cursor < directory_path.len) : (cursor += 1) {
+        if (directory_path[cursor] == std.fs.path.sep) {
+            if (cursor > 0) {
+                try paths.append(allocator, try allocator.dupeZ(u8, directory_path[0..cursor]));
+            }
+        }
+    }
+    try paths.append(allocator, try allocator.dupeZ(u8, directory_path));
+    return try paths.toOwnedSlice(allocator);
+}
+
 /// Copy one chunk from src_fd@in_off to dst_fd@out_off. Uses
 /// `posix.copy_file_range`, which on Linux ≥5.3 transparently handles
 /// cross-fs copies (kernel falls back to its internal read/write loop
@@ -604,12 +1100,27 @@ fn copyChunk(src_fd: posix.fd_t, in_off: u64, dst_fd: posix.fd_t, out_off: u64, 
 // ── Tests ─────────────────────────────────────────────────
 
 const testing = std.testing;
+const RealIO = @import("../io/real_io.zig").RealIO;
 
 fn expectEventuallyState(job: *MoveJob, want: State, timeout_ms: u32) !void {
     var elapsed: u32 = 0;
     while (elapsed < timeout_ms) : (elapsed += 5) {
         if (job.progress().state == want) return;
         std.Thread.sleep(5 * std.time.ns_per_ms);
+    }
+    return error.TimedOutWaitingForJobState;
+}
+
+fn expectEventLoopEventuallyState(job: *MoveJob, io: *RealIO, want: State, timeout_ms: u32) !void {
+    var elapsed: u32 = 0;
+    while (elapsed < timeout_ms) : (elapsed += 5) {
+        job.tickOnEventLoop(io);
+        if (job.progress().state == want) return;
+        if (job.io_pending) {
+            try io.tick(1);
+        } else {
+            std.Thread.sleep(5 * std.time.ns_per_ms);
+        }
     }
     return error.TimedOutWaitingForJobState;
 }
@@ -943,6 +1454,62 @@ test "MoveJob: manifest-scoped move leaves unrelated siblings in source root" {
 
     try job.start(null, null);
     try expectEventuallyState(job, .succeeded, 5000);
+
+    const moved = try tmp.dir.openFile("dst/torrent/sub/piece.bin", .{});
+    defer @constCast(&moved).close();
+    var moved_buf: [16]u8 = undefined;
+    const moved_n = try moved.readAll(&moved_buf);
+    try testing.expectEqualStrings("payload", moved_buf[0..moved_n]);
+
+    const sibling = try tmp.dir.openFile("src/unrelated.bin", .{});
+    defer @constCast(&sibling).close();
+    var sibling_buf: [16]u8 = undefined;
+    const sibling_n = try sibling.readAll(&sibling_buf);
+    try testing.expectEqualStrings("keep", sibling_buf[0..sibling_n]);
+
+    try testing.expectError(error.FileNotFound, tmp.dir.openFile("src/torrent/sub/piece.bin", .{}));
+}
+
+test "MoveJob: event-loop manifest move relocates one file without sibling damage" {
+    var io = RealIO.init(.{ .entries = 32 }) catch return error.SkipZigTest;
+    defer io.deinit();
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    try tmp.dir.makePath("src/torrent/sub");
+    {
+        const f = try tmp.dir.createFile("src/torrent/sub/piece.bin", .{});
+        defer f.close();
+        try f.writeAll("payload");
+    }
+    {
+        const f = try tmp.dir.createFile("src/unrelated.bin", .{});
+        defer f.close();
+        try f.writeAll("keep");
+    }
+
+    var src_buf: [4096]u8 = undefined;
+    var root_buf: [4096]u8 = undefined;
+    const src_abs = try tmp.dir.realpath("src", &src_buf);
+    const tmp_root = try tmp.dir.realpath(".", &root_buf);
+    const dst_abs = try std.fmt.allocPrint(testing.allocator, "{s}/dst", .{tmp_root});
+    defer testing.allocator.free(dst_abs);
+
+    var files = [_]MoveJob.File{.{
+        .relative_path = "torrent/sub/piece.bin",
+        .length = 7,
+    }};
+    var job = try MoveJob.createForFiles(testing.allocator, 9, src_abs, dst_abs, &files);
+    defer job.destroy();
+
+    try job.startOnEventLoop(null, null);
+    try expectEventLoopEventuallyState(job, &io, .succeeded, 5000);
+
+    const p = job.progress();
+    try testing.expectEqual(State.succeeded, p.state);
+    try testing.expectEqual(@as(u32, 1), p.files_done);
+    try testing.expectEqual(@as(u64, 7), p.bytes_copied);
 
     const moved = try tmp.dir.openFile("dst/torrent/sub/piece.bin", .{});
     defer @constCast(&moved).close();
