@@ -262,6 +262,36 @@ test "EpollPosixIO closeSocket cancels parked send callback" {
     try testing.expectEqual(error.OperationCanceled, counter.last_send_err.?);
 }
 
+test "EpollPosixIO queues multiple same-fd sends submitted before readiness" {
+    var io = try skipIfUnavailable();
+    defer io.deinit();
+
+    const fds = (try makeSocketpairNonBlocking()) orelse return error.SkipZigTest;
+    defer posix.close(fds[0]);
+    defer posix.close(fds[1]);
+
+    var counter = Counter{};
+    var first_send = Completion{};
+    var second_send = Completion{};
+
+    try io.send(.{ .fd = fds[0], .buf = "alpha" }, &first_send, &counter, sendCb);
+    try io.send(.{ .fd = fds[0], .buf = "beta" }, &second_send, &counter, sendCb);
+
+    var attempts: u32 = 0;
+    while (counter.sent < 2 and attempts < 100) : (attempts += 1) {
+        try io.tick(1);
+    }
+
+    try testing.expectEqual(@as(u32, 2), counter.sent);
+    try testing.expectEqual(@as(usize, 9), counter.bytes_sent);
+    try testing.expectEqual(@as(?anyerror, null), counter.last_send_err);
+
+    var got: [16]u8 = undefined;
+    const n = try posix.read(fds[1], &got);
+    try testing.expectEqual(@as(usize, 9), n);
+    try testing.expectEqualStrings("alphabeta", got[0..n]);
+}
+
 test "EpollPosixIO recv rearm after peer close delivers EOF" {
     var io = try skipIfUnavailable();
     defer io.deinit();
