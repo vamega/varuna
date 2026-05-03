@@ -100,6 +100,16 @@ pub const MoveJob = struct {
     const SpawnThreadFn = *const fn (*MoveJob) anyerror!std.Thread;
     const FsyncFn = *const fn (posix.fd_t) anyerror!void;
 
+    pub const File = struct {
+        relative_path: []const u8,
+        length: u64,
+    };
+
+    const OwnedFile = struct {
+        relative_path: []u8,
+        length: u64,
+    };
+
     id: JobId,
     allocator: std.mem.Allocator,
 
@@ -107,6 +117,7 @@ pub const MoveJob = struct {
     /// MUST be absolute (the SessionManager validates this on submit).
     src_root: []u8,
     dst_root: []u8,
+    files: []OwnedFile = &.{},
 
     // ── Atomic progress (any thread can read) ─────────────
     bytes_copied: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
@@ -153,6 +164,45 @@ pub const MoveJob = struct {
         return self;
     }
 
+    /// Allocate a manifest-scoped move job. Only the listed relative paths
+    /// are relocated; sibling files under `src_root` are left alone.
+    pub fn createForFiles(
+        allocator: std.mem.Allocator,
+        id: JobId,
+        src_root: []const u8,
+        dst_root: []const u8,
+        files: []const File,
+    ) !*MoveJob {
+        const self = try create(allocator, id, src_root, dst_root);
+        errdefer self.destroy();
+
+        const owned_files = try allocator.alloc(OwnedFile, files.len);
+        errdefer allocator.free(owned_files);
+
+        var initialized: usize = 0;
+        errdefer {
+            for (owned_files[0..initialized]) |file| allocator.free(file.relative_path);
+        }
+
+        for (files, 0..) |file, index| {
+            if (std.fs.path.isAbsolute(file.relative_path)) return error.InvalidMovePath;
+            var parts = std.mem.splitScalar(u8, file.relative_path, std.fs.path.sep);
+            while (parts.next()) |part| {
+                if (part.len == 0 or std.mem.eql(u8, part, ".") or std.mem.eql(u8, part, "..")) {
+                    return error.InvalidMovePath;
+                }
+            }
+            owned_files[index] = .{
+                .relative_path = try allocator.dupe(u8, file.relative_path),
+                .length = file.length,
+            };
+            initialized = index + 1;
+        }
+
+        self.files = owned_files;
+        return self;
+    }
+
     /// Free the job. Safe to call after `state` is terminal; if the
     /// worker thread is still running, this joins it first.
     pub fn destroy(self: *MoveJob) void {
@@ -162,6 +212,8 @@ pub const MoveJob = struct {
         }
         self.allocator.free(self.src_root);
         self.allocator.free(self.dst_root);
+        for (self.files) |file| self.allocator.free(file.relative_path);
+        if (self.files.len > 0) self.allocator.free(self.files);
         if (self.error_message) |m| self.allocator.free(m);
         const allocator = self.allocator;
         allocator.destroy(self);
@@ -265,6 +317,13 @@ pub const MoveJob = struct {
         // `error.SourceNotFound`.
         try self.scanSource();
 
+        if (self.files.len > 0) {
+            try makeDirAbsoluteIdempotent(self.dst_root);
+            try self.moveListedFiles();
+            if (self.cancel_requested.load(.acquire)) return .canceled;
+            return .succeeded;
+        }
+
         // Same-fs detection: stat src and the parent of dst (dst may not
         // exist yet). Matching `dev` ⇒ rename is safe.
         if (try self.detectSameFs()) {
@@ -314,7 +373,14 @@ pub const MoveJob = struct {
     fn scanSource(self: *MoveJob) !void {
         var total_bytes: u64 = 0;
         var total_files: u32 = 0;
-        try scanDir(self.src_root, &total_bytes, &total_files);
+        if (self.files.len > 0) {
+            for (self.files) |file| {
+                total_bytes += file.length;
+                total_files += 1;
+            }
+        } else {
+            try scanDir(self.src_root, &total_bytes, &total_files);
+        }
         self.total_bytes.store(total_bytes, .release);
         self.total_files.store(total_files, .release);
     }
@@ -367,6 +433,23 @@ pub const MoveJob = struct {
     }
 
     // ── Cross-FS recursive copy ───────────────────────────
+
+    fn moveListedFiles(self: *MoveJob) !void {
+        for (self.files) |file| {
+            if (self.cancel_requested.load(.acquire)) return;
+
+            const src_path = try std.fs.path.join(self.allocator, &.{ self.src_root, file.relative_path });
+            defer self.allocator.free(src_path);
+            const dst_path = try std.fs.path.join(self.allocator, &.{ self.dst_root, file.relative_path });
+            defer self.allocator.free(dst_path);
+
+            if (std.fs.path.dirname(dst_path)) |parent| {
+                try makePathAbsoluteIdempotent(parent);
+            }
+
+            try self.copyOneFile(src_path, dst_path);
+        }
+    }
 
     fn copyTree(self: *MoveJob, src_dir: []const u8, dst_dir: []const u8) !void {
         var dir = try std.fs.openDirAbsolute(src_dir, .{ .iterate = true });
@@ -495,6 +578,14 @@ fn makeDirAbsoluteIdempotent(path: []const u8) !void {
         // bufPrint(parent, name); a missing parent indicates dst_root
         // points outside any existing filesystem hierarchy. Surface
         // that explicitly.
+        error.FileNotFound => return error.DestinationParentMissing,
+        else => return err,
+    };
+}
+
+fn makePathAbsoluteIdempotent(path: []const u8) !void {
+    std.fs.cwd().makePath(path) catch |err| switch (err) {
+        error.PathAlreadyExists => return,
         error.FileNotFound => return error.DestinationParentMissing,
         else => return err,
     };
@@ -818,4 +909,52 @@ test "MoveJob: completion callback fires with terminal state" {
     }
     try testing.expectEqual(@as(u32, 1), Box.fired.load(.acquire));
     try testing.expectEqual(@intFromEnum(State.succeeded), Box.observed_state.load(.acquire));
+}
+
+test "MoveJob: manifest-scoped move leaves unrelated siblings in source root" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    try tmp.dir.makePath("src/torrent/sub");
+    {
+        const f = try tmp.dir.createFile("src/torrent/sub/piece.bin", .{});
+        defer f.close();
+        try f.writeAll("payload");
+    }
+    {
+        const f = try tmp.dir.createFile("src/unrelated.bin", .{});
+        defer f.close();
+        try f.writeAll("keep");
+    }
+
+    var src_buf: [4096]u8 = undefined;
+    var root_buf: [4096]u8 = undefined;
+    const src_abs = try tmp.dir.realpath("src", &src_buf);
+    const tmp_root = try tmp.dir.realpath(".", &root_buf);
+    const dst_abs = try std.fmt.allocPrint(testing.allocator, "{s}/dst", .{tmp_root});
+    defer testing.allocator.free(dst_abs);
+
+    var files = [_]MoveJob.File{.{
+        .relative_path = "torrent/sub/piece.bin",
+        .length = 7,
+    }};
+    var job = try MoveJob.createForFiles(testing.allocator, 8, src_abs, dst_abs, &files);
+    defer job.destroy();
+
+    try job.start(null, null);
+    try expectEventuallyState(job, .succeeded, 5000);
+
+    const moved = try tmp.dir.openFile("dst/torrent/sub/piece.bin", .{});
+    defer @constCast(&moved).close();
+    var moved_buf: [16]u8 = undefined;
+    const moved_n = try moved.readAll(&moved_buf);
+    try testing.expectEqualStrings("payload", moved_buf[0..moved_n]);
+
+    const sibling = try tmp.dir.openFile("src/unrelated.bin", .{});
+    defer @constCast(&sibling).close();
+    var sibling_buf: [16]u8 = undefined;
+    const sibling_n = try sibling.readAll(&sibling_buf);
+    try testing.expectEqualStrings("keep", sibling_buf[0..sibling_n]);
+
+    try testing.expectError(error.FileNotFound, tmp.dir.openFile("src/torrent/sub/piece.bin", .{}));
 }

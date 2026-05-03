@@ -1026,7 +1026,24 @@ pub fn SessionManagerOf(comptime IO: type) type {
             const id = self.next_move_job_id;
             self.next_move_job_id += 1;
 
-            const job = try MoveJob.create(self.allocator, id, old_path, new_path);
+            var manifest_files: ?[]MoveJob.File = null;
+            if (session.session) |loaded_session| {
+                const files = try self.allocator.alloc(MoveJob.File, loaded_session.manifest.files.len);
+                errdefer self.allocator.free(files);
+                for (loaded_session.manifest.files, 0..) |file, index| {
+                    files[index] = .{
+                        .relative_path = file.relative_path,
+                        .length = file.length,
+                    };
+                }
+                manifest_files = files;
+            }
+            defer if (manifest_files) |files| self.allocator.free(files);
+
+            const job = if (manifest_files) |files|
+                try MoveJob.createForFiles(self.allocator, id, old_path, new_path, files)
+            else
+                try MoveJob.create(self.allocator, id, old_path, new_path);
             // After hand-off MoveJob owns its own copies of the paths.
             errdefer job.destroy();
 
