@@ -81,6 +81,18 @@ After fixing the sparse-payload false-complete artifact and tracker self-peer st
 
 The 1 GiB readiness-backend failures reached MSE handshake and started from a valid empty downloader recheck, so the next bottleneck investigation should focus on large-transfer request/piece progress after handshake in the epoll-backed paths.
 
+### Stage 1 1 GiB Backend Validation (2026-05-03)
+
+After the epoll same-fd send queue fix, the same ReleaseFast 1 GiB marked-payload matrix passes across all Linux backends:
+
+| Payload | Backend | Status | Transfer seconds | Throughput MiB/s | Output |
+|---------|---------|--------|------------------|------------------|--------|
+| 1 GiB | `io_uring` | pass | 43.088 | 23.765 | `perf/output/backend-swarm-stage1-1g-20260503/run-1/io_uring/` |
+| 1 GiB | `epoll_posix` | pass | 41.367 | 24.754 | `perf/output/backend-swarm-stage1-1g-20260503/run-1/epoll_posix/` |
+| 1 GiB | `epoll_mmap` | pass | 44.494 | 23.014 | `perf/output/backend-swarm-stage1-1g-20260503/run-1/epoll_mmap/` |
+
+This closes the earlier 1 GiB readiness-backend no-progress finding for the current tree. Treat these as single-run loopback smoke numbers, not stable throughput rankings.
+
 ## Synthetic Workloads
 
 Use `varuna-perf` when you need deterministic allocator and cache comparisons without a real swarm or API client.
