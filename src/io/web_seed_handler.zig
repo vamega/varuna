@@ -12,6 +12,8 @@ const http = @import("http_parse.zig");
 const storage = @import("../storage/root.zig");
 const LayoutSpan = @import("../torrent/layout.zig").Layout.Span;
 const peer_handler = @import("peer_handler.zig");
+const Bitfield = @import("../bitfield.zig").Bitfield;
+const PieceTracker = @import("../torrent/piece_tracker.zig").PieceTracker;
 
 pub const max_web_seed_slots: usize = 16;
 
@@ -334,9 +336,10 @@ fn validateRangeResponse(response: RangeResponse, expected: ExpectedRange) error
             if (!contentRangeMatches(headers, expected)) return error.InvalidRangeResponse;
         },
         200 => {
-            if (expected.range_start != 0) return error.InvalidRangeResponse;
-            const content_len = http.parseContentLength(headers) orelse return error.InvalidRangeResponse;
-            if (content_len != expected_len) return error.InvalidRangeResponse;
+            // Web seed downloads always issue an HTTP Range request. A 200 OK
+            // response means the origin ignored that contract, even if the
+            // requested span starts at byte 0 and the byte count happens to fit.
+            return error.InvalidRangeResponse;
         },
         else => return error.InvalidRangeResponse,
     }
@@ -764,6 +767,481 @@ test "WebSeedSlot reset" {
     try std.testing.expectEqual(@as(u32, 0), slot.total_bytes);
     try std.testing.expectEqual(@as(?[]u8, null), slot.buf);
     try std.testing.expectEqual(@as(u32, 0), slot.pieces_hashed);
+}
+
+const FakeWebSeedResponseMode = enum {
+    honor_range,
+    ignore_range_with_200,
+};
+
+const FakeWebSeedServer = struct {
+    data: []const u8,
+    expected_range_header: []const u8,
+    response_mode: FakeWebSeedResponseMode,
+    request_count: u32 = 0,
+    validated_range_count: u32 = 0,
+    observed_range_buf: [128]u8 = undefined,
+    observed_range_len: usize = 0,
+    headers_buf: [256]u8 = undefined,
+
+    fn observedRange(self: *const FakeWebSeedServer) []const u8 {
+        return self.observed_range_buf[0..self.observed_range_len];
+    }
+
+    fn handle(self: *FakeWebSeedServer, job: FakeHttpExecutor.Job) void {
+        self.request_count += 1;
+
+        const range_line = findRangeHeader(&job) orelse {
+            self.complete(job, .{
+                .status = 400,
+                .headers = self.formatHeaders("HTTP/1.1 400 Bad Request\r\nContent-Length: 0\r\n"),
+                .target_bytes_written = 0,
+            });
+            return;
+        };
+
+        self.observed_range_len = @min(range_line.len, self.observed_range_buf.len);
+        @memcpy(self.observed_range_buf[0..self.observed_range_len], range_line[0..self.observed_range_len]);
+
+        if (!std.mem.eql(u8, range_line, self.expected_range_header)) {
+            self.complete(job, .{
+                .status = 412,
+                .headers = self.formatHeaders("HTTP/1.1 412 Precondition Failed\r\nContent-Length: 0\r\n"),
+                .target_bytes_written = 0,
+            });
+            return;
+        }
+        self.validated_range_count += 1;
+
+        const requested = parseFakeRange(range_line) orelse {
+            self.complete(job, .{
+                .status = 416,
+                .headers = self.formatHeaders("HTTP/1.1 416 Range Not Satisfiable\r\nContent-Length: 0\r\n"),
+                .target_bytes_written = 0,
+            });
+            return;
+        };
+
+        switch (self.response_mode) {
+            .honor_range => {
+                if (requested.end >= self.data.len or requested.start > requested.end) {
+                    const headers = std.fmt.bufPrint(
+                        &self.headers_buf,
+                        "HTTP/1.1 416 Range Not Satisfiable\r\nContent-Range: bytes */{d}\r\nContent-Length: 0\r\n",
+                        .{self.data.len},
+                    ) catch unreachable;
+                    self.complete(job, .{ .status = 416, .headers = headers, .target_bytes_written = 0 });
+                    return;
+                }
+
+                const body = self.data[requested.start .. requested.end + 1];
+                const written = writeToTarget(job, body);
+                const headers = std.fmt.bufPrint(
+                    &self.headers_buf,
+                    "HTTP/1.1 206 Partial Content\r\nContent-Length: {d}\r\nContent-Range: bytes {d}-{d}/{d}\r\n",
+                    .{ body.len, requested.start, requested.end, self.data.len },
+                ) catch unreachable;
+                self.complete(job, .{ .status = 206, .headers = headers, .target_bytes_written = written });
+            },
+            .ignore_range_with_200 => {
+                const written = writeToTarget(job, self.data);
+                const headers = std.fmt.bufPrint(
+                    &self.headers_buf,
+                    "HTTP/1.1 200 OK\r\nContent-Length: {d}\r\n",
+                    .{self.data.len},
+                ) catch unreachable;
+                self.complete(job, .{ .status = 200, .headers = headers, .target_bytes_written = written });
+            },
+        }
+    }
+
+    fn complete(self: *FakeWebSeedServer, job: FakeHttpExecutor.Job, result: FakeHttpExecutor.RequestResult) void {
+        _ = self;
+        job.on_complete(job.context, result);
+    }
+
+    fn formatHeaders(self: *FakeWebSeedServer, value: []const u8) []const u8 {
+        @memcpy(self.headers_buf[0..value.len], value);
+        return self.headers_buf[0..value.len];
+    }
+
+    fn findRangeHeader(job: *const FakeHttpExecutor.Job) ?[]const u8 {
+        for (&job.extra_headers) |*header| {
+            const line = header.slice();
+            if (line.len == 0) continue;
+            const colon = std.mem.indexOfScalar(u8, line, ':') orelse continue;
+            if (std.ascii.eqlIgnoreCase(line[0..colon], "range")) return line;
+        }
+        return null;
+    }
+
+    fn parseFakeRange(line: []const u8) ?struct { start: usize, end: usize } {
+        const value = extractHttpHeader(line, "range") orelse return null;
+        if (!std.ascii.startsWithIgnoreCase(value, "bytes=")) return null;
+        const spec = value["bytes=".len..];
+        const dash = std.mem.indexOfScalar(u8, spec, '-') orelse return null;
+        const start = std.fmt.parseInt(usize, spec[0..dash], 10) catch return null;
+        const end = std.fmt.parseInt(usize, spec[dash + 1 ..], 10) catch return null;
+        return .{ .start = start, .end = end };
+    }
+
+    fn writeToTarget(job: FakeHttpExecutor.Job, body: []const u8) u32 {
+        const target = job.target_buf orelse return 0;
+        const start: usize = @intCast(job.target_offset);
+        if (start >= target.len) return 0;
+        const copy_len = @min(body.len, target.len - start);
+        @memcpy(target[start .. start + copy_len], body[0..copy_len]);
+        return @intCast(copy_len);
+    }
+};
+
+const FakeHttpExecutor = struct {
+    server: *FakeWebSeedServer,
+    submit_count: u32 = 0,
+
+    pub const CompletionFn = *const fn (*anyopaque, RequestResult) void;
+    pub const max_extra_headers = 4;
+
+    pub const RequestResult = struct {
+        status: u16 = 0,
+        body: ?[]const u8 = null,
+        headers: ?[]const u8 = null,
+        target_bytes_written: u32 = 0,
+        err: ?anyerror = null,
+    };
+
+    pub const ExtraHeader = struct {
+        data: [max_header_len]u8 = undefined,
+        len: u16 = 0,
+
+        const max_header_len = 256;
+
+        pub fn slice(self: *const ExtraHeader) []const u8 {
+            return self.data[0..self.len];
+        }
+
+        pub fn set(value: []const u8) ExtraHeader {
+            var h = ExtraHeader{};
+            const copy_len = @min(value.len, max_header_len);
+            @memcpy(h.data[0..copy_len], value[0..copy_len]);
+            h.len = @intCast(copy_len);
+            return h;
+        }
+    };
+
+    pub const Job = struct {
+        context: *anyopaque,
+        on_complete: CompletionFn,
+        url: [max_url_len]u8 = undefined,
+        url_len: u16 = 0,
+        host: [max_host_len]u8 = undefined,
+        host_len: u8 = 0,
+        extra_headers: [max_extra_headers]ExtraHeader = [_]ExtraHeader{.{}} ** max_extra_headers,
+        target_buf: ?[]u8 = null,
+        target_offset: u32 = 0,
+
+        const max_host_len = 253;
+        const max_url_len = 2048;
+    };
+
+    pub fn submit(self: *FakeHttpExecutor, job: Job) !void {
+        self.submit_count += 1;
+        self.server.handle(job);
+    }
+};
+
+const FakeClock = struct {
+    value: i64 = 100,
+
+    fn now(self: *FakeClock) i64 {
+        return self.value;
+    }
+};
+
+const FakeHasher = struct {
+    fn submitVerify(
+        self: *FakeHasher,
+        sentinel_slot: u16,
+        piece_index: u32,
+        piece_buf: []u8,
+        hash: [20]u8,
+        torrent_id: TorrentId,
+    ) !void {
+        _ = self;
+        _ = sentinel_slot;
+        _ = piece_index;
+        _ = piece_buf;
+        _ = hash;
+        _ = torrent_id;
+    }
+};
+
+const FakeIO = struct {
+    pub fn write(self: *FakeIO, op: anytype, completion: anytype, userdata: anytype, cb: anytype) !void {
+        _ = self;
+        _ = op;
+        _ = completion;
+        _ = userdata;
+        _ = cb;
+        return error.UnexpectedWrite;
+    }
+};
+
+const FakeEventLoop = struct {
+    pub const PendingWriteKey = struct {
+        piece_index: u32,
+        torrent_id: TorrentId,
+    };
+
+    pub const PendingWrite = struct {
+        write_id: u32,
+        piece_index: u32,
+        torrent_id: TorrentId,
+        slot: u16,
+        buf: []u8,
+        spans_remaining: u32,
+        write_failed: bool = false,
+    };
+
+    allocator: std.mem.Allocator,
+    clock: FakeClock = .{},
+    io: FakeIO = .{},
+    web_seed_slots: [max_web_seed_slots]WebSeedSlot = [_]WebSeedSlot{.{}} ** max_web_seed_slots,
+    torrent_id: TorrentId,
+    tc: *TorrentContext,
+    hasher: ?*FakeHasher = null,
+
+    pub fn getTorrentContext(self: *FakeEventLoop, torrent_id: TorrentId) ?*TorrentContext {
+        if (torrent_id != self.torrent_id) return null;
+        return self.tc;
+    }
+
+    fn createPendingWrite(self: *FakeEventLoop, key: PendingWriteKey, pending_write: PendingWrite) !u32 {
+        _ = self;
+        _ = key;
+        _ = pending_write;
+        return error.UnexpectedWrite;
+    }
+
+    fn getPendingWrite(self: *FakeEventLoop, key: PendingWriteKey) ?*PendingWrite {
+        _ = self;
+        _ = key;
+        return null;
+    }
+
+    fn removePendingWrite(self: *FakeEventLoop, key: PendingWriteKey) ?PendingWrite {
+        _ = self;
+        _ = key;
+        return null;
+    }
+
+    pub fn getPendingWriteById(self: *FakeEventLoop, write_id: u32) ?*PendingWrite {
+        _ = self;
+        _ = write_id;
+        return null;
+    }
+
+    pub fn removePendingWriteById(self: *FakeEventLoop, write_id: u32) ?PendingWrite {
+        _ = self;
+        _ = write_id;
+        return null;
+    }
+
+    pub fn markPieceAwaitingDurability(self: *FakeEventLoop, torrent_id: TorrentId, piece_index: u32) !void {
+        _ = self;
+        _ = torrent_id;
+        _ = piece_index;
+    }
+
+    pub fn submitTorrentSync(self: *FakeEventLoop, torrent_id: TorrentId, force_even_if_clean: bool) void {
+        _ = self;
+        _ = torrent_id;
+        _ = force_even_if_clean;
+    }
+};
+
+fn initSingleFileWebSeedManager(allocator: std.mem.Allocator) !WebSeedManager {
+    const urls = [_][]const u8{"http://webseed.test/file.bin"};
+    return WebSeedManager.init(
+        allocator,
+        &urls,
+        "file.bin",
+        false,
+        &.{},
+        8,
+        16,
+    );
+}
+
+fn initFakeTorrentContext(wsm: *WebSeedManager, pt: ?*PieceTracker) TorrentContext {
+    const no_fds: []const posix.fd_t = &.{};
+    return .{
+        .session = null,
+        .piece_tracker = pt,
+        .shared_fds = no_fds,
+        .info_hash = [_]u8{0} ** 20,
+        .peer_id = [_]u8{0} ** 20,
+        .web_seed_manager = wsm,
+    };
+}
+
+test "web seed fake server validates requested Range header through handler flow" {
+    var wsm = try initSingleFileWebSeedManager(std.testing.allocator);
+    defer wsm.deinit();
+    const seed_index = wsm.assignPiece(0, 0).?;
+
+    var tc = initFakeTorrentContext(&wsm, null);
+    var el = FakeEventLoop{
+        .allocator = std.testing.allocator,
+        .torrent_id = 7,
+        .tc = &tc,
+    };
+
+    var server = FakeWebSeedServer{
+        .data = "0123456789abcdef",
+        .expected_range_header = "Range: bytes=4-11",
+        .response_mode = .honor_range,
+    };
+    var executor = FakeHttpExecutor{ .server = &server };
+
+    var run_buf = try std.testing.allocator.alloc(u8, 12);
+    defer std.testing.allocator.free(run_buf);
+    @memset(run_buf, '.');
+
+    el.web_seed_slots[0] = .{
+        .state = .downloading,
+        .seed_index = seed_index,
+        .torrent_id = el.torrent_id,
+        .first_piece = 0,
+        .piece_count = 1,
+        .total_bytes = @intCast(run_buf.len),
+        .buf = run_buf,
+        .ranges_total = 2,
+        .ranges_completed = 0,
+    };
+
+    try submitMultiPieceRangeRequest(&el, &executor, &wsm, 0, seed_index, .{
+        .file_index = 0,
+        .range_start = 4,
+        .range_end = 11,
+        .buf_offset = 2,
+        .length = 8,
+    }, run_buf);
+
+    try std.testing.expectEqual(@as(u32, 1), executor.submit_count);
+    try std.testing.expectEqual(@as(u32, 1), server.request_count);
+    try std.testing.expectEqual(@as(u32, 1), server.validated_range_count);
+    try std.testing.expectEqualStrings("Range: bytes=4-11", server.observedRange());
+    try std.testing.expectEqualStrings("456789ab", run_buf[2..10]);
+    try std.testing.expectEqual(@as(u8, 1), el.web_seed_slots[0].ranges_completed);
+    try std.testing.expect(!el.web_seed_slots[0].ranges_failed);
+    try std.testing.expectEqual(WebSeedSlot.State.downloading, el.web_seed_slots[0].state);
+}
+
+test "web seed fake server ignored Range response fails handler slot end-to-end" {
+    var initial = try Bitfield.init(std.testing.allocator, 2);
+    defer initial.deinit(std.testing.allocator);
+    var pt = try PieceTracker.init(std.testing.allocator, 2, 8, 16, &initial, 0);
+    defer pt.deinit(std.testing.allocator);
+    try std.testing.expect(pt.claimSpecificPiece(0));
+
+    var wsm = try initSingleFileWebSeedManager(std.testing.allocator);
+    defer wsm.deinit();
+    const seed_index = wsm.assignPiece(0, 0).?;
+
+    var tc = initFakeTorrentContext(&wsm, &pt);
+    var el = FakeEventLoop{
+        .allocator = std.testing.allocator,
+        .torrent_id = 7,
+        .tc = &tc,
+    };
+
+    var server = FakeWebSeedServer{
+        .data = "0123456789abcdef",
+        .expected_range_header = "Range: bytes=4-11",
+        .response_mode = .ignore_range_with_200,
+    };
+    var executor = FakeHttpExecutor{ .server = &server };
+
+    const run_buf = try std.testing.allocator.alloc(u8, 16);
+    @memset(run_buf, '.');
+
+    el.web_seed_slots[0] = .{
+        .state = .downloading,
+        .seed_index = seed_index,
+        .torrent_id = el.torrent_id,
+        .first_piece = 0,
+        .piece_count = 1,
+        .total_bytes = @intCast(run_buf.len),
+        .buf = run_buf,
+        .ranges_total = 1,
+        .ranges_completed = 0,
+    };
+
+    try submitMultiPieceRangeRequest(&el, &executor, &wsm, 0, seed_index, .{
+        .file_index = 0,
+        .range_start = 4,
+        .range_end = 11,
+        .buf_offset = 0,
+        .length = 8,
+    }, run_buf);
+
+    try std.testing.expectEqual(@as(u32, 1), server.validated_range_count);
+    try std.testing.expectEqualStrings("Range: bytes=4-11", server.observedRange());
+    try std.testing.expectEqual(WebSeedSlot.State.free, el.web_seed_slots[0].state);
+    try std.testing.expectEqual(@as(u32, 1), wsm.seeds[seed_index].failed_requests);
+    try std.testing.expectEqual(@as(u32, 1), wsm.seeds[seed_index].consecutive_failures);
+    try std.testing.expectEqual(@as(i64, 105), wsm.seeds[seed_index].backoff_until);
+    try std.testing.expect(pt.claimSpecificPiece(0));
+}
+
+test "web seed fake server rejects ignored Range response even for zero start" {
+    var wsm = try initSingleFileWebSeedManager(std.testing.allocator);
+    defer wsm.deinit();
+    const seed_index = wsm.assignPiece(0, 0).?;
+
+    var tc = initFakeTorrentContext(&wsm, null);
+    var el = FakeEventLoop{
+        .allocator = std.testing.allocator,
+        .torrent_id = 7,
+        .tc = &tc,
+    };
+
+    var server = FakeWebSeedServer{
+        .data = "0123456789abcdef",
+        .expected_range_header = "Range: bytes=0-15",
+        .response_mode = .ignore_range_with_200,
+    };
+    var executor = FakeHttpExecutor{ .server = &server };
+
+    const run_buf = try std.testing.allocator.alloc(u8, 16);
+    defer std.testing.allocator.free(run_buf);
+    @memset(run_buf, '.');
+
+    el.web_seed_slots[0] = .{
+        .state = .downloading,
+        .seed_index = seed_index,
+        .torrent_id = el.torrent_id,
+        .first_piece = 0,
+        .piece_count = 1,
+        .total_bytes = @intCast(run_buf.len),
+        .buf = run_buf,
+        .ranges_total = 2,
+        .ranges_completed = 0,
+    };
+
+    try submitMultiPieceRangeRequest(&el, &executor, &wsm, 0, seed_index, .{
+        .file_index = 0,
+        .range_start = 0,
+        .range_end = 15,
+        .buf_offset = 0,
+        .length = 16,
+    }, run_buf);
+
+    try std.testing.expectEqual(@as(u32, 1), server.validated_range_count);
+    try std.testing.expectEqualStrings("Range: bytes=0-15", server.observedRange());
+    try std.testing.expectEqual(@as(u8, 1), el.web_seed_slots[0].ranges_completed);
+    try std.testing.expect(el.web_seed_slots[0].ranges_failed);
 }
 
 test "web seed range response accepts exact 206 Content-Range" {
