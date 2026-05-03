@@ -263,6 +263,14 @@ pub fn build(b: *std.Build) void {
     const test_rpc_parser_step = b.step("test-rpc-parser", "Run focused RPC parser compatibility tests");
     test_rpc_parser_step.dependOn(&run_rpc_parser_tests.step);
 
+    const web_seed_source_tests = b.addTest(.{
+        .root_module = varuna_mod,
+        .filters = &.{"web seed"},
+    });
+    const run_web_seed_source_tests = b.addRunArtifact(web_seed_source_tests);
+    const test_web_seed_source_step = b.step("test-web-seed", "Run focused web seed source tests");
+    test_web_seed_source_step.dependOn(&run_web_seed_source_tests.step);
+
     // ── Hardening tests (adversarial peer, private tracker) ─
     const adversarial_tests = b.addTest(.{
         .root_module = b.createModule(.{

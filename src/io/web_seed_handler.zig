@@ -8,6 +8,7 @@ const encodeUserData = @import("types.zig").encodeUserData;
 const WebSeedManager = @import("../net/web_seed.zig").WebSeedManager;
 const MultiPieceRange = @import("../net/web_seed.zig").MultiPieceRange;
 const Hasher = @import("hasher.zig").Hasher;
+const http = @import("http_parse.zig");
 const storage = @import("../storage/root.zig");
 const LayoutSpan = @import("../torrent/layout.zig").Layout.Span;
 const peer_handler = @import("peer_handler.zig");
@@ -51,6 +52,8 @@ fn RangeContextOf(comptime EventLoop: type) type {
     return struct {
         event_loop: *EventLoop,
         slot_index: u8,
+        range_start: u64,
+        range_end: u64,
     };
 }
 
@@ -231,6 +234,8 @@ fn submitMultiPieceRangeRequest(
     ctx.* = .{
         .event_loop = el,
         .slot_index = slot_idx,
+        .range_start = range.range_start,
+        .range_end = range.range_end,
     };
 
     var job = HttpExecutor.Job{
@@ -300,6 +305,70 @@ fn extractHost(url: []const u8) ?[]const u8 {
     return host_port;
 }
 
+const RangeResponse = struct {
+    status: u16,
+    headers: ?[]const u8,
+    target_bytes_written: u32,
+};
+
+const ExpectedRange = struct {
+    range_start: u64,
+    range_end: u64,
+};
+
+fn validateRangeResponse(response: RangeResponse, expected: ExpectedRange) error{InvalidRangeResponse}!void {
+    if (expected.range_end < expected.range_start) return error.InvalidRangeResponse;
+    const expected_len_u64 = expected.range_end - expected.range_start + 1;
+    if (expected_len_u64 > std.math.maxInt(u32)) return error.InvalidRangeResponse;
+    const expected_len: u32 = @intCast(expected_len_u64);
+
+    if (response.target_bytes_written != expected_len) return error.InvalidRangeResponse;
+
+    const headers = response.headers orelse return error.InvalidRangeResponse;
+    if (http.parseContentLength(headers)) |content_len| {
+        if (content_len != expected_len) return error.InvalidRangeResponse;
+    }
+
+    switch (response.status) {
+        206 => {
+            if (!contentRangeMatches(headers, expected)) return error.InvalidRangeResponse;
+        },
+        200 => {
+            if (expected.range_start != 0) return error.InvalidRangeResponse;
+            const content_len = http.parseContentLength(headers) orelse return error.InvalidRangeResponse;
+            if (content_len != expected_len) return error.InvalidRangeResponse;
+        },
+        else => return error.InvalidRangeResponse,
+    }
+}
+
+fn contentRangeMatches(headers: []const u8, expected: ExpectedRange) bool {
+    const value = extractHttpHeader(headers, "content-range") orelse return false;
+    if (!std.ascii.startsWithIgnoreCase(value, "bytes")) return false;
+    if (value.len == "bytes".len) return false;
+    if (value["bytes".len] != ' ' and value["bytes".len] != '\t') return false;
+
+    const range_part = std.mem.trim(u8, value["bytes".len..], " \t");
+    const slash = std.mem.indexOfScalar(u8, range_part, '/') orelse return false;
+    const byte_range = range_part[0..slash];
+    const dash = std.mem.indexOfScalar(u8, byte_range, '-') orelse return false;
+
+    const start = std.fmt.parseInt(u64, std.mem.trim(u8, byte_range[0..dash], " \t"), 10) catch return false;
+    const end = std.fmt.parseInt(u64, std.mem.trim(u8, byte_range[dash + 1 ..], " \t"), 10) catch return false;
+    return start == expected.range_start and end == expected.range_end;
+}
+
+fn extractHttpHeader(headers: []const u8, name: []const u8) ?[]const u8 {
+    var iter = std.mem.splitSequence(u8, headers, "\r\n");
+    while (iter.next()) |line| {
+        const colon = std.mem.indexOfScalar(u8, line, ':') orelse continue;
+        if (line[0..colon].len != name.len) continue;
+        if (!std.ascii.eqlIgnoreCase(line[0..colon], name)) continue;
+        return std.mem.trim(u8, line[colon + 1 ..], " \t");
+    }
+    return null;
+}
+
 /// HttpExecutor completion callback for a single range request.
 fn webSeedRangeCompleteFor(
     comptime EventLoop: type,
@@ -311,14 +380,27 @@ fn webSeedRangeCompleteFor(
             const ctx: *RangeContext = @ptrCast(@alignCast(context));
             const el = ctx.event_loop;
             const slot_idx = ctx.slot_index;
+            const expected_range = ExpectedRange{
+                .range_start = ctx.range_start,
+                .range_end = ctx.range_end,
+            };
             el.allocator.destroy(ctx);
 
             if (slot_idx >= max_web_seed_slots) return;
             const slot = &el.web_seed_slots[slot_idx];
             if (slot.state != .downloading) return;
 
-            // Check HTTP status
-            if (result.err != null or (result.status != 200 and result.status != 206)) {
+            const range_valid = if (result.err == null) blk: {
+                validateRangeResponse(.{
+                    .status = result.status,
+                    .headers = result.headers,
+                    .target_bytes_written = result.target_bytes_written,
+                }, expected_range) catch break :blk false;
+                break :blk true;
+            } else false;
+
+            // Check HTTP status and range contract.
+            if (result.err != null or !range_valid) {
                 log.debug("web seed: range failed for pieces {d}..{d} (status={d}, err={?})", .{
                     slot.first_piece,
                     slot.first_piece + slot.piece_count - 1,
@@ -682,4 +764,68 @@ test "WebSeedSlot reset" {
     try std.testing.expectEqual(@as(u32, 0), slot.total_bytes);
     try std.testing.expectEqual(@as(?[]u8, null), slot.buf);
     try std.testing.expectEqual(@as(u32, 0), slot.pieces_hashed);
+}
+
+test "web seed range response accepts exact 206 Content-Range" {
+    const headers = "HTTP/1.1 206 Partial Content\r\n" ++
+        "Content-Length: 16\r\n" ++
+        "Content-Range: bytes 32-47/1024\r\n";
+    try validateRangeResponse(.{
+        .status = 206,
+        .headers = headers,
+        .target_bytes_written = 16,
+    }, .{
+        .range_start = 32,
+        .range_end = 47,
+    });
+}
+
+test "web seed range response rejects missing or mismatched Content-Range" {
+    const missing = "HTTP/1.1 206 Partial Content\r\nContent-Length: 16\r\n";
+    try std.testing.expectError(error.InvalidRangeResponse, validateRangeResponse(.{
+        .status = 206,
+        .headers = missing,
+        .target_bytes_written = 16,
+    }, .{
+        .range_start = 32,
+        .range_end = 47,
+    }));
+
+    const mismatch = "HTTP/1.1 206 Partial Content\r\n" ++
+        "Content-Length: 16\r\n" ++
+        "Content-Range: bytes 31-46/1024\r\n";
+    try std.testing.expectError(error.InvalidRangeResponse, validateRangeResponse(.{
+        .status = 206,
+        .headers = mismatch,
+        .target_bytes_written = 16,
+    }, .{
+        .range_start = 32,
+        .range_end = 47,
+    }));
+}
+
+test "web seed range response rejects short target body" {
+    const headers = "HTTP/1.1 206 Partial Content\r\n" ++
+        "Content-Length: 16\r\n" ++
+        "Content-Range: bytes 32-47/1024\r\n";
+    try std.testing.expectError(error.InvalidRangeResponse, validateRangeResponse(.{
+        .status = 206,
+        .headers = headers,
+        .target_bytes_written = 15,
+    }, .{
+        .range_start = 32,
+        .range_end = 47,
+    }));
+}
+
+test "web seed range response rejects 200 OK for nonzero range" {
+    const headers = "HTTP/1.1 200 OK\r\nContent-Length: 16\r\n";
+    try std.testing.expectError(error.InvalidRangeResponse, validateRangeResponse(.{
+        .status = 200,
+        .headers = headers,
+        .target_bytes_written = 16,
+    }, .{
+        .range_start = 32,
+        .range_end = 47,
+    }));
 }
