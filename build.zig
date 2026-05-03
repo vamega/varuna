@@ -255,6 +255,14 @@ pub fn build(b: *std.Build) void {
     const test_dht_step = b.step("test-dht", "Run focused DHT source tests");
     test_dht_step.dependOn(&run_dht_source_tests.step);
 
+    const rpc_parser_tests = b.addTest(.{
+        .root_module = varuna_mod,
+        .filters = &.{"RPC parser"},
+    });
+    const run_rpc_parser_tests = b.addRunArtifact(rpc_parser_tests);
+    const test_rpc_parser_step = b.step("test-rpc-parser", "Run focused RPC parser compatibility tests");
+    test_rpc_parser_step.dependOn(&run_rpc_parser_tests.step);
+
     // ── Hardening tests (adversarial peer, private tracker) ─
     const adversarial_tests = b.addTest(.{
         .root_module = b.createModule(.{

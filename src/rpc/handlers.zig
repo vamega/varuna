@@ -57,6 +57,7 @@ pub fn ApiHandlerOf(comptime IO: type) type {
                     return withCors(.{ .status = 500, .body = "{\"error\":\"internal\"}" });
                 request.body = owned_body.?;
             }
+            const route_path = pathWithoutQuery(request.path);
 
             // CORS preflight
             if (std.mem.eql(u8, request.method, "OPTIONS")) {
@@ -69,10 +70,10 @@ pub fn ApiHandlerOf(comptime IO: type) type {
             }
 
             // Auth endpoints are always accessible
-            if (std.mem.eql(u8, request.path, "/api/v2/auth/login") and std.mem.eql(u8, request.method, "POST")) {
+            if (std.mem.eql(u8, route_path, "/api/v2/auth/login") and std.mem.eql(u8, request.method, "POST")) {
                 return self.handleLogin(allocator, request.body);
             }
-            if (std.mem.eql(u8, request.path, "/api/v2/auth/logout")) {
+            if (std.mem.eql(u8, route_path, "/api/v2/auth/logout")) {
                 return withCors(self.handleLogout(request.cookie_sid));
             }
 
@@ -83,93 +84,93 @@ pub fn ApiHandlerOf(comptime IO: type) type {
                 return withCors(.{ .status = 403, .body = "Forbidden" });
             }
 
-            if (std.mem.eql(u8, request.path, "/api/v2/app/webapiVersion")) {
+            if (std.mem.eql(u8, route_path, "/api/v2/app/webapiVersion")) {
                 return withCors(.{ .body = "\"2.9.3\"", .content_type = "text/plain" });
             }
 
-            if (std.mem.eql(u8, request.path, "/api/v2/app/version")) {
+            if (std.mem.eql(u8, route_path, "/api/v2/app/version")) {
                 return withCors(.{ .body = "v5.0.0", .content_type = "text/plain" });
             }
 
-            if (std.mem.eql(u8, request.path, "/api/v2/app/buildInfo")) {
+            if (std.mem.eql(u8, route_path, "/api/v2/app/buildInfo")) {
                 return withCors(.{ .body = "{\"qt\":\"N/A\",\"libtorrent\":\"N/A\",\"boost\":\"N/A\",\"openssl\":\"N/A\",\"bitness\":64}" });
             }
 
-            if (std.mem.eql(u8, request.path, "/api/v2/app/preferences")) {
+            if (std.mem.eql(u8, route_path, "/api/v2/app/preferences")) {
                 return withCors(self.handlePreferences(allocator));
             }
 
-            if (std.mem.eql(u8, request.path, "/api/v2/app/setPreferences") and std.mem.eql(u8, request.method, "POST")) {
+            if (std.mem.eql(u8, route_path, "/api/v2/app/setPreferences") and std.mem.eql(u8, request.method, "POST")) {
                 return withCors(self.handleSetPreferences(allocator, request.body));
             }
 
-            if (std.mem.eql(u8, request.path, "/api/v2/app/defaultSavePath")) {
+            if (std.mem.eql(u8, route_path, "/api/v2/app/defaultSavePath")) {
                 return withCors(self.handleDefaultSavePath());
             }
 
-            if (std.mem.startsWith(u8, request.path, "/api/v2/app/shutdown") and std.mem.eql(u8, request.method, "POST")) {
+            if (std.mem.startsWith(u8, route_path, "/api/v2/app/shutdown") and std.mem.eql(u8, request.method, "POST")) {
                 return withCors(self.handleShutdown(request.path, request.body));
             }
 
-            if (std.mem.eql(u8, request.path, "/api/v2/transfer/info")) {
+            if (std.mem.eql(u8, route_path, "/api/v2/transfer/info")) {
                 return withCors(self.handleTransferInfo(allocator));
             }
 
-            if (std.mem.eql(u8, request.path, "/api/v2/transfer/speedLimitsMode")) {
+            if (std.mem.eql(u8, route_path, "/api/v2/transfer/speedLimitsMode")) {
                 return withCors(self.handleSpeedLimitsMode(allocator));
             }
 
-            if (std.mem.eql(u8, request.path, "/api/v2/transfer/toggleSpeedLimitsMode") and std.mem.eql(u8, request.method, "POST")) {
+            if (std.mem.eql(u8, route_path, "/api/v2/transfer/toggleSpeedLimitsMode") and std.mem.eql(u8, request.method, "POST")) {
                 return withCors(self.handleToggleSpeedLimitsMode());
             }
 
-            if (std.mem.eql(u8, request.path, "/api/v2/transfer/downloadLimit")) {
+            if (std.mem.eql(u8, route_path, "/api/v2/transfer/downloadLimit")) {
                 return withCors(self.handleGlobalDlLimit(allocator));
             }
 
-            if (std.mem.eql(u8, request.path, "/api/v2/transfer/uploadLimit")) {
+            if (std.mem.eql(u8, route_path, "/api/v2/transfer/uploadLimit")) {
                 return withCors(self.handleGlobalUlLimit(allocator));
             }
 
-            if (std.mem.eql(u8, request.path, "/api/v2/transfer/setDownloadLimit") and std.mem.eql(u8, request.method, "POST")) {
+            if (std.mem.eql(u8, route_path, "/api/v2/transfer/setDownloadLimit") and std.mem.eql(u8, request.method, "POST")) {
                 return withCors(self.handleSetGlobalDlLimit(request.body));
             }
 
-            if (std.mem.eql(u8, request.path, "/api/v2/transfer/setUploadLimit") and std.mem.eql(u8, request.method, "POST")) {
+            if (std.mem.eql(u8, route_path, "/api/v2/transfer/setUploadLimit") and std.mem.eql(u8, request.method, "POST")) {
                 return withCors(self.handleSetGlobalUlLimit(request.body));
             }
 
             // ── Ban management endpoints ──────────────────────────
-            if (std.mem.eql(u8, request.path, "/api/v2/transfer/banPeers") and std.mem.eql(u8, request.method, "POST")) {
+            if (std.mem.eql(u8, route_path, "/api/v2/transfer/banPeers") and std.mem.eql(u8, request.method, "POST")) {
                 return withCors(self.handleBanPeers(allocator, request.body));
             }
 
-            if (std.mem.eql(u8, request.path, "/api/v2/transfer/unbanPeers") and std.mem.eql(u8, request.method, "POST")) {
+            if (std.mem.eql(u8, route_path, "/api/v2/transfer/unbanPeers") and std.mem.eql(u8, request.method, "POST")) {
                 return withCors(self.handleUnbanPeers(allocator, request.body));
             }
 
-            if (std.mem.eql(u8, request.path, "/api/v2/transfer/bannedPeers")) {
+            if (std.mem.eql(u8, route_path, "/api/v2/transfer/bannedPeers")) {
                 return withCors(self.handleBannedPeers(allocator));
             }
 
-            if (std.mem.eql(u8, request.path, "/api/v2/transfer/importBanList") and std.mem.eql(u8, request.method, "POST")) {
+            if (std.mem.eql(u8, route_path, "/api/v2/transfer/importBanList") and std.mem.eql(u8, request.method, "POST")) {
                 return withCors(self.handleImportBanList(allocator, request.body, request.content_type));
             }
 
-            if (std.mem.startsWith(u8, request.path, "/api/v2/varuna/torrents/move")) {
+            if (std.mem.startsWith(u8, route_path, "/api/v2/varuna/torrents/move")) {
                 return withCors(self.handleVarunaMove(allocator, request.method, request.path, request.body));
             }
 
-            if (std.mem.startsWith(u8, request.path, "/api/v2/torrents/")) {
+            if (std.mem.startsWith(u8, route_path, "/api/v2/torrents/")) {
                 const action = request.path["/api/v2/torrents/".len..];
                 return withCors(self.handleTorrents(allocator, request.method, action, request.body, request.content_type));
             }
 
-            if (std.mem.startsWith(u8, request.path, "/api/v2/sync/maindata")) {
+            if (std.mem.startsWith(u8, route_path, "/api/v2/sync/maindata")) {
                 return withCors(self.handleSyncMaindata(allocator, request.path));
             }
 
-            if (std.mem.startsWith(u8, request.path, "/api/v2/sync/torrentPeers")) {
+            if (std.mem.startsWith(u8, route_path, "/api/v2/sync/torrentPeers")) {
                 return withCors(self.handleSyncTorrentPeers(allocator, request.path));
             }
 
@@ -2493,6 +2494,11 @@ fn compareTorrentStats(key: []const u8, lhs: TorrentSession.Stats, rhs: TorrentS
 
 fn bodyLooksLikeJson(body: []const u8) bool {
     return body.len > 0 and (body[0] == '{' or body[0] == '[');
+}
+
+fn pathWithoutQuery(path: []const u8) []const u8 {
+    const query_start = std.mem.indexOfScalar(u8, path, '?') orelse return path;
+    return path[0..query_start];
 }
 
 fn parseBoolPreference(value: []const u8) error{InvalidBoolean}!bool {

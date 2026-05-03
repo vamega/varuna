@@ -137,10 +137,11 @@ pub fn extractSidFromHeaders(data: []const u8) ?[]const u8 {
 
 fn extractSidFromCookieValue(cookie: []const u8) ?[]const u8 {
     // Parse "SID=abc123" or "SID=abc123; other=val"
-    var iter = std.mem.splitSequence(u8, cookie, "; ");
+    var iter = std.mem.splitScalar(u8, cookie, ';');
     while (iter.next()) |pair| {
-        if (pair.len > 4 and std.mem.eql(u8, pair[0..4], "SID=")) {
-            return pair[4..];
+        const trimmed = std.mem.trim(u8, pair, " \t");
+        if (trimmed.len > 4 and std.mem.eql(u8, trimmed[0..4], "SID=")) {
+            return trimmed[4..];
         }
     }
     return null;
@@ -223,6 +224,13 @@ test "extract SID from headers" {
 
 test "extract SID from cookie with multiple values" {
     const headers = "Cookie: other=123; SID=abcdef0123456789abcdef0123456789; foo=bar\r\n\r\n";
+    const sid = extractSidFromHeaders(headers);
+    try std.testing.expect(sid != null);
+    try std.testing.expectEqualStrings("abcdef0123456789abcdef0123456789", sid.?);
+}
+
+test "RPC parser extracts SID from semicolon-delimited cookies without spaces" {
+    const headers = "Cookie: other=123;SID=abcdef0123456789abcdef0123456789;foo=bar\r\n\r\n";
     const sid = extractSidFromHeaders(headers);
     try std.testing.expect(sid != null);
     try std.testing.expectEqualStrings("abcdef0123456789abcdef0123456789", sid.?);

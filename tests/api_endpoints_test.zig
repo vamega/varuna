@@ -59,6 +59,15 @@ test "defaultSavePath returns plain text" {
     try std.testing.expectEqualStrings("/tmp/test-downloads", resp.body);
 }
 
+test "RPC parser routes exact API endpoints with query strings" {
+    var ctx = TestCtx.init();
+    defer ctx.deinit();
+    const resp = ctx.handle("GET", "/api/v2/app/defaultSavePath?rid=42", "");
+    try std.testing.expectEqual(@as(u16, 200), resp.status);
+    try std.testing.expectEqualStrings("text/plain", resp.content_type);
+    try std.testing.expectEqualStrings("/tmp/test-downloads", resp.body);
+}
+
 test "toggleSpeedLimitsMode returns 501 Not Implemented" {
     var ctx = TestCtx.init();
     defer ctx.deinit();

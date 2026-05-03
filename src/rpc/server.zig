@@ -675,7 +675,7 @@ fn extractHeader(headers: []const u8, name: []const u8) ?[]const u8 {
         }
         if (!match) continue;
 
-        return std.mem.trimLeft(u8, line[colon + 1 ..], " ");
+        return std.mem.trim(u8, line[colon + 1 ..], " \t");
     }
     return null;
 }
@@ -857,6 +857,11 @@ test "extractHeader case insensitive" {
 
 test "parseContentLength extracts length" {
     const headers = "Content-Type: text/plain\r\nContent-Length: 1234\r\n";
+    try std.testing.expectEqual(@as(?usize, 1234), parseContentLength(headers));
+}
+
+test "RPC parser accepts optional whitespace around content length" {
+    const headers = "Content-Type: text/plain\r\nContent-Length: \t1234 \r\n";
     try std.testing.expectEqual(@as(?usize, 1234), parseContentLength(headers));
 }
 
