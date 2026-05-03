@@ -247,6 +247,14 @@ pub fn build(b: *std.Build) void {
     const test_move_job_step = b.step("test-move-job", "Run focused MoveJob relocation tests");
     test_move_job_step.dependOn(&run_move_job_tests.step);
 
+    const dht_source_tests = b.addTest(.{
+        .root_module = varuna_mod,
+        .filters = &.{"DHT"},
+    });
+    const run_dht_source_tests = b.addRunArtifact(dht_source_tests);
+    const test_dht_step = b.step("test-dht", "Run focused DHT source tests");
+    test_dht_step.dependOn(&run_dht_source_tests.step);
+
     // ── Hardening tests (adversarial peer, private tracker) ─
     const adversarial_tests = b.addTest(.{
         .root_module = b.createModule(.{

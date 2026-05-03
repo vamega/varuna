@@ -25,6 +25,12 @@ const max_registered_searches: usize = 4096;
 /// Maximum pending outbound queries.
 const max_pending: usize = 256;
 
+/// Maximum queued outbound UDP packets waiting for the event loop.
+const max_send_queue: usize = 512;
+
+/// Maximum queued peer-result batches waiting for the event loop.
+const max_peer_result_queue: usize = 128;
+
 /// Query timeout in seconds.
 const query_timeout_secs: i64 = 15;
 
@@ -601,6 +607,11 @@ pub const DhtEngine = struct {
         return result;
     }
 
+    pub fn freeSendQueueBatch(self: *DhtEngine, batch: []OutboundPacket) void {
+        if (batch.len == 0) return;
+        self.allocator.free(batch);
+    }
+
     /// Drain peer results. Returns discovered peers for the event loop.
     pub fn drainPeerResults(self: *DhtEngine) []PeerResult {
         const items = self.peer_results.items;
@@ -609,6 +620,11 @@ pub const DhtEngine = struct {
         @memcpy(result, items);
         self.peer_results.clearRetainingCapacity();
         return result;
+    }
+
+    pub fn freePeerResultsBatch(self: *DhtEngine, batch: []PeerResult) void {
+        if (batch.len == 0) return;
+        self.allocator.free(batch);
     }
 
     /// Number of nodes in the routing table.
@@ -993,12 +1009,7 @@ pub const DhtEngine = struct {
                     return;
                 };
                 @memcpy(peers_copy, peers);
-                self.peer_results.append(self.allocator, .{
-                    .info_hash = lk.target,
-                    .peers = peers_copy,
-                }) catch {
-                    self.allocator.free(peers_copy);
-                };
+                self.emitPeerResult(lk.target, peers_copy);
             }
 
             // Send announce_peer to the closest responded nodes
@@ -1130,12 +1141,34 @@ pub const DhtEngine = struct {
     // ── Internal helpers ────────────────────────────────
 
     fn queueSend(self: *DhtEngine, data: []const u8, remote: std.net.Address) void {
+        if (self.send_queue.items.len >= max_send_queue) {
+            log.debug("DHT send queue full at {d} packets, dropping packet", .{max_send_queue});
+            return;
+        }
+
         var pkt = OutboundPacket{ .remote = remote };
         const len = @min(data.len, pkt.data.len);
         @memcpy(pkt.data[0..len], data[0..len]);
         pkt.len = len;
         self.send_queue.append(self.allocator, pkt) catch {
             log.warn("DHT send queue full, dropping packet", .{});
+        };
+    }
+
+    /// Queue a discovered peer batch. Takes ownership of `peers` either way.
+    fn emitPeerResult(self: *DhtEngine, info_hash: [20]u8, peers: []std.net.Address) void {
+        if (self.peer_results.items.len >= max_peer_result_queue) {
+            self.allocator.free(peers);
+            log.debug("DHT peer result queue full at {d} batches, dropping result", .{max_peer_result_queue});
+            return;
+        }
+
+        self.peer_results.append(self.allocator, .{
+            .info_hash = info_hash,
+            .peers = peers,
+        }) catch {
+            self.allocator.free(peers);
+            log.warn("DHT peer result queue allocation failed, dropping result", .{});
         };
     }
 
@@ -1383,6 +1416,77 @@ test "DhtEngine tick rotates tokens" {
 
     // Token should still validate (within rotation window)
     try std.testing.expect(engine.tokens.validateToken(&token_before, &ip));
+}
+
+test "DHT announce tokens bind all IPv6 address bytes" {
+    var rng = Random.simRandom(0x3041);
+    const mgr = TokenManager.init(&rng);
+
+    const addr1 = std.net.Address.initIp6(
+        .{ 0x20, 0x01, 0x0d, 0xb8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1 },
+        6881,
+        0,
+        0,
+    );
+    const addr2 = std.net.Address.initIp6(
+        .{ 0x20, 0x01, 0x0d, 0xb8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 2 },
+        6881,
+        0,
+        0,
+    );
+
+    const token_addr1 = addressTokenBytes(addr1);
+    const token_addr2 = addressTokenBytes(addr2);
+    try std.testing.expectEqual(@as(u8, 16), token_addr1.len);
+    try std.testing.expectEqual(@as(u8, 16), token_addr2.len);
+    try std.testing.expect(!std.mem.eql(u8, token_addr1.slice(), token_addr2.slice()));
+
+    const tok = mgr.generateToken(token_addr1.slice());
+    try std.testing.expect(mgr.validateToken(&tok, token_addr1.slice()));
+    try std.testing.expect(!mgr.validateToken(&tok, token_addr2.slice()));
+}
+
+test "DHT outbound packet queue is bounded and batch drained" {
+    const allocator = std.testing.allocator;
+    var rng = Random.simRandom(0x3042);
+    var engine = DhtEngine.init(allocator, &rng, node_id.generateRandom(&rng));
+    defer engine.deinit();
+
+    const payload = [_]u8{ 'd', '1', ':', 't', '0', ':' };
+    for (0..max_send_queue + 8) |i| {
+        const remote = std.net.Address.initIp4(.{ 10, 0, 0, @intCast(i % 250 + 1) }, 6881);
+        engine.queueSend(&payload, remote);
+    }
+
+    try std.testing.expectEqual(@as(usize, max_send_queue), engine.send_queue.items.len);
+
+    const batch = engine.drainSendQueue();
+    defer engine.freeSendQueueBatch(batch);
+    try std.testing.expectEqual(@as(usize, max_send_queue), batch.len);
+    try std.testing.expectEqual(@as(usize, 0), engine.send_queue.items.len);
+}
+
+test "DHT peer result queue is bounded and batch drained" {
+    const allocator = std.testing.allocator;
+    var rng = Random.simRandom(0x3043);
+    var engine = DhtEngine.init(allocator, &rng, node_id.generateRandom(&rng));
+    defer engine.deinit();
+
+    for (0..max_peer_result_queue + 8) |i| {
+        const peers = try allocator.alloc(std.net.Address, 1);
+        peers[0] = std.net.Address.initIp4(.{ 10, 1, 0, @intCast(i % 250 + 1) }, 6881);
+        var hash: [20]u8 = [_]u8{0} ** 20;
+        hash[19] = @intCast(i % 251);
+        engine.emitPeerResult(hash, peers);
+    }
+
+    try std.testing.expectEqual(@as(usize, max_peer_result_queue), engine.peer_results.items.len);
+
+    const batch = engine.drainPeerResults();
+    defer engine.freePeerResultsBatch(batch);
+    try std.testing.expectEqual(@as(usize, max_peer_result_queue), batch.len);
+    try std.testing.expectEqual(@as(usize, 0), engine.peer_results.items.len);
+    for (batch) |result| allocator.free(result.peers);
 }
 
 test "DhtEngine requestPeers registers both v1 and v2 hashes for hybrid torrents" {

@@ -33,8 +33,10 @@ pub fn dhtTick(self: anytype) void {
 fn drainDhtSendQueue(self: anytype) void {
     const engine = self.dht_engine orelse return;
 
-    while (engine.send_queue.items.len > 0) {
-        const pkt = engine.send_queue.orderedRemove(0);
+    const batch = engine.drainSendQueue();
+    defer engine.freeSendQueueBatch(batch);
+
+    for (batch) |pkt| {
         // Use the uTP/UDP send path (shared UDP socket)
         utp_handler.utpSendPacket(self, pkt.data[0..pkt.len], pkt.remote);
     }
@@ -45,8 +47,10 @@ fn drainDhtSendQueue(self: anytype) void {
 fn drainDhtPeerResults(self: anytype) void {
     const engine = self.dht_engine orelse return;
 
-    while (engine.peer_results.items.len > 0) {
-        const result = engine.peer_results.orderedRemove(0);
+    const batch = engine.drainPeerResults();
+    defer engine.freePeerResultsBatch(batch);
+
+    for (batch) |result| {
         defer self.allocator.free(result.peers);
 
         const tid = self.findTorrentIdByInfoHash(&result.info_hash) orelse continue;
