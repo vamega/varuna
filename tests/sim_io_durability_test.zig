@@ -19,6 +19,7 @@
 const std = @import("std");
 const testing = std.testing;
 const posix = std.posix;
+const linux = std.os.linux;
 
 const varuna = @import("varuna");
 const ifc = varuna.io.io_interface;
@@ -108,13 +109,61 @@ fn truncateSync(io: *SimIO, fd: posix.fd_t, length: u64) !void {
 }
 
 fn fallocateSync(io: *SimIO, fd: posix.fd_t, offset: u64, len: u64) !void {
+    return fallocateModeSync(io, fd, 0, offset, len);
+}
+
+fn fallocateModeSync(io: *SimIO, fd: posix.fd_t, mode: i32, offset: u64, len: u64) !void {
     var c = Completion{};
     var ctx = TestCtx{};
-    try io.fallocate(.{ .fd = fd, .offset = offset, .len = len }, &c, &ctx, testCallback);
+    try io.fallocate(.{ .fd = fd, .mode = mode, .offset = offset, .len = len }, &c, &ctx, testCallback);
     try io.tick(0);
     try testing.expectEqual(@as(u32, 1), ctx.calls);
     return switch (ctx.last_result.?) {
         .fallocate => |r| try r,
+        else => unreachable,
+    };
+}
+
+fn expectFallocateError(
+    io: *SimIO,
+    fd: posix.fd_t,
+    mode: i32,
+    offset: u64,
+    len: u64,
+    expected: anyerror,
+) !void {
+    var c = Completion{};
+    var ctx = TestCtx{};
+    try io.fallocate(.{ .fd = fd, .mode = mode, .offset = offset, .len = len }, &c, &ctx, testCallback);
+    try io.tick(0);
+    try testing.expectEqual(@as(u32, 1), ctx.calls);
+    switch (ctx.last_result.?) {
+        .fallocate => |r| try testing.expectError(expected, r),
+        else => unreachable,
+    }
+}
+
+fn copyFileRangeSync(
+    io: *SimIO,
+    in_fd: posix.fd_t,
+    in_offset: u64,
+    out_fd: posix.fd_t,
+    out_offset: u64,
+    len: usize,
+) !usize {
+    var c = Completion{};
+    var ctx = TestCtx{};
+    try io.copy_file_range(.{
+        .in_fd = in_fd,
+        .in_offset = in_offset,
+        .out_fd = out_fd,
+        .out_offset = out_offset,
+        .len = len,
+    }, &c, &ctx, testCallback);
+    try io.tick(0);
+    try testing.expectEqual(@as(u32, 1), ctx.calls);
+    return switch (ctx.last_result.?) {
+        .copy_file_range => |r| try r,
         else => unreachable,
     };
 }
@@ -448,4 +497,120 @@ test "SimIO durability: fsynced fallocate exposes durable zero length" {
     const n = try readSync(&io, fd, 0, &buf);
     try testing.expectEqual(@as(usize, 8), n);
     try testing.expectEqualSlices(u8, "\x00\x00\x00\x00\x00\x00\x00\x00", &buf);
+}
+
+test "SimIO durability: copy_file_range copies source bytes into destination pending layer" {
+    var io = try SimIO.init(testing.allocator, .{});
+    defer io.deinit();
+
+    const src_fd: posix.fd_t = 79;
+    const dst_fd: posix.fd_t = 83;
+    try io.setFileBytes(src_fd, "0123456789");
+    try io.setFileBytes(dst_fd, "XXXXXXXXXX");
+
+    const copied = try copyFileRangeSync(&io, src_fd, 2, dst_fd, 3, 4);
+    try testing.expectEqual(@as(usize, 4), copied);
+
+    var pre_buf: [10]u8 = undefined;
+    const n_pre = try readSync(&io, dst_fd, 0, &pre_buf);
+    try testing.expectEqual(@as(usize, 10), n_pre);
+    try testing.expectEqualSlices(u8, "XXX2345XXX", &pre_buf);
+
+    try fsyncSync(&io, dst_fd);
+    io.crash();
+
+    var post_buf: [10]u8 = undefined;
+    const n_post = try readSync(&io, dst_fd, 0, &post_buf);
+    try testing.expectEqual(@as(usize, 10), n_post);
+    try testing.expectEqualSlices(u8, "XXX2345XXX", &post_buf);
+}
+
+test "SimIO durability: crash before fsync drops copied bytes" {
+    var io = try SimIO.init(testing.allocator, .{});
+    defer io.deinit();
+
+    const src_fd: posix.fd_t = 89;
+    const dst_fd: posix.fd_t = 97;
+    try io.setFileBytes(src_fd, "ABCDE");
+    try io.setFileBytes(dst_fd, "AAAAAA");
+
+    const copied = try copyFileRangeSync(&io, src_fd, 1, dst_fd, 2, 3);
+    try testing.expectEqual(@as(usize, 3), copied);
+
+    var pre_buf: [6]u8 = undefined;
+    const n_pre = try readSync(&io, dst_fd, 0, &pre_buf);
+    try testing.expectEqual(@as(usize, 6), n_pre);
+    try testing.expectEqualSlices(u8, "AABCDA", &pre_buf);
+
+    io.crash();
+
+    var post_buf: [6]u8 = undefined;
+    const n_post = try readSync(&io, dst_fd, 0, &post_buf);
+    try testing.expectEqual(@as(usize, 6), n_post);
+    try testing.expectEqualSlices(u8, "AAAAAA", &post_buf);
+}
+
+test "SimIO durability: FALLOC_FL_ZERO_RANGE zeros bytes pending until fsync" {
+    var io = try SimIO.init(testing.allocator, .{});
+    defer io.deinit();
+
+    const fd: posix.fd_t = 101;
+    try io.setFileBytes(fd, "ABCDEFGH");
+
+    try fallocateModeSync(&io, fd, linux.FALLOC.FL_ZERO_RANGE, 2, 3);
+
+    var pre_buf: [8]u8 = undefined;
+    const n_pre = try readSync(&io, fd, 0, &pre_buf);
+    try testing.expectEqual(@as(usize, 8), n_pre);
+    try testing.expectEqualSlices(u8, "AB\x00\x00\x00FGH", &pre_buf);
+
+    io.crash();
+
+    var crash_buf: [8]u8 = undefined;
+    const n_crash = try readSync(&io, fd, 0, &crash_buf);
+    try testing.expectEqual(@as(usize, 8), n_crash);
+    try testing.expectEqualSlices(u8, "ABCDEFGH", &crash_buf);
+
+    try fallocateModeSync(&io, fd, linux.FALLOC.FL_ZERO_RANGE, 2, 3);
+    try fsyncSync(&io, fd);
+    io.crash();
+
+    var post_buf: [8]u8 = undefined;
+    const n_post = try readSync(&io, fd, 0, &post_buf);
+    try testing.expectEqual(@as(usize, 8), n_post);
+    try testing.expectEqualSlices(u8, "AB\x00\x00\x00FGH", &post_buf);
+}
+
+test "SimIO durability: FALLOC_FL_KEEP_SIZE does not extend visible length" {
+    var io = try SimIO.init(testing.allocator, .{});
+    defer io.deinit();
+
+    const fd: posix.fd_t = 103;
+    try io.setFileBytes(fd, "ABCD");
+
+    try fallocateModeSync(&io, fd, linux.FALLOC.FL_KEEP_SIZE, 0, 12);
+    try fsyncSync(&io, fd);
+    io.crash();
+
+    var buf: [12]u8 = undefined;
+    const n = try readSync(&io, fd, 0, &buf);
+    try testing.expectEqual(@as(usize, 4), n);
+    try testing.expectEqualSlices(u8, "ABCD", buf[0..n]);
+}
+
+test "SimIO durability: unsupported fallocate range-edit modes are rejected" {
+    var io = try SimIO.init(testing.allocator, .{});
+    defer io.deinit();
+
+    const fd: posix.fd_t = 107;
+    try io.setFileBytes(fd, "ABCDEFGH");
+
+    try expectFallocateError(&io, fd, linux.FALLOC.FL_COLLAPSE_RANGE, 2, 3, error.OperationNotSupported);
+    try expectFallocateError(&io, fd, linux.FALLOC.FL_PUNCH_HOLE | linux.FALLOC.FL_KEEP_SIZE, 2, 3, error.OperationNotSupported);
+    try expectFallocateError(&io, fd, linux.FALLOC.FL_UNSHARE_RANGE, 2, 3, error.OperationNotSupported);
+
+    var buf: [8]u8 = undefined;
+    const n = try readSync(&io, fd, 0, &buf);
+    try testing.expectEqual(@as(usize, 8), n);
+    try testing.expectEqualSlices(u8, "ABCDEFGH", &buf);
 }
