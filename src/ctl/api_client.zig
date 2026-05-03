@@ -24,32 +24,17 @@ pub const Client = struct {
     allocator: std.mem.Allocator,
     host: []const u8,
     port: u16,
-    io: CtlIO,
-    executor: *HttpExecutor,
     sid: ?[]u8 = null,
 
-    pub fn init(allocator: std.mem.Allocator, host: []const u8, port: u16) !Client {
-        var io = try CtlIO.init(allocator, .{ .file_pool_workers = 0 });
-        errdefer io.deinit();
-
-        const executor = try HttpExecutor.create(allocator, &io, .{
-            .max_concurrent = 1,
-            .max_per_host = 1,
-        });
-        errdefer executor.destroy();
-
+    pub fn init(allocator: std.mem.Allocator, host: []const u8, port: u16) Client {
         return .{
             .allocator = allocator,
             .host = host,
             .port = port,
-            .io = io,
-            .executor = executor,
         };
     }
 
     pub fn deinit(self: *Client) void {
-        self.executor.destroy();
-        self.io.deinit();
         if (self.sid) |sid| self.allocator.free(sid);
         self.sid = null;
     }
@@ -115,12 +100,21 @@ pub const Client = struct {
 
         var request_ctx = SyncRequest{ .allocator = self.allocator };
         job.context = &request_ctx;
-        try self.executor.submit(job);
+
+        var io = try CtlIO.init(self.allocator, .{ .file_pool_workers = 0 });
+        defer io.deinit();
+        const executor = try HttpExecutor.create(self.allocator, &io, .{
+            .max_concurrent = 1,
+            .max_per_host = 1,
+        });
+        defer executor.destroy();
+
+        try executor.submit(job);
 
         while (!request_ctx.done) {
-            self.executor.tick();
+            executor.tick();
             if (request_ctx.done) break;
-            try self.io.tick(1);
+            try io.tick(1);
         }
 
         if (request_ctx.err) |err| return err;

@@ -498,7 +498,7 @@ fn doLogin(
     password: []const u8,
 ) !?[]u8 {
     _ = stdout;
-    var client = try api_client.Client.init(allocator, host, port);
+    var client = api_client.Client.init(allocator, host, port);
     defer client.deinit();
     if (!try client.login(username, password)) return null;
     return try allocator.dupe(u8, client.sid.?);
@@ -512,7 +512,7 @@ fn doGet(
     path: []const u8,
     sid: ?[]const u8,
 ) !void {
-    var client = try api_client.Client.init(allocator, host, port);
+    var client = api_client.Client.init(allocator, host, port);
     defer client.deinit();
     if (sid) |s| client.sid = try allocator.dupe(u8, s);
 
@@ -537,7 +537,7 @@ fn doPost(
     body: []const u8,
     sid: ?[]const u8,
 ) !void {
-    var client = try api_client.Client.init(allocator, host, port);
+    var client = api_client.Client.init(allocator, host, port);
     defer client.deinit();
     if (sid) |s| client.sid = try allocator.dupe(u8, s);
 
