@@ -363,6 +363,44 @@ pub const SimFile = struct {
         self.pending_len = @max(self.pending_len orelse self.durable.items.len, len);
     }
 
+    fn markDirtyRange(self: *SimFile, start: usize, end: usize) void {
+        var i: usize = start;
+        while (i < end) : (i += 1) self.pending_dirty.set(i);
+    }
+
+    fn writePendingBytes(
+        self: *SimFile,
+        allocator: std.mem.Allocator,
+        off: usize,
+        bytes: []const u8,
+    ) !void {
+        const end = off + bytes.len;
+        try self.ensurePending(allocator, end);
+        self.extendPendingLen(end);
+        @memcpy(self.pending.items[off..end], bytes);
+        self.markDirtyRange(off, end);
+    }
+
+    fn fillPendingBytes(
+        self: *SimFile,
+        allocator: std.mem.Allocator,
+        off: usize,
+        len: usize,
+        byte: u8,
+        keep_size: bool,
+    ) !void {
+        const visible_before = self.visibleLen();
+        const end = off + len;
+        if (!keep_size) self.extendPendingLen(end);
+
+        const dirty_end = if (keep_size) @min(end, visible_before) else end;
+        if (off >= dirty_end) return;
+
+        try self.ensurePending(allocator, dirty_end);
+        @memset(self.pending.items[off..dirty_end], byte);
+        self.markDirtyRange(off, dirty_end);
+    }
+
     /// Read the union of durable+pending into `dst`, starting at file
     /// offset `off`. Returns the number of bytes written into `dst`.
     /// Bytes past the visible length read as zero, mirroring real
@@ -1345,8 +1383,7 @@ pub const SimIO = struct {
         };
         gop.value_ptr.extendPendingLen(end);
         @memcpy(gop.value_ptr.pending.items[off..end], op.buf);
-        var i: usize = off;
-        while (i < end) : (i += 1) gop.value_ptr.pending_dirty.set(i);
+        gop.value_ptr.markDirtyRange(off, end);
 
         // Real `write(2)` / `IORING_OP_WRITE` returns the number of bytes
         // accepted, normally the full buffer length on regular files.
@@ -1389,8 +1426,40 @@ pub const SimIO = struct {
         if (r.float(f32) < self.config.faults.fallocate_error_probability) {
             return self.schedule(c, .{ .fallocate = error.NoSpaceLeft }, 0);
         }
-        if (op.mode == 0) {
-            const end: usize = @intCast(op.offset + op.len);
+
+        const keep_size = (op.mode & linux.FALLOC.FL_KEEP_SIZE) != 0;
+        const zero_range = (op.mode & linux.FALLOC.FL_ZERO_RANGE) != 0;
+        const modeled_bits: i32 =
+            linux.FALLOC.FL_KEEP_SIZE |
+            linux.FALLOC.FL_ZERO_RANGE;
+
+        if ((op.mode & ~modeled_bits) != 0) {
+            return self.schedule(c, .{ .fallocate = error.OperationNotSupported }, 0);
+        }
+
+        const off: usize = @intCast(op.offset);
+        const len: usize = @intCast(op.len);
+
+        // Supported visible behaviours:
+        //   * mode 0 extends pending length with zero-filled bytes.
+        //   * KEEP_SIZE allocates without changing visible bytes/length.
+        //   * ZERO_RANGE zeros the byte range and extends length unless
+        //     paired with KEEP_SIZE.
+        //
+        // Intentionally unsupported: PUNCH_HOLE, COLLAPSE_RANGE,
+        // INSERT_RANGE, UNSHARE_RANGE, NO_HIDE_STALE, unknown bits, and
+        // mixed range-edit modes whose sparse extent, shifting, or
+        // shared-block semantics do not fit this byte-layer model.
+        if (zero_range) {
+            const gop = self.file_state.getOrPut(op.fd) catch {
+                return self.schedule(c, .{ .fallocate = error.NoSpaceLeft }, 0);
+            };
+            if (!gop.found_existing) gop.value_ptr.* = .{};
+            gop.value_ptr.fillPendingBytes(self.allocator, off, len, 0, keep_size) catch {
+                return self.schedule(c, .{ .fallocate = error.NoSpaceLeft }, 0);
+            };
+        } else if (!keep_size) {
+            const end = off + len;
             const gop = self.file_state.getOrPut(op.fd) catch {
                 return self.schedule(c, .{ .fallocate = error.NoSpaceLeft }, 0);
             };
@@ -1431,15 +1500,49 @@ pub const SimIO = struct {
         return self.schedule(c, .{ .splice = op.len }, 0);
     }
 
-    /// Sim copy_file_range mirrors the splice variant: success = full
-    /// `op.len` transferred; fault = EIO. Used by MoveJob tests.
+    /// Sim copy_file_range copies visible source bytes into the
+    /// destination's pending layer when the source fd is content-aware.
+    /// The copied bytes are readable immediately but need `fsync` to
+    /// become durable; `crash()` drops them like write-accepted bytes.
+    /// If the source fd has no SimFile state, preserve the legacy opaque
+    /// full-count success used by state-machine tests that do not inspect
+    /// file content.
     pub fn copy_file_range(self: *SimIO, op: ifc.CopyFileRangeOp, c: *Completion, ud: ?*anyopaque, cb: Callback) !void {
         try self.armCompletion(c, .{ .copy_file_range = op }, ud, cb);
         const r = self.rng.random();
         if (r.float(f32) < self.config.faults.copy_file_range_error_probability) {
             return self.schedule(c, .{ .copy_file_range = error.InputOutput }, 0);
         }
-        return self.schedule(c, .{ .copy_file_range = op.len }, 0);
+
+        const src = self.file_state.getPtr(op.in_fd) orelse {
+            return self.schedule(c, .{ .copy_file_range = op.len }, 0);
+        };
+
+        const in_off: usize = @intCast(op.in_offset);
+        const visible = src.visibleLen();
+        if (in_off >= visible or op.len == 0) {
+            return self.schedule(c, .{ .copy_file_range = @as(usize, 0) }, 0);
+        }
+
+        const copied_len = @min(op.len, visible - in_off);
+        const scratch = self.allocator.alloc(u8, copied_len) catch {
+            return self.schedule(c, .{ .copy_file_range = error.NoSpaceLeft }, 0);
+        };
+        defer self.allocator.free(scratch);
+
+        const read_n = src.readUnion(in_off, scratch);
+        assert(read_n == copied_len);
+
+        const out_off: usize = @intCast(op.out_offset);
+        const gop = self.file_state.getOrPut(op.out_fd) catch {
+            return self.schedule(c, .{ .copy_file_range = error.NoSpaceLeft }, 0);
+        };
+        if (!gop.found_existing) gop.value_ptr.* = .{};
+        gop.value_ptr.writePendingBytes(self.allocator, out_off, scratch) catch {
+            return self.schedule(c, .{ .copy_file_range = error.NoSpaceLeft }, 0);
+        };
+
+        return self.schedule(c, .{ .copy_file_range = copied_len }, 0);
     }
 
     pub fn openat(self: *SimIO, op: ifc.OpenAtOp, c: *Completion, ud: ?*anyopaque, cb: Callback) !void {
