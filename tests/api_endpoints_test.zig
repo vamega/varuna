@@ -68,6 +68,17 @@ test "RPC parser routes exact API endpoints with query strings" {
     try std.testing.expectEqualStrings("/tmp/test-downloads", resp.body);
 }
 
+test "RPC parser repeated form lookups ignore decoded delimiter bytes" {
+    var ctx = TestCtx.init();
+    defer ctx.deinit();
+    ctx.handler.api_username = "admin&password=evil";
+    ctx.handler.api_password = "real";
+
+    const resp = ctx.handle("POST", "/api/v2/auth/login", "username=admin%26password%3Devil&password=real");
+    defer if (resp.owned_extra_headers) |h| std.testing.allocator.free(h);
+    try std.testing.expectEqualStrings("Ok.", resp.body);
+}
+
 test "toggleSpeedLimitsMode returns 501 Not Implemented" {
     var ctx = TestCtx.init();
     defer ctx.deinit();
