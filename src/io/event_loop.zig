@@ -1160,8 +1160,8 @@ pub fn EventLoopOf(comptime IO: type) type {
         }
 
         /// Add a peer using the transport selected by `selectTransport()`.
-        /// When uTP is selected but the connection fails (e.g. no UDP socket),
-        /// falls back to TCP transparently.
+        /// When uTP is selected but setup fails, falls back to TCP only if
+        /// outbound TCP is enabled by the transport disposition.
         pub fn addPeerAutoTransport(self: *Self, address: std.net.Address, torrent_id: TorrentId) !u16 {
             const swarm_hash = try self.defaultOutboundSwarmHash(torrent_id);
             return self.addPeerAutoTransportWithSwarmHash(address, torrent_id, swarm_hash);
@@ -1180,7 +1180,12 @@ pub fn EventLoopOf(comptime IO: type) type {
             const transport = self.selectTransport();
             if (transport == .utp) {
                 return self.addUtpPeerWithSwarmHash(address, torrent_id, selected_hash) catch |err| switch (err) {
-                    error.NoUtpManager, error.UtpConnectFailed => return self.addPeerForTorrentWithSwarmHash(address, torrent_id, selected_hash),
+                    error.NoUtpManager, error.UtpConnectFailed => {
+                        if (self.transport_disposition.outgoing_tcp) {
+                            return self.addPeerForTorrentWithSwarmHash(address, torrent_id, selected_hash);
+                        }
+                        return err;
+                    },
                     else => return err,
                 };
             }

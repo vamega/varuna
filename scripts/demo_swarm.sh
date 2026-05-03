@@ -16,6 +16,7 @@ DOWNLOAD_API_PORT="${DOWNLOAD_API_PORT:-8082}"
 # under non-io_uring backends.
 IO_BACKEND="${IO_BACKEND:-io_uring}"
 RUNTIME_IO_BACKEND="${RUNTIME_IO_BACKEND:-$IO_BACKEND}"
+TRANSPORT_MODE="${TRANSPORT_MODE:-}"
 PAYLOAD_BYTES="${PAYLOAD_BYTES:-}"
 TIMEOUT="${TIMEOUT:-60}"
 SKIP_BUILD="${SKIP_BUILD:-0}"
@@ -157,6 +158,19 @@ else
 fi
 PAYLOAD_SIZE="$(wc -c <"$PAYLOAD_PATH" | tr -d ' ')"
 
+case "$TRANSPORT_MODE" in
+  "" | all | tcp_and_utp | tcp_only | utp_only) ;;
+  *)
+    echo "TRANSPORT_MODE must be one of: all, tcp_and_utp, tcp_only, utp_only" >&2
+    exit 1
+    ;;
+esac
+if [[ -n "$TRANSPORT_MODE" ]]; then
+  TRANSPORT_CONFIG="transport = \"$TRANSPORT_MODE\""
+else
+  TRANSPORT_CONFIG="enable_utp = true"
+fi
+
 # Pick the build wrapper. `mise exec` is the standard path documented in
 # AGENTS.md, but the nix-based devshell doesn't ship mise — there `zig`
 # is on $PATH directly. Fall through transparently.
@@ -216,7 +230,7 @@ port_max = ${SEED_PORT}
 dht = false
 pex = false
 encryption = "preferred"
-enable_utp = true
+${TRANSPORT_CONFIG}
 EOF
 
 cat >"$WORK_DIR/download-daemon/varuna.toml" <<EOF
@@ -237,7 +251,7 @@ port_max = ${DOWNLOAD_PORT}
 dht = false
 pex = false
 encryption = "preferred"
-enable_utp = true
+${TRANSPORT_CONFIG}
 EOF
 
 # ── Start seeder daemon ─────────────────────────────────
@@ -307,6 +321,7 @@ cmp "$PAYLOAD_PATH" "$WORK_DIR/download-root/fixture.bin"
 cat <<EOF
 swarm demo succeeded
 backend: $RUNTIME_IO_BACKEND
+transport_mode: ${TRANSPORT_MODE:-tcp_and_utp}
 payload_bytes: $PAYLOAD_SIZE
 transfer_seconds: $TRANSFER_SECONDS
 work dir: $WORK_DIR
