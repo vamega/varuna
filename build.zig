@@ -247,6 +247,19 @@ pub fn build(b: *std.Build) void {
     const test_move_job_step = b.step("test-move-job", "Run focused MoveJob relocation tests");
     test_move_job_step.dependOn(&run_move_job_tests.step);
 
+    const ctl_tests = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/ctl/root.zig"),
+            .target = target,
+            .optimize = optimize,
+            .imports = &varuna_import,
+        }),
+    });
+    const run_ctl_tests = b.addRunArtifact(ctl_tests);
+    const test_ctl_step = b.step("test-ctl", "Run varuna-ctl focused tests");
+    test_ctl_step.dependOn(&run_ctl_tests.step);
+    test_step.dependOn(&run_ctl_tests.step);
+
     const dht_source_tests = b.addTest(.{
         .root_module = varuna_mod,
         .filters = &.{"DHT"},

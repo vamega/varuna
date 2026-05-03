@@ -8,6 +8,55 @@ pub const ParsedUrl = struct {
     is_https: bool,
 };
 
+pub const Header = struct {
+    name: []const u8,
+    value: []const u8,
+};
+
+pub const Request = struct {
+    method: []const u8 = "GET",
+    host: []const u8,
+    path: []const u8,
+    body: []const u8 = "",
+    content_type: ?[]const u8 = null,
+    cookie: ?[]const u8 = null,
+    extra_headers: []const Header = &.{},
+    connection: []const u8 = "keep-alive",
+    user_agent: []const u8 = "varuna/0.1",
+};
+
+pub const ParsedResponse = struct {
+    status: u16,
+    headers: []const u8,
+    body: []const u8,
+
+    pub fn headerValue(self: ParsedResponse, name: []const u8) ?[]const u8 {
+        return findHeaderValue(self.headers, name);
+    }
+};
+
+pub fn appendRequest(allocator: std.mem.Allocator, buf: *std.ArrayList(u8), request: Request) !void {
+    try buf.print(allocator, "{s} {s} HTTP/1.1\r\n", .{ request.method, request.path });
+    try buf.print(allocator, "Host: {s}\r\n", .{request.host});
+    try buf.print(allocator, "Connection: {s}\r\n", .{request.connection});
+    try buf.print(allocator, "User-Agent: {s}\r\n", .{request.user_agent});
+    if (request.content_type) |content_type| {
+        try buf.print(allocator, "Content-Type: {s}\r\n", .{content_type});
+    }
+    if (request.cookie) |cookie| {
+        try buf.print(allocator, "Cookie: {s}\r\n", .{cookie});
+    }
+    for (request.extra_headers) |header| {
+        if (header.name.len == 0) continue;
+        try buf.print(allocator, "{s}: {s}\r\n", .{ header.name, header.value });
+    }
+    if (request.body.len > 0 or !std.mem.eql(u8, request.method, "GET")) {
+        try buf.print(allocator, "Content-Length: {}\r\n", .{request.body.len});
+    }
+    try buf.appendSlice(allocator, "\r\n");
+    try buf.appendSlice(allocator, request.body);
+}
+
 /// Parse an HTTP or HTTPS URL into its components.
 /// The returned slices point into the input `url` — no allocation.
 pub fn parseUrl(url: []const u8) !ParsedUrl {
@@ -115,6 +164,27 @@ pub fn parseStatusCode(data: []const u8) ?u16 {
     return std.fmt.parseInt(u16, data[space1 + 1 .. space1 + 4], 10) catch null;
 }
 
+pub fn findHeaderValue(headers: []const u8, name: []const u8) ?[]const u8 {
+    var iter = std.mem.splitSequence(u8, headers, "\r\n");
+    while (iter.next()) |line| {
+        const colon = std.mem.indexOfScalar(u8, line, ':') orelse continue;
+        const key = std.mem.trim(u8, line[0..colon], " ");
+        if (!std.ascii.eqlIgnoreCase(key, name)) continue;
+        return std.mem.trim(u8, line[colon + 1 ..], " ");
+    }
+    return null;
+}
+
+pub fn parseResponse(data: []const u8) !ParsedResponse {
+    const body_start = findBodyStart(data) orelse return error.IncompleteResponse;
+    const status = parseStatusCode(data) orelse return error.InvalidStatusLine;
+    return .{
+        .status = status,
+        .headers = data[0..body_start],
+        .body = data[body_start..],
+    };
+}
+
 test "parseStatusCode" {
     try std.testing.expectEqual(@as(?u16, 200), parseStatusCode("HTTP/1.1 200 OK\r\n"));
     try std.testing.expectEqual(@as(?u16, 404), parseStatusCode("HTTP/1.1 404 Not Found\r\n"));
@@ -134,4 +204,51 @@ test "parseContentLength" {
 test "parseConnectionClose" {
     try std.testing.expect(parseConnectionClose("HTTP/1.1 200 OK\r\nConnection: close\r\n"));
     try std.testing.expect(!parseConnectionClose("HTTP/1.1 200 OK\r\nConnection: keep-alive\r\n"));
+}
+
+test "appendRequest includes method body content type cookie and custom headers" {
+    const allocator = std.testing.allocator;
+    var buf = std.ArrayList(u8).empty;
+    defer buf.deinit(allocator);
+
+    try appendRequest(allocator, &buf, .{
+        .method = "POST",
+        .host = "127.0.0.1",
+        .path = "/api/v2/app/setPreferences",
+        .body = "dht=false",
+        .content_type = "application/x-www-form-urlencoded",
+        .cookie = "SID=abc123",
+        .extra_headers = &.{
+            .{ .name = "X-Test", .value = "yes" },
+        },
+        .connection = "close",
+        .user_agent = "varuna-ctl/test",
+    });
+
+    try std.testing.expectEqualStrings(
+        "POST /api/v2/app/setPreferences HTTP/1.1\r\n" ++
+            "Host: 127.0.0.1\r\n" ++
+            "Connection: close\r\n" ++
+            "User-Agent: varuna-ctl/test\r\n" ++
+            "Content-Type: application/x-www-form-urlencoded\r\n" ++
+            "Cookie: SID=abc123\r\n" ++
+            "X-Test: yes\r\n" ++
+            "Content-Length: 9\r\n" ++
+            "\r\n" ++
+            "dht=false",
+        buf.items,
+    );
+}
+
+test "parseResponse returns status headers and complete body" {
+    const raw = "HTTP/1.1 403 Forbidden\r\n" ++
+        "Content-Type: text/plain\r\n" ++
+        "Content-Length: 9\r\n" ++
+        "\r\n" ++
+        "Forbidden";
+
+    const parsed = try parseResponse(raw);
+    try std.testing.expectEqual(@as(u16, 403), parsed.status);
+    try std.testing.expectEqualStrings("Forbidden", parsed.body);
+    try std.testing.expectEqualStrings("text/plain", parsed.headerValue("content-type").?);
 }

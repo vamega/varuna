@@ -1,5 +1,7 @@
 const std = @import("std");
 const varuna = @import("varuna");
+const api_client = @import("api_client.zig");
+const cli = @import("cli.zig");
 
 pub fn main() !void {
     var gpa_state = std.heap.GeneralPurposeAllocator(.{}){};
@@ -35,21 +37,18 @@ pub fn main() !void {
     const api_port = cfg.daemon.api_port;
     const api_host = cfg.daemon.api_bind;
 
-    // Parse global flags: --username, --password
-    var api_username: []const u8 = cfg.daemon.api_username;
-    var api_password: []const u8 = cfg.daemon.api_password;
-    var cmd_start: usize = 1;
-    while (cmd_start < args.len) {
-        if (std.mem.eql(u8, args[cmd_start], "--username") and cmd_start + 1 < args.len) {
-            api_username = args[cmd_start + 1];
-            cmd_start += 2;
-        } else if (std.mem.eql(u8, args[cmd_start], "--password") and cmd_start + 1 < args.len) {
-            api_password = args[cmd_start + 1];
-            cmd_start += 2;
-        } else {
-            break;
-        }
-    }
+    const global = cli.parseGlobalOptions(args, .{
+        .username = cfg.daemon.api_username,
+        .password = cfg.daemon.api_password,
+    }) catch |err| {
+        try stdout.print("error: invalid global options ({s})\n", .{@errorName(err)});
+        try stdout.flush();
+        return;
+    };
+    const api_username = global.username;
+    const api_password = global.password;
+    const cmd_start = global.command_index;
+    const output_format = global.format;
 
     if (cmd_start >= args.len) {
         try printUsage(stdout, api_host, api_port);
@@ -72,6 +71,7 @@ pub fn main() !void {
     }
 
     const command = args[cmd_start];
+    _ = output_format;
 
     if (std.mem.eql(u8, command, "list")) {
         try doGet(allocator, stdout, api_host, api_port, "/api/v2/torrents/info", sid);
@@ -462,21 +462,29 @@ pub fn main() !void {
         }
         try doPost(allocator, stdout, api_host, api_port, "/api/v2/app/shutdown", body_buf.items, sid);
         try stdout.print("Shutdown initiated\n", .{});
+    } else if (std.mem.eql(u8, command, "api")) {
+        if (cmd_start + 2 >= args.len) {
+            try stdout.print("usage: varuna-ctl api get <path>\n", .{});
+            try stdout.print("       varuna-ctl api post <path> [body]\n", .{});
+        } else {
+            const verb = args[cmd_start + 1];
+            const path = args[cmd_start + 2];
+            if (std.mem.eql(u8, verb, "get")) {
+                try doGet(allocator, stdout, api_host, api_port, path, sid);
+            } else if (std.mem.eql(u8, verb, "post")) {
+                const body = if (cmd_start + 3 < args.len) args[cmd_start + 3] else "";
+                try doPost(allocator, stdout, api_host, api_port, path, body, sid);
+            } else {
+                try stdout.print("usage: varuna-ctl api get <path>\n", .{});
+                try stdout.print("       varuna-ctl api post <path> [body]\n", .{});
+            }
+        }
     } else {
         try stdout.print("unknown command: {s}\n\n", .{command});
         try printUsage(stdout, api_host, api_port);
     }
 
     try stdout.flush();
-}
-
-/// Write all bytes to a file descriptor, looping until complete.
-fn sendAll(fd: std.posix.fd_t, buf: []const u8) !void {
-    var sent: usize = 0;
-    while (sent < buf.len) {
-        const n = try std.posix.write(fd, buf[sent..]);
-        sent += n;
-    }
 }
 
 /// Login to the daemon API and return the SID cookie value.
@@ -490,66 +498,10 @@ fn doLogin(
     password: []const u8,
 ) !?[]u8 {
     _ = stdout;
-    const posix = std.posix;
-
-    const addr = std.net.Address.parseIp4(host, port) catch return error.InvalidAddress;
-
-    const fd = try posix.socket(addr.any.family, posix.SOCK.STREAM | posix.SOCK.CLOEXEC, posix.IPPROTO.TCP);
-    defer posix.close(fd);
-
-    try posix.connect(fd, &addr.any, addr.getOsSockLen());
-
-    // Build login body
-    var body_buf = std.ArrayList(u8).empty;
-    defer body_buf.deinit(allocator);
-    try body_buf.print(allocator, "username={s}&password={s}", .{ username, password });
-
-    // Build HTTP POST
-    var request = std.ArrayList(u8).empty;
-    defer request.deinit(allocator);
-    try request.print(allocator, "POST /api/v2/auth/login HTTP/1.1\r\nHost: {s}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n", .{ host, body_buf.items.len });
-    try request.appendSlice(allocator, body_buf.items);
-
-    try sendAll(fd, request.items);
-
-    // Read response
-    var response_buf: [8192]u8 = undefined;
-    const n = try posix.read(fd, &response_buf);
-    const response = response_buf[0..n];
-
-    // Check for successful login (body should be "Ok.")
-    const header_end = std.mem.indexOf(u8, response, "\r\n\r\n") orelse return null;
-    const resp_body = response[header_end + 4 ..];
-    if (!std.mem.eql(u8, resp_body, "Ok.")) return null;
-
-    // Extract SID from Set-Cookie header
-    const headers = response[0..header_end];
-    return extractSidFromSetCookie(allocator, headers);
-}
-
-/// Extract SID value from a Set-Cookie header in the response.
-fn extractSidFromSetCookie(allocator: std.mem.Allocator, headers: []const u8) ?[]u8 {
-    var line_start: usize = 0;
-    while (line_start < headers.len) {
-        const line_end = std.mem.indexOfPos(u8, headers, line_start, "\r\n") orelse headers.len;
-        const line = headers[line_start..line_end];
-
-        // Look for "Set-Cookie:" header
-        if (line.len > 11 and std.ascii.eqlIgnoreCase(line[0..11], "Set-Cookie:")) {
-            const value = std.mem.trimLeft(u8, line[11..], " ");
-            // Parse "SID=<value>; HttpOnly; path=/"
-            if (std.mem.startsWith(u8, value, "SID=")) {
-                const sid_start = 4;
-                const sid_end = std.mem.indexOfScalar(u8, value[sid_start..], ';') orelse (value.len - sid_start);
-                const sid = value[sid_start .. sid_start + sid_end];
-                return allocator.dupe(u8, sid) catch return null;
-            }
-        }
-
-        if (line_end >= headers.len) break;
-        line_start = line_end + 2;
-    }
-    return null;
+    var client = try api_client.Client.init(allocator, host, port);
+    defer client.deinit();
+    if (!try client.login(username, password)) return null;
+    return try allocator.dupe(u8, client.sid.?);
 }
 
 fn doGet(
@@ -560,52 +512,20 @@ fn doGet(
     path: []const u8,
     sid: ?[]const u8,
 ) !void {
-    const posix = std.posix;
+    var client = try api_client.Client.init(allocator, host, port);
+    defer client.deinit();
+    if (sid) |s| client.sid = try allocator.dupe(u8, s);
 
-    const addr = std.net.Address.parseIp4(host, port) catch {
-        try stdout.print("error: invalid daemon address\n", .{});
+    const response = client.request(.{
+        .method = "GET",
+        .path = path,
+    }) catch |err| {
+        try stdout.print("error: request failed ({s})\n", .{@errorName(err)});
         return;
     };
+    defer response.deinit(allocator);
 
-    const fd = posix.socket(addr.any.family, posix.SOCK.STREAM | posix.SOCK.CLOEXEC, posix.IPPROTO.TCP) catch {
-        try stdout.print("error: could not create socket\n", .{});
-        return;
-    };
-    defer posix.close(fd);
-
-    posix.connect(fd, &addr.any, addr.getOsSockLen()) catch {
-        try stdout.print("error: could not connect to daemon\n", .{});
-        return;
-    };
-
-    // Build HTTP GET with Cookie header
-    var request = std.ArrayList(u8).empty;
-    defer request.deinit(allocator);
-    try request.print(allocator, "GET {s} HTTP/1.1\r\nHost: {s}\r\n", .{ path, host });
-    if (sid) |s| {
-        try request.print(allocator, "Cookie: SID={s}\r\n", .{s});
-    }
-    try request.appendSlice(allocator, "Connection: close\r\n\r\n");
-
-    sendAll(fd, request.items) catch {
-        try stdout.print("error: failed to send request\n", .{});
-        return;
-    };
-
-    // Read response
-    var response_buf: [8192]u8 = undefined;
-    const n = posix.read(fd, &response_buf) catch {
-        try stdout.print("error: failed to read response\n", .{});
-        return;
-    };
-    const response = response_buf[0..n];
-
-    // Extract body
-    if (std.mem.indexOf(u8, response, "\r\n\r\n")) |body_start| {
-        try stdout.print("{s}\n", .{response[body_start + 4 ..]});
-    } else {
-        try stdout.print("{s}\n", .{response});
-    }
+    try stdout.print("{s}\n", .{response.body});
 }
 
 fn doPost(
@@ -617,54 +537,27 @@ fn doPost(
     body: []const u8,
     sid: ?[]const u8,
 ) !void {
-    // Build a raw HTTP POST request and send via POSIX syscalls
-    const posix = std.posix;
+    var client = try api_client.Client.init(allocator, host, port);
+    defer client.deinit();
+    if (sid) |s| client.sid = try allocator.dupe(u8, s);
 
-    const addr = std.net.Address.parseIp4(host, port) catch {
-        try stdout.print("error: invalid daemon address\n", .{});
+    const response = client.request(.{
+        .method = "POST",
+        .path = path,
+        .body = body,
+        .content_type = contentTypeForPostBody(body),
+    }) catch |err| {
+        try stdout.print("error: request failed ({s})\n", .{@errorName(err)});
         return;
     };
+    defer response.deinit(allocator);
 
-    const fd = posix.socket(addr.any.family, posix.SOCK.STREAM | posix.SOCK.CLOEXEC, posix.IPPROTO.TCP) catch {
-        try stdout.print("error: could not create socket\n", .{});
-        return;
-    };
-    defer posix.close(fd);
+    try stdout.print("{s}\n", .{response.body});
+}
 
-    posix.connect(fd, &addr.any, addr.getOsSockLen()) catch {
-        try stdout.print("error: could not connect to daemon\n", .{});
-        return;
-    };
-
-    // Build HTTP POST with Cookie header
-    var request = std.ArrayList(u8).empty;
-    defer request.deinit(allocator);
-    try request.print(allocator, "POST {s} HTTP/1.1\r\nHost: {s}\r\nContent-Length: {}\r\n", .{ path, host, body.len });
-    if (sid) |s| {
-        try request.print(allocator, "Cookie: SID={s}\r\n", .{s});
-    }
-    try request.appendSlice(allocator, "Connection: close\r\n\r\n");
-    try request.appendSlice(allocator, body);
-
-    sendAll(fd, request.items) catch {
-        try stdout.print("error: failed to send request\n", .{});
-        return;
-    };
-
-    // Read response
-    var response_buf: [8192]u8 = undefined;
-    const n = posix.read(fd, &response_buf) catch {
-        try stdout.print("error: failed to read response\n", .{});
-        return;
-    };
-    const response = response_buf[0..n];
-
-    // Extract body
-    if (std.mem.indexOf(u8, response, "\r\n\r\n")) |body_start| {
-        try stdout.print("{s}\n", .{response[body_start + 4 ..]});
-    } else {
-        try stdout.print("{s}\n", .{response});
-    }
+fn contentTypeForPostBody(body: []const u8) ?[]const u8 {
+    if (std.mem.indexOfScalar(u8, body, '=')) |_| return "application/x-www-form-urlencoded";
+    return null;
 }
 
 fn printUsage(stdout: *std.Io.Writer, host: []const u8, port: u16) !void {
@@ -672,6 +565,7 @@ fn printUsage(stdout: *std.Io.Writer, host: []const u8, port: u16) !void {
     try stdout.print("options:\n", .{});
     try stdout.print("  --username <user>              API username (default: admin)\n", .{});
     try stdout.print("  --password <pass>              API password (default: adminadmin)\n", .{});
+    try stdout.print("  --format <human|json>          output format (default: human)\n", .{});
     try stdout.print("\ncommands:\n", .{});
     try stdout.print("  list                           list all torrents\n", .{});
     try stdout.print("  add <torrent-file>             add torrent\n", .{});
@@ -701,5 +595,7 @@ fn printUsage(stdout: *std.Io.Writer, host: []const u8, port: u16) !void {
     try stdout.print("  shutdown [--timeout <secs>]     graceful daemon shutdown\n", .{});
     try stdout.print("  version                        daemon API version\n", .{});
     try stdout.print("  stats                          global transfer stats\n", .{});
+    try stdout.print("  api get <path>                 GET an API path\n", .{});
+    try stdout.print("  api post <path> [body]         POST an API path\n", .{});
     try stdout.print("\ndaemon: http://{s}:{}\n", .{ host, port });
 }

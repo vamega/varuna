@@ -83,6 +83,12 @@ pub fn HttpExecutorOf(comptime IO: type) type {
 
         pub const CompletionFn = *const fn (context: *anyopaque, result: RequestResult) void;
 
+        pub const max_host_len = 253;
+        pub const max_url_len = 2048;
+        pub const max_method_len = 16;
+        pub const max_content_type_len = 128;
+        pub const max_cookie_len = 512;
+        pub const max_header_len = 256;
         pub const max_extra_headers = 4;
 
         pub const RequestResult = struct {
@@ -102,6 +108,13 @@ pub fn HttpExecutorOf(comptime IO: type) type {
             url_len: u16 = 0,
             host: [max_host_len]u8 = undefined,
             host_len: u8 = 0,
+            method: [max_method_len]u8 = [_]u8{0} ** max_method_len,
+            method_len: u8 = 0,
+            body: []const u8 = "",
+            content_type: [max_content_type_len]u8 = [_]u8{0} ** max_content_type_len,
+            content_type_len: u8 = 0,
+            cookie: [max_cookie_len]u8 = [_]u8{0} ** max_cookie_len,
+            cookie_len: u16 = 0,
 
             /// Extra HTTP headers to include in the request.
             /// Each entry is a pre-formatted header line WITHOUT trailing \r\n.
@@ -114,9 +127,6 @@ pub fn HttpExecutorOf(comptime IO: type) type {
             target_buf: ?[]u8 = null,
             target_offset: u32 = 0,
 
-            const max_host_len = 253;
-            const max_url_len = 2048;
-
             pub fn urlSlice(self: *const Job) []const u8 {
                 return self.url[0..self.url_len];
             }
@@ -124,13 +134,41 @@ pub fn HttpExecutorOf(comptime IO: type) type {
             pub fn hostSlice(self: *const Job) []const u8 {
                 return self.host[0..self.host_len];
             }
+
+            pub fn methodSlice(self: *const Job) []const u8 {
+                return if (self.method_len == 0) "GET" else self.method[0..self.method_len];
+            }
+
+            pub fn contentTypeSlice(self: *const Job) ?[]const u8 {
+                return if (self.content_type_len == 0) null else self.content_type[0..self.content_type_len];
+            }
+
+            pub fn cookieSlice(self: *const Job) ?[]const u8 {
+                return if (self.cookie_len == 0) null else self.cookie[0..self.cookie_len];
+            }
+
+            pub fn setMethodOn(self: *Job, value: []const u8) void {
+                const copy_len = @min(value.len, max_method_len);
+                @memcpy(self.method[0..copy_len], value[0..copy_len]);
+                self.method_len = @intCast(copy_len);
+            }
+
+            pub fn setContentType(self: *Job, value: []const u8) void {
+                const copy_len = @min(value.len, max_content_type_len);
+                @memcpy(self.content_type[0..copy_len], value[0..copy_len]);
+                self.content_type_len = @intCast(copy_len);
+            }
+
+            pub fn setCookie(self: *Job, value: []const u8) void {
+                const copy_len = @min(value.len, max_cookie_len);
+                @memcpy(self.cookie[0..copy_len], value[0..copy_len]);
+                self.cookie_len = @intCast(copy_len);
+            }
         };
 
         pub const ExtraHeader = struct {
             data: [max_header_len]u8 = undefined,
             len: u16 = 0,
-
-            const max_header_len = 256;
 
             pub fn slice(self: *const ExtraHeader) []const u8 {
                 return self.data[0..self.len];
@@ -841,7 +879,10 @@ pub fn HttpExecutorOf(comptime IO: type) type {
 
             switch (result) {
                 .complete => {
-                    self.buildRequest(slot);
+                    self.buildRequest(slot) catch {
+                        self.completeSlot(slot_idx, .{ .err = error.OutOfMemory });
+                        return;
+                    };
                     // Encrypt the request.
                     _ = tls.writePlaintext(slot.send_buf.items) catch {
                         self.completeSlot(slot_idx, .{ .err = error.TlsWriteFailed });
@@ -894,30 +935,44 @@ pub fn HttpExecutorOf(comptime IO: type) type {
             };
         }
 
-        fn buildRequest(self: *Self, slot: *RequestSlot) void {
+        fn buildRequest(self: *Self, slot: *RequestSlot) !void {
             const parsed = slot.parsed;
             slot.send_buf.clearRetainingCapacity();
-            const items = &slot.send_buf;
-            const alloc = self.allocator;
-            items.appendSlice(alloc, "GET ") catch return;
-            items.appendSlice(alloc, parsed.path) catch return;
-            items.appendSlice(alloc, " HTTP/1.1\r\nHost: ") catch return;
-            items.appendSlice(alloc, slot.job.hostSlice()) catch return;
-            items.appendSlice(alloc, "\r\nConnection: keep-alive\r\nUser-Agent: varuna/0.1\r\n") catch return;
 
-            // Append extra headers.
+            var header_storage: [max_extra_headers]http.Header = undefined;
+            var header_count: usize = 0;
             for (&slot.job.extra_headers) |*hdr| {
-                if (hdr.len > 0) {
-                    items.appendSlice(alloc, hdr.slice()) catch return;
-                    items.appendSlice(alloc, "\r\n") catch return;
+                if (hdr.len == 0) continue;
+                const line = hdr.slice();
+                const colon = std.mem.indexOfScalar(u8, line, ':') orelse continue;
+                header_storage[header_count] = .{
+                    .name = std.mem.trim(u8, line[0..colon], " "),
+                    .value = std.mem.trim(u8, line[colon + 1 ..], " "),
+                };
+                header_count += 1;
+                if (header_count == header_storage.len) {
+                    break;
                 }
             }
 
-            items.appendSlice(alloc, "\r\n") catch return;
+            try http.appendRequest(self.allocator, &slot.send_buf, .{
+                .method = slot.job.methodSlice(),
+                .host = slot.job.hostSlice(),
+                .path = parsed.path,
+                .body = slot.job.body,
+                .content_type = slot.job.contentTypeSlice(),
+                .cookie = slot.job.cookieSlice(),
+                .extra_headers = header_storage[0..header_count],
+                .connection = "keep-alive",
+                .user_agent = "varuna/0.1",
+            });
         }
 
         fn buildAndSendRequest(self: *Self, slot: *RequestSlot, slot_idx: u16) void {
-            self.buildRequest(slot);
+            self.buildRequest(slot) catch {
+                self.completeSlot(slot_idx, .{ .err = error.OutOfMemory });
+                return;
+            };
             if (slot.send_buf.items.len == 0) {
                 self.completeSlot(slot_idx, .{ .err = error.InvalidUrl });
                 return;
