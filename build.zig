@@ -89,6 +89,12 @@ pub fn build(b: *std.Build) void {
     });
     const toml_mod = toml_dep.module("toml");
 
+    const zigzag_dep = b.dependency("zigzag", .{
+        .target = target,
+        .optimize = optimize,
+    });
+    const zigzag_mod = zigzag_dep.module("zigzag");
+
     // ── Shared library module ─────────────────────────────
     const varuna_mod = b.addModule("varuna", .{
         .root_source_file = b.path("src/root.zig"),
@@ -155,6 +161,18 @@ pub fn build(b: *std.Build) void {
         .{ .name = "varuna", .module = varuna_mod },
     };
 
+    const tui_mod = b.addModule("varuna_tui", .{
+        .root_source_file = b.path("src/tui/root.zig"),
+        .target = target,
+        .imports = &.{
+            .{ .name = "zigzag", .module = zigzag_mod },
+        },
+    });
+
+    const tui_import = [_]std.Build.Module.Import{
+        .{ .name = "varuna_tui", .module = tui_mod },
+    };
+
     // The daemon (varuna) and the thin RPC client (varuna-ctl) now route
     // through `src/io/backend.zig`, which dispatches on `-Dio=`. They
     // build under Linux-targeting production backends (`io_uring`,
@@ -206,6 +224,27 @@ pub fn build(b: *std.Build) void {
     });
     if (build_daemon) b.installArtifact(ctl_exe);
 
+    // ── varuna-tui (mock terminal UI client) ───────────────────
+    const tui_exe = b.addExecutable(.{
+        .name = "varuna-tui",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/tui/main.zig"),
+            .target = target,
+            .optimize = optimize,
+            .imports = &tui_import,
+        }),
+    });
+    const install_tui = b.addInstallArtifact(tui_exe, .{});
+    if (build_daemon) b.getInstallStep().dependOn(&install_tui.step);
+
+    const build_tui_step = b.step("build-tui", "Build the mock varuna-tui binary");
+    build_tui_step.dependOn(&install_tui.step);
+
+    const run_tui_step = b.step("run-tui", "Run the mock varuna-tui binary");
+    const run_tui_cmd = b.addRunArtifact(tui_exe);
+    if (b.args) |args| run_tui_cmd.addArgs(args);
+    run_tui_step.dependOn(&run_tui_cmd.step);
+
     // ── varuna-tools (standalone utilities) ────────────────
     const tools_exe = b.addExecutable(.{
         .name = "varuna-tools",
@@ -238,6 +277,19 @@ pub fn build(b: *std.Build) void {
     const test_step = b.step("test", "Run the full test suite");
     test_step.dependOn(&run_mod_tests.step);
     test_step.dependOn(&run_daemon_tests.step);
+
+    const tui_tests = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("tests/tui_render_test.zig"),
+            .target = target,
+            .optimize = optimize,
+            .imports = &tui_import,
+        }),
+    });
+    const run_tui_tests = b.addRunArtifact(tui_tests);
+    const test_tui_step = b.step("test-tui", "Run focused varuna-tui render/model tests");
+    test_tui_step.dependOn(&run_tui_tests.step);
+    test_step.dependOn(&run_tui_tests.step);
 
     const move_job_tests = b.addTest(.{
         .root_module = varuna_mod,
