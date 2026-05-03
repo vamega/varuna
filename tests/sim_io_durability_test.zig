@@ -12,9 +12,9 @@
 //!   * `crash()` drops every fd's `pending` layer, leaving only durable.
 //!
 //! These are algorithm-level tests against `SimIO.read` / `write` /
-//! `fsync` / `crash` — they don't drive an EventLoop. The end-to-end
-//! "resume DB asserts completion for un-fsynced bytes" repro lives in
-//! `tests/resume_durability_bug_test.zig`.
+//! `truncate` / `fallocate` / `fsync` / `crash` — they don't drive an
+//! EventLoop. The end-to-end resume gate harness lives in
+//! `tests/resume_durability_buggify_test.zig`.
 
 const std = @import("std");
 const testing = std.testing;
@@ -91,6 +91,30 @@ fn fsyncSync(io: *SimIO, fd: posix.fd_t) !void {
     try testing.expectEqual(@as(u32, 1), ctx.calls);
     return switch (ctx.last_result.?) {
         .fsync => |r| try r,
+        else => unreachable,
+    };
+}
+
+fn truncateSync(io: *SimIO, fd: posix.fd_t, length: u64) !void {
+    var c = Completion{};
+    var ctx = TestCtx{};
+    try io.truncate(.{ .fd = fd, .length = length }, &c, &ctx, testCallback);
+    try io.tick(0);
+    try testing.expectEqual(@as(u32, 1), ctx.calls);
+    return switch (ctx.last_result.?) {
+        .truncate => |r| try r,
+        else => unreachable,
+    };
+}
+
+fn fallocateSync(io: *SimIO, fd: posix.fd_t, offset: u64, len: u64) !void {
+    var c = Completion{};
+    var ctx = TestCtx{};
+    try io.fallocate(.{ .fd = fd, .offset = offset, .len = len }, &c, &ctx, testCallback);
+    try io.tick(0);
+    try testing.expectEqual(@as(u32, 1), ctx.calls);
+    return switch (ctx.last_result.?) {
+        .fallocate => |r| try r,
         else => unreachable,
     };
 }
@@ -349,4 +373,79 @@ test "SimIO durability: per-fd isolation; one fd's crash doesn't affect another"
     const n_b = try readSync(&io, fd_b, 0, &buf_b);
     try testing.expectEqual(@as(usize, 9), n_b);
     try testing.expectEqualSlices(u8, "B-pending", &buf_b);
+}
+
+test "SimIO durability: truncate length is pending until fsync" {
+    var io = try SimIO.init(testing.allocator, .{});
+    defer io.deinit();
+
+    const fd: posix.fd_t = 59;
+    try io.setFileBytes(fd, "ABCDEFGH");
+
+    try truncateSync(&io, fd, 3);
+
+    var pre_buf: [8]u8 = undefined;
+    const n_pre = try readSync(&io, fd, 0, &pre_buf);
+    try testing.expectEqual(@as(usize, 3), n_pre);
+    try testing.expectEqualSlices(u8, "ABC", pre_buf[0..n_pre]);
+
+    io.crash();
+
+    var post_buf: [8]u8 = undefined;
+    const n_post = try readSync(&io, fd, 0, &post_buf);
+    try testing.expectEqual(@as(usize, 8), n_post);
+    try testing.expectEqualSlices(u8, "ABCDEFGH", post_buf[0..n_post]);
+}
+
+test "SimIO durability: fsynced truncate survives crash" {
+    var io = try SimIO.init(testing.allocator, .{});
+    defer io.deinit();
+
+    const fd: posix.fd_t = 61;
+    try io.setFileBytes(fd, "ABCDEFGH");
+
+    try truncateSync(&io, fd, 3);
+    try fsyncSync(&io, fd);
+    io.crash();
+
+    var buf: [8]u8 = undefined;
+    const n = try readSync(&io, fd, 0, &buf);
+    try testing.expectEqual(@as(usize, 3), n);
+    try testing.expectEqualSlices(u8, "ABC", buf[0..n]);
+}
+
+test "SimIO durability: fallocate length is pending until fsync" {
+    var io = try SimIO.init(testing.allocator, .{});
+    defer io.deinit();
+
+    const fd: posix.fd_t = 67;
+    try fallocateSync(&io, fd, 0, 8);
+
+    var pre_buf: [8]u8 = undefined;
+    @memset(&pre_buf, 0xff);
+    const n_pre = try readSync(&io, fd, 0, &pre_buf);
+    try testing.expectEqual(@as(usize, 8), n_pre);
+    try testing.expectEqualSlices(u8, "\x00\x00\x00\x00\x00\x00\x00\x00", &pre_buf);
+
+    io.crash();
+
+    var post_buf: [8]u8 = undefined;
+    const n_post = try readSync(&io, fd, 0, &post_buf);
+    try testing.expectEqual(@as(usize, 0), n_post);
+}
+
+test "SimIO durability: fsynced fallocate exposes durable zero length" {
+    var io = try SimIO.init(testing.allocator, .{});
+    defer io.deinit();
+
+    const fd: posix.fd_t = 71;
+    try fallocateSync(&io, fd, 0, 8);
+    try fsyncSync(&io, fd);
+    io.crash();
+
+    var buf: [8]u8 = undefined;
+    @memset(&buf, 0xff);
+    const n = try readSync(&io, fd, 0, &buf);
+    try testing.expectEqual(@as(usize, 8), n);
+    try testing.expectEqualSlices(u8, "\x00\x00\x00\x00\x00\x00\x00\x00", &buf);
 }

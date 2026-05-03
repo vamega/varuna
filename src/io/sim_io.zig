@@ -299,14 +299,18 @@ const synthetic_fd_base: i32 = 100_000;
 //   - `durable`: bytes that have been fsynced. Survives `crash()`.
 //   - `pending`: bytes accepted by `write` but not yet fsynced. Dropped
 //     by `crash()`.
+//   - `pending_len`: file length metadata accepted by `write`,
+//     `truncate`, or `fallocate` but not yet fsynced. Dropped by
+//     `crash()`.
 //   - `pending_dirty`: bit-per-byte mask. Bit `i` set means `pending[i]`
 //     is an overlay (returned by reads in preference to `durable[i]`);
 //     clear means `durable[i]` wins.
 //
 // `read` returns `durable[i]` when `pending_dirty[i] == 0` and
 // `pending[i]` when `pending_dirty[i] == 1`. `fsync` copies each set bit
-// from `pending` into `durable` (extending `durable` if needed) then
-// clears those bits. `crash()` clears all bits and resets `pending_len`.
+// from `pending` into `durable` (resizing `durable` to `pending_len` when
+// file length metadata is dirty) then clears those bits. `crash()` clears
+// all bits and resets `pending_len`.
 //
 // All three buffers grow as needed when a `write` extends past their
 // current length; bytes added by growth are zeroed and marked
@@ -314,6 +318,7 @@ const synthetic_fd_base: i32 = 100_000;
 pub const SimFile = struct {
     durable: std.ArrayListUnmanaged(u8) = .{},
     pending: std.ArrayListUnmanaged(u8) = .{},
+    pending_len: ?usize = null,
     pending_dirty: std.DynamicBitSetUnmanaged = .{},
 
     fn deinit(self: *SimFile, allocator: std.mem.Allocator) void {
@@ -328,9 +333,9 @@ pub const SimFile = struct {
     }
 
     /// Length the union (durable + pending overlay) claims. Equals
-    /// `max(durable.len, pending.len)`.
+    /// pending metadata length when present, otherwise durable length.
     fn visibleLen(self: *const SimFile) usize {
-        return @max(self.durable.items.len, self.pending.items.len);
+        return self.pending_len orelse self.durable.items.len;
     }
 
     /// Grow `pending` and `pending_dirty` so they cover at least `n`
@@ -348,6 +353,14 @@ pub const SimFile = struct {
         if (self.pending_dirty.bit_length < n) {
             try self.pending_dirty.resize(allocator, n, false);
         }
+    }
+
+    fn markPendingLen(self: *SimFile, len: usize) void {
+        self.pending_len = len;
+    }
+
+    fn extendPendingLen(self: *SimFile, len: usize) void {
+        self.pending_len = @max(self.pending_len orelse self.durable.items.len, len);
     }
 
     /// Read the union of durable+pending into `dst`, starting at file
@@ -378,39 +391,41 @@ pub const SimFile = struct {
         return n;
     }
 
-    /// Promote every dirty byte in `pending` into `durable`, then clear
-    /// the dirty mask. Grows `durable` if a dirty byte sits past its
-    /// current length (newly grown bytes are zeroed first; then the
-    /// dirty bytes overwrite). After the call, `pending` retains its
-    /// buffer (so the next write doesn't have to grow from zero) but
-    /// no bit in `pending_dirty` is set.
+    /// Promote pending length metadata and every dirty byte into
+    /// `durable`, then clear the dirty mask. After the call, `pending`
+    /// retains its buffer (so the next write doesn't have to grow from
+    /// zero) but no bit in `pending_dirty` is set.
     fn promotePending(
         self: *SimFile,
         allocator: std.mem.Allocator,
     ) !void {
-        if (self.pending_dirty.bit_length == 0) return;
+        const target_len = self.pending_len orelse self.durable.items.len;
+        var need = target_len;
+
         // Grow durable to cover the highest dirty bit, if any.
-        var max_idx: usize = 0;
-        var found: bool = false;
-        var it = self.pending_dirty.iterator(.{});
-        while (it.next()) |idx| {
-            max_idx = idx;
-            found = true;
+        if (self.pending_dirty.bit_length > 0) {
+            var it = self.pending_dirty.iterator(.{});
+            while (it.next()) |idx| {
+                if (idx + 1 > need) need = idx + 1;
+            }
         }
-        if (!found) return;
-        const need = max_idx + 1;
-        if (self.durable.items.len < need) {
+
+        if (self.durable.items.len != need) {
             const old_len = self.durable.items.len;
             try self.durable.resize(allocator, need);
-            @memset(self.durable.items[old_len..], 0);
+            if (need > old_len) @memset(self.durable.items[old_len..], 0);
         }
+
         var it2 = self.pending_dirty.iterator(.{});
         while (it2.next()) |idx| {
-            self.durable.items[idx] = self.pending.items[idx];
+            if (idx < self.durable.items.len) {
+                self.durable.items[idx] = self.pending.items[idx];
+            }
         }
         // Clear the dirty mask in one shot. We keep the bit-set
         // capacity around; the next write will set bits again.
         self.pending_dirty.unsetAll();
+        self.pending_len = null;
     }
 
     /// Drop every dirty bit (i.e. forget all pending writes). The
@@ -418,6 +433,7 @@ pub const SimFile = struct {
     /// — a subsequent write reuses the allocation. Mirrors a
     /// power-loss between write CQE and fsync CQE.
     fn dropPending(self: *SimFile) void {
+        self.pending_len = null;
         self.pending_dirty.unsetAll();
         self.pending.clearRetainingCapacity();
     }
@@ -1327,6 +1343,7 @@ pub const SimIO = struct {
         gop.value_ptr.ensurePending(self.allocator, end) catch {
             return self.schedule(c, .{ .write = error.NoSpaceLeft }, self.config.faults.write_latency_ns);
         };
+        gop.value_ptr.extendPendingLen(end);
         @memcpy(gop.value_ptr.pending.items[off..end], op.buf);
         var i: usize = off;
         while (i < end) : (i += 1) gop.value_ptr.pending_dirty.set(i);
@@ -1372,20 +1389,31 @@ pub const SimIO = struct {
         if (r.float(f32) < self.config.faults.fallocate_error_probability) {
             return self.schedule(c, .{ .fallocate = error.NoSpaceLeft }, 0);
         }
+        if (op.mode == 0) {
+            const end: usize = @intCast(op.offset + op.len);
+            const gop = self.file_state.getOrPut(op.fd) catch {
+                return self.schedule(c, .{ .fallocate = error.NoSpaceLeft }, 0);
+            };
+            if (!gop.found_existing) gop.value_ptr.* = .{};
+            gop.value_ptr.extendPendingLen(end);
+        }
         return self.schedule(c, .{ .fallocate = {} }, 0);
     }
 
-    /// SimIO doesn't model on-disk file lengths, so truncate is a no-op
-    /// on success — it just delivers a `.truncate = {}` completion
-    /// through the heap. The fault knob delivers `error.InputOutput`,
-    /// matching the kind of error a real ftruncate could surface on disk
-    /// failure mid-call.
+    /// Truncate updates the simulated visible file length, but the
+    /// metadata is pending until `fsync` promotes it. A later `crash()`
+    /// reverts the length to the durable layer.
     pub fn truncate(self: *SimIO, op: ifc.TruncateOp, c: *Completion, ud: ?*anyopaque, cb: Callback) !void {
         try self.armCompletion(c, .{ .truncate = op }, ud, cb);
         const r = self.rng.random();
         if (r.float(f32) < self.config.faults.truncate_error_probability) {
             return self.schedule(c, .{ .truncate = error.InputOutput }, 0);
         }
+        const gop = self.file_state.getOrPut(op.fd) catch {
+            return self.schedule(c, .{ .truncate = error.InputOutput }, 0);
+        };
+        if (!gop.found_existing) gop.value_ptr.* = .{};
+        gop.value_ptr.markPendingLen(@intCast(op.length));
         return self.schedule(c, .{ .truncate = {} }, 0);
     }
 
