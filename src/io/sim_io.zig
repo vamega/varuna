@@ -128,9 +128,11 @@ pub const FaultConfig = struct {
     openat_error_probability: f32 = 0.0,
     mkdirat_error_probability: f32 = 0.0,
     renameat_error_probability: f32 = 0.0,
+    renameat_exdev_probability: f32 = 0.0,
     unlinkat_error_probability: f32 = 0.0,
     statx_error_probability: f32 = 0.0,
     getdents_error_probability: f32 = 0.0,
+    close_error_probability: f32 = 0.0,
     /// Probability that an fsync completes with `error.InputOutput`
     /// (disk failure mid-flush). Distinct from
     /// `write_error_probability` so BUGGIFY can target sync-only paths.
@@ -553,8 +555,10 @@ pub const SimIO = struct {
     /// normalized path strings owned by SimIO; fd handles opened through
     /// `openat` store an owned copy in `fd_paths`.
     fs_nodes: std.StringHashMapUnmanaged(SimFsKind) = .{},
+    path_file_state: std.StringHashMapUnmanaged(SimFile) = .{},
     fd_paths: std.AutoHashMap(posix.fd_t, []u8),
     fd_dir_offsets: std.AutoHashMap(posix.fd_t, usize),
+    closed_fds: std.AutoHashMap(posix.fd_t, void),
 
     /// FIFO of pre-prepared fds returned by future `socket()` calls.
     /// Each `socket` submission consumes one entry; if the queue is
@@ -622,6 +626,7 @@ pub const SimIO = struct {
             .file_state = std.AutoHashMap(posix.fd_t, SimFile).init(allocator),
             .fd_paths = std.AutoHashMap(posix.fd_t, []u8).init(allocator),
             .fd_dir_offsets = std.AutoHashMap(posix.fd_t, usize).init(allocator),
+            .closed_fds = std.AutoHashMap(posix.fd_t, void).init(allocator),
         };
         errdefer self.deinit();
 
@@ -634,6 +639,12 @@ pub const SimIO = struct {
         var it = self.file_state.iterator();
         while (it.next()) |entry| entry.value_ptr.deinit(self.allocator);
         self.file_state.deinit();
+        var path_file_it = self.path_file_state.iterator();
+        while (path_file_it.next()) |entry| {
+            self.allocator.free(entry.key_ptr.*);
+            entry.value_ptr.deinit(self.allocator);
+        }
+        self.path_file_state.deinit(self.allocator);
         var node_it = self.fs_nodes.iterator();
         while (node_it.next()) |entry| self.allocator.free(entry.key_ptr.*);
         self.fs_nodes.deinit(self.allocator);
@@ -641,6 +652,7 @@ pub const SimIO = struct {
         while (fd_it.next()) |entry| self.allocator.free(entry.value_ptr.*);
         self.fd_paths.deinit();
         self.fd_dir_offsets.deinit();
+        self.closed_fds.deinit();
         self.prepared_socket_fds.deinit(self.allocator);
         self.allocator.free(self.pending);
         self.allocator.free(self.recv_queue_pool);
@@ -661,17 +673,8 @@ pub const SimIO = struct {
     /// Calling twice with the same fd replaces the durable layer and
     /// drops any pending bytes.
     pub fn setFileBytes(self: *SimIO, fd: posix.fd_t, bytes: []const u8) !void {
-        const gop = try self.file_state.getOrPut(fd);
-        if (!gop.found_existing) {
-            gop.value_ptr.* = .{};
-        } else {
-            gop.value_ptr.deinit(self.allocator);
-            gop.value_ptr.* = .{};
-        }
-        var owned = std.ArrayListUnmanaged(u8){};
-        errdefer owned.deinit(self.allocator);
-        try owned.appendSlice(self.allocator, bytes);
-        gop.value_ptr.durable = owned;
+        const sf = try self.getOrPutFileStateForFd(fd);
+        try self.resetFileBytes(sf, bytes);
     }
 
     /// Drop every fd's pending (un-fsynced) bytes; durable bytes stay.
@@ -681,6 +684,8 @@ pub const SimIO = struct {
     pub fn crash(self: *SimIO) void {
         var it = self.file_state.iterator();
         while (it.next()) |entry| entry.value_ptr.dropPending();
+        var path_it = self.path_file_state.iterator();
+        while (path_it.next()) |entry| entry.value_ptr.dropPending();
     }
 
     /// Enqueue `fd` so the next `socket()` submission returns it
@@ -824,6 +829,7 @@ pub const SimIO = struct {
             .read => |op| try self.read(op, c, ud, cb),
             .write => |op| try self.write(op, c, ud, cb),
             .fsync => |op| try self.fsync(op, c, ud, cb),
+            .close => |op| try self.close(op, c, ud, cb),
             .fallocate => |op| try self.fallocate(op, c, ud, cb),
             .truncate => |op| try self.truncate(op, c, ud, cb),
             .openat => |op| try self.openat(op, c, ud, cb),
@@ -1034,6 +1040,61 @@ pub const SimIO = struct {
         if (self.fs_nodes.fetchRemove(path)) |kv| self.allocator.free(kv.key);
     }
 
+    fn getOrPutPathFileState(self: *SimIO, path: []const u8) !*SimFile {
+        if (self.path_file_state.getPtr(path)) |sf| return sf;
+        const owned = try self.allocator.dupe(u8, path);
+        errdefer self.allocator.free(owned);
+        try self.path_file_state.put(self.allocator, owned, .{});
+        return self.path_file_state.getPtr(path).?;
+    }
+
+    fn getOrPutRawFileState(self: *SimIO, fd: posix.fd_t) !*SimFile {
+        const gop = try self.file_state.getOrPut(fd);
+        if (!gop.found_existing) gop.value_ptr.* = .{};
+        return gop.value_ptr;
+    }
+
+    fn getOrPutFileStateForFd(self: *SimIO, fd: posix.fd_t) !*SimFile {
+        if (self.closed_fds.contains(fd)) return error.BadFileDescriptor;
+        if (self.fd_paths.get(fd)) |path| return self.getOrPutPathFileState(path);
+        return self.getOrPutRawFileState(fd);
+    }
+
+    fn fileStatePtrForFd(self: *SimIO, fd: posix.fd_t) !?*SimFile {
+        if (self.closed_fds.contains(fd)) return error.BadFileDescriptor;
+        if (self.fd_paths.get(fd)) |path| return self.path_file_state.getPtr(path);
+        return self.file_state.getPtr(fd);
+    }
+
+    fn resetFileBytes(self: *SimIO, sf: *SimFile, bytes: []const u8) !void {
+        sf.deinit(self.allocator);
+        sf.* = .{};
+        var owned = std.ArrayListUnmanaged(u8){};
+        errdefer owned.deinit(self.allocator);
+        try owned.appendSlice(self.allocator, bytes);
+        sf.durable = owned;
+    }
+
+    fn removePathFileState(self: *SimIO, path: []const u8) void {
+        if (self.path_file_state.fetchRemove(path)) |kv| {
+            self.allocator.free(kv.key);
+            var value = kv.value;
+            value.deinit(self.allocator);
+        }
+    }
+
+    fn movePathFileState(self: *SimIO, old_path: []const u8, new_path: []const u8) !void {
+        const kv = self.path_file_state.fetchRemove(old_path) orelse return;
+        var value = kv.value;
+        errdefer value.deinit(self.allocator);
+        self.allocator.free(kv.key);
+
+        self.removePathFileState(new_path);
+        const owned_new = try self.allocator.dupe(u8, new_path);
+        errdefer self.allocator.free(owned_new);
+        try self.path_file_state.put(self.allocator, owned_new, value);
+    }
+
     fn resolveAt(self: *SimIO, dir_fd: posix.fd_t, path: [:0]const u8) ![]u8 {
         if (path.len == 0) return error.FileNotFound;
         if (path[0] == '/') return try self.allocator.dupe(u8, path);
@@ -1170,6 +1231,7 @@ pub const SimIO = struct {
         if (self.fd_paths.fetchRemove(fd)) |kv| {
             self.allocator.free(kv.value);
             _ = self.fd_dir_offsets.remove(fd);
+            self.closed_fds.put(fd, {}) catch {};
             return;
         }
 
@@ -1207,6 +1269,34 @@ pub const SimIO = struct {
     }
 
     // ── Public submission methods (interface) ─────────────
+
+    pub fn close(self: *SimIO, op: ifc.CloseOp, c: *Completion, ud: ?*anyopaque, cb: Callback) !void {
+        try self.armCompletion(c, .{ .close = op }, ud, cb);
+        const r = self.rng.random();
+        if (r.float(f32) < self.config.faults.close_error_probability) {
+            return self.schedule(c, .{ .close = error.InputOutput }, 0);
+        }
+
+        if (self.fd_paths.fetchRemove(op.fd)) |kv| {
+            self.allocator.free(kv.value);
+            _ = self.fd_dir_offsets.remove(op.fd);
+            try self.closed_fds.put(op.fd, {});
+            return self.schedule(c, .{ .close = {} }, 0);
+        }
+
+        if (self.slotForFd(op.fd)) |_| {
+            self.closeSocket(op.fd);
+            try self.closed_fds.put(op.fd, {});
+            return self.schedule(c, .{ .close = {} }, 0);
+        }
+
+        if (self.file_state.contains(op.fd)) {
+            try self.closed_fds.put(op.fd, {});
+            return self.schedule(c, .{ .close = {} }, 0);
+        }
+
+        return self.schedule(c, .{ .close = error.BadFileDescriptor }, 0);
+    }
 
     pub fn recv(self: *SimIO, op: ifc.RecvOp, c: *Completion, ud: ?*anyopaque, cb: Callback) !void {
         try self.armCompletion(c, .{ .recv = op }, ud, cb);
@@ -1345,7 +1435,10 @@ pub const SimIO = struct {
         // writes), return the union of durable+pending at the requested
         // offset. Otherwise fall through to the legacy zero-byte
         // success for callers that don't care about disk content.
-        if (self.file_state.getPtr(op.fd)) |sf| {
+        const maybe_sf = self.fileStatePtrForFd(op.fd) catch |err| {
+            return self.schedule(c, .{ .read = err }, 0);
+        };
+        if (maybe_sf) |sf| {
             const off: usize = @intCast(op.offset);
             const n = sf.readUnion(off, op.buf);
             return self.schedule(c, .{ .read = n }, 0);
@@ -1371,19 +1464,19 @@ pub const SimIO = struct {
         // exercises the durability model end-to-end.
         const off: usize = @intCast(op.offset);
         const end: usize = off + op.buf.len;
-        const gop = self.file_state.getOrPut(op.fd) catch {
+        const sf = self.getOrPutFileStateForFd(op.fd) catch |err| {
             // Out of memory while creating the entry — surface as EIO
             // through the normal completion path so the caller's error
             // handling fires.
+            const result_err = if (err == error.BadFileDescriptor) err else error.NoSpaceLeft;
+            return self.schedule(c, .{ .write = result_err }, self.config.faults.write_latency_ns);
+        };
+        sf.ensurePending(self.allocator, end) catch {
             return self.schedule(c, .{ .write = error.NoSpaceLeft }, self.config.faults.write_latency_ns);
         };
-        if (!gop.found_existing) gop.value_ptr.* = .{};
-        gop.value_ptr.ensurePending(self.allocator, end) catch {
-            return self.schedule(c, .{ .write = error.NoSpaceLeft }, self.config.faults.write_latency_ns);
-        };
-        gop.value_ptr.extendPendingLen(end);
-        @memcpy(gop.value_ptr.pending.items[off..end], op.buf);
-        gop.value_ptr.markDirtyRange(off, end);
+        sf.extendPendingLen(end);
+        @memcpy(sf.pending.items[off..end], op.buf);
+        sf.markDirtyRange(off, end);
 
         // Real `write(2)` / `IORING_OP_WRITE` returns the number of bytes
         // accepted, normally the full buffer length on regular files.
@@ -1407,7 +1500,10 @@ pub const SimIO = struct {
         // Success: promote dirty pending bytes into durable. This is
         // the kernel-pagecache barrier the daemon is supposed to wait
         // for before recording resume-DB completions.
-        if (self.file_state.getPtr(op.fd)) |sf| {
+        const maybe_sf = self.fileStatePtrForFd(op.fd) catch |err| {
+            return self.schedule(c, .{ .fsync = err }, 0);
+        };
+        if (maybe_sf) |sf| {
             sf.promotePending(self.allocator) catch {
                 // Allocation failure during promotePending — surface as
                 // EIO so the caller's error path runs.
@@ -1451,20 +1547,20 @@ pub const SimIO = struct {
         // mixed range-edit modes whose sparse extent, shifting, or
         // shared-block semantics do not fit this byte-layer model.
         if (zero_range) {
-            const gop = self.file_state.getOrPut(op.fd) catch {
-                return self.schedule(c, .{ .fallocate = error.NoSpaceLeft }, 0);
+            const sf = self.getOrPutFileStateForFd(op.fd) catch |err| {
+                const result_err = if (err == error.BadFileDescriptor) err else error.NoSpaceLeft;
+                return self.schedule(c, .{ .fallocate = result_err }, 0);
             };
-            if (!gop.found_existing) gop.value_ptr.* = .{};
-            gop.value_ptr.fillPendingBytes(self.allocator, off, len, 0, keep_size) catch {
+            sf.fillPendingBytes(self.allocator, off, len, 0, keep_size) catch {
                 return self.schedule(c, .{ .fallocate = error.NoSpaceLeft }, 0);
             };
         } else if (!keep_size) {
             const end = off + len;
-            const gop = self.file_state.getOrPut(op.fd) catch {
-                return self.schedule(c, .{ .fallocate = error.NoSpaceLeft }, 0);
+            const sf = self.getOrPutFileStateForFd(op.fd) catch |err| {
+                const result_err = if (err == error.BadFileDescriptor) err else error.NoSpaceLeft;
+                return self.schedule(c, .{ .fallocate = result_err }, 0);
             };
-            if (!gop.found_existing) gop.value_ptr.* = .{};
-            gop.value_ptr.extendPendingLen(end);
+            sf.extendPendingLen(end);
         }
         return self.schedule(c, .{ .fallocate = {} }, 0);
     }
@@ -1478,11 +1574,11 @@ pub const SimIO = struct {
         if (r.float(f32) < self.config.faults.truncate_error_probability) {
             return self.schedule(c, .{ .truncate = error.InputOutput }, 0);
         }
-        const gop = self.file_state.getOrPut(op.fd) catch {
-            return self.schedule(c, .{ .truncate = error.InputOutput }, 0);
+        const sf = self.getOrPutFileStateForFd(op.fd) catch |err| {
+            const result_err = if (err == error.BadFileDescriptor) err else error.InputOutput;
+            return self.schedule(c, .{ .truncate = result_err }, 0);
         };
-        if (!gop.found_existing) gop.value_ptr.* = .{};
-        gop.value_ptr.markPendingLen(@intCast(op.length));
+        sf.markPendingLen(@intCast(op.length));
         return self.schedule(c, .{ .truncate = {} }, 0);
     }
 
@@ -1514,7 +1610,9 @@ pub const SimIO = struct {
             return self.schedule(c, .{ .copy_file_range = error.InputOutput }, 0);
         }
 
-        const src = self.file_state.getPtr(op.in_fd) orelse {
+        const src = (self.fileStatePtrForFd(op.in_fd) catch |err| {
+            return self.schedule(c, .{ .copy_file_range = err }, 0);
+        }) orelse {
             return self.schedule(c, .{ .copy_file_range = op.len }, 0);
         };
 
@@ -1534,11 +1632,11 @@ pub const SimIO = struct {
         assert(read_n == copied_len);
 
         const out_off: usize = @intCast(op.out_offset);
-        const gop = self.file_state.getOrPut(op.out_fd) catch {
-            return self.schedule(c, .{ .copy_file_range = error.NoSpaceLeft }, 0);
+        const dst = self.getOrPutFileStateForFd(op.out_fd) catch |err| {
+            const result_err = if (err == error.BadFileDescriptor) err else error.NoSpaceLeft;
+            return self.schedule(c, .{ .copy_file_range = result_err }, 0);
         };
-        if (!gop.found_existing) gop.value_ptr.* = .{};
-        gop.value_ptr.writePendingBytes(self.allocator, out_off, scratch) catch {
+        dst.writePendingBytes(self.allocator, out_off, scratch) catch {
             return self.schedule(c, .{ .copy_file_range = error.NoSpaceLeft }, 0);
         };
 
@@ -1564,13 +1662,24 @@ pub const SimIO = struct {
             self.putFsNode(path, .file) catch {
                 return self.schedule(c, .{ .openat = error.NoSpaceLeft }, 0);
             };
+            _ = self.getOrPutPathFileState(path) catch {
+                return self.schedule(c, .{ .openat = error.NoSpaceLeft }, 0);
+            };
         } else if (op.flags.CREAT and op.flags.EXCL) {
             return self.schedule(c, .{ .openat = error.PathAlreadyExists }, 0);
         } else if (op.flags.DIRECTORY and kind.? != .dir) {
             return self.schedule(c, .{ .openat = error.NotDir }, 0);
+        } else if (kind.? == .file and op.flags.TRUNC) {
+            const sf = self.getOrPutPathFileState(path) catch {
+                return self.schedule(c, .{ .openat = error.NoSpaceLeft }, 0);
+            };
+            self.resetFileBytes(sf, "") catch {
+                return self.schedule(c, .{ .openat = error.NoSpaceLeft }, 0);
+            };
         }
 
         const fd = self.nextSyntheticFd();
+        _ = self.closed_fds.remove(fd);
         const owned = self.allocator.dupe(u8, path) catch {
             return self.schedule(c, .{ .openat = error.NoSpaceLeft }, 0);
         };
@@ -1615,6 +1724,9 @@ pub const SimIO = struct {
         if (r.float(f32) < self.config.faults.renameat_error_probability) {
             return self.schedule(c, .{ .renameat = error.InputOutput }, 0);
         }
+        if (self.rng.random().float(f32) < self.config.faults.renameat_exdev_probability) {
+            return self.schedule(c, .{ .renameat = error.RenameAcrossMountPoints }, 0);
+        }
         if (op.flags != 0) return self.schedule(c, .{ .renameat = error.OperationNotSupported }, 0);
 
         const old_path = self.resolveAt(op.old_dir_fd, op.old_path) catch |err| {
@@ -1633,6 +1745,9 @@ pub const SimIO = struct {
 
         self.removeFsNode(old_path);
         self.putFsNode(new_path, kind) catch {
+            return self.schedule(c, .{ .renameat = error.NoSpaceLeft }, 0);
+        };
+        self.movePathFileState(old_path, new_path) catch {
             return self.schedule(c, .{ .renameat = error.NoSpaceLeft }, 0);
         };
         return self.schedule(c, .{ .renameat = {} }, 0);
@@ -1658,6 +1773,7 @@ pub const SimIO = struct {
         if (remove_dir and self.hasChild(path)) return self.schedule(c, .{ .unlinkat = error.DirNotEmpty }, 0);
 
         self.removeFsNode(path);
+        if (kind == .file) self.removePathFileState(path);
         return self.schedule(c, .{ .unlinkat = {} }, 0);
     }
 
@@ -1685,7 +1801,10 @@ pub const SimIO = struct {
             .file => linux.S.IFREG | 0o644,
             .dir => linux.S.IFDIR | 0o755,
         };
-        op.buf.size = 0;
+        op.buf.size = if (kind == .file)
+            @intCast(if (self.path_file_state.getPtr(path)) |sf| sf.visibleLen() else 0)
+        else
+            0;
         return self.schedule(c, .{ .statx = {} }, 0);
     }
 
@@ -1891,6 +2010,7 @@ fn cancelResultFor(op: Operation) Result {
         .read => .{ .read = error.OperationCanceled },
         .write => .{ .write = error.OperationCanceled },
         .fsync => .{ .fsync = error.OperationCanceled },
+        .close => .{ .close = error.OperationCanceled },
         .fallocate => .{ .fallocate = error.OperationCanceled },
         .truncate => .{ .truncate = error.OperationCanceled },
         .openat => .{ .openat = error.OperationCanceled },
@@ -1926,6 +2046,7 @@ fn buggifyResultFor(op: Operation) Result {
         .read => .{ .read = error.InputOutput },
         .write => .{ .write = error.NoSpaceLeft },
         .fsync => .{ .fsync = error.InputOutput },
+        .close => .{ .close = error.InputOutput },
         .fallocate => .{ .fallocate = error.NoSpaceLeft },
         .truncate => .{ .truncate = error.InputOutput },
         .openat => .{ .openat = error.InputOutput },

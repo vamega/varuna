@@ -33,21 +33,22 @@ const CallbackAction = ifc.CallbackAction;
 fn requireBackendMethods(comptime IO: type) void {
     comptime {
         const required = [_][]const u8{
-            "init",            "deinit",
-            "tick",            "closeSocket",
-            "recv",            "send",
-            "recvmsg",         "sendmsg",
-            "read",            "write",
-            "fsync",           "fallocate",
-            "truncate",        "openat",
-            "mkdirat",         "renameat",
-            "unlinkat",        "statx",
-            "getdents",        "splice",
-            "copy_file_range", "socket",
-            "connect",         "accept",
-            "bind",            "listen",
-            "setsockopt",      "timeout",
-            "poll",            "cancel",
+            "init",     "deinit",
+            "tick",     "closeSocket",
+            "recv",     "send",
+            "recvmsg",  "sendmsg",
+            "read",     "write",
+            "fsync",    "fallocate",
+            "truncate", "close",
+            "openat",   "mkdirat",
+            "renameat", "unlinkat",
+            "statx",    "getdents",
+            "splice",   "copy_file_range",
+            "socket",   "connect",
+            "accept",   "bind",
+            "listen",   "setsockopt",
+            "timeout",  "poll",
+            "cancel",
         };
         for (required) |name| {
             if (!@hasDecl(IO, name)) {
@@ -159,7 +160,15 @@ fn runDirectoryOpsRoundTrip(
             .openat => |r| try r,
             else => return error.UnexpectedResult,
         };
-        io.closeSocket(fd);
+        var close_c = Completion{};
+        var close_counter = Counter{};
+        try io.close(.{ .fd = fd }, &close_c, &close_counter, counterCallback);
+        if (close_counter.fires == 0) try drain_fn(io);
+        try testing.expectEqual(@as(u32, 1), close_counter.fires);
+        switch (close_counter.last_result.?) {
+            .close => |r| try r,
+            else => try testing.expect(false),
+        }
     }
 
     {
@@ -232,7 +241,15 @@ fn runDirectoryOpsRoundTrip(
             .openat => |r| try r,
             else => return error.UnexpectedResult,
         };
-        io.closeSocket(fd);
+        var close_c = Completion{};
+        var close_counter = Counter{};
+        try io.close(.{ .fd = fd }, &close_c, &close_counter, counterCallback);
+        if (close_counter.fires == 0) try drain_fn(io);
+        try testing.expectEqual(@as(u32, 1), close_counter.fires);
+        switch (close_counter.last_result.?) {
+            .close => |r| try r,
+            else => try testing.expect(false),
+        }
     }
 
     {
@@ -255,7 +272,6 @@ fn runDirectoryOpsRoundTrip(
             .openat => |r| try r,
             else => return error.UnexpectedResult,
         };
-        defer io.closeSocket(dir_fd);
 
         var dir_buf: [512]u8 align(@alignOf(linux.dirent64)) = undefined;
         var dents = Completion{};
@@ -292,6 +308,16 @@ fn runDirectoryOpsRoundTrip(
             else => return error.UnexpectedResult,
         };
         try testing.expectEqual(@as(usize, 0), eof_bytes);
+
+        var close_c = Completion{};
+        var close_counter = Counter{};
+        try io.close(.{ .fd = dir_fd }, &close_c, &close_counter, counterCallback);
+        if (close_counter.fires == 0) try drain_fn(io);
+        try testing.expectEqual(@as(u32, 1), close_counter.fires);
+        switch (close_counter.last_result.?) {
+            .close => |r| try r,
+            else => try testing.expect(false),
+        }
     }
 
     {

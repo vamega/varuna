@@ -624,6 +624,7 @@ pub const EpollPosixIO = struct {
             .read => |op| try self.read(op, c, userdata, callback),
             .write => |op| try self.write(op, c, userdata, callback),
             .fsync => |op| try self.fsync(op, c, userdata, callback),
+            .close => |op| try self.close(op, c, userdata, callback),
             .fallocate => |op| try self.fallocate(op, c, userdata, callback),
             .truncate => |op| try self.truncate(op, c, userdata, callback),
             .openat => |op| try self.openat(op, c, userdata, callback),
@@ -1055,6 +1056,11 @@ pub const EpollPosixIO = struct {
         try self.submitFileOp(.{ .fsync = op }, c);
     }
 
+    pub fn close(self: *EpollPosixIO, op: ifc.CloseOp, c: *Completion, ud: ?*anyopaque, cb: Callback) !void {
+        try self.armCompletion(c, .{ .close = op }, ud, cb);
+        try self.submitFileOp(.{ .close = op }, c);
+    }
+
     pub fn fallocate(self: *EpollPosixIO, op: ifc.FallocateOp, c: *Completion, ud: ?*anyopaque, cb: Callback) !void {
         try self.armCompletion(c, .{ .fallocate = op }, ud, cb);
         try self.submitFileOp(.{ .fallocate = op }, c);
@@ -1296,6 +1302,7 @@ fn makeCancelledResult(op: Operation) Result {
         .read => .{ .read = error.OperationCanceled },
         .write => .{ .write = error.OperationCanceled },
         .fsync => .{ .fsync = error.OperationCanceled },
+        .close => .{ .close = error.OperationCanceled },
         .fallocate => .{ .fallocate = error.OperationCanceled },
         .truncate => .{ .truncate = error.OperationCanceled },
         .openat => .{ .openat = error.OperationCanceled },

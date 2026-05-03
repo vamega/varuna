@@ -164,6 +164,7 @@ pub const FeatureSupport = struct {
     /// Directory/file namespace ops used by future EL-driven MoveJob and
     /// PieceStore.init rewrites. All four have synchronous fallbacks so
     /// older/backported kernels remain supported.
+    supports_close: bool = false,
     supports_openat: bool = false,
     supports_mkdirat: bool = false,
     supports_renameat: bool = false,
@@ -194,6 +195,7 @@ pub fn probeFeatures(ring: *linux.IoUring) FeatureSupport {
         // URING_CMD itself is a *necessary* condition only — see
         // FeatureSupport.supports_setsockopt for the caveat.
         .supports_setsockopt = p.is_supported(.URING_CMD),
+        .supports_close = p.is_supported(.CLOSE),
         .supports_openat = p.is_supported(.OPENAT),
         .supports_mkdirat = p.is_supported(.MKDIRAT),
         .supports_renameat = p.is_supported(.RENAMEAT),
@@ -230,6 +232,7 @@ test "probeFeatures FeatureSupport.none has every flag false" {
     try std.testing.expectEqual(false, none.supports_bind);
     try std.testing.expectEqual(false, none.supports_listen);
     try std.testing.expectEqual(false, none.supports_setsockopt);
+    try std.testing.expectEqual(false, none.supports_close);
     try std.testing.expectEqual(false, none.supports_openat);
     try std.testing.expectEqual(false, none.supports_mkdirat);
     try std.testing.expectEqual(false, none.supports_renameat);

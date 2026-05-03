@@ -81,6 +81,7 @@ pub const FileOp = union(enum) {
     read: ifc.ReadOp,
     write: ifc.WriteOp,
     fsync: ifc.FsyncOp,
+    close: ifc.CloseOp,
     fallocate: ifc.FallocateOp,
     truncate: ifc.TruncateOp,
     splice: ifc.SpliceOp,
@@ -359,6 +360,7 @@ fn executeOp(op: FileOp) Result {
         .read => |p| .{ .read = executeRead(p) },
         .write => |p| .{ .write = executeWrite(p) },
         .fsync => |p| .{ .fsync = executeFsync(p) },
+        .close => |p| .{ .close = executeClose(p) },
         .fallocate => |p| .{ .fallocate = executeFallocate(p) },
         .truncate => |p| .{ .truncate = executeTruncate(p) },
         .splice => |p| .{ .splice = executeSplice(p) },
@@ -392,6 +394,10 @@ fn executeFsync(op: ifc.FsyncOp) anyerror!void {
     // `op.datasync` is best-effort; on platforms without a separate
     // datasync we degrade to fsync.
     return posix.fsync(op.fd);
+}
+
+fn executeClose(op: ifc.CloseOp) anyerror!void {
+    posix.close(op.fd);
 }
 
 fn executeFallocate(op: ifc.FallocateOp) anyerror!void {
@@ -530,6 +536,7 @@ fn makeCancelledResult(op: FileOp) Result {
         .read => .{ .read = error.OperationCanceled },
         .write => .{ .write = error.OperationCanceled },
         .fsync => .{ .fsync = error.OperationCanceled },
+        .close => .{ .close = error.OperationCanceled },
         .fallocate => .{ .fallocate = error.OperationCanceled },
         .truncate => .{ .truncate = error.OperationCanceled },
         .splice => .{ .splice = error.OperationCanceled },

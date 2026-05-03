@@ -41,6 +41,14 @@
 //! same-FS rename path sets both to the same value at completion (the
 //! "we moved zero bytes through userspace, but conceptually all of it
 //! moved" interpretation). Files-counter analogous.
+//!
+//! ## Scheduling policy
+//!
+//! `SessionManager.tickMoveJobs` gives each active event-loop job one
+//! `tickOnEventLoop` call per daemon loop pass. A job tick consumes at
+//! most one completed IO result and submits at most one follow-up IO op;
+//! it never drains a full copy by itself. This keeps concurrent moves
+//! fair without adding a global relocation scheduler yet.
 
 const std = @import("std");
 const builtin = @import("builtin");
@@ -336,13 +344,13 @@ pub const MoveJob = struct {
     pub fn tickOnEventLoop(self: *MoveJob, io: anytype) void {
         if (self.runner != .event_loop) return;
         if (self.progress().state != .running) return;
-        self.tickOnEventLoopInternal(io) catch |err| self.failEventLoop(err);
+        self.tickOnEventLoopInternal(io) catch |err| self.failEventLoop(io, err);
     }
 
     fn tickOnEventLoopInternal(self: *MoveJob, io: anytype) !void {
         if (self.io_result) |result| {
             self.io_result = null;
-            try self.handleEventLoopResult(result);
+            try self.handleEventLoopResult(io, result);
         }
         if (self.progress().state != .running or self.io_pending) return;
 
@@ -413,7 +421,7 @@ pub const MoveJob = struct {
         self.event_stage = .mkdir_next;
     }
 
-    fn handleEventLoopResult(self: *MoveJob, result: ifc.Result) !void {
+    fn handleEventLoopResult(self: *MoveJob, io: anytype, result: ifc.Result) !void {
         switch (self.event_stage) {
             .mkdir_next => {
                 switch (result) {
@@ -477,7 +485,7 @@ pub const MoveJob = struct {
                     .fsync => |r| try r,
                     else => return error.UnexpectedMoveJobCompletion,
                 }
-                self.closeOpenFileFds();
+                self.closeOpenFileFds(io);
                 self.event_stage = .unlink_src_file;
             },
             .unlink_src_file => {
@@ -503,7 +511,7 @@ pub const MoveJob = struct {
                     .fsync => |r| try r,
                     else => return error.UnexpectedMoveJobCompletion,
                 }
-                self.closeOpenDirFd();
+                self.closeOpenDirFd(io);
                 switch (self.pending_dir_sync) {
                     .dst_parent => {
                         self.pending_dir_sync = .src_parent;
@@ -575,7 +583,7 @@ pub const MoveJob = struct {
 
     fn submitCopyFileRange(self: *MoveJob, io: anytype) !void {
         if (self.cancel_requested.load(.acquire)) {
-            self.closeOpenFileFds();
+            self.closeOpenFileFds(io);
             self.completeEventLoop(.canceled);
             return;
         }
@@ -663,40 +671,41 @@ pub const MoveJob = struct {
     }
 
     fn completeEventLoop(self: *MoveJob, terminal: State) void {
-        self.closeOpenFileFds();
-        self.closeOpenDirFd();
         self.freeEventLoopFileState();
         self.event_stage = .done;
         self.state_atomic.store(@intFromEnum(terminal), .release);
         if (self.completion_cb) |cb| cb(self.completion_ctx, self.id, terminal);
     }
 
-    fn failEventLoop(self: *MoveJob, err: anyerror) void {
+    fn failEventLoop(self: *MoveJob, io: anytype, err: anyerror) void {
         self.recordError(err);
+        self.closeOpenFileFds(io);
+        self.closeOpenDirFd(io);
         self.completeEventLoop(.failed);
     }
 
-    fn closeOpenFileFds(self: *MoveJob) void {
+    fn closeOpenFileFds(self: *MoveJob, io: anytype) void {
         if (self.src_fd >= 0) {
-            posix.close(self.src_fd);
+            io.closeSocket(self.src_fd);
             self.src_fd = -1;
         }
         if (self.dst_fd >= 0) {
-            posix.close(self.dst_fd);
+            io.closeSocket(self.dst_fd);
             self.dst_fd = -1;
         }
     }
 
-    fn closeOpenDirFd(self: *MoveJob) void {
+    fn closeOpenDirFd(self: *MoveJob, io: anytype) void {
         if (self.dir_fd >= 0) {
-            posix.close(self.dir_fd);
+            io.closeSocket(self.dir_fd);
             self.dir_fd = -1;
         }
     }
 
     fn freeEventLoopFileState(self: *MoveJob) void {
-        self.closeOpenFileFds();
-        self.closeOpenDirFd();
+        assert(self.src_fd < 0);
+        assert(self.dst_fd < 0);
+        assert(self.dir_fd < 0);
         for (self.mkdir_paths) |path| self.allocator.free(path);
         if (self.mkdir_paths.len > 0) self.allocator.free(self.mkdir_paths);
         self.mkdir_paths = &.{};
@@ -1101,6 +1110,10 @@ fn copyChunk(src_fd: posix.fd_t, in_off: u64, dst_fd: posix.fd_t, out_off: u64, 
 
 const testing = std.testing;
 const RealIO = @import("../io/real_io.zig").RealIO;
+const SimIO = @import("../io/sim_io.zig").SimIO;
+const Completion = ifc.Completion;
+const Result = ifc.Result;
+const CallbackAction = ifc.CallbackAction;
 
 fn expectEventuallyState(job: *MoveJob, want: State, timeout_ms: u32) !void {
     var elapsed: u32 = 0;
@@ -1124,6 +1137,155 @@ fn expectEventLoopEventuallyState(job: *MoveJob, io: *RealIO, want: State, timeo
     }
     return error.TimedOutWaitingForJobState;
 }
+
+fn expectSimEventLoopEventuallyState(job: *MoveJob, io: *SimIO, want: State, max_ticks: u32) !void {
+    var ticks: u32 = 0;
+    while (ticks < max_ticks) : (ticks += 1) {
+        job.tickOnEventLoop(io);
+        if (job.progress().state == want) return;
+        try io.tick(0);
+    }
+    return error.TimedOutWaitingForJobState;
+}
+
+const SimCtx = struct {
+    calls: u32 = 0,
+    result: ?Result = null,
+};
+
+fn simCallback(userdata: ?*anyopaque, _: *Completion, result: Result) CallbackAction {
+    const ctx: *SimCtx = @ptrCast(@alignCast(userdata.?));
+    ctx.calls += 1;
+    ctx.result = result;
+    return .disarm;
+}
+
+fn simMkdir(io: *SimIO, path: [:0]const u8) !void {
+    var c = Completion{};
+    var ctx = SimCtx{};
+    try io.mkdirat(.{ .dir_fd = MoveJob.at_fdcwd, .path = path, .mode = 0o755 }, &c, &ctx, simCallback);
+    try io.tick(0);
+    try testing.expectEqual(@as(u32, 1), ctx.calls);
+    return switch (ctx.result.?) {
+        .mkdirat => |r| try r,
+        else => error.UnexpectedMoveJobCompletion,
+    };
+}
+
+fn simOpen(io: *SimIO, path: [:0]const u8, flags: posix.O, mode: posix.mode_t) !posix.fd_t {
+    var c = Completion{};
+    var ctx = SimCtx{};
+    try io.openat(.{ .dir_fd = MoveJob.at_fdcwd, .path = path, .flags = flags, .mode = mode }, &c, &ctx, simCallback);
+    try io.tick(0);
+    try testing.expectEqual(@as(u32, 1), ctx.calls);
+    return switch (ctx.result.?) {
+        .openat => |r| try r,
+        else => error.UnexpectedMoveJobCompletion,
+    };
+}
+
+fn simWrite(io: *SimIO, fd: posix.fd_t, offset: u64, bytes: []const u8) !void {
+    var c = Completion{};
+    var ctx = SimCtx{};
+    try io.write(.{ .fd = fd, .buf = bytes, .offset = offset }, &c, &ctx, simCallback);
+    try io.tick(0);
+    try testing.expectEqual(@as(u32, 1), ctx.calls);
+    switch (ctx.result.?) {
+        .write => |r| try testing.expectEqual(bytes.len, try r),
+        else => return error.UnexpectedMoveJobCompletion,
+    }
+}
+
+fn simRead(io: *SimIO, fd: posix.fd_t, offset: u64, buf: []u8) !usize {
+    var c = Completion{};
+    var ctx = SimCtx{};
+    try io.read(.{ .fd = fd, .buf = buf, .offset = offset }, &c, &ctx, simCallback);
+    try io.tick(0);
+    try testing.expectEqual(@as(u32, 1), ctx.calls);
+    return switch (ctx.result.?) {
+        .read => |r| try r,
+        else => error.UnexpectedMoveJobCompletion,
+    };
+}
+
+fn simFsync(io: *SimIO, fd: posix.fd_t) !void {
+    var c = Completion{};
+    var ctx = SimCtx{};
+    try io.fsync(.{ .fd = fd, .datasync = false }, &c, &ctx, simCallback);
+    try io.tick(0);
+    try testing.expectEqual(@as(u32, 1), ctx.calls);
+    return switch (ctx.result.?) {
+        .fsync => |r| try r,
+        else => error.UnexpectedMoveJobCompletion,
+    };
+}
+
+fn simClose(io: *SimIO, fd: posix.fd_t) !void {
+    var c = Completion{};
+    var ctx = SimCtx{};
+    try io.close(.{ .fd = fd }, &c, &ctx, simCallback);
+    try io.tick(0);
+    try testing.expectEqual(@as(u32, 1), ctx.calls);
+    return switch (ctx.result.?) {
+        .close => |r| try r,
+        else => error.UnexpectedMoveJobCompletion,
+    };
+}
+
+fn simSeedFile(io: *SimIO, path: [:0]const u8, bytes: []const u8) !void {
+    const fd = try simOpen(io, path, .{ .ACCMODE = .WRONLY, .CREAT = true, .TRUNC = true }, 0o644);
+    try simWrite(io, fd, 0, bytes);
+    try simFsync(io, fd);
+    try simClose(io, fd);
+}
+
+fn simReadPath(io: *SimIO, path: [:0]const u8, buf: []u8) !usize {
+    const fd = try simOpen(io, path, .{ .ACCMODE = .RDONLY }, 0);
+    const n = try simRead(io, fd, 0, buf);
+    try simClose(io, fd);
+    return n;
+}
+
+const CountingIO = struct {
+    submitted: u32 = 0,
+    mkdirat_submitted: u32 = 0,
+
+    fn arm(self: *CountingIO, c: *Completion, op: ifc.Operation, ud: ?*anyopaque, cb: ifc.Callback) !void {
+        self.submitted += 1;
+        c.arm(op, ud, cb);
+    }
+
+    pub fn mkdirat(self: *CountingIO, op: ifc.MkdirAtOp, c: *Completion, ud: ?*anyopaque, cb: ifc.Callback) !void {
+        self.mkdirat_submitted += 1;
+        try self.arm(c, .{ .mkdirat = op }, ud, cb);
+    }
+
+    pub fn renameat(self: *CountingIO, op: ifc.RenameAtOp, c: *Completion, ud: ?*anyopaque, cb: ifc.Callback) !void {
+        try self.arm(c, .{ .renameat = op }, ud, cb);
+    }
+
+    pub fn openat(self: *CountingIO, op: ifc.OpenAtOp, c: *Completion, ud: ?*anyopaque, cb: ifc.Callback) !void {
+        try self.arm(c, .{ .openat = op }, ud, cb);
+    }
+
+    pub fn copy_file_range(self: *CountingIO, op: ifc.CopyFileRangeOp, c: *Completion, ud: ?*anyopaque, cb: ifc.Callback) !void {
+        try self.arm(c, .{ .copy_file_range = op }, ud, cb);
+    }
+
+    pub fn fsync(self: *CountingIO, op: ifc.FsyncOp, c: *Completion, ud: ?*anyopaque, cb: ifc.Callback) !void {
+        try self.arm(c, .{ .fsync = op }, ud, cb);
+    }
+
+    pub fn unlinkat(self: *CountingIO, op: ifc.UnlinkAtOp, c: *Completion, ud: ?*anyopaque, cb: ifc.Callback) !void {
+        try self.arm(c, .{ .unlinkat = op }, ud, cb);
+    }
+
+    pub fn close(self: *CountingIO, op: ifc.CloseOp, c: *Completion, ud: ?*anyopaque, cb: ifc.Callback) !void {
+        try self.arm(c, .{ .close = op }, ud, cb);
+    }
+
+    pub fn closeSocket(_: *CountingIO, _: posix.fd_t) void {}
+};
 
 test "MoveJob: same-fs rename moves a single file" {
     var tmp = std.testing.tmpDir(.{});
@@ -1524,4 +1686,92 @@ test "MoveJob: event-loop manifest move relocates one file without sibling damag
     try testing.expectEqualStrings("keep", sibling_buf[0..sibling_n]);
 
     try testing.expectError(error.FileNotFound, tmp.dir.openFile("src/torrent/sub/piece.bin", .{}));
+}
+
+test "MoveJob: event-loop EXDEV fallback copies bytes and fsyncs destination in SimIO" {
+    var io = try SimIO.init(testing.allocator, .{
+        .faults = .{ .renameat_exdev_probability = 1.0 },
+    });
+    defer io.deinit();
+
+    try simMkdir(&io, "/src");
+    try simMkdir(&io, "/src/torrent");
+    try simSeedFile(&io, "/src/torrent/piece.bin", "payload");
+
+    var files = [_]MoveJob.File{.{
+        .relative_path = "torrent/piece.bin",
+        .length = 7,
+    }};
+    var job = try MoveJob.createForFiles(testing.allocator, 10, "/src", "/dst", &files);
+    defer job.destroy();
+
+    try job.startOnEventLoop(null, null);
+    try expectSimEventLoopEventuallyState(job, &io, .succeeded, 200);
+
+    const p = job.progress();
+    try testing.expectEqual(State.succeeded, p.state);
+    try testing.expectEqual(@as(u64, 7), p.bytes_copied);
+    try testing.expectEqual(@as(u32, 1), p.files_done);
+    try testing.expect(!p.used_rename);
+
+    io.crash();
+
+    var dst_buf: [16]u8 = undefined;
+    const dst_n = try simReadPath(&io, "/dst/torrent/piece.bin", &dst_buf);
+    try testing.expectEqualStrings("payload", dst_buf[0..dst_n]);
+    try testing.expectError(error.FileNotFound, simOpen(&io, "/src/torrent/piece.bin", .{ .ACCMODE = .RDONLY }, 0));
+}
+
+test "MoveJob: event-loop copy fallback keeps source when destination fsync fails" {
+    var io = try SimIO.init(testing.allocator, .{
+        .faults = .{ .renameat_exdev_probability = 1.0 },
+    });
+    defer io.deinit();
+
+    try simMkdir(&io, "/src");
+    try simMkdir(&io, "/src/torrent");
+    try simSeedFile(&io, "/src/torrent/piece.bin", "payload");
+    io.config.faults.fsync_error_probability = 1.0;
+
+    var files = [_]MoveJob.File{.{
+        .relative_path = "torrent/piece.bin",
+        .length = 7,
+    }};
+    var job = try MoveJob.createForFiles(testing.allocator, 11, "/src", "/dst", &files);
+    defer job.destroy();
+
+    try job.startOnEventLoop(null, null);
+    try expectSimEventLoopEventuallyState(job, &io, .failed, 200);
+
+    const p = job.progress();
+    try testing.expectEqual(State.failed, p.state);
+    try testing.expectEqual(@as(u32, 0), p.files_done);
+
+    var src_buf: [16]u8 = undefined;
+    const src_n = try simReadPath(&io, "/src/torrent/piece.bin", &src_buf);
+    try testing.expectEqualStrings("payload", src_buf[0..src_n]);
+}
+
+test "MoveJob: scheduler policy submits one operation per active job tick" {
+    var files_a = [_]MoveJob.File{.{ .relative_path = "a.bin", .length = 1 }};
+    var files_b = [_]MoveJob.File{.{ .relative_path = "b.bin", .length = 1 }};
+
+    var job_a = try MoveJob.createForFiles(testing.allocator, 12, "/src-a", "/dst-a", &files_a);
+    defer job_a.destroy();
+    var job_b = try MoveJob.createForFiles(testing.allocator, 13, "/src-b", "/dst-b", &files_b);
+    defer job_b.destroy();
+
+    try job_a.startOnEventLoop(null, null);
+    try job_b.startOnEventLoop(null, null);
+
+    var io = CountingIO{};
+    job_a.tickOnEventLoop(&io);
+    job_b.tickOnEventLoop(&io);
+
+    try testing.expectEqual(@as(u32, 2), io.submitted);
+    try testing.expectEqual(@as(u32, 2), io.mkdirat_submitted);
+
+    job_a.tickOnEventLoop(&io);
+    job_b.tickOnEventLoop(&io);
+    try testing.expectEqual(@as(u32, 2), io.submitted);
 }

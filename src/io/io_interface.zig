@@ -77,6 +77,7 @@ pub const Operation = union(enum) {
     read: ReadOp,
     write: WriteOp,
     fsync: FsyncOp,
+    close: CloseOp,
     fallocate: FallocateOp,
     truncate: TruncateOp,
     openat: OpenAtOp,
@@ -144,6 +145,13 @@ pub const FsyncOp = struct {
     fd: posix.fd_t,
     /// Mirrors IORING_FSYNC_DATASYNC. When set, sync data only (skip metadata).
     datasync: bool = true,
+};
+
+/// `close(2)` for fds returned by contract operations such as `openat`.
+/// There is no Linux `closeat(2)` syscall: fd-relative lifecycle is modeled
+/// by closing the fd produced by the earlier `openat` operation.
+pub const CloseOp = struct {
+    fd: posix.fd_t,
 };
 
 pub const FallocateOp = struct {
@@ -367,6 +375,7 @@ pub const Result = union(enum) {
     read: anyerror!usize,
     write: anyerror!usize,
     fsync: anyerror!void,
+    close: anyerror!void,
     fallocate: anyerror!void,
     truncate: anyerror!void,
     openat: anyerror!posix.fd_t,
@@ -581,6 +590,7 @@ comptime {
 //   pub fn read     (self: *@This(), op: ReadOp,     c: *Completion, ud: ?*anyopaque, cb: Callback) !void;
 //   pub fn write    (self: *@This(), op: WriteOp,    c: *Completion, ud: ?*anyopaque, cb: Callback) !void;
 //   pub fn fsync    (self: *@This(), op: FsyncOp,    c: *Completion, ud: ?*anyopaque, cb: Callback) !void;
+//   pub fn close    (self: *@This(), op: CloseOp,    c: *Completion, ud: ?*anyopaque, cb: Callback) !void;
 //   pub fn fallocate(self: *@This(), op: FallocateOp, c: *Completion, ud: ?*anyopaque, cb: Callback) !void;
 //   pub fn truncate (self: *@This(), op: TruncateOp, c: *Completion, ud: ?*anyopaque, cb: Callback) !void;
 //   pub fn openat   (self: *@This(), op: OpenAtOp,   c: *Completion, ud: ?*anyopaque, cb: Callback) !void;

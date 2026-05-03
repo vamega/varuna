@@ -177,6 +177,7 @@ pub const RealIO = struct {
             .read => |op| try self.read(op, c, userdata, callback),
             .write => |op| try self.write(op, c, userdata, callback),
             .fsync => |op| try self.fsync(op, c, userdata, callback),
+            .close => |op| try self.close(op, c, userdata, callback),
             .fallocate => |op| try self.fallocate(op, c, userdata, callback),
             .truncate => |op| try self.truncate(op, c, userdata, callback),
             .openat => |op| try self.openat(op, c, userdata, callback),
@@ -242,6 +243,30 @@ pub const RealIO = struct {
         const flags: u32 = if (op.datasync) linux.IORING_FSYNC_DATASYNC else 0;
         const sqe = try self.ring.fsync(@intFromPtr(c), op.fd, flags);
         _ = sqe;
+    }
+
+    pub fn close(self: *RealIO, op_in: ifc.CloseOp, c: *Completion, ud: ?*anyopaque, cb: Callback) !void {
+        if (self.feature_support.supports_close) {
+            try self.armCompletion(c, .{ .close = op_in }, ud, cb);
+            const sqe = try self.ring.close(@intFromPtr(c), op_in.fd);
+            _ = sqe;
+            return;
+        }
+
+        var op = op_in;
+        while (true) {
+            try self.armCompletion(c, .{ .close = op }, ud, cb);
+            const result: Result = .{ .close = closeFdResult(op.fd) };
+            realState(c).in_flight = false;
+            const action = cb(ud, c, result);
+            switch (action) {
+                .disarm => return,
+                .rearm => switch (c.op) {
+                    .close => |new_op| op = new_op,
+                    else => return,
+                },
+            }
+        }
     }
 
     /// `IORING_OP_FALLOCATE` (kernel ≥5.6). The CQE delivers `0` on
@@ -799,6 +824,7 @@ fn buildResult(op: Operation, cqe: linux.io_uring_cqe) Result {
         .read => .{ .read = countOrError(cqe) },
         .write => .{ .write = countOrError(cqe) },
         .fsync => .{ .fsync = voidOrError(cqe) },
+        .close => .{ .close = voidOrError(cqe) },
         .fallocate => .{ .fallocate = voidOrError(cqe) },
         // On kernels with `IORING_OP_FTRUNCATE` support
         // (`feature_support.supports_ftruncate == true`), truncate flows
@@ -884,6 +910,14 @@ fn cancelResult(cqe: linux.io_uring_cqe) anyerror!void {
         .NOENT => error.OperationNotFound,
         .ALREADY => error.AlreadyCompleted,
         else => |e| posix.unexpectedErrno(e),
+    };
+}
+
+fn closeFdResult(fd: posix.fd_t) anyerror!void {
+    const rc = linux.close(fd);
+    return switch (linux.E.init(rc)) {
+        .SUCCESS => {},
+        else => |e| errnoToError(e),
     };
 }
 

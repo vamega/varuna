@@ -542,6 +542,7 @@ pub const KqueuePosixIO = struct {
             .read => |op| try self.read(op, c, ud, cb),
             .write => |op| try self.write(op, c, ud, cb),
             .fsync => |op| try self.fsync(op, c, ud, cb),
+            .close => |op| try self.close(op, c, ud, cb),
             .fallocate => |op| try self.fallocate(op, c, ud, cb),
             .truncate => |op| try self.truncate(op, c, ud, cb),
             .openat => |op| try self.openat(op, c, ud, cb),
@@ -1117,6 +1118,11 @@ pub const KqueuePosixIO = struct {
         try self.submitFileOp(.{ .fsync = op }, c);
     }
 
+    pub fn close(self: *KqueuePosixIO, op: ifc.CloseOp, c: *Completion, ud: ?*anyopaque, cb: Callback) !void {
+        try self.armCompletion(c, .{ .close = op }, ud, cb);
+        try self.submitFileOp(.{ .close = op }, c);
+    }
+
     pub fn fallocate(self: *KqueuePosixIO, op: ifc.FallocateOp, c: *Completion, ud: ?*anyopaque, cb: Callback) !void {
         try self.armCompletion(c, .{ .fallocate = op }, ud, cb);
         try self.submitFileOp(.{ .fallocate = op }, c);
@@ -1186,6 +1192,7 @@ fn makeCancelledResult(op: Operation) Result {
         .read => .{ .read = error.OperationCanceled },
         .write => .{ .write = error.OperationCanceled },
         .fsync => .{ .fsync = error.OperationCanceled },
+        .close => .{ .close = error.OperationCanceled },
         .fallocate => .{ .fallocate = error.OperationCanceled },
         .truncate => .{ .truncate = error.OperationCanceled },
         .openat => .{ .openat = error.OperationCanceled },

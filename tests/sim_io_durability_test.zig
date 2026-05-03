@@ -96,6 +96,18 @@ fn fsyncSync(io: *SimIO, fd: posix.fd_t) !void {
     };
 }
 
+fn closeSync(io: *SimIO, fd: posix.fd_t) !void {
+    var c = Completion{};
+    var ctx = TestCtx{};
+    try io.close(.{ .fd = fd }, &c, &ctx, testCallback);
+    try io.tick(0);
+    try testing.expectEqual(@as(u32, 1), ctx.calls);
+    return switch (ctx.last_result.?) {
+        .close => |r| try r,
+        else => unreachable,
+    };
+}
+
 fn truncateSync(io: *SimIO, fd: posix.fd_t, length: u64) !void {
     var c = Completion{};
     var ctx = TestCtx{};
@@ -613,4 +625,69 @@ test "SimIO durability: unsupported fallocate range-edit modes are rejected" {
     const n = try readSync(&io, fd, 0, &buf);
     try testing.expectEqual(@as(usize, 8), n);
     try testing.expectEqualSlices(u8, "ABCDEFGH", &buf);
+}
+
+test "SimIO durability: close releases an openat fd without dropping durable path bytes" {
+    var io = try SimIO.init(testing.allocator, .{});
+    defer io.deinit();
+
+    var mkdir_c = Completion{};
+    var mkdir_ctx = TestCtx{};
+    try io.mkdirat(.{ .dir_fd = posix.AT.FDCWD, .path = "/tmp", .mode = 0o755 }, &mkdir_c, &mkdir_ctx, testCallback);
+    try io.tick(0);
+    switch (mkdir_ctx.last_result.?) {
+        .mkdirat => |r| try r,
+        else => unreachable,
+    }
+
+    var open_c = Completion{};
+    var open_ctx = TestCtx{};
+    try io.openat(
+        .{
+            .dir_fd = posix.AT.FDCWD,
+            .path = "/tmp/file.bin",
+            .flags = .{ .ACCMODE = .WRONLY, .CREAT = true, .TRUNC = true },
+            .mode = 0o644,
+        },
+        &open_c,
+        &open_ctx,
+        testCallback,
+    );
+    try io.tick(0);
+    const first_fd = switch (open_ctx.last_result.?) {
+        .openat => |r| try r,
+        else => unreachable,
+    };
+
+    try writeSync(&io, first_fd, 0, "persist");
+    try fsyncSync(&io, first_fd);
+    try closeSync(&io, first_fd);
+
+    var closed_buf: [7]u8 = undefined;
+    try testing.expectError(error.BadFileDescriptor, readSync(&io, first_fd, 0, &closed_buf));
+
+    var reopen_c = Completion{};
+    var reopen_ctx = TestCtx{};
+    try io.openat(
+        .{
+            .dir_fd = posix.AT.FDCWD,
+            .path = "/tmp/file.bin",
+            .flags = .{ .ACCMODE = .RDONLY },
+            .mode = 0,
+        },
+        &reopen_c,
+        &reopen_ctx,
+        testCallback,
+    );
+    try io.tick(0);
+    const second_fd = switch (reopen_ctx.last_result.?) {
+        .openat => |r| try r,
+        else => unreachable,
+    };
+    defer closeSync(&io, second_fd) catch unreachable;
+
+    var buf: [7]u8 = undefined;
+    const n = try readSync(&io, second_fd, 0, &buf);
+    try testing.expectEqual(@as(usize, 7), n);
+    try testing.expectEqualSlices(u8, "persist", &buf);
 }

@@ -356,6 +356,7 @@ pub const KqueueMmapIO = struct {
             .read => |op| try self.read(op, c, ud, cb),
             .write => |op| try self.write(op, c, ud, cb),
             .fsync => |op| try self.fsync(op, c, ud, cb),
+            .close => |op| try self.close(op, c, ud, cb),
             .fallocate => |op| try self.fallocate(op, c, ud, cb),
             .truncate => |op| try self.truncate(op, c, ud, cb),
             .openat => |op| try self.openat(op, c, ud, cb),
@@ -981,6 +982,13 @@ pub const KqueueMmapIO = struct {
         self.pushCompleted(c, r);
     }
 
+    pub fn close(self: *KqueueMmapIO, op: ifc.CloseOp, c: *Completion, ud: ?*anyopaque, cb: Callback) !void {
+        try self.armCompletion(c, .{ .close = op }, ud, cb);
+        self.unmapFile(op.fd);
+        if (comptime is_kqueue_platform) posix.close(op.fd);
+        self.pushCompleted(c, .{ .close = {} });
+    }
+
     pub fn fallocate(self: *KqueueMmapIO, op: ifc.FallocateOp, c: *Completion, ud: ?*anyopaque, cb: Callback) !void {
         try self.armCompletion(c, .{ .fallocate = op }, ud, cb);
         const r: Result = blk: {
@@ -1108,6 +1116,7 @@ fn makeCancelledResult(op: Operation) Result {
         .read => .{ .read = error.OperationCanceled },
         .write => .{ .write = error.OperationCanceled },
         .fsync => .{ .fsync = error.OperationCanceled },
+        .close => .{ .close = error.OperationCanceled },
         .fallocate => .{ .fallocate = error.OperationCanceled },
         .truncate => .{ .truncate = error.OperationCanceled },
         .openat => .{ .openat = error.OperationCanceled },

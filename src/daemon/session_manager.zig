@@ -1160,6 +1160,12 @@ pub fn SessionManagerOf(comptime IO: type) type {
             self.mutex.lock();
             defer self.mutex.unlock();
             const el = self.shared_event_loop orelse return;
+
+            // Scheduling policy: every active MoveJob gets one state-machine
+            // tick per daemon loop pass. MoveJob itself limits a tick to at
+            // most one completed result and one newly-submitted IO op, so
+            // several moves make round-robin progress without a separate
+            // global relocation queue.
             var iter = self.move_jobs.iterator();
             while (iter.next()) |entry| {
                 entry.value_ptr.*.tickOnEventLoop(&el.io);
