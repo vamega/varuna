@@ -7,6 +7,7 @@
 /.tools/
 /vendor/sqlite/sqlite3.c
 /vendor/sqlite/sqlite3.h
+/lib/libsqlite3.so
 *.deb
 .claude/worktrees/
 .claude/ralph-loop.local.md

@@ -32,7 +32,6 @@ varuna-tools inspect file.torrent
 
 ### Known Limitations
 
-- **`scripts/demo_swarm.sh` baseline regression under `-Dio=io_uring`** (current main): two daemons connect and complete MSE + BEP-10 handshakes, but no BITFIELD/INTERESTED/UNCHOKE/PIECE messages follow and progress stays at 0.0. The in-process `transfer_integration_test` still passes, so the algorithm-layer wire-protocol logic in `src/io/peer_handler.zig` is intact; the failure is at the daemon-glue boundary across two real processes. Last verified passing at commit `3ab5f59` (2026-04-30). See `progress-reports/2026-04-30-backend-validation.md`.
 - **`network.bind_device` is silently bypassed by the default threadpool DNS backend**: peer connections, uTP/DHT, RPC, and tracker clients honor `bind_device`, but `getaddrinfo` owns its own UDP socket internally with no hook for `SO_BINDTODEVICE`. Workaround: build with `-Ddns=c_ares`, which applies `bind_device` for every socket the c-ares channel opens. Full fix queued behind the custom-DNS work in `docs/custom-dns-design-round2.md` §1.
 
 The living scope and architecture record lives in [DECISIONS.md](DECISIONS.md). Keep that file updated as constraints and design choices change.
@@ -42,11 +41,11 @@ Use [STATUS.md](STATUS.md) as the current ledger for what is already implemented
 
 ```bash
 zig build test                    # all unit tests
-./scripts/demo_swarm.sh           # e2e: seeder → downloader via tracker (TCP + uTP)
+zig build test-swarm              # e2e: seeder → downloader via tracker (TCP + uTP)
 ./scripts/test_web_seed.sh        # e2e: web seed download (3 scenarios, BEP 19)
 ```
 
-The demo swarm creates a torrent with `varuna-tools create`, starts opentracker with the info hash whitelisted, runs a seeder and downloader daemon, and verifies the downloaded payload.
+The swarm harness creates a torrent with `varuna-tools create`, starts opentracker with the info hash whitelisted, runs a seeder and downloader daemon, and verifies the downloaded payload.
 
 ## Project Direction
 Varuna is intended for local Linux storage only. SSDs, HDDs, mergerfs, ext4, xfs, btrfs, bcachefs, and zfs matter; network filesystems such as NFS and CIFS do not. The initial focus is private-tracker functionality and operational reliability, not broad feature coverage or plugin systems.
@@ -68,6 +67,16 @@ System packages (Ubuntu/Debian):
 ```bash
 sudo apt install libsqlite3-dev liburing-dev
 ```
+
+The build links system SQLite by default. With Nix, enter the dev shell; it
+provides SQLite, c-ares, and BoringSSL packages for system-link builds. Outside
+Nix, pass package prefixes explicitly when they are not on the default linker
+path, for example `zig build --search-prefix /path/to/sqlite-prefix`.
+
+HTTPS support defaults to vendored BoringSSL (`-Dtls=boringssl`). For faster
+clean rebuilds in environments that provide BoringSSL, use
+`-Dtls=system_boringssl` with matching `--search-prefix` values for the library
+and headers.
 
 Toolchain — Zig stable (`0.15.2` or the latest stable; never nightly), pinned via `mise`:
 

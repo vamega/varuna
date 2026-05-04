@@ -3,10 +3,12 @@ const std = @import("std");
 pub const Library = struct {
     lib: *std.Build.Step.Compile,
     include_path: std.Build.LazyPath,
+    generated_include_path: std.Build.LazyPath,
 
     pub fn link(self: *const @This(), mod: *std.Build.Module) void {
         mod.linkLibrary(self.lib);
         mod.addIncludePath(self.include_path);
+        mod.addIncludePath(self.generated_include_path);
     }
 };
 
@@ -173,5 +175,6 @@ pub fn create(
     return .{
         .lib = lib,
         .include_path = public_include,
+        .generated_include_path = generated_include,
     };
 }

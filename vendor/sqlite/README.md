@@ -1,6 +1,12 @@
-# SQLite Amalgamation
+# SQLite
 
-Place `sqlite3.c` and `sqlite3.h` here for bundled builds (`-Dsqlite=bundled`).
+Varuna defaults to `-Dsqlite=system`. Use the SQLite package from your distro,
+Nix dev shell, or an explicit Zig `--search-prefix`; do not check in a
+machine-specific `libsqlite3.so` symlink.
+
+The repository does not vendor SQLite by default. If a system SQLite is not
+available and you intentionally want a bundled build, place `sqlite3.c` and
+`sqlite3.h` here locally and build with `-Dsqlite=bundled`.
 
 Download from https://www.sqlite.org/download.html (look for "sqlite-amalgamation-*.zip").
 

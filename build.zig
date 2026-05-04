@@ -10,7 +10,7 @@ pub fn build(b: *std.Build) void {
     const sqlite_mode = b.option(
         enum { system, bundled },
         "sqlite",
-        "SQLite linking strategy: 'system' links libsqlite3, 'bundled' compiles the amalgamation from vendor/sqlite/",
+        "SQLite linking strategy: 'system' links libsqlite3 from the host/dev shell, 'bundled' compiles a local vendor/sqlite/sqlite3.c amalgamation if provided",
     ) orelse .system;
 
     const dns_backend = b.option(
@@ -62,7 +62,7 @@ pub fn build(b: *std.Build) void {
     const tls_backend = b.option(
         TlsBackend,
         "tls",
-        "TLS backend: 'boringssl' links vendored BoringSSL for HTTPS tracker support (default), 'none' disables TLS",
+        "TLS backend: 'boringssl' compiles vendored BoringSSL (default), 'system_boringssl' links libssl/libcrypto from the host/dev shell, 'none' disables TLS",
     ) orelse .boringssl;
 
     const crypto_backend = b.option(
@@ -71,9 +71,10 @@ pub fn build(b: *std.Build) void {
         "Cryptographic algorithm backend: 'varuna' uses our SHA-1 with hardware acceleration (default), 'stdlib' uses Zig std.crypto, 'boringssl' uses vendored BoringSSL",
     ) orelse .varuna;
 
-    // Validate: -Dcrypto=boringssl requires -Dtls=boringssl (BoringSSL must be linked)
-    if (crypto_backend == .boringssl and tls_backend != .boringssl) {
-        @panic("-Dcrypto=boringssl requires -Dtls=boringssl (BoringSSL is not linked when -Dtls=none)");
+    // Validate: -Dcrypto=boringssl requires a BoringSSL-backed TLS mode so
+    // the BoringSSL headers/libraries are available to src/crypto/boringssl.zig.
+    if (crypto_backend == .boringssl and !tls_backend.hasBoringSsl()) {
+        @panic("-Dcrypto=boringssl requires -Dtls=boringssl or -Dtls=system_boringssl");
     }
 
     // ── Build options module (dns backend + tls backend + crypto backend + io backend) ─
@@ -94,6 +95,7 @@ pub fn build(b: *std.Build) void {
         .root_source_file = b.path("src/root.zig"),
         .target = target,
         .link_libc = true,
+        .link_libcpp = tls_backend == .system_boringssl,
         .imports = &.{
             .{ .name = "toml", .module = toml_mod },
             .{ .name = "build_options", .module = build_options.createModule() },
@@ -102,10 +104,12 @@ pub fn build(b: *std.Build) void {
 
     switch (sqlite_mode) {
         .system => {
-            varuna_mod.addLibraryPath(b.path("lib"));
             varuna_mod.linkSystemLibrary("sqlite3", .{});
         },
         .bundled => {
+            std.fs.cwd().access("vendor/sqlite/sqlite3.c", .{}) catch {
+                @panic("-Dsqlite=bundled requires vendor/sqlite/sqlite3.c; the repository does not vendor SQLite by default. Install system SQLite or pass --search-prefix for your SQLite package.");
+            };
             varuna_mod.addCSourceFile(.{
                 .file = b.path("vendor/sqlite/sqlite3.c"),
                 .flags = &.{
@@ -132,23 +136,31 @@ pub fn build(b: *std.Build) void {
                 const cares_lib = cares.create(b, target, optimize);
                 varuna_mod.linkLibrary(cares_lib.lib);
                 varuna_mod.addIncludePath(cares_lib.include_path);
+                varuna_mod.addIncludePath(cares_lib.generated_include_path);
             },
         }
     }
 
-    // ── BoringSSL linking (when tls=boringssl) ──────────────
-    if (tls_backend == .boringssl) {
-        const boringssl_libs = boringssl.create(
-            b,
-            b.path("vendor/boringssl"),
-            target,
-            optimize,
-        );
-        // Link all three BoringSSL libraries into the varuna module
-        varuna_mod.linkLibrary(boringssl_libs.bcm);
-        varuna_mod.linkLibrary(boringssl_libs.crypto);
-        varuna_mod.linkLibrary(boringssl_libs.ssl);
-        varuna_mod.addIncludePath(boringssl_libs.include_path);
+    // ── BoringSSL linking ───────────────────────────────────
+    switch (tls_backend) {
+        .boringssl => {
+            const boringssl_libs = boringssl.create(
+                b,
+                b.path("vendor/boringssl"),
+                target,
+                optimize,
+            );
+            // Link all three BoringSSL libraries into the varuna module.
+            varuna_mod.linkLibrary(boringssl_libs.bcm);
+            varuna_mod.linkLibrary(boringssl_libs.crypto);
+            varuna_mod.linkLibrary(boringssl_libs.ssl);
+            varuna_mod.addIncludePath(boringssl_libs.include_path);
+        },
+        .system_boringssl => {
+            varuna_mod.linkSystemLibrary("ssl", .{});
+            varuna_mod.linkSystemLibrary("crypto", .{});
+        },
+        .none => {},
     }
 
     const varuna_import = [_]std.Build.Module.Import{
@@ -1591,8 +1603,17 @@ const DnsBackend = enum {
 pub const TlsBackend = enum {
     /// Vendored BoringSSL — enables HTTPS tracker support.
     boringssl,
+    /// Host/dev-shell BoringSSL — enables HTTPS without compiling vendored C/C++.
+    system_boringssl,
     /// No TLS — HTTPS tracker URLs will return error.HttpsNotSupported.
     none,
+
+    pub fn hasBoringSsl(self: TlsBackend) bool {
+        return switch (self) {
+            .boringssl, .system_boringssl => true,
+            .none => false,
+        };
+    }
 };
 
 /// IO backend selection.
@@ -1644,6 +1665,6 @@ pub const CryptoBackend = enum {
     /// RC4 falls back to our implementation (no stdlib RC4).
     stdlib,
     /// BoringSSL: SHA1_Init/SHA256_Init/RC4_set_key via @cImport.
-    /// Requires -Dtls=boringssl so BoringSSL is linked.
+    /// Requires a BoringSSL-backed TLS mode so BoringSSL is linked.
     boringssl,
 };

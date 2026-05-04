@@ -10,10 +10,16 @@ const log = std.log.scoped(.tls);
 /// - Outbound ciphertext is extracted from the write BIO and sent via io_uring send
 ///
 /// This keeps all network I/O on io_uring while BoringSSL handles crypto/protocol.
-pub const TlsStream = if (build_options.tls_backend == .boringssl)
+pub const TlsStream = if (build_options.tls_backend != .none)
     TlsStreamImpl
 else
     TlsStreamStub;
+
+pub const TlsHandshakeResult = enum {
+    complete,
+    want_read,
+    want_write,
+};
 
 /// Stub for builds without TLS support.
 const TlsStreamStub = struct {
@@ -37,7 +43,7 @@ const TlsStreamStub = struct {
         return error.TlsNotAvailable;
     }
 
-    pub const HandshakeResult = TlsStreamImpl.HandshakeResult;
+    pub const HandshakeResult = TlsHandshakeResult;
 };
 
 /// Full TLS implementation backed by BoringSSL.
@@ -56,11 +62,7 @@ const TlsStreamImpl = struct {
     /// Write BIO: BoringSSL writes ciphertext here, we read from it to send.
     network_bio: *ssl_c.BIO,
 
-    pub const HandshakeResult = enum {
-        complete,
-        want_read,
-        want_write,
-    };
+    pub const HandshakeResult = TlsHandshakeResult;
 
     pub const Error = error{
         TlsInitFailed,
@@ -253,7 +255,7 @@ const TlsStreamImpl = struct {
 // ── Tests ─────────────────────────────────────────────────
 
 test "TlsStream init and deinit with boringssl" {
-    if (build_options.tls_backend != .boringssl) return error.SkipZigTest;
+    if (build_options.tls_backend == .none) return error.SkipZigTest;
 
     var stream = TlsStream.init(std.testing.allocator, "example.com") catch |err| {
         // If system CA certs are not available, skip
@@ -269,7 +271,7 @@ test "TlsStream init and deinit with boringssl" {
 }
 
 test "TlsStream produces ClientHello on handshake" {
-    if (build_options.tls_backend != .boringssl) return error.SkipZigTest;
+    if (build_options.tls_backend == .none) return error.SkipZigTest;
 
     var stream = TlsStream.init(std.testing.allocator, "example.com") catch |err| {
         if (err == error.TlsInitFailed) return error.SkipZigTest;
@@ -291,7 +293,7 @@ test "TlsStream produces ClientHello on handshake" {
 }
 
 test "TlsStream feedRecv with garbage returns no plaintext" {
-    if (build_options.tls_backend != .boringssl) return error.SkipZigTest;
+    if (build_options.tls_backend == .none) return error.SkipZigTest;
 
     var stream = TlsStream.init(std.testing.allocator, "example.com") catch |err| {
         if (err == error.TlsInitFailed) return error.SkipZigTest;

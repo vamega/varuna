@@ -6,13 +6,13 @@
 const std = @import("std");
 const build_options = @import("build_options");
 
-const ssl_c = if (build_options.tls_backend == .boringssl)
+const ssl_c = if (build_options.tls_backend != .none)
     @cImport({
         @cInclude("openssl/sha.h");
         @cInclude("openssl/rc4.h");
     })
 else
-    @compileError("BoringSSL crypto backend requires -Dtls=boringssl");
+    @compileError("BoringSSL crypto backend requires -Dtls=boringssl or -Dtls=system_boringssl");
 
 // ── SHA-1 ────────────────────────────────────────────────────────────
 

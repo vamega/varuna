@@ -3,6 +3,7 @@ const posix = std.posix;
 const linux = std.os.linux;
 const dns = @import("dns.zig");
 const dns_cache = @import("dns_custom/cache.zig");
+const ThreadpoolDnsJob = @import("dns_threadpool.zig").DnsJob;
 const TtlBounds = dns.TtlBounds;
 const Config = dns.Config;
 const applyBindDevice = @import("../net/socket.zig").applyBindDevice;
@@ -223,6 +224,24 @@ pub const DnsResolver = struct {
         return address;
     }
 
+    /// Compatibility surface for executors that expect the threadpool DNS
+    /// backend's async shape. The c-ares backend already performs its own
+    /// bounded wait internally, so it completes synchronously and never
+    /// returns `.pending`.
+    pub const AsyncResult = union(enum) {
+        resolved: std.net.Address,
+        pending: *ThreadpoolDnsJob,
+    };
+
+    pub fn resolveAsync(self: *DnsResolver, host: []const u8, port: u16, _: std.posix.fd_t) !AsyncResult {
+        return .{ .resolved = try self.resolve(self.allocator, host, port) };
+    }
+
+    pub fn cacheResult(self: *DnsResolver, allocator: std.mem.Allocator, host: []const u8, address: std.net.Address) void {
+        const now = std.time.timestamp();
+        self.put(allocator, host, address, now + @as(i64, self.ttl_bounds.cap_s));
+    }
+
     /// Invalidate a specific host entry from the cache.
     pub fn invalidate(self: *DnsResolver, allocator: std.mem.Allocator, host: []const u8) void {
         self.mutex.lock();
@@ -440,19 +459,19 @@ pub const DnsResolver = struct {
             return;
         };
 
-        result.answer_ttl_s = node.ai_ttl;
+        result.answer_ttl_s = node.*.ai_ttl;
 
-        const sa = node.ai_addr orelse {
+        const sa = node.*.ai_addr orelse {
             result.err = error.DnsResolutionFailed;
             result.done = true;
             return;
         };
 
-        if (node.ai_family == c.AF_INET) {
+        if (node.*.ai_family == c.AF_INET) {
             const sin: *const c.struct_sockaddr_in = @ptrCast(@alignCast(sa));
             const bytes: *const [4]u8 = @ptrCast(&sin.sin_addr);
             result.address = std.net.Address.initIp4(bytes.*, 0);
-        } else if (node.ai_family == c.AF_INET6) {
+        } else if (node.*.ai_family == c.AF_INET6) {
             const sin6: *const c.struct_sockaddr_in6 = @ptrCast(@alignCast(sa));
             const bytes: *const [16]u8 = @ptrCast(&sin6.sin6_addr);
             result.address = std.net.Address.initIp6(bytes.*, 0, 0, 0);

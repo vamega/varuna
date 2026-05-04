@@ -48,9 +48,12 @@ Use `mise` for pinned tools in `mise.toml`:
 
 Required local setup:
 - SQLite dev package: `libsqlite3-dev` on Ubuntu/Debian
+- c-ares dev package (`libc-ares-dev`) when using `-Ddns=c_ares -Dcares=system`
+- BoringSSL package when using `-Dtls=system_boringssl`; otherwise initialize `vendor/boringssl`
 - local Linux/io_uring docs for substantial kernel work: `man-db`, `manpages`, `manpages-dev`, `manpages-posix`, `manpages-posix-dev`, `liburing-dev`
 - git submodules initialized with `git submodule update --init`
-- `vendor/boringssl` and `vendor/c-ares` initialized or `zig build` will fail
+- `vendor/boringssl` and `vendor/c-ares` initialized for default bundled builds, or use the system-link build flags with matching system packages
+- do not add checked-in `libsqlite3.so` symlinks; use system SQLite from the distro/Nix dev shell or pass Zig `--search-prefix`
 
 ### Worktree setup
 

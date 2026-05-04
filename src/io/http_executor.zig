@@ -894,7 +894,7 @@ pub fn HttpExecutorOf(comptime IO: type) type {
         // ── TLS handshake (async via BIO pairs) ──────────────────
 
         fn startTlsHandshake(self: *Self, slot: *RequestSlot, slot_idx: u16) void {
-            if (build_options.tls_backend != .boringssl) {
+            if (build_options.tls_backend == .none) {
                 self.completeSlot(slot_idx, .{ .err = error.HttpsNotSupported });
                 return;
             }

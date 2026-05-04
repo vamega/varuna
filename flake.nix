@@ -20,6 +20,8 @@
         packages = [
           zig
           pkgs.sqlite
+          pkgs.c-ares
+          pkgs.boringssl
           pkgs.liburing
           pkgs.pkg-config
           pkgs.git
