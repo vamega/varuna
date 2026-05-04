@@ -1837,8 +1837,9 @@ pub fn SessionManagerOf(comptime IO: type) type {
 
                 // Parse IP:port
                 const addr = parseIpPort(trimmed) orelse continue;
-                _ = el.addPeerAutoTransport(addr, tid) catch continue;
+                _ = el.enqueuePeerCandidate(addr, tid, .manual) catch continue;
             }
+            el.processPeerCandidates();
         }
 
         /// Parse an "IP:port" string into a std.net.Address.

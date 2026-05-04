@@ -18,7 +18,6 @@ const Hasher = @import("hasher.zig").Hasher;
 const LayoutSpan = @import("../torrent/layout.zig").Layout.Span;
 const utp_handler = @import("utp_handler.zig");
 const web_seed_handler = @import("web_seed_handler.zig");
-const addr_mod = @import("../net/address.zig");
 const BanList = @import("../net/ban_list.zig").BanList;
 const peer_handler = @import("peer_handler.zig");
 const SmartBan = @import("../net/smart_ban.zig").SmartBan;
@@ -1509,32 +1508,8 @@ pub fn checkReannounce(self: anytype) void {
             drained.deinit(self.allocator);
         }
         for (owned_results.items) |result| {
-            const tc = self.getTorrentContext(result.torrent_id) orelse continue;
             for (result.peers) |addr| {
-                if (self.peer_count >= self.max_connections) break;
-
-                // Skip self: the tracker echoes our own announce back.
-                if (addr_mod.isSelfAnnounceEndpoint(self.bind_address, self.port, &addr)) continue;
-
-                // Deduplicate: skip addresses we already have a peer for.
-                // Tracker responses frequently include the announcing client
-                // itself, plus PEX can re-echo peers tracker already gave us.
-                // Without this check we kick off a fresh outbound for every
-                // announce → socket/connect SQE churn on loopback (windesk
-                // 249164d). addPeerForTorrent does ban/limit checks but no
-                // address dedup, so this guard has to live here.
-                var already = false;
-                for (tc.peer_slots.items) |slot| {
-                    const p = &self.peers[slot];
-                    if (p.state == .free) continue;
-                    if (addr_mod.addressEql(&p.address, &addr)) {
-                        already = true;
-                        break;
-                    }
-                }
-                if (already) continue;
-
-                _ = self.addPeerAutoTransport(addr, result.torrent_id) catch continue;
+                _ = self.enqueuePeerCandidate(addr, result.torrent_id, .tracker) catch continue;
             }
         }
     }
@@ -1969,6 +1944,7 @@ test "checkReannounce keeps loopback peer on a different port" {
     try el.enqueueAnnounceResult(tid, peers);
 
     checkReannounce(&el);
+    el.processPeerCandidates();
 
     try std.testing.expectEqual(@as(usize, 1), el.peer_count);
     try std.testing.expectEqual(@as(usize, 1), el.getTorrentContext(tid).?.peer_slots.items.len);

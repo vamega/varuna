@@ -12,6 +12,7 @@ const SuperSeedState = @import("super_seed.zig").SuperSeedState;
 const MerkleCache = @import("../torrent/merkle_cache.zig").MerkleCache;
 const LeafHashStore = @import("../torrent/leaf_hashes.zig").LeafHashStore;
 const WebSeedManager = @import("../net/web_seed.zig").WebSeedManager;
+const peer_candidates = @import("peer_candidates.zig");
 
 // ── Constants ────────────────────────────────────────────
 
@@ -238,6 +239,11 @@ pub const TorrentContext = struct {
     // Slots of peers currently attached to this torrent.
     peer_slots: std.ArrayList(u16) = std.ArrayList(u16).empty,
     torrent_peer_list_index: ?u32 = null,
+
+    // In-memory peer candidates discovered by tracker, DHT, PEX, or API.
+    // This is not persisted to disk; it only prevents discovery results
+    // from being dropped while connection capacity is temporarily full.
+    peer_candidates: peer_candidates.PeerCandidateList = .{},
 
     // ── Durability tracking ───────────────────────────────────
     // Number of piece writes that have completed but not yet been

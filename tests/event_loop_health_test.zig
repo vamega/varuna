@@ -351,6 +351,7 @@ test "BEP 52 DHT peer results preserve selected v2 swarm hash" {
     });
 
     varuna.io.dht_handler.dhtTick(&el);
+    el.processPeerCandidates();
 
     var found_slot: ?u16 = null;
     for (el.peers, 0..) |*peer, idx| {

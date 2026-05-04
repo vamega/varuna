@@ -16,6 +16,7 @@ pub const dns_custom = struct {
 pub const event_loop = @import("event_loop.zig");
 pub const io_interface = @import("io_interface.zig");
 pub const types = @import("types.zig");
+pub const peer_candidates = @import("peer_candidates.zig");
 pub const peer_handler = @import("peer_handler.zig");
 pub const protocol = @import("protocol.zig");
 pub const seed_handler = @import("seed_handler.zig");
@@ -83,6 +84,7 @@ test {
     _ = http_parse;
     _ = io_interface;
     _ = metadata_handler;
+    _ = peer_candidates;
     _ = peer_handler;
     _ = peer_policy;
     _ = protocol;

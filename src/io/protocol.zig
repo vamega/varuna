@@ -16,7 +16,6 @@ const Peer = @import("event_loop.zig").Peer;
 const TorrentContext = @import("event_loop.zig").TorrentContext;
 const encodeUserData = @import("event_loop.zig").encodeUserData;
 const TorrentId = @import("event_loop.zig").TorrentId;
-const address = @import("../net/address.zig");
 const policy = @import("peer_policy.zig");
 const seed_handler = @import("seed_handler.zig");
 const utp_handler = @import("utp_handler.zig");
@@ -605,29 +604,8 @@ fn handlePexMessage(self: anytype, slot: u16, payload: []const u8) void {
     // Only for non-private torrents (already checked by caller).
     const torrent_id = peer.torrent_id;
     for (msg.added) |pex_peer| {
-        // Check connection limits before attempting
-        if (self.peer_count >= self.max_connections) break;
-        if (self.peerCountForTorrent(torrent_id) >= self.max_peers_per_torrent) break;
-        if (self.half_open_count >= self.max_half_open) break;
-
-        // Don't connect to peers we already have
-        if (isPeerAlreadyConnected(self, torrent_id, pex_peer.address)) continue;
-
-        // When uTP is enabled, try uTP first and fall back to TCP on timeout.
-        _ = self.addPeerAutoTransport(pex_peer.address, torrent_id) catch continue;
+        _ = self.enqueuePeerCandidate(pex_peer.address, torrent_id, .pex) catch continue;
     }
-}
-
-/// Check if we already have a connection to the given address for this torrent.
-fn isPeerAlreadyConnected(self: anytype, torrent_id: TorrentId, addr: std.net.Address) bool {
-    const tc = self.getTorrentContext(torrent_id) orelse return false;
-    for (tc.peer_slots.items) |slot| {
-        const p = &self.peers[slot];
-        if (p.state == .free) continue;
-        // Compare address family, IP, and port
-        if (address.addressEql(&p.address, &addr)) return true;
-    }
-    return false;
 }
 
 /// Build and send a PEX message to the given peer slot.

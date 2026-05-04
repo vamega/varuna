@@ -13,6 +13,7 @@ const Hasher = @import("hasher.zig").Hasher;
 const RateLimiter = @import("rate_limiter.zig").RateLimiter;
 const pex_mod = @import("../net/pex.zig");
 const socket_util = @import("../net/socket.zig");
+const addr_mod = @import("../net/address.zig");
 const utp_mod = @import("../net/utp.zig");
 const utp_mgr = @import("../net/utp_manager.zig");
 const mse = @import("../crypto/mse.zig");
@@ -45,6 +46,7 @@ const utp_handler = @import("utp_handler.zig");
 const dht_handler = @import("dht_handler.zig");
 const metadata_handler = @import("metadata_handler.zig");
 const web_seed_handler = @import("web_seed_handler.zig");
+const peer_candidates_mod = @import("peer_candidates.zig");
 
 // ── Re-exported type definitions (moved to types.zig) ────
 
@@ -57,6 +59,7 @@ pub const PeerState = types.PeerState;
 pub const Peer = types.Peer;
 pub const SpeedStats = types.SpeedStats;
 pub const TorrentContext = types.TorrentContext;
+pub const PeerCandidateSource = peer_candidates_mod.PeerCandidateSource;
 
 const clock_mod = @import("clock.zig");
 pub const Clock = clock_mod.Clock;
@@ -791,6 +794,7 @@ pub fn EventLoopOf(comptime IO: type) type {
                     }
                     tc.pending_resume_durability.deinit(self.allocator);
                     tc.durable_resume_pieces.deinit(self.allocator);
+                    tc.peer_candidates.deinit(self.allocator);
                     tc.peer_slots.deinit(self.allocator);
                 }
             }
@@ -1035,6 +1039,8 @@ pub fn EventLoopOf(comptime IO: type) type {
                 tc.pending_resume_durability = std.ArrayList(u32).empty;
                 tc.durable_resume_pieces.deinit(self.allocator);
                 tc.durable_resume_pieces = std.ArrayList(u32).empty;
+                tc.peer_candidates.deinit(self.allocator);
+                tc.peer_candidates = .{};
                 self.unregisterTorrentHashes(tc.info_hash, tc.info_hash_v2);
             }
             self.torrents.items[torrent_id] = null;
@@ -1148,6 +1154,101 @@ pub fn EventLoopOf(comptime IO: type) type {
             const tc = self.getTorrentContextConst(peer.torrent_id) orelse return selected;
             if (contextHasSwarmHash(tc, selected)) return selected;
             return contextDefaultOutboundSwarmHash(tc);
+        }
+
+        pub fn enqueuePeerCandidate(
+            self: *Self,
+            address: std.net.Address,
+            torrent_id: TorrentId,
+            source: PeerCandidateSource,
+        ) !bool {
+            const swarm_hash = try self.defaultOutboundSwarmHash(torrent_id);
+            return self.enqueuePeerCandidateWithSwarmHash(address, torrent_id, swarm_hash, source);
+        }
+
+        pub fn enqueuePeerCandidateWithSwarmHash(
+            self: *Self,
+            address: std.net.Address,
+            torrent_id: TorrentId,
+            swarm_hash: [20]u8,
+            source: PeerCandidateSource,
+        ) !bool {
+            const tc = self.getTorrentContext(torrent_id) orelse return error.TorrentNotFound;
+            if (tc.is_private and (source == .dht or source == .pex)) {
+                return error.PrivateTorrentPeerDiscoveryDisabled;
+            }
+
+            const family = address.any.family;
+            if (family != posix.AF.INET and family != posix.AF.INET6) {
+                return error.InvalidAddressFamily;
+            }
+            if (addr_mod.isSelfAnnounceEndpoint(self.bind_address, self.port, &address)) return false;
+            if (self.isPeerAddressKnown(torrent_id, address)) return false;
+            if (self.ban_list) |bl| {
+                if (bl.isBanned(address)) return false;
+            }
+
+            const selected_hash = try self.normalizeOutboundSwarmHash(torrent_id, swarm_hash);
+            return tc.peer_candidates.add(self.allocator, address, selected_hash, source, self.clock.now());
+        }
+
+        pub fn peerCandidateCount(self: *const Self, torrent_id: TorrentId) usize {
+            const tc = self.getTorrentContextConst(torrent_id) orelse return 0;
+            return tc.peer_candidates.count();
+        }
+
+        fn isPeerAddressKnown(self: *const Self, torrent_id: TorrentId, addr: std.net.Address) bool {
+            const tc = self.getTorrentContextConst(torrent_id) orelse return false;
+            for (tc.peer_slots.items) |slot| {
+                const peer = &self.peers[slot];
+                if (peer.state == .free or peer.state == .disconnecting) continue;
+                if (addr_mod.addressEql(&peer.address, &addr)) return true;
+            }
+            return false;
+        }
+
+        pub fn processPeerCandidates(self: *Self) void {
+            for (self.active_torrent_ids.items) |torrent_id| {
+                self.processPeerCandidatesForTorrent(torrent_id);
+            }
+        }
+
+        fn processPeerCandidatesForTorrent(self: *Self, torrent_id: TorrentId) void {
+            while (self.peer_count < self.max_connections and self.half_open_count < self.max_half_open) {
+                if (self.peerCountForTorrent(torrent_id) >= self.max_peers_per_torrent) return;
+                const now = self.clock.now();
+                const candidate = blk: {
+                    const tc = self.getTorrentContext(torrent_id) orelse return;
+                    var idx_opt = tc.peer_candidates.nextConnectableIndex(now);
+                    while (idx_opt) |idx| {
+                        const entry = tc.peer_candidates.entries.items[idx];
+                        if (self.isPeerAddressKnown(torrent_id, entry.address) or
+                            addr_mod.isSelfAnnounceEndpoint(self.bind_address, self.port, &entry.address) or
+                            (self.ban_list != null and self.ban_list.?.isBanned(entry.address)))
+                        {
+                            tc.peer_candidates.markAttempt(idx, now);
+                            idx_opt = tc.peer_candidates.nextConnectableIndex(now);
+                            continue;
+                        }
+                        tc.peer_candidates.markAttempt(idx, now);
+                        break :blk entry;
+                    }
+                    return;
+                };
+
+                _ = self.addPeerAutoTransportWithSwarmHash(
+                    candidate.address,
+                    torrent_id,
+                    candidate.swarm_hash,
+                ) catch |err| switch (err) {
+                    error.ConnectionLimitReached,
+                    error.TorrentConnectionLimitReached,
+                    error.HalfOpenLimitReached,
+                    error.TooManyPeers,
+                    => return,
+                    else => continue,
+                };
+            }
         }
 
         /// Add a peer using the transport selected by `selectTransport()`.
@@ -1876,6 +1977,7 @@ pub fn EventLoopOf(comptime IO: type) type {
             peer_policy.checkPartialSeed(self);
             utp_handler.utpTick(self);
             dht_handler.dhtTick(self);
+            self.processPeerCandidates();
             if (self.http_executor) |he| he.tick();
             if (self.udp_tracker_executor) |ute| ute.tick();
 
@@ -3317,6 +3419,54 @@ test "announce results are queued per torrent" {
     try std.testing.expectEqual(@as(TorrentId, 7), el.announce_results.items[1].torrent_id);
     try std.testing.expectEqual(@as(usize, 1), el.announce_results.items[0].peers.len);
     try std.testing.expectEqual(@as(usize, 2), el.announce_results.items[1].peers.len);
+}
+
+test "peer candidates persist when connection capacity is exhausted" {
+    var el = try EventLoop.initBare(std.testing.allocator, 0);
+    defer el.deinit();
+
+    const empty_fds = [_]posix.fd_t{};
+    const tid = try el.addTorrentContext(.{
+        .shared_fds = empty_fds[0..],
+        .info_hash = [_]u8{0xA1} ** 20,
+        .peer_id = [_]u8{0xB2} ** 20,
+    });
+
+    const peer_a = try std.net.Address.parseIp4("127.0.0.10", 6882);
+    const peer_b = try std.net.Address.parseIp4("127.0.0.11", 6883);
+
+    try std.testing.expect(try el.enqueuePeerCandidate(peer_a, tid, .tracker));
+    try std.testing.expect(try el.enqueuePeerCandidate(peer_b, tid, .tracker));
+    try std.testing.expect(!try el.enqueuePeerCandidate(peer_a, tid, .tracker));
+
+    el.max_half_open = 0;
+    el.processPeerCandidates();
+
+    try std.testing.expectEqual(@as(usize, 2), el.peerCandidateCount(tid));
+    try std.testing.expectEqual(@as(u32, 0), el.peer_count);
+    try std.testing.expectEqual(@as(u32, 0), el.half_open_count);
+}
+
+test "private torrents reject DHT and PEX peer candidates" {
+    var el = try EventLoop.initBare(std.testing.allocator, 0);
+    defer el.deinit();
+
+    const empty_fds = [_]posix.fd_t{};
+    const tid = try el.addTorrentContext(.{
+        .shared_fds = empty_fds[0..],
+        .info_hash = [_]u8{0xC1} ** 20,
+        .peer_id = [_]u8{0xD2} ** 20,
+        .is_private = true,
+    });
+
+    const dht_peer = try std.net.Address.parseIp4("127.0.0.12", 6881);
+    const pex_peer = try std.net.Address.parseIp4("127.0.0.13", 6881);
+    const tracker_peer = try std.net.Address.parseIp4("127.0.0.14", 6882);
+
+    try std.testing.expectError(error.PrivateTorrentPeerDiscoveryDisabled, el.enqueuePeerCandidate(dht_peer, tid, .dht));
+    try std.testing.expectError(error.PrivateTorrentPeerDiscoveryDisabled, el.enqueuePeerCandidate(pex_peer, tid, .pex));
+    try std.testing.expect(try el.enqueuePeerCandidate(tracker_peer, tid, .tracker));
+    try std.testing.expectEqual(@as(usize, 1), el.peerCandidateCount(tid));
 }
 
 test "peer and torrent membership indices stay consistent across swap-remove" {
