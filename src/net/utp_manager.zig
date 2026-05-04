@@ -60,7 +60,10 @@ pub const UtpManager = struct {
         sock.remote_addr = remote;
         sock.allocator = self.allocator;
 
-        const syn_pkt = sock.connect(random, now_us);
+        const syn_pkt = sock.connect(random, now_us) catch |err| {
+            self.freeSlot(slot);
+            return err;
+        };
 
         return .{
             .slot = slot,
@@ -594,7 +597,7 @@ test "manager handshake with retransmission and data exchange" {
     // Client connects.
     const conn = try client_mgr.connect(&utp_test_rng, server_addr, 1_000_000);
     const client_sock = client_mgr.getSocket(conn.slot).?;
-    try std.testing.expectEqual(@as(u16, 1), client_sock.out_buf_count);
+    try std.testing.expectEqual(@as(u16, 1), client_sock.outBufCount());
 
     // Server receives SYN.
     const srv_result = server_mgr.processPacket(&conn.syn_packet, client_addr, 1_001_000).?;
@@ -604,7 +607,7 @@ test "manager handshake with retransmission and data exchange" {
     // Client receives SYN-ACK -- SYN should be acked.
     _ = client_mgr.processPacket(&srv_result.response.?, server_addr, 1_002_000);
     try std.testing.expectEqual(utp.State.connected, client_sock.state);
-    try std.testing.expectEqual(@as(u16, 0), client_sock.out_buf_count);
+    try std.testing.expectEqual(@as(u16, 0), client_sock.outBufCount());
 
     // Client sends data.
     const payload = "hello";
@@ -616,9 +619,9 @@ test "manager handshake with retransmission and data exchange" {
     var datagram: [utp.Header.size + payload.len]u8 = undefined;
     @memcpy(datagram[0..utp.Header.size], &hdr_bytes.?);
     @memcpy(datagram[utp.Header.size..], payload);
-    client_sock.bufferSentPacket(pkt_seq, &datagram, @intCast(payload.len), 1_003_000);
+    try client_sock.bufferSentPacket(pkt_seq, &datagram, @intCast(payload.len), 1_003_000);
 
-    try std.testing.expectEqual(@as(u16, 1), client_sock.out_buf_count);
+    try std.testing.expectEqual(@as(u16, 1), client_sock.outBufCount());
 
     // Clean up.
     _ = client_mgr.reset(conn.slot, 3_000_000);
@@ -682,7 +685,7 @@ test "manager freeSlot cleans up outbound buffers" {
 
     // SYN is buffered inline for retransmission.
     const sock = mgr.getSocket(conn.slot).?;
-    try std.testing.expect(sock.out_buf[sock.out_seq_start % 128].packet_len != 0);
+    try std.testing.expect(sock.outPacketForSeq(sock.out_seq_start).?.packet_len != 0);
 
     // Reset frees the slot and the outbound buffers.
     _ = mgr.reset(conn.slot, 2_000_000);

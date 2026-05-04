@@ -2099,7 +2099,7 @@ pub fn SessionManagerOf(comptime IO: type) type {
                             if (mgr.getSocket(utp_slot)) |sock| {
                                 utp_cwnd = sock.ledbat.window();
                                 utp_bytes_in_flight = sock.bytesInFlight();
-                                utp_out_buf_count = sock.out_buf_count;
+                                utp_out_buf_count = sock.outBufCount();
                                 utp_pending_send_bytes = @intCast(@min(
                                     sock.pendingSendSlice().len,
                                     std.math.maxInt(u32),

@@ -917,7 +917,7 @@ fn flushUtpPendingData(self: anytype, utp_slot: u16) !void {
         @memcpy(send_buf[0..utp_mod.Header.size], &hdr_bytes);
         @memcpy(send_buf[utp_mod.Header.size..][0..chunk_len], pending[0..chunk_len]);
 
-        sock.bufferSentPacket(pkt_seq_nr, send_buf[0..total], @intCast(chunk_len), now_us);
+        try sock.bufferSentPacket(pkt_seq_nr, send_buf[0..total], @intCast(chunk_len), now_us);
 
         utpSendPacket(self, send_buf[0..total], remote);
         sock.consumePendingSend(chunk_len);

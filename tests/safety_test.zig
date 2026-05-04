@@ -8,8 +8,8 @@ const utp = varuna.net.utp;
 // These tests catch regressions from past production bugs:
 // - 46MB stack overflow from passing std.net.Address (112 bytes) by value
 //   in a 4096-iteration loop
-// - UAF from UtpSocket.out_buf leaving pointer fields as garbage when
-//   initialized with `= undefined`
+// - UAF from UtpSocket retransmit storage leaving packet fields in an unsafe
+//   state across default initialization and teardown
 // - Struct size regressions that silently degrade performance or blow stacks
 
 // ═══════════════════════════════════════════════════════════════
@@ -42,39 +42,37 @@ test "addressEql parameters are const pointers" {
 // 2. Struct initialization safety
 // ═══════════════════════════════════════════════════════════════
 
-test "UtpSocket out_buf initializes packet storage as empty" {
-    // A past bug had `out_buf: [128]OutPacket = undefined` which left
-    // pointer fields as garbage, causing UAF on deinit. The packet buffer is
-    // now inline; default initialization must mark every slot as empty.
+test "UtpSocket retransmit buffer starts empty" {
+    // A past bug had inline packet storage initialized with `undefined`, which
+    // left pointer fields as garbage and caused UAF on deinit. The retransmit
+    // buffer is now dynamic; default initialization must start with no live
+    // packet entries.
     var sock = utp.UtpSocket{};
-    for (&sock.out_buf) |*pkt| {
-        try std.testing.expectEqual(@as(u16, 0), pkt.packet_len);
-        try std.testing.expect(pkt.datagram() == null);
-    }
+    try std.testing.expectEqual(@as(u16, 0), sock.outBufCount());
+    try std.testing.expectEqual(@as(usize, 0), sock.out_buf.items.len);
 }
 
-test "UtpSocket out_buf default fields are zero-initialized" {
+test "OutPacket default fields are zero-initialized" {
     // Verify all OutPacket fields start in a safe, known state.
-    const sock = utp.UtpSocket{};
-    for (&sock.out_buf) |*pkt| {
-        try std.testing.expectEqual(@as(u16, 0), pkt.seq_nr);
-        try std.testing.expectEqual(@as(u16, 0), pkt.payload_len);
-        try std.testing.expectEqual(@as(u32, 0), pkt.send_time_us);
-        try std.testing.expectEqual(@as(u8, 0), pkt.retransmit_count);
-        try std.testing.expect(!pkt.acked);
-        try std.testing.expect(!pkt.needs_resend);
-    }
+    const pkt = utp.OutPacket{};
+    try std.testing.expectEqual(@as(u16, 0), pkt.seq_nr);
+    try std.testing.expectEqual(@as(u16, 0), pkt.packet_len);
+    try std.testing.expectEqual(@as(u16, 0), pkt.payload_len);
+    try std.testing.expectEqual(@as(u32, 0), pkt.send_time_us);
+    try std.testing.expectEqual(@as(u8, 0), pkt.retransmit_count);
+    try std.testing.expect(!pkt.acked);
+    try std.testing.expect(!pkt.needs_resend);
 }
 
 // ═══════════════════════════════════════════════════════════════
 // 3. Struct size regression tests
 // ═══════════════════════════════════════════════════════════════
 
-test "UtpSocket inline retransmit storage stays bounded" {
+test "UtpSocket inline state stays bounded" {
     // UtpManager stores sockets behind heap pointers, while tests may still
-    // instantiate them directly. Keep the inline retransmit buffer bounded so
-    // the no-per-packet-allocation design cannot grow without review.
-    try std.testing.expect(@sizeOf(utp.UtpSocket) <= (utp.max_datagram * 128) + (32 * 1024));
+    // instantiate them directly. Retransmit storage is dynamic, so the socket
+    // itself should stay compact enough that direct test instantiation is safe.
+    try std.testing.expect(@sizeOf(utp.UtpSocket) <= 32 * 1024);
 }
 
 test "std.net.Address size is documented" {
@@ -84,8 +82,8 @@ test "std.net.Address size is documented" {
 }
 
 test "OutPacket stores one inline datagram plus small metadata" {
-    // OutPacket is stored in a [128] array inside UtpSocket. It should remain
-    // one full datagram plus a small amount of retransmit/ACK metadata.
+    // OutPacket should remain one full datagram plus a small amount of
+    // retransmit/ACK metadata.
     try std.testing.expect(@sizeOf(utp.OutPacket) <= utp.max_datagram + 64);
 }
 

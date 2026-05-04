@@ -36,7 +36,7 @@ test "BT handshake over uTP byte stream" {
     client.allocator = allocator;
     defer client.deinit();
 
-    const syn_pkt = client.connect(&bytestream_test_rng, 1_000_000);
+    const syn_pkt = try client.connect(&bytestream_test_rng, 1_000_000);
     const syn_hdr = Header.decode(&syn_pkt).?;
 
     var server = UtpSocket{};
@@ -77,7 +77,7 @@ test "BT handshake over uTP byte stream" {
     @memcpy(full_pkt[0..Header.size], &data_hdr_bytes);
     @memcpy(full_pkt[Header.size..], &bt_handshake_client);
     const data_hdr = Header.decode(&data_hdr_bytes).?;
-    client.bufferSentPacket(data_hdr.seq_nr, &full_pkt, 68, 1_003_000);
+    try client.bufferSentPacket(data_hdr.seq_nr, &full_pkt, 68, 1_003_000);
 
     // ── Step 3: Server receives DATA packet ──
     const server_result = server.processPacket(data_hdr, &bt_handshake_client, 1_004_000);
@@ -116,7 +116,7 @@ test "BT handshake over uTP byte stream" {
     @memcpy(server_full_pkt[0..Header.size], &server_data_hdr_bytes);
     @memcpy(server_full_pkt[Header.size..], &bt_handshake_server);
     const server_data_hdr = Header.decode(&server_data_hdr_bytes).?;
-    server.bufferSentPacket(server_data_hdr.seq_nr, &server_full_pkt, 68, 1_006_000);
+    try server.bufferSentPacket(server_data_hdr.seq_nr, &server_full_pkt, 68, 1_006_000);
     try std.testing.expectEqual(syn_ack_hdr.seq_nr, server_data_hdr.seq_nr);
 
     // ── Step 6: Client receives server's handshake ──
@@ -150,7 +150,7 @@ test "multiple BT wire messages over uTP byte stream" {
     server.allocator = allocator;
     defer server.deinit();
 
-    const syn = client.connect(&bytestream_test_rng, 1_000_000);
+    const syn = try client.connect(&bytestream_test_rng, 1_000_000);
     const syn_hdr = Header.decode(&syn).?;
     const syn_ack = server.acceptSyn(syn_hdr, 1_001_000);
     _ = client.processPacket(Header.decode(&syn_ack).?, &.{}, 1_002_000);
@@ -162,7 +162,7 @@ test "multiple BT wire messages over uTP byte stream" {
     var bf_full: [Header.size + 6]u8 = undefined;
     @memcpy(bf_full[0..Header.size], &bf_hdr_bytes);
     @memcpy(bf_full[Header.size..], &bitfield_msg);
-    server.bufferSentPacket(bf_hdr.seq_nr, &bf_full, @intCast(bitfield_msg.len), 2_000_000);
+    try server.bufferSentPacket(bf_hdr.seq_nr, &bf_full, @intCast(bitfield_msg.len), 2_000_000);
 
     const bf_result = client.processPacket(bf_hdr, &bitfield_msg, 2_001_000);
     try std.testing.expect(bf_result.data != null);
@@ -183,7 +183,7 @@ test "multiple BT wire messages over uTP byte stream" {
     var uc_full: [Header.size + 5]u8 = undefined;
     @memcpy(uc_full[0..Header.size], &uc_hdr_bytes);
     @memcpy(uc_full[Header.size..], &unchoke_msg);
-    server.bufferSentPacket(uc_hdr.seq_nr, &uc_full, @intCast(unchoke_msg.len), 3_000_000);
+    try server.bufferSentPacket(uc_hdr.seq_nr, &uc_full, @intCast(unchoke_msg.len), 3_000_000);
 
     const uc_result = client.processPacket(uc_hdr, &unchoke_msg, 3_001_000);
     try std.testing.expect(uc_result.data != null);
@@ -197,7 +197,7 @@ test "multiple BT wire messages over uTP byte stream" {
     var int_full: [Header.size + 5]u8 = undefined;
     @memcpy(int_full[0..Header.size], &int_hdr_bytes);
     @memcpy(int_full[Header.size..], &interested_msg);
-    client.bufferSentPacket(int_hdr.seq_nr, &int_full, @intCast(interested_msg.len), 4_000_000);
+    try client.bufferSentPacket(int_hdr.seq_nr, &int_full, @intCast(interested_msg.len), 4_000_000);
 
     const int_result = server.processPacket(int_hdr, &interested_msg, 4_001_000);
     try std.testing.expect(int_result.data != null);
@@ -222,7 +222,7 @@ test "fragmented PIECE message over uTP" {
     defer server.deinit();
 
     // Connect
-    const syn = client.connect(&bytestream_test_rng, 1_000_000);
+    const syn = try client.connect(&bytestream_test_rng, 1_000_000);
     const syn_hdr = Header.decode(&syn).?;
     const syn_ack = server.acceptSyn(syn_hdr, 1_001_000);
     _ = client.processPacket(Header.decode(&syn_ack).?, &.{}, 1_002_000);
@@ -251,7 +251,7 @@ test "fragmented PIECE message over uTP" {
         defer allocator.free(buf);
         @memcpy(buf[0..Header.size], &hdr_bytes);
         @memcpy(buf[Header.size..], piece_data[offset..][0..chunk_len]);
-        server.bufferSentPacket(hdr.seq_nr, buf, @intCast(chunk_len), 5_000_000 + packets_sent * 1000);
+        try server.bufferSentPacket(hdr.seq_nr, buf, @intCast(chunk_len), 5_000_000 + packets_sent * 1000);
 
         // Client receives this chunk
         const result = client.processPacket(hdr, piece_data[offset..][0..chunk_len], 5_000_500 + packets_sent * 1000);
@@ -303,7 +303,7 @@ test "uTP sender resumes window-limited byte stream after ACK" {
     }).encode();
     _ = mgr.processPacket(&syn_ack, remote, 1_002_000);
     try std.testing.expectEqual(State.connected, sock.state);
-    try std.testing.expectEqual(@as(u16, 0), sock.out_buf_count);
+    try std.testing.expectEqual(@as(u16, 0), sock.outBufCount());
 
     const peer_slot: u16 = 0;
     el.peers[peer_slot] = event_loop_mod.Peer{
@@ -396,9 +396,8 @@ test "uTP sender packetizes queued bytes up to available window" {
 
     try utp_handler.utpSendData(&el, peer_slot, &request_batch);
 
-    try std.testing.expectEqual(@as(u16, 1), sock.out_buf_count);
-    const idx = sock.out_seq_start % sock.out_buf.len;
-    try std.testing.expectEqual(@as(u16, 200), sock.out_buf[idx].payload_len);
+    try std.testing.expectEqual(@as(u16, 1), sock.outBufCount());
+    try std.testing.expectEqual(@as(u16, 200), sock.outPacketForSeq(sock.out_seq_start).?.payload_len);
     try std.testing.expectEqual(@as(usize, request_batch.len - 200), sock.pendingSendSlice().len);
 }
 
