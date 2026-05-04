@@ -802,6 +802,7 @@ pub fn SessionManagerOf(comptime IO: type) type {
 
             // Heavyweight fallback: full session teardown + re-init.
             session.stop();
+            session.startup_recheck_requested = true;
             session.start();
         }
 

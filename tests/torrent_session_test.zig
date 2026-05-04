@@ -9,6 +9,7 @@ const Session = varuna.torrent.session.Session;
 const TorrentSession = varuna.daemon.torrent_session.TorrentSession;
 const TorrentState = varuna.daemon.torrent_session.State;
 const Transport = varuna.io.event_loop.Transport;
+const Random = varuna.runtime.random.Random;
 
 test {
     _ = varuna.daemon.torrent_session;
@@ -80,4 +81,53 @@ test "addPeersToEventLoop honors uTP-only transport for tracker peers" {
         try std.testing.expect(peer.utp_slot != null);
     }
     try std.testing.expect(found_utp_peer);
+}
+
+test "normal startup skips recheck even when target file already exists" {
+    const allocator = std.testing.allocator;
+    const torrent_bytes =
+        "d8:announce14:http://tracker4:infod6:lengthi4e4:name8:test.bin12:piece lengthi4e6:pieces20:abcdefghijklmnopqrstee";
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    {
+        const f = try tmp.dir.createFile("test.bin", .{});
+        defer f.close();
+        try f.writeAll("junk");
+    }
+
+    const save_path = try tmp.dir.realpathAlloc(allocator, ".");
+    defer allocator.free(save_path);
+
+    const resume_db_path_raw = try std.fmt.allocPrint(allocator, "{s}/resume.db", .{save_path});
+    defer allocator.free(resume_db_path_raw);
+    const resume_db_path = try allocator.dupeZ(u8, resume_db_path_raw);
+    defer allocator.free(resume_db_path);
+
+    var el = EventLoop.initBare(allocator, 0) catch |err| {
+        if (err == error.SystemResources) return error.SkipZigTest;
+        return err;
+    };
+    defer el.deinit();
+
+    var random = Random.simRandom(0x516b1d);
+    var session = try TorrentSession.create(allocator, &random, torrent_bytes, save_path, null);
+    defer session.deinit();
+    session.shared_event_loop = &el;
+    session.resume_db_path = resume_db_path.ptr;
+
+    session.start();
+
+    var waited: u32 = 0;
+    while (!session.background_init_done.load(.acquire) and waited < 500) : (waited += 1) {
+        std.Thread.sleep(std.time.ns_per_ms);
+    }
+    try std.testing.expect(session.background_init_done.load(.acquire));
+
+    try std.testing.expect(session.integrateIntoEventLoop());
+    try std.testing.expectEqual(@as(usize, 0), el.rechecks.items.len);
+    try std.testing.expectEqual(TorrentState.downloading, session.state);
+    try std.testing.expect(session.piece_tracker != null);
+    try std.testing.expect(session.pending_peers != null);
 }

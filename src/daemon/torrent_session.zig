@@ -220,6 +220,9 @@ pub fn TorrentSessionOf(comptime IO: type) type {
         thread: ?std.Thread = null,
         announcing: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
         announce_jobs_in_flight: std.atomic.Value(u32) = std.atomic.Value(u32).init(0),
+        /// One-shot request set only by explicit force-recheck fallback paths.
+        /// Normal add/start/restart must not infer recheck from files on disk.
+        startup_recheck_requested: bool = false,
 
         // Resume state persistence (runs on background thread)
         resume_writer: ?ResumeWriter = null,
@@ -488,17 +491,14 @@ pub fn TorrentSessionOf(comptime IO: type) type {
                     }
                     self.background_init_done.store(false, .release);
                 } else if (self.state == .checking and self.session != null and self.shared_fds != null) {
-                    if (self.resume_pieces != null) {
-                        // Fast resume: resume DB has saved state. Trust it and
-                        // create PieceTracker directly without rechecking.
-                        action = .skip_recheck;
-                    } else if (self.resume_writer != null) {
-                        // Resume DB exists but no saved pieces for this torrent.
-                        // This could be a fresh download OR imported data without
-                        // prior resume state. Recheck to discover existing data.
+                    if (self.startup_recheck_requested) {
+                        self.startup_recheck_requested = false;
                         action = .recheck;
                     } else {
-                        // No resume DB at all — fresh download, no data on disk.
+                        // Normal startup trusts Varuna's resume DB as the
+                        // source of truth. If there is no resume bitfield, start
+                        // with an empty PieceTracker even if files already exist;
+                        // explicit force-recheck/import workflows verify bytes.
                         action = .skip_recheck;
                     }
                     self.background_init_done.store(false, .release);
@@ -548,74 +548,74 @@ pub fn TorrentSessionOf(comptime IO: type) type {
                     return true;
                 },
                 .skip_recheck => {
-                    // Fast resume: trust resume DB or start fresh (no data).
-                    // Create PieceTracker from resume_pieces if available,
-                    // otherwise create an empty one.
                     self.mutex.lock();
                     defer self.mutex.unlock();
-
-                    const session = &(self.session orelse return false);
-
-                    // Use resume_pieces if available (restart), or create empty (fresh)
-                    var bytes_complete: u64 = 0;
-                    const initial_bf: *const Bitfield = if (self.resume_pieces) |*rp| blk: {
-                        // Calculate bytes from resume piece count
-                        var idx: u32 = 0;
-                        while (idx < session.pieceCount()) : (idx += 1) {
-                            if (rp.has(idx)) {
-                                bytes_complete += session.layout.pieceSize(idx) catch 0;
-                            }
-                        }
-                        break :blk rp;
-                    } else blk: {
-                        // No resume data — all pieces incomplete
-                        const empty = Bitfield.init(self.allocator, session.pieceCount()) catch return false;
-                        // Store it temporarily so we can take a pointer
-                        self.resume_pieces = empty;
-                        break :blk &self.resume_pieces.?;
-                    };
-
-                    const pt = PieceTracker.init(
-                        self.allocator,
-                        session.pieceCount(),
-                        session.layout.piece_length,
-                        session.totalSize(),
-                        initial_bf,
-                        bytes_complete,
-                    ) catch return false;
-                    self.piece_tracker = pt;
-
-                    // Free resume_pieces — PieceTracker made its own copy
-                    if (self.resume_pieces) |*rp| {
-                        rp.deinit(self.allocator);
-                        self.resume_pieces = null;
-                    }
-
-                    // Determine state based on completion
-                    if (bytes_complete == session.totalSize()) {
-                        self.state = .seeding;
-                        if (self.completion_on == 0) {
-                            self.completion_on = std.time.timestamp();
-                        }
-                        self.pending_seed_setup = true;
-                        // Phase 2 of the piece-hash lifecycle: skip-recheck with
-                        // full bitfield means we trust resume DB the torrent is
-                        // already verified. The seeder never consults piece
-                        // hashes (peers verify with their own copy), so drop
-                        // the table now to free `piece_count * 20` bytes for
-                        // the lifetime of the seeding session.
-                        session.freePieces();
-                    } else {
-                        self.state = .downloading;
-                    }
-
-                    if (self.pending_peers == null) {
-                        self.pending_peers = self.allocator.alloc(std.net.Address, 0) catch null;
-                    }
-                    return true;
+                    return self.finishStartupWithoutRecheckLocked();
                 },
                 .none => return false,
             }
+        }
+
+        /// Create the PieceTracker without reading data from disk. Caller must
+        /// hold `self.mutex`. Used for trusted fast-resume state and normal
+        /// fresh/startup downloads.
+        fn finishStartupWithoutRecheckLocked(self: *Self) bool {
+            const session = &(self.session orelse return false);
+
+            var bytes_complete: u64 = 0;
+            var empty_bf: Bitfield = undefined;
+            var empty_bf_active = false;
+            defer if (empty_bf_active) empty_bf.deinit(self.allocator);
+
+            const initial_bf: *const Bitfield = if (self.resume_pieces) |*rp| blk: {
+                var idx: u32 = 0;
+                while (idx < session.pieceCount()) : (idx += 1) {
+                    if (rp.has(idx)) {
+                        bytes_complete += session.layout.pieceSize(idx) catch 0;
+                    }
+                }
+                break :blk rp;
+            } else blk: {
+                empty_bf = Bitfield.init(self.allocator, session.pieceCount()) catch return false;
+                empty_bf_active = true;
+                break :blk &empty_bf;
+            };
+
+            const pt = PieceTracker.init(
+                self.allocator,
+                session.pieceCount(),
+                session.layout.piece_length,
+                session.totalSize(),
+                initial_bf,
+                bytes_complete,
+            ) catch return false;
+            self.piece_tracker = pt;
+            self.resume_last_count = initial_bf.count;
+
+            if (self.resume_pieces) |*rp| {
+                rp.deinit(self.allocator);
+                self.resume_pieces = null;
+            }
+
+            if (bytes_complete == session.totalSize()) {
+                self.state = .seeding;
+                if (self.completion_on == 0) {
+                    self.completion_on = std.time.timestamp();
+                }
+                self.pending_seed_setup = true;
+                // Phase 2 of the piece-hash lifecycle: skip-recheck with
+                // full bitfield means we trust resume DB the torrent is
+                // already verified. The seeder never consults piece hashes
+                // (peers verify with their own copy), so drop the table now.
+                session.freePieces();
+            } else {
+                self.state = .downloading;
+            }
+
+            if (self.pending_peers == null) {
+                self.pending_peers = self.allocator.alloc(std.net.Address, 0) catch null;
+            }
+            return true;
         }
 
         /// Called by the main thread to add peers to the event loop after
@@ -679,12 +679,13 @@ pub fn TorrentSessionOf(comptime IO: type) type {
             var added: u32 = 0;
             for (peers) |addr| {
                 self.conn_attempts += 1;
-                _ = sel.addPeerAutoTransport(addr, tid) catch {
+                _ = sel.enqueuePeerCandidate(addr, tid, .tracker) catch {
                     self.conn_failures += 1;
                     continue;
                 };
                 added += 1;
             }
+            sel.processPeerCandidates();
 
             // DHT peer discovery: force an immediate requery now that the torrent
             // is registered in the event loop (findTorrentIdByInfoHash will work).
@@ -703,8 +704,8 @@ pub fn TorrentSessionOf(comptime IO: type) type {
                     std.log.warn("scheduleCompletedAnnounce failed: {s}", .{@errorName(err)});
                 };
             } else if (self.state == .downloading) {
-                self.scheduleReannounce() catch |err| {
-                    std.log.warn("scheduleReannounce failed: {s}", .{@errorName(err)});
+                self.scheduleStartedAnnounce() catch |err| {
+                    std.log.warn("scheduleStartedAnnounce failed: {s}", .{@errorName(err)});
                 };
             }
 
@@ -929,7 +930,7 @@ pub fn TorrentSessionOf(comptime IO: type) type {
             self.mutex.lock();
             defer self.mutex.unlock();
             if (self.state == .downloading or self.state == .seeding) {
-                self.scheduleReannounce() catch {};
+                self.scheduleStartedAnnounce() catch {};
             }
         }
 
@@ -1417,8 +1418,9 @@ pub fn TorrentSessionOf(comptime IO: type) type {
             const shared_fds = try self.store.?.fileHandles(self.allocator);
             self.shared_fds = shared_fds;
 
-            // Stay in .checking state -- the event loop will run async recheck
-            // via integrateIntoEventLoop -> startRecheck.
+            // Stay in .checking state -- the main loop will finish startup on
+            // the event loop. Normal startup creates the PieceTracker without
+            // reading disk; explicit force-recheck fallback requests a recheck.
             self.state = .checking;
             self.background_init_done.store(true, .release);
         }
@@ -1530,12 +1532,19 @@ pub fn TorrentSessionOf(comptime IO: type) type {
 
         fn makeAnnounceRequest(self: *Self, event: ?tracker.announce.Request.Event) ?tracker.announce.Request {
             const session = &(self.session orelse return null);
+            const speed_stats = if (self.shared_event_loop) |sel|
+                if (self.torrent_id_in_shared) |tid| sel.getSpeedStats(tid) else @import("../io/event_loop.zig").SpeedStats{}
+            else
+                @import("../io/event_loop.zig").SpeedStats{};
+            const left = if (self.piece_tracker) |*pt| pt.bytesRemaining() else session.totalSize();
             return .{
                 .announce_url = "",
                 .info_hash = session.metainfo.info_hash,
                 .peer_id = self.peer_id,
                 .port = self.port,
-                .left = 0,
+                .uploaded = self.baseline_uploaded + speed_stats.ul_total,
+                .downloaded = self.baseline_downloaded + speed_stats.dl_total,
+                .left = left,
                 .event = event,
                 .key = self.tracker_key,
                 .info_hash_v2 = self.info_hash_v2,
@@ -1564,6 +1573,13 @@ pub fn TorrentSessionOf(comptime IO: type) type {
 
         pub fn scheduleCompletedAnnounce(self: *Self) !void {
             const request = self.makeAnnounceRequest(.completed) orelse return;
+            if (self.announcing.swap(true, .acq_rel)) return;
+            errdefer self.announcing.store(false, .release);
+            try self.scheduleAnnounceJobs(request);
+        }
+
+        pub fn scheduleStartedAnnounce(self: *Self) !void {
+            const request = self.makeAnnounceRequest(.started) orelse return;
             if (self.announcing.swap(true, .acq_rel)) return;
             errdefer self.announcing.store(false, .release);
             try self.scheduleAnnounceJobs(request);
@@ -2072,7 +2088,7 @@ pub fn TorrentSessionOf(comptime IO: type) type {
 
             mlog.info("metadata downloaded: {s} ({d} bytes)", .{ self.name, self.total_size });
 
-            // Now do the normal Session.load + PieceStore.init + start recheck path.
+            // Now do the normal Session.load + PieceStore.init path.
             // This is similar to doStartBackground but runs on the event loop thread.
             // The one-time file creation in PieceStore.init is an acceptable exception
             // per the io_uring policy.
@@ -2108,13 +2124,24 @@ pub fn TorrentSessionOf(comptime IO: type) type {
             };
             self.shared_fds = shared_fds;
 
-            // Start async recheck
+            if (!self.startup_recheck_requested) {
+                if (!self.finishStartupWithoutRecheckLocked()) {
+                    self.state = .@"error";
+                    self.error_message = std.fmt.allocPrint(self.allocator, "failed to initialize fresh metadata download", .{}) catch null;
+                }
+                return;
+            }
+
+            self.startup_recheck_requested = false;
+
+            // Explicit force-recheck fallback after metadata fetch verifies
+            // bytes before trusting any pieces.
             self.state = .checking;
             sel.startRecheck(
                 &self.session.?,
                 shared_fds,
                 0,
-                null, // no resume pieces for fresh magnet
+                null,
                 onRecheckComplete,
                 @ptrCast(self),
             ) catch {
@@ -2500,6 +2527,60 @@ fn initTestEventLoop(allocator: std.mem.Allocator) !DefaultEventLoop {
 
 fn deinitTestEventLoop(_: std.mem.Allocator, el: *DefaultEventLoop) void {
     el.deinit();
+}
+
+test "announce request reports bytes left while downloading" {
+    const allocator = std.testing.allocator;
+
+    const pieces = [_]u8{'x'} ** 60;
+    var torrent_buf = std.ArrayList(u8).empty;
+    defer torrent_buf.deinit(allocator);
+    try torrent_buf.appendSlice(allocator, "d8:announce19:http://tracker.test4:infod6:lengthi10e4:name8:test.bin12:piece lengthi4e6:pieces60:");
+    try torrent_buf.appendSlice(allocator, &pieces);
+    try torrent_buf.appendSlice(allocator, "ee");
+
+    var loaded = try session_mod.Session.load(allocator, torrent_buf.items, "/tmp");
+    defer loaded.deinit(allocator);
+
+    var complete = try Bitfield.init(allocator, loaded.pieceCount());
+    defer complete.deinit(allocator);
+
+    var pt = try PieceTracker.init(
+        allocator,
+        loaded.pieceCount(),
+        @intCast(loaded.layout.piece_length),
+        loaded.totalSize(),
+        &complete,
+        0,
+    );
+    defer pt.deinit(allocator);
+
+    _ = pt.completePiece(0, @intCast(try loaded.layout.pieceSize(0)));
+
+    var ts = TorrentSession{
+        .allocator = allocator,
+        .state = .downloading,
+        .torrent_bytes = "",
+        .save_path = "",
+        .info_hash = loaded.metainfo.info_hash,
+        .info_hash_hex = [_]u8{'0'} ** 40,
+        .name = "test.bin",
+        .total_size = loaded.totalSize(),
+        .piece_count = loaded.pieceCount(),
+        .added_on = 0,
+        .peer_id = "-VR0001-ann-left-012".*,
+        .tracker_key = "abcd1234".*,
+        .session = loaded,
+        .piece_tracker = pt,
+        .baseline_uploaded = 55,
+        .baseline_downloaded = 4,
+    };
+
+    const req = ts.makeAnnounceRequest(.started).?;
+    try std.testing.expectEqual(tracker.announce.Request.Event.started, req.event.?);
+    try std.testing.expectEqual(@as(u64, 6), req.left);
+    try std.testing.expectEqual(@as(u64, 4), req.downloaded);
+    try std.testing.expectEqual(@as(u64, 55), req.uploaded);
 }
 
 test "getStats does not mutate completion state" {
