@@ -1,36 +1,61 @@
 const std = @import("std");
 const posix = std.posix;
-const linux = std.os.linux;
 const log = std.log.scoped(.event_loop);
 const pw = @import("../net/peer_wire.zig");
 const ext = @import("../net/extensions.zig");
 const utp_mod = @import("../net/utp.zig");
 const utp_mgr = @import("../net/utp_manager.zig");
+const mse = @import("../crypto/mse.zig");
 const Peer = @import("event_loop.zig").Peer;
 const protocol = @import("protocol.zig");
 const io_interface = @import("io_interface.zig");
+const enetunreach_errno: i32 = 101;
 
 // ── uTP transport ──────────────────────────────────────
 
 /// Submit a RECVMSG SQE for the UDP socket to receive the next datagram.
 pub fn submitUtpRecv(self: anytype) !void {
     if (self.udp_fd < 0) return;
+    const slot_idx = acquireUtpRecvSlot(self) orelse return error.UtpRecvSlotsFull;
+    try submitUtpRecvSlot(self, slot_idx);
+}
+
+pub fn submitInitialUtpRecvs(self: anytype) !void {
+    var submitted: usize = 0;
+    while (submitted < self.utp_recv_slots.len) : (submitted += 1) {
+        submitUtpRecv(self) catch |err| {
+            if (submitted == 0) return err;
+            log.warn("submitted only {d}/{d} UDP recv slots: {s}", .{
+                submitted,
+                self.utp_recv_slots.len,
+                @errorName(err),
+            });
+            return;
+        };
+    }
+}
+
+fn submitUtpRecvSlot(self: anytype, slot_idx: u16) !void {
+    if (self.udp_fd < 0) return;
+    const slot = &self.utp_recv_slots[slot_idx];
+    slot.active = true;
+    errdefer slot.active = false;
 
     // Set up iovec pointing to the recv buffer
-    self.utp_recv_iov[0] = .{
-        .base = &self.utp_recv_buf,
-        .len = self.utp_recv_buf.len,
+    slot.iov[0] = .{
+        .base = &slot.data,
+        .len = slot.data.len,
     };
 
     // Initialize the source address storage (large enough for IPv4 and IPv6).
-    self.utp_recv_addr = std.mem.zeroes(std.net.Address);
+    slot.addr = std.mem.zeroes(std.net.Address);
 
     // Set up msghdr. namelen is set to the full storage size so the kernel
     // can write an IPv6 sockaddr_in6 if needed; it updates namelen on return.
-    self.utp_recv_msg = .{
-        .name = @ptrCast(&self.utp_recv_addr),
+    slot.msg = .{
+        .name = @ptrCast(&slot.addr),
         .namelen = @sizeOf(std.net.Address),
-        .iov = &self.utp_recv_iov,
+        .iov = &slot.iov,
         .iovlen = 1,
         .control = null,
         .controllen = 0,
@@ -38,58 +63,87 @@ pub fn submitUtpRecv(self: anytype) !void {
     };
 
     try self.io.recvmsg(
-        .{ .fd = self.udp_fd, .msg = &self.utp_recv_msg },
-        &self.utp_recv_completion,
+        .{ .fd = self.udp_fd, .msg = &slot.msg },
+        &slot.completion,
         self,
         utpRecvCompleteFor(@TypeOf(self.*)),
     );
+    self.utp_recv_active += 1;
 }
 
 fn utpRecvCompleteFor(comptime EL: type) io_interface.Callback {
     return struct {
         fn cb(
             userdata: ?*anyopaque,
-            _: *io_interface.Completion,
+            completion: *io_interface.Completion,
             result: io_interface.Result,
         ) io_interface.CallbackAction {
             const self: *EL = @ptrCast(@alignCast(userdata.?));
+            const slot_idx = findUtpRecvSlotByCompletion(self, completion) orelse return .disarm;
             const res: i32 = switch (result) {
                 .recvmsg => |r| if (r) |n|
                     std.math.cast(i32, n) orelse std.math.maxInt(i32)
                 else |err| if (err == error.OperationCanceled) -125 else -1, // -ECANCELED
                 else => -1,
             };
-            handleUtpRecvResult(self, res);
+            handleUtpRecvResult(self, slot_idx, res);
             return .disarm; // re-armed by handleUtpRecvResult via submitUtpRecv
         }
     }.cb;
 }
 
+fn acquireUtpRecvSlot(self: anytype) ?u16 {
+    const len = self.utp_recv_slots.len;
+    var i: usize = 0;
+    while (i < len) : (i += 1) {
+        const idx: u16 = @intCast((@as(usize, self.utp_recv_next_slot) + i) % len);
+        if (self.utp_recv_slots[idx].active) continue;
+        self.utp_recv_next_slot = @intCast((@as(usize, idx) + 1) % len);
+        return idx;
+    }
+    return null;
+}
+
+fn findUtpRecvSlotByCompletion(self: anytype, completion: *io_interface.Completion) ?u16 {
+    for (&self.utp_recv_slots, 0..) |*slot, i| {
+        if (&slot.completion == completion) return @intCast(i);
+    }
+    return null;
+}
+
 /// Submit a SENDMSG SQE to send a uTP packet over UDP.
 pub fn submitUtpSend(self: anytype, data: []const u8, remote: std.net.Address) !void {
     if (self.udp_fd < 0) return;
+    const slot_idx = acquireUtpSendSlot(self) orelse return error.UtpSendSlotsFull;
+    const slot = &self.utp_send_slots[slot_idx];
+    slot.active = true;
+    errdefer slot.active = false;
 
     // Copy data into send buffer
-    const len = @min(data.len, self.utp_send_buf.len);
-    @memcpy(self.utp_send_buf[0..len], data[0..len]);
+    const len = @min(data.len, slot.data.len);
+    slot.len = len;
+    slot.remote = remote;
+    @memcpy(slot.data[0..len], data[0..len]);
 
     // Set up iovec
     // Need to cast the const buffer pointer to iovec_const
-    self.utp_send_iov[0] = .{
-        .base = @ptrCast(&self.utp_send_buf),
+    slot.iov[0] = .{
+        .base = @ptrCast(&slot.data),
         .len = len,
     };
+
+    slot.original_family = remote.any.family;
 
     // Set up destination address. If the UDP socket is AF.INET6 (dual-stack)
     // and the remote is an IPv4 address, convert to IPv4-mapped IPv6 so the
     // kernel can route it correctly.
-    self.utp_send_addr = toSendAddr(remote);
+    slot.addr = toSendAddr(remote);
 
     // Set up msghdr_const
-    self.utp_send_msg = .{
-        .name = @ptrCast(&self.utp_send_addr),
-        .namelen = self.utp_send_addr.getOsSockLen(),
-        .iov = @ptrCast(&self.utp_send_iov),
+    slot.msg = .{
+        .name = @ptrCast(&slot.addr),
+        .namelen = slot.addr.getOsSockLen(),
+        .iov = @ptrCast(&slot.iov),
         .iovlen = 1,
         .control = null,
         .controllen = 0,
@@ -97,11 +151,12 @@ pub fn submitUtpSend(self: anytype, data: []const u8, remote: std.net.Address) !
     };
 
     try self.io.sendmsg(
-        .{ .fd = self.udp_fd, .msg = &self.utp_send_msg },
-        &self.utp_send_completion,
+        .{ .fd = self.udp_fd, .msg = &slot.msg },
+        &slot.completion,
         self,
         utpSendCompleteFor(@TypeOf(self.*)),
     );
+    self.utp_send_inflight += 1;
     self.utp_send_pending = true;
 }
 
@@ -109,21 +164,25 @@ fn utpSendCompleteFor(comptime EL: type) io_interface.Callback {
     return struct {
         fn cb(
             userdata: ?*anyopaque,
-            _: *io_interface.Completion,
+            completion: *io_interface.Completion,
             result: io_interface.Result,
         ) io_interface.CallbackAction {
             const self: *EL = @ptrCast(@alignCast(userdata.?));
+            const slot_idx = findUtpSendSlotByCompletion(self, completion) orelse {
+                handleUtpSendError(self, null, error.UnexpectedCompletion);
+                return .disarm;
+            };
             switch (result) {
                 .sendmsg => |r| {
                     if (r) |n| {
                         const res = std.math.cast(i32, n) orelse std.math.maxInt(i32);
-                        handleUtpSendResult(self, res);
+                        handleUtpSendResult(self, slot_idx, res);
                     } else |err| {
-                        handleUtpSendError(self, err);
+                        handleUtpSendError(self, slot_idx, err);
                     }
                 },
                 else => {
-                    handleUtpSendError(self, error.UnexpectedCompletion);
+                    handleUtpSendError(self, slot_idx, error.UnexpectedCompletion);
                 },
             }
             return .disarm;
@@ -131,47 +190,118 @@ fn utpSendCompleteFor(comptime EL: type) io_interface.Callback {
     }.cb;
 }
 
-/// Queue a uTP packet for sending. If no send is in flight, submit immediately.
-pub fn utpSendPacket(self: anytype, data: []const u8, remote: std.net.Address) void {
-    const UtpQueuedPacket = @TypeOf(self.*).UtpQueuedPacket;
-    if (self.utp_send_pending) {
-        // Queue for later
-        var pkt = UtpQueuedPacket{
-            .len = @min(data.len, 1500),
-            .remote = remote,
-        };
-        @memcpy(pkt.data[0..pkt.len], data[0..pkt.len]);
-        self.utp_send_queue.append(self.allocator, pkt) catch {
-            log.warn("uTP send queue full, dropping packet", .{});
-        };
-    } else {
-        submitUtpSend(self, data, remote) catch |err| {
-            log.warn("uTP send failed: {s}", .{@errorName(err)});
-        };
+fn acquireUtpSendSlot(self: anytype) ?u16 {
+    const len = self.utp_send_slots.len;
+    var i: usize = 0;
+    while (i < len) : (i += 1) {
+        const idx: u16 = @intCast((@as(usize, self.utp_send_next_slot) + i) % len);
+        if (self.utp_send_slots[idx].active) continue;
+        self.utp_send_next_slot = @intCast((@as(usize, idx) + 1) % len);
+        return idx;
     }
+    return null;
+}
+
+fn findUtpSendSlotByCompletion(self: anytype, completion: *io_interface.Completion) ?u16 {
+    for (&self.utp_send_slots, 0..) |*slot, i| {
+        if (&slot.completion == completion) return @intCast(i);
+    }
+    return null;
+}
+
+fn releaseUtpSendSlot(self: anytype, maybe_slot_idx: ?u16) void {
+    const slot_idx = maybe_slot_idx orelse return;
+    if (slot_idx >= self.utp_send_slots.len) return;
+    const slot = &self.utp_send_slots[slot_idx];
+    if (!slot.active) return;
+    slot.active = false;
+    slot.len = 0;
+    if (self.utp_send_inflight > 0) self.utp_send_inflight -= 1;
+    self.utp_send_pending = self.utp_send_inflight > 0;
+}
+
+fn queueUtpPacket(self: anytype, data: []const u8, remote: std.net.Address) void {
+    const UtpQueuedPacket = @TypeOf(self.*).UtpQueuedPacket;
+    var pkt = UtpQueuedPacket{
+        .len = @min(data.len, 1500),
+        .remote = remote,
+    };
+    @memcpy(pkt.data[0..pkt.len], data[0..pkt.len]);
+    const priority = isPriorityUtpPacket(data);
+    if (priority) {
+        for (self.utp_send_queue.items) |*queued| {
+            if (!queued.remote.eql(remote)) continue;
+            if (!isPriorityUtpPacket(queued.data[0..queued.len])) continue;
+            queued.* = pkt;
+            return;
+        }
+    }
+    const insert_idx: usize = if (priority) 0 else self.utp_send_queue.items.len;
+    self.utp_send_queue.insert(self.allocator, insert_idx, pkt) catch {
+        log.warn("uTP send queue full, dropping packet", .{});
+    };
+}
+
+/// Queue a uTP packet for sending. Submits immediately while send slots are available.
+pub fn utpSendPacket(self: anytype, data: []const u8, remote: std.net.Address) void {
+    if (shouldDropUdpPacket(self, remote)) return;
+
+    submitUtpSend(self, data, remote) catch |err| switch (err) {
+        error.UtpSendSlotsFull => queueUtpPacket(self, data, remote),
+        else => {
+            rememberUdpSendError(self, err, remote.any.family);
+            log.warn("uTP send failed: {s}", .{@errorName(err)});
+        },
+    };
+}
+
+fn isPriorityUtpPacket(data: []const u8) bool {
+    if (data.len < utp_mod.Header.size) return false;
+    if ((data[0] & 0x0f) != utp_mod.version) return false;
+    const packet_type = data[0] >> 4;
+    return packet_type == @intFromEnum(utp_mod.PacketType.st_state) or
+        packet_type == @intFromEnum(utp_mod.PacketType.st_reset) or
+        packet_type == @intFromEnum(utp_mod.PacketType.st_fin);
 }
 
 /// Drain the uTP send queue: submit the next queued packet.
 pub fn utpDrainSendQueue(self: anytype) void {
-    if (self.utp_send_queue.items.len == 0) return;
-    const pkt = self.utp_send_queue.orderedRemove(0);
-    submitUtpSend(self, pkt.data[0..pkt.len], pkt.remote) catch |err| {
-        log.warn("uTP queued send failed: {s}", .{@errorName(err)});
-        // Try next packet
-        self.utp_send_pending = false;
-        utpDrainSendQueue(self);
-    };
+    while (self.utp_send_queue.items.len > 0) {
+        const pkt = self.utp_send_queue.orderedRemove(0);
+        if (shouldDropUdpPacket(self, pkt.remote)) continue;
+        submitUtpSend(self, pkt.data[0..pkt.len], pkt.remote) catch |err| {
+            if (err == error.UtpSendSlotsFull) {
+                self.utp_send_queue.insert(self.allocator, 0, pkt) catch {
+                    log.warn("uTP send queue full, dropping packet", .{});
+                };
+                return;
+            }
+            rememberUdpSendError(self, err, pkt.remote.any.family);
+            log.warn("uTP queued send failed: {s}", .{@errorName(err)});
+            continue;
+        };
+    }
 }
 
-fn handleUtpRecvResult(self: anytype, recv_res: i32) void {
+fn handleUtpRecvResult(self: anytype, slot_idx: u16, recv_res: i32) void {
+    const slot = &self.utp_recv_slots[slot_idx];
+    if (slot.active) {
+        slot.active = false;
+        if (self.utp_recv_active > 0) self.utp_recv_active -= 1;
+    }
+
     // Always re-submit recv for the next datagram
     defer submitUtpRecv(self) catch |err| {
-        log.err("failed to re-submit uTP recv: {s}", .{@errorName(err)});
+        if (self.udp_fd >= 0) {
+            log.err("failed to re-submit uTP recv: {s}", .{@errorName(err)});
+        }
     };
 
     if (recv_res < 0) {
         // ECANCELED is expected when stopUtpListener cancels the pending recvmsg.
-        if (recv_res != -125) {
+        // Closing the UDP fd during shutdown also completes posted recv slots
+        // with errors; udp_fd is already -1 in that path.
+        if (recv_res != -125 and self.udp_fd >= 0) {
             log.warn("uTP recvmsg failed: res={d}", .{recv_res});
         }
         return;
@@ -180,13 +310,13 @@ fn handleUtpRecvResult(self: anytype, recv_res: i32) void {
     const datagram_len: usize = @intCast(recv_res);
     if (datagram_len == 0) return;
 
-    const data = self.utp_recv_buf[0..datagram_len];
+    const data = slot.data[0..datagram_len];
 
     // The remote address was written into utp_recv_addr by the kernel.
     // On a dual-stack IPv6 socket, IPv4 peers arrive as IPv4-mapped IPv6
     // addresses (::ffff:x.x.x.x, AF.INET6). Normalize these back to AF.INET
     // so DHT and uTP code can treat them uniformly.
-    const remote = normalizeMappedAddr(self.utp_recv_addr);
+    const remote = normalizeMappedAddr(slot.addr);
 
     // Demux DHT vs uTP: bencode dicts start with 'd' (0x64), uTP starts with version nibble 0x01
     if (data[0] == 'd') {
@@ -206,7 +336,7 @@ fn handleUtpRecvResult(self: anytype, recv_res: i32) void {
 
     // Send response packet if any
     if (result.response) |resp| {
-        utpSendPacket(self, &resp, result.remote);
+        utpSendPacket(self, resp[0..result.response_len], result.remote);
     }
 
     // Handle new inbound connections
@@ -239,10 +369,13 @@ fn handleUtpRecvResult(self: anytype, recv_res: i32) void {
     }
 }
 
-fn handleUtpSendResult(self: anytype, send_res: i32) void {
-    self.utp_send_pending = false;
+fn handleUtpSendResult(self: anytype, slot_idx: u16, send_res: i32) void {
+    releaseUtpSendSlot(self, slot_idx);
 
     if (send_res < 0) {
+        if (send_res == -enetunreach_errno) {
+            rememberUdpSendError(self, error.NetworkUnreachable, self.utp_send_slots[slot_idx].original_family);
+        }
         log.warn("uTP sendmsg failed: res={d}", .{send_res});
     }
 
@@ -250,10 +383,28 @@ fn handleUtpSendResult(self: anytype, send_res: i32) void {
     utpDrainSendQueue(self);
 }
 
-fn handleUtpSendError(self: anytype, err: anyerror) void {
-    self.utp_send_pending = false;
+fn handleUtpSendError(self: anytype, maybe_slot_idx: ?u16, err: anyerror) void {
+    const original_family = if (maybe_slot_idx) |slot_idx|
+        self.utp_send_slots[slot_idx].original_family
+    else
+        @as(posix.sa_family_t, 0);
+    releaseUtpSendSlot(self, maybe_slot_idx);
+    rememberUdpSendError(self, err, original_family);
     log.warn("uTP sendmsg failed: {s}", .{@errorName(err)});
     utpDrainSendQueue(self);
+}
+
+fn shouldDropUdpPacket(self: anytype, remote: std.net.Address) bool {
+    return self.udp_ipv6_unreachable and remote.any.family == posix.AF.INET6;
+}
+
+fn rememberUdpSendError(self: anytype, err: anyerror, original_family: posix.sa_family_t) void {
+    if (err != error.NetworkUnreachable) return;
+    if (original_family != posix.AF.INET6) return;
+    if (!self.udp_ipv6_unreachable) {
+        log.warn("IPv6 UDP route unreachable; suppressing further IPv6 DHT/uTP sends", .{});
+    }
+    self.udp_ipv6_unreachable = true;
 }
 
 /// Check if an outbound uTP connection just completed the three-way
@@ -275,11 +426,39 @@ fn checkOutboundUtpConnect(self: anytype, utp_slot: u16, mgr: *utp_mgr.UtpManage
 
     log.info("outbound uTP connection established to {f}", .{peer.address});
 
-    // Build and send BitTorrent handshake over uTP.
-    const tc = self.getTorrentContext(peer.torrent_id) orelse {
+    if (shouldInitiateUtpMse(self, peer)) {
+        startUtpMseInitiator(self, peer_slot) catch {
+            self.removePeer(peer_slot);
+        };
+        return;
+    }
+
+    sendUtpBtHandshake(self, peer_slot) catch {
         self.removePeer(peer_slot);
         return;
     };
+}
+
+fn shouldInitiateUtpMse(self: anytype, peer: *const Peer) bool {
+    if (self.encryption_mode == .disabled) return false;
+    if (peer.mse_rejected) return false;
+    if (peer.mse_fallback) return false;
+    if (self.encryption_mode == .enabled) return false;
+    return true;
+}
+
+fn startUtpMseInitiator(self: anytype, peer_slot: u16) !void {
+    const peer = &self.peers[peer_slot];
+    const swarm_hash = self.selectedPeerSwarmHash(peer);
+    const mi = try self.allocator.create(mse.MseInitiatorHandshake);
+    mi.* = mse.MseInitiatorHandshake.init(&self.random, swarm_hash, self.encryption_mode);
+    peer.mse_initiator = mi;
+    executeUtpMseAction(self, peer_slot, mi.start(), true);
+}
+
+fn sendUtpBtHandshake(self: anytype, peer_slot: u16) !void {
+    const peer = &self.peers[peer_slot];
+    const tc = self.getTorrentContext(peer.torrent_id) orelse return error.TorrentNotFound;
     const swarm_hash = self.selectedPeerSwarmHash(peer);
     var buf: [68]u8 = undefined;
     buf[0] = pw.protocol_length;
@@ -293,14 +472,81 @@ fn checkOutboundUtpConnect(self: anytype, utp_slot: u16, mgr: *utp_mgr.UtpManage
     @memcpy(buf[28..48], &swarm_hash);
     @memcpy(buf[48..68], &tc.peer_id);
 
-    utpSendData(self, peer_slot, &buf) catch {
-        self.removePeer(peer_slot);
-        return;
-    };
-
-    // Transition to waiting for the peer's handshake response.
+    try utpSendData(self, peer_slot, &buf);
     peer.state = .handshake_recv;
     peer.handshake_offset = 0;
+}
+
+fn executeUtpMseAction(self: anytype, peer_slot: u16, action: mse.MseAction, is_initiator: bool) void {
+    const peer = &self.peers[peer_slot];
+    switch (action) {
+        .send => |data| {
+            peer.state = if (is_initiator) .mse_handshake_send else .mse_resp_send;
+            peer.mse_send_remaining = data;
+            utpSendData(self, peer_slot, data) catch {
+                handleUtpMseFailure(self, peer_slot, is_initiator);
+                return;
+            };
+            peer.mse_send_remaining = &.{};
+            const next = if (is_initiator)
+                (peer.mse_initiator orelse {
+                    self.removePeer(peer_slot);
+                    return;
+                }).feedSend()
+            else
+                (peer.mse_responder orelse {
+                    self.removePeer(peer_slot);
+                    return;
+                }).feedSend();
+            executeUtpMseAction(self, peer_slot, next, is_initiator);
+        },
+        .recv => |buf| {
+            peer.state = if (is_initiator) .mse_handshake_recv else .mse_resp_recv;
+            peer.mse_recv_remaining = buf;
+        },
+        .complete => {
+            if (is_initiator) {
+                const mi = peer.mse_initiator orelse {
+                    self.removePeer(peer_slot);
+                    return;
+                };
+                peer.crypto = mi.result();
+                self.allocator.destroy(mi);
+                peer.mse_initiator = null;
+                log.info("slot {d}: uTP MSE handshake complete (initiator, method={s})", .{
+                    peer_slot,
+                    if (peer.crypto.crypto_method == mse.crypto_rc4) "RC4" else "plaintext",
+                });
+                sendUtpBtHandshake(self, peer_slot) catch {
+                    self.removePeer(peer_slot);
+                };
+            } else {
+                self.removePeer(peer_slot);
+            }
+        },
+        .failed => |err| {
+            log.debug("slot {d}: uTP MSE handshake failed: {s}", .{ peer_slot, @tagName(err) });
+            handleUtpMseFailure(self, peer_slot, is_initiator);
+        },
+    }
+}
+
+fn handleUtpMseFailure(self: anytype, peer_slot: u16, is_initiator: bool) void {
+    const peer = &self.peers[peer_slot];
+    if (is_initiator) {
+        if (peer.mse_initiator) |mi| {
+            self.allocator.destroy(mi);
+            peer.mse_initiator = null;
+        }
+    } else {
+        if (peer.mse_responder) |mr| {
+            self.allocator.destroy(mr);
+            peer.mse_responder = null;
+        }
+    }
+    peer.mse_recv_remaining = &.{};
+    peer.mse_send_remaining = &.{};
+    self.removePeer(peer_slot);
 }
 
 /// Accept pending inbound uTP connections and create Peer entries.
@@ -380,13 +626,18 @@ fn deliverUtpData(self: anytype, utp_slot: u16, data: []const u8) void {
     const peer = &self.peers[peer_slot];
 
     if (peer.state == .free) return;
+    peer.last_activity = self.clock.now();
 
     switch (peer.state) {
+        .mse_handshake_recv, .mse_resp_recv => {
+            deliverUtpMseData(self, utp_slot, data);
+        },
         .handshake_recv => {
             // Outbound uTP peer: receiving the peer's handshake response.
             const remaining = 68 - peer.handshake_offset;
             const to_copy = @min(data.len, remaining);
             @memcpy(peer.handshake_buf[peer.handshake_offset .. peer.handshake_offset + to_copy], data[0..to_copy]);
+            peer.crypto.decryptBuf(peer.handshake_buf[peer.handshake_offset .. peer.handshake_offset + to_copy]);
             peer.handshake_offset += to_copy;
 
             if (peer.handshake_offset >= 68) {
@@ -403,6 +654,7 @@ fn deliverUtpData(self: anytype, utp_slot: u16, data: []const u8) void {
             const remaining = 68 - peer.handshake_offset;
             const to_copy = @min(data.len, remaining);
             @memcpy(peer.handshake_buf[peer.handshake_offset .. peer.handshake_offset + to_copy], data[0..to_copy]);
+            peer.crypto.decryptBuf(peer.handshake_buf[peer.handshake_offset .. peer.handshake_offset + to_copy]);
             peer.handshake_offset += to_copy;
 
             if (peer.handshake_offset >= 68) {
@@ -420,6 +672,7 @@ fn deliverUtpData(self: anytype, utp_slot: u16, data: []const u8) void {
             const remaining = 4 - peer.header_offset;
             const to_copy = @min(data.len, remaining);
             @memcpy(peer.header_buf[peer.header_offset .. peer.header_offset + to_copy], data[0..to_copy]);
+            peer.crypto.decryptBuf(peer.header_buf[peer.header_offset .. peer.header_offset + to_copy]);
             peer.header_offset += to_copy;
 
             if (peer.header_offset >= 4) {
@@ -459,6 +712,7 @@ fn deliverUtpData(self: anytype, utp_slot: u16, data: []const u8) void {
             const to_copy = @min(data.len, remaining);
             if (peer.body_buf) |buf| {
                 @memcpy(buf[peer.body_offset .. peer.body_offset + to_copy], data[0..to_copy]);
+                peer.crypto.decryptBuf(buf[peer.body_offset .. peer.body_offset + to_copy]);
             }
             peer.body_offset += to_copy;
 
@@ -481,6 +735,37 @@ fn deliverUtpData(self: anytype, utp_slot: u16, data: []const u8) void {
             }
         },
         else => {},
+    }
+}
+
+fn deliverUtpMseData(self: anytype, utp_slot: u16, data: []const u8) void {
+    const peer_slot = findPeerByUtpSlot(self, utp_slot) orelse return;
+    const peer = &self.peers[peer_slot];
+    if (peer.mse_recv_remaining.len == 0) {
+        self.removePeer(peer_slot);
+        return;
+    }
+
+    const to_copy = @min(data.len, peer.mse_recv_remaining.len);
+    @memcpy(peer.mse_recv_remaining[0..to_copy], data[0..to_copy]);
+    peer.mse_recv_remaining = peer.mse_recv_remaining[to_copy..];
+
+    const is_initiator = peer.state == .mse_handshake_recv;
+    const action = if (is_initiator)
+        (peer.mse_initiator orelse {
+            self.removePeer(peer_slot);
+            return;
+        }).feedRecv(to_copy)
+    else
+        (peer.mse_responder orelse {
+            self.removePeer(peer_slot);
+            return;
+        }).feedRecv(to_copy);
+    executeUtpMseAction(self, peer_slot, action, is_initiator);
+
+    if (self.peers[peer_slot].state == .free) return;
+    if (to_copy < data.len) {
+        deliverUtpData(self, utp_slot, data[to_copy..]);
     }
 }
 
@@ -592,7 +877,15 @@ pub fn utpSendData(self: anytype, peer_slot: u16, data: []const u8) !void {
     const mgr = self.utp_manager orelse return error.NoUtpManager;
     const sock = mgr.getSocket(utp_slot) orelse return error.NoSocket;
 
-    try sock.queueSendBytes(data);
+    if (peer.crypto.isEncrypted()) {
+        const encrypted = try self.allocator.alloc(u8, data.len);
+        defer self.allocator.free(encrypted);
+        @memcpy(encrypted, data);
+        peer.crypto.encryptBuf(encrypted);
+        try sock.queueSendBytes(encrypted);
+    } else {
+        try sock.queueSendBytes(data);
+    }
     try flushUtpPendingData(self, utp_slot);
 }
 
@@ -607,7 +900,9 @@ fn flushUtpPendingData(self: anytype, utp_slot: u16) !void {
     while (sock.hasPendingSend()) {
         const now_us = self.clock.nowUs32();
         const pending = sock.pendingSendSlice();
-        const chunk_len = @min(pending.len, max_payload);
+        const available_window: usize = sock.availablePayloadWindow();
+        if (available_window == 0) return;
+        const chunk_len = @min(pending.len, @min(max_payload, available_window));
 
         const hdr_bytes = mgr.createDataPacket(utp_slot, @intCast(chunk_len), now_us) orelse {
             // Congestion/receive window full. The unsent tail stays in
@@ -794,17 +1089,19 @@ pub fn utpTick(self: anytype) void {
     const mgr = self.utp_manager orelse return;
     const now_us = self.clock.nowUs32();
 
+    var connect_timeout_buf: [utp_mgr.max_connections]u16 = undefined;
+    const connect_timeout_count = mgr.checkUnconfirmedConnectTimeouts(now_us, &connect_timeout_buf);
+    for (connect_timeout_buf[0..connect_timeout_count]) |utp_slot| {
+        failUnconfirmedUtpConnect(self, utp_slot, now_us);
+    }
+
     var timeout_buf: [64]u16 = undefined;
     const timeout_count = mgr.checkTimeouts(now_us, &timeout_buf);
 
     // Close connections that have backed off too much.
     for (timeout_buf[0..timeout_count]) |utp_slot| {
         const sock = mgr.getSocket(utp_slot) orelse continue;
-        if (sock.unconfirmedConnectTimedOut(now_us)) {
-            failUnconfirmedUtpConnect(self, utp_slot, now_us);
-            continue;
-        }
-        if (sock.rto >= 30_000_000) { // 30 seconds
+        if (sock.rto >= 60_000_000) { // 60 seconds, matching the uTP max RTO.
             const remote = mgr.getRemoteAddress(utp_slot);
             if (mgr.reset(utp_slot, now_us)) |rst| {
                 if (remote) |addr| {
@@ -863,6 +1160,26 @@ test "uTP handshake delivery rejects invalid protocol prefix" {
     deliverUtpData(&el, 7, &handshake);
 
     try std.testing.expectEqual(event_loop_mod.PeerState.free, el.peers[slot].state);
+}
+
+test "uTP send queue prioritizes ACK/control packets" {
+    const ack_header = utp_mod.Header{
+        .packet_type = .st_state,
+        .extension = .none,
+        .connection_id = 1,
+        .timestamp_us = 2,
+        .timestamp_diff_us = 3,
+        .wnd_size = 4,
+        .seq_nr = 5,
+        .ack_nr = 6,
+    };
+    var ack = ack_header.encode();
+    var data = ack;
+    data[0] = (@as(u8, @intFromEnum(utp_mod.PacketType.st_data)) << 4) | utp_mod.version;
+
+    try std.testing.expect(isPriorityUtpPacket(&ack));
+    try std.testing.expect(!isPriorityUtpPacket(&data));
+    try std.testing.expect(!isPriorityUtpPacket("d1:ad2:id20:abcdefghijklmnopqrstee"));
 }
 
 test "uTP body delivery does not re-arm a slot removed by message processing" {

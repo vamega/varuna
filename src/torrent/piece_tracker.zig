@@ -515,6 +515,12 @@ pub const PieceTracker = struct {
         return self.total_size - self.bytes_complete;
     }
 
+    pub fn bytesComplete(self: *PieceTracker) u64 {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        return self.bytes_complete;
+    }
+
     fn clearInProgress(self: *PieceTracker, piece_index: u32) void {
         self.in_progress.clear(piece_index);
     }
@@ -537,6 +543,7 @@ test "claim and complete pieces" {
 
     _ = tracker.completePiece(0, 4);
     try std.testing.expectEqual(@as(u32, 1), tracker.completedCount());
+    try std.testing.expectEqual(@as(u64, 4), tracker.bytesComplete());
     try std.testing.expect(!tracker.isComplete());
 
     // Piece 0 should not be claimable again

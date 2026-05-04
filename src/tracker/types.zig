@@ -11,7 +11,7 @@ pub const Request = struct {
     left: u64,
     event: ?Event = .started,
     key: ?[8]u8 = null,
-    numwant: u32 = 50,
+    numwant: u32 = 200,
 
     info_hash_v2: ?[32]u8 = null,
 

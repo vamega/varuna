@@ -221,6 +221,10 @@ pub fn HttpExecutorOf(comptime IO: type) type {
             recv_buf: std.ArrayList(u8) = std.ArrayList(u8).empty,
             recv_tmp: [8192]u8 = undefined,
             tls_send_buf: [16384]u8 = undefined,
+            tls_send_len: usize = 0,
+            tls_send_offset: usize = 0,
+            tls_handshake_bytes_sent: usize = 0,
+            tls_handshake_bytes_received: usize = 0,
             deadline: i64 = 0,
             pooled: bool = false,
             /// Tracks how many body bytes have been written into target_buf.
@@ -260,6 +264,10 @@ pub fn HttpExecutorOf(comptime IO: type) type {
                 self.send_offset = 0;
                 self.recv_buf.deinit(allocator);
                 self.recv_buf = std.ArrayList(u8).empty;
+                self.tls_send_len = 0;
+                self.tls_send_offset = 0;
+                self.tls_handshake_bytes_sent = 0;
+                self.tls_handshake_bytes_received = 0;
                 self.fd = -1;
                 self.state = .free;
                 self.generation +%= 1;
@@ -279,36 +287,57 @@ pub fn HttpExecutorOf(comptime IO: type) type {
                 host: [253]u8 = undefined,
                 host_len: u8 = 0,
                 port: u16 = 0,
+                is_https: bool = false,
                 fd: posix.fd_t = -1,
+                tls_stream: ?TlsStream = null,
                 stored_at: i64 = 0,
             };
 
-            fn get(self: *ConnectionPool, host_str: []const u8, port: u16, now: i64) ?posix.fd_t {
+            const PooledConnection = struct {
+                fd: posix.fd_t,
+                tls_stream: ?TlsStream = null,
+            };
+
+            fn dropEntry(e: *Entry) void {
+                if (e.fd >= 0) {
+                    posix.close(e.fd);
+                    e.fd = -1;
+                }
+                if (e.tls_stream) |*tls| {
+                    tls.deinit();
+                    e.tls_stream = null;
+                }
+                e.host_len = 0;
+            }
+
+            fn get(self: *ConnectionPool, host_str: []const u8, port: u16, is_https: bool, now: i64) ?PooledConnection {
                 for (&self.entries) |*e| {
                     if (e.fd < 0) continue;
                     if (now - e.stored_at > max_age_s) {
-                        posix.close(e.fd);
-                        e.fd = -1;
+                        dropEntry(e);
                         continue;
                     }
-                    if (e.port == port and e.host_len == host_str.len and
+                    if (e.port == port and e.is_https == is_https and e.host_len == host_str.len and
                         std.mem.eql(u8, e.host[0..e.host_len], host_str))
                     {
                         const fd = e.fd;
+                        const tls_stream = e.tls_stream;
                         e.fd = -1;
-                        return fd;
+                        e.tls_stream = null;
+                        e.host_len = 0;
+                        return .{ .fd = fd, .tls_stream = tls_stream };
                     }
                 }
                 return null;
             }
 
-            fn put(self: *ConnectionPool, host_str: []const u8, port: u16, fd: posix.fd_t, now: i64) void {
+            fn put(self: *ConnectionPool, host_str: []const u8, port: u16, is_https: bool, fd: posix.fd_t, tls_stream: ?TlsStream, now: i64) void {
                 // Find empty slot or evict oldest
                 var oldest_idx: usize = 0;
                 var oldest_time: i64 = std.math.maxInt(i64);
                 for (&self.entries, 0..) |e, i| {
                     if (e.fd < 0) {
-                        self.storeAt(i, host_str, port, fd, now);
+                        self.storeAt(i, host_str, port, is_https, fd, tls_stream, now);
                         return;
                     }
                     if (e.stored_at < oldest_time) {
@@ -316,14 +345,16 @@ pub fn HttpExecutorOf(comptime IO: type) type {
                         oldest_idx = i;
                     }
                 }
-                posix.close(self.entries[oldest_idx].fd);
-                self.storeAt(oldest_idx, host_str, port, fd, now);
+                dropEntry(&self.entries[oldest_idx]);
+                self.storeAt(oldest_idx, host_str, port, is_https, fd, tls_stream, now);
             }
 
-            fn storeAt(self: *ConnectionPool, idx: usize, host_str: []const u8, port: u16, fd: posix.fd_t, now: i64) void {
+            fn storeAt(self: *ConnectionPool, idx: usize, host_str: []const u8, port: u16, is_https: bool, fd: posix.fd_t, tls_stream: ?TlsStream, now: i64) void {
                 var e = &self.entries[idx];
                 e.fd = fd;
                 e.port = port;
+                e.is_https = is_https;
+                e.tls_stream = tls_stream;
                 e.stored_at = now;
                 e.host_len = @intCast(host_str.len);
                 @memcpy(e.host[0..host_str.len], host_str);
@@ -331,10 +362,7 @@ pub fn HttpExecutorOf(comptime IO: type) type {
 
             fn closeAll(self: *ConnectionPool) void {
                 for (&self.entries) |*e| {
-                    if (e.fd >= 0) {
-                        posix.close(e.fd);
-                        e.fd = -1;
-                    }
+                    dropEntry(e);
                 }
             }
         };
@@ -563,10 +591,20 @@ pub fn HttpExecutorOf(comptime IO: type) type {
 
             // Check connection pool first.
             const now = std.time.timestamp();
-            if (!slot.parsed.is_https) {
-                if (self.pool.get(host, slot.parsed.port, now)) |fd| {
-                    slot.fd = fd;
-                    slot.pooled = true;
+            if (self.pool.get(host, slot.parsed.port, slot.parsed.is_https, now)) |pooled| {
+                slot.fd = pooled.fd;
+                slot.pooled = true;
+                if (slot.parsed.is_https) {
+                    slot.tls_stream = pooled.tls_stream orelse {
+                        posix.close(slot.fd);
+                        slot.fd = -1;
+                        slot.pooled = false;
+                        self.startConnect(slot, slot_idx);
+                        return true;
+                    };
+                    self.buildAndSendTlsRequest(slot, slot_idx);
+                    return true;
+                } else {
                     self.buildAndSendRequest(slot, slot_idx);
                     return true;
                 }
@@ -872,42 +910,49 @@ pub fn HttpExecutorOf(comptime IO: type) type {
         fn advanceTlsHandshake(self: *Self, slot: *RequestSlot, slot_idx: u16) void {
             var tls = &(slot.tls_stream orelse return);
 
-            const result = tls.doHandshake() catch {
-                self.completeSlot(slot_idx, .{ .err = error.TlsHandshakeFailed });
+            const result = tls.doHandshake() catch |err| {
+                self.completeSlot(slot_idx, .{ .err = err });
                 return;
             };
 
             switch (result) {
                 .complete => {
-                    self.buildRequest(slot) catch {
-                        self.completeSlot(slot_idx, .{ .err = error.OutOfMemory });
-                        return;
-                    };
-                    // Encrypt the request.
-                    _ = tls.writePlaintext(slot.send_buf.items) catch {
-                        self.completeSlot(slot_idx, .{ .err = error.TlsWriteFailed });
-                        return;
-                    };
-                    // Extract ciphertext to send.
-                    self.flushTlsPendingSend(slot, slot_idx);
+                    self.buildAndSendTlsRequest(slot, slot_idx);
                 },
                 .want_write => {
                     self.flushTlsPendingSend(slot, slot_idx);
                 },
                 .want_read => {
-                    self.io.recv(
-                        .{ .fd = slot.fd, .buf = &slot.recv_tmp },
-                        &slot.completion,
-                        self,
-                        httpRecvComplete,
-                    ) catch {
-                        self.completeSlot(slot_idx, .{ .err = error.SubmitFailed });
-                    };
+                    self.flushTlsPendingSend(slot, slot_idx);
                 },
             }
         }
 
+        fn buildAndSendTlsRequest(self: *Self, slot: *RequestSlot, slot_idx: u16) void {
+            var tls = &(slot.tls_stream orelse {
+                self.completeSlot(slot_idx, .{ .err = error.TlsWriteFailed });
+                return;
+            });
+            self.buildRequest(slot) catch {
+                self.completeSlot(slot_idx, .{ .err = error.OutOfMemory });
+                return;
+            };
+            // Encrypt the request.
+            _ = tls.writePlaintext(slot.send_buf.items) catch {
+                self.completeSlot(slot_idx, .{ .err = error.TlsWriteFailed });
+                return;
+            };
+            slot.state = .sending;
+            // Extract ciphertext to send.
+            self.flushTlsPendingSend(slot, slot_idx);
+        }
+
         fn flushTlsPendingSend(self: *Self, slot: *RequestSlot, slot_idx: u16) void {
+            if (slot.tls_send_offset < slot.tls_send_len) {
+                self.submitTlsSend(slot, slot_idx);
+                return;
+            }
+
             var tls = &(slot.tls_stream orelse return);
             const n = tls.pendingSend(&slot.tls_send_buf) catch {
                 self.completeSlot(slot_idx, .{ .err = error.TlsReadFailed });
@@ -925,8 +970,14 @@ pub fn HttpExecutorOf(comptime IO: type) type {
                 };
                 return;
             }
+            slot.tls_send_len = n;
+            slot.tls_send_offset = 0;
+            self.submitTlsSend(slot, slot_idx);
+        }
+
+        fn submitTlsSend(self: *Self, slot: *RequestSlot, slot_idx: u16) void {
             self.io.send(
-                .{ .fd = slot.fd, .buf = slot.tls_send_buf[0..n] },
+                .{ .fd = slot.fd, .buf = slot.tls_send_buf[slot.tls_send_offset..slot.tls_send_len] },
                 &slot.completion,
                 self,
                 httpSendComplete,
@@ -1009,6 +1060,12 @@ pub fn HttpExecutorOf(comptime IO: type) type {
                         posix.close(slot.fd);
                         slot.fd = -1;
                         slot.pooled = false;
+                        if (slot.tls_stream) |*tls| {
+                            tls.deinit();
+                            slot.tls_stream = null;
+                        }
+                        slot.tls_send_len = 0;
+                        slot.tls_send_offset = 0;
                         self.startConnect(slot, slot_idx);
                         return .disarm;
                     }
@@ -1022,7 +1079,32 @@ pub fn HttpExecutorOf(comptime IO: type) type {
                 return .disarm;
             }
 
+            if (slot.parsed.is_https and slot.state == .tls_handshaking) {
+                slot.tls_handshake_bytes_sent += n;
+            }
+
+            if (slot.parsed.is_https and slot.tls_stream != null and slot.tls_send_len > 0) {
+                slot.tls_send_offset += @min(n, slot.tls_send_len - slot.tls_send_offset);
+                if (slot.tls_send_offset < slot.tls_send_len) {
+                    self.submitTlsSend(slot, slot_idx);
+                    return .disarm;
+                }
+                slot.tls_send_len = 0;
+                slot.tls_send_offset = 0;
+            }
+
             if (slot.state == .tls_handshaking) {
+                var tls = &(slot.tls_stream orelse return .disarm);
+                const pending = tls.pendingSend(&slot.tls_send_buf) catch {
+                    self.completeSlot(slot_idx, .{ .err = error.TlsReadFailed });
+                    return .disarm;
+                };
+                if (pending > 0) {
+                    slot.tls_send_len = pending;
+                    slot.tls_send_offset = 0;
+                    self.submitTlsSend(slot, slot_idx);
+                    return .disarm;
+                }
                 self.advanceTlsHandshake(slot, slot_idx);
                 return .disarm;
             }
@@ -1034,14 +1116,9 @@ pub fn HttpExecutorOf(comptime IO: type) type {
                     return .disarm;
                 };
                 if (pending > 0) {
-                    self.io.send(
-                        .{ .fd = slot.fd, .buf = slot.tls_send_buf[0..pending] },
-                        &slot.completion,
-                        self,
-                        httpSendComplete,
-                    ) catch {
-                        self.completeSlot(slot_idx, .{ .err = error.SubmitFailed });
-                    };
+                    slot.tls_send_len = pending;
+                    slot.tls_send_offset = 0;
+                    self.submitTlsSend(slot, slot_idx);
                     return .disarm;
                 }
                 slot.state = .receiving;
@@ -1100,6 +1177,7 @@ pub fn HttpExecutorOf(comptime IO: type) type {
                     self.completeSlot(slot_idx, .{ .err = error.TlsHandshakeFailed });
                     return;
                 }
+                slot.tls_handshake_bytes_received += n;
                 var tls = &(slot.tls_stream orelse return);
                 tls.feedRecv(slot.recv_tmp[0..n]) catch {
                     self.completeSlot(slot_idx, .{ .err = error.TlsHandshakeFailed });
@@ -1264,12 +1342,20 @@ pub fn HttpExecutorOf(comptime IO: type) type {
             else
                 false;
 
-            // Return connection to pool before completing the slot.
-            if (reusable and !slot.parsed.is_https and slot.fd >= 0) {
+            // Return connection (and, for HTTPS, the established TLS stream)
+            // to the pool before completing the slot.
+            if (reusable and slot.fd >= 0) {
+                const tls_stream = if (slot.parsed.is_https) blk: {
+                    const tls = slot.tls_stream orelse break :blk null;
+                    slot.tls_stream = null;
+                    break :blk tls;
+                } else null;
                 self.pool.put(
                     slot.job.hostSlice(),
                     slot.parsed.port,
+                    slot.parsed.is_https,
                     slot.fd,
+                    tls_stream,
                     std.time.timestamp(),
                 );
                 slot.fd = -1; // Prevent close in completeSlot.
@@ -1285,6 +1371,14 @@ pub fn HttpExecutorOf(comptime IO: type) type {
             for (self.slots, 0..) |*slot, i| {
                 if (slot.state == .free) continue;
                 if (now >= slot.deadline) {
+                    log.warn("request timed out (state={s}, host={s}, url={s}, addr={f}, tls_sent={d}, tls_recv={d})", .{
+                        @tagName(slot.state),
+                        slot.job.hostSlice(),
+                        slot.job.urlSlice(),
+                        slot.address,
+                        slot.tls_handshake_bytes_sent,
+                        slot.tls_handshake_bytes_received,
+                    });
                     self.completeSlot(@intCast(i), .{ .err = error.RequestTimedOut });
                 }
             }

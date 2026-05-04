@@ -426,6 +426,9 @@ fn peerHash(peer: anytype) u64 {
     hasher.update(std.mem.asBytes(&peer.current_piece));
     hasher.update(std.mem.asBytes(&peer.next_piece));
     hasher.update(std.mem.asBytes(&peer.inflight_requests));
+    hasher.update(std.mem.asBytes(&peer.request_target_depth));
+    hasher.update(std.mem.asBytes(&peer.request_age_secs));
+    hasher.update(std.mem.asBytes(&peer.last_piece_age_secs));
     hasher.update(std.mem.asBytes(&peer.pipeline_sent));
     hasher.update(std.mem.asBytes(&peer.next_pipeline_sent));
     hasher.update(std.mem.asBytes(&peer.blocks_received));
@@ -436,6 +439,11 @@ fn peerHash(peer: anytype) u64 {
     hasher.update(std.mem.asBytes(&peer.peer_choking));
     hasher.update(std.mem.asBytes(&peer.am_interested));
     hasher.update(std.mem.asBytes(&peer.extensions_supported));
+    hasher.update(std.mem.asBytes(&peer.utp_cwnd));
+    hasher.update(std.mem.asBytes(&peer.utp_bytes_in_flight));
+    hasher.update(std.mem.asBytes(&peer.utp_out_buf_count));
+    hasher.update(std.mem.asBytes(&peer.utp_pending_send_bytes));
+    hasher.update(std.mem.asBytes(&peer.utp_rto_us));
     return hasher.final();
 }
 
@@ -473,6 +481,9 @@ const PeerJson = struct {
     current_piece: ?u32,
     next_piece: ?u32,
     inflight_requests: u32,
+    request_target_depth: u32,
+    request_age_secs: i64,
+    last_piece_age_secs: i64,
     pipeline_sent: u32,
     next_pipeline_sent: u32,
     blocks_received: u32,
@@ -483,6 +494,11 @@ const PeerJson = struct {
     peer_choking: bool,
     am_interested: bool,
     extensions_supported: bool,
+    utp_cwnd: u32,
+    utp_bytes_in_flight: u32,
+    utp_out_buf_count: u16,
+    utp_pending_send_bytes: u32,
+    utp_rto_us: u32,
 };
 
 fn peerJson(peer: anytype) PeerJson {
@@ -507,6 +523,9 @@ fn peerJson(peer: anytype) PeerJson {
         .current_piece = peer.current_piece,
         .next_piece = peer.next_piece,
         .inflight_requests = peer.inflight_requests,
+        .request_target_depth = peer.request_target_depth,
+        .request_age_secs = peer.request_age_secs,
+        .last_piece_age_secs = peer.last_piece_age_secs,
         .pipeline_sent = peer.pipeline_sent,
         .next_pipeline_sent = peer.next_pipeline_sent,
         .blocks_received = peer.blocks_received,
@@ -517,6 +536,11 @@ fn peerJson(peer: anytype) PeerJson {
         .peer_choking = peer.peer_choking,
         .am_interested = peer.am_interested,
         .extensions_supported = peer.extensions_supported,
+        .utp_cwnd = peer.utp_cwnd,
+        .utp_bytes_in_flight = peer.utp_bytes_in_flight,
+        .utp_out_buf_count = peer.utp_out_buf_count,
+        .utp_pending_send_bytes = peer.utp_pending_send_bytes,
+        .utp_rto_us = peer.utp_rto_us,
     };
 }
 

@@ -47,27 +47,11 @@ pub fn processMessage(self: anytype, slot: u16) void {
             }
             // Clear pipeline state
             peer.inflight_requests = 0;
+            peer.request_target_depth = 0;
+            peer.request_started_at = 0;
             peer.pipeline_sent = peer.blocks_received;
-            // Release pre-fetched next piece back to the tracker
-            if (peer.next_downloading_piece != null) {
-                policy.detachPeerFromNextDownloadingPiece(self, peer);
-                peer.next_piece = null;
-                peer.next_blocks_expected = 0;
-                peer.next_blocks_received = 0;
-                peer.next_pipeline_sent = 0;
-            } else if (peer.next_piece) |next_idx| {
-                if (self.getTorrentContext(peer.torrent_id)) |tc| {
-                    if (tc.piece_tracker) |pt| pt.releasePiece(next_idx);
-                }
-                if (peer.next_piece_buf) |nbuf| {
-                    self.allocator.free(nbuf);
-                    peer.next_piece_buf = null; // prevent double-free in cleanupPeer
-                }
-                peer.next_piece = null;
-                peer.next_blocks_expected = 0;
-                peer.next_blocks_received = 0;
-                peer.next_pipeline_sent = 0;
-            }
+            // Release queued prefetch pieces back to the tracker.
+            policy.detachPeerFromPrefetchPieces(self, peer);
             self.unmarkIdle(slot);
         },
         1 => {
@@ -195,6 +179,8 @@ pub fn processMessage(self: anytype, slot: u16) void {
 
                 // Decrement shared inflight counter for any received block
                 if (peer.inflight_requests > 0) peer.inflight_requests -= 1;
+                peer.last_piece_received_at = self.clock.now();
+                peer.request_started_at = if (peer.inflight_requests > 0) peer.last_piece_received_at else 0;
 
                 if (peer.current_piece != null and peer.current_piece.? == piece_index) {
                     if (peer.downloading_piece) |dp| {
@@ -246,21 +232,21 @@ pub fn processMessage(self: anytype, slot: u16) void {
                             }
                         }
                     }
-                } else if (peer.next_piece != null and peer.next_piece.? == piece_index) {
+                } else if (policy.prefetchSlotForPiece(peer, piece_index)) |prefetch_idx| {
                     // Block arrived early for the pre-fetched next piece
-                    if (peer.next_downloading_piece) |next_dp| {
+                    if (policy.prefetchDownloadingPiece(peer, prefetch_idx)) |next_dp| {
                         if (next_dp.markBlockReceived(block_index, slot, peer.address, block_offset, block_data)) {
-                            peer.next_blocks_received += 1;
+                            policy.incrementPrefetchBlocksReceived(peer, prefetch_idx);
                             peer.bytes_downloaded_from += block_data.len;
                             self.accountTorrentBytes(peer.torrent_id, block_data.len, 0);
                             policy.tryFillPipeline(self, slot) catch {};
                         }
-                    } else if (peer.next_piece_buf) |nbuf| {
+                    } else if (policy.prefetchBuffer(peer, prefetch_idx)) |nbuf| {
                         const start: usize = @intCast(block_offset);
                         const end = start + block_data.len;
                         if (end <= nbuf.len) {
                             @memcpy(nbuf[start..end], block_data);
-                            peer.next_blocks_received += 1;
+                            policy.incrementPrefetchBlocksReceived(peer, prefetch_idx);
                             peer.bytes_downloaded_from += block_data.len;
                             self.accountTorrentBytes(peer.torrent_id, block_data.len, 0);
                             // Refill pipeline with more blocks for next_piece or claim further piece
@@ -562,7 +548,6 @@ pub fn submitExtensionHandshake(self: anytype, slot: u16) !void {
 
     // Build the full framed message: 4-byte len | msg_id=20 | sub_id=0 | payload
     const frame = try ext.serializeExtensionMessage(self.allocator, ext.handshake_sub_id, ext_payload);
-    errdefer self.allocator.free(frame);
 
     // uTP peers: route through the uTP byte stream.
     if (peer.transport == .utp) {
@@ -575,6 +560,7 @@ pub fn submitExtensionHandshake(self: anytype, slot: u16) !void {
     peer.crypto.encryptBuf(frame);
 
     // Track for cleanup with unique send_id
+    errdefer self.allocator.free(frame);
     const send_id = self.nextSendId();
     const ps = try self.trackPendingSendOwned(slot, send_id, frame);
     errdefer self.freeOnePendingSend(slot, send_id);
@@ -639,7 +625,6 @@ pub fn submitPexMessage(self: anytype, slot: u16) !void {
 
     // Frame as BEP 10 extension message and send
     const frame = try ext.serializeExtensionMessage(self.allocator, peer_pex_id, payload);
-    errdefer self.allocator.free(frame);
 
     // uTP peers: route through the uTP byte stream.
     if (peer.transport == .utp) {
@@ -653,6 +638,7 @@ pub fn submitPexMessage(self: anytype, slot: u16) !void {
     // MSE/PE: encrypt in-place before sending
     peer.crypto.encryptBuf(frame);
 
+    errdefer self.allocator.free(frame);
     const send_id = self.nextSendId();
     const ps = try self.trackPendingSendOwned(slot, send_id, frame);
     errdefer self.freeOnePendingSend(slot, send_id);
@@ -1130,6 +1116,7 @@ test "choke clears inflight_requests" {
 
     peer.peer_choking = false;
     peer.inflight_requests = 5;
+    peer.request_started_at = 123;
     peer.blocks_received = 2;
     peer.pipeline_sent = 7;
 
@@ -1139,6 +1126,7 @@ test "choke clears inflight_requests" {
     processMessage(&el, slot);
 
     try testing.expectEqual(@as(u32, 0), peer.inflight_requests);
+    try testing.expectEqual(@as(i64, 0), peer.request_started_at);
     // pipeline_sent is reset to blocks_received
     try testing.expectEqual(@as(u32, 2), peer.pipeline_sent);
 }

@@ -31,6 +31,17 @@ pub const Transport = enum {
     utp,
 };
 
+pub const extra_prefetch_piece_count: usize = 2;
+
+pub const PrefetchPiece = struct {
+    piece: ?u32 = null,
+    buf: ?[]u8 = null,
+    downloading_piece: ?*@import("downloading_piece.zig").DownloadingPiece = null,
+    blocks_expected: u32 = 0,
+    blocks_received: u32 = 0,
+    pipeline_sent: u32 = 0,
+};
+
 pub const PeerState = enum {
     free,
     connecting,
@@ -114,6 +125,14 @@ pub const Peer = struct {
     blocks_expected: u32 = 0,
     pipeline_sent: u32 = 0,
     inflight_requests: u32 = 0,
+    /// Last request queue target used by the peer policy. Exposed in diagnostics
+    /// so real-swarm runs can tell whether uTP is request-starved.
+    request_target_depth: u32 = 0,
+    /// Monotonic seconds when this peer last entered a non-empty request
+    /// queue, or when the last PIECE response refreshed that queue.
+    request_started_at: i64 = 0,
+    /// Monotonic seconds when this peer last sent us a PIECE block.
+    last_piece_received_at: i64 = 0,
 
     // Multi-source piece assembly: shared DownloadingPiece for current and next piece.
     downloading_piece: ?*@import("downloading_piece.zig").DownloadingPiece = null,
@@ -125,6 +144,8 @@ pub const Peer = struct {
     next_blocks_expected: u32 = 0,
     next_blocks_received: u32 = 0,
     next_pipeline_sent: u32 = 0,
+    extra_prefetch_pieces: [extra_prefetch_piece_count]PrefetchPiece =
+        [_]PrefetchPiece{.{}} ** extra_prefetch_piece_count,
 
     // BEP 10 extension protocol state
     extensions_supported: bool = false, // peer advertised BEP 10 support
@@ -155,6 +176,9 @@ pub const Peer = struct {
     // Used to handle partial sends during MSE handshake without prematurely
     // advancing the state machine.
     mse_send_remaining: []const u8 = &.{},
+    // Remaining buffer to fill for the current MSE recv operation on ordered
+    // stream transports that do not submit a backend recv for each MSE chunk.
+    mse_recv_remaining: []u8 = &.{},
 
     // Caller-owned completion for the peer's in-flight recv on the
     // io_interface backend. Recvs are naturally serial per peer (handshake,

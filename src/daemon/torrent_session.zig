@@ -1185,13 +1185,19 @@ pub fn TorrentSessionOf(comptime IO: type) type {
             else
                 @import("../io/event_loop.zig").SpeedStats{};
 
-            // Lifetime totals = persisted baseline + current session
-            const total_downloaded = self.baseline_downloaded + speed_stats.dl_total;
+            // Transfer counters are fed by peer and web-seed bytes, but user-
+            // visible completion must come from the verified piece tracker.
+            // Web-seed-only torrents otherwise showed progress/pieces_have
+            // advancing while qBittorrent-compatible downloaded/completed
+            // fields stayed at zero.
+            const verified_downloaded = if (self.piece_tracker) |*pt| pt.bytesComplete() else 0;
+            const raw_downloaded = self.baseline_downloaded + speed_stats.dl_total;
+            const total_downloaded = @max(raw_downloaded, verified_downloaded);
             const total_uploaded = self.baseline_uploaded + speed_stats.ul_total;
 
             // Compute ETA: bytes_remaining / download_speed
-            const bytes_remaining = if (self.total_size > speed_stats.dl_total)
-                self.total_size - speed_stats.dl_total
+            const bytes_remaining = if (self.total_size > verified_downloaded)
+                self.total_size - verified_downloaded
             else
                 0;
             const eta: i64 = if (stats_state == .downloading and speed_stats.dl_speed > 0)
@@ -1261,7 +1267,7 @@ pub fn TorrentSessionOf(comptime IO: type) type {
                 .pieces_have = pieces_have,
                 .pieces_total = self.piece_count,
                 .total_size = self.total_size,
-                .bytes_downloaded = total_downloaded,
+                .bytes_downloaded = verified_downloaded,
                 .bytes_uploaded = total_uploaded,
                 .name = self.name,
                 .info_hash_hex = self.info_hash_hex,

@@ -1,12 +1,13 @@
 const std = @import("std");
 const build_options = @import("build_options");
+const log = std.log.scoped(.tls);
 
-/// TLS client using BoringSSL BIO pairs.
+/// TLS client using BoringSSL memory BIOs.
 ///
 /// BoringSSL never touches sockets directly. Instead:
-/// - Received ciphertext (from io_uring recv) is fed into the internal BIO
+/// - Received ciphertext (from io_uring recv) is fed into the read BIO
 /// - BoringSSL processes TLS records, producing plaintext and outbound ciphertext
-/// - Outbound ciphertext is extracted and sent via io_uring send
+/// - Outbound ciphertext is extracted from the write BIO and sent via io_uring send
 ///
 /// This keeps all network I/O on io_uring while BoringSSL handles crypto/protocol.
 pub const TlsStream = if (build_options.tls_backend == .boringssl)
@@ -45,13 +46,14 @@ const TlsStreamImpl = struct {
         @cInclude("openssl/ssl.h");
         @cInclude("openssl/bio.h");
         @cInclude("openssl/err.h");
+        @cInclude("openssl/x509_vfy.h");
     });
 
     ssl_ctx: *ssl_c.SSL_CTX,
     ssl: *ssl_c.SSL,
-    /// Internal BIO: we write received ciphertext here, BoringSSL reads from it.
+    /// Read BIO: we write received ciphertext here, BoringSSL reads from it.
     internal_bio: *ssl_c.BIO,
-    /// Network BIO: BoringSSL writes ciphertext here, we read from it to send.
+    /// Write BIO: BoringSSL writes ciphertext here, we read from it to send.
     network_bio: *ssl_c.BIO,
 
     pub const HandshakeResult = enum {
@@ -73,13 +75,13 @@ const TlsStreamImpl = struct {
 
     /// Create a new TLS client stream configured for the given hostname.
     /// The hostname is used for SNI and certificate verification.
-    pub fn init(_: std.mem.Allocator, hostname: []const u8) (Error || error{OutOfMemory})!TlsStreamImpl {
+    pub fn init(allocator: std.mem.Allocator, hostname: []const u8) (Error || error{OutOfMemory})!TlsStreamImpl {
         const ctx = ssl_c.SSL_CTX_new(ssl_c.TLS_method()) orelse
             return error.TlsInitFailed;
         errdefer ssl_c.SSL_CTX_free(ctx);
 
         // Load system CA certificates for server verification
-        if (ssl_c.SSL_CTX_set_default_verify_paths(ctx) != 1) {
+        if (!(try loadVerifyPaths(allocator, ctx))) {
             return error.TlsInitFailed;
         }
 
@@ -102,32 +104,66 @@ const TlsStreamImpl = struct {
             return error.TlsInitFailed;
         }
 
-        // Create BIO pair: internal_bio <-> network_bio
-        // We write received ciphertext to internal_bio (BoringSSL reads from it).
-        // BoringSSL writes outbound ciphertext to network_bio (we read from it).
-        var internal_bio: ?*ssl_c.BIO = null;
-        var network_bio: ?*ssl_c.BIO = null;
-        if (ssl_c.BIO_new_bio_pair(&internal_bio, 0, &network_bio, 0) != 1) {
+        const internal_bio = ssl_c.BIO_new(ssl_c.BIO_s_mem()) orelse
             return error.TlsInitFailed;
-        }
+        errdefer _ = ssl_c.BIO_free(internal_bio);
 
-        // SSL_set_bio takes ownership of internal_bio. network_bio is ours to manage.
-        ssl_c.SSL_set_bio(ssl, internal_bio, internal_bio);
+        const network_bio = ssl_c.BIO_new(ssl_c.BIO_s_mem()) orelse
+            return error.TlsInitFailed;
+        errdefer _ = ssl_c.BIO_free(network_bio);
+
+        // SSL_set_bio takes ownership of both memory BIOs.
+        ssl_c.SSL_set_bio(ssl, internal_bio, network_bio);
 
         return .{
             .ssl_ctx = ctx,
             .ssl = ssl,
-            .internal_bio = internal_bio.?,
-            .network_bio = network_bio.?,
+            .internal_bio = internal_bio,
+            .network_bio = network_bio,
         };
     }
 
+    fn loadVerifyPaths(allocator: std.mem.Allocator, ctx: *ssl_c.SSL_CTX) error{OutOfMemory}!bool {
+        var loaded = ssl_c.SSL_CTX_set_default_verify_paths(ctx) == 1;
+
+        const env_names = [_][]const u8{
+            "SSL_CERT_FILE",
+            "NIX_SSL_CERT_FILE",
+        };
+        for (env_names) |name| {
+            const value = std.process.getEnvVarOwned(allocator, name) catch |err| switch (err) {
+                error.EnvironmentVariableNotFound => continue,
+                error.OutOfMemory => return error.OutOfMemory,
+                else => continue,
+            };
+            defer allocator.free(value);
+            loaded = loadVerifyFile(ctx, value) or loaded;
+        }
+
+        const common_files = [_][]const u8{
+            "/etc/ssl/certs/ca-certificates.crt",
+            "/etc/pki/tls/certs/ca-bundle.crt",
+            "/etc/ssl/cert.pem",
+        };
+        for (common_files) |path| {
+            loaded = loadVerifyFile(ctx, path) or loaded;
+        }
+
+        return loaded;
+    }
+
+    fn loadVerifyFile(ctx: *ssl_c.SSL_CTX, path: []const u8) bool {
+        if (path.len == 0 or path.len >= std.fs.max_path_bytes) return false;
+        var path_buf: [std.fs.max_path_bytes:0]u8 = undefined;
+        @memcpy(path_buf[0..path.len], path);
+        path_buf[path.len] = 0;
+        return ssl_c.SSL_CTX_load_verify_locations(ctx, &path_buf, null) == 1;
+    }
+
     pub fn deinit(self: *TlsStreamImpl) void {
-        // SSL_free frees the internal_bio that was set via SSL_set_bio.
+        // SSL_free frees both BIOs that were set via SSL_set_bio.
         ssl_c.SSL_free(self.ssl);
         ssl_c.SSL_CTX_free(self.ssl_ctx);
-        // We own network_bio separately.
-        _ = ssl_c.BIO_free(self.network_bio);
     }
 
     /// Feed received ciphertext from the network into BoringSSL.
@@ -137,7 +173,7 @@ const TlsStreamImpl = struct {
         while (written < data.len) {
             const remaining = data.len - written;
             const chunk: c_int = @intCast(@min(remaining, std.math.maxInt(c_int)));
-            const n = ssl_c.BIO_write(self.network_bio, data.ptr + written, chunk);
+            const n = ssl_c.BIO_write(self.internal_bio, data.ptr + written, chunk);
             if (n <= 0) return error.TlsBioWriteFailed;
             written += @intCast(n);
         }
@@ -155,7 +191,22 @@ const TlsStreamImpl = struct {
         return switch (err) {
             ssl_c.SSL_ERROR_WANT_READ => .want_read,
             ssl_c.SSL_ERROR_WANT_WRITE => .want_write,
-            else => error.TlsHandshakeFailed,
+            else => {
+                const verify_result = ssl_c.SSL_get_verify_result(self.ssl);
+                if (verify_result != ssl_c.X509_V_OK) {
+                    return error.TlsCertVerifyFailed;
+                }
+                const err_code = ssl_c.ERR_peek_error();
+                const reason_ptr = ssl_c.ERR_reason_error_string(err_code);
+                const reason = if (reason_ptr != null) std.mem.span(reason_ptr) else "unknown";
+                log.warn("TLS handshake failed (ssl_error={d}, verify={d}, err=0x{x}, reason={s})", .{
+                    err,
+                    verify_result,
+                    err_code,
+                    reason,
+                });
+                return error.TlsHandshakeFailed;
+            },
         };
     }
 

@@ -196,7 +196,7 @@ test "BUGGIFY: computeMultiPieceRanges single-file is panic-free over random inp
     // `computeMultiPieceRanges` writes `length: u32` derived from a
     // `u64` byte span (`run_end - run_start`). The `@intCast` panics
     // if the span exceeds `maxInt(u32)`. Production today is bounded
-    // by the `web_seed_max_request_bytes` config (default 4 MB) which
+    // by the `web_seed_max_request_bytes` config (default 16 MB) which
     // keeps the run < `maxInt(u32)`, but the API surface does not
     // enforce that. This fuzz harness bounds inputs to the production
     // invariant — a fix to the API (either u64 length or an
@@ -373,7 +373,7 @@ test "BUGGIFY: appendUrlEncoded is panic-free over random bytes" {
 // Closes Task #5 (round-2 audit follow-up): `computeMultiPieceRanges`
 // used to write a u64 byte span into a u32 length via `@intCast`,
 // panicking on runs > maxInt(u32). Production today is bounded by
-// the TOML config knob `web_seed_max_request_bytes` (default 4 MB)
+// the TOML config knob `web_seed_max_request_bytes` (default 16 MB)
 // which keeps the run well under 4 GB, but a misconfigured value
 // (e.g. 8 GB) would crash the daemon on the first multi-piece request.
 // The fix: the function now rejects with `error.RunTooLarge` upfront

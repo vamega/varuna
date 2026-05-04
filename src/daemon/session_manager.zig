@@ -1362,6 +1362,17 @@ pub fn SessionManagerOf(comptime IO: type) type {
             dht_pending_queries: usize = 0,
             dht_send_queue_len: usize = 0,
             dht_peer_result_queue_len: usize = 0,
+            utp_send_queue_len: usize = 0,
+            utp_send_pending: bool = false,
+            web_seed_idle: usize = 0,
+            web_seed_active: usize = 0,
+            web_seed_backoff: usize = 0,
+            web_seed_disabled: usize = 0,
+            web_seed_active_requests: usize = 0,
+            web_seed_downloading_slots: usize = 0,
+            web_seed_hashing_slots: usize = 0,
+            web_seed_bytes_downloaded: u64 = 0,
+            web_seed_failed_requests: u64 = 0,
             dht_search_registered: bool = false,
             dht_search_done: bool = false,
             dht_active_lookup_for_hash: bool = false,
@@ -1379,8 +1390,32 @@ pub fn SessionManagerOf(comptime IO: type) type {
             // Get peer count from event loop
             if (self.shared_event_loop) |el| {
                 if (session.torrent_id_in_shared) |tid| {
-                    diag.peers_connected = el.peerCountForTorrent(tid);
+                    diag.peers_connected = el.establishedPeerCountForTorrent(tid);
                     diag.peers_half_open = el.halfOpenCount();
+                    if (el.getTorrentContext(tid)) |tc| {
+                        if (tc.web_seed_manager) |wsm| {
+                            for (wsm.seeds) |seed| {
+                                switch (seed.state) {
+                                    .idle => diag.web_seed_idle += 1,
+                                    .active => diag.web_seed_active += 1,
+                                    .backoff => diag.web_seed_backoff += 1,
+                                    .disabled => diag.web_seed_disabled += 1,
+                                }
+                                diag.web_seed_active_requests += seed.active_requests;
+                                diag.web_seed_bytes_downloaded += seed.bytes_downloaded;
+                                diag.web_seed_failed_requests += seed.failed_requests;
+                            }
+                        }
+                    }
+                }
+                diag.utp_send_queue_len = el.utp_send_queue.items.len;
+                diag.utp_send_pending = el.utp_send_pending;
+                for (&el.web_seed_slots) |*slot| {
+                    switch (slot.state) {
+                        .free => {},
+                        .downloading => diag.web_seed_downloading_slots += 1,
+                        .hashing => diag.web_seed_hashing_slots += 1,
+                    }
                 }
                 if (el.dht_engine) |engine| {
                     const dht_diag = engine.diagnostics(session.info_hash);
@@ -1943,6 +1978,9 @@ pub fn SessionManagerOf(comptime IO: type) type {
             current_piece: ?u32 = null,
             next_piece: ?u32 = null,
             inflight_requests: u32 = 0,
+            request_target_depth: u32 = 0,
+            request_age_secs: i64 = 0,
+            last_piece_age_secs: i64 = 0,
             pipeline_sent: u32 = 0,
             next_pipeline_sent: u32 = 0,
             blocks_received: u32 = 0,
@@ -1953,6 +1991,11 @@ pub fn SessionManagerOf(comptime IO: type) type {
             peer_choking: bool = true,
             am_interested: bool = false,
             extensions_supported: bool = false,
+            utp_cwnd: u32 = 0,
+            utp_bytes_in_flight: u32 = 0,
+            utp_out_buf_count: u16 = 0,
+            utp_pending_send_bytes: u32 = 0,
+            utp_rto_us: u32 = 0,
         };
 
         pub fn freePeerInfos(allocator: std.mem.Allocator, infos: []const PeerInfo) void {
@@ -1973,6 +2016,7 @@ pub fn SessionManagerOf(comptime IO: type) type {
             // Get the event loop and torrent ID
             const el = session.shared_event_loop orelse return try allocator.alloc(PeerInfo, 0);
             const tid = session.torrent_id_in_shared orelse return try allocator.alloc(PeerInfo, 0);
+            const now = el.clock.now();
 
             var result = std.ArrayList(PeerInfo).empty;
             errdefer {
@@ -2044,6 +2088,40 @@ pub fn SessionManagerOf(comptime IO: type) type {
                 else
                     try allocator.dupe(u8, "");
 
+                var utp_cwnd: u32 = 0;
+                var utp_bytes_in_flight: u32 = 0;
+                var utp_out_buf_count: u16 = 0;
+                var utp_pending_send_bytes: u32 = 0;
+                var utp_rto_us: u32 = 0;
+                if (peer.transport == .utp) {
+                    if (peer.utp_slot) |utp_slot| {
+                        if (el.utp_manager) |mgr| {
+                            if (mgr.getSocket(utp_slot)) |sock| {
+                                utp_cwnd = sock.ledbat.window();
+                                utp_bytes_in_flight = sock.bytesInFlight();
+                                utp_out_buf_count = sock.out_buf_count;
+                                utp_pending_send_bytes = @intCast(@min(
+                                    sock.pendingSendSlice().len,
+                                    std.math.maxInt(u32),
+                                ));
+                                utp_rto_us = sock.rto;
+                            }
+                        }
+                    }
+                }
+                var prefetch_pipeline_sent = peer.next_pipeline_sent;
+                for (peer.extra_prefetch_pieces) |prefetch_slot| {
+                    prefetch_pipeline_sent += prefetch_slot.pipeline_sent;
+                }
+                const request_age_secs: i64 = if (peer.request_started_at > 0 and now >= peer.request_started_at)
+                    now - peer.request_started_at
+                else
+                    0;
+                const last_piece_age_secs: i64 = if (peer.last_piece_received_at > 0 and now >= peer.last_piece_received_at)
+                    now - peer.last_piece_received_at
+                else
+                    0;
+
                 try result.append(allocator, .{
                     .ip = ip_str,
                     .port = port,
@@ -2065,8 +2143,11 @@ pub fn SessionManagerOf(comptime IO: type) type {
                     .current_piece = peer.current_piece,
                     .next_piece = peer.next_piece,
                     .inflight_requests = peer.inflight_requests,
+                    .request_target_depth = peer.request_target_depth,
+                    .request_age_secs = request_age_secs,
+                    .last_piece_age_secs = last_piece_age_secs,
                     .pipeline_sent = peer.pipeline_sent,
-                    .next_pipeline_sent = peer.next_pipeline_sent,
+                    .next_pipeline_sent = prefetch_pipeline_sent,
                     .blocks_received = peer.blocks_received,
                     .blocks_expected = peer.blocks_expected,
                     .send_pending = peer.send_pending,
@@ -2075,6 +2156,11 @@ pub fn SessionManagerOf(comptime IO: type) type {
                     .peer_choking = peer.peer_choking,
                     .am_interested = peer.am_interested,
                     .extensions_supported = peer.extensions_supported,
+                    .utp_cwnd = utp_cwnd,
+                    .utp_bytes_in_flight = utp_bytes_in_flight,
+                    .utp_out_buf_count = utp_out_buf_count,
+                    .utp_pending_send_bytes = utp_pending_send_bytes,
+                    .utp_rto_us = utp_rto_us,
                 });
             }
 

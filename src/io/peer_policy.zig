@@ -26,15 +26,21 @@ const DownloadingPiece = dp_mod.DownloadingPiece;
 const DownloadingPieceKey = dp_mod.DownloadingPieceKey;
 const PieceTracker = @import("../torrent/piece_tracker.zig").PieceTracker;
 const session_mod = @import("../torrent/session.zig");
+const io_types = @import("types.zig");
 
 const pipeline_depth: u32 = 64;
+const prefetch_piece_count: usize = 1 + io_types.extra_prefetch_piece_count;
 
 /// Maximum number of peers that can work on the same piece simultaneously.
 const max_peers_per_piece: u8 = 3;
 
 /// Threshold at which a peer is banned for sending too many corrupt pieces.
 const trust_ban_threshold: i8 = -7;
-const peer_timeout_secs: i64 = 60;
+const peer_handshake_timeout_secs: i64 = 60;
+const peer_timeout_secs: i64 = 180;
+const request_queue_target_secs: u64 = 3;
+const request_timeout_secs: i64 = 60;
+const request_block_size: u64 = 16 * 1024;
 const unchoke_interval_secs: i64 = 10; // BEP 3: recalculate every 10 seconds
 const optimistic_unchoke_interval_secs: i64 = 30; // rotate optimistic unchoke every 30s
 const max_unchoked: u32 = 4;
@@ -204,6 +210,9 @@ pub fn startPieceDownload(self: anytype, slot: u16, piece_index: u32) !void {
     peer.blocks_expected = block_count;
     peer.pipeline_sent = 0;
     peer.inflight_requests = 0;
+    peer.request_target_depth = 0;
+    peer.request_started_at = 0;
+    peer.last_piece_received_at = 0;
 
     tryFillPipeline(self, slot) catch {
         // On failure, detach this peer from the DownloadingPiece
@@ -227,6 +236,9 @@ pub fn joinPieceDownload(self: anytype, slot: u16, dp: *DownloadingPiece) !void 
     peer.blocks_expected = dp.blocks_total;
     peer.pipeline_sent = 0;
     peer.inflight_requests = 0;
+    peer.request_target_depth = 0;
+    peer.request_started_at = 0;
+    peer.last_piece_received_at = 0;
 
     tryFillPipeline(self, slot) catch {
         detachPeerFromDownloadingPiece(self, peer);
@@ -260,12 +272,32 @@ pub fn detachPeerFromDownloadingPiece(self: anytype, peer: *Peer) void {
 
 /// Detach a peer from its next_downloading_piece.
 pub fn detachPeerFromNextDownloadingPiece(self: anytype, peer: *Peer) void {
-    const dp = peer.next_downloading_piece orelse return;
+    detachPeerFromPrefetchSlot(self, peer, 0);
+}
+
+/// Detach a peer from every queued prefetch DownloadingPiece.
+pub fn detachPeerFromPrefetchPieces(self: anytype, peer: *Peer) void {
+    var idx: usize = 0;
+    while (idx < prefetch_piece_count) : (idx += 1) {
+        detachPeerFromPrefetchSlot(self, peer, idx);
+    }
+}
+
+fn detachPeerFromPrefetchSlot(self: anytype, peer: *Peer, idx: usize) void {
+    const dp = prefetchDownloadingPiece(peer, idx) orelse {
+        if (prefetchPiece(peer, idx)) |piece_index| {
+            if (self.getTorrentContext(peer.torrent_id)) |tc| {
+                if (tc.piece_tracker) |pt| pt.releasePiece(piece_index);
+            }
+            if (prefetchBuffer(peer, idx)) |buf| self.allocator.free(buf);
+            clearPrefetchSlot(peer, idx);
+        }
+        return;
+    };
     const slot = peerSlot(self, peer);
     dp.releaseBlocksForPeer(slot);
     if (dp.peer_count > 0) dp.peer_count -= 1;
-    peer.next_downloading_piece = null;
-    peer.next_piece_buf = null;
+    clearPrefetchSlot(peer, idx);
 
     if (dp.peer_count == 0 and dp.blocks_received == 0) {
         const dp_key = DownloadingPieceKey{ .torrent_id = dp.torrent_id, .piece_index = dp.piece_index };
@@ -274,6 +306,173 @@ pub fn detachPeerFromNextDownloadingPiece(self: anytype, peer: *Peer) void {
             if (tc.piece_tracker) |pt| pt.releasePiece(dp.piece_index);
         }
         dp_mod.destroyDownloadingPieceFull(self.allocator, dp);
+    }
+}
+
+pub fn prefetchSlotForPiece(peer: *const Peer, piece_index: u32) ?usize {
+    var idx: usize = 0;
+    while (idx < prefetch_piece_count) : (idx += 1) {
+        if (prefetchPiece(peer, idx)) |queued_piece| {
+            if (queued_piece == piece_index) return idx;
+        }
+    }
+    return null;
+}
+
+pub fn prefetchDownloadingPiece(peer: *const Peer, idx: usize) ?*DownloadingPiece {
+    if (idx == 0) return peer.next_downloading_piece;
+    return peer.extra_prefetch_pieces[idx - 1].downloading_piece;
+}
+
+pub fn prefetchBuffer(peer: *const Peer, idx: usize) ?[]u8 {
+    if (idx == 0) return peer.next_piece_buf;
+    return peer.extra_prefetch_pieces[idx - 1].buf;
+}
+
+pub fn incrementPrefetchBlocksReceived(peer: *Peer, idx: usize) void {
+    if (idx == 0) {
+        peer.next_blocks_received += 1;
+    } else {
+        peer.extra_prefetch_pieces[idx - 1].blocks_received += 1;
+    }
+}
+
+fn prefetchPiece(peer: *const Peer, idx: usize) ?u32 {
+    if (idx == 0) return peer.next_piece;
+    return peer.extra_prefetch_pieces[idx - 1].piece;
+}
+
+fn prefetchBlocksExpected(peer: *const Peer, idx: usize) u32 {
+    if (idx == 0) return peer.next_blocks_expected;
+    return peer.extra_prefetch_pieces[idx - 1].blocks_expected;
+}
+
+fn prefetchBlocksReceived(peer: *const Peer, idx: usize) u32 {
+    if (idx == 0) return peer.next_blocks_received;
+    return peer.extra_prefetch_pieces[idx - 1].blocks_received;
+}
+
+fn prefetchPipelineSent(peer: *const Peer, idx: usize) u32 {
+    if (idx == 0) return peer.next_pipeline_sent;
+    return peer.extra_prefetch_pieces[idx - 1].pipeline_sent;
+}
+
+fn setPrefetchSlot(peer: *Peer, idx: usize, piece_index: u32, dp: *DownloadingPiece, block_count: u32) void {
+    if (idx == 0) {
+        peer.next_piece = piece_index;
+        peer.next_piece_buf = dp.buf;
+        peer.next_downloading_piece = dp;
+        peer.next_blocks_expected = block_count;
+        peer.next_blocks_received = 0;
+        peer.next_pipeline_sent = 0;
+    } else {
+        peer.extra_prefetch_pieces[idx - 1] = .{
+            .piece = piece_index,
+            .buf = dp.buf,
+            .downloading_piece = dp,
+            .blocks_expected = block_count,
+            .blocks_received = 0,
+            .pipeline_sent = 0,
+        };
+    }
+}
+
+fn setPrefetchSlotFrom(peer: *Peer, idx: usize, value: io_types.PrefetchPiece) void {
+    if (idx == 0) {
+        peer.next_piece = value.piece;
+        peer.next_piece_buf = value.buf;
+        peer.next_downloading_piece = value.downloading_piece;
+        peer.next_blocks_expected = value.blocks_expected;
+        peer.next_blocks_received = value.blocks_received;
+        peer.next_pipeline_sent = value.pipeline_sent;
+    } else {
+        peer.extra_prefetch_pieces[idx - 1] = value;
+    }
+}
+
+fn getPrefetchSlot(peer: *const Peer, idx: usize) io_types.PrefetchPiece {
+    if (idx == 0) {
+        return .{
+            .piece = peer.next_piece,
+            .buf = peer.next_piece_buf,
+            .downloading_piece = peer.next_downloading_piece,
+            .blocks_expected = peer.next_blocks_expected,
+            .blocks_received = peer.next_blocks_received,
+            .pipeline_sent = peer.next_pipeline_sent,
+        };
+    }
+    return peer.extra_prefetch_pieces[idx - 1];
+}
+
+fn clearPrefetchSlot(peer: *Peer, idx: usize) void {
+    if (idx == 0) {
+        peer.next_piece = null;
+        peer.next_piece_buf = null;
+        peer.next_downloading_piece = null;
+        peer.next_blocks_expected = 0;
+        peer.next_blocks_received = 0;
+        peer.next_pipeline_sent = 0;
+    } else {
+        peer.extra_prefetch_pieces[idx - 1] = .{};
+    }
+}
+
+fn addPrefetchPipelineSent(peer: *Peer, idx: usize, count: u32) void {
+    if (idx == 0) {
+        peer.next_pipeline_sent += count;
+    } else {
+        peer.extra_prefetch_pieces[idx - 1].pipeline_sent += count;
+    }
+}
+
+pub fn totalPrefetchPipelineSent(peer: *const Peer) u32 {
+    var total = peer.next_pipeline_sent;
+    for (peer.extra_prefetch_pieces) |slot| total += slot.pipeline_sent;
+    return total;
+}
+
+fn compactPrefetchSlots(peer: *Peer) void {
+    var write_idx: usize = 0;
+    var read_idx: usize = 0;
+    while (read_idx < prefetch_piece_count) : (read_idx += 1) {
+        const value = getPrefetchSlot(peer, read_idx);
+        if (value.piece == null) continue;
+        if (write_idx != read_idx) {
+            setPrefetchSlotFrom(peer, write_idx, value);
+            clearPrefetchSlot(peer, read_idx);
+        }
+        write_idx += 1;
+    }
+}
+
+fn prefetchContainsPiece(peer: *const Peer, piece_index: u32) bool {
+    return prefetchSlotForPiece(peer, piece_index) != null;
+}
+
+fn requestPipelineDepth(peer: *const Peer) u32 {
+    if (peer.transport != .utp) return pipeline_depth;
+
+    // Mirror libtorrent's queue-time approach for uTP: newly connected or
+    // silent peers get a small queue until they prove throughput, while fast
+    // peers still ramp up to the normal cap.
+    const min_depth: u32 = if (peer.bytes_downloaded_from == 0 and peer.current_dl_speed == 0) 32 else pipeline_depth;
+    if (peer.current_dl_speed == 0) return min_depth;
+
+    const wanted = (peer.current_dl_speed * request_queue_target_secs + request_block_size - 1) / request_block_size;
+    return @min(pipeline_depth, @max(min_depth, @as(u32, @intCast(@min(wanted, pipeline_depth)))));
+}
+
+fn requestPrefetchPieceCount(peer: *const Peer) usize {
+    _ = peer;
+    return prefetch_piece_count;
+}
+
+fn markRequestQueueStarted(self: anytype, peer: *Peer) void {
+    if (peer.inflight_requests != 0) return;
+    if (comptime @hasField(@TypeOf(self.*), "clock")) {
+        peer.request_started_at = self.clock.now();
+    } else {
+        peer.request_started_at = 1;
     }
 }
 
@@ -302,8 +501,9 @@ pub fn tryFillPipeline(self: anytype, slot: u16) !void {
 
     // 17 bytes per REQUEST: 4-byte len + 1-byte id + 12-byte payload
     const request_size: usize = 17;
-    // Buffer covers current + next piece (at most pipeline_depth * 2 total requests)
-    var send_buf: [request_size * pipeline_depth * 2]u8 = undefined;
+    var send_buf: [request_size * pipeline_depth]u8 = undefined;
+    const target_depth = requestPipelineDepth(peer);
+    peer.request_target_depth = target_depth;
 
     // --- Phase 1: fill requests for current piece using DownloadingPiece ---
     var p1: u32 = 0; // requests to send for current piece this call
@@ -359,7 +559,7 @@ pub fn tryFillPipeline(self: anytype, slot: u16) !void {
             const per_call_cap: u16 = @max(1, pipeline_depth / max_peers_per_piece);
             const claim_cap: u16 = @min(per_call_cap, remaining_share);
             var claimed_this_call: u16 = 0;
-            while (peer.inflight_requests + p1 < pipeline_depth and
+            while (peer.inflight_requests + p1 < target_depth and
                 claimed_this_call < claim_cap)
             {
                 const block_idx = dp.nextUnrequestedBlock() orelse break;
@@ -406,7 +606,7 @@ pub fn tryFillPipeline(self: anytype, slot: u16) !void {
                 false;
             if (peer_has_piece) {
                 var steal_idx: u16 = 0;
-                while (peer.inflight_requests + p1 < pipeline_depth and
+                while (peer.inflight_requests + p1 < target_depth and
                     claimed_this_call < per_call_cap and
                     steal_idx < dp.blocks_total)
                 {
@@ -422,7 +622,7 @@ pub fn tryFillPipeline(self: anytype, slot: u16) !void {
             }
         } else {
             // Legacy path (no DownloadingPiece -- should not happen after migration)
-            while (peer.inflight_requests + p1 < pipeline_depth and
+            while (peer.inflight_requests + p1 < target_depth and
                 peer.pipeline_sent + p1 < peer.blocks_expected)
             {
                 const req = geometry.requestForBlock(piece_index, peer.pipeline_sent + p1) catch break;
@@ -432,8 +632,9 @@ pub fn tryFillPipeline(self: anytype, slot: u16) !void {
         }
     }
 
-    // --- Phase 2: prefetch next piece if current is fully requested and pipeline has headroom ---
-    var p2: u32 = 0; // requests to send for next piece this call
+    // --- Phase 2: prefetch queued pieces if current is fully requested and pipeline has headroom ---
+    var prefetch_counts = [_]u32{0} ** prefetch_piece_count;
+    var prefetch_total: u32 = 0;
     const cur_fully_requested = if (peer.downloading_piece) |dp|
         dp.nextUnrequestedBlock() == null
     else if (peer.current_piece) |_|
@@ -441,101 +642,99 @@ pub fn tryFillPipeline(self: anytype, slot: u16) !void {
     else
         false;
 
-    if (cur_fully_requested and peer.inflight_requests + p1 < pipeline_depth) {
-        // Claim next piece if not already done
-        if (peer.next_piece == null) {
-            if (tc.piece_tracker) |pt| {
+    if (cur_fully_requested and peer.inflight_requests + p1 < target_depth) {
+        compactPrefetchSlots(peer);
+        const max_prefetch = requestPrefetchPieceCount(peer);
+        var prefetch_idx: usize = 0;
+        while (prefetch_idx < max_prefetch and
+            peer.inflight_requests + p1 + prefetch_total < target_depth) : (prefetch_idx += 1)
+        {
+            if (prefetchPiece(peer, prefetch_idx) == null) {
+                const pt = tc.piece_tracker orelse break;
                 const peer_bf: ?*const Bitfield = if (peer.availability) |*bf| bf else null;
-                if (pt.claimPiece(peer_bf)) |next_idx| {
-                    // Endgame mode can return the same piece we're already
-                    // downloading.  Skip prefetch in that case -- otherwise
-                    // next_downloading_piece aliases downloading_piece and
-                    // completePieceDownload double-frees the DP.
-                    // Don't releasePiece -- endgame doesn't set in_progress,
-                    // and the original claim still needs it.
-                    if (peer.current_piece != null and next_idx == peer.current_piece.?) {
-                        // no-op: skip duplicate piece prefetch
-                    } else {
-                        const next_size = sess.layout.pieceSize(next_idx) catch {
-                            pt.releasePiece(next_idx);
-                            return try submitPipelineRequests(self, slot, send_buf[0 .. p1 * request_size], p1, 0);
-                        };
-                        const next_block_count = geometry.blockCount(next_idx) catch {
-                            pt.releasePiece(next_idx);
-                            return try submitPipelineRequests(self, slot, send_buf[0 .. p1 * request_size], p1, 0);
-                        };
-                        // Create DownloadingPiece for next piece
-                        const next_dp_key = DownloadingPieceKey{ .torrent_id = peer.torrent_id, .piece_index = next_idx };
-                        const next_dp = if (self.downloading_pieces.get(next_dp_key)) |existing| existing else blk: {
-                            const new_dp = dp_mod.createDownloadingPiece(
-                                self.allocator,
-                                next_idx,
-                                peer.torrent_id,
-                                next_size,
-                                @intCast(next_block_count),
-                            ) catch {
-                                pt.releasePiece(next_idx);
-                                return try submitPipelineRequests(self, slot, send_buf[0 .. p1 * request_size], p1, 0);
-                            };
-                            self.downloading_pieces.put(self.allocator, next_dp_key, new_dp) catch {
-                                dp_mod.destroyDownloadingPieceFull(self.allocator, new_dp);
-                                pt.releasePiece(next_idx);
-                                return try submitPipelineRequests(self, slot, send_buf[0 .. p1 * request_size], p1, 0);
-                            };
-                            break :blk new_dp;
-                        };
+                const next_idx = pt.claimPiece(peer_bf) orelse break;
 
-                        peer.next_piece = next_idx;
-                        peer.next_piece_buf = next_dp.buf;
-                        peer.next_downloading_piece = next_dp;
-                        next_dp.peer_count += 1;
-                        peer.next_blocks_expected = next_block_count;
-                        peer.next_blocks_received = 0;
-                        peer.next_pipeline_sent = 0;
-                    }
+                // Endgame can return a piece already owned by this peer.
+                // That does not set a new in_progress bit, so there is
+                // nothing to release. Stop prefetching rather than aliasing
+                // current/prefetch DownloadingPiece state.
+                if ((peer.current_piece != null and next_idx == peer.current_piece.?) or
+                    prefetchContainsPiece(peer, next_idx))
+                {
+                    break;
                 }
+
+                const next_size = sess.layout.pieceSize(next_idx) catch {
+                    pt.releasePiece(next_idx);
+                    break;
+                };
+                const next_block_count = geometry.blockCount(next_idx) catch {
+                    pt.releasePiece(next_idx);
+                    break;
+                };
+                const next_dp_key = DownloadingPieceKey{ .torrent_id = peer.torrent_id, .piece_index = next_idx };
+                const next_dp = if (self.downloading_pieces.get(next_dp_key)) |existing| existing else blk: {
+                    const new_dp = dp_mod.createDownloadingPiece(
+                        self.allocator,
+                        next_idx,
+                        peer.torrent_id,
+                        next_size,
+                        @intCast(next_block_count),
+                    ) catch {
+                        pt.releasePiece(next_idx);
+                        break;
+                    };
+                    self.downloading_pieces.put(self.allocator, next_dp_key, new_dp) catch {
+                        dp_mod.destroyDownloadingPieceFull(self.allocator, new_dp);
+                        pt.releasePiece(next_idx);
+                        break;
+                    };
+                    break :blk new_dp;
+                };
+
+                setPrefetchSlot(peer, prefetch_idx, next_idx, next_dp, next_block_count);
+                next_dp.peer_count += 1;
             }
-        }
 
-        // Fill requests for next piece using DownloadingPiece
-        if (peer.next_piece) |next_idx| {
-            if (peer.next_downloading_piece) |next_dp| {
-                // Same fair-share cap as the current-piece path (above).
-                const next_peer_count = @max(@as(u8, 1), next_dp.peer_count);
-                const next_fair_share: u16 = @intCast(@max(
-                    @as(u32, 1),
-                    (@as(u32, next_dp.blocks_total) + next_peer_count - 1) / next_peer_count,
-                ));
-                const next_already = next_dp.attributedCountForPeer(slot);
-                const next_remaining: u16 = if (next_fair_share > next_already)
-                    next_fair_share - next_already
-                else
-                    0;
-                var next_claimed: u16 = 0;
-                while (peer.inflight_requests + p1 + p2 < pipeline_depth and
-                    next_claimed < next_remaining)
-                {
-                    const block_idx = next_dp.nextUnrequestedBlock() orelse break;
-                    const req = geometry.requestForBlock(next_idx, block_idx) catch break;
-                    if (!next_dp.markBlockRequested(block_idx, slot)) break;
-                    writeRequestMsg(send_buf[(p1 + p2) * request_size ..], req);
-                    p2 += 1;
-                    next_claimed += 1;
-                }
-            } else {
-                // Legacy path
-                while (peer.inflight_requests + p1 + p2 < pipeline_depth and
-                    peer.next_pipeline_sent + p2 < peer.next_blocks_expected)
-                {
-                    const req = geometry.requestForBlock(next_idx, peer.next_pipeline_sent + p2) catch break;
-                    writeRequestMsg(send_buf[(p1 + p2) * request_size ..], req);
-                    p2 += 1;
+            if (prefetchPiece(peer, prefetch_idx)) |next_idx| {
+                if (prefetchDownloadingPiece(peer, prefetch_idx)) |next_dp| {
+                    const next_peer_count = @max(@as(u8, 1), next_dp.peer_count);
+                    const next_fair_share: u16 = @intCast(@max(
+                        @as(u32, 1),
+                        (@as(u32, next_dp.blocks_total) + next_peer_count - 1) / next_peer_count,
+                    ));
+                    const next_already = next_dp.attributedCountForPeer(slot);
+                    const next_remaining: u16 = if (next_fair_share > next_already)
+                        next_fair_share - next_already
+                    else
+                        0;
+                    var next_claimed: u16 = 0;
+                    while (peer.inflight_requests + p1 + prefetch_total < target_depth and
+                        next_claimed < next_remaining)
+                    {
+                        const block_idx = next_dp.nextUnrequestedBlock() orelse break;
+                        const req = geometry.requestForBlock(next_idx, block_idx) catch break;
+                        if (!next_dp.markBlockRequested(block_idx, slot)) break;
+                        writeRequestMsg(send_buf[(p1 + prefetch_total) * request_size ..], req);
+                        prefetch_counts[prefetch_idx] += 1;
+                        prefetch_total += 1;
+                        next_claimed += 1;
+                    }
+                } else {
+                    while (peer.inflight_requests + p1 + prefetch_total < target_depth and
+                        prefetchPipelineSent(peer, prefetch_idx) + prefetch_counts[prefetch_idx] < prefetchBlocksExpected(peer, prefetch_idx))
+                    {
+                        const req = geometry.requestForBlock(next_idx, prefetchPipelineSent(peer, prefetch_idx) + prefetch_counts[prefetch_idx]) catch break;
+                        writeRequestMsg(send_buf[(p1 + prefetch_total) * request_size ..], req);
+                        prefetch_counts[prefetch_idx] += 1;
+                        prefetch_total += 1;
+                    }
                 }
             }
         }
     }
 
-    return try submitPipelineRequests(self, slot, send_buf[0 .. (p1 + p2) * request_size], p1, p2);
+    return try submitPipelineRequests(self, slot, send_buf[0 .. (p1 + prefetch_total) * request_size], p1, prefetch_counts);
 }
 
 fn writeRequestMsg(buf: []u8, req: anytype) void {
@@ -552,17 +751,23 @@ fn submitPipelineRequests(
     slot: u16,
     buf: []u8,
     p1: u32, // requests for current piece
-    p2: u32, // requests for next piece
+    prefetch_counts: [prefetch_piece_count]u32,
 ) !void {
     const peer = &self.peers[slot];
-    const total = p1 + p2;
+    var prefetch_total: u32 = 0;
+    for (prefetch_counts) |count| prefetch_total += count;
+    const total = p1 + prefetch_total;
     if (total == 0) return;
 
     // uTP peers: route through the uTP byte stream instead of io_uring send.
     if (peer.transport == .utp) {
+        if (comptime !@hasField(@TypeOf(self.*), "utp_manager")) return error.NoUtpManager;
         utp_handler.utpSendData(self, slot, buf) catch return;
+        markRequestQueueStarted(self, peer);
         peer.pipeline_sent += p1;
-        peer.next_pipeline_sent += p2;
+        for (prefetch_counts, 0..) |count, idx| {
+            addPrefetchPipelineSent(peer, idx, count);
+        }
         peer.inflight_requests += total;
         return;
     }
@@ -577,29 +782,33 @@ fn submitPipelineRequests(
         self.freeOnePendingSend(slot, send_id);
         return;
     };
+    markRequestQueueStarted(self, peer);
     peer.pipeline_sent += p1;
-    peer.next_pipeline_sent += p2;
+    for (prefetch_counts, 0..) |count, idx| {
+        addPrefetchPipelineSent(peer, idx, count);
+    }
     peer.inflight_requests += total;
 }
 
-/// After current piece completes: promote pre-fetched next_piece to current,
-/// or fall back to markIdle if no next piece is queued.
+/// After current piece completes: promote the head prefetch piece to current,
+/// or fall back to markIdle if no prefetch piece is queued.
 fn promoteNextPieceOrMarkIdle(self: anytype, slot: u16) void {
     const peer = &self.peers[slot];
-    if (peer.next_piece != null) {
-        peer.current_piece = peer.next_piece;
-        peer.piece_buf = peer.next_piece_buf;
-        peer.downloading_piece = peer.next_downloading_piece;
-        peer.blocks_expected = peer.next_blocks_expected;
-        peer.blocks_received = peer.next_blocks_received;
-        peer.pipeline_sent = peer.next_pipeline_sent;
+    compactPrefetchSlots(peer);
+    if (prefetchPiece(peer, 0) != null) {
+        const promoted = getPrefetchSlot(peer, 0);
+        peer.current_piece = promoted.piece;
+        peer.piece_buf = promoted.buf;
+        peer.downloading_piece = promoted.downloading_piece;
+        peer.blocks_expected = promoted.blocks_expected;
+        peer.blocks_received = promoted.blocks_received;
+        peer.pipeline_sent = promoted.pipeline_sent;
         // inflight_requests covers pending requests for the promoted piece -- do not reset.
-        peer.next_piece = null;
-        peer.next_piece_buf = null;
-        peer.next_downloading_piece = null;
-        peer.next_blocks_expected = 0;
-        peer.next_blocks_received = 0;
-        peer.next_pipeline_sent = 0;
+        var idx: usize = 0;
+        while (idx + 1 < prefetch_piece_count) : (idx += 1) {
+            setPrefetchSlotFrom(peer, idx, getPrefetchSlot(peer, idx + 1));
+        }
+        clearPrefetchSlot(peer, prefetch_piece_count - 1);
 
         // Check if the promoted piece is already complete (all blocks received)
         if (peer.downloading_piece) |dp| {
@@ -1058,14 +1267,13 @@ fn detachAllPeersExcept(self: anytype, dp: *DownloadingPiece, except_slot: u16) 
             p.pipeline_sent = 0;
             self.markIdle(s);
         }
-        if (p.next_downloading_piece == dp) {
-            p.next_downloading_piece = null;
-            p.next_piece_buf = null;
-            p.next_piece = null;
-            p.next_blocks_expected = 0;
-            p.next_blocks_received = 0;
-            p.next_pipeline_sent = 0;
+        var prefetch_idx: usize = 0;
+        while (prefetch_idx < prefetch_piece_count) : (prefetch_idx += 1) {
+            if (prefetchDownloadingPiece(p, prefetch_idx) == dp) {
+                clearPrefetchSlot(p, prefetch_idx);
+            }
         }
+        compactPrefetchSlots(p);
     }
 }
 
@@ -1357,7 +1565,21 @@ pub fn checkPeerTimeouts(self: anytype) void {
         if (peer.last_activity == 0) continue;
         if (peer.mode == .inbound) continue; // don't timeout inbound peers
 
-        if (now - peer.last_activity > peer_timeout_secs) {
+        if ((peer.state == .active_recv_header or peer.state == .active_recv_body) and
+            peer.inflight_requests > 0 and
+            peer.request_started_at > 0 and
+            now - peer.request_started_at > request_timeout_secs)
+        {
+            to_remove.append(self.allocator, slot) catch break;
+            continue;
+        }
+
+        const timeout_secs = switch (peer.state) {
+            .active_recv_header, .active_recv_body => peer_timeout_secs,
+            else => peer_handshake_timeout_secs,
+        };
+
+        if (now - peer.last_activity > timeout_secs) {
             to_remove.append(self.allocator, slot) catch break;
         }
     }
@@ -1579,8 +1801,6 @@ pub fn checkPex(self: anytype) void {
 
 /// Update speed counters for all active torrents and individual peers (called from tick).
 pub fn updateSpeedCounters(self: anytype) void {
-    if (self.active_peer_slots.items.len == 0) return;
-
     const now = self.clock.now();
 
     // Update per-peer speed counters
@@ -1611,7 +1831,7 @@ pub fn updateSpeedCounters(self: anytype) void {
     }
 
     // Update per-torrent speed counters
-    for (self.torrents_with_peers.items) |tid| {
+    for (self.active_torrent_ids.items) |tid| {
         const tc = self.getTorrentContext(tid) orelse continue;
         const dl_total = tc.downloaded_bytes;
         const ul_total = tc.uploaded_bytes;
@@ -1898,6 +2118,156 @@ test "writeRequestMsg encodes max u32 values" {
     try std.testing.expectEqual(max, std.mem.readInt(u32, buf[13..17], .big));
 }
 
+test "uTP request pipeline starts shallow and grows with measured speed" {
+    var peer = Peer{ .transport = .utp };
+    try std.testing.expectEqual(@as(u32, 32), requestPipelineDepth(&peer));
+
+    peer.bytes_downloaded_from = 16 * 1024;
+    try std.testing.expectEqual(@as(u32, 64), requestPipelineDepth(&peer));
+
+    peer.current_dl_speed = 256 * 1024;
+    try std.testing.expectEqual(@as(u32, 64), requestPipelineDepth(&peer));
+
+    peer.current_dl_speed = 8 * 1024 * 1024;
+    try std.testing.expectEqual(@as(u32, 64), requestPipelineDepth(&peer));
+}
+
+test "TCP request pipeline keeps full depth" {
+    var peer = Peer{ .transport = .tcp };
+    try std.testing.expectEqual(@as(u32, 64), requestPipelineDepth(&peer));
+}
+
+test "tryFillPipeline prefetches enough small pieces to fill request depth" {
+    const FakeLayout = struct {
+        piece_length: u32,
+        piece_count: u32,
+        total_size: u64,
+
+        fn pieceSize(self: @This(), piece_index: u32) !u32 {
+            if (piece_index >= self.piece_count) return error.InvalidPieceIndex;
+            if (piece_index + 1 < self.piece_count) return self.piece_length;
+            const consumed = @as(u64, piece_index) * self.piece_length;
+            return @intCast(self.total_size - consumed);
+        }
+    };
+    const FakeGeometry = struct {
+        layout: *const FakeLayout,
+        block_size: u32 = 16 * 1024,
+
+        fn blockCount(self: @This(), piece_index: u32) !u32 {
+            const piece_size = try self.layout.pieceSize(piece_index);
+            return @intCast((piece_size + self.block_size - 1) / self.block_size);
+        }
+
+        fn requestForBlock(self: @This(), piece_index: u32, block_index: u32) !struct {
+            piece_index: u32,
+            piece_offset: u32,
+            length: u32,
+        } {
+            const block_count = try self.blockCount(piece_index);
+            if (block_index >= block_count) return error.InvalidBlockIndex;
+            const piece_size = try self.layout.pieceSize(piece_index);
+            const offset = block_index * self.block_size;
+            const length = @min(self.block_size, piece_size - offset);
+            return .{ .piece_index = piece_index, .piece_offset = offset, .length = length };
+        }
+    };
+    const FakeSession = struct {
+        layout: FakeLayout,
+
+        fn geometry(self: *const @This()) FakeGeometry {
+            return .{ .layout = &self.layout };
+        }
+    };
+    const FakeTorrentContext = struct {
+        session: ?*FakeSession,
+        piece_tracker: ?*PieceTracker,
+    };
+    const FakeLoop = struct {
+        allocator: std.mem.Allocator,
+        peers: []Peer,
+        downloading_pieces: dp_mod.DownloadingPieceMap = .{},
+        torrent_context: FakeTorrentContext,
+        sent_bytes: usize = 0,
+
+        fn isDownloadThrottled(_: *@This(), _: u32) bool {
+            return false;
+        }
+
+        fn getTorrentContext(self: *@This(), _: u32) ?*FakeTorrentContext {
+            return &self.torrent_context;
+        }
+
+        fn nextSendId(_: *@This()) u64 {
+            return 1;
+        }
+
+        fn trackPendingSendCopy(self: *@This(), _: u16, _: u64, buf: []const u8) !usize {
+            self.sent_bytes += buf.len;
+            return 0;
+        }
+
+        fn submitPendingSend(_: *@This(), _: usize) !void {}
+
+        fn freeOnePendingSend(_: *@This(), _: u16, _: u64) void {}
+    };
+
+    var peer_storage = [_]Peer{.{}} ** 1;
+    var session = FakeSession{ .layout = .{
+        .piece_length = 256 * 1024,
+        .piece_count = 8,
+        .total_size = 8 * 256 * 1024,
+    } };
+    var initial_complete = try Bitfield.init(std.testing.allocator, session.layout.piece_count);
+    defer initial_complete.deinit(std.testing.allocator);
+    var tracker = try PieceTracker.init(
+        std.testing.allocator,
+        session.layout.piece_count,
+        session.layout.piece_length,
+        session.layout.total_size,
+        &initial_complete,
+        0,
+    );
+    defer tracker.deinit(std.testing.allocator);
+
+    var fake = FakeLoop{
+        .allocator = std.testing.allocator,
+        .peers = peer_storage[0..],
+        .torrent_context = .{ .session = &session, .piece_tracker = &tracker },
+    };
+    defer {
+        var it = fake.downloading_pieces.valueIterator();
+        while (it.next()) |dp_ptr| {
+            dp_mod.destroyDownloadingPieceFull(std.testing.allocator, dp_ptr.*);
+        }
+        fake.downloading_pieces.deinit(std.testing.allocator);
+    }
+
+    const slot: u16 = 0;
+    const peer = &fake.peers[slot];
+    peer.peer_choking = false;
+    peer.transport = .tcp;
+    peer.torrent_id = 0;
+    peer.availability = try Bitfield.init(std.testing.allocator, session.layout.piece_count);
+    defer peer.availability.?.deinit(std.testing.allocator);
+    var piece_index: u32 = 0;
+    while (piece_index < session.layout.piece_count) : (piece_index += 1) {
+        try peer.availability.?.set(piece_index);
+    }
+
+    const first_piece = if (peer.availability) |*bf| tracker.claimPiece(bf) else null;
+    try std.testing.expectEqual(@as(?u32, 0), first_piece);
+    try startPieceDownload(&fake, slot, first_piece.?);
+
+    try std.testing.expectEqual(@as(u32, 64), peer.inflight_requests);
+    try std.testing.expectEqual(@as(u32, 16), peer.pipeline_sent);
+    try std.testing.expectEqual(@as(u32, 48), totalPrefetchPipelineSent(peer));
+    try std.testing.expect(peer.next_piece != null);
+    try std.testing.expect(peer.extra_prefetch_pieces[0].piece != null);
+    try std.testing.expect(peer.extra_prefetch_pieces[1].piece != null);
+    try std.testing.expectEqual(@as(usize, 64 * 17), fake.sent_bytes);
+}
+
 test "checkReannounce skips loopback self peer when bound to wildcard" {
     var el = try EventLoop.initBare(std.testing.allocator, 0);
     defer el.deinit();
@@ -2177,6 +2547,42 @@ test "checkPeerTimeouts removes inactive download peers" {
     // Peer should have been removed (state reset to .free)
     try std.testing.expectEqual(PeerState.free, el.peers[0].state);
     try std.testing.expectEqual(@as(u16, 0), el.peer_count);
+}
+
+test "checkPeerTimeouts removes download peers with stalled requests" {
+    var el = try EventLoop.initBare(std.testing.allocator, 0);
+    defer el.deinit();
+
+    el.peers[0].state = .active_recv_header;
+    el.peers[0].mode = .outbound;
+    el.peers[0].last_activity = el.clock.now();
+    el.peers[0].inflight_requests = 8;
+    el.peers[0].request_started_at = el.clock.now() - (request_timeout_secs + 1);
+    el.peer_count = 1;
+    el.markActivePeer(0);
+
+    checkPeerTimeouts(&el);
+
+    try std.testing.expectEqual(PeerState.free, el.peers[0].state);
+    try std.testing.expectEqual(@as(u16, 0), el.peer_count);
+}
+
+test "checkPeerTimeouts keeps peers with recent request progress" {
+    var el = try EventLoop.initBare(std.testing.allocator, 0);
+    defer el.deinit();
+
+    el.peers[0].state = .active_recv_header;
+    el.peers[0].mode = .outbound;
+    el.peers[0].last_activity = el.clock.now();
+    el.peers[0].inflight_requests = 8;
+    el.peers[0].request_started_at = el.clock.now() - 5;
+    el.peer_count = 1;
+    el.markActivePeer(0);
+
+    checkPeerTimeouts(&el);
+
+    try std.testing.expect(el.peers[0].state != .free);
+    try std.testing.expectEqual(@as(u16, 1), el.peer_count);
 }
 
 test "checkPeerTimeouts does not remove seed mode peers" {

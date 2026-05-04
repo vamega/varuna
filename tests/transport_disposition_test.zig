@@ -174,7 +174,7 @@ test "utp_only auto transport does not fall back to tcp when utp setup is unavai
     try std.testing.expectEqual(@as(u32, 0), el.peer_count);
 }
 
-test "tcp_and_utp auto transport starts with optimistic utp" {
+test "tcp_and_utp auto transport starts with tcp" {
     const EL = event_loop_mod.EventLoopOf(SimIO);
     const sim_io = try SimIO.init(std.testing.allocator, .{ .seed = 0x7470 });
     var el = try EL.initBareWithIO(std.testing.allocator, sim_io, 0);
@@ -204,9 +204,9 @@ test "tcp_and_utp auto transport starts with optimistic utp" {
     const addr = try std.net.Address.parseIp4("127.0.0.1", 6882);
 
     const slot = try el.addPeerAutoTransport(addr, tid);
-    try std.testing.expectEqual(Transport.utp, el.peers[slot].transport);
-    try std.testing.expectEqual(@as(u16, 1), activePeerCountByTransport(&el, .utp));
-    try std.testing.expectEqual(@as(u16, 0), activePeerCountByTransport(&el, .tcp));
+    try std.testing.expectEqual(Transport.tcp, el.peers[slot].transport);
+    try std.testing.expectEqual(@as(u16, 0), activePeerCountByTransport(&el, .utp));
+    try std.testing.expectEqual(@as(u16, 1), activePeerCountByTransport(&el, .tcp));
 }
 
 test "silent utp connect falls back to tcp after connect timeout" {

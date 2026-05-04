@@ -3,6 +3,8 @@ const log = std.log.scoped(.web_seed);
 const layout_mod = @import("../torrent/layout.zig");
 const metainfo_mod = @import("../torrent/metainfo.zig");
 
+pub const max_parallel_requests_per_seed: u8 = 3;
+
 /// State of a single web seed source.
 pub const WebSeedState = enum {
     idle, // ready to request
@@ -17,6 +19,8 @@ pub const WebSeed = struct {
     state: WebSeedState = .idle,
     /// Current piece being downloaded (valid when state == .active).
     current_piece: u32 = 0,
+    /// Number of in-flight range requests assigned to this seed.
+    active_requests: u8 = 0,
     /// Consecutive failure count for exponential backoff.
     consecutive_failures: u32 = 0,
     /// Timestamp (seconds) when backoff expires.
@@ -81,10 +85,15 @@ pub const WebSeedManager = struct {
     pub fn availableCount(self: *const WebSeedManager, now: i64) usize {
         var count: usize = 0;
         for (self.seeds) |seed| {
-            if (seed.state == .idle) {
-                count += 1;
-            } else if (seed.state == .backoff and now >= seed.backoff_until) {
-                count += 1;
+            switch (seed.state) {
+                .idle => count += 1,
+                .active => {
+                    if (seed.active_requests < max_parallel_requests_per_seed) count += 1;
+                },
+                .backoff => {
+                    if (now >= seed.backoff_until and seed.active_requests < max_parallel_requests_per_seed) count += 1;
+                },
+                .disabled => {},
             }
         }
         return count;
@@ -94,10 +103,12 @@ pub const WebSeedManager = struct {
     pub fn assignPiece(self: *WebSeedManager, piece_index: u32, now: i64) ?usize {
         for (self.seeds, 0..) |*seed, i| {
             const available = seed.state == .idle or
-                (seed.state == .backoff and now >= seed.backoff_until);
+                (seed.state == .active and seed.active_requests < max_parallel_requests_per_seed) or
+                (seed.state == .backoff and now >= seed.backoff_until and seed.active_requests < max_parallel_requests_per_seed);
             if (available) {
                 seed.state = .active;
                 seed.current_piece = piece_index;
+                seed.active_requests += 1;
                 return i;
             }
         }
@@ -108,7 +119,10 @@ pub const WebSeedManager = struct {
     pub fn markSuccess(self: *WebSeedManager, seed_index: usize, bytes: u64) void {
         if (seed_index >= self.seeds.len) return;
         var seed = &self.seeds[seed_index];
-        seed.state = .idle;
+        if (seed.active_requests > 0) seed.active_requests -= 1;
+        if (seed.state != .backoff) {
+            seed.state = if (seed.active_requests == 0) .idle else .active;
+        }
         seed.consecutive_failures = 0;
         seed.bytes_downloaded += bytes;
         seed.pieces_downloaded += 1;
@@ -118,6 +132,7 @@ pub const WebSeedManager = struct {
     pub fn markFailure(self: *WebSeedManager, seed_index: usize, now: i64) void {
         if (seed_index >= self.seeds.len) return;
         var seed = &self.seeds[seed_index];
+        if (seed.active_requests > 0) seed.active_requests -= 1;
         seed.failed_requests += 1;
         seed.consecutive_failures += 1;
 
@@ -131,6 +146,7 @@ pub const WebSeedManager = struct {
         // After 10 consecutive failures, disable the seed
         if (seed.consecutive_failures >= 10) {
             seed.state = .disabled;
+            seed.active_requests = 0;
         }
     }
 
@@ -138,6 +154,7 @@ pub const WebSeedManager = struct {
     pub fn disable(self: *WebSeedManager, seed_index: usize) void {
         if (seed_index >= self.seeds.len) return;
         self.seeds[seed_index].state = .disabled;
+        self.seeds[seed_index].active_requests = 0;
     }
 
     /// Build the full URL for downloading a piece from a BEP 19 web seed.
@@ -253,7 +270,7 @@ pub const WebSeedManager = struct {
     /// the rest of the web-seed handler pipeline (the `run_buf` allocation is
     /// u32, `WebSeedSlot.total_bytes` is u32, `target_offset` is u32). The
     /// production caller bounds the run via the `web_seed_max_request_bytes`
-    /// config (default 4 MB), so the u32 width is plenty in practice — but a
+    /// config (default 16 MB), so the u32 width is plenty in practice — but a
     /// misconfigured bound (e.g. > 4 GB) would previously panic the
     /// `@intCast(u64 -> u32)` here and crash the daemon on the first
     /// multi-piece request. The check below rejects with `error.RunTooLarge`
@@ -424,15 +441,24 @@ test "web seed assign and complete piece" {
     const idx = mgr.assignPiece(0, 0);
     try std.testing.expectEqual(@as(?usize, 0), idx);
     try std.testing.expectEqual(WebSeedState.active, mgr.seeds[0].state);
+    try std.testing.expectEqual(@as(u8, 1), mgr.seeds[0].active_requests);
 
-    // No more seeds available
-    try std.testing.expectEqual(@as(?usize, null), mgr.assignPiece(1, 0));
+    // A single seed can carry a small number of parallel range requests.
+    try std.testing.expectEqual(@as(?usize, 0), mgr.assignPiece(1, 0));
+    try std.testing.expectEqual(@as(?usize, 0), mgr.assignPiece(2, 0));
+    try std.testing.expectEqual(@as(u8, max_parallel_requests_per_seed), mgr.seeds[0].active_requests);
+    try std.testing.expectEqual(@as(?usize, null), mgr.assignPiece(3, 0));
 
     // Mark success
     mgr.markSuccess(0, 256);
+    try std.testing.expectEqual(WebSeedState.active, mgr.seeds[0].state);
+    try std.testing.expectEqual(@as(u8, max_parallel_requests_per_seed - 1), mgr.seeds[0].active_requests);
+    mgr.markSuccess(0, 256);
+    mgr.markSuccess(0, 256);
     try std.testing.expectEqual(WebSeedState.idle, mgr.seeds[0].state);
-    try std.testing.expectEqual(@as(u64, 256), mgr.seeds[0].bytes_downloaded);
-    try std.testing.expectEqual(@as(u32, 1), mgr.seeds[0].pieces_downloaded);
+    try std.testing.expectEqual(@as(u8, 0), mgr.seeds[0].active_requests);
+    try std.testing.expectEqual(@as(u64, 768), mgr.seeds[0].bytes_downloaded);
+    try std.testing.expectEqual(@as(u32, 3), mgr.seeds[0].pieces_downloaded);
 }
 
 test "web seed failure backoff" {

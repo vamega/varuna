@@ -182,8 +182,9 @@ pub const RoutingTable = struct {
         }.lessThan);
 
         // Return up to count nodes
-        const result_count = @min(count, @as(u8, @intCast(candidate_count)));
-        const actual_count = @min(result_count, @as(u8, @intCast(buf.len)));
+        const requested: usize = @min(@as(usize, count), buf.len);
+        const actual_count_usize = @min(requested, candidate_count);
+        const actual_count: u8 = @intCast(actual_count_usize);
         @memcpy(buf[0..actual_count], candidates[0..actual_count]);
         return actual_count;
     }
@@ -394,6 +395,33 @@ test "findClosest returns sorted results" {
     for (1..count) |i| {
         try std.testing.expect(!node_id.isCloser(target, buf[i].id, buf[i - 1].id));
     }
+}
+
+test "findClosest clamps after collecting more than 255 nodes" {
+    var rng = Random.simRandom(0x406);
+    const own_id = node_id.generateRandom(&rng);
+    var table = RoutingTable.init(own_id);
+    const now: i64 = 1000000;
+
+    for (0..160) |bucket| {
+        for (0..2) |slot| {
+            _ = table.addNode(.{
+                .id = node_id.randomIdInBucket(&rng, own_id, @intCast(bucket)),
+                .address = std.net.Address.initIp4(.{
+                    10,
+                    @intCast(bucket),
+                    @intCast(slot),
+                    @intCast((bucket + slot) % 250 + 1),
+                }, 6881),
+            }, now);
+        }
+    }
+    try std.testing.expect(table.nodeCount() > 255);
+
+    const target = [_]u8{0x55} ** 20;
+    var buf: [8]NodeInfo = undefined;
+    const count = table.findClosest(target, 8, &buf);
+    try std.testing.expectEqual(@as(u8, 8), count);
 }
 
 test "needsRefresh detects stale buckets" {

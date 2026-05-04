@@ -138,6 +138,31 @@ pub fn EventLoopOf(comptime IO: type) type {
             remote: std.net.Address,
         };
 
+        pub const utp_send_slot_count: usize = 64;
+
+        pub const UtpSendSlot = struct {
+            data: [1500]u8 = undefined,
+            len: usize = 0,
+            remote: std.net.Address = undefined,
+            addr: std.net.Address = undefined,
+            original_family: posix.sa_family_t = 0,
+            iov: [1]posix.iovec_const = undefined,
+            msg: posix.msghdr_const = undefined,
+            completion: io_interface.Completion = .{},
+            active: bool = false,
+        };
+
+        pub const utp_recv_slot_count: usize = 8;
+
+        pub const UtpRecvSlot = struct {
+            data: [1500]u8 = undefined,
+            iov: [1]posix.iovec = undefined,
+            addr: std.net.Address = undefined,
+            msg: posix.msghdr = undefined,
+            completion: io_interface.Completion = .{},
+            active: bool = false,
+        };
+
         /// A one-shot timer callback scheduled via scheduleTimer().
         /// Fired when the monotonic clock passes fire_at_ms.
         pub const TimerCallback = struct {
@@ -258,25 +283,21 @@ pub fn EventLoopOf(comptime IO: type) type {
         // uTP over UDP: single UDP socket + connection multiplexer
         udp_fd: posix.fd_t = -1,
         utp_manager: ?*utp_mgr.UtpManager = null,
-        // Persistent recv buffer and msghdr for io_uring RECVMSG
-        utp_recv_buf: [1500]u8 = undefined,
-        utp_recv_iov: [1]posix.iovec = undefined,
-        // sockaddr.storage is large enough for IPv4, IPv6, and any other family.
-        utp_recv_addr: std.net.Address = undefined,
-        utp_recv_msg: posix.msghdr = undefined,
-        // Persistent send buffer and msghdr for io_uring SENDMSG
-        utp_send_buf: [1500]u8 = undefined,
-        utp_send_iov: [1]posix.iovec_const = undefined,
-        // sockaddr.storage is large enough for IPv4, IPv6, and any other family.
-        utp_send_addr: std.net.Address = undefined,
-        utp_send_msg: posix.msghdr_const = undefined,
+        // Persistent recv slots and msghdrs for concurrent io_uring RECVMSGs.
+        utp_recv_slots: [utp_recv_slot_count]UtpRecvSlot =
+            [_]UtpRecvSlot{.{}} ** utp_recv_slot_count,
+        utp_recv_active: u16 = 0,
+        utp_recv_next_slot: u16 = 0,
+        // Persistent send slots and msghdrs for concurrent io_uring SENDMSGs.
+        utp_send_slots: [utp_send_slot_count]UtpSendSlot =
+            [_]UtpSendSlot{.{}} ** utp_send_slot_count,
+        utp_send_inflight: u16 = 0,
+        utp_send_next_slot: u16 = 0,
         utp_send_pending: bool = false,
+        udp_ipv6_unreachable: bool = false,
         // Outbound packet queue (when a send is already in flight)
         utp_send_queue: std.ArrayList(UtpQueuedPacket) = std.ArrayList(UtpQueuedPacket).empty,
-        // io_interface completions for the UDP socket recvmsg / sendmsg.
-        // recv is re-armed indefinitely; send is one-shot per packet.
-        utp_recv_completion: io_interface.Completion = .{},
-        utp_send_completion: io_interface.Completion = .{},
+        // send completions live in utp_send_slots; recv completions live in utp_recv_slots.
 
         // DHT (BEP 5): distributed hash table engine for trackerless peer discovery.
         // Shares the UDP socket with uTP. Incoming datagrams starting with 'd'
@@ -409,7 +430,7 @@ pub fn EventLoopOf(comptime IO: type) type {
         web_seed_slots: [web_seed_handler.max_web_seed_slots]web_seed_handler.WebSeedSlot =
             [_]web_seed_handler.WebSeedSlot{.{}} ** web_seed_handler.max_web_seed_slots,
         /// Maximum bytes per web seed HTTP Range request (batches multiple pieces).
-        web_seed_max_request_bytes: u32 = 4 * 1024 * 1024,
+        web_seed_max_request_bytes: u32 = 16 * 1024 * 1024,
 
         // Compact list of peer slots that are idle (active, unchoked, have
         // availability, and need a piece assignment).  Avoids scanning all
@@ -770,6 +791,11 @@ pub fn EventLoopOf(comptime IO: type) type {
                 if (peer.next_downloading_piece == null) {
                     if (peer.next_piece_buf) |buf| self.allocator.free(buf);
                 }
+                for (peer.extra_prefetch_pieces) |slot| {
+                    if (slot.downloading_piece == null) {
+                        if (slot.buf) |buf| self.allocator.free(buf);
+                    }
+                }
                 if (peer.availability) |*bf| bf.deinit(self.allocator);
                 if (peer.pex_state) |ps| {
                     ps.deinit(self.allocator);
@@ -968,6 +994,21 @@ pub fn EventLoopOf(comptime IO: type) type {
             return @intCast(@min(tc.peer_slots.items.len, std.math.maxInt(u16)));
         }
 
+        /// Count peers that have moved past the half-open connection phase.
+        /// Half-open slots are limited separately by `max_half_open`; counting
+        /// them against the per-torrent connected-peer cap makes uTP swarms
+        /// under-connect when many SYNs are in flight.
+        pub fn establishedPeerCountForTorrent(self: *const Self, torrent_id: TorrentId) u16 {
+            const tc = self.getTorrentContextConst(torrent_id) orelse return 0;
+            var count: u16 = 0;
+            for (tc.peer_slots.items) |slot| {
+                const peer = &self.peers[slot];
+                if (peer.state == .free or peer.state == .connecting or peer.state == .disconnecting) continue;
+                count += 1;
+            }
+            return count;
+        }
+
         /// Return the current half-open (connecting) peer count.
         pub fn halfOpenCount(self: *const Self) u16 {
             return @intCast(@min(self.half_open_count, std.math.maxInt(u16)));
@@ -1105,10 +1146,11 @@ pub fn EventLoopOf(comptime IO: type) type {
 
         /// Select the transport for a new outbound connection based on the
         /// transport disposition. When both outgoing TCP and uTP are enabled,
-        /// prefer uTP first; silent uTP connects fall back to TCP from
-        /// `utp_handler.utpTick`, matching libtorrent's default behavior.
+        /// prefer TCP; libtorrent/qBittorrent only choose outgoing uTP when
+        /// TCP is disabled or the peer is already known to support uTP.
         pub fn selectTransport(self: *Self) Transport {
             const disp = self.transport_disposition;
+            if (disp.outgoing_tcp) return .tcp;
             if (disp.outgoing_utp) return .utp;
             // Default to TCP (includes the case where neither is enabled,
             // which is a misconfiguration but safe to fall back to TCP).
@@ -1215,7 +1257,7 @@ pub fn EventLoopOf(comptime IO: type) type {
 
         fn processPeerCandidatesForTorrent(self: *Self, torrent_id: TorrentId) void {
             while (self.peer_count < self.max_connections and self.half_open_count < self.max_half_open) {
-                if (self.peerCountForTorrent(torrent_id) >= self.max_peers_per_torrent) return;
+                if (self.establishedPeerCountForTorrent(torrent_id) >= self.max_peers_per_torrent) return;
                 const now = self.clock.now();
                 const candidate = blk: {
                     const tc = self.getTorrentContext(torrent_id) orelse return;
@@ -1324,11 +1366,12 @@ pub fn EventLoopOf(comptime IO: type) type {
                 return error.ConnectionLimitReached;
             }
 
-            // Enforce per-torrent connection limit
-            if (self.peerCountForTorrent(torrent_id) >= self.max_peers_per_torrent) {
+            // Enforce per-torrent established-peer limit. Half-open
+            // connection attempts are governed by `max_half_open`.
+            if (self.establishedPeerCountForTorrent(torrent_id) >= self.max_peers_per_torrent) {
                 log.warn("per-torrent connection limit reached for torrent {d} ({d}/{d})", .{
                     torrent_id,
-                    self.peerCountForTorrent(torrent_id),
+                    self.establishedPeerCountForTorrent(torrent_id),
                     self.max_peers_per_torrent,
                 });
                 return error.TorrentConnectionLimitReached;
@@ -1591,6 +1634,9 @@ pub fn EventLoopOf(comptime IO: type) type {
             if (self.peer_count >= self.max_connections) {
                 return error.ConnectionLimitReached;
             }
+            if (self.establishedPeerCountForTorrent(torrent_id) >= self.max_peers_per_torrent) {
+                return error.TorrentConnectionLimitReached;
+            }
             if (self.half_open_count >= self.max_half_open) {
                 return error.HalfOpenLimitReached;
             }
@@ -1676,6 +1722,20 @@ pub fn EventLoopOf(comptime IO: type) type {
                 .optval = &v6only_zero,
             }) catch {};
 
+            // uTP and DHT share this UDP socket. The Linux default receive
+            // buffer (~208 KiB on many systems) drops packets under public
+            // swarm fan-in well before the daemon saturates the link. Ask for
+            // a larger buffer; the kernel may cap it at net.core.rmem_max.
+            const recv_buf_bytes = std.mem.toBytes(@as(c_int, 8 * 1024 * 1024));
+            io_interface.setsockoptBlocking(&self.io, .{
+                .fd = fd,
+                .level = posix.SOL.SOCKET,
+                .optname = posix.SO.RCVBUF,
+                .optval = &recv_buf_bytes,
+            }) catch |err| {
+                log.warn("UDP socket SO_RCVBUF failed: {s}", .{@errorName(err)});
+            };
+
             // Apply SO_BINDTODEVICE if configured (keeps traffic on a specific interface).
             if (self.bind_device) |device| {
                 socket_util.applyBindDevice(fd, device) catch |err| {
@@ -1703,27 +1763,20 @@ pub fn EventLoopOf(comptime IO: type) type {
             mgr.* = utp_mgr.UtpManager.init(self.allocator);
             self.utp_manager = mgr;
 
-            // Submit first RECVMSG
-            try utp_handler.submitUtpRecv(self);
+            // Keep multiple RECVMSG SQEs posted so the shared DHT/uTP UDP
+            // socket can drain public-swarm bursts without serializing each
+            // datagram on a fresh submit/complete cycle.
+            try utp_handler.submitInitialUtpRecvs(self);
             log.info("uTP listener started on UDP port {d}", .{self.port});
         }
 
-        /// Stop the UDP listener (uTP/DHT). Cancels the pending RECVMSG,
-        /// closes the UDP socket via io_uring, and frees the UtpManager.
-        /// The cancel and close CQEs will be processed on the next tick;
-        /// setting udp_fd = -1 immediately ensures the dispatch loop ignores them.
+        /// Stop the UDP listener (uTP/DHT). Closing the fd completes pending
+        /// RECVMSG/SENDMSG SQEs with errors; setting udp_fd = -1 immediately
+        /// ensures callbacks do not re-arm receives.
         pub fn stopUtpListener(self: *Self) void {
             if (self.udp_fd < 0) return;
             const fd = self.udp_fd;
             self.udp_fd = -1;
-
-            // Cancel the pending RECVMSG on the io_interface ring.
-            self.io.cancel(
-                .{ .target = &self.utp_recv_completion },
-                &self.accept_cancel_completion,
-                null,
-                ignoredCancelComplete,
-            ) catch {};
 
             posix.close(fd);
 
@@ -1854,15 +1907,7 @@ pub fn EventLoopOf(comptime IO: type) type {
                     if (tc.piece_tracker) |pt| pt.releasePiece(piece_index);
                 }
             }
-            if (peer.next_downloading_piece != null) {
-                peer_policy.detachPeerFromNextDownloadingPiece(self, peer);
-            } else if (peer.next_piece) |next_index| {
-                if (self.getTorrentContext(peer.torrent_id)) |tc| {
-                    if (tc.piece_tracker) |pt| pt.releasePiece(next_index);
-                }
-                if (peer.next_piece_buf) |buf| self.allocator.free(buf);
-                peer.next_piece_buf = null; // prevent double-free in cleanupPeer
-            }
+            peer_policy.detachPeerFromPrefetchPieces(self, peer);
             // Decrement per-piece availability counters so rarest-first stays accurate
             if (peer.availability_known) {
                 if (peer.availability) |*bf| {
@@ -3284,6 +3329,11 @@ pub fn EventLoopOf(comptime IO: type) type {
             if (peer.next_downloading_piece == null) {
                 if (peer.next_piece_buf) |buf| self.allocator.free(buf);
             }
+            for (peer.extra_prefetch_pieces) |slot| {
+                if (slot.downloading_piece == null) {
+                    if (slot.buf) |buf| self.allocator.free(buf);
+                }
+            }
             if (peer.availability) |*bf| bf.deinit(self.allocator);
             if (peer.pex_state) |ps| {
                 ps.deinit(self.allocator);
@@ -3449,6 +3499,33 @@ test "peer candidates persist when connection capacity is exhausted" {
     try std.testing.expectEqual(@as(u32, 0), el.half_open_count);
 }
 
+test "established peer count excludes half-open candidates" {
+    var el = try EventLoop.initBare(std.testing.allocator, 0);
+    defer el.deinit();
+
+    const empty_fds = [_]posix.fd_t{};
+    const tid = try el.addTorrentContext(.{
+        .shared_fds = empty_fds[0..],
+        .info_hash = [_]u8{0xA3} ** 20,
+        .peer_id = [_]u8{0xB4} ** 20,
+    });
+
+    el.peers[0].state = .connecting;
+    el.peers[0].torrent_id = tid;
+    el.attachPeerToTorrent(tid, 0);
+
+    el.peers[1].state = .active_recv_header;
+    el.peers[1].torrent_id = tid;
+    el.attachPeerToTorrent(tid, 1);
+
+    el.peers[2].state = .handshake_recv;
+    el.peers[2].torrent_id = tid;
+    el.attachPeerToTorrent(tid, 2);
+
+    try std.testing.expectEqual(@as(u16, 3), el.peerCountForTorrent(tid));
+    try std.testing.expectEqual(@as(u16, 2), el.establishedPeerCountForTorrent(tid));
+}
+
 test "private torrents reject DHT and PEX peer candidates" {
     var el = try EventLoop.initBare(std.testing.allocator, 0);
     defer el.deinit();
@@ -3552,18 +3629,18 @@ test "selectTransport always returns tcp when outgoing utp disabled" {
     }
 }
 
-test "selectTransport prefers utp when both outgoing enabled" {
+test "selectTransport prefers tcp when both outgoing enabled" {
     const allocator = std.testing.allocator;
     var el = try EventLoop.initBare(allocator, 0);
     defer el.deinit();
 
     el.transport_disposition = TransportDisposition.tcp_and_utp;
 
-    try std.testing.expectEqual(Transport.utp, el.selectTransport());
-    try std.testing.expectEqual(Transport.utp, el.selectTransport());
+    try std.testing.expectEqual(Transport.tcp, el.selectTransport());
+    try std.testing.expectEqual(Transport.tcp, el.selectTransport());
 }
 
-test "selectTransport consistently chooses utp in mixed mode" {
+test "selectTransport consistently chooses tcp in mixed mode" {
     const allocator = std.testing.allocator;
     var el = try EventLoop.initBare(allocator, 0);
     defer el.deinit();
@@ -3576,8 +3653,8 @@ test "selectTransport consistently chooses utp in mixed mode" {
         const t = el.selectTransport();
         if (t == .tcp) tcp_count += 1 else utp_count += 1;
     }
-    try std.testing.expectEqual(@as(u32, 0), tcp_count);
-    try std.testing.expectEqual(@as(u32, 100), utp_count);
+    try std.testing.expectEqual(@as(u32, 100), tcp_count);
+    try std.testing.expectEqual(@as(u32, 0), utp_count);
 }
 
 test "selectTransport returns utp only when outgoing_tcp disabled" {

@@ -22,7 +22,7 @@ test "announce URL includes compact=1" {
 test "announce URL includes numwant" {
     const url = try buildTestUrl(.{});
     defer std.testing.allocator.free(url);
-    try std.testing.expect(std.mem.indexOf(u8, url, "numwant=50") != null);
+    try std.testing.expect(std.mem.indexOf(u8, url, "numwant=200") != null);
 }
 
 test "announce URL includes custom numwant" {
@@ -286,7 +286,7 @@ const BuildTestUrlOptions = struct {
     left: u64 = 42,
     event: ?announce.Request.Event = .started,
     key: ?[8]u8 = "test1234".*,
-    numwant: u32 = 50,
+    numwant: u32 = 200,
 };
 
 fn buildTestUrl(opts: BuildTestUrlOptions) ![]u8 {

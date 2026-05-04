@@ -182,7 +182,7 @@ test "build announce url percent encodes binary fields" {
     try std.testing.expect(std.mem.indexOf(u8, url, "peer_id=ABCDEFGHIJKLMNOPQRST") != null);
     try std.testing.expect(std.mem.indexOf(u8, url, "compact=1") != null);
     try std.testing.expect(std.mem.indexOf(u8, url, "event=started") != null);
-    try std.testing.expect(std.mem.indexOf(u8, url, "numwant=50") != null);
+    try std.testing.expect(std.mem.indexOf(u8, url, "numwant=200") != null);
 }
 
 test "build url includes key when provided" {

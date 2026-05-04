@@ -9,10 +9,15 @@ const Random = @import("../runtime/random.zig").Random;
 pub const K = routing_table.K;
 
 /// Maximum number of candidates tracked during a lookup.
-const max_candidates: usize = 64;
+///
+/// Public swarms often need more breadth than the strict Kademlia closest-K
+/// walk to quickly discover enough reachable peers. libtorrent defaults to
+/// aggressive lookups with a broader search fan-out; keep enough candidates
+/// to continue walking while peer values arrive from the tail of the search.
+const max_candidates: usize = 256;
 
 /// Alpha: number of concurrent queries per lookup round.
-pub const alpha: u8 = 3;
+pub const alpha: u8 = 5;
 
 /// State of a candidate node during iterative lookup.
 const CandidateState = enum {
@@ -84,9 +89,16 @@ pub const Lookup = struct {
     pub fn nextToQueryN(self: *Lookup, buf: []NodeInfo) u8 {
         if (self.state == .done) return 0;
 
-        var count: u8 = 0;
+        var in_flight: usize = 0;
+        for (self.candidates[0..self.candidate_count]) |c| {
+            if (c.state == .queried) in_flight += 1;
+        }
+        if (in_flight >= buf.len) return 0;
+
+        const allowance = buf.len - in_flight;
+        var count: usize = 0;
         for (0..self.candidate_count) |ci| {
-            if (count >= buf.len) break;
+            if (count >= allowance) break;
             if (self.candidates[ci].state == .pending) {
                 buf[count] = self.candidates[ci].info;
                 self.candidates[ci].state = .queried;
@@ -109,7 +121,7 @@ pub const Lookup = struct {
             }
         }
 
-        return count;
+        return @intCast(count);
     }
 
     /// Handle a response from a queried node. Adds newly discovered nodes
@@ -307,6 +319,32 @@ test "nextToQuery returns alpha nodes" {
     var buf: [alpha]NodeInfo = undefined;
     const count = lk.nextToQuery(&buf);
     try std.testing.expectEqual(@as(u8, alpha), count);
+}
+
+test "nextToQuery respects alpha as concurrent in-flight limit" {
+    var rng = Random.simRandom(0x5021);
+    var lk = Lookup.init(node_id.generateRandom(&rng), .find_node);
+
+    for (0..10) |i| {
+        var id: NodeId = [_]u8{0} ** 20;
+        id[19] = @intCast(i + 1);
+        lk.addCandidate(.{
+            .id = id,
+            .address = std.net.Address.initIp4(.{ 10, 0, 0, @intCast(i + 1) }, 6881),
+        });
+    }
+
+    var buf: [alpha]NodeInfo = undefined;
+    const first = lk.nextToQuery(&buf);
+    try std.testing.expectEqual(@as(u8, alpha), first);
+
+    const second = lk.nextToQuery(&buf);
+    try std.testing.expectEqual(@as(u8, 0), second);
+    try std.testing.expect(!lk.isDone());
+
+    lk.handleResponse(buf[0].id, null, null, null);
+    const third = lk.nextToQuery(&buf);
+    try std.testing.expectEqual(@as(u8, 1), third);
 }
 
 test "lookup completes when no pending candidates" {

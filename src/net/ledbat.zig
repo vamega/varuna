@@ -45,7 +45,7 @@ pub const Ledbat = struct {
     pub const target_delay_us: u32 = 100_000;
 
     /// Minimum congestion window: one packet (MTU).
-    pub const min_cwnd: u32 = 150; // one small packet
+    pub const min_cwnd: u32 = mss;
 
     /// Maximum congestion window (1 MiB).
     pub const max_cwnd: u32 = 1024 * 1024;

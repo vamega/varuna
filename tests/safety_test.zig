@@ -42,13 +42,14 @@ test "addressEql parameters are const pointers" {
 // 2. Struct initialization safety
 // ═══════════════════════════════════════════════════════════════
 
-test "UtpSocket out_buf initializes packet_buf to null" {
+test "UtpSocket out_buf initializes packet storage as empty" {
     // A past bug had `out_buf: [128]OutPacket = undefined` which left
-    // pointer fields (packet_buf) as garbage, causing UAF on deinit.
-    // Default initialization must set packet_buf to null for every slot.
-    const sock = utp.UtpSocket{};
+    // pointer fields as garbage, causing UAF on deinit. The packet buffer is
+    // now inline; default initialization must mark every slot as empty.
+    var sock = utp.UtpSocket{};
     for (&sock.out_buf) |*pkt| {
-        try std.testing.expect(pkt.packet_buf == null);
+        try std.testing.expectEqual(@as(u16, 0), pkt.packet_len);
+        try std.testing.expect(pkt.datagram() == null);
     }
 }
 
@@ -69,10 +70,11 @@ test "UtpSocket out_buf default fields are zero-initialized" {
 // 3. Struct size regression tests
 // ═══════════════════════════════════════════════════════════════
 
-test "UtpSocket size stays under 8KB" {
-    // UtpSocket lives on the stack in several call paths.
-    // If it grows past 8KB, we risk stack pressure or need heap allocation.
-    try std.testing.expect(@sizeOf(utp.UtpSocket) < 8192);
+test "UtpSocket inline retransmit storage stays bounded" {
+    // UtpManager stores sockets behind heap pointers, while tests may still
+    // instantiate them directly. Keep the inline retransmit buffer bounded so
+    // the no-per-packet-allocation design cannot grow without review.
+    try std.testing.expect(@sizeOf(utp.UtpSocket) <= (utp.max_datagram * 128) + (32 * 1024));
 }
 
 test "std.net.Address size is documented" {
@@ -81,10 +83,10 @@ test "std.net.Address size is documented" {
     try std.testing.expect(@sizeOf(std.net.Address) <= 128);
 }
 
-test "OutPacket size stays reasonable" {
-    // OutPacket is stored in a [128] array inside UtpSocket.
-    // Keep it under 64 bytes to prevent UtpSocket bloat.
-    try std.testing.expect(@sizeOf(utp.OutPacket) <= 64);
+test "OutPacket stores one inline datagram plus small metadata" {
+    // OutPacket is stored in a [128] array inside UtpSocket. It should remain
+    // one full datagram plus a small amount of retransmit/ACK metadata.
+    try std.testing.expect(@sizeOf(utp.OutPacket) <= utp.max_datagram + 64);
 }
 
 // ═══════════════════════════════════════════════════════════════

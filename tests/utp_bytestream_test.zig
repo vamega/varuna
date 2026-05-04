@@ -50,6 +50,10 @@ test "BT handshake over uTP byte stream" {
     _ = client.processPacket(syn_ack_hdr, &.{}, 1_002_000);
     try std.testing.expectEqual(State.connected, client.state);
     try std.testing.expectEqual(State.connected, server.state);
+    // ST_STATE is ACK-only in BEP 29/libtorrent. It carries the next
+    // outbound DATA sequence number, but receiving it must not make the
+    // initiator expect seq_nr+1.
+    try std.testing.expectEqual(syn_ack_hdr.seq_nr -% 1, client.ack_nr);
 
     // ── Step 2: Client sends 68-byte BT handshake ──
     var bt_handshake_client: [68]u8 = undefined;
@@ -76,16 +80,7 @@ test "BT handshake over uTP byte stream" {
     client.bufferSentPacket(data_hdr.seq_nr, &full_pkt, 68, 1_003_000);
 
     // ── Step 3: Server receives DATA packet ──
-    std.debug.print("\nDEBUG: data_hdr.seq_nr={d} server.ack_nr={d} expected={d}\n", .{
-        data_hdr.seq_nr, server.ack_nr, server.ack_nr +% 1,
-    });
-    std.debug.print("DEBUG: data_hdr.connection_id={d} server.recv_id={d} server.send_id={d}\n", .{
-        data_hdr.connection_id, server.recv_id, server.send_id,
-    });
-    std.debug.print("DEBUG: server.state={s}\n", .{@tagName(server.state)});
     const server_result = server.processPacket(data_hdr, &bt_handshake_client, 1_004_000);
-
-    std.debug.print("DEBUG: result.data={}\n", .{server_result.data != null});
 
     // Data should be delivered
     try std.testing.expect(server_result.data != null);
@@ -122,16 +117,10 @@ test "BT handshake over uTP byte stream" {
     @memcpy(server_full_pkt[Header.size..], &bt_handshake_server);
     const server_data_hdr = Header.decode(&server_data_hdr_bytes).?;
     server.bufferSentPacket(server_data_hdr.seq_nr, &server_full_pkt, 68, 1_006_000);
+    try std.testing.expectEqual(syn_ack_hdr.seq_nr, server_data_hdr.seq_nr);
 
     // ── Step 6: Client receives server's handshake ──
-    std.debug.print("DEBUG step6: server_data_hdr.seq_nr={d} client.ack_nr={d} expected={d}\n", .{
-        server_data_hdr.seq_nr, client.ack_nr, client.ack_nr +% 1,
-    });
-    std.debug.print("DEBUG step6: server_data_hdr.connection_id={d} client.recv_id={d}\n", .{
-        server_data_hdr.connection_id, client.recv_id,
-    });
     const client_result = client.processPacket(server_data_hdr, &bt_handshake_server, 1_007_000);
-    std.debug.print("DEBUG step6: result.data={}\n", .{client_result.data != null});
 
     try std.testing.expect(client_result.data != null);
     const received_response = client_result.data.?;
@@ -142,8 +131,6 @@ test "BT handshake over uTP byte stream" {
 
     // ACK should be generated
     try std.testing.expect(client_result.response != null);
-
-    std.debug.print("\nuTP BT handshake exchange: PASSED\n", .{});
 }
 
 // ── Test: Multiple BT wire messages over uTP ─────────────────────
@@ -216,7 +203,6 @@ test "multiple BT wire messages over uTP byte stream" {
     try std.testing.expect(int_result.data != null);
     try std.testing.expectEqual(@as(u8, 2), int_result.data.?[4]); // INTERESTED
 
-    std.debug.print("\nuTP multiple BT messages: PASSED\n", .{});
 }
 
 // ── Test: Large message fragmentation round-trip ─────────────────
@@ -285,7 +271,6 @@ test "fragmented PIECE message over uTP" {
     }
 
     try std.testing.expect(packets_sent >= 2); // should need at least 2 packets
-    std.debug.print("\nuTP fragmented PIECE ({d} bytes, {d} packets): PASSED\n", .{ piece_data.len, packets_sent });
 }
 
 test "uTP sender resumes window-limited byte stream after ACK" {
@@ -360,4 +345,68 @@ test "uTP sender resumes window-limited byte stream after ACK" {
     try utp_handler.utpSendData(&el, peer_slot, &.{});
 
     try std.testing.expect(sock.seq_nr > seq_after_first_send);
+}
+
+test "uTP sender packetizes queued bytes up to available window" {
+    const allocator = std.testing.allocator;
+    const EL = event_loop_mod.EventLoopOf(SimIO);
+
+    const sim_io = try SimIO.init(allocator, .{ .seed = 0x757471 });
+    var el = try EL.initBareWithIO(allocator, sim_io, 0);
+    defer el.deinit();
+    el.clock = varuna.runtime.Clock.simAtNs(6_000_000_123);
+    el.random = event_loop_mod.Random.simRandom(0x75747101);
+
+    const mgr = try allocator.create(utp_mgr.UtpManager);
+    mgr.* = utp_mgr.UtpManager.init(allocator);
+    el.utp_manager = mgr;
+
+    const remote = std.net.Address.initIp4(.{ 127, 0, 0, 1 }, 6881);
+    const conn = try mgr.connect(&el.random, remote, 1_000_000);
+    const sock = mgr.getSocket(conn.slot).?;
+
+    const syn_ack = (Header{
+        .packet_type = .st_state,
+        .extension = .none,
+        .connection_id = sock.recv_id,
+        .timestamp_us = 1_001_000,
+        .timestamp_diff_us = 1_000,
+        .wnd_size = utp.default_recv_window,
+        .seq_nr = 1,
+        .ack_nr = 1,
+    }).encode();
+    _ = mgr.processPacket(&syn_ack, remote, 1_002_000);
+    try std.testing.expectEqual(State.connected, sock.state);
+
+    const peer_slot: u16 = 0;
+    el.peers[peer_slot] = event_loop_mod.Peer{
+        .fd = -1,
+        .state = .active_recv_header,
+        .mode = .inbound,
+        .transport = .utp,
+        .address = remote,
+        .utp_slot = conn.slot,
+    };
+    el.peer_count = 1;
+    el.markActivePeer(peer_slot);
+
+    sock.ledbat.cwnd = 200;
+    var request_batch: [17 * 16]u8 = undefined;
+    @memset(&request_batch, 0xA5);
+
+    try utp_handler.utpSendData(&el, peer_slot, &request_batch);
+
+    try std.testing.expectEqual(@as(u16, 1), sock.out_buf_count);
+    const idx = sock.out_seq_start % sock.out_buf.len;
+    try std.testing.expectEqual(@as(u16, 200), sock.out_buf[idx].payload_len);
+    try std.testing.expectEqual(@as(usize, request_batch.len - 200), sock.pendingSendSlice().len);
+}
+
+test "uTP timeout floor still permits one full payload packet" {
+    var sock = UtpSocket{};
+    sock.state = .connected;
+
+    sock.ledbat.onTimeout();
+
+    try std.testing.expect(sock.availablePayloadWindow() >= utp.max_payload);
 }

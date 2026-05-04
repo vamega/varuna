@@ -266,7 +266,7 @@ pub const DhtEngine = struct {
     tokens: TokenManager,
     next_txn_id: u16 = 1,
     pending: [max_pending]?PendingQuery = [_]?PendingQuery{null} ** max_pending,
-    active_lookups: [max_lookups]?Lookup = [_]?Lookup{null} ** max_lookups,
+    active_lookups: [max_lookups]?*Lookup = [_]?*Lookup{null} ** max_lookups,
     /// Outbound packet queue. The event loop drains this via dhtDrainSendQueue.
     send_queue: std.ArrayList(OutboundPacket),
     /// Peer results from completed get_peers lookups.
@@ -402,7 +402,7 @@ pub const DhtEngine = struct {
     /// (~1 MB) struct value on the caller's stack. DhtEngine contains:
     ///   - RoutingTable: 160 KBuckets × 8 NodeInfos = ~183 KB
     ///   - pending[256]?PendingQuery = ~39 KB
-    ///   - active_lookups[16]?Lookup  = ~688 KB
+    ///   - historical active_lookups[16]?Lookup payloads were ~688 KB
     /// Assigning these as struct literals would create large stack temporaries.
     /// Instead we initialize each field individually via pointer dereference,
     /// and use explicit loops for the large arrays so Zig writes directly
@@ -440,6 +440,12 @@ pub const DhtEngine = struct {
     }
 
     pub fn deinit(self: *DhtEngine) void {
+        for (&self.active_lookups) |*slot| {
+            if (slot.*) |lk| {
+                self.allocator.destroy(lk);
+                slot.* = null;
+            }
+        }
         for (self.peer_results.items) |result| {
             self.allocator.free(result.peers);
         }
@@ -601,7 +607,7 @@ pub const DhtEngine = struct {
 
         // Skip if a lookup for this hash is already active
         for (0..max_lookups) |i| {
-            if (self.active_lookups[i]) |*lk| {
+            if (self.active_lookups[i]) |lk| {
                 if (std.mem.eql(u8, &lk.target, &info_hash)) return;
             }
         }
@@ -611,11 +617,9 @@ pub const DhtEngine = struct {
             if (self.active_lookups[i] == null) break i;
         } else return error.TooManyLookups;
 
-        var lk = Lookup.init(info_hash, .get_peers);
-        lk.seed(&self.table);
-
+        const lk = try self.createSeededLookup(info_hash, .get_peers);
+        errdefer self.allocator.destroy(lk);
         if (lk.candidate_count == 0) return error.NoNodes;
-
         self.active_lookups[idx] = lk;
         self.sendLookupQueries(idx);
     }
@@ -915,7 +919,7 @@ pub const DhtEngine = struct {
 
         // If this was part of a lookup, feed the response
         if (pending.lookup_idx) |idx| {
-            if (self.active_lookups[idx]) |*lk| {
+            if (self.active_lookups[idx]) |lk| {
                 // Decode compact IPv4 nodes (26 bytes each: 20 ID + 4 IP + 2 port)
                 var new_nodes_buf: [routing_table.K * 2]NodeInfo = undefined;
                 var new_node_count: usize = 0;
@@ -974,6 +978,9 @@ pub const DhtEngine = struct {
                     if (peer_count > 0) peer_addrs[0..peer_count] else null,
                     r.token,
                 );
+                if (peer_count > 0) {
+                    self.emitPeerResultCopy(lk.target, peer_addrs[0..peer_count]);
+                }
             }
         }
     }
@@ -987,7 +994,7 @@ pub const DhtEngine = struct {
 
     fn driveLookups(self: *DhtEngine, now: i64) void {
         for (0..max_lookups) |i| {
-            if (self.active_lookups[i]) |*lk| {
+            if (self.active_lookups[i]) |lk| {
                 if (lk.isDone()) {
                     self.completeLookup(i, now);
                     continue;
@@ -998,7 +1005,7 @@ pub const DhtEngine = struct {
     }
 
     fn sendLookupQueries(self: *DhtEngine, lookup_idx: usize) void {
-        const lk = &(self.active_lookups[lookup_idx] orelse return);
+        const lk = self.active_lookups[lookup_idx] orelse return;
         var buf: [lookup.alpha]NodeInfo = undefined;
         const count = lk.nextToQuery(&buf);
 
@@ -1013,7 +1020,6 @@ pub const DhtEngine = struct {
                 .get_peers => krpc.encodeGetPeersQuery(&pkt_buf, txn_id, self.own_id, lk.target) catch continue,
             };
 
-            self.queueSend(pkt_buf[0..len], info.address);
             if (!self.addPending(.{
                 .transaction_id = txn_id,
                 .target_id = info.id,
@@ -1025,13 +1031,14 @@ pub const DhtEngine = struct {
                 lk.markPending(info.id);
                 break;
             }
+            self.queueSend(pkt_buf[0..len], info.address);
         }
     }
 
     /// Like sendLookupQueries but sends to ALL candidates (up to K=8),
     /// not just alpha=3. Used during bootstrap to maximize initial discovery.
     fn sendLookupQueriesAll(self: *DhtEngine, lookup_idx: usize) void {
-        const lk = &(self.active_lookups[lookup_idx] orelse return);
+        const lk = self.active_lookups[lookup_idx] orelse return;
 
         // Query all candidates, not just alpha
         var buf: [routing_table.K]NodeInfo = undefined;
@@ -1047,7 +1054,6 @@ pub const DhtEngine = struct {
                 .get_peers => krpc.encodeGetPeersQuery(&pkt_buf, txn_id, self.own_id, lk.target) catch continue,
             };
 
-            self.queueSend(pkt_buf[0..len], info.address);
             if (!self.addPending(.{
                 .transaction_id = txn_id,
                 .target_id = info.id,
@@ -1059,6 +1065,7 @@ pub const DhtEngine = struct {
                 lk.markPending(info.id);
                 break;
             }
+            self.queueSend(pkt_buf[0..len], info.address);
         }
     }
 
@@ -1067,15 +1074,7 @@ pub const DhtEngine = struct {
 
         if (lk.kind == .get_peers) {
             const peers = lk.getPeers();
-            if (peers.len > 0) {
-                // Copy peers and emit result
-                const peers_copy = self.allocator.alloc(std.net.Address, peers.len) catch {
-                    self.active_lookups[idx] = null;
-                    return;
-                };
-                @memcpy(peers_copy, peers);
-                self.emitPeerResult(lk.target, peers_copy);
-            }
+            self.emitPeerResultCopy(lk.target, peers);
 
             // Send announce_peer to the closest responded nodes
             var closest: [lookup.K]NodeInfo = undefined;
@@ -1103,6 +1102,7 @@ pub const DhtEngine = struct {
         }
 
         _ = now;
+        self.allocator.destroy(lk);
         self.active_lookups[idx] = null;
     }
 
@@ -1128,14 +1128,17 @@ pub const DhtEngine = struct {
                 if (self.active_lookups[i] == null) break i;
             } else break;
 
-            var lk = Lookup.init(target, .find_node);
-            lk.seed(&self.table);
-
+            const lk = self.createSeededLookup(target, .find_node) catch {
+                log.warn("DHT bootstrap lookup allocation failed", .{});
+                break;
+            };
             if (lk.candidate_count > 0) {
                 self.active_lookups[idx] = lk;
                 // Send to ALL candidates during bootstrap (not just alpha=3)
                 // to maximize the number of nodes discovered in parallel.
                 self.sendLookupQueriesAll(idx);
+            } else {
+                self.allocator.destroy(lk);
             }
         }
     }
@@ -1149,15 +1152,15 @@ pub const DhtEngine = struct {
             const txn_id = self.allocTxnId();
             var buf: [512]u8 = undefined;
             const len = krpc.encodePingQuery(&buf, txn_id, self.own_id) catch continue;
-            self.queueSend(buf[0..len], addr);
-            _ = self.addPending(.{
+            if (!self.addPending(.{
                 .transaction_id = txn_id,
                 .target_id = [_]u8{0} ** 20, // unknown ID
                 .target_addr = addr,
                 .sent_at = now,
                 .lookup_idx = null,
                 .method = .ping,
-            });
+            })) continue;
+            self.queueSend(buf[0..len], addr);
         }
     }
 
@@ -1172,12 +1175,15 @@ pub const DhtEngine = struct {
             if (self.active_lookups[i] == null) break i;
         } else return;
 
-        var lk = Lookup.init(target, .find_node);
-        lk.seed(&self.table);
-
+        const lk = self.createSeededLookup(target, .find_node) catch {
+            log.warn("DHT refresh lookup allocation failed", .{});
+            return;
+        };
         if (lk.candidate_count > 0) {
             self.active_lookups[idx] = lk;
             self.sendLookupQueries(idx);
+        } else {
+            self.allocator.destroy(lk);
         }
     }
 
@@ -1192,7 +1198,7 @@ pub const DhtEngine = struct {
 
                     // Notify lookup if applicable
                     if (pending.lookup_idx) |idx| {
-                        if (self.active_lookups[idx]) |*lk| {
+                        if (self.active_lookups[idx]) |lk| {
                             lk.markFailed(pending.target_id);
                         }
                     }
@@ -1237,11 +1243,25 @@ pub const DhtEngine = struct {
         };
     }
 
+    fn emitPeerResultCopy(self: *DhtEngine, info_hash: [20]u8, peers: []const std.net.Address) void {
+        if (peers.len == 0) return;
+        const peers_copy = self.allocator.alloc(std.net.Address, peers.len) catch return;
+        @memcpy(peers_copy, peers);
+        self.emitPeerResult(info_hash, peers_copy);
+    }
+
     fn allocTxnId(self: *DhtEngine) u16 {
         const id = self.next_txn_id;
         self.next_txn_id +%= 1;
         if (self.next_txn_id == 0) self.next_txn_id = 1;
         return id;
+    }
+
+    fn createSeededLookup(self: *DhtEngine, target: NodeId, kind: Lookup.Kind) !*Lookup {
+        const lk = try self.allocator.create(Lookup);
+        lk.* = Lookup.init(target, kind);
+        lk.seed(&self.table);
+        return lk;
     }
 
     fn addPending(self: *DhtEngine, query: PendingQuery) bool {
@@ -1529,6 +1549,71 @@ test "DHT outbound packet queue is bounded and batch drained" {
     defer engine.freeSendQueueBatch(batch);
     try std.testing.expectEqual(@as(usize, max_send_queue), batch.len);
     try std.testing.expectEqual(@as(usize, 0), engine.send_queue.items.len);
+}
+
+test "DHT lookup does not queue untracked packet when pending table is full" {
+    const allocator = std.testing.allocator;
+    var rng = Random.simRandom(0x30421);
+    var engine = DhtEngine.init(allocator, &rng, node_id.generateRandom(&rng));
+    defer engine.deinit();
+
+    const now = std.time.timestamp();
+    for (&engine.pending, 0..) |*slot, i| {
+        var id: NodeId = [_]u8{0} ** 20;
+        id[19] = @intCast(i % 251);
+        slot.* = .{
+            .transaction_id = @intCast(i + 1),
+            .target_id = id,
+            .target_addr = std.net.Address.initIp4(.{ 10, 0, 0, @intCast(i % 250 + 1) }, 6881),
+            .sent_at = now,
+            .lookup_idx = 0,
+            .method = .get_peers,
+        };
+    }
+
+    const info = NodeInfo{
+        .id = node_id.generateRandom(&rng),
+        .address = std.net.Address.initIp4(.{ 192, 0, 2, 1 }, 6881),
+    };
+    const lk = try allocator.create(Lookup);
+    lk.* = Lookup.init(node_id.generateRandom(&rng), .get_peers);
+    lk.seedNodes(&.{info});
+    engine.active_lookups[0] = lk;
+
+    engine.sendLookupQueries(0);
+    try std.testing.expectEqual(@as(usize, 0), engine.send_queue.items.len);
+
+    var retry_buf: [lookup.alpha]NodeInfo = undefined;
+    try std.testing.expectEqual(@as(u8, 1), engine.active_lookups[0].?.nextToQuery(&retry_buf));
+}
+
+test "DHT lookup keeps successfully queued query outstanding" {
+    const allocator = std.testing.allocator;
+    var rng = Random.simRandom(0x30422);
+    var engine = DhtEngine.init(allocator, &rng, node_id.generateRandom(&rng));
+    defer engine.deinit();
+
+    const info = NodeInfo{
+        .id = node_id.generateRandom(&rng),
+        .address = std.net.Address.initIp4(.{ 192, 0, 2, 2 }, 6881),
+    };
+    const lk = try allocator.create(Lookup);
+    lk.* = Lookup.init(node_id.generateRandom(&rng), .get_peers);
+    lk.seedNodes(&.{info});
+    engine.active_lookups[0] = lk;
+
+    engine.sendLookupQueries(0);
+    try std.testing.expectEqual(@as(usize, 1), engine.send_queue.items.len);
+
+    var pending_count: usize = 0;
+    for (engine.pending) |slot| {
+        if (slot != null) pending_count += 1;
+    }
+    try std.testing.expectEqual(@as(usize, 1), pending_count);
+
+    var retry_buf: [lookup.alpha]NodeInfo = undefined;
+    try std.testing.expectEqual(@as(u8, 0), engine.active_lookups[0].?.nextToQuery(&retry_buf));
+    try std.testing.expect(!engine.active_lookups[0].?.isDone());
 }
 
 test "DHT peer result queue is bounded and batch drained" {

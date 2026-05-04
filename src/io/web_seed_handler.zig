@@ -404,11 +404,14 @@ fn webSeedRangeCompleteFor(
 
             // Check HTTP status and range contract.
             if (result.err != null or !range_valid) {
-                log.debug("web seed: range failed for pieces {d}..{d} (status={d}, err={?})", .{
+                log.warn("web seed: range failed for pieces {d}..{d} (status={d}, err={?}, bytes={d}, expected={d}-{d})", .{
                     slot.first_piece,
                     slot.first_piece + slot.piece_count - 1,
                     result.status,
                     result.err,
+                    result.target_bytes_written,
+                    expected_range.range_start,
+                    expected_range.range_end,
                 });
                 slot.ranges_failed = true;
 
@@ -422,6 +425,8 @@ fn webSeedRangeCompleteFor(
                 // Note: status=0 with no error (stale pooled connection) is still
                 // a failure -- ranges_failed stays true. The seed will be retried
                 // without backoff penalty below.
+            } else {
+                el.accountTorrentBytes(slot.torrent_id, result.target_bytes_written, 0);
             }
 
             slot.ranges_completed += 1;
@@ -1010,6 +1015,7 @@ const FakeEventLoop = struct {
     torrent_id: TorrentId,
     tc: *TorrentContext,
     hasher: ?*FakeHasher = null,
+    accounted_download_bytes: u64 = 0,
 
     pub fn getTorrentContext(self: *FakeEventLoop, torrent_id: TorrentId) ?*TorrentContext {
         if (torrent_id != self.torrent_id) return null;
@@ -1045,6 +1051,12 @@ const FakeEventLoop = struct {
         _ = self;
         _ = write_id;
         return null;
+    }
+
+    pub fn accountTorrentBytes(self: *FakeEventLoop, torrent_id: TorrentId, dl_bytes: usize, ul_bytes: usize) void {
+        _ = ul_bytes;
+        if (torrent_id != self.torrent_id) return;
+        self.accounted_download_bytes += dl_bytes;
     }
 
     pub fn markPieceAwaitingDurability(self: *FakeEventLoop, torrent_id: TorrentId, piece_index: u32) !void {
@@ -1136,6 +1148,7 @@ test "web seed fake server validates requested Range header through handler flow
     try std.testing.expectEqual(@as(u8, 1), el.web_seed_slots[0].ranges_completed);
     try std.testing.expect(!el.web_seed_slots[0].ranges_failed);
     try std.testing.expectEqual(WebSeedSlot.State.downloading, el.web_seed_slots[0].state);
+    try std.testing.expectEqual(@as(u64, 8), el.accounted_download_bytes);
 }
 
 test "web seed fake server ignored Range response fails handler slot end-to-end" {

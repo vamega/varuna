@@ -1,7 +1,7 @@
 const std = @import("std");
 const addr_mod = @import("../net/address.zig");
 
-pub const max_candidates_per_torrent: usize = 512;
+pub const max_candidates_per_torrent: usize = 3000;
 const retry_base_secs: i64 = 30;
 const retry_max_secs: i64 = 5 * 60;
 

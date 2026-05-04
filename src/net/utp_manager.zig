@@ -97,6 +97,7 @@ pub const UtpManager = struct {
         // Truncated chains (ext_len > remaining bytes) are rejected by
         // returning null — the daemon drops the malformed datagram.
         const payload = stripExtensions(hdr.extension, raw_payload) orelse return null;
+        const sack = findSelectiveAck(hdr.extension, raw_payload);
 
         // Route by connection_id.
         if (hdr.packet_type == .st_syn) {
@@ -110,11 +111,12 @@ pub const UtpManager = struct {
         };
 
         const sock = self.connections[slot].?;
-        const result = sock.processPacket(hdr, payload, now_us);
+        const result = sock.processPacketWithSack(hdr, payload, now_us, sack);
 
         var packet_result = PacketResult{
             .slot = slot,
             .response = result.response,
+            .response_len = result.response_len,
             .data = result.data,
             .data_len = result.data_len,
             .reorder_delivered = result.reorder_delivered,
@@ -194,6 +196,24 @@ pub const UtpManager = struct {
         return count;
     }
 
+    /// Collect outbound uTP connections whose SYN has not been confirmed
+    /// before the connect deadline. This is intentionally separate from
+    /// retransmission timeout handling so a large batch of timed-out sockets
+    /// cannot strand half-open peers behind a small retransmit buffer.
+    pub fn checkUnconfirmedConnectTimeouts(self: *UtpManager, now_us: u32, out_buf: []u16) u16 {
+        var count: u16 = 0;
+        for (0..max_connections) |i| {
+            if (!self.slot_active[i]) continue;
+            const slot: u16 = @intCast(i);
+            const sock = self.connections[slot].?;
+            if (!sock.unconfirmedConnectTimedOut(now_us)) continue;
+            if (count >= out_buf.len) return count;
+            out_buf[count] = slot;
+            count += 1;
+        }
+        return count;
+    }
+
     /// Collect retransmission packets from all connections that timed out.
     /// Returns entries with the data to resend and the remote address.
     pub fn collectRetransmits(self: *UtpManager, now_us: u32, out: []RetransmitResult) u16 {
@@ -230,10 +250,11 @@ pub const UtpManager = struct {
         const existing = self.findByRecvIdRemote(hdr.connection_id +% 1, remote);
         if (existing) |slot| {
             // Resend SYN-ACK.
-            const response = self.connections[slot].?.makeAck(now_us);
+            const response = self.connections[slot].?.makeAckPacket(now_us);
             return .{
                 .slot = slot,
-                .response = response,
+                .response = response.bytes,
+                .response_len = response.len,
                 .data = null,
                 .data_len = 0,
                 .remote = remote,
@@ -255,7 +276,8 @@ pub const UtpManager = struct {
 
         return .{
             .slot = slot,
-            .response = syn_ack,
+            .response = utp.AckPacket.fromHeader(syn_ack).bytes,
+            .response_len = Header.size,
             .data = null,
             .data_len = 0,
             .remote = remote,
@@ -289,7 +311,8 @@ pub const UtpManager = struct {
         };
         return .{
             .slot = 0,
-            .response = rst.encode(),
+            .response = utp.AckPacket.fromHeader(rst.encode()).bytes,
+            .response_len = Header.size,
             .data = null,
             .data_len = 0,
             .remote = remote,
@@ -327,6 +350,23 @@ pub const UtpManager = struct {
             current_ext = next_ext;
         }
         return remaining;
+    }
+
+    fn findSelectiveAck(initial_ext: utp.Extension, payload: []const u8) ?utp.SelectiveAck {
+        var current_ext = initial_ext;
+        var remaining = payload;
+        while (current_ext != .none) {
+            if (remaining.len < 2) return null;
+            const next_ext: utp.Extension = @enumFromInt(remaining[0]);
+            const ext_len: usize = remaining[1];
+            if (remaining.len < 2 + ext_len) return null;
+            if (current_ext == .selective_ack) {
+                return utp.SelectiveAck.decode(remaining[0 .. 2 + ext_len]);
+            }
+            remaining = remaining[2 + ext_len ..];
+            current_ext = next_ext;
+        }
+        return null;
     }
 
     fn allocSlot(self: *UtpManager) ?u16 {
@@ -373,7 +413,8 @@ pub const ConnectResult = struct {
 /// Result of processing a received packet.
 pub const PacketResult = struct {
     slot: u16,
-    response: ?[Header.size]u8,
+    response: ?[utp.max_ack_size]u8,
+    response_len: u8 = 0,
     data: ?[]const u8,
     data_len: u16,
     /// Number of additional payloads drained from the reorder buffer.
@@ -612,6 +653,26 @@ test "manager collectRetransmits returns timed-out packets" {
     _ = mgr.reset(conn.slot, 4_000_000);
 }
 
+test "manager collects unconfirmed connect timeouts beyond retransmit batch size" {
+    var mgr = UtpManager.init(std.testing.allocator);
+    defer mgr.deinit();
+
+    const attempts = 96;
+    var i: u16 = 0;
+    while (i < attempts) : (i += 1) {
+        const remote = std.net.Address.initIp4(.{ 127, 0, 0, 1 }, 20_000 + i);
+        _ = try mgr.connect(&utp_test_rng, remote, 1_000_000);
+    }
+
+    var timeout_buf: [64]u16 = undefined;
+    const retransmit_timeout_count = mgr.checkTimeouts(4_000_000, &timeout_buf);
+    try std.testing.expectEqual(@as(u16, 64), retransmit_timeout_count);
+
+    var connect_timeout_buf: [attempts]u16 = undefined;
+    const connect_timeout_count = mgr.checkUnconfirmedConnectTimeouts(4_000_000, &connect_timeout_buf);
+    try std.testing.expectEqual(@as(u16, attempts), connect_timeout_count);
+}
+
 test "manager freeSlot cleans up outbound buffers" {
     var mgr = UtpManager.init(std.testing.allocator);
     defer mgr.deinit();
@@ -619,9 +680,9 @@ test "manager freeSlot cleans up outbound buffers" {
 
     const conn = try mgr.connect(&utp_test_rng, remote, 1_000_000);
 
-    // SYN is buffered with allocator-owned data.
+    // SYN is buffered inline for retransmission.
     const sock = mgr.getSocket(conn.slot).?;
-    try std.testing.expect(sock.out_buf[sock.out_seq_start % 128].packet_buf != null);
+    try std.testing.expect(sock.out_buf[sock.out_seq_start % 128].packet_len != 0);
 
     // Reset frees the slot and the outbound buffers.
     _ = mgr.reset(conn.slot, 2_000_000);

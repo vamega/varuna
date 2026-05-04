@@ -254,8 +254,8 @@ pub const Config = struct {
         disable_trackers: bool = false,
         /// Maximum bytes to request in a single web seed HTTP Range request.
         /// Larger values batch more pieces per request, reducing HTTP overhead.
-        /// Default: 4 MB.
-        web_seed_max_request_bytes: u32 = 4 * 1024 * 1024,
+        /// Default: 16 MB.
+        web_seed_max_request_bytes: u32 = 16 * 1024 * 1024,
         /// Enable DHT (BEP 5) for distributed peer discovery.
         dht: bool = true,
         /// Enable PEX (BEP 11) for peer exchange between connected peers.
