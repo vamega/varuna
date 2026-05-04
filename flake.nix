@@ -46,6 +46,7 @@
             packages = defaultPackages ++ [
               pkgs.strace
               pkgs.perf
+              pkgs.qbittorrent-nox
             ];
 
             shellHook = ''

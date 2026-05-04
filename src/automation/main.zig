@@ -76,6 +76,58 @@ const RealConfig = struct {
     torrents: []const TorrentSource = &default_torrents,
 };
 
+const ParsedRealConfig = struct {
+    config: RealConfig,
+    torrents: std.ArrayList(TorrentSource),
+
+    fn deinit(self: *ParsedRealConfig, allocator: std.mem.Allocator) void {
+        allocator.free(self.config.build_extra_args);
+        self.torrents.deinit(allocator);
+    }
+};
+
+const RealRunSummary = struct {
+    client: []const u8,
+    transport: []const u8,
+    out_dir: []const u8,
+    elapsed_seconds: f64,
+    downloaded: u64,
+    total_size: u64,
+    complete_count: usize,
+    torrent_count: usize,
+
+    fn avgMiBps(self: RealRunSummary) f64 {
+        if (self.elapsed_seconds <= 0) return 0;
+        return @as(f64, @floatFromInt(self.downloaded)) / 1048576.0 / self.elapsed_seconds;
+    }
+};
+
+const ClientKind = enum {
+    varuna,
+    qbittorrent,
+
+    fn label(self: ClientKind) []const u8 {
+        return switch (self) {
+            .varuna => "varuna",
+            .qbittorrent => "qbittorrent",
+        };
+    }
+};
+
+const ParsedParityConfig = struct {
+    base: RealConfig,
+    transports: std.ArrayList([]const u8),
+    clients: std.ArrayList(ClientKind),
+    torrents: std.ArrayList(TorrentSource),
+
+    fn deinit(self: *ParsedParityConfig, allocator: std.mem.Allocator) void {
+        allocator.free(self.base.build_extra_args);
+        self.transports.deinit(allocator);
+        self.clients.deinit(allocator);
+        self.torrents.deinit(allocator);
+    }
+};
+
 const DockerConformanceConfig = struct {
     timeout_seconds: u64 = 180,
     poll_interval_seconds: u64 = 3,
@@ -164,6 +216,8 @@ pub fn main() !void {
         try runBackendSwarmMatrix(&shell, args[2..]);
     } else if (std.mem.eql(u8, args[1], "real-torrents")) {
         try runRealTorrents(&shell, args[2..]);
+    } else if (std.mem.eql(u8, args[1], "real-torrent-parity")) {
+        try runRealTorrentParity(&shell, args[2..]);
     } else if (std.mem.eql(u8, args[1], "tracker")) {
         try runTrackerCommand(&shell, args[2..]);
     } else if (std.mem.eql(u8, args[1], "setup-worktree")) {
@@ -199,6 +253,7 @@ fn printUsage() void {
         \\  swarm          run one local tracker/seeder/downloader transfer
         \\  backend-swarm  run the local swarm transfer across IO backends
         \\  real-torrents  run a real-public-torrent Varuna performance sample
+        \\  real-torrent-parity compare Varuna and qBittorrent public-torrent samples
         \\  tracker        run opentracker with an optional whitelist
         \\  setup-worktree prepare a git worktree for Varuna development
         \\  validate-strace validate strace -c output against daemon IO policy
@@ -572,7 +627,7 @@ fn waitForFirstTorrentComplete(shell: *Shell, port: u16, sid: []const u8, timeou
     return error.Timeout;
 }
 
-fn runRealTorrents(shell: *Shell, args: []const []const u8) !void {
+fn parseRealConfig(shell: *Shell, args: []const []const u8) !ParsedRealConfig {
     var config = RealConfig{
         .transport = shell.envString("TRANSPORT_MODE", "tcp_and_utp"),
         .backend = shell.envString("IO_BACKEND", "io_uring"),
@@ -586,10 +641,10 @@ fn runRealTorrents(shell: *Shell, args: []const []const u8) !void {
         .skip_build = std.mem.eql(u8, shell.envString("SKIP_BUILD", "0"), "1"),
         .build_extra_args = try splitWords(shell.allocator, shell.envString("ZIG_BUILD_EXTRA_ARGS", "")),
     };
-    defer shell.allocator.free(config.build_extra_args);
+    errdefer shell.allocator.free(config.build_extra_args);
 
     var torrents = std.ArrayList(TorrentSource).empty;
-    defer torrents.deinit(shell.allocator);
+    errdefer torrents.deinit(shell.allocator);
 
     var i: usize = 0;
     while (i < args.len) : (i += 1) {
@@ -634,6 +689,19 @@ fn runRealTorrents(shell: *Shell, args: []const []const u8) !void {
     try validateTransport(config.transport);
     if (torrents.items.len > 0) config.torrents = torrents.items;
 
+    return .{
+        .config = config,
+        .torrents = torrents,
+    };
+}
+
+fn runRealTorrents(shell: *Shell, args: []const []const u8) !void {
+    var parsed = try parseRealConfig(shell, args);
+    defer parsed.deinit(shell.allocator);
+    _ = try runVarunaRealTorrents(shell, parsed.config);
+}
+
+fn runVarunaRealTorrents(shell: *Shell, config: RealConfig) !RealRunSummary {
     if (!config.skip_build) try buildForBackend(shell, config.zig_exe, config.backend, config.build_extra_args);
 
     const out_dir = config.out_dir orelse try shell.fmt("perf/output/real-torrents-{d}", .{std.time.timestamp()});
@@ -695,7 +763,13 @@ fn runRealTorrents(shell: *Shell, args: []const []const u8) !void {
     }
 
     const elapsed = Shell.nowSeconds() - start;
+    var downloaded_total: u64 = 0;
+    var size_total: u64 = 0;
+    var complete_count: usize = 0;
     for (final_snapshots) |snapshot| {
+        downloaded_total += snapshot.downloaded;
+        size_total += snapshot.total_size;
+        if (snapshot.progress >= 1.0) complete_count += 1;
         const avg = if (elapsed > 0) @as(f64, @floatFromInt(snapshot.downloaded)) / 1048576.0 / elapsed else 0;
         const line = try shell.fmt("{s}\t{s}\t{d:.6}\t{d}\t{d}\t{d:.3}\t{d:.3}\n", .{
             snapshot.hash,
@@ -713,6 +787,315 @@ fn runRealTorrents(shell: *Shell, args: []const []const u8) !void {
     const summary = try std.fs.cwd().readFileAlloc(shell.allocator, summary_path, 1024 * 1024);
     defer shell.allocator.free(summary);
     std.debug.print("{s}", .{summary});
+
+    return .{
+        .client = "varuna",
+        .transport = config.transport,
+        .out_dir = out_dir,
+        .elapsed_seconds = elapsed,
+        .downloaded = downloaded_total,
+        .total_size = size_total,
+        .complete_count = complete_count,
+        .torrent_count = config.torrents.len,
+    };
+}
+
+fn parseRealTorrentParityConfig(shell: *Shell, args: []const []const u8) !ParsedParityConfig {
+    var base = RealConfig{
+        .backend = shell.envString("IO_BACKEND", "io_uring"),
+        .runtime_backend = shell.envString("RUNTIME_IO_BACKEND", shell.envString("IO_BACKEND", "io_uring")),
+        .duration_seconds = try shell.envInt(u64, "DURATION", 600),
+        .out_dir = shell.envOpt("OUT_DIR"),
+        .data_dir = shell.envOpt("DATA_DIR"),
+        .api_port = try shell.envInt(u16, "API_PORT", 18080),
+        .peer_port = try shell.envInt(u16, "PEER_PORT", 16881),
+        .zig_exe = shell.envString("ZIG_EXE", "zig"),
+        .skip_build = std.mem.eql(u8, shell.envString("SKIP_BUILD", "0"), "1"),
+        .build_extra_args = try splitWords(shell.allocator, shell.envString("ZIG_BUILD_EXTRA_ARGS", "")),
+    };
+    errdefer shell.allocator.free(base.build_extra_args);
+
+    var transports = std.ArrayList([]const u8).empty;
+    errdefer transports.deinit(shell.allocator);
+    var clients = std.ArrayList(ClientKind).empty;
+    errdefer clients.deinit(shell.allocator);
+    var torrents = std.ArrayList(TorrentSource).empty;
+    errdefer torrents.deinit(shell.allocator);
+
+    if (shell.envOpt("TRANSPORTS")) |raw| {
+        const parsed = try splitWords(shell.allocator, raw);
+        defer shell.allocator.free(parsed);
+        for (parsed) |transport| try transports.append(shell.allocator, transport);
+    }
+    if (shell.envOpt("CLIENTS")) |raw| {
+        const parsed = try splitWords(shell.allocator, raw);
+        defer shell.allocator.free(parsed);
+        for (parsed) |client| try appendClientKind(shell, &clients, client);
+    }
+
+    var i: usize = 0;
+    while (i < args.len) : (i += 1) {
+        if (std.mem.eql(u8, args[i], "--duration")) {
+            i += 1;
+            base.duration_seconds = try std.fmt.parseInt(u64, args[i], 10);
+        } else if (std.mem.eql(u8, args[i], "--transport")) {
+            i += 1;
+            try transports.append(shell.allocator, args[i]);
+        } else if (std.mem.eql(u8, args[i], "--client")) {
+            i += 1;
+            try appendClientKind(shell, &clients, args[i]);
+        } else if (std.mem.eql(u8, args[i], "--backend")) {
+            i += 1;
+            base.backend = args[i];
+            base.runtime_backend = args[i];
+        } else if (std.mem.eql(u8, args[i], "--runtime-backend")) {
+            i += 1;
+            base.runtime_backend = args[i];
+        } else if (std.mem.eql(u8, args[i], "--out-dir")) {
+            i += 1;
+            base.out_dir = args[i];
+        } else if (std.mem.eql(u8, args[i], "--data-dir")) {
+            i += 1;
+            base.data_dir = args[i];
+        } else if (std.mem.eql(u8, args[i], "--api-port")) {
+            i += 1;
+            base.api_port = try std.fmt.parseInt(u16, args[i], 10);
+        } else if (std.mem.eql(u8, args[i], "--peer-port")) {
+            i += 1;
+            base.peer_port = try std.fmt.parseInt(u16, args[i], 10);
+        } else if (std.mem.eql(u8, args[i], "--torrent")) {
+            i += 1;
+            try torrents.append(shell.allocator, try parseTorrentSource(shell, args[i]));
+        } else if (std.mem.eql(u8, args[i], "--skip-build")) {
+            base.skip_build = true;
+        } else if (std.mem.eql(u8, args[i], "--zig-exe")) {
+            i += 1;
+            base.zig_exe = args[i];
+        } else {
+            std.debug.print("unknown real-torrent-parity option: {s}\n", .{args[i]});
+            return error.InvalidArgument;
+        }
+    }
+
+    if (transports.items.len == 0) {
+        try transports.appendSlice(shell.allocator, &.{ "tcp_and_utp", "utp_only" });
+    }
+    if (clients.items.len == 0) {
+        try clients.appendSlice(shell.allocator, &.{ .varuna, .qbittorrent });
+    }
+    if (torrents.items.len > 0) base.torrents = torrents.items;
+
+    for (transports.items) |transport| try validateTransport(transport);
+
+    return .{
+        .base = base,
+        .transports = transports,
+        .clients = clients,
+        .torrents = torrents,
+    };
+}
+
+fn appendClientKind(shell: *Shell, clients: *std.ArrayList(ClientKind), raw: []const u8) !void {
+    if (std.mem.eql(u8, raw, "all")) {
+        try clients.appendSlice(shell.allocator, &.{ .varuna, .qbittorrent });
+    } else if (std.mem.eql(u8, raw, "varuna")) {
+        try clients.append(shell.allocator, .varuna);
+    } else if (std.mem.eql(u8, raw, "qbittorrent") or std.mem.eql(u8, raw, "qbt")) {
+        try clients.append(shell.allocator, .qbittorrent);
+    } else {
+        std.debug.print("unknown parity client: {s}\n", .{raw});
+        return error.InvalidArgument;
+    }
+}
+
+fn hasClient(clients: []const ClientKind, needle: ClientKind) bool {
+    for (clients) |client| {
+        if (client == needle) return true;
+    }
+    return false;
+}
+
+fn runRealTorrentParity(shell: *Shell, args: []const []const u8) !void {
+    var parsed = try parseRealTorrentParityConfig(shell, args);
+    defer parsed.deinit(shell.allocator);
+
+    if (!parsed.base.skip_build and hasClient(parsed.clients.items, .varuna)) {
+        try buildForBackend(shell, parsed.base.zig_exe, parsed.base.backend, parsed.base.build_extra_args);
+    }
+
+    const base_out_dir = parsed.base.out_dir orelse try shell.fmt("perf/output/real-torrent-parity-{d}", .{std.time.timestamp()});
+    try shell.makePath(base_out_dir);
+    const aggregate_path = try shell.path(&.{ base_out_dir, "summary.tsv" });
+    try shell.writeFile(aggregate_path, "client\ttransport\tcomplete_count\ttorrent_count\tdownloaded\tsize\telapsed_seconds\tavg_mib_s\tout_dir\n");
+
+    var run_index: u16 = 0;
+    for (parsed.transports.items) |transport| {
+        for (parsed.clients.items) |client| {
+            const client_out_dir = try shell.path(&.{ base_out_dir, try shell.fmt("{s}-{s}", .{ client.label(), transport }) });
+            const client_data_dir = try shell.path(&.{ client_out_dir, "data" });
+            var config = parsed.base;
+            config.transport = transport;
+            config.out_dir = client_out_dir;
+            config.data_dir = client_data_dir;
+            config.api_port = parsed.base.api_port + run_index * 20;
+            config.peer_port = parsed.base.peer_port + run_index * 20;
+            config.skip_build = true;
+            run_index += 1;
+
+            const result = switch (client) {
+                .varuna => try runVarunaRealTorrents(shell, config),
+                .qbittorrent => try runQbittorrentRealTorrents(shell, config),
+            };
+            try shell.appendFile(aggregate_path, try shell.fmt("{s}\t{s}\t{d}\t{d}\t{d}\t{d}\t{d:.3}\t{d:.3}\t{s}\n", .{
+                result.client,
+                result.transport,
+                result.complete_count,
+                result.torrent_count,
+                result.downloaded,
+                result.total_size,
+                result.elapsed_seconds,
+                result.avgMiBps(),
+                result.out_dir,
+            }));
+        }
+    }
+
+    std.debug.print("real torrent parity output: {s}\n", .{base_out_dir});
+    const summary = try std.fs.cwd().readFileAlloc(shell.allocator, aggregate_path, 1024 * 1024);
+    defer shell.allocator.free(summary);
+    std.debug.print("{s}", .{summary});
+}
+
+fn runQbittorrentRealTorrents(shell: *Shell, config: RealConfig) !RealRunSummary {
+    const qbt_bin = (try findExecutable(shell, "qbittorrent-nox")) orelse {
+        std.debug.print("qbittorrent-nox not found; use nix develop .#performance-tools or install qBittorrent-nox\n", .{});
+        return error.MissingQbittorrent;
+    };
+
+    const out_dir = config.out_dir orelse try shell.fmt("perf/output/qbittorrent-real-torrents-{d}", .{std.time.timestamp()});
+    const data_dir = config.data_dir orelse try shell.path(&.{ out_dir, "data" });
+    const profile_dir = try shell.path(&.{ out_dir, "profile" });
+    const torrent_dir = try shell.path(&.{ out_dir, "torrents" });
+    try shell.makePath(out_dir);
+    try shell.makePath(data_dir);
+    try shell.makePath(profile_dir);
+    try shell.makePath(torrent_dir);
+
+    const samples_path = try shell.path(&.{ out_dir, "samples.tsv" });
+    const summary_path = try shell.path(&.{ out_dir, "summary.tsv" });
+    try shell.writeFile(samples_path, "elapsed_seconds\thash\tname\tprogress\tdownloaded\tsize\tdl_speed\n");
+    try shell.writeFile(summary_path, "hash\tname\tprogress\tdownloaded\tsize\telapsed_seconds\tavg_mib_s\n");
+
+    const stdout_log = try shell.path(&.{ out_dir, "qbittorrent.stdout.log" });
+    const stderr_log = try shell.path(&.{ out_dir, "qbittorrent.stderr.log" });
+    var qbt = try shell.spawnLogged(&.{
+        qbt_bin,
+        "--confirm-legal-notice",
+        try shell.fmt("--profile={s}", .{profile_dir}),
+        try shell.fmt("--webui-port={d}", .{config.api_port}),
+        try shell.fmt("--torrenting-port={d}", .{config.peer_port}),
+    }, out_dir, stdout_log, stderr_log);
+    defer qbt.stop();
+
+    try shell.waitForTcp("127.0.0.1", config.api_port, 30_000);
+    const sid = try qbtLoginFromLogs(shell, config.api_port, stdout_log, stderr_log);
+    try apiPostForm(shell, config.api_port, sid, "/api/v2/app/setPreferences", try shell.fmt(
+        "json={{\"bittorrent_protocol\":{d},\"dht\":true,\"pex\":true,\"lsd\":true,\"queueing_enabled\":false,\"max_active_downloads\":100,\"max_active_torrents\":100,\"max_connec\":1000,\"max_connec_per_torrent\":200,\"dl_limit\":0,\"up_limit\":0}}",
+        .{qbtProtocolForTransport(config.transport)},
+    ));
+
+    for (config.torrents) |torrent| {
+        const torrent_path = try materializeTorrent(shell, torrent_dir, torrent);
+        try apiPostTorrentMultipart(shell, "127.0.0.1", config.api_port, sid, torrent_path, data_dir);
+    }
+
+    const start = Shell.nowSeconds();
+    var final_snapshots: []TorrentSnapshot = &.{};
+    defer freeSnapshots(shell.allocator, final_snapshots);
+    while (Shell.nowSeconds() - start < @as(f64, @floatFromInt(config.duration_seconds))) {
+        freeSnapshots(shell.allocator, final_snapshots);
+        final_snapshots = try apiTorrentSnapshots(shell, config.api_port, sid);
+        const elapsed = Shell.nowSeconds() - start;
+        for (final_snapshots) |snapshot| {
+            const line = try shell.fmt("{d:.3}\t{s}\t{s}\t{d:.6}\t{d}\t{d}\t{d}\n", .{
+                elapsed,
+                snapshot.hash,
+                snapshot.name,
+                snapshot.progress,
+                snapshot.downloaded,
+                snapshot.total_size,
+                snapshot.dl_speed,
+            });
+            try shell.appendFile(samples_path, line);
+        }
+        if (allComplete(final_snapshots, config.torrents.len)) break;
+        std.Thread.sleep(std.time.ns_per_s);
+    }
+
+    const elapsed = Shell.nowSeconds() - start;
+    var downloaded_total: u64 = 0;
+    var size_total: u64 = 0;
+    var complete_count: usize = 0;
+    for (final_snapshots) |snapshot| {
+        downloaded_total += snapshot.downloaded;
+        size_total += snapshot.total_size;
+        if (snapshot.progress >= 1.0) complete_count += 1;
+        const avg = if (elapsed > 0) @as(f64, @floatFromInt(snapshot.downloaded)) / 1048576.0 / elapsed else 0;
+        const line = try shell.fmt("{s}\t{s}\t{d:.6}\t{d}\t{d}\t{d:.3}\t{d:.3}\n", .{
+            snapshot.hash,
+            snapshot.name,
+            snapshot.progress,
+            snapshot.downloaded,
+            snapshot.total_size,
+            elapsed,
+            avg,
+        });
+        try shell.appendFile(summary_path, line);
+    }
+
+    std.debug.print("qBittorrent real torrent run output: {s}\n", .{out_dir});
+    const summary = try std.fs.cwd().readFileAlloc(shell.allocator, summary_path, 1024 * 1024);
+    defer shell.allocator.free(summary);
+    std.debug.print("{s}", .{summary});
+
+    return .{
+        .client = "qbittorrent",
+        .transport = config.transport,
+        .out_dir = out_dir,
+        .elapsed_seconds = elapsed,
+        .downloaded = downloaded_total,
+        .total_size = size_total,
+        .complete_count = complete_count,
+        .torrent_count = config.torrents.len,
+    };
+}
+
+fn qbtProtocolForTransport(transport: []const u8) u8 {
+    if (std.mem.eql(u8, transport, "tcp_only")) return 1;
+    if (std.mem.eql(u8, transport, "utp_only")) return 2;
+    return 0;
+}
+
+fn qbtLoginFromLogs(shell: *Shell, port: u16, stdout_log: []const u8, stderr_log: []const u8) ![]const u8 {
+    if (try apiLoginHost(shell, "127.0.0.1", port, "admin", "adminadmin")) |sid| return sid;
+
+    const deadline = std.time.milliTimestamp() + 10_000;
+    while (std.time.milliTimestamp() < deadline) {
+        if (try qbtTemporaryPasswordFromLog(shell, stdout_log)) |password| {
+            if (try apiLoginHost(shell, "127.0.0.1", port, "admin", password)) |sid| return sid;
+        }
+        if (try qbtTemporaryPasswordFromLog(shell, stderr_log)) |password| {
+            if (try apiLoginHost(shell, "127.0.0.1", port, "admin", password)) |sid| return sid;
+        }
+        std.Thread.sleep(200 * std.time.ns_per_ms);
+    }
+    return error.LoginFailed;
+}
+
+fn qbtTemporaryPasswordFromLog(shell: *Shell, path: []const u8) !?[]const u8 {
+    const bytes = std.fs.cwd().readFileAlloc(shell.allocator, path, 1024 * 1024) catch return null;
+    defer shell.allocator.free(bytes);
+    return parseQbtTemporaryPassword(shell, bytes);
 }
 
 fn buildForBackend(shell: *Shell, zig_exe: []const u8, backend: []const u8, extra_args: []const []const u8) !void {

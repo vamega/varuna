@@ -1388,6 +1388,13 @@ pub fn build(b: *std.Build) void {
     if (b.args) |args| perf_real_torrents_cmd.addArgs(args);
     perf_real_torrents_step.dependOn(&perf_real_torrents_cmd.step);
 
+    const perf_real_torrent_parity_step = b.step("perf-real-torrent-parity", "Compare Varuna and qBittorrent public torrent downloads");
+    const perf_real_torrent_parity_cmd = b.addRunArtifact(automation_exe);
+    perf_real_torrent_parity_cmd.addArgs(&.{ "real-torrent-parity", "--skip-build", "--zig-exe", b.graph.zig_exe });
+    perf_real_torrent_parity_cmd.step.dependOn(b.getInstallStep());
+    if (b.args) |args| perf_real_torrent_parity_cmd.addArgs(args);
+    perf_real_torrent_parity_step.dependOn(&perf_real_torrent_parity_cmd.step);
+
     const tracker_step = b.step("tracker", "Run opentracker through varuna-automation");
     const tracker_cmd = b.addRunArtifact(automation_exe);
     tracker_cmd.addArg("tracker");

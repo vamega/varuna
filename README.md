@@ -72,8 +72,9 @@ The build links system SQLite by default. With Nix, enter the dev shell; it
 provides SQLite, c-ares, BoringSSL, opentracker, Python, curl, and diffutils
 for system-link builds and local automation harnesses. Use
 `nix develop .#performance-tools` when running the profiling helpers that need
-`strace` and `perf`. Outside Nix, pass package prefixes explicitly when they
-are not on the default linker path, for example
+`strace` and `perf`, or the public-swarm parity harness that needs
+`qbittorrent-nox`. Outside Nix, pass package prefixes explicitly when they are
+not on the default linker path, for example
 `zig build --search-prefix /path/to/sqlite-prefix`.
 
 HTTPS support defaults to vendored BoringSSL (`-Dtls=boringssl`). For faster
@@ -118,6 +119,7 @@ Available helper commands:
 - `zig build trace-syscalls -- ...`
 - `zig build perf-stat -- ...`
 - `zig build perf-record -- ...`
+- `zig build perf-real-torrent-parity -- ...`
 
 ## Open Design Questions
 The next high-value decision is how aggressively startup should trade initialization work for steady-state performance.

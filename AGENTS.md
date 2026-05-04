@@ -51,7 +51,7 @@ Required local setup:
 - c-ares dev package (`libc-ares-dev`) when using `-Ddns=c_ares -Dcares=system`
 - BoringSSL package when using `-Dtls=system_boringssl`; otherwise initialize `vendor/boringssl`
 - Nix default dev shell (`nix develop`) includes the normal build/test harness tools: SQLite, c-ares, BoringSSL, liburing, opentracker, Python, curl, diffutils (`cmp`), pkg-config, and git
-- Nix performance dev shell (`nix develop .#performance-tools`) adds `strace` and Linux `perf` for profiling build steps
+- Nix performance dev shell (`nix develop .#performance-tools`) adds `strace`, Linux `perf`, and `qbittorrent-nox` for profiling and public-swarm parity checks
 - local Linux/io_uring docs for substantial kernel work: `man-db`, `manpages`, `manpages-dev`, `manpages-posix`, `manpages-posix-dev`, `liburing-dev`
 - git submodules initialized with `git submodule update --init`
 - `vendor/boringssl` and `vendor/c-ares` initialized for default bundled builds, or use the system-link build flags with matching system packages
@@ -88,6 +88,7 @@ Core commands:
 - `zig build test-swarm`
 - `zig build perf-swarm-backends`
 - `zig build perf-real-torrents -- ...`
+- `zig build perf-real-torrent-parity -- ...`
 - `zig build test-web-seed-e2e`
 - `zig build validate-strace -- <strace-summary-file>`
 - `zig build trace-syscalls -- ...`

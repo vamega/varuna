@@ -41,6 +41,8 @@ These commands build `varuna` first and then run it under the selected tool. Pas
   Runs the live tracker/seeder/downloader swarm matrix in perf mode through `zig-out/bin/varuna-automation` and writes a throughput summary under `perf/output/backend-swarm-perf-*/summary.tsv`.
 - `zig build perf-real-torrents -- --duration 600`
   Runs the real public torrent performance harness through `zig-out/bin/varuna-automation`, using Proxmox, Ubuntu 26, and Deepin by default, and writes samples/summaries under `perf/output/real-torrents-*/`.
+- `zig build perf-real-torrent-parity -- --duration 600`
+  Runs the same public torrent set through Varuna and qBittorrent for mixed TCP+uTP and uTP-only transport comparisons, writing per-client samples plus an aggregate summary.
 
 ## Live Swarm Backend Perf
 
@@ -71,7 +73,7 @@ Small payloads are dominated by startup and one-second polling granularity; use 
 
 ## Real Torrent Perf
 
-Use `perf-real-torrents` for public-swarm checks like the Ubuntu/Proxmox/Deepin performance investigation. The harness downloads `.torrent` files with `curl`, starts one Varuna daemon with DHT/PEX enabled, adds all requested torrents, samples `/api/v2/torrents/info`, and writes `samples.tsv` plus `summary.tsv`.
+Use `perf-real-torrents` for Varuna-only public-swarm checks like the Ubuntu/Proxmox/Deepin performance investigation. The harness downloads `.torrent` files with `curl`, starts one Varuna daemon with DHT/PEX enabled, adds all requested torrents, samples `/api/v2/torrents/info`, and writes `samples.tsv` plus `summary.tsv`.
 
 Default run:
 
@@ -86,7 +88,13 @@ zig build -Doptimize=ReleaseFast perf-real-torrents -- --transport utp_only --du
 zig build -Doptimize=ReleaseFast perf-real-torrents -- --out-dir perf/output/manual-real --torrent ubuntu=https://distrowatch.com/dwres/torrents/ubuntu-26.04-desktop-amd64.iso.torrent
 ```
 
-The current harness measures Varuna. qBittorrent control automation is still a follow-up; keep same-window qBittorrent comparisons in progress reports until that client can be configured repeatably from the Zig harness.
+Use `perf-real-torrent-parity` when you need the repeatable qBittorrent control. By default it runs Proxmox, Ubuntu 26, and Deepin across `tcp_and_utp` and `utp_only` for both `varuna` and `qbittorrent`, with one output directory per client/transport and an aggregate `summary.tsv` at the top level. It requires `qbittorrent-nox` on `PATH`; the Nix `performance-tools` shell includes it.
+
+```bash
+nix develop .#performance-tools
+zig build -Doptimize=ReleaseFast perf-real-torrent-parity -- --duration 600
+zig build -Doptimize=ReleaseFast perf-real-torrent-parity -- --client qbittorrent --transport utp_only --duration 600
+```
 
 ### Post-Stall Live Swarm Snapshot (2026-05-02)
 
