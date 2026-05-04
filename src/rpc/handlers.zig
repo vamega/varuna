@@ -3,6 +3,7 @@ const server = @import("server.zig");
 const auth = @import("auth.zig");
 const multipart = @import("multipart.zig");
 const sync_mod = @import("sync.zig");
+const json_response = @import("json_body.zig");
 const json_mod = @import("json.zig");
 const compat = @import("compat.zig");
 const config_mod = @import("../config.zig");
@@ -93,7 +94,7 @@ pub fn ApiHandlerOf(comptime IO: type) type {
             }
 
             if (std.mem.eql(u8, route_path, "/api/v2/app/buildInfo")) {
-                return withCors(.{ .body = "{\"qt\":\"N/A\",\"libtorrent\":\"N/A\",\"boost\":\"N/A\",\"openssl\":\"N/A\",\"bitness\":64}" });
+                return withCors(json_response.response(allocator, 200, BuildInfoResponse{}));
             }
 
             if (std.mem.eql(u8, route_path, "/api/v2/app/preferences")) {
@@ -223,9 +224,15 @@ pub fn ApiHandlerOf(comptime IO: type) type {
             const info = self.session_manager.getTransferInfo(allocator) catch
                 return .{ .status = 500, .body = "{\"error\":\"internal\"}" };
 
-            const body = std.fmt.allocPrint(allocator, "{{\"connection_status\":\"connected\",\"dht_nodes\":{},\"dl_info_speed\":{},\"up_info_speed\":{},\"dl_info_data\":{},\"up_info_data\":{},\"dl_rate_limit\":{},\"up_rate_limit\":{}}}", .{ info.dht_nodes, info.dl_speed, info.ul_speed, info.dl_data, info.ul_data, info.dl_limit, info.ul_limit }) catch
-                return .{ .status = 500, .body = "{\"error\":\"internal\"}" };
-            return .{ .body = body, .owned_body = body };
+            return json_response.response(allocator, 200, TransferInfoResponse{
+                .dht_nodes = info.dht_nodes,
+                .dl_info_speed = info.dl_speed,
+                .up_info_speed = info.ul_speed,
+                .dl_info_data = info.dl_data,
+                .up_info_data = info.ul_data,
+                .dl_rate_limit = info.dl_limit,
+                .up_rate_limit = info.ul_limit,
+            });
         }
 
         fn handleTorrents(self: *const Self, allocator: std.mem.Allocator, method: []const u8, action: []const u8, body: []const u8, content_type: ?[]const u8) server.Response {
@@ -567,7 +574,7 @@ pub fn ApiHandlerOf(comptime IO: type) type {
                 }
             }
 
-            return .{ .body = "{\"status\":\"ok\"}" };
+            return json_response.ok(allocator);
         }
 
         fn handleTorrentsDelete(self: *const Self, allocator: std.mem.Allocator, body_params: *const FormParams) server.Response {
@@ -590,7 +597,7 @@ pub fn ApiHandlerOf(comptime IO: type) type {
                 };
             }
 
-            return .{ .body = "{\"status\":\"ok\"}" };
+            return json_response.ok(allocator);
         }
 
         fn handleTorrentsPause(self: *const Self, allocator: std.mem.Allocator, body_params: *const FormParams) server.Response {
@@ -607,7 +614,7 @@ pub fn ApiHandlerOf(comptime IO: type) type {
                 };
             }
 
-            return .{ .body = "{\"status\":\"ok\"}" };
+            return json_response.ok(allocator);
         }
 
         fn handleTorrentsResume(self: *const Self, allocator: std.mem.Allocator, body_params: *const FormParams) server.Response {
@@ -624,7 +631,7 @@ pub fn ApiHandlerOf(comptime IO: type) type {
                 };
             }
 
-            return .{ .body = "{\"status\":\"ok\"}" };
+            return json_response.ok(allocator);
         }
 
         // ── Speed limit handlers ─────────────────────────────
@@ -634,7 +641,6 @@ pub fn ApiHandlerOf(comptime IO: type) type {
             const el = sm.shared_event_loop;
             const dl_limit: u64 = if (el) |e| e.getGlobalDlLimit() else 0;
             const ul_limit: u64 = if (el) |e| e.getGlobalUlLimit() else 0;
-            const esc = json_mod.jsonSafe;
             const save_path = sm.default_save_path;
 
             // qBittorrent encryption: 0 = prefer, 1 = force, 2 = disable
@@ -659,65 +665,32 @@ pub fn ApiHandlerOf(comptime IO: type) type {
 
             const qcfg = self.session_manager.queue_manager.config;
 
-            const body = std.fmt.allocPrint(allocator,
-                \\{{"dl_limit":{},"up_limit":{},"alt_dl_limit":0,"alt_up_limit":0,
-                \\"save_path":"{f}","temp_path":"","temp_path_enabled":false,
-                \\"queueing_enabled":{s},"max_active_downloads":{},"max_active_torrents":{},
-                \\"max_active_uploads":{},"max_active_checking_torrents":1,
-                \\"listen_port":6881,"random_port":false,"upnp":false,"upnp_lease_duration":0,
-                \\"bittorrent_protocol":0,"utp_tcp_mixed_mode":0,
-                \\"current_network_interface":"","current_interface_address":"",
-                \\"announce_ip":"","reannounce_when_address_changed":false,
-                \\"max_connec":500,"max_connec_per_torrent":100,
-                \\"max_uploads":-1,"max_uploads_per_torrent":-1,
-                \\"enable_multi_connections_from_same_ip":false,
-                \\"outgoing_ports_min":0,"outgoing_ports_max":0,
-                \\"limit_lan_peers":true,"limit_tcp_overhead":false,"limit_utp_rate":true,
-                \\"peer_tos":0,"socket_backlog_size":30,
-                \\"send_buffer_watermark":500,"send_buffer_low_watermark":10,
-                \\"send_buffer_watermark_factor":50,
-                \\"max_concurrent_http_announces":50,"request_queue_size":500,
-                \\"stop_tracker_timeout":5,
-                \\"max_ratio_enabled":{s},"max_ratio":{d:.4},"max_ratio_act":{},
-                \\"max_seeding_time_enabled":{s},"max_seeding_time":{},
-                \\"auto_tmm_enabled":false,"save_resume_data_interval":60,
-                \\"start_paused_enabled":false,
-                \\"dht":{s},"pex":{s},"lsd":false,"encryption":{},"anonymous_mode":false,
-                \\"enable_utp":{s},
-                \\"outgoing_tcp":{s},"outgoing_utp":{s},"incoming_tcp":{s},"incoming_utp":{s},
-                \\"transport_disposition":{},
-                \\"piece_cache_enabled":{},
-                \\"web_seed_max_request_bytes":{},
-                \\"ip_filter_enabled":false,"ip_filter_path":"","ip_filter_trackers":false,
-                \\"banned_IPs":"{f}"}}
-            , .{
-                dl_limit,
-                ul_limit,
-                esc(save_path),
-                @as([]const u8, if (qcfg.enabled) "true" else "false"),
-                qcfg.max_active_downloads,
-                qcfg.max_active_torrents,
-                qcfg.max_active_uploads,
-                @as([]const u8, if (sm.max_ratio_enabled) "true" else "false"),
-                sm.max_ratio,
-                sm.max_ratio_act,
-                @as([]const u8, if (sm.max_seeding_time_enabled) "true" else "false"),
-                sm.max_seeding_time,
-                @as([]const u8, if (el) |e| (if (e.dht_engine != null) "true" else "false") else "false"),
-                @as([]const u8, if (el) |e| (if (e.pex_enabled) "true" else "false") else "false"),
-                enc_mode,
-                @as([]const u8, if (el) |e| (if (e.transport_disposition.toEnableUtp()) "true" else "false") else "false"),
-                @as([]const u8, if (el) |e| (if (e.transport_disposition.outgoing_tcp) "true" else "false") else "true"),
-                @as([]const u8, if (el) |e| (if (e.transport_disposition.outgoing_utp) "true" else "false") else "false"),
-                @as([]const u8, if (el) |e| (if (e.transport_disposition.incoming_tcp) "true" else "false") else "true"),
-                @as([]const u8, if (el) |e| (if (e.transport_disposition.incoming_utp) "true" else "false") else "false"),
-                if (el) |e| e.transport_disposition.toBitfield() else @as(u8, 15),
-                @as(u8, if (piece_cache_enabled) 1 else 0),
-                if (el) |e| e.web_seed_max_request_bytes else @as(u32, 4 * 1024 * 1024),
-                esc(banned_ips_str),
-            }) catch
-                return .{ .status = 500, .body = "{\"error\":\"internal\"}" };
-            return .{ .body = body, .owned_body = body };
+            return json_response.response(allocator, 200, PreferencesResponse{
+                .dl_limit = dl_limit,
+                .up_limit = ul_limit,
+                .save_path = save_path,
+                .queueing_enabled = qcfg.enabled,
+                .max_active_downloads = qcfg.max_active_downloads,
+                .max_active_torrents = qcfg.max_active_torrents,
+                .max_active_uploads = qcfg.max_active_uploads,
+                .max_ratio_enabled = sm.max_ratio_enabled,
+                .max_ratio = .{ .value = sm.max_ratio },
+                .max_ratio_act = sm.max_ratio_act,
+                .max_seeding_time_enabled = sm.max_seeding_time_enabled,
+                .max_seeding_time = sm.max_seeding_time,
+                .dht = if (el) |e| e.dht_engine != null else false,
+                .pex = if (el) |e| e.pex_enabled else false,
+                .encryption = enc_mode,
+                .enable_utp = if (el) |e| e.transport_disposition.toEnableUtp() else false,
+                .outgoing_tcp = if (el) |e| e.transport_disposition.outgoing_tcp else true,
+                .outgoing_utp = if (el) |e| e.transport_disposition.outgoing_utp else false,
+                .incoming_tcp = if (el) |e| e.transport_disposition.incoming_tcp else true,
+                .incoming_utp = if (el) |e| e.transport_disposition.incoming_utp else false,
+                .transport_disposition = if (el) |e| e.transport_disposition.toBitfield() else @as(u8, 15),
+                .piece_cache_enabled = if (piece_cache_enabled) 1 else 0,
+                .web_seed_max_request_bytes = if (el) |e| e.web_seed_max_request_bytes else @as(u32, 4 * 1024 * 1024),
+                .banned_IPs = banned_ips_str,
+            });
         }
 
         fn handleSetPreferences(self: *const Self, allocator: std.mem.Allocator, body: []const u8) server.Response {
@@ -1001,29 +974,23 @@ pub fn ApiHandlerOf(comptime IO: type) type {
             };
             defer SessionManager.freeFileInfos(allocator, files);
 
-            var json = std.ArrayList(u8).empty;
-            defer json.deinit(allocator);
-
-            json.append(allocator, '[') catch return .{ .status = 500, .body = "[]" };
+            const response_files = allocator.alloc(TorrentFileResponse, files.len) catch
+                return .{ .status = 500, .body = "[]" };
+            defer allocator.free(response_files);
 
             for (files, 0..) |file, i| {
-                if (i > 0) json.append(allocator, ',') catch {};
-
-                json.print(allocator, "{{\"index\":{},\"name\":\"{f}\",\"size\":{},\"progress\":{d:.4},\"priority\":{},\"availability\":{d:.4},\"is_seed\":false,\"piece_range\":[{},{}]}}", .{
-                    i,
-                    json_mod.jsonSafe(file.name),
-                    file.size,
-                    file.progress,
-                    file.priority,
-                    file.progress, // availability approximated by progress
-                    file.first_piece,
-                    file.last_piece,
-                }) catch {};
+                response_files[i] = .{
+                    .index = i,
+                    .name = file.name,
+                    .size = file.size,
+                    .progress = .{ .value = file.progress },
+                    .priority = file.priority,
+                    .availability = .{ .value = file.progress },
+                    .piece_range = .{ file.first_piece, file.last_piece },
+                };
             }
 
-            json.append(allocator, ']') catch {};
-            const result = json.toOwnedSlice(allocator) catch return .{ .status = 500, .body = "[]" };
-            return .{ .body = result, .owned_body = result };
+            return json_response.response(allocator, 200, response_files);
         }
 
         fn handleTorrentsTrackers(self: *const Self, allocator: std.mem.Allocator, body_params: *const FormParams) server.Response {
@@ -1037,27 +1004,23 @@ pub fn ApiHandlerOf(comptime IO: type) type {
             };
             defer SessionManager.freeTrackerInfos(allocator, trackers);
 
-            var json = std.ArrayList(u8).empty;
-            defer json.deinit(allocator);
-
-            json.append(allocator, '[') catch return .{ .status = 500, .body = "[]" };
+            const response_trackers = allocator.alloc(TorrentTrackerResponse, trackers.len) catch
+                return .{ .status = 500, .body = "[]" };
+            defer allocator.free(response_trackers);
 
             for (trackers, 0..) |tracker, i| {
-                if (i > 0) json.append(allocator, ',') catch {};
-                json.print(allocator, "{{\"url\":\"{f}\",\"status\":{},\"tier\":{},\"num_peers\":{},\"num_seeds\":{},\"num_leeches\":{},\"num_downloaded\":{},\"msg\":\"\"}}", .{
-                    json_mod.jsonSafe(tracker.url),
-                    tracker.status,
-                    tracker.tier,
-                    tracker.num_peers,
-                    tracker.num_seeds,
-                    tracker.num_leeches,
-                    tracker.num_downloaded,
-                }) catch {};
+                response_trackers[i] = .{
+                    .url = tracker.url,
+                    .status = tracker.status,
+                    .tier = tracker.tier,
+                    .num_peers = tracker.num_peers,
+                    .num_seeds = tracker.num_seeds,
+                    .num_leeches = tracker.num_leeches,
+                    .num_downloaded = tracker.num_downloaded,
+                };
             }
 
-            json.append(allocator, ']') catch {};
-            const result = json.toOwnedSlice(allocator) catch return .{ .status = 500, .body = "[]" };
-            return .{ .body = result, .owned_body = result };
+            return json_response.response(allocator, 200, response_trackers);
         }
 
         fn handleTorrentsProperties(self: *const Self, allocator: std.mem.Allocator, body_params: *const FormParams) server.Response {
@@ -1073,63 +1036,52 @@ pub fn ApiHandlerOf(comptime IO: type) type {
             // Time active since added
             const now = std.time.timestamp();
             const time_active: i64 = now - info.added_on;
-            const esc = json_mod.jsonSafe;
-
             const v2_hex = compat.formatInfoHashV2(info.info_hash_v2);
             const v2_str: []const u8 = if (v2_hex) |*hex| hex else "";
             const completion_date: i64 = if (info.completion_on > 0) info.completion_on else if (info.state == .seeding) info.added_on else -1;
 
-            var json = std.ArrayList(u8).empty;
-            defer json.deinit(allocator);
-
-            // Split into two print calls to stay under Zig's 32-argument format limit
-            json.print(allocator, "{{\"save_path\":\"{f}\",\"download_path\":\"\",\"creation_date\":{},\"piece_size\":{},\"comment\":\"{f}\",\"created_by\":\"{f}\",\"total_size\":{},\"pieces_have\":{},\"pieces_num\":{},\"dl_speed\":{},\"dl_speed_avg\":0,\"up_speed\":{},\"up_speed_avg\":0,\"dl_limit\":{},\"up_limit\":{},\"eta\":{},\"hash\":\"{s}\",\"infohash_v1\":\"{s}\",\"infohash_v2\":\"{s}\",\"name\":\"{f}\",\"ratio\":{d:.4},\"share_ratio\":{d:.4},\"time_elapsed\":{},\"time_active\":{},\"seeding_time\":{},\"nb_connections\":{},\"nb_connections_limit\":500,", .{
-                esc(info.save_path),
-                info.creation_date orelse -1,
-                info.piece_size,
-                esc(info.comment),
-                esc(info.created_by),
-                info.total_size,
-                info.pieces_have,
-                info.pieces_total,
-                info.download_speed,
-                info.upload_speed,
-                info.dl_limit,
-                info.ul_limit,
-                info.eta,
-                info.info_hash_hex,
-                info.info_hash_hex,
-                v2_str,
-                esc(info.name),
-                info.ratio,
-                info.ratio,
-                time_active,
-                time_active,
-                info.seeding_time,
-                info.peers_connected,
-            }) catch return .{ .status = 500, .body = "{\"error\":\"internal\"}" };
-            json.print(allocator, "\"peers\":{},\"peers_total\":{},\"seeds\":{},\"seeds_total\":{},\"last_seen\":-1,\"reannounce\":0,\"addition_date\":{},\"completion_date\":{},\"total_downloaded\":{},\"total_downloaded_session\":{},\"total_uploaded\":{},\"total_uploaded_session\":{},\"total_wasted\":0,\"is_private\":{s},\"seq_dl\":{s},\"super_seeding\":{},\"web_seeds_count\":{},\"partial_seed\":{s},\"ratio_limit\":{d:.4},\"seeding_time_limit\":{}}}", .{
-                info.scrape_incomplete,
-                info.scrape_complete,
-                info.scrape_complete,
-                info.scrape_complete,
-                info.added_on,
-                completion_date,
-                info.bytes_downloaded,
-                info.bytes_downloaded,
-                info.bytes_uploaded,
-                info.bytes_uploaded,
-                @as([]const u8, if (info.is_private) "true" else "false"),
-                @as([]const u8, if (info.sequential_download) "true" else "false"),
-                @as(u8, if (info.super_seeding) 1 else 0),
-                info.web_seeds_count,
-                @as([]const u8, if (info.partial_seed) "true" else "false"),
-                info.ratio_limit,
-                info.seeding_time_limit,
-            }) catch return .{ .status = 500, .body = "{\"error\":\"internal\"}" };
-
-            const result = json.toOwnedSlice(allocator) catch return .{ .status = 500, .body = "{\"error\":\"internal\"}" };
-            return .{ .body = result, .owned_body = result };
+            return json_response.response(allocator, 200, TorrentPropertiesResponse{
+                .save_path = info.save_path,
+                .creation_date = info.creation_date orelse -1,
+                .piece_size = info.piece_size,
+                .comment = info.comment,
+                .created_by = info.created_by,
+                .total_size = info.total_size,
+                .pieces_have = info.pieces_have,
+                .pieces_num = info.pieces_total,
+                .dl_speed = info.download_speed,
+                .up_speed = info.upload_speed,
+                .dl_limit = info.dl_limit,
+                .up_limit = info.ul_limit,
+                .eta = info.eta,
+                .hash = info.info_hash_hex[0..],
+                .infohash_v1 = info.info_hash_hex[0..],
+                .infohash_v2 = v2_str,
+                .name = info.name,
+                .ratio = .{ .value = info.ratio },
+                .share_ratio = .{ .value = info.ratio },
+                .time_elapsed = time_active,
+                .time_active = time_active,
+                .seeding_time = info.seeding_time,
+                .nb_connections = info.peers_connected,
+                .peers = info.scrape_incomplete,
+                .peers_total = info.scrape_complete,
+                .seeds = info.scrape_complete,
+                .seeds_total = info.scrape_complete,
+                .addition_date = info.added_on,
+                .completion_date = completion_date,
+                .total_downloaded = info.bytes_downloaded,
+                .total_downloaded_session = info.bytes_downloaded,
+                .total_uploaded = info.bytes_uploaded,
+                .total_uploaded_session = info.bytes_uploaded,
+                .is_private = info.is_private,
+                .seq_dl = info.sequential_download,
+                .super_seeding = if (info.super_seeding) 1 else 0,
+                .web_seeds_count = info.web_seeds_count,
+                .partial_seed = info.partial_seed,
+                .ratio_limit = .{ .value = info.ratio_limit },
+                .seeding_time_limit = info.seeding_time_limit,
+            });
         }
 
         fn handleTorrentsFilePrio(self: *const Self, allocator: std.mem.Allocator, body_params: *const FormParams) server.Response {
@@ -1428,9 +1380,7 @@ pub fn ApiHandlerOf(comptime IO: type) type {
                 };
             };
 
-            const body_out = std.fmt.allocPrint(allocator, "{{\"id\":{}}}", .{id}) catch
-                return .{ .status = 500, .body = "{\"error\":\"internal\"}" };
-            return .{ .status = 202, .body = body_out, .owned_body = body_out };
+            return json_response.response(allocator, 202, MoveStartedResponse{ .id = id });
         }
 
         fn handleVarunaMoveStatus(self: *const Self, allocator: std.mem.Allocator, id: @import("../daemon/session_manager.zig").MoveJobId) server.Response {
@@ -1449,22 +1399,25 @@ pub fn ApiHandlerOf(comptime IO: type) type {
             };
             const err_str: []const u8 = if (p.error_message) |m| m else "";
 
-            const body = std.fmt.allocPrint(
-                allocator,
-                "{{\"id\":{},\"state\":\"{s}\",\"bytes_copied\":{},\"total_bytes\":{},\"files_done\":{},\"total_files\":{},\"used_rename\":{},\"error\":\"{s}\"}}",
-                .{ id, state_str, p.bytes_copied, p.total_bytes, p.files_done, p.total_files, p.used_rename, err_str },
-            ) catch return .{ .status = 500, .body = "{\"error\":\"internal\"}" };
-            return .{ .body = body, .owned_body = body };
+            return json_response.response(allocator, 200, MoveStatusResponse{
+                .id = id,
+                .state = state_str,
+                .bytes_copied = p.bytes_copied,
+                .total_bytes = p.total_bytes,
+                .files_done = p.files_done,
+                .total_files = p.total_files,
+                .used_rename = p.used_rename,
+                .@"error" = err_str,
+            });
         }
 
         fn handleVarunaMoveCancel(self: *const Self, allocator: std.mem.Allocator, id: @import("../daemon/session_manager.zig").MoveJobId) server.Response {
-            _ = allocator;
             self.session_manager.cancelMoveJob(id) catch |err| {
                 return switch (err) {
                     error.JobNotFound => .{ .status = 404, .body = "{\"error\":\"job not found\"}" },
                 };
             };
-            return .{ .body = "{\"status\":\"ok\"}" };
+            return json_response.ok(allocator);
         }
 
         fn handleVarunaMoveCommit(self: *const Self, allocator: std.mem.Allocator, id: @import("../daemon/session_manager.zig").MoveJobId) server.Response {
@@ -1476,18 +1429,17 @@ pub fn ApiHandlerOf(comptime IO: type) type {
                     error.OutOfMemory => errorResponse(allocator, 500, err),
                 };
             };
-            return .{ .body = "{\"status\":\"ok\"}" };
+            return json_response.ok(allocator);
         }
 
         fn handleVarunaMoveForget(self: *const Self, allocator: std.mem.Allocator, id: @import("../daemon/session_manager.zig").MoveJobId) server.Response {
-            _ = allocator;
             self.session_manager.forgetMoveJob(id) catch |err| {
                 return switch (err) {
                     error.JobNotFound => .{ .status = 404, .body = "{\"error\":\"job not found\"}" },
                     error.JobStillRunning => .{ .status = 409, .body = "{\"error\":\"cancel first; job is still running\"}" },
                 };
             };
-            return .{ .body = "{\"status\":\"ok\"}" };
+            return json_response.ok(allocator);
         }
 
         fn handleTorrentsConnDiagnostics(self: *const Self, allocator: std.mem.Allocator, params: *const FormParams) server.Response {
@@ -1497,15 +1449,14 @@ pub fn ApiHandlerOf(comptime IO: type) type {
             const diag = self.session_manager.getConnDiagnostics(hash) catch
                 return .{ .status = 404, .body = "{\"error\":\"torrent not found\"}" };
 
-            const body = std.fmt.allocPrint(allocator, "{{\"connection_attempts\":{},\"connection_failures\":{},\"timeout_failures\":{},\"refused_failures\":{},\"peers_connected\":{},\"peers_half_open\":{}}}", .{
-                diag.connection_attempts,
-                diag.connection_failures,
-                diag.timeout_failures,
-                diag.refused_failures,
-                diag.peers_connected,
-                diag.peers_half_open,
-            }) catch return .{ .status = 500, .body = "{\"error\":\"internal\"}" };
-            return .{ .body = body, .owned_body = body };
+            return json_response.response(allocator, 200, ConnDiagnosticsResponse{
+                .connection_attempts = diag.connection_attempts,
+                .connection_failures = diag.connection_failures,
+                .timeout_failures = diag.timeout_failures,
+                .refused_failures = diag.refused_failures,
+                .peers_connected = diag.peers_connected,
+                .peers_half_open = diag.peers_half_open,
+            });
         }
 
         fn handleSetShareLimits(self: *const Self, allocator: std.mem.Allocator, body_params: *const FormParams) server.Response {
@@ -1534,7 +1485,7 @@ pub fn ApiHandlerOf(comptime IO: type) type {
                     return errorResponse(allocator, 404, err);
                 };
             }
-            return .{ .body = "{\"status\":\"ok\"}" };
+            return json_response.ok(allocator);
         }
 
         fn handleTorrentsWebSeeds(self: *const Self, allocator: std.mem.Allocator, params: *const FormParams) server.Response {
@@ -1548,19 +1499,15 @@ pub fn ApiHandlerOf(comptime IO: type) type {
                 allocator.free(urls);
             }
 
-            var json = std.ArrayList(u8).empty;
-            defer json.deinit(allocator);
+            const response_urls = allocator.alloc(WebSeedResponse, urls.len) catch
+                return .{ .status = 500, .body = "{\"error\":\"internal\"}" };
+            defer allocator.free(response_urls);
 
-            const esc = json_mod.jsonSafe;
-            json.appendSlice(allocator, "[") catch return .{ .status = 500, .body = "{\"error\":\"internal\"}" };
             for (urls, 0..) |url, i| {
-                if (i > 0) json.appendSlice(allocator, ",") catch return .{ .status = 500, .body = "{\"error\":\"internal\"}" };
-                json.print(allocator, "{{\"url\":\"{f}\"}}", .{esc(url)}) catch return .{ .status = 500, .body = "{\"error\":\"internal\"}" };
+                response_urls[i] = .{ .url = url };
             }
-            json.appendSlice(allocator, "]") catch return .{ .status = 500, .body = "{\"error\":\"internal\"}" };
 
-            const body = json.toOwnedSlice(allocator) catch return .{ .status = 500, .body = "{\"error\":\"internal\"}" };
-            return .{ .body = body, .owned_body = body };
+            return json_response.response(allocator, 200, response_urls);
         }
 
         // ── Category endpoints ────────────────────────────────
@@ -1878,15 +1825,17 @@ pub fn ApiHandlerOf(comptime IO: type) type {
             // Persist to SQLite (background thread)
             self.session_manager.persistBanList();
 
-            const resp = std.fmt.allocPrint(allocator, "{{\"removed\":{}}}", .{removed}) catch
-                return .{ .status = 500, .body = "{\"error\":\"internal\"}" };
-            return .{ .body = resp, .owned_body = resp };
+            return json_response.response(allocator, 200, UnbanPeersResponse{ .removed = removed });
         }
 
         /// GET /api/v2/transfer/bannedPeers -- list all bans.
         fn handleBannedPeers(self: *const Self, allocator: std.mem.Allocator) server.Response {
             const bl = self.session_manager.ban_list orelse
-                return .{ .body = "{\"individual\":[],\"ranges\":[],\"total_rules\":0}" };
+                return json_response.response(allocator, 200, BannedPeersResponse{
+                    .individual = &.{},
+                    .ranges = &.{},
+                    .total_rules = 0,
+                });
 
             const bans = bl.listBans(allocator) catch
                 return .{ .status = 500, .body = "{\"error\":\"internal\"}" };
@@ -1908,43 +1857,35 @@ pub fn ApiHandlerOf(comptime IO: type) type {
                 allocator.free(ranges);
             }
 
-            const esc = json_mod.jsonSafe;
-            var json_buf = std.ArrayList(u8).empty;
-            defer json_buf.deinit(allocator);
-
-            json_buf.appendSlice(allocator, "{\"individual\":[") catch
+            const response_bans = allocator.alloc(BannedPeerResponse, bans.len) catch
                 return .{ .status = 500, .body = "{\"error\":\"internal\"}" };
-
-            for (bans, 0..) |info, idx| {
-                if (idx > 0) json_buf.append(allocator, ',') catch {};
-                const source_str: []const u8 = if (info.source == .manual) "manual" else "ipfilter";
-                if (info.reason) |r| {
-                    json_buf.writer(allocator).print("{{\"ip\":\"{f}\",\"source\":\"{s}\",\"reason\":\"{f}\",\"created_at\":{}}}", .{
-                        esc(info.ip_str), source_str, esc(r), info.created_at,
-                    }) catch {};
-                } else {
-                    json_buf.writer(allocator).print("{{\"ip\":\"{f}\",\"source\":\"{s}\",\"reason\":null,\"created_at\":{}}}", .{
-                        esc(info.ip_str), source_str, info.created_at,
-                    }) catch {};
-                }
+            defer allocator.free(response_bans);
+            for (bans, 0..) |info, i| {
+                response_bans[i] = .{
+                    .ip = info.ip_str,
+                    .source = banSourceString(info.source),
+                    .reason = info.reason,
+                    .created_at = info.created_at,
+                };
             }
 
-            json_buf.appendSlice(allocator, "],\"ranges\":[") catch {};
-
-            for (ranges, 0..) |info, idx| {
-                if (idx > 0) json_buf.append(allocator, ',') catch {};
-                const source_str: []const u8 = if (info.source == .manual) "manual" else "ipfilter";
-                json_buf.writer(allocator).print("{{\"start\":\"{f}\",\"end\":\"{f}\",\"source\":\"{s}\",\"created_at\":{}}}", .{
-                    esc(info.start_str), esc(info.end_str), source_str, info.created_at,
-                }) catch {};
+            const response_ranges = allocator.alloc(BannedRangeResponse, ranges.len) catch
+                return .{ .status = 500, .body = "{\"error\":\"internal\"}" };
+            defer allocator.free(response_ranges);
+            for (ranges, 0..) |info, i| {
+                response_ranges[i] = .{
+                    .start = info.start_str,
+                    .end = info.end_str,
+                    .source = banSourceString(info.source),
+                    .created_at = info.created_at,
+                };
             }
 
-            const total = bl.ruleCount();
-            json_buf.writer(allocator).print("],\"total_rules\":{}}}", .{total}) catch {};
-
-            const resp_body = json_buf.toOwnedSlice(allocator) catch
-                return .{ .status = 500, .body = "{\"error\":\"internal\"}" };
-            return .{ .body = resp_body, .owned_body = resp_body };
+            return json_response.response(allocator, 200, BannedPeersResponse{
+                .individual = response_bans,
+                .ranges = response_ranges,
+                .total_rules = bl.ruleCount(),
+            });
         }
 
         /// POST /api/v2/transfer/importBanList -- import an ipfilter file.
@@ -1983,9 +1924,10 @@ pub fn ApiHandlerOf(comptime IO: type) type {
             // Persist to SQLite
             self.session_manager.persistBanList();
 
-            const resp = std.fmt.allocPrint(allocator, "{{\"imported\":{},\"errors\":{}}}", .{ result.imported, result.errors }) catch
-                return .{ .status = 500, .body = "{\"error\":\"internal\"}" };
-            return .{ .body = resp, .owned_body = resp };
+            return json_response.response(allocator, 200, ImportBanListResponse{
+                .imported = result.imported,
+                .errors = result.errors,
+            });
         }
 
         // ── Queue management endpoints (qBittorrent-compatible) ──
@@ -2228,18 +2170,7 @@ pub fn ApiHandlerOf(comptime IO: type) type {
             };
             defer allocator.free(states);
 
-            var json = std.ArrayList(u8).empty;
-            defer json.deinit(allocator);
-
-            json.append(allocator, '[') catch return .{ .status = 500, .body = "[]" };
-            for (states, 0..) |state, i| {
-                if (i > 0) json.append(allocator, ',') catch {};
-                json.print(allocator, "{}", .{state}) catch {};
-            }
-            json.append(allocator, ']') catch {};
-
-            const body = json.toOwnedSlice(allocator) catch return .{ .status = 500, .body = "[]" };
-            return .{ .body = body, .owned_body = body };
+            return json_response.response(allocator, 200, PieceStatesResponse{ .values = states });
         }
 
         /// GET /api/v2/torrents/pieceHashes -- return piece hashes as JSON array of hex strings.
@@ -2257,20 +2188,7 @@ pub fn ApiHandlerOf(comptime IO: type) type {
                 allocator.free(hashes);
             }
 
-            var json = std.ArrayList(u8).empty;
-            defer json.deinit(allocator);
-
-            json.append(allocator, '[') catch return .{ .status = 500, .body = "[]" };
-            for (hashes, 0..) |hex, i| {
-                if (i > 0) json.append(allocator, ',') catch {};
-                json.append(allocator, '"') catch {};
-                json.appendSlice(allocator, hex) catch {};
-                json.append(allocator, '"') catch {};
-            }
-            json.append(allocator, ']') catch {};
-
-            const body = json.toOwnedSlice(allocator) catch return .{ .status = 500, .body = "[]" };
-            return .{ .body = body, .owned_body = body };
+            return json_response.response(allocator, 200, hashes);
         }
 
         /// POST /api/v2/torrents/renameFile — 501 Not Implemented.
@@ -2341,6 +2259,239 @@ pub fn ApiHandlerOf(comptime IO: type) type {
 
 pub const ApiHandler = ApiHandlerOf(backend.RealIO);
 
+const BuildInfoResponse = struct {
+    qt: []const u8 = "N/A",
+    libtorrent: []const u8 = "N/A",
+    boost: []const u8 = "N/A",
+    openssl: []const u8 = "N/A",
+    bitness: u8 = 64,
+};
+
+const TransferInfoResponse = struct {
+    connection_status: []const u8 = "connected",
+    dht_nodes: usize,
+    dl_info_speed: u64,
+    up_info_speed: u64,
+    dl_info_data: u64,
+    up_info_data: u64,
+    dl_rate_limit: u64,
+    up_rate_limit: u64,
+};
+
+const PreferencesResponse = struct {
+    dl_limit: u64,
+    up_limit: u64,
+    alt_dl_limit: u8 = 0,
+    alt_up_limit: u8 = 0,
+    save_path: []const u8,
+    temp_path: []const u8 = "",
+    temp_path_enabled: bool = false,
+    queueing_enabled: bool,
+    max_active_downloads: i32,
+    max_active_torrents: i32,
+    max_active_uploads: i32,
+    max_active_checking_torrents: u8 = 1,
+    listen_port: u16 = 6881,
+    random_port: bool = false,
+    upnp: bool = false,
+    upnp_lease_duration: u8 = 0,
+    bittorrent_protocol: u8 = 0,
+    utp_tcp_mixed_mode: u8 = 0,
+    current_network_interface: []const u8 = "",
+    current_interface_address: []const u8 = "",
+    announce_ip: []const u8 = "",
+    reannounce_when_address_changed: bool = false,
+    max_connec: u16 = 500,
+    max_connec_per_torrent: u16 = 100,
+    max_uploads: i8 = -1,
+    max_uploads_per_torrent: i8 = -1,
+    enable_multi_connections_from_same_ip: bool = false,
+    outgoing_ports_min: u8 = 0,
+    outgoing_ports_max: u8 = 0,
+    limit_lan_peers: bool = true,
+    limit_tcp_overhead: bool = false,
+    limit_utp_rate: bool = true,
+    peer_tos: u8 = 0,
+    socket_backlog_size: u8 = 30,
+    send_buffer_watermark: u16 = 500,
+    send_buffer_low_watermark: u8 = 10,
+    send_buffer_watermark_factor: u8 = 50,
+    max_concurrent_http_announces: u8 = 50,
+    request_queue_size: u16 = 500,
+    stop_tracker_timeout: u8 = 5,
+    max_ratio_enabled: bool,
+    max_ratio: json_response.Fixed4,
+    max_ratio_act: u8,
+    max_seeding_time_enabled: bool,
+    max_seeding_time: i64,
+    auto_tmm_enabled: bool = false,
+    save_resume_data_interval: u8 = 60,
+    start_paused_enabled: bool = false,
+    dht: bool,
+    pex: bool,
+    lsd: bool = false,
+    encryption: u8,
+    anonymous_mode: bool = false,
+    enable_utp: bool,
+    outgoing_tcp: bool,
+    outgoing_utp: bool,
+    incoming_tcp: bool,
+    incoming_utp: bool,
+    transport_disposition: u8,
+    piece_cache_enabled: u8,
+    web_seed_max_request_bytes: u32,
+    ip_filter_enabled: bool = false,
+    ip_filter_path: []const u8 = "",
+    ip_filter_trackers: bool = false,
+    banned_IPs: []const u8,
+};
+
+const TorrentFileResponse = struct {
+    index: usize,
+    name: []const u8,
+    size: u64,
+    progress: json_response.Fixed4,
+    priority: u8,
+    availability: json_response.Fixed4,
+    is_seed: bool = false,
+    piece_range: [2]u32,
+};
+
+const TorrentTrackerResponse = struct {
+    url: []const u8,
+    status: u8,
+    tier: u32,
+    num_peers: u16,
+    num_seeds: u32,
+    num_leeches: u32,
+    num_downloaded: u32,
+    msg: []const u8 = "",
+};
+
+const TorrentPropertiesResponse = struct {
+    save_path: []const u8,
+    download_path: []const u8 = "",
+    creation_date: i64,
+    piece_size: u32,
+    comment: []const u8,
+    created_by: []const u8,
+    total_size: u64,
+    pieces_have: u32,
+    pieces_num: u32,
+    dl_speed: u64,
+    dl_speed_avg: u8 = 0,
+    up_speed: u64,
+    up_speed_avg: u8 = 0,
+    dl_limit: u64,
+    up_limit: u64,
+    eta: i64,
+    hash: []const u8,
+    infohash_v1: []const u8,
+    infohash_v2: []const u8,
+    name: []const u8,
+    ratio: json_response.Fixed4,
+    share_ratio: json_response.Fixed4,
+    time_elapsed: i64,
+    time_active: i64,
+    seeding_time: i64,
+    nb_connections: u16,
+    nb_connections_limit: u16 = 500,
+    peers: u32,
+    peers_total: u32,
+    seeds: u32,
+    seeds_total: u32,
+    last_seen: i8 = -1,
+    reannounce: u8 = 0,
+    addition_date: i64,
+    completion_date: i64,
+    total_downloaded: u64,
+    total_downloaded_session: u64,
+    total_uploaded: u64,
+    total_uploaded_session: u64,
+    total_wasted: u8 = 0,
+    is_private: bool,
+    seq_dl: bool,
+    super_seeding: u8,
+    web_seeds_count: u32,
+    partial_seed: bool,
+    ratio_limit: json_response.Fixed4,
+    seeding_time_limit: i64,
+};
+
+const MoveStartedResponse = struct {
+    id: session_manager_mod.MoveJobId,
+};
+
+const MoveStatusResponse = struct {
+    id: session_manager_mod.MoveJobId,
+    state: []const u8,
+    bytes_copied: u64,
+    total_bytes: u64,
+    files_done: u32,
+    total_files: u32,
+    used_rename: bool,
+    @"error": []const u8,
+};
+
+const ConnDiagnosticsResponse = struct {
+    connection_attempts: u64,
+    connection_failures: u64,
+    timeout_failures: u64,
+    refused_failures: u64,
+    peers_connected: u16,
+    peers_half_open: u16,
+};
+
+const WebSeedResponse = struct {
+    url: []const u8,
+};
+
+const UnbanPeersResponse = struct {
+    removed: usize,
+};
+
+const ImportBanListResponse = struct {
+    imported: usize,
+    errors: usize,
+};
+
+const BannedPeerResponse = struct {
+    ip: []const u8,
+    source: []const u8,
+    reason: ?[]const u8,
+    created_at: i64,
+};
+
+const BannedRangeResponse = struct {
+    start: []const u8,
+    end: []const u8,
+    source: []const u8,
+    created_at: i64,
+};
+
+const BannedPeersResponse = struct {
+    individual: []const BannedPeerResponse,
+    ranges: []const BannedRangeResponse,
+    total_rules: usize,
+};
+
+const PieceStatesResponse = struct {
+    values: []const u8,
+
+    pub fn jsonStringify(self: PieceStatesResponse, writer: anytype) !void {
+        try writer.print("[", .{});
+        for (self.values, 0..) |state, i| {
+            if (i > 0) try writer.print(",", .{});
+            try writer.print("{}", .{state});
+        }
+        try writer.print("]", .{});
+    }
+};
+
+fn banSourceString(source: BanList.BanSource) []const u8 {
+    return if (source == .manual) "manual" else "ipfilter";
+}
+
 fn serializeTorrentInfo(allocator: std.mem.Allocator, json: *std.ArrayList(u8), stat: TorrentSession.Stats) !void {
     return compat.serializeTorrentJson(allocator, json, stat, true);
 }
@@ -2374,9 +2525,7 @@ const PreferencesUpdate = struct {
 /// Build a `server.Response` carrying a JSON error body.
 /// `owned_body` is set so the caller's arena or response-send path can free it.
 fn errorResponse(allocator: std.mem.Allocator, status: u16, err: anyerror) server.Response {
-    const msg = std.fmt.allocPrint(allocator, "{{\"error\":\"{s}\"}}", .{@errorName(err)}) catch
-        return .{ .status = 500, .body = "{\"error\":\"internal\"}" };
-    return .{ .status = status, .body = msg, .owned_body = msg };
+    return json_response.errorMessage(allocator, status, @errorName(err));
 }
 
 /// Extract a torrent hash from the request body.  Tries `hashes` first (the
@@ -2889,6 +3038,53 @@ test "requireHashes returns null for empty body" {
 }
 
 // ── errorResponse helper tests ──────────────────────────
+
+test "rpc json body helper serializes structured response bodies" {
+    const body = try json_response.alloc(std.testing.allocator, .{
+        .status = "ok",
+        .message = "file \"ready\"",
+    });
+    defer std.testing.allocator.free(body);
+
+    try std.testing.expectEqualStrings("{\"status\":\"ok\",\"message\":\"file \\\"ready\\\"\"}", body);
+}
+
+test "preferences response serializes structured body with qBittorrent field types" {
+    const body = try json_response.alloc(std.testing.allocator, PreferencesResponse{
+        .dl_limit = 100,
+        .up_limit = 200,
+        .save_path = "/tmp/varuna \"test\"",
+        .queueing_enabled = true,
+        .max_active_downloads = 3,
+        .max_active_torrents = -1,
+        .max_active_uploads = 2,
+        .max_ratio_enabled = true,
+        .max_ratio = .{ .value = 2.5 },
+        .max_ratio_act = 1,
+        .max_seeding_time_enabled = false,
+        .max_seeding_time = -1,
+        .dht = true,
+        .pex = false,
+        .encryption = 0,
+        .enable_utp = true,
+        .outgoing_tcp = true,
+        .outgoing_utp = true,
+        .incoming_tcp = true,
+        .incoming_utp = false,
+        .transport_disposition = 7,
+        .piece_cache_enabled = 1,
+        .web_seed_max_request_bytes = 4096,
+        .banned_IPs = "192.0.2.1\n198.51.100.0/24",
+    });
+    defer std.testing.allocator.free(body);
+
+    try std.testing.expect(std.mem.indexOf(u8, body, "\"save_path\":\"/tmp/varuna \\\"test\\\"\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, body, "\"queueing_enabled\":true") != null);
+    try std.testing.expect(std.mem.indexOf(u8, body, "\"max_ratio\":2.5000") != null);
+    try std.testing.expect(std.mem.indexOf(u8, body, "\"max_active_torrents\":-1") != null);
+    try std.testing.expect(std.mem.indexOf(u8, body, "\"piece_cache_enabled\":1") != null);
+    try std.testing.expect(std.mem.indexOf(u8, body, "\"banned_IPs\":\"192.0.2.1\\n198.51.100.0/24\"") != null);
+}
 
 test "errorResponse formats error message" {
     const resp = errorResponse(std.testing.allocator, 404, error.TorrentNotFound);
