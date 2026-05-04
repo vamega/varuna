@@ -2769,11 +2769,6 @@ pub fn EventLoopOf(comptime IO: type) type {
             const policy = @import("peer_policy.zig");
             if (self.getTorrentContext(peer.torrent_id)) |tc| {
                 if (!tc.upload_only and !self.isDownloadThrottled(peer.torrent_id)) {
-                    // First try joining an existing DownloadingPiece (multi-source)
-                    if (policy.tryJoinExistingPiece(self, slot, peer)) {
-                        return; // joined existing download; don't add to idle queue
-                    }
-                    // Then try claiming a new piece
                     if (tc.piece_tracker) |pt| {
                         const peer_bf: ?*const Bitfield = if (peer.availability) |*bf| bf else null;
                         if (pt.claimPiece(peer_bf)) |piece_index| {
@@ -2784,6 +2779,13 @@ pub fn EventLoopOf(comptime IO: type) type {
                                 // startPieceDownload failed; fall through to add to idle queue
                             }
                         }
+                    }
+                    // If no fresh piece is claimable, join an in-flight piece
+                    // as a fallback. This preserves multi-source assembly for
+                    // scarce pieces without crowding every idle peer onto work
+                    // that could instead proceed independently.
+                    if (policy.tryJoinExistingPiece(self, slot, peer)) {
+                        return; // joined existing download; don't add to idle queue
                     }
                 }
             }

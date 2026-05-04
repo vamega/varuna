@@ -79,18 +79,15 @@ pub fn tryAssignPieces(self: anytype) void {
             continue;
         };
 
-        // Phase 2: try to join an existing DownloadingPiece before claiming a new one.
-        // This enables multi-source piece assembly -- multiple peers contribute
-        // blocks to the same piece simultaneously.
-        if (tryJoinExistingPiece(self, slot, peer)) {
-            self.unmarkIdle(slot);
-            continue;
-        }
-
         const peer_bf: ?*const Bitfield = if (peer.availability) |*bf| bf else null;
         const piece_index = pt.claimPiece(peer_bf) orelse {
-            // No piece available for this peer right now; keep it in the
-            // list so we retry next tick.
+            // No fresh piece is available for this peer. Fall back to joining
+            // an in-flight DownloadingPiece so scarce/last pieces still get
+            // multi-source assembly instead of serializing on one peer.
+            if (tryJoinExistingPiece(self, slot, peer)) {
+                self.unmarkIdle(slot);
+                continue;
+            }
             i += 1;
             continue;
         };
