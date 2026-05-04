@@ -19,23 +19,37 @@
         let
           pkgs = import nixpkgs { inherit system; };
           zig = zig-overlay.packages.${system}."0.15.2";
+          defaultPackages = [
+            zig
+            pkgs.sqlite
+            pkgs.c-ares
+            pkgs.boringssl
+            pkgs.liburing
+            pkgs.opentracker
+            pkgs.python3
+            pkgs.curl
+            pkgs.diffutils
+            pkgs.pkg-config
+            pkgs.git
+          ];
         in
         {
           default = pkgs.mkShell {
-            packages = [
-              zig
-              pkgs.sqlite
-              pkgs.c-ares
-              pkgs.boringssl
-              pkgs.liburing
-              pkgs.opentracker
-              pkgs.python3
-              pkgs.pkg-config
-              pkgs.git
-            ];
+            packages = defaultPackages;
 
             shellHook = ''
               echo "varuna devshell — zig $(zig version)"
+            '';
+          };
+
+          performance-tools = pkgs.mkShell {
+            packages = defaultPackages ++ [
+              pkgs.strace
+              pkgs.perf
+            ];
+
+            shellHook = ''
+              echo "varuna performance devshell — zig $(zig version)"
             '';
           };
         });

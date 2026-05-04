@@ -50,6 +50,8 @@ Required local setup:
 - SQLite dev package: `libsqlite3-dev` on Ubuntu/Debian
 - c-ares dev package (`libc-ares-dev`) when using `-Ddns=c_ares -Dcares=system`
 - BoringSSL package when using `-Dtls=system_boringssl`; otherwise initialize `vendor/boringssl`
+- Nix default dev shell (`nix develop`) includes the normal build/test harness tools: SQLite, c-ares, BoringSSL, liburing, opentracker, Python, curl, diffutils (`cmp`), pkg-config, and git
+- Nix performance dev shell (`nix develop .#performance-tools`) adds `strace` and Linux `perf` for profiling build steps
 - local Linux/io_uring docs for substantial kernel work: `man-db`, `manpages`, `manpages-dev`, `manpages-posix`, `manpages-posix-dev`, `liburing-dev`
 - git submodules initialized with `git submodule update --init`
 - `vendor/boringssl` and `vendor/c-ares` initialized for default bundled builds, or use the system-link build flags with matching system packages

@@ -16,6 +16,7 @@ These tools are external Linux packages, not Zig dependencies. The helper steps 
 - `pahole`
 
 On many distributions this means packages similar to `strace`, `linux-perf` or `perf`, and `bpftrace`.
+With Nix, use `nix develop .#performance-tools` for the `strace` and generic Linux `perf` tooling on top of the default Varuna dev shell.
 On Ubuntu and WSL, `/usr/bin/perf` may be a wrapper script that refuses to run unless an exact kernel-matched backend exists. The build helpers in `build.zig` detect and prefer a real backend binary from `/usr/lib/linux-tools.../perf` when one is installed.
 
 ## Goals

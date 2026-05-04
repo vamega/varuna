@@ -69,9 +69,12 @@ sudo apt install libsqlite3-dev liburing-dev
 ```
 
 The build links system SQLite by default. With Nix, enter the dev shell; it
-provides SQLite, c-ares, and BoringSSL packages for system-link builds. Outside
-Nix, pass package prefixes explicitly when they are not on the default linker
-path, for example `zig build --search-prefix /path/to/sqlite-prefix`.
+provides SQLite, c-ares, BoringSSL, opentracker, Python, curl, and diffutils
+for system-link builds and local automation harnesses. Use
+`nix develop .#performance-tools` when running the profiling helpers that need
+`strace` and `perf`. Outside Nix, pass package prefixes explicitly when they
+are not on the default linker path, for example
+`zig build --search-prefix /path/to/sqlite-prefix`.
 
 HTTPS support defaults to vendored BoringSSL (`-Dtls=boringssl`). For faster
 clean rebuilds in environments that provide BoringSSL, use
