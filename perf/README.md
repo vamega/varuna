@@ -65,7 +65,7 @@ The perf-mode `summary.tsv` columns are:
 run	backend	status	elapsed_seconds	transfer_seconds	payload_bytes	throughput_mib_s	work_dir	log
 ```
 
-Interpret `throughput_mib_s` as `payload_bytes / transfer_seconds`, where `transfer_seconds` is measured by `demo_swarm.sh` from downloader add until completed progress is observed.
+Interpret `throughput_mib_s` as `payload_bytes / transfer_seconds`, where `transfer_seconds` is measured by `varuna-automation swarm` from downloader add until completed progress is observed.
 Small payloads are dominated by startup and one-second polling granularity; use larger payloads and multiple `RUNS` for backend deltas that are close together.
 
 ## Real Torrent Perf

@@ -1388,6 +1388,76 @@ pub fn build(b: *std.Build) void {
     if (b.args) |args| perf_real_torrents_cmd.addArgs(args);
     perf_real_torrents_step.dependOn(&perf_real_torrents_cmd.step);
 
+    const tracker_step = b.step("tracker", "Run opentracker through varuna-automation");
+    const tracker_cmd = b.addRunArtifact(automation_exe);
+    tracker_cmd.addArg("tracker");
+    tracker_cmd.step.dependOn(b.getInstallStep());
+    if (b.args) |args| tracker_cmd.addArgs(args);
+    tracker_step.dependOn(&tracker_cmd.step);
+
+    const setup_worktree_step = b.step("setup-worktree", "Prepare a git worktree for Varuna development");
+    const setup_worktree_cmd = b.addRunArtifact(automation_exe);
+    setup_worktree_cmd.addArg("setup-worktree");
+    setup_worktree_cmd.step.dependOn(b.getInstallStep());
+    if (b.args) |args| setup_worktree_cmd.addArgs(args);
+    setup_worktree_step.dependOn(&setup_worktree_cmd.step);
+
+    const validate_strace_step = b.step("validate-strace", "Validate strace -c output against the daemon IO policy");
+    const validate_strace_cmd = b.addRunArtifact(automation_exe);
+    validate_strace_cmd.addArg("validate-strace");
+    validate_strace_cmd.step.dependOn(b.getInstallStep());
+    if (b.args) |args| validate_strace_cmd.addArgs(args);
+    validate_strace_step.dependOn(&validate_strace_cmd.step);
+
+    const large_transfer_step = b.step("test-large-transfer", "Run daemon transfer stress cases");
+    const large_transfer_cmd = b.addRunArtifact(automation_exe);
+    large_transfer_cmd.addArgs(&.{ "large-transfer", "--skip-build" });
+    large_transfer_cmd.step.dependOn(b.getInstallStep());
+    if (b.args) |args| large_transfer_cmd.addArgs(args);
+    large_transfer_step.dependOn(&large_transfer_cmd.step);
+
+    const daemon_swarm_step = b.step("test-daemon-swarm", "Run tools-seeder to daemon-downloader smoke test");
+    const daemon_swarm_cmd = b.addRunArtifact(automation_exe);
+    daemon_swarm_cmd.addArgs(&.{ "daemon-swarm", "--skip-build" });
+    daemon_swarm_cmd.step.dependOn(b.getInstallStep());
+    if (b.args) |args| daemon_swarm_cmd.addArgs(args);
+    daemon_swarm_step.dependOn(&daemon_swarm_cmd.step);
+
+    const daemon_seed_step = b.step("test-daemon-seed", "Verify daemon can serve after completing a download");
+    const daemon_seed_cmd = b.addRunArtifact(automation_exe);
+    daemon_seed_cmd.addArgs(&.{ "daemon-seed", "--skip-build" });
+    daemon_seed_cmd.step.dependOn(b.getInstallStep());
+    if (b.args) |args| daemon_seed_cmd.addArgs(args);
+    daemon_seed_step.dependOn(&daemon_seed_cmd.step);
+
+    const web_seed_e2e_step = b.step("test-web-seed-e2e", "Run BEP 19 web seed integration scenarios");
+    const web_seed_e2e_cmd = b.addRunArtifact(automation_exe);
+    web_seed_e2e_cmd.addArgs(&.{ "web-seed", "--skip-build" });
+    web_seed_e2e_cmd.step.dependOn(b.getInstallStep());
+    if (b.args) |args| web_seed_e2e_cmd.addArgs(args);
+    web_seed_e2e_step.dependOn(&web_seed_e2e_cmd.step);
+
+    const selective_download_step = b.step("test-selective-download", "Run selective file priority integration scenario");
+    const selective_download_cmd = b.addRunArtifact(automation_exe);
+    selective_download_cmd.addArgs(&.{ "selective-download", "--skip-build" });
+    selective_download_cmd.step.dependOn(b.getInstallStep());
+    if (b.args) |args| selective_download_cmd.addArgs(args);
+    selective_download_step.dependOn(&selective_download_cmd.step);
+
+    const e2e_downloads_step = b.step("test-e2e-downloads", "Run public-torrent daemon e2e checks");
+    const e2e_downloads_cmd = b.addRunArtifact(automation_exe);
+    e2e_downloads_cmd.addArgs(&.{ "e2e-downloads", "--skip-build" });
+    e2e_downloads_cmd.step.dependOn(b.getInstallStep());
+    if (b.args) |args| e2e_downloads_cmd.addArgs(args);
+    e2e_downloads_step.dependOn(&e2e_downloads_cmd.step);
+
+    const docker_conformance_step = b.step("test-docker-conformance", "Run Docker qBittorrent cross-client conformance tests");
+    const docker_conformance_cmd = b.addRunArtifact(automation_exe);
+    docker_conformance_cmd.addArgs(&.{ "docker-conformance", "--skip-build" });
+    docker_conformance_cmd.step.dependOn(b.getInstallStep());
+    if (b.args) |args| docker_conformance_cmd.addArgs(args);
+    docker_conformance_step.dependOn(&docker_conformance_cmd.step);
+
     // ── Benchmarks ────────────────────────────────────────
     const bench_exe = b.addExecutable(.{
         .name = "varuna-bench",

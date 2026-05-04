@@ -42,7 +42,7 @@ Use [STATUS.md](STATUS.md) as the current ledger for what is already implemented
 ```bash
 zig build test                    # all unit tests
 zig build test-swarm              # e2e: seeder → downloader via tracker (TCP + uTP)
-./scripts/test_web_seed.sh        # e2e: web seed download (3 scenarios, BEP 19)
+zig build test-web-seed-e2e       # e2e: web seed download (3 scenarios, BEP 19)
 ```
 
 The swarm harness creates a torrent with `varuna-tools create`, starts opentracker with the info hash whitelisted, runs a seeder and downloader daemon, and verifies the downloaded payload.
@@ -93,7 +93,7 @@ zig build                         # produces varuna, varuna-ctl, varuna-tools
 zig build test                    # all unit tests
 ```
 
-For worktrees, run `scripts/setup-worktree.sh <path>` instead of plain `git submodule update --init` — it initializes the build-dep submodules and symlinks `reference-codebases/` from the main checkout. See [AGENTS.md](AGENTS.md) for the full contributor workflow.
+For worktrees, run `zig build setup-worktree -- <path>` instead of plain `git submodule update --init` — it initializes the build-dep submodules and symlinks `reference-codebases/` from the main checkout. See [AGENTS.md](AGENTS.md) for the full contributor workflow.
 
 ## Working Principles
 - Prefer `io_uring` where it actually improves the design.

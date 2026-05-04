@@ -638,7 +638,7 @@ DHT `get_peers` and `announce_peer` use a 20-byte info-hash. For v2 torrents, us
 ### 2.14 Testing Strategy
 
 - **Unit tests:** v2 file tree parsing, Merkle tree construction and root computation, SHA-256 piece hashing, version detection for v1/v2/hybrid torrents.
-- **Test fixtures:** Create test `.torrent` files for v2-only and hybrid formats. Store in `testdata/`. Use `scripts/create_torrent.mjs` as a reference for generating them (may need a v2-capable torrent creator -- libtorrent's Python bindings or mktorrent v2).
+- **Test fixtures:** Create test `.torrent` files for v2-only and hybrid formats. Store in `testdata/`. Use `varuna-tools create` for Varuna-supported fixture generation, and use a v2-capable external creator such as libtorrent's Python bindings or mktorrent v2 when exercising unsupported BEP 52 fixture shapes.
 - **Fuzz tests:** v2 file tree parsing (untrusted input from `.torrent` files).
 - **Integration test:** Full download of a hybrid torrent, verifying both v1 and v2 hashes match.
 - **Benchmark:** SHA-256 Merkle tree construction throughput for large files (compare with v1 flat SHA-1 hashing).

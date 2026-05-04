@@ -17,7 +17,7 @@ import json
 import os
 import sys
 import threading
-from http.server import HTTPServer, BaseHTTPRequestHandler
+from http.server import ThreadingHTTPServer, BaseHTTPRequestHandler
 
 
 class RangeHTTPHandler(BaseHTTPRequestHandler):
@@ -152,8 +152,8 @@ def main():
     args = parser.parse_args()
 
     RangeHTTPHandler.serve_dir = os.path.abspath(args.dir)
-    HTTPServer.allow_reuse_address = True
-    server = HTTPServer((args.bind, args.port), RangeHTTPHandler)
+    ThreadingHTTPServer.allow_reuse_address = True
+    server = ThreadingHTTPServer((args.bind, args.port), RangeHTTPHandler)
     print(f"web seed server: http://{args.bind}:{args.port}/ serving {args.dir}", flush=True)
     try:
         server.serve_forever()

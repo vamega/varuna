@@ -379,9 +379,9 @@ Decision:
 - Add a minimal seed mode that only runs when all torrent data already verifies on disk.
 - Keep the seeding contract narrow: one listening socket, one inbound peer, sequential block serving, and exit after the downloader disconnects.
 - Add `varuna inspect` so scripts can read the torrent info hash without duplicating metainfo parsing logic.
-- Use the Ubuntu-packaged `opentracker` binary as the current external tracker helper, wrapped by `scripts/tracker.sh`.
+- Use the Ubuntu-packaged `opentracker` binary as the current external tracker helper, wrapped by `zig build tracker --`.
 - Whitelist torrent info hashes explicitly when starting that tracker, because the packaged `opentracker` build rejects unlisted torrents.
-- Keep `scripts/demo_swarm.sh` as the reproducible local proof path for one seed and one downloader.
+- Keep `zig build test-swarm` / `varuna-automation swarm` as the reproducible local proof path for one seed and one downloader.
 
 Reasoning:
 - This gets the project to a real swarm milestone quickly while keeping peer-state and lifetime rules simple.
@@ -392,7 +392,7 @@ Reasoning:
 Current behavior:
 - `varuna seed` listens on one configured TCP port and announces with `left=0`.
 - `varuna download` and `varuna seed` can run concurrently against the local tracker helper.
-- The current external tracker demo has been verified with `scripts/demo_swarm.sh`.
+- The current external tracker demo has been verified with `zig build test-swarm`.
 
 ### 2026-03-24: Performance Inspection Workflow
 

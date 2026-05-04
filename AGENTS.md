@@ -19,7 +19,7 @@ Keep implementation under `src/`. The current major subsystems are:
 - `src/perf/` - benchmarks and profiling helpers exposed through `build.zig`
 - `src/automation/` - Zig-based repository automation and harnesses that replace ad hoc shell scripting; intentionally isolated from daemon/core modules
 
-Keep reusable fixtures in `testdata/`. Keep profiling helpers in `perf/` or `scripts/`.
+Keep reusable fixtures in `testdata/`. Keep profiling helpers in `perf/` or `src/automation/`.
 
 Read these first when orienting:
 - [STYLE.md](STYLE.md) - coding style, design goals, IO abstraction model, simulation-first testing philosophy
@@ -60,12 +60,12 @@ Required local setup:
 `git worktree add` does NOT auto-populate submodules — they start empty in the new tree. After creating a worktree, run:
 
 ```
-scripts/setup-worktree.sh <worktree-path>
+zig build setup-worktree -- <worktree-path>
 ```
 
-That shallow-initializes (`--depth 1`) the build-dep submodules `vendor/boringssl` + `vendor/c-ares`, symlinks `reference-codebases/` from the main checkout (read-only — never modify reference codebases inside a worktree, the symlink reaches main's submodule pointers), and symlinks `.zig-cache/` to the main checkout so worker builds share the compiler cache. `zig-out/` stays per-worktree so branch builds do not overwrite each other's binaries. The script also marks the tracked `reference-codebases/*` gitlinks as `skip-worktree` in the worker checkout and adds local excludes for setup symlinks, so those artifacts do not appear in `git status`.
+That shallow-initializes (`--depth 1`) the build-dep submodules `vendor/boringssl` + `vendor/c-ares`, symlinks `reference-codebases/` from the main checkout (read-only — never modify reference codebases inside a worktree, the symlink reaches main's submodule pointers), and symlinks `.zig-cache/` to the main checkout so worker builds share the compiler cache. `zig-out/` stays per-worktree so branch builds do not overwrite each other's binaries. The automation command also marks the tracked `reference-codebases/*` gitlinks as `skip-worktree` in the worker checkout and adds local excludes for setup symlinks, so those artifacts do not appear in `git status`.
 
-Note: `reference-codebases/*` submodules are *registered* in `.gitmodules` but **not** initialized by `setup-worktree.sh` (the script only creates the symlink). In a fresh main checkout they are empty until you run `git submodule update --init reference-codebases/<name>` explicitly. In worktrees, the symlink resolves to the main checkout's reference-codebases tree, so they appear populated only if main has initialized them.
+Note: `reference-codebases/*` submodules are *registered* in `.gitmodules` but **not** initialized by `zig build setup-worktree` (the command only creates the symlink). In a fresh main checkout they are empty until you run `git submodule update --init reference-codebases/<name>` explicitly. In worktrees, the symlink resolves to the main checkout's reference-codebases tree, so they appear populated only if main has initialized them.
 
 Reference repos under `reference-codebases/`:
 - `libtorrent` - arvidn/libtorrent
@@ -86,6 +86,8 @@ Core commands:
 - `zig build test-swarm`
 - `zig build perf-swarm-backends`
 - `zig build perf-real-torrents -- ...`
+- `zig build test-web-seed-e2e`
+- `zig build validate-strace -- <strace-summary-file>`
 - `zig build trace-syscalls -- ...`
 - `zig build perf-stat -- ...`
 - `zig build perf-record -- ...`
@@ -99,8 +101,8 @@ Rules:
 - when touching existing shell-driven workflows, prefer migrating them to `src/automation/` and calling them from `build.zig`
 - do not rely on direct-file `zig test src/...`; this repo is wired through `build.zig`
 - when a subsystem becomes a repeated hotspot, add a focused `zig build <step>` target for it
-- for tracker validation, prefer `zig build test-swarm` / `zig build perf-swarm-backends`; legacy scripts in `scripts/` should be treated as compatibility shims or migration candidates
-- the packaged Ubuntu `opentracker` runs in whitelist mode; pass `--whitelist-hash <info-hash>` to `scripts/tracker.sh`
+- for tracker validation, prefer `zig build test-swarm` / `zig build perf-swarm-backends`
+- the packaged Ubuntu `opentracker` runs in whitelist mode; pass `--whitelist-hash <info-hash>` to `zig build tracker --`
 
 ## io_uring Policy
 This is a current operating rule for the daemon, not a design aspiration.

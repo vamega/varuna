@@ -171,6 +171,7 @@ pub fn spawnLogged(
         .stdout_thread = stdout_thread,
         .stderr_thread = stderr_thread,
         .alive = true,
+        .joined = false,
     };
 }
 
@@ -196,14 +197,29 @@ pub const ManagedProcess = struct {
     stdout_thread: std.Thread,
     stderr_thread: std.Thread,
     alive: bool,
+    joined: bool,
 
     pub fn stop(self: *ManagedProcess) void {
         if (self.alive) {
             _ = self.child.kill() catch {};
             self.alive = false;
         }
-        self.stdout_thread.join();
-        self.stderr_thread.join();
+        if (!self.joined) {
+            self.stdout_thread.join();
+            self.stderr_thread.join();
+            self.joined = true;
+        }
+    }
+
+    pub fn wait(self: *ManagedProcess) !std.process.Child.Term {
+        const term = try self.child.wait();
+        self.alive = false;
+        if (!self.joined) {
+            self.stdout_thread.join();
+            self.stderr_thread.join();
+            self.joined = true;
+        }
+        return term;
     }
 };
 

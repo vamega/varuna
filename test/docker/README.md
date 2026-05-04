@@ -19,7 +19,7 @@ Both scenarios verify data integrity via SHA-256 comparison after transfer.
 From the project root:
 
 ```bash
-./test/docker/run_conformance.sh
+zig build test-docker-conformance
 ```
 
 The script will:
@@ -43,7 +43,7 @@ The script will:
 Example:
 
 ```bash
-TIMEOUT=300 ./test/docker/run_conformance.sh
+zig build test-docker-conformance -- --timeout 300
 ```
 
 ## Manual Operation
@@ -83,7 +83,6 @@ If tests fail, the runner dumps the last 50 lines of each container's log.
 For deeper investigation:
 
 ```bash
-# Keep containers running after failure (comment out trap in run_conformance.sh)
 docker compose -f test/docker/docker-compose.yml logs -f varuna-download
 docker compose -f test/docker/docker-compose.yml exec varuna-download varuna-ctl list
 ```
