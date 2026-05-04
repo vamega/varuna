@@ -2,6 +2,7 @@ const std = @import("std");
 const TorrentStats = @import("../daemon/torrent_session.zig").Stats;
 const SessionManager = @import("../daemon/session_manager.zig").SessionManager;
 const compat = @import("compat.zig");
+const json_body = @import("json_body.zig");
 const json_esc = @import("json.zig");
 
 /// Delta sync state for the /api/v2/sync/maindata endpoint.
@@ -148,17 +149,18 @@ pub const SyncState = struct {
             try json.appendSlice(allocator, tag_json);
         }
 
-        // Server state (includes all fields qui's ServerState interface expects)
-        try json.print(allocator, ",\"server_state\":{{\"connection_status\":\"connected\",\"dht_nodes\":{},\"dl_info_speed\":{},\"up_info_speed\":{},\"dl_info_data\":{},\"up_info_data\":{},\"dl_rate_limit\":{},\"up_rate_limit\":{},\"alltime_dl\":{},\"alltime_ul\":{},\"queueing\":false,\"use_alt_speed_limits\":false,\"refresh_interval\":1500,\"free_space_on_disk\":0,\"total_peer_connections\":0}}", .{
-            dht_nodes,
-            total_dl_speed,
-            total_ul_speed,
-            total_dl_data,
-            total_ul_data,
-            dl_limit,
-            ul_limit,
-            total_dl_data,
-            total_ul_data,
+        // Server state includes all fields qui's ServerState interface expects.
+        try json.appendSlice(allocator, ",\"server_state\":");
+        try json_body.append(allocator, &json, SyncServerStateResponse{
+            .dht_nodes = dht_nodes,
+            .dl_info_speed = total_dl_speed,
+            .up_info_speed = total_ul_speed,
+            .dl_info_data = total_dl_data,
+            .up_info_data = total_ul_data,
+            .dl_rate_limit = dl_limit,
+            .up_rate_limit = ul_limit,
+            .alltime_dl = total_dl_data,
+            .alltime_ul = total_ul_data,
         });
 
         try json.append(allocator, '}');
@@ -198,6 +200,24 @@ pub const SyncState = struct {
             .torrent_hashes = hashes,
         };
     }
+};
+
+const SyncServerStateResponse = struct {
+    connection_status: []const u8 = "connected",
+    dht_nodes: usize,
+    dl_info_speed: u64,
+    up_info_speed: u64,
+    dl_info_data: u64,
+    up_info_data: u64,
+    dl_rate_limit: u64,
+    up_rate_limit: u64,
+    alltime_dl: u64,
+    alltime_ul: u64,
+    queueing: bool = false,
+    use_alt_speed_limits: bool = false,
+    refresh_interval: u16 = 1500,
+    free_space_on_disk: u8 = 0,
+    total_peer_connections: u8 = 0,
 };
 
 /// Delta sync state for /api/v2/sync/torrentPeers.

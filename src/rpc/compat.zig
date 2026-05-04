@@ -5,7 +5,7 @@
 const std = @import("std");
 const TorrentState = @import("../daemon/torrent_session.zig").State;
 const TorrentStats = @import("../daemon/torrent_session.zig").Stats;
-const json_esc = @import("json.zig");
+const json_body = @import("json_body.zig");
 
 /// Map Varuna's internal torrent state to qBittorrent-compatible state strings.
 /// qui and Flood read these values to determine torrent status, icon, and label.
@@ -81,13 +81,94 @@ pub fn formatInfoHashV2(v2: ?[32]u8) ?[64]u8 {
     return null;
 }
 
+fn writeField(writer: anytype, key: []const u8, value: anytype) !void {
+    try writer.objectField(key);
+    try writer.write(value);
+}
+
+const TorrentJsonBody = struct {
+    stat: TorrentStats,
+    include_partial_seed: bool,
+    qbt_state: []const u8,
+    content_path: []const u8,
+    magnet_uri: []const u8,
+    infohash_v2: []const u8,
+    now: i64,
+    time_active: i64,
+    amount_left: u64,
+    completion_on: i64,
+
+    pub fn jsonStringify(self: TorrentJsonBody, writer: anytype) !void {
+        const stat = self.stat;
+
+        try writer.beginObject();
+        try writeField(writer, "name", stat.name);
+        try writeField(writer, "hash", stat.info_hash_hex[0..]);
+        try writeField(writer, "infohash_v1", stat.info_hash_hex[0..]);
+        try writeField(writer, "infohash_v2", self.infohash_v2);
+        try writeField(writer, "state", self.qbt_state);
+        try writeField(writer, "size", stat.total_size);
+        try writeField(writer, "total_size", stat.total_size);
+        try writeField(writer, "progress", json_body.Fixed4{ .value = stat.progress });
+        try writeField(writer, "dlspeed", stat.download_speed);
+        try writeField(writer, "upspeed", stat.upload_speed);
+        try writeField(writer, "num_seeds", stat.scrape_complete);
+        try writeField(writer, "num_leechs", stat.peers_connected);
+        try writeField(writer, "num_complete", stat.scrape_complete);
+        try writeField(writer, "num_incomplete", stat.scrape_incomplete);
+        try writeField(writer, "added_on", stat.added_on);
+        try writeField(writer, "completion_on", self.completion_on);
+        try writeField(writer, "save_path", stat.save_path);
+        try writeField(writer, "content_path", self.content_path);
+        try writeField(writer, "download_path", "");
+        try writeField(writer, "pieces_have", stat.pieces_have);
+        try writeField(writer, "pieces_num", stat.pieces_total);
+        try writeField(writer, "dl_limit", stat.dl_limit);
+        try writeField(writer, "up_limit", stat.ul_limit);
+        try writeField(writer, "eta", stat.eta);
+        try writeField(writer, "ratio", json_body.Fixed4{ .value = stat.ratio });
+        try writeField(writer, "seq_dl", stat.sequential_download);
+        try writeField(writer, "private", stat.is_private);
+        try writeField(writer, "f_l_piece_prio", false);
+        try writeField(writer, "force_start", false);
+        try writeField(writer, "super_seeding", stat.super_seeding);
+        if (self.include_partial_seed) {
+            try writeField(writer, "partial_seed", stat.partial_seed);
+        }
+        try writeField(writer, "auto_tmm", false);
+        try writeField(writer, "category", stat.category);
+        try writeField(writer, "tags", stat.tags);
+        try writeField(writer, "tracker", stat.tracker);
+        try writeField(writer, "trackers_count", stat.trackers_count);
+        try writeField(writer, "amount_left", self.amount_left);
+        try writeField(writer, "completed", stat.bytes_downloaded);
+        try writeField(writer, "downloaded", stat.bytes_downloaded);
+        try writeField(writer, "downloaded_session", stat.bytes_downloaded);
+        try writeField(writer, "uploaded", stat.bytes_uploaded);
+        try writeField(writer, "uploaded_session", stat.bytes_uploaded);
+        try writeField(writer, "time_active", self.time_active);
+        try writeField(writer, "seeding_time", stat.seeding_time);
+        try writeField(writer, "last_activity", self.now);
+        try writeField(writer, "seen_complete", -1);
+        try writeField(writer, "priority", stat.queue_position);
+        try writeField(writer, "availability", -1);
+        try writeField(writer, "max_ratio", -1);
+        try writeField(writer, "max_seeding_time", -1);
+        try writeField(writer, "ratio_limit", json_body.Fixed4{ .value = stat.ratio_limit });
+        try writeField(writer, "seeding_time_limit", stat.seeding_time_limit);
+        try writeField(writer, "popularity", 0);
+        try writeField(writer, "magnet_uri", self.magnet_uri);
+        try writeField(writer, "reannounce", 0);
+        try writer.endObject();
+    }
+};
+
 /// Serialize a torrent stats object as a JSON object. Used by both
 /// the /torrents/info endpoint (handlers.zig) and /sync/maindata (sync.zig).
 ///
 /// When `include_partial_seed` is true, the "partial_seed" field is included
 /// in the output (required by /torrents/info but not by /sync/maindata).
 pub fn serializeTorrentJson(allocator: std.mem.Allocator, json: *std.ArrayList(u8), stat: TorrentStats, include_partial_seed: bool) !void {
-    const esc = json_esc.jsonSafe;
     const qbt_state = torrentStateString(stat.state, stat.progress);
     const now = std.time.timestamp();
     const time_active: i64 = now - stat.added_on;
@@ -104,92 +185,18 @@ pub fn serializeTorrentJson(allocator: std.mem.Allocator, json: *std.ArrayList(u
     const v2_hex = formatInfoHashV2(stat.info_hash_v2);
     const v2_str: []const u8 = if (v2_hex) |*hex| hex else "";
 
-    // Split into two print calls to stay under the 32-argument limit.
-    try json.print(
-        allocator,
-        "{{\"name\":\"{f}\",\"hash\":\"{s}\",\"infohash_v1\":\"{s}\",\"infohash_v2\":\"{s}\",\"state\":\"{s}\",\"size\":{},\"total_size\":{},\"progress\":{d:.4},\"dlspeed\":{},\"upspeed\":{},\"num_seeds\":{},\"num_leechs\":{},\"num_complete\":{},\"num_incomplete\":{},\"added_on\":{},\"completion_on\":{},\"save_path\":\"{f}\",\"content_path\":\"{f}\",\"download_path\":\"\",\"pieces_have\":{},\"pieces_num\":{},\"dl_limit\":{},\"up_limit\":{},\"eta\":{},\"ratio\":{d:.4},\"seq_dl\":{s},\"private\":{s}",
-        .{
-            esc(stat.name),
-            stat.info_hash_hex,
-            stat.info_hash_hex,
-            v2_str,
-            qbt_state,
-            stat.total_size,
-            stat.total_size,
-            stat.progress,
-            stat.download_speed,
-            stat.upload_speed,
-            stat.scrape_complete,
-            stat.peers_connected,
-            stat.scrape_complete,
-            stat.scrape_incomplete,
-            stat.added_on,
-            completion_on,
-            esc(stat.save_path),
-            esc(content_path),
-            stat.pieces_have,
-            stat.pieces_total,
-            stat.dl_limit,
-            stat.ul_limit,
-            stat.eta,
-            stat.ratio,
-            @as([]const u8, if (stat.sequential_download) "true" else "false"),
-            @as([]const u8, if (stat.is_private) "true" else "false"),
-        },
-    );
-
-    if (include_partial_seed) {
-        try json.print(
-            allocator,
-            ",\"f_l_piece_prio\":false,\"force_start\":false,\"super_seeding\":{s},\"partial_seed\":{s},\"auto_tmm\":false,\"category\":\"{f}\",\"tags\":\"{f}\",\"tracker\":\"{f}\",\"trackers_count\":{},\"amount_left\":{},\"completed\":{},\"downloaded\":{},\"downloaded_session\":{},\"uploaded\":{},\"uploaded_session\":{},\"time_active\":{},\"seeding_time\":{},\"last_activity\":{},\"seen_complete\":-1,\"priority\":{},\"availability\":-1,\"max_ratio\":-1,\"max_seeding_time\":-1,\"ratio_limit\":{d:.4},\"seeding_time_limit\":{},\"popularity\":0,\"magnet_uri\":\"{f}\",\"reannounce\":0}}",
-            .{
-                @as([]const u8, if (stat.super_seeding) "true" else "false"),
-                @as([]const u8, if (stat.partial_seed) "true" else "false"),
-                esc(stat.category),
-                esc(stat.tags),
-                esc(stat.tracker),
-                stat.trackers_count,
-                amount_left,
-                stat.bytes_downloaded,
-                stat.bytes_downloaded,
-                stat.bytes_downloaded,
-                stat.bytes_uploaded,
-                stat.bytes_uploaded,
-                time_active,
-                stat.seeding_time,
-                now,
-                stat.queue_position,
-                stat.ratio_limit,
-                stat.seeding_time_limit,
-                esc(magnet_uri),
-            },
-        );
-    } else {
-        try json.print(
-            allocator,
-            ",\"f_l_piece_prio\":false,\"force_start\":false,\"super_seeding\":{s},\"auto_tmm\":false,\"category\":\"{f}\",\"tags\":\"{f}\",\"tracker\":\"{f}\",\"trackers_count\":{},\"amount_left\":{},\"completed\":{},\"downloaded\":{},\"downloaded_session\":{},\"uploaded\":{},\"uploaded_session\":{},\"time_active\":{},\"seeding_time\":{},\"last_activity\":{},\"seen_complete\":-1,\"priority\":{},\"availability\":-1,\"max_ratio\":-1,\"max_seeding_time\":-1,\"ratio_limit\":{d:.4},\"seeding_time_limit\":{},\"popularity\":0,\"magnet_uri\":\"{f}\",\"reannounce\":0}}",
-            .{
-                @as([]const u8, if (stat.super_seeding) "true" else "false"),
-                esc(stat.category),
-                esc(stat.tags),
-                esc(stat.tracker),
-                stat.trackers_count,
-                amount_left,
-                stat.bytes_downloaded,
-                stat.bytes_downloaded,
-                stat.bytes_downloaded,
-                stat.bytes_uploaded,
-                stat.bytes_uploaded,
-                time_active,
-                stat.seeding_time,
-                now,
-                stat.queue_position,
-                stat.ratio_limit,
-                stat.seeding_time_limit,
-                esc(magnet_uri),
-            },
-        );
-    }
+    try json_body.append(allocator, json, TorrentJsonBody{
+        .stat = stat,
+        .include_partial_seed = include_partial_seed,
+        .qbt_state = qbt_state,
+        .content_path = content_path,
+        .magnet_uri = magnet_uri,
+        .infohash_v2 = v2_str,
+        .now = now,
+        .time_active = time_active,
+        .amount_left = amount_left,
+        .completion_on = completion_on,
+    });
 }
 
 // ── Tests ─────────────────────────────────────────────────
