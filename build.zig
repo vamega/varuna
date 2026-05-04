@@ -218,6 +218,22 @@ pub fn build(b: *std.Build) void {
     });
     if (build_companion_tools) b.installArtifact(tools_exe);
 
+    // ── varuna-automation (Zig replacement for repo shell scripts) ──
+    //
+    // This binary is intentionally isolated from the varuna module and the
+    // daemon IO abstraction. It is repository automation code: process
+    // orchestration, fixture generation, local swarm runs, and real-torrent
+    // perf harnesses. Blocking stdlib I/O is acceptable here.
+    const automation_exe = b.addExecutable(.{
+        .name = "varuna-automation",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/automation/main.zig"),
+            .target = target,
+            .optimize = optimize,
+        }),
+    });
+    b.installArtifact(automation_exe);
+
     // ── Run targets ───────────────────────────────────────
     // The `run` step is only meaningful when the daemon is built.
     if (build_daemon) {
@@ -1332,28 +1348,33 @@ pub fn build(b: *std.Build) void {
     soak_step.dependOn(&b.addRunArtifact(soak_exe).step);
 
     // ── Swarm integration test ─────────────────────────────
-    // Runs the demo_swarm.sh script which starts a tracker, seeder, and
-    // downloader, transfers a file, and verifies data integrity.
+    // Starts a tracker, seeder, and downloader, transfers a file, and verifies
+    // data integrity through the Zig automation harness.
     const swarm_step = b.step("test-swarm", "Run end-to-end swarm transfer test (requires opentracker)");
-    const swarm_cmd = b.addSystemCommand(&.{"./scripts/demo_swarm.sh"});
+    const swarm_cmd = b.addRunArtifact(automation_exe);
+    swarm_cmd.addArg("swarm");
+    swarm_cmd.addArg("--skip-build");
     swarm_cmd.step.dependOn(b.getInstallStep());
     swarm_step.dependOn(&swarm_cmd.step);
 
     const swarm_backends_step = b.step("test-swarm-backends", "Run end-to-end swarm transfer test across Linux IO backends");
-    const swarm_backends_cmd = b.addSystemCommand(&.{ "env", "SKIP_BUILD=1", "bash", "./scripts/backend_swarm_matrix.sh" });
+    const swarm_backends_cmd = b.addRunArtifact(automation_exe);
+    swarm_backends_cmd.addArgs(&.{ "backend-swarm", "--mode", "test", "--zig-exe", b.graph.zig_exe });
     swarm_backends_cmd.step.dependOn(b.getInstallStep());
     swarm_backends_step.dependOn(&swarm_backends_cmd.step);
 
     const perf_swarm_backends_step = b.step("perf-swarm-backends", "Measure live swarm transfer throughput across Linux IO backends");
-    const perf_swarm_backends_cmd = b.addSystemCommand(&.{
-        "env",
-        "SKIP_BUILD=1",
-        "SWARM_MATRIX_MODE=perf",
-        "bash",
-        "./scripts/backend_swarm_matrix.sh",
-    });
+    const perf_swarm_backends_cmd = b.addRunArtifact(automation_exe);
+    perf_swarm_backends_cmd.addArgs(&.{ "backend-swarm", "--mode", "perf", "--zig-exe", b.graph.zig_exe });
     perf_swarm_backends_cmd.step.dependOn(b.getInstallStep());
     perf_swarm_backends_step.dependOn(&perf_swarm_backends_cmd.step);
+
+    const perf_real_torrents_step = b.step("perf-real-torrents", "Measure real public torrent downloads through the Zig automation harness");
+    const perf_real_torrents_cmd = b.addRunArtifact(automation_exe);
+    perf_real_torrents_cmd.addArgs(&.{ "real-torrents", "--skip-build", "--zig-exe", b.graph.zig_exe });
+    perf_real_torrents_cmd.step.dependOn(b.getInstallStep());
+    if (b.args) |args| perf_real_torrents_cmd.addArgs(args);
+    perf_real_torrents_step.dependOn(&perf_real_torrents_cmd.step);
 
     // ── Benchmarks ────────────────────────────────────────
     const bench_exe = b.addExecutable(.{

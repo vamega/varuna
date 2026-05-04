@@ -17,6 +17,7 @@ Keep implementation under `src/`. The current major subsystems are:
 - `src/tools/` - `varuna-tools` (torrent create / inspect)
 - `src/bench/` - CPU microbenchmarks (parser, bencode, SHA-1, metainfo) wired through `zig build bench`
 - `src/perf/` - benchmarks and profiling helpers exposed through `build.zig`
+- `src/automation/` - Zig-based repository automation and harnesses that replace ad hoc shell scripting; intentionally isolated from daemon/core modules
 
 Keep reusable fixtures in `testdata/`. Keep profiling helpers in `perf/` or `scripts/`.
 
@@ -79,19 +80,23 @@ Core commands:
 - `zig build test`
 - `zig build test-torrent-session`
 - `zig build bench`
+- `zig build test-swarm`
+- `zig build perf-swarm-backends`
+- `zig build perf-real-torrents -- ...`
 - `zig build trace-syscalls -- ...`
 - `zig build perf-stat -- ...`
 - `zig build perf-record -- ...`
 - `zig fmt .`
-- `./scripts/demo_swarm.sh`
 
 Run `zig build --help` for the full list — there are 40+ focused test/sim/buggify/parity targets beyond the ones above (e.g. `test-sim-*`, `test-api`, `test-recheck`, `test-event-loop`, `test-bind-device`, `test-swarm`, `soak-test`).
 
 Rules:
 - add practical new commands to `build.zig` instead of one-off shell scripts
+- avoid adding new shell scripts for repeatable repo automation; add Zig code under `src/automation/` or a focused tool binary instead
+- when touching existing shell-driven workflows, prefer migrating them to `src/automation/` and calling them from `build.zig`
 - do not rely on direct-file `zig test src/...`; this repo is wired through `build.zig`
 - when a subsystem becomes a repeated hotspot, add a focused `zig build <step>` target for it
-- for tracker validation, prefer `scripts/tracker.sh` plus `varuna inspect` or `scripts/demo_swarm.sh`
+- for tracker validation, prefer `zig build test-swarm` / `zig build perf-swarm-backends`; legacy scripts in `scripts/` should be treated as compatibility shims or migration candidates
 - the packaged Ubuntu `opentracker` runs in whitelist mode; pass `--whitelist-hash <info-hash>` to `scripts/tracker.sh`
 
 ## io_uring Policy

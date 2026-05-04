@@ -37,12 +37,14 @@ These commands build `varuna` first and then run it under the selected tool. Pas
 - `zig build perf-workload -- request_batch --iterations=100000`
   Runs the synthetic workload harness (`zig-out/bin/varuna-perf`) for targeted allocation and cache baselines.
 - `zig build perf-swarm-backends`
-  Runs the live tracker/seeder/downloader swarm matrix in perf mode and writes a throughput summary under `perf/output/backend-swarm-perf-*/summary.tsv`.
+  Runs the live tracker/seeder/downloader swarm matrix in perf mode through `zig-out/bin/varuna-automation` and writes a throughput summary under `perf/output/backend-swarm-perf-*/summary.tsv`.
+- `zig build perf-real-torrents -- --duration 600`
+  Runs the real public torrent performance harness through `zig-out/bin/varuna-automation`, using Proxmox, Ubuntu 26, and Deepin by default, and writes samples/summaries under `perf/output/real-torrents-*/`.
 
 ## Live Swarm Backend Perf
 
 Use `perf-swarm-backends` when comparing the production Linux daemon backends through the real swarm path instead of synthetic CPU-only workloads.
-The harness reuses `scripts/backend_swarm_matrix.sh` and `scripts/demo_swarm.sh`, so it requires `opentracker` and starts one tracker, seeder daemon, and downloader daemon per backend run.
+The harness uses `src/automation/main.zig`, so it requires `opentracker` on `PATH` and starts one tracker, seeder daemon, and downloader daemon per backend run.
 
 Default run:
 
@@ -65,6 +67,25 @@ run	backend	status	elapsed_seconds	transfer_seconds	payload_bytes	throughput_mib
 
 Interpret `throughput_mib_s` as `payload_bytes / transfer_seconds`, where `transfer_seconds` is measured by `demo_swarm.sh` from downloader add until completed progress is observed.
 Small payloads are dominated by startup and one-second polling granularity; use larger payloads and multiple `RUNS` for backend deltas that are close together.
+
+## Real Torrent Perf
+
+Use `perf-real-torrents` for public-swarm checks like the Ubuntu/Proxmox/Deepin performance investigation. The harness downloads `.torrent` files with `curl`, starts one Varuna daemon with DHT/PEX enabled, adds all requested torrents, samples `/api/v2/torrents/info`, and writes `samples.tsv` plus `summary.tsv`.
+
+Default run:
+
+```bash
+zig build -Doptimize=ReleaseFast perf-real-torrents -- --duration 600
+```
+
+Useful overrides:
+
+```bash
+zig build -Doptimize=ReleaseFast perf-real-torrents -- --transport utp_only --duration 600
+zig build -Doptimize=ReleaseFast perf-real-torrents -- --out-dir perf/output/manual-real --torrent ubuntu=https://distrowatch.com/dwres/torrents/ubuntu-26.04-desktop-amd64.iso.torrent
+```
+
+The current harness measures Varuna. qBittorrent control automation is still a follow-up; keep same-window qBittorrent comparisons in progress reports until that client can be configured repeatably from the Zig harness.
 
 ### Post-Stall Live Swarm Snapshot (2026-05-02)
 
