@@ -4,10 +4,23 @@ const varuna = @import("varuna");
 const config_mod = varuna.config;
 const TransportDisposition = config_mod.TransportDisposition;
 const EventLoop = varuna.io.event_loop.EventLoop;
+const event_loop_mod = varuna.io.event_loop;
 const Transport = varuna.io.event_loop.Transport;
+const Clock = varuna.io.Clock;
+const SimIO = varuna.io.sim_io.SimIO;
+const UtpManager = varuna.net.utp_manager.UtpManager;
 const handlers_mod = varuna.rpc.handlers;
 const server_mod = varuna.rpc.server;
 const SessionManager = varuna.daemon.session_manager.SessionManager;
+const utp_handler = varuna.io.utp_handler;
+
+fn activePeerCountByTransport(el: anytype, transport: Transport) u16 {
+    var count: u16 = 0;
+    for (el.peers) |peer| {
+        if (peer.state != .free and peer.transport == transport) count += 1;
+    }
+    return count;
+}
 
 // ── Test 1: TCP-only mode rejects outbound uTP ───────────────
 //
@@ -159,6 +172,182 @@ test "utp_only auto transport does not fall back to tcp when utp setup is unavai
 
     try std.testing.expectError(error.NoUtpManager, el.addPeerAutoTransport(addr, tid));
     try std.testing.expectEqual(@as(u32, 0), el.peer_count);
+}
+
+test "tcp_and_utp auto transport starts with optimistic utp" {
+    const EL = event_loop_mod.EventLoopOf(SimIO);
+    const sim_io = try SimIO.init(std.testing.allocator, .{ .seed = 0x7470 });
+    var el = try EL.initBareWithIO(std.testing.allocator, sim_io, 0);
+    defer el.deinit();
+
+    const fake_udp_fd = posix.socket(
+        posix.AF.INET,
+        posix.SOCK.DGRAM | posix.SOCK.CLOEXEC | posix.SOCK.NONBLOCK,
+        posix.IPPROTO.UDP,
+    ) catch |err| {
+        if (err == error.SystemResources) return error.SkipZigTest;
+        return err;
+    };
+    el.udp_fd = fake_udp_fd;
+    const mgr = try std.testing.allocator.create(UtpManager);
+    mgr.* = UtpManager.init(std.testing.allocator);
+    el.utp_manager = mgr;
+    el.clock = Clock.simAtMs(1000);
+    el.transport_disposition = TransportDisposition.tcp_and_utp;
+
+    const empty_fds = [_]posix.fd_t{};
+    const tid = try el.addTorrentContext(.{
+        .shared_fds = empty_fds[0..],
+        .info_hash = [_]u8{0x55} ** 20,
+        .peer_id = "-VR0001-test00000002".*,
+    });
+    const addr = try std.net.Address.parseIp4("127.0.0.1", 6882);
+
+    const slot = try el.addPeerAutoTransport(addr, tid);
+    try std.testing.expectEqual(Transport.utp, el.peers[slot].transport);
+    try std.testing.expectEqual(@as(u16, 1), activePeerCountByTransport(&el, .utp));
+    try std.testing.expectEqual(@as(u16, 0), activePeerCountByTransport(&el, .tcp));
+}
+
+test "silent utp connect falls back to tcp after connect timeout" {
+    const EL = event_loop_mod.EventLoopOf(SimIO);
+    const sim_io = try SimIO.init(std.testing.allocator, .{ .seed = 0x7471 });
+    var el = try EL.initBareWithIO(std.testing.allocator, sim_io, 0);
+    defer el.deinit();
+
+    const fake_udp_fd = posix.socket(
+        posix.AF.INET,
+        posix.SOCK.DGRAM | posix.SOCK.CLOEXEC | posix.SOCK.NONBLOCK,
+        posix.IPPROTO.UDP,
+    ) catch |err| {
+        if (err == error.SystemResources) return error.SkipZigTest;
+        return err;
+    };
+    el.udp_fd = fake_udp_fd;
+    const mgr = try std.testing.allocator.create(UtpManager);
+    mgr.* = UtpManager.init(std.testing.allocator);
+    el.utp_manager = mgr;
+    el.clock = Clock.simAtMs(1000);
+    el.transport_disposition = TransportDisposition.tcp_and_utp;
+
+    const empty_fds = [_]posix.fd_t{};
+    const tid = try el.addTorrentContext(.{
+        .shared_fds = empty_fds[0..],
+        .info_hash = [_]u8{0x56} ** 20,
+        .peer_id = "-VR0001-test00000003".*,
+    });
+    const addr = try std.net.Address.parseIp4("127.0.0.1", 6883);
+
+    _ = try el.addUtpPeer(addr, tid);
+    try std.testing.expectEqual(@as(u16, 1), activePeerCountByTransport(&el, .utp));
+
+    el.clock.advanceMs(3000);
+    utp_handler.utpTick(&el);
+
+    try std.testing.expectEqual(@as(u16, 0), activePeerCountByTransport(&el, .utp));
+    try std.testing.expectEqual(@as(u16, 1), activePeerCountByTransport(&el, .tcp));
+}
+
+test "utp connect fallback is not starved by frequent ticks" {
+    const EL = event_loop_mod.EventLoopOf(SimIO);
+    const sim_io = try SimIO.init(std.testing.allocator, .{ .seed = 0x7472 });
+    var el = try EL.initBareWithIO(std.testing.allocator, sim_io, 0);
+    defer el.deinit();
+
+    const fake_udp_fd = posix.socket(
+        posix.AF.INET,
+        posix.SOCK.DGRAM | posix.SOCK.CLOEXEC | posix.SOCK.NONBLOCK,
+        posix.IPPROTO.UDP,
+    ) catch |err| {
+        if (err == error.SystemResources) return error.SkipZigTest;
+        return err;
+    };
+    el.udp_fd = fake_udp_fd;
+    const mgr = try std.testing.allocator.create(UtpManager);
+    mgr.* = UtpManager.init(std.testing.allocator);
+    el.utp_manager = mgr;
+    el.clock = Clock.simAtMs(1000);
+    el.transport_disposition = TransportDisposition.tcp_and_utp;
+
+    const empty_fds = [_]posix.fd_t{};
+    const tid = try el.addTorrentContext(.{
+        .shared_fds = empty_fds[0..],
+        .info_hash = [_]u8{0x57} ** 20,
+        .peer_id = "-VR0001-test00000004".*,
+    });
+    const addr = try std.net.Address.parseIp4("127.0.0.1", 6884);
+
+    _ = try el.addUtpPeer(addr, tid);
+
+    el.clock.advanceMs(1000);
+    utp_handler.utpTick(&el);
+    try std.testing.expectEqual(@as(u16, 1), activePeerCountByTransport(&el, .utp));
+
+    for (0..20) |_| {
+        el.clock.advanceMs(100);
+        utp_handler.utpTick(&el);
+    }
+
+    try std.testing.expectEqual(@as(u16, 0), activePeerCountByTransport(&el, .utp));
+    try std.testing.expectEqual(@as(u16, 1), activePeerCountByTransport(&el, .tcp));
+}
+
+test "outbound tcp peer connect carries a deadline" {
+    const EL = event_loop_mod.EventLoopOf(SimIO);
+    const sim_io = try SimIO.init(std.testing.allocator, .{
+        .seed = 0x7473,
+        .max_ops_per_tick = 1,
+    });
+    var el = try EL.initBareWithIO(std.testing.allocator, sim_io, 0);
+    defer el.deinit();
+
+    el.transport_disposition = TransportDisposition.tcp_only;
+    el.peer_connect_timeout_ns = 3 * std.time.ns_per_s;
+
+    const empty_fds = [_]posix.fd_t{};
+    const tid = try el.addTorrentContext(.{
+        .shared_fds = empty_fds[0..],
+        .info_hash = [_]u8{0x58} ** 20,
+        .peer_id = "-VR0001-test00000005".*,
+    });
+    const addr = try std.net.Address.parseIp4("127.0.0.1", 6885);
+
+    const slot = try el.addPeerForTorrent(addr, tid);
+    try el.io.tick(1);
+
+    switch (el.peers[slot].connect_completion.op) {
+        .connect => |op| try std.testing.expectEqual(@as(u64, 3 * std.time.ns_per_s), op.deadline_ns.?),
+        else => try std.testing.expect(false),
+    }
+}
+
+test "outbound tcp peer connect uses configured deadline" {
+    const EL = event_loop_mod.EventLoopOf(SimIO);
+    const sim_io = try SimIO.init(std.testing.allocator, .{
+        .seed = 0x7474,
+        .max_ops_per_tick = 1,
+    });
+    var el = try EL.initBareWithIO(std.testing.allocator, sim_io, 0);
+    defer el.deinit();
+
+    el.transport_disposition = TransportDisposition.tcp_only;
+    el.peer_connect_timeout_ns = 1250 * std.time.ns_per_ms;
+
+    const empty_fds = [_]posix.fd_t{};
+    const tid = try el.addTorrentContext(.{
+        .shared_fds = empty_fds[0..],
+        .info_hash = [_]u8{0x59} ** 20,
+        .peer_id = "-VR0001-test00000006".*,
+    });
+    const addr = try std.net.Address.parseIp4("127.0.0.1", 6886);
+
+    const slot = try el.addPeerForTorrent(addr, tid);
+    try el.io.tick(1);
+
+    switch (el.peers[slot].connect_completion.op) {
+        .connect => |op| try std.testing.expectEqual(@as(u64, 1250 * std.time.ns_per_ms), op.deadline_ns.?),
+        else => try std.testing.expect(false),
+    }
 }
 
 // ── Test 4: Runtime toggle via API ───────────────────────────

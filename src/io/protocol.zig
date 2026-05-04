@@ -613,7 +613,7 @@ fn handlePexMessage(self: anytype, slot: u16, payload: []const u8) void {
         // Don't connect to peers we already have
         if (isPeerAlreadyConnected(self, torrent_id, pex_peer.address)) continue;
 
-        // When uTP is enabled, alternate between TCP and uTP transports.
+        // When uTP is enabled, try uTP first and fall back to TCP on timeout.
         _ = self.addPeerAutoTransport(pex_peer.address, torrent_id) catch continue;
     }
 }

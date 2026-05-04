@@ -183,6 +183,7 @@ pub const default_recv_window: u32 = 256 * 1024;
 const min_rto_us: u32 = 500_000; // 500 ms
 const max_rto_us: u32 = 60_000_000; // 60 s
 const initial_rto_us: u32 = 1_000_000; // 1 s
+pub const connect_timeout_us: u32 = 3_000_000; // 3 s, matching libtorrent's default
 
 /// Maximum payload size per uTP packet (MTU - IP - UDP - uTP header).
 pub const max_payload: u16 = 1400 - Header.size;
@@ -291,6 +292,10 @@ pub const UtpSocket = struct {
 
     /// Timestamp of the last packet we sent.
     last_send_time_us: u32 = 0,
+    /// Timestamp of the original outbound SYN. Retransmits update
+    /// `last_send_time_us`, but the connect deadline is measured from
+    /// the first SYN just like libtorrent's unconfirmed uTP timeout.
+    connect_started_us: ?u32 = null,
 
     /// Remote address (set on connect/accept).
     remote_addr: std.net.Address = undefined,
@@ -341,6 +346,7 @@ pub const UtpSocket = struct {
         self.send_id = conn_id +% 1;
         self.seq_nr = 1;
         self.state = .syn_sent;
+        self.connect_started_us = now_us;
 
         const hdr = Header{
             .packet_type = .st_syn,
@@ -424,6 +430,7 @@ pub const UtpSocket = struct {
                     // SYN-ACK received: complete handshake.
                     self.ack_nr = hdr.seq_nr;
                     self.state = .connected;
+                    self.connect_started_us = null;
                 }
                 self.processAck(hdr.ack_nr, timestamp_diff, now_us);
                 return result;
@@ -587,6 +594,17 @@ pub const UtpSocket = struct {
         return (now_us -% self.last_send_time_us) >= self.rto;
     }
 
+    /// True when an outbound SYN has not been confirmed inside the
+    /// connection-establishment deadline. This intentionally ignores
+    /// retransmit timestamps so a silent peer fails after the connect
+    /// window instead of after exponential RTO backoff reaches the
+    /// general connection teardown threshold.
+    pub fn unconfirmedConnectTimedOut(self: *const UtpSocket, now_us: u32) bool {
+        if (self.state != .syn_sent) return false;
+        const started = self.connect_started_us orelse return false;
+        return (now_us -% started) >= connect_timeout_us;
+    }
+
     /// Handle a retransmission timeout event. Marks the oldest unacked
     /// packet for retransmission and applies exponential backoff.
     pub fn handleTimeout(self: *UtpSocket) void {
@@ -625,7 +643,9 @@ pub const UtpSocket = struct {
                 }
             }
         }
-        self.last_send_time_us = now_us;
+        if (count > 0) {
+            self.last_send_time_us = now_us;
+        }
         return count;
     }
 
@@ -1635,6 +1655,24 @@ test "timeout marks oldest unacked packet for retransmission" {
     const count = sock.collectRetransmits(&entries, 2_000_000);
     try std.testing.expectEqual(@as(u16, 1), count);
     try std.testing.expectEqual(@as(u16, 10), entries[0].seq_nr);
+}
+
+test "unconfirmed connect timeout uses original SYN timestamp" {
+    var sock = UtpSocket{};
+    sock.allocator = std.testing.allocator;
+    defer sock.deinit();
+
+    var rng = Random.simRandom(0xc017);
+    _ = sock.connect(&rng, 1_000_000);
+    try std.testing.expect(!sock.unconfirmedConnectTimedOut(3_999_999));
+
+    sock.handleTimeout();
+    var entries: [1]RetransmitEntry = undefined;
+    const count = sock.collectRetransmits(&entries, 2_000_000);
+    try std.testing.expectEqual(@as(u16, 1), count);
+    try std.testing.expectEqual(@as(u32, 2_000_000), sock.last_send_time_us);
+
+    try std.testing.expect(sock.unconfirmedConnectTimedOut(4_000_000));
 }
 
 test "acked packets are freed from outbound buffer" {

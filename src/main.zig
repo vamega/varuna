@@ -160,6 +160,7 @@ fn runDaemonWithBackend(
     shared_el.max_connections = cfg.network.max_connections;
     shared_el.max_peers_per_torrent = cfg.network.max_peers_per_torrent;
     shared_el.max_half_open = cfg.network.max_half_open;
+    shared_el.peer_connect_timeout_ns = @as(u64, cfg.network.peer_connect_timeout_ms) * std.time.ns_per_ms;
 
     // Apply graceful shutdown timeout from config
     shared_el.shutdown_timeout = cfg.daemon.shutdown_timeout;

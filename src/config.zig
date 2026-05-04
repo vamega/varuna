@@ -212,6 +212,10 @@ pub const Config = struct {
         max_peers_per_torrent: u32 = 100,
         /// Maximum number of simultaneous outbound connections (SYN queue protection).
         max_half_open: u32 = 50,
+        /// TCP peer connect timeout in milliseconds. Applies to outbound
+        /// BitTorrent TCP peers, including TCP fallback after an unconfirmed
+        /// uTP connect. Default: 3 seconds.
+        peer_connect_timeout_ms: u32 = 3000,
         /// Global download speed limit in bytes/sec. 0 = unlimited.
         dl_limit: u64 = 0,
         /// Global upload speed limit in bytes/sec. 0 = unlimited.
@@ -504,6 +508,7 @@ test "default config has sensible values" {
     try std.testing.expectEqual(@as(u32, 500), config.network.max_connections);
     try std.testing.expectEqual(@as(u32, 100), config.network.max_peers_per_torrent);
     try std.testing.expectEqual(@as(u32, 50), config.network.max_half_open);
+    try std.testing.expectEqual(@as(u32, 3000), config.network.peer_connect_timeout_ms);
     try std.testing.expectEqual(@as(u32, 4), config.performance.hasher_threads);
     try std.testing.expectEqual(@as(?[]const u8, null), config.network.bind_device);
     try std.testing.expectEqual(@as(?[]const u8, null), config.network.bind_address);
@@ -889,6 +894,7 @@ test "load transport array with other network fields" {
         \\port_min = 7000
         \\port_max = 7100
         \\max_peers = 200
+        \\peer_connect_timeout_ms = 1250
         \\encryption = "forced"
         \\dht = false
         \\
@@ -906,6 +912,7 @@ test "load transport array with other network fields" {
     try std.testing.expectEqual(@as(u16, 7000), net.port_min);
     try std.testing.expectEqual(@as(u16, 7100), net.port_max);
     try std.testing.expectEqual(@as(u32, 200), net.max_peers);
+    try std.testing.expectEqual(@as(u32, 1250), net.peer_connect_timeout_ms);
     try std.testing.expectEqualSlices(u8, "forced", net.encryption);
     try std.testing.expect(!net.dht);
 }

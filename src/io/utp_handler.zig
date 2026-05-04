@@ -113,14 +113,19 @@ fn utpSendCompleteFor(comptime EL: type) io_interface.Callback {
             result: io_interface.Result,
         ) io_interface.CallbackAction {
             const self: *EL = @ptrCast(@alignCast(userdata.?));
-            const res: i32 = switch (result) {
-                .sendmsg => |r| if (r) |n|
-                    std.math.cast(i32, n) orelse std.math.maxInt(i32)
-                else |_|
-                    -1,
-                else => -1,
-            };
-            handleUtpSendResult(self, res);
+            switch (result) {
+                .sendmsg => |r| {
+                    if (r) |n| {
+                        const res = std.math.cast(i32, n) orelse std.math.maxInt(i32);
+                        handleUtpSendResult(self, res);
+                    } else |err| {
+                        handleUtpSendError(self, err);
+                    }
+                },
+                else => {
+                    handleUtpSendError(self, error.UnexpectedCompletion);
+                },
+            }
             return .disarm;
         }
     }.cb;
@@ -242,6 +247,12 @@ fn handleUtpSendResult(self: anytype, send_res: i32) void {
     }
 
     // Drain the send queue
+    utpDrainSendQueue(self);
+}
+
+fn handleUtpSendError(self: anytype, err: anyerror) void {
+    self.utp_send_pending = false;
+    log.warn("uTP sendmsg failed: {s}", .{@errorName(err)});
     utpDrainSendQueue(self);
 }
 
@@ -750,6 +761,33 @@ pub fn findPeerByUtpSlot(self: anytype, utp_slot: u16) ?u16 {
     return null;
 }
 
+fn failUnconfirmedUtpConnect(self: anytype, utp_slot: u16, now_us: u32) void {
+    const peer_slot = findPeerByUtpSlot(self, utp_slot) orelse {
+        if (self.utp_manager) |mgr| {
+            _ = mgr.reset(utp_slot, now_us);
+        }
+        return;
+    };
+
+    const peer = &self.peers[peer_slot];
+    const address = peer.address;
+    const torrent_id = peer.torrent_id;
+    const swarm_hash = self.selectedPeerSwarmHash(peer);
+    const retry_tcp = peer.mode == .outbound and
+        peer.state == .connecting and
+        self.transport_disposition.outgoing_tcp and
+        !self.draining;
+
+    log.debug("uTP connect to {f} timed out; retry_tcp={}", .{ address, retry_tcp });
+    self.removePeer(peer_slot);
+
+    if (retry_tcp) {
+        _ = self.addPeerForTorrentWithSwarmHash(address, torrent_id, swarm_hash) catch |err| {
+            log.debug("TCP fallback after uTP connect timeout failed for {f}: {s}", .{ address, @errorName(err) });
+        };
+    }
+}
+
 /// Process uTP timeouts for all active connections. Retransmits packets
 /// that have timed out and closes connections that have backed off too much.
 pub fn utpTick(self: anytype) void {
@@ -762,10 +800,15 @@ pub fn utpTick(self: anytype) void {
     // Close connections that have backed off too much.
     for (timeout_buf[0..timeout_count]) |utp_slot| {
         const sock = mgr.getSocket(utp_slot) orelse continue;
+        if (sock.unconfirmedConnectTimedOut(now_us)) {
+            failUnconfirmedUtpConnect(self, utp_slot, now_us);
+            continue;
+        }
         if (sock.rto >= 30_000_000) { // 30 seconds
+            const remote = mgr.getRemoteAddress(utp_slot);
             if (mgr.reset(utp_slot, now_us)) |rst| {
-                if (mgr.getRemoteAddress(utp_slot)) |remote| {
-                    utpSendPacket(self, &rst, remote);
+                if (remote) |addr| {
+                    utpSendPacket(self, &rst, addr);
                 }
             }
             // Remove the associated peer

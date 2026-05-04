@@ -14,6 +14,10 @@ const peer_policy = @import("peer_policy.zig");
 const socket_util = @import("../net/socket.zig");
 const BanList = @import("../net/ban_list.zig").BanList;
 
+/// Default peer TCP connect timeout. Keep this short so stale half-open
+/// connects don't delay useful peer attempts in DHT-heavy swarms.
+pub const default_peer_connect_timeout_ns: u64 = 3 * std.time.ns_per_s;
+
 // ── Generic callback shape ────────────────────────────────
 //
 // `EventLoop` is parameterised over a comptime `IO: type` (see
@@ -213,7 +217,7 @@ fn handleSocketResult(self: anytype, slot: u16, res: i32) void {
 
     peer.connect_pending = true;
     self.io.connect(
-        .{ .fd = fd, .addr = peer.address },
+        .{ .fd = fd, .addr = peer.address, .deadline_ns = self.peer_connect_timeout_ns },
         &peer.connect_completion,
         self,
         peerConnectCompleteFor(@TypeOf(self.*)),

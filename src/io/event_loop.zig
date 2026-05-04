@@ -234,10 +234,6 @@ pub fn EventLoopOf(comptime IO: type) type {
         pex_enabled: bool = true,
         /// Fine-grained transport control: which TCP/uTP directions are allowed.
         transport_disposition: TransportDisposition = TransportDisposition.tcp_and_utp,
-        /// Monotonic counter for alternating between TCP and uTP connections.
-        /// When both outgoing TCP and uTP are enabled, even values use TCP and odd values use uTP.
-        utp_transport_counter: u32 = 0,
-
         // signalfd for SIGINT/SIGTERM — produces a CQE via `io.poll` when
         // a shutdown signal arrives. The callback (`signalPollComplete`)
         // sets `running = false` and re-arms after the first signal so a
@@ -359,6 +355,7 @@ pub fn EventLoopOf(comptime IO: type) type {
         max_connections: u32 = 500,
         max_peers_per_torrent: u32 = 100,
         max_half_open: u32 = 50,
+        peer_connect_timeout_ns: u64 = peer_handler.default_peer_connect_timeout_ns,
         half_open_count: u32 = 0,
 
         // Re-announce result handoff: daemon tracker sessions enqueue
@@ -1102,16 +1099,10 @@ pub fn EventLoopOf(comptime IO: type) type {
 
         /// Select the transport for a new outbound connection based on the
         /// transport disposition. When both outgoing TCP and uTP are enabled,
-        /// alternates using a simple counter (approximately 50/50 split).
-        /// When only one outgoing transport is enabled, always returns that one.
+        /// prefer uTP first; silent uTP connects fall back to TCP from
+        /// `utp_handler.utpTick`, matching libtorrent's default behavior.
         pub fn selectTransport(self: *Self) Transport {
             const disp = self.transport_disposition;
-            if (disp.outgoing_tcp and disp.outgoing_utp) {
-                // Both enabled: alternate
-                const counter = self.utp_transport_counter;
-                self.utp_transport_counter = counter +% 1;
-                return if (counter % 2 == 0) .tcp else .utp;
-            }
             if (disp.outgoing_utp) return .utp;
             // Default to TCP (includes the case where neither is enabled,
             // which is a misconfiguration but safe to fall back to TCP).
@@ -1160,7 +1151,8 @@ pub fn EventLoopOf(comptime IO: type) type {
         }
 
         /// Add a peer using the transport selected by `selectTransport()`.
-        /// When uTP is selected but setup fails, falls back to TCP only if
+        /// In mixed TCP/uTP mode this starts optimistically over uTP; setup
+        /// errors and later unconfirmed-connect timeouts retry over TCP when
         /// outbound TCP is enabled by the transport disposition.
         pub fn addPeerAutoTransport(self: *Self, address: std.net.Address, torrent_id: TorrentId) !u16 {
             const swarm_hash = try self.defaultOutboundSwarmHash(torrent_id);
@@ -3408,31 +3400,23 @@ test "selectTransport always returns tcp when outgoing utp disabled" {
     }
 }
 
-test "selectTransport alternates tcp and utp when both outgoing enabled" {
+test "selectTransport prefers utp when both outgoing enabled" {
     const allocator = std.testing.allocator;
     var el = try EventLoop.initBare(allocator, 0);
     defer el.deinit();
 
     el.transport_disposition = TransportDisposition.tcp_and_utp;
-    el.utp_transport_counter = 0;
 
-    // Even counter -> TCP, odd counter -> uTP
-    try std.testing.expectEqual(Transport.tcp, el.selectTransport());
     try std.testing.expectEqual(Transport.utp, el.selectTransport());
-    try std.testing.expectEqual(Transport.tcp, el.selectTransport());
     try std.testing.expectEqual(Transport.utp, el.selectTransport());
-
-    // Verify counter is incrementing
-    try std.testing.expectEqual(@as(u32, 4), el.utp_transport_counter);
 }
 
-test "selectTransport yields approximately 50/50 split" {
+test "selectTransport consistently chooses utp in mixed mode" {
     const allocator = std.testing.allocator;
     var el = try EventLoop.initBare(allocator, 0);
     defer el.deinit();
 
     el.transport_disposition = TransportDisposition.tcp_and_utp;
-    el.utp_transport_counter = 0;
 
     var tcp_count: u32 = 0;
     var utp_count: u32 = 0;
@@ -3440,8 +3424,8 @@ test "selectTransport yields approximately 50/50 split" {
         const t = el.selectTransport();
         if (t == .tcp) tcp_count += 1 else utp_count += 1;
     }
-    try std.testing.expectEqual(@as(u32, 50), tcp_count);
-    try std.testing.expectEqual(@as(u32, 50), utp_count);
+    try std.testing.expectEqual(@as(u32, 0), tcp_count);
+    try std.testing.expectEqual(@as(u32, 100), utp_count);
 }
 
 test "selectTransport returns utp only when outgoing_tcp disabled" {
