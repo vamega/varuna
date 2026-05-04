@@ -859,6 +859,7 @@ pub const KqueueMmapIO = struct {
         }
         switch (errno) {
             .AGAIN => try self.parkOnFilter(c, op.fd, std.c.EVFILT.READ),
+            .NOTCONN => self.pushCompleted(c, .{ .recvmsg = error.SocketNotConnected }),
             else => |e| self.pushCompleted(c, .{ .recvmsg = posix.unexpectedErrno(e) }),
         }
     }
@@ -880,6 +881,7 @@ pub const KqueueMmapIO = struct {
         }
         switch (errno) {
             .AGAIN => try self.parkOnFilter(c, op.fd, std.c.EVFILT.WRITE),
+            .NOTCONN => self.pushCompleted(c, .{ .sendmsg = error.SocketNotConnected }),
             else => |e| self.pushCompleted(c, .{ .sendmsg = posix.unexpectedErrno(e) }),
         }
     }
@@ -1143,11 +1145,13 @@ fn errnoFromCInt(errno_value: u32) anyerror {
     return switch (errno_value) {
         @intFromEnum(posix.E.CONNREFUSED) => error.ConnectionRefused,
         @intFromEnum(posix.E.CONNRESET) => error.ConnectionResetByPeer,
+        @intFromEnum(posix.E.NOTCONN) => error.SocketNotConnected,
         @intFromEnum(posix.E.NETUNREACH) => error.NetworkUnreachable,
         @intFromEnum(posix.E.HOSTUNREACH) => error.HostUnreachable,
         @intFromEnum(posix.E.TIMEDOUT) => error.ConnectionTimedOut,
         @intFromEnum(posix.E.PIPE) => error.BrokenPipe,
         @intFromEnum(posix.E.CONNABORTED) => error.ConnectionAborted,
+        @intFromEnum(posix.E.DESTADDRREQ) => error.DestinationAddressRequired,
         @intFromEnum(posix.E.AGAIN) => error.WouldBlock,
         @intFromEnum(posix.E.BADF) => error.BadFileDescriptor,
         @intFromEnum(posix.E.INTR) => error.Interrupted,
@@ -1224,6 +1228,8 @@ test "KqueueMmapIO: makeCancelledResult preserves op tag" {
 
 test "KqueueMmapIO: errnoFromCInt maps common errnos" {
     try testing.expectEqual(error.ConnectionRefused, errnoFromCInt(@intFromEnum(posix.E.CONNREFUSED)));
+    try testing.expectEqual(error.SocketNotConnected, errnoFromCInt(@intFromEnum(posix.E.NOTCONN)));
+    try testing.expectEqual(error.DestinationAddressRequired, errnoFromCInt(@intFromEnum(posix.E.DESTADDRREQ)));
     try testing.expectEqual(error.WouldBlock, errnoFromCInt(@intFromEnum(posix.E.AGAIN)));
     try testing.expectEqual(error.Unexpected, errnoFromCInt(99999));
 }

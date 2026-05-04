@@ -25,6 +25,11 @@ const Completion = ifc.Completion;
 const Result = ifc.Result;
 const CallbackAction = ifc.CallbackAction;
 
+test "Linux errno mapping covers datagram socket send failures" {
+    try testing.expect(ifc.linuxErrnoToError(.NOTCONN) == error.SocketNotConnected);
+    try testing.expect(ifc.linuxErrnoToError(.DESTADDRREQ) == error.DestinationAddressRequired);
+}
+
 // ── Compile-time interface check ──────────────────────────
 //
 // Forces both backends to expose the same set of submission methods. A

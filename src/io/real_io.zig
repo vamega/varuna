@@ -592,10 +592,14 @@ pub const RealIO = struct {
 
     pub fn connect(self: *RealIO, op: ifc.ConnectOp, c: *Completion, ud: ?*anyopaque, cb: Callback) !void {
         try self.armCompletion(c, .{ .connect = op }, ud, cb);
-        const addrlen = op.addr.getOsSockLen();
-        const sqe = try self.ring.connect(@intFromPtr(c), op.fd, &op.addr.any, addrlen);
+        // `connect` is asynchronous: the kernel may read the sockaddr after
+        // this function returns. Keep the pointer anchored in the completion's
+        // stored operation, not the by-value stack parameter.
+        const stored = &c.op.connect;
+        const addrlen = stored.addr.getOsSockLen();
+        const sqe = try self.ring.connect(@intFromPtr(c), stored.fd, &stored.addr.any, addrlen);
 
-        if (op.deadline_ns) |ns| {
+        if (stored.deadline_ns) |ns| {
             // Chain a link_timeout. The connect SQE must carry IO_LINK and
             // be immediately followed by the link_timeout SQE. The
             // link_timeout user_data is a sentinel — we silently swallow
@@ -926,6 +930,7 @@ fn errnoToError(e: linux.E) anyerror {
         .SUCCESS => unreachable,
         .CONNREFUSED => error.ConnectionRefused,
         .CONNRESET => error.ConnectionResetByPeer,
+        .NOTCONN => error.SocketNotConnected,
         .NETUNREACH => error.NetworkUnreachable,
         .HOSTUNREACH => error.HostUnreachable,
         .TIMEDOUT => error.ConnectionTimedOut,
@@ -939,6 +944,7 @@ fn errnoToError(e: linux.E) anyerror {
         .ADDRINUSE => error.AddressInUse,
         .ADDRNOTAVAIL => error.AddressNotAvailable,
         .AFNOSUPPORT => error.AddressFamilyNotSupported,
+        .DESTADDRREQ => error.DestinationAddressRequired,
         .AGAIN => error.WouldBlock,
         .BADF => error.BadFileDescriptor,
         .INTR => error.Interrupted,
@@ -957,6 +963,13 @@ fn errnoToError(e: linux.E) anyerror {
 // ── Tests ─────────────────────────────────────────────────
 
 const testing = std.testing;
+
+test "RealIO maps ENOTCONN completions to SocketNotConnected" {
+    try testing.expect(errnoToError(.NOTCONN) == error.SocketNotConnected);
+    try testing.expect(ifc.linuxErrnoToError(.NOTCONN) == error.SocketNotConnected);
+    try testing.expect(errnoToError(.DESTADDRREQ) == error.DestinationAddressRequired);
+    try testing.expect(ifc.linuxErrnoToError(.DESTADDRREQ) == error.DestinationAddressRequired);
+}
 
 fn skipIfUnavailable() !RealIO {
     return RealIO.init(.{ .entries = 16 }) catch return error.SkipZigTest;
@@ -1341,6 +1354,58 @@ test "RealIO listen on a bound socket via the runtime-detected path" {
     try testing.expectEqual(@as(u32, 1), ctx.calls);
     switch (ctx.last_result.?) {
         .listen => |r| try r,
+        else => try testing.expect(false),
+    }
+}
+
+test "RealIO connected UDP sendmsg can omit destination address" {
+    var io = try skipIfUnavailable();
+    defer io.deinit();
+
+    const server = try posix.socket(posix.AF.INET, posix.SOCK.DGRAM | posix.SOCK.CLOEXEC, posix.IPPROTO.UDP);
+    defer posix.close(server);
+    const bind_addr = try std.net.Address.parseIp4("127.0.0.1", 0);
+    try posix.bind(server, &bind_addr.any, bind_addr.getOsSockLen());
+
+    var server_sockaddr: posix.sockaddr = undefined;
+    var server_socklen: posix.socklen_t = @sizeOf(posix.sockaddr);
+    try posix.getsockname(server, &server_sockaddr, &server_socklen);
+    const server_addr = std.net.Address{ .any = server_sockaddr };
+
+    const client = try posix.socket(posix.AF.INET, posix.SOCK.DGRAM | posix.SOCK.CLOEXEC | posix.SOCK.NONBLOCK, posix.IPPROTO.UDP);
+    defer posix.close(client);
+
+    var connect_c = Completion{};
+    var connect_ctx = TestCtx{};
+    try io.connect(.{ .fd = client, .addr = server_addr }, &connect_c, &connect_ctx, testCallback);
+    if (connect_ctx.calls == 0) try io.tick(1);
+    try testing.expectEqual(@as(u32, 1), connect_ctx.calls);
+    switch (connect_ctx.last_result.?) {
+        .connect => |r| try r,
+        else => try testing.expect(false),
+    }
+
+    const payload = "ping";
+    var iov = [1]posix.iovec_const{.{
+        .base = payload.ptr,
+        .len = payload.len,
+    }};
+    var msg = posix.msghdr_const{
+        .name = null,
+        .namelen = 0,
+        .iov = &iov,
+        .iovlen = 1,
+        .control = null,
+        .controllen = 0,
+        .flags = 0,
+    };
+    var send_c = Completion{};
+    var send_ctx = TestCtx{};
+    try io.sendmsg(.{ .fd = client, .msg = &msg }, &send_c, &send_ctx, testCallback);
+    try io.tick(1);
+    try testing.expectEqual(@as(u32, 1), send_ctx.calls);
+    switch (send_ctx.last_result.?) {
+        .sendmsg => |r| try testing.expectEqual(payload.len, try r),
         else => try testing.expect(false),
     }
 }

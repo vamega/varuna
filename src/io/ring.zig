@@ -78,6 +78,7 @@ pub fn checkCqe(cqe: linux.io_uring_cqe) !void {
         .SUCCESS => {},
         .CONNREFUSED => return error.ConnectionRefused,
         .CONNRESET => return error.ConnectionResetByPeer,
+        .NOTCONN => return error.SocketNotConnected,
         .NETUNREACH => return error.NetworkUnreachable,
         .HOSTUNREACH => return error.HostUnreachable,
         .TIMEDOUT => return error.ConnectionTimedOut,
@@ -382,6 +383,9 @@ test "checkCqe maps error codes correctly" {
 
     const reset_cqe = linux.io_uring_cqe{ .user_data = 0, .res = -@as(i32, @intFromEnum(linux.E.CONNRESET)), .flags = 0 };
     try std.testing.expectError(error.ConnectionResetByPeer, checkCqe(reset_cqe));
+
+    const notconn_cqe = linux.io_uring_cqe{ .user_data = 0, .res = -@as(i32, @intFromEnum(linux.E.NOTCONN)), .flags = 0 };
+    try std.testing.expectError(error.SocketNotConnected, checkCqe(notconn_cqe));
 
     const pipe_cqe = linux.io_uring_cqe{ .user_data = 0, .res = -@as(i32, @intFromEnum(linux.E.PIPE)), .flags = 0 };
     try std.testing.expectError(error.BrokenPipe, checkCqe(pipe_cqe));

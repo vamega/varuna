@@ -156,7 +156,6 @@ pub fn UdpTrackerExecutorOf(comptime IO: type) type {
             // msghdr structures for io_uring sendmsg/recvmsg
             send_iov: [1]posix.iovec_const = undefined,
             send_msg: posix.msghdr_const = undefined,
-            send_addr: std.net.Address = undefined,
 
             recv_iov: [1]posix.iovec = undefined,
             recv_msg: posix.msghdr = undefined,
@@ -410,14 +409,11 @@ pub fn UdpTrackerExecutorOf(comptime IO: type) type {
                 self.tryResetSlot(slot_idx);
                 return .disarm;
             }
-            const fake_cqe = makeFakeCqe(switch (result) {
-                .sendmsg => |r| if (r) |n|
-                    std.math.cast(i32, n) orelse std.math.maxInt(i32)
-                else |_|
-                    -1,
-                else => -1,
-            });
-            self.handleSend(slot, slot_idx, fake_cqe);
+            const send_result: anyerror!usize = switch (result) {
+                .sendmsg => |r| r,
+                else => error.UnexpectedCompletion,
+            };
+            self.handleSend(slot, slot_idx, send_result);
             return .disarm;
         }
 
@@ -788,14 +784,13 @@ pub fn UdpTrackerExecutorOf(comptime IO: type) type {
 
         fn submitSendmsg(self: *Self, slot: *RequestSlot, slot_idx: u16) void {
             if (slot.send_in_flight or slot.closing or slot.completed) return;
-            slot.send_addr = slot.address;
             slot.send_iov[0] = .{
                 .base = @ptrCast(&slot.send_buf),
                 .len = slot.send_len,
             };
             slot.send_msg = .{
-                .name = @ptrCast(&slot.send_addr),
-                .namelen = slot.send_addr.getOsSockLen(),
+                .name = null,
+                .namelen = 0,
                 .iov = @ptrCast(&slot.send_iov),
                 .iovlen = 1,
                 .control = null,
@@ -846,16 +841,17 @@ pub fn UdpTrackerExecutorOf(comptime IO: type) type {
 
         // ── CQE handlers ─────────────────────────────────────────
 
-        fn handleSend(self: *Self, slot: *RequestSlot, slot_idx: u16, cqe: linux.io_uring_cqe) void {
+        fn handleSend(self: *Self, slot: *RequestSlot, slot_idx: u16, send_result: anyerror!usize) void {
             _ = self;
             _ = slot;
             _ = slot_idx;
             // For UDP, send completion just means the datagram was queued.
             // Errors are rare but possible.
-            if (cqe.res < 0) {
-                log.debug("UDP tracker sendmsg failed: errno={d}", .{-cqe.res});
+            _ = send_result catch |err| {
+                log.debug("UDP tracker sendmsg failed: {s}", .{@errorName(err)});
                 // Don't complete yet -- the retransmission timer will handle it
-            }
+                return;
+            };
         }
 
         fn handleRecv(self: *Self, slot: *RequestSlot, slot_idx: u16, cqe: linux.io_uring_cqe) void {
@@ -1120,6 +1116,8 @@ test "UdpTrackerExecutor uses independent send and recv completions" {
     try std.testing.expect(!ctx.completed);
     try std.testing.expect(slot.send_in_flight);
     try std.testing.expect(slot.recv_in_flight);
+    try std.testing.expect(slot.send_msg.name == null);
+    try std.testing.expectEqual(@as(posix.socklen_t, 0), slot.send_msg.namelen);
 
     slot.closing = true;
     slot.completed = true;

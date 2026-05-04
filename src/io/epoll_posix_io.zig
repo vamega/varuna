@@ -1334,6 +1334,8 @@ fn doRecvmsg(op: ifc.RecvmsgOp) anyerror!usize {
         .CONNREFUSED => return error.ConnectionRefused,
         .CONNRESET => return error.ConnectionResetByPeer,
         .INTR => return error.Interrupted,
+        .NOTCONN => return error.SocketNotConnected,
+        .DESTADDRREQ => return error.DestinationAddressRequired,
         else => |e| return posix.unexpectedErrno(e),
     }
 }
@@ -1346,6 +1348,8 @@ fn doSendmsg(op: ifc.SendmsgOp) anyerror!usize {
         .PIPE => return error.BrokenPipe,
         .CONNRESET => return error.ConnectionResetByPeer,
         .INTR => return error.Interrupted,
+        .NOTCONN => return error.SocketNotConnected,
+        .DESTADDRREQ => return error.DestinationAddressRequired,
         else => |e| return posix.unexpectedErrno(e),
     }
 }
