@@ -1352,6 +1352,19 @@ pub fn SessionManagerOf(comptime IO: type) type {
             refused_failures: u64 = 0,
             peers_connected: u16 = 0,
             peers_half_open: u16 = 0,
+            dht_enabled: bool = false,
+            dht_bootstrapped: bool = false,
+            dht_bootstrap_pending: bool = false,
+            dht_nodes: usize = 0,
+            dht_registered_searches: usize = 0,
+            dht_registered_searches_done: usize = 0,
+            dht_active_lookups: usize = 0,
+            dht_pending_queries: usize = 0,
+            dht_send_queue_len: usize = 0,
+            dht_peer_result_queue_len: usize = 0,
+            dht_search_registered: bool = false,
+            dht_search_done: bool = false,
+            dht_active_lookup_for_hash: bool = false,
         };
 
         /// Get connection diagnostics for a torrent.
@@ -1368,6 +1381,22 @@ pub fn SessionManagerOf(comptime IO: type) type {
                 if (session.torrent_id_in_shared) |tid| {
                     diag.peers_connected = el.peerCountForTorrent(tid);
                     diag.peers_half_open = el.halfOpenCount();
+                }
+                if (el.dht_engine) |engine| {
+                    const dht_diag = engine.diagnostics(session.info_hash);
+                    diag.dht_enabled = dht_diag.enabled;
+                    diag.dht_bootstrapped = dht_diag.bootstrapped;
+                    diag.dht_bootstrap_pending = dht_diag.bootstrap_pending;
+                    diag.dht_nodes = dht_diag.node_count;
+                    diag.dht_registered_searches = dht_diag.registered_searches;
+                    diag.dht_registered_searches_done = dht_diag.registered_searches_done;
+                    diag.dht_active_lookups = dht_diag.active_lookups;
+                    diag.dht_pending_queries = dht_diag.pending_queries;
+                    diag.dht_send_queue_len = dht_diag.send_queue_len;
+                    diag.dht_peer_result_queue_len = dht_diag.peer_result_queue_len;
+                    diag.dht_search_registered = dht_diag.search_registered;
+                    diag.dht_search_done = dht_diag.search_done;
+                    diag.dht_active_lookup_for_hash = dht_diag.active_lookup_for_hash;
                 }
             }
 
@@ -1890,6 +1919,9 @@ pub fn SessionManagerOf(comptime IO: type) type {
             /// IP:port string, owned by caller.
             ip: []const u8,
             port: u16,
+            state: []const u8 = "",
+            mode: []const u8 = "",
+            transport: []const u8 = "",
             /// Peer client identification string (from peer ID convention).
             client: []const u8,
             /// Connection flags: D=downloading, U=uploading, d=interested, u=peer interested,
@@ -1905,6 +1937,22 @@ pub fn SessionManagerOf(comptime IO: type) type {
             upload_only: bool = false,
             /// Smart Ban Phase 0: pieces that failed hash verification from this peer.
             hashfails: u8 = 0,
+            availability_known: bool = false,
+            availability_count: u32 = 0,
+            availability_pieces: u32 = 0,
+            current_piece: ?u32 = null,
+            next_piece: ?u32 = null,
+            inflight_requests: u32 = 0,
+            pipeline_sent: u32 = 0,
+            next_pipeline_sent: u32 = 0,
+            blocks_received: u32 = 0,
+            blocks_expected: u32 = 0,
+            send_pending: bool = false,
+            recv_pending: bool = false,
+            connect_pending: bool = false,
+            peer_choking: bool = true,
+            am_interested: bool = false,
+            extensions_supported: bool = false,
         };
 
         pub fn freePeerInfos(allocator: std.mem.Allocator, infos: []const PeerInfo) void {
@@ -1982,11 +2030,12 @@ pub fn SessionManagerOf(comptime IO: type) type {
                 errdefer allocator.free(flags_str);
 
                 // Peer progress from bitfield
-                const progress: f64 = if (peer.availability) |*bf| blk: {
-                    const total_pieces = bf.piece_count;
-                    if (total_pieces == 0) break :blk 0.0;
-                    break :blk @as(f64, @floatFromInt(bf.count)) / @as(f64, @floatFromInt(total_pieces));
-                } else 0.0;
+                const availability_count: u32 = if (peer.availability) |*bf| bf.count else 0;
+                const availability_pieces: u32 = if (peer.availability) |*bf| bf.piece_count else 0;
+                const progress: f64 = if (availability_pieces > 0)
+                    @as(f64, @floatFromInt(availability_count)) / @as(f64, @floatFromInt(availability_pieces))
+                else
+                    0.0;
 
                 // Client ID from peer handshake peer ID
                 const peer_id_mod = @import("../net/peer_id.zig");
@@ -1998,6 +2047,9 @@ pub fn SessionManagerOf(comptime IO: type) type {
                 try result.append(allocator, .{
                     .ip = ip_str,
                     .port = port,
+                    .state = @tagName(peer.state),
+                    .mode = @tagName(peer.mode),
+                    .transport = @tagName(peer.transport),
                     .client = client_str,
                     .flags = flags_str,
                     .dl_speed = peer.current_dl_speed,
@@ -2007,6 +2059,22 @@ pub fn SessionManagerOf(comptime IO: type) type {
                     .progress = progress,
                     .upload_only = peer.upload_only,
                     .hashfails = peer.hashfails,
+                    .availability_known = peer.availability_known,
+                    .availability_count = availability_count,
+                    .availability_pieces = availability_pieces,
+                    .current_piece = peer.current_piece,
+                    .next_piece = peer.next_piece,
+                    .inflight_requests = peer.inflight_requests,
+                    .pipeline_sent = peer.pipeline_sent,
+                    .next_pipeline_sent = peer.next_pipeline_sent,
+                    .blocks_received = peer.blocks_received,
+                    .blocks_expected = peer.blocks_expected,
+                    .send_pending = peer.send_pending,
+                    .recv_pending = peer.recv_pending,
+                    .connect_pending = peer.connect_pending,
+                    .peer_choking = peer.peer_choking,
+                    .am_interested = peer.am_interested,
+                    .extensions_supported = peer.extensions_supported,
                 });
             }
 

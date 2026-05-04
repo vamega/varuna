@@ -295,6 +295,71 @@ pub const DhtEngine = struct {
         peers: []std.net.Address,
     };
 
+    pub const Diagnostics = struct {
+        enabled: bool,
+        bootstrapped: bool,
+        bootstrap_pending: bool,
+        node_count: usize,
+        registered_searches: usize,
+        registered_searches_done: usize,
+        active_lookups: usize,
+        pending_queries: usize,
+        send_queue_len: usize,
+        peer_result_queue_len: usize,
+        search_registered: bool = false,
+        search_done: bool = false,
+        active_lookup_for_hash: bool = false,
+    };
+
+    pub fn diagnostics(self: *const DhtEngine, hash: ?[20]u8) Diagnostics {
+        var done_count: usize = 0;
+        var search_registered = false;
+        var search_done = false;
+        for (self.pending_searches.items) |search| {
+            if (search.done) done_count += 1;
+            if (hash) |h| {
+                if (std.mem.eql(u8, &search.hash, &h)) {
+                    search_registered = true;
+                    search_done = search.done;
+                }
+            }
+        }
+
+        var active_count: usize = 0;
+        var active_lookup_for_hash = false;
+        for (self.active_lookups) |maybe_lookup| {
+            if (maybe_lookup) |lk| {
+                active_count += 1;
+                if (hash) |h| {
+                    if (std.mem.eql(u8, &lk.target, &h)) {
+                        active_lookup_for_hash = true;
+                    }
+                }
+            }
+        }
+
+        var pending_count: usize = 0;
+        for (self.pending) |pending| {
+            if (pending != null) pending_count += 1;
+        }
+
+        return .{
+            .enabled = self.enabled,
+            .bootstrapped = self.bootstrapped,
+            .bootstrap_pending = self.bootstrap_pending,
+            .node_count = self.table.nodeCount(),
+            .registered_searches = self.pending_searches.items.len,
+            .registered_searches_done = done_count,
+            .active_lookups = active_count,
+            .pending_queries = pending_count,
+            .send_queue_len = self.send_queue.items.len,
+            .peer_result_queue_len = self.peer_results.items.len,
+            .search_registered = search_registered,
+            .search_done = search_done,
+            .active_lookup_for_hash = active_lookup_for_hash,
+        };
+    }
+
     /// Export all nodes from the routing table for persistence.
     /// Caller owns the returned slice.
     pub fn exportNodes(self: *const DhtEngine, allocator: std.mem.Allocator) ![]NodeInfo {
@@ -1518,6 +1583,24 @@ test "DhtEngine requestPeers v1-only (null v2) registers only one hash" {
     engine.requestPeers(v1_hash, null);
     try std.testing.expectEqual(@as(usize, 1), engine.registeredSearchCount());
     try std.testing.expectEqualSlices(u8, &v1_hash, &engine.pending_searches.items[0].hash);
+}
+
+test "DhtEngine diagnostics reports registered search state" {
+    const allocator = std.testing.allocator;
+    var rng = Random.simRandom(0x3061);
+    var engine = DhtEngine.init(allocator, &rng, node_id.generateRandom(&rng));
+    defer engine.deinit();
+
+    const v1_hash: [20]u8 = [_]u8{0xAA} ** 20;
+    engine.requestPeers(v1_hash, null);
+    engine.pending_searches.items[0].done = true;
+
+    const diag = engine.diagnostics(v1_hash);
+    try std.testing.expect(diag.enabled);
+    try std.testing.expectEqual(@as(usize, 1), diag.registered_searches);
+    try std.testing.expectEqual(@as(usize, 1), diag.registered_searches_done);
+    try std.testing.expect(diag.search_registered);
+    try std.testing.expect(diag.search_done);
 }
 
 test "DhtEngine forceRequery toggles search-done flag for both hashes" {

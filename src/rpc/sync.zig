@@ -3,7 +3,6 @@ const TorrentStats = @import("../daemon/torrent_session.zig").Stats;
 const SessionManager = @import("../daemon/session_manager.zig").SessionManager;
 const compat = @import("compat.zig");
 const json_body = @import("json_body.zig");
-const json_esc = @import("json.zig");
 
 /// Delta sync state for the /api/v2/sync/maindata endpoint.
 /// Tracks torrent snapshots across request IDs so that only changes
@@ -273,54 +272,67 @@ pub const PeerSyncState = struct {
 
         var current_hashes = std.StringHashMap(u64).init(allocator);
         defer current_hashes.deinit();
+        var current_keys = std.ArrayList([]u8).empty;
+        defer {
+            for (current_keys.items) |key| allocator.free(key);
+            current_keys.deinit(allocator);
+        }
         for (peers) |peer| {
-            try current_hashes.put(peer.ip, peerHash(peer));
+            const key = try peerKeyAlloc(allocator, peer);
+            errdefer allocator.free(key);
+            try current_hashes.put(key, peerHash(peer));
+            try current_keys.append(allocator, key);
         }
 
         self.current_rid += 1;
         const response_rid = self.current_rid;
 
-        var out = std.ArrayList(u8).empty;
-        errdefer out.deinit(allocator);
+        var out = std.Io.Writer.Allocating.init(allocator);
+        errdefer out.deinit();
 
-        try out.print(allocator, "{{\"rid\":{},\"full_update\":{s},\"peers\":{{", .{
-            response_rid,
-            if (full_update) "true" else "false",
-        });
+        var json: std.json.Stringify = .{ .writer = &out.writer, .options = .{} };
 
-        var first_peer = true;
-        for (peers) |peer| {
+        try json.beginObject();
+        try json.objectField("rid");
+        try json.write(response_rid);
+        try json.objectField("full_update");
+        try json.write(full_update);
+        try json.objectField("peers");
+        try json.beginObject();
+
+        for (peers, current_keys.items) |peer, key| {
             const include = if (full_update)
                 true
             else if (prev_snapshot) |prev| blk: {
-                const prev_hash = prev.peer_hashes.get(peer.ip);
+                const prev_hash = prev.peer_hashes.get(key);
                 break :blk prev_hash == null or prev_hash.? != peerHash(peer);
             } else true;
 
             if (!include) continue;
-            if (!first_peer) try out.append(allocator, ',');
-            first_peer = false;
-            try serializePeerObject(allocator, &out, peer);
+            try json.objectField(key);
+            try json.write(peerJson(peer));
         }
-        try out.appendSlice(allocator, "},\"peers_removed\":[");
+        try json.endObject();
 
+        try json.objectField("peers_removed");
+        try json.beginArray();
         if (!full_update) {
             if (prev_snapshot) |prev| {
-                var first_removed = true;
                 var iter = prev.peer_hashes.iterator();
                 while (iter.next()) |entry| {
                     if (!current_hashes.contains(entry.key_ptr.*)) {
-                        if (!first_removed) try out.append(allocator, ',');
-                        first_removed = false;
-                        try out.writer(allocator).print("\"{f}\"", .{json_esc.jsonSafe(entry.key_ptr.*)});
+                        try json.write(entry.key_ptr.*);
                     }
                 }
             }
         }
+        try json.endArray();
 
-        try out.appendSlice(allocator, "],\"show_flags\":true}");
+        try json.objectField("show_flags");
+        try json.write(true);
+        try json.endObject();
         self.storeSnapshot(response_rid, torrent_hash, peers);
-        return out.toOwnedSlice(allocator);
+        return out.toOwnedSlice();
     }
 
     fn getSnapshot(self: *const PeerSyncState, rid: u64, torrent_hash: []const u8) ?*const Snapshot {
@@ -347,7 +359,7 @@ pub const PeerSyncState = struct {
 
         var peer_hashes = std.StringHashMap(u64).init(self.allocator);
         for (peers) |peer| {
-            const key = self.allocator.dupe(u8, peer.ip) catch continue;
+            const key = peerKeyAlloc(self.allocator, peer) catch continue;
             peer_hashes.put(key, peerHash(peer)) catch {
                 self.allocator.free(key);
                 continue;
@@ -396,6 +408,9 @@ fn peerHash(peer: anytype) u64 {
     var hasher = std.hash.Wyhash.init(0);
     hasher.update(peer.ip);
     hasher.update(std.mem.asBytes(&peer.port));
+    hasher.update(peer.state);
+    hasher.update(peer.mode);
+    hasher.update(peer.transport);
     hasher.update(peer.client);
     hasher.update(peer.flags);
     hasher.update(std.mem.asBytes(&peer.dl_speed));
@@ -405,29 +420,104 @@ fn peerHash(peer: anytype) u64 {
     hasher.update(std.mem.asBytes(&peer.progress));
     hasher.update(std.mem.asBytes(&peer.upload_only));
     hasher.update(std.mem.asBytes(&peer.hashfails));
+    hasher.update(std.mem.asBytes(&peer.availability_known));
+    hasher.update(std.mem.asBytes(&peer.availability_count));
+    hasher.update(std.mem.asBytes(&peer.availability_pieces));
+    hasher.update(std.mem.asBytes(&peer.current_piece));
+    hasher.update(std.mem.asBytes(&peer.next_piece));
+    hasher.update(std.mem.asBytes(&peer.inflight_requests));
+    hasher.update(std.mem.asBytes(&peer.pipeline_sent));
+    hasher.update(std.mem.asBytes(&peer.next_pipeline_sent));
+    hasher.update(std.mem.asBytes(&peer.blocks_received));
+    hasher.update(std.mem.asBytes(&peer.blocks_expected));
+    hasher.update(std.mem.asBytes(&peer.send_pending));
+    hasher.update(std.mem.asBytes(&peer.recv_pending));
+    hasher.update(std.mem.asBytes(&peer.connect_pending));
+    hasher.update(std.mem.asBytes(&peer.peer_choking));
+    hasher.update(std.mem.asBytes(&peer.am_interested));
+    hasher.update(std.mem.asBytes(&peer.extensions_supported));
     return hasher.final();
 }
 
-fn serializePeerObject(
-    allocator: std.mem.Allocator,
-    json_buf: *std.ArrayList(u8),
-    peer: anytype,
-) !void {
-    const esc = json_esc.jsonSafe;
-    try json_buf.writer(allocator).print("\"{f}\":{{\"client\":\"{f}\",\"connection\":\"\",\"country\":\"\",\"country_code\":\"\",\"dl_speed\":{},\"downloaded\":{},\"files\":\"\",\"flags\":\"{f}\",\"flags_desc\":\"\",\"hashfails\":{},\"ip\":\"{f}\",\"port\":{},\"progress\":{d:.4},\"relevance\":1,\"up_speed\":{},\"uploaded\":{},\"upload_only\":{}}}", .{
-        esc(peer.ip),
-        esc(peer.client),
-        peer.dl_speed,
-        peer.downloaded,
-        esc(peer.flags),
-        peer.hashfails,
-        esc(peer.ip),
-        peer.port,
-        peer.progress,
-        peer.ul_speed,
-        peer.uploaded,
-        peer.upload_only,
-    });
+fn peerKeyAlloc(allocator: std.mem.Allocator, peer: anytype) ![]u8 {
+    if (std.mem.indexOfScalar(u8, peer.ip, ':') != null and !std.mem.startsWith(u8, peer.ip, "[")) {
+        return std.fmt.allocPrint(allocator, "[{s}]:{}", .{ peer.ip, peer.port });
+    }
+    return std.fmt.allocPrint(allocator, "{s}:{}", .{ peer.ip, peer.port });
+}
+
+const PeerJson = struct {
+    client: []const u8,
+    connection: []const u8 = "",
+    country: []const u8 = "",
+    country_code: []const u8 = "",
+    dl_speed: u64,
+    downloaded: u64,
+    files: []const u8 = "",
+    flags: []const u8,
+    flags_desc: []const u8 = "",
+    hashfails: u8,
+    ip: []const u8,
+    port: u16,
+    progress: f64,
+    relevance: u8 = 1,
+    up_speed: u64,
+    uploaded: u64,
+    upload_only: bool,
+    state: []const u8,
+    mode: []const u8,
+    transport: []const u8,
+    availability_known: bool,
+    availability_count: u32,
+    availability_pieces: u32,
+    current_piece: ?u32,
+    next_piece: ?u32,
+    inflight_requests: u32,
+    pipeline_sent: u32,
+    next_pipeline_sent: u32,
+    blocks_received: u32,
+    blocks_expected: u32,
+    send_pending: bool,
+    recv_pending: bool,
+    connect_pending: bool,
+    peer_choking: bool,
+    am_interested: bool,
+    extensions_supported: bool,
+};
+
+fn peerJson(peer: anytype) PeerJson {
+    return .{
+        .client = peer.client,
+        .dl_speed = peer.dl_speed,
+        .downloaded = peer.downloaded,
+        .flags = peer.flags,
+        .hashfails = peer.hashfails,
+        .ip = peer.ip,
+        .port = peer.port,
+        .progress = peer.progress,
+        .up_speed = peer.ul_speed,
+        .uploaded = peer.uploaded,
+        .upload_only = peer.upload_only,
+        .state = peer.state,
+        .mode = peer.mode,
+        .transport = peer.transport,
+        .availability_known = peer.availability_known,
+        .availability_count = peer.availability_count,
+        .availability_pieces = peer.availability_pieces,
+        .current_piece = peer.current_piece,
+        .next_piece = peer.next_piece,
+        .inflight_requests = peer.inflight_requests,
+        .pipeline_sent = peer.pipeline_sent,
+        .next_pipeline_sent = peer.next_pipeline_sent,
+        .blocks_received = peer.blocks_received,
+        .blocks_expected = peer.blocks_expected,
+        .send_pending = peer.send_pending,
+        .recv_pending = peer.recv_pending,
+        .connect_pending = peer.connect_pending,
+        .peer_choking = peer.peer_choking,
+        .am_interested = peer.am_interested,
+        .extensions_supported = peer.extensions_supported,
+    };
 }
 
 // ── Tests ─────────────────────────────────────────────────

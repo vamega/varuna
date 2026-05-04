@@ -1456,6 +1456,19 @@ pub fn ApiHandlerOf(comptime IO: type) type {
                 .refused_failures = diag.refused_failures,
                 .peers_connected = diag.peers_connected,
                 .peers_half_open = diag.peers_half_open,
+                .dht_enabled = diag.dht_enabled,
+                .dht_bootstrapped = diag.dht_bootstrapped,
+                .dht_bootstrap_pending = diag.dht_bootstrap_pending,
+                .dht_nodes = diag.dht_nodes,
+                .dht_registered_searches = diag.dht_registered_searches,
+                .dht_registered_searches_done = diag.dht_registered_searches_done,
+                .dht_active_lookups = diag.dht_active_lookups,
+                .dht_pending_queries = diag.dht_pending_queries,
+                .dht_send_queue_len = diag.dht_send_queue_len,
+                .dht_peer_result_queue_len = diag.dht_peer_result_queue_len,
+                .dht_search_registered = diag.dht_search_registered,
+                .dht_search_done = diag.dht_search_done,
+                .dht_active_lookup_for_hash = diag.dht_active_lookup_for_hash,
             });
         }
 
@@ -2440,6 +2453,19 @@ const ConnDiagnosticsResponse = struct {
     refused_failures: u64,
     peers_connected: u16,
     peers_half_open: u16,
+    dht_enabled: bool,
+    dht_bootstrapped: bool,
+    dht_bootstrap_pending: bool,
+    dht_nodes: usize,
+    dht_registered_searches: usize,
+    dht_registered_searches_done: usize,
+    dht_active_lookups: usize,
+    dht_pending_queries: usize,
+    dht_send_queue_len: usize,
+    dht_peer_result_queue_len: usize,
+    dht_search_registered: bool,
+    dht_search_done: bool,
+    dht_active_lookup_for_hash: bool,
 };
 
 const WebSeedResponse = struct {
