@@ -56,6 +56,7 @@ test "OutPacket default fields are zero-initialized" {
     // Verify all OutPacket fields start in a safe, known state.
     const pkt = utp.OutPacket{};
     try std.testing.expectEqual(@as(u16, 0), pkt.seq_nr);
+    try std.testing.expect(pkt.handle == null);
     try std.testing.expectEqual(@as(u16, 0), pkt.packet_len);
     try std.testing.expectEqual(@as(u16, 0), pkt.payload_len);
     try std.testing.expectEqual(@as(u32, 0), pkt.send_time_us);
@@ -81,10 +82,10 @@ test "std.net.Address size is documented" {
     try std.testing.expect(@sizeOf(std.net.Address) <= 128);
 }
 
-test "OutPacket stores one inline datagram plus small metadata" {
-    // OutPacket should remain one full datagram plus a small amount of
-    // retransmit/ACK metadata.
-    try std.testing.expect(@sizeOf(utp.OutPacket) <= utp.max_datagram + 64);
+test "OutPacket stores pool handle plus small metadata" {
+    // Retained packet bytes live in UtpPacketPool; OutPacket should stay small
+    // enough that growing the retransmit window does not bloat socket memory.
+    try std.testing.expect(@sizeOf(utp.OutPacket) <= 128);
 }
 
 // ═══════════════════════════════════════════════════════════════

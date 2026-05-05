@@ -14,6 +14,14 @@ const SimIO = varuna.io.sim_io.SimIO;
 /// File-scoped sim-seeded CSPRNG for the uTP byte-stream tests.
 var bytestream_test_rng: Random = Random.simRandom(0xb71);
 
+fn initTestPacketPool() !utp.UtpPacketPool {
+    return utp.UtpPacketPool.init(std.testing.allocator, .{
+        .initial_bytes = 512 * 1024,
+        .max_bytes = 2 * 1024 * 1024,
+        .mtu_slot_bytes = utp.max_datagram,
+    });
+}
+
 // ── Test: Full BT handshake over uTP byte stream ────────────────
 //
 // Simulates two UtpSockets (client + server) exchanging a 68-byte
@@ -34,6 +42,9 @@ test "BT handshake over uTP byte stream" {
     // ── Step 1: Three-way handshake ──
     var client = UtpSocket{};
     client.allocator = allocator;
+    var client_pool = try initTestPacketPool();
+    defer client_pool.deinit();
+    client.packet_pool = &client_pool;
     defer client.deinit();
 
     const syn_pkt = try client.connect(&bytestream_test_rng, 1_000_000);
@@ -41,6 +52,9 @@ test "BT handshake over uTP byte stream" {
 
     var server = UtpSocket{};
     server.allocator = allocator;
+    var server_pool = try initTestPacketPool();
+    defer server_pool.deinit();
+    server.packet_pool = &server_pool;
     defer server.deinit();
 
     const syn_ack_pkt = server.acceptSyn(syn_hdr, 1_001_000);
@@ -145,9 +159,15 @@ test "multiple BT wire messages over uTP byte stream" {
     // Set up connected pair
     var client = UtpSocket{};
     client.allocator = allocator;
+    var client_pool = try initTestPacketPool();
+    defer client_pool.deinit();
+    client.packet_pool = &client_pool;
     defer client.deinit();
     var server = UtpSocket{};
     server.allocator = allocator;
+    var server_pool = try initTestPacketPool();
+    defer server_pool.deinit();
+    server.packet_pool = &server_pool;
     defer server.deinit();
 
     const syn = try client.connect(&bytestream_test_rng, 1_000_000);
@@ -216,9 +236,15 @@ test "fragmented PIECE message over uTP" {
 
     var client = UtpSocket{};
     client.allocator = allocator;
+    var client_pool = try initTestPacketPool();
+    defer client_pool.deinit();
+    client.packet_pool = &client_pool;
     defer client.deinit();
     var server = UtpSocket{};
     server.allocator = allocator;
+    var server_pool = try initTestPacketPool();
+    defer server_pool.deinit();
+    server.packet_pool = &server_pool;
     defer server.deinit();
 
     // Connect

@@ -1098,20 +1098,21 @@ pub fn utpTick(self: anytype) void {
     var timeout_buf: [64]u16 = undefined;
     const timeout_count = mgr.checkTimeouts(now_us, &timeout_buf);
 
-    // Close connections that have backed off too much.
+    // Close connections whose configured SYN/FIN/DATA resend limit was
+    // exceeded by timeout handling.
     for (timeout_buf[0..timeout_count]) |utp_slot| {
         const sock = mgr.getSocket(utp_slot) orelse continue;
-        if (sock.rto >= 60_000_000) { // 60 seconds, matching the uTP max RTO.
-            const remote = mgr.getRemoteAddress(utp_slot);
-            if (mgr.reset(utp_slot, now_us)) |rst| {
-                if (remote) |addr| {
-                    utpSendPacket(self, &rst, addr);
-                }
+        if (!sock.timeout_close_pending) continue;
+
+        const remote = mgr.getRemoteAddress(utp_slot);
+        if (mgr.reset(utp_slot, now_us)) |rst| {
+            if (remote) |addr| {
+                utpSendPacket(self, &rst, addr);
             }
-            // Remove the associated peer
-            if (findPeerByUtpSlot(self, utp_slot)) |peer_slot| {
-                self.removePeer(peer_slot);
-            }
+        }
+        // Remove the associated peer.
+        if (findPeerByUtpSlot(self, utp_slot)) |peer_slot| {
+            self.removePeer(peer_slot);
         }
     }
 

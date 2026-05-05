@@ -283,6 +283,8 @@ pub fn EventLoopOf(comptime IO: type) type {
         // uTP over UDP: single UDP socket + connection multiplexer
         udp_fd: posix.fd_t = -1,
         utp_manager: ?*utp_mgr.UtpManager = null,
+        utp_settings: utp_mod.UtpSettings = .{},
+        utp_preallocate_packet_pool: bool = false,
         // Persistent recv slots and msghdrs for concurrent io_uring RECVMSGs.
         utp_recv_slots: [utp_recv_slot_count]UtpRecvSlot =
             @as([utp_recv_slot_count]UtpRecvSlot, @splat(.{})),
@@ -1760,7 +1762,11 @@ pub fn EventLoopOf(comptime IO: type) type {
 
             // Initialize UtpManager
             const mgr = try self.allocator.create(utp_mgr.UtpManager);
-            mgr.* = utp_mgr.UtpManager.init(self.allocator);
+            mgr.* = try utp_mgr.UtpManager.initWithSettings(
+                self.allocator,
+                self.utp_settings,
+                self.utp_preallocate_packet_pool,
+            );
             self.utp_manager = mgr;
 
             // Keep multiple RECVMSG SQEs posted so the shared DHT/uTP UDP
@@ -1885,6 +1891,12 @@ pub fn EventLoopOf(comptime IO: type) type {
                         self.transport_disposition.incoming_utp = false;
                         self.transport_disposition.outgoing_utp = false;
                     };
+                } else if (disp.toEnableUtp()) {
+                    if (self.utp_manager) |mgr| {
+                        mgr.ensurePacketPoolPreallocated() catch |err| {
+                            log.warn("failed to preallocate uTP packet pool on transport change: {s}", .{@errorName(err)});
+                        };
+                    }
                 }
             } else {
                 self.stopUtpListener();

@@ -32,6 +32,46 @@ pub fn runtimeIoBackendName(value: RuntimeIoBackend) []const u8 {
     };
 }
 
+pub fn parseByteSizeToml(value: toml.Value) !u64 {
+    return switch (value) {
+        .integer => |x| blk: {
+            if (x < 0) return error.InvalidByteSize;
+            break :blk @intCast(x);
+        },
+        .string => |s| parseByteSizeString(s),
+        else => error.InvalidByteSize,
+    };
+}
+
+pub fn parseByteSizeString(value: []const u8) !u64 {
+    if (value.len == 0) return error.InvalidByteSize;
+
+    var digit_end: usize = 0;
+    while (digit_end < value.len and std.ascii.isDigit(value[digit_end])) {
+        digit_end += 1;
+    }
+    if (digit_end == 0) return error.InvalidByteSize;
+    if (digit_end < value.len and (value[digit_end] == '.' or value[digit_end] == '-')) return error.InvalidByteSize;
+
+    const number = std.fmt.parseInt(u64, value[0..digit_end], 10) catch |err| switch (err) {
+        error.Overflow => return error.Overflow,
+        else => return error.InvalidByteSize,
+    };
+    const suffix = value[digit_end..];
+    const multiplier = byteSizeMultiplier(suffix) orelse return error.InvalidByteSize;
+    return std.math.mul(u64, number, multiplier) catch error.Overflow;
+}
+
+fn byteSizeMultiplier(suffix: []const u8) ?u64 {
+    if (suffix.len == 0) return 1;
+    if (std.mem.eql(u8, suffix, "K") or std.mem.eql(u8, suffix, "KB") or std.mem.eql(u8, suffix, "KiB")) return 1024;
+    if (std.mem.eql(u8, suffix, "M") or std.mem.eql(u8, suffix, "MB") or std.mem.eql(u8, suffix, "MiB")) return 1024 * 1024;
+    if (std.mem.eql(u8, suffix, "G") or std.mem.eql(u8, suffix, "GB") or std.mem.eql(u8, suffix, "GiB")) return 1024 * 1024 * 1024;
+    if (std.mem.eql(u8, suffix, "T") or std.mem.eql(u8, suffix, "TB") or std.mem.eql(u8, suffix, "TiB")) return 1024 * 1024 * 1024 * 1024;
+    if (std.mem.eql(u8, suffix, "E") or std.mem.eql(u8, suffix, "EB") or std.mem.eql(u8, suffix, "EiB")) return 1024 * 1024 * 1024 * 1024 * 1024 * 1024;
+    return null;
+}
+
 /// Fine-grained transport control inspired by uTorrent's `bt.transp_disposition`.
 /// Each bit controls a specific transport direction:
 ///   bit 0 (1): allow outgoing TCP connections
@@ -272,6 +312,18 @@ pub const Config = struct {
         /// "utp_outbound"]). Takes precedence over `enable_utp` when set.
         /// Default null means fall through to `enable_utp`.
         transport: ?TransportDisposition = null,
+        /// Initial uTP packet pool budget. TOML accepts integer bytes or
+        /// strings with binary suffixes such as "64MiB".
+        utp_packet_pool_initial_bytes: u64 = 64 * 1024 * 1024,
+        /// Maximum uTP packet pool budget. TOML accepts integer bytes or
+        /// strings with binary suffixes such as "256MiB".
+        utp_packet_pool_max_bytes: u64 = 256 * 1024 * 1024,
+        utp_target_delay_ms: u32 = 100,
+        utp_min_timeout_ms: u32 = 500,
+        utp_connect_timeout_ms: u32 = 3000,
+        utp_syn_resends: u8 = 2,
+        utp_fin_resends: u8 = 2,
+        utp_data_resends: u8 = 3,
 
         /// Resolve the effective TransportDisposition from config fields.
         /// `transport` takes precedence when set; otherwise falls back to `enable_utp`.
@@ -320,8 +372,15 @@ pub const Config = struct {
                 // Skip methods/decls, only process actual fields.
                 if (table.fetchRemove(field.name)) |entry| {
                     alloc.free(entry.key);
-                    setField(Network, &result, field.name, entry.value) catch
-                        return error.InvalidValueType;
+                    if (comptime std.mem.eql(u8, field.name, "utp_packet_pool_initial_bytes") or
+                        std.mem.eql(u8, field.name, "utp_packet_pool_max_bytes"))
+                    {
+                        @field(result, field.name) = parseByteSizeToml(entry.value) catch
+                            return error.InvalidValueType;
+                    } else {
+                        setField(Network, &result, field.name, entry.value) catch
+                            return error.InvalidValueType;
+                    }
                 }
                 // Fields not present in TOML keep their default values.
             }
@@ -489,6 +548,15 @@ pub fn validateConfig(config: Config) !void {
     _ = try parseRuntimeIoBackend(config.daemon.io_backend);
     _ = try parseEncryptionMode(config.network.encryption);
     _ = config.network.resolveTransportDisposition();
+    if (config.network.utp_packet_pool_initial_bytes > config.network.utp_packet_pool_max_bytes) {
+        return error.InvalidUtpPacketPoolBudget;
+    }
+    if (config.network.utp_target_delay_ms == 0 or
+        config.network.utp_min_timeout_ms == 0 or
+        config.network.utp_connect_timeout_ms == 0)
+    {
+        return error.InvalidUtpTimeout;
+    }
 }
 
 /// Parse the encryption config string into an EncryptionMode enum.
@@ -537,6 +605,49 @@ test "parseRuntimeIoBackend recognizes runtime backend names" {
     try std.testing.expectEqual(RuntimeIoBackend.kqueue_posix, try parseRuntimeIoBackend("kqueue_posix"));
     try std.testing.expectEqual(RuntimeIoBackend.kqueue_mmap, try parseRuntimeIoBackend("kqueue+mmap"));
     try std.testing.expectError(error.InvalidIoBackend, parseRuntimeIoBackend("select"));
+}
+
+test "parseByteSize accepts integer bytes and binary string suffixes" {
+    try std.testing.expectEqual(@as(u64, 1234), try parseByteSizeToml(toml.Value{ .integer = 1234 }));
+    try std.testing.expectEqual(@as(u64, 1024), try parseByteSizeToml(toml.Value{ .string = "1K" }));
+    try std.testing.expectEqual(@as(u64, 1024), try parseByteSizeToml(toml.Value{ .string = "1KB" }));
+    try std.testing.expectEqual(@as(u64, 1024), try parseByteSizeToml(toml.Value{ .string = "1KiB" }));
+    try std.testing.expectEqual(@as(u64, 2 * 1024 * 1024), try parseByteSizeToml(toml.Value{ .string = "2MB" }));
+    try std.testing.expectEqual(@as(u64, 3 * 1024 * 1024 * 1024), try parseByteSizeToml(toml.Value{ .string = "3GiB" }));
+    try std.testing.expectEqual(@as(u64, 4 * 1024 * 1024 * 1024 * 1024), try parseByteSizeToml(toml.Value{ .string = "4TB" }));
+    try std.testing.expectEqual(@as(u64, 5) * 1024 * 1024 * 1024 * 1024 * 1024 * 1024, try parseByteSizeToml(toml.Value{ .string = "5EiB" }));
+}
+
+test "parseByteSize rejects decimals negatives unknown suffixes and overflow" {
+    try std.testing.expectError(error.InvalidByteSize, parseByteSizeToml(toml.Value{ .string = "1.5MiB" }));
+    try std.testing.expectError(error.InvalidByteSize, parseByteSizeToml(toml.Value{ .string = "-1MiB" }));
+    try std.testing.expectError(error.InvalidByteSize, parseByteSizeToml(toml.Value{ .string = "1ZB" }));
+    try std.testing.expectError(error.InvalidByteSize, parseByteSizeToml(toml.Value{ .string = "1bytes" }));
+    try std.testing.expectError(error.Overflow, parseByteSizeToml(toml.Value{ .string = "16EiB" }));
+    try std.testing.expectError(error.InvalidByteSize, parseByteSizeToml(toml.Value{ .integer = -1 }));
+}
+
+test "network config parses uTP packet pool byte-size fields" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    try tmp.dir.writeFile(.{
+        .sub_path = "utp-pool.toml",
+        .data =
+        \\[network]
+        \\utp_packet_pool_initial_bytes = "1MiB"
+        \\utp_packet_pool_max_bytes = 2097152
+        \\
+        ,
+    });
+
+    var path_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const path = try tmp.dir.realpath("utp-pool.toml", &path_buf);
+    var loaded = try load(std.testing.allocator, path);
+    defer loaded.deinit();
+
+    try std.testing.expectEqual(@as(u64, 1024 * 1024), loaded.value.network.utp_packet_pool_initial_bytes);
+    try std.testing.expectEqual(@as(u64, 2 * 1024 * 1024), loaded.value.network.utp_packet_pool_max_bytes);
 }
 
 test "loadDefault stops on malformed config in current directory" {

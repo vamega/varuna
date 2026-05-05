@@ -180,6 +180,17 @@ fn runDaemonWithBackend(
     shared_el.pex_enabled = cfg.network.pex;
     const transport_disp = cfg.network.resolveTransportDisposition();
     shared_el.transport_disposition = transport_disp;
+    shared_el.utp_settings = .{
+        .packet_pool_initial_bytes = cfg.network.utp_packet_pool_initial_bytes,
+        .packet_pool_max_bytes = cfg.network.utp_packet_pool_max_bytes,
+        .target_delay_ms = cfg.network.utp_target_delay_ms,
+        .min_timeout_ms = cfg.network.utp_min_timeout_ms,
+        .connect_timeout_ms = cfg.network.utp_connect_timeout_ms,
+        .syn_resends = cfg.network.utp_syn_resends,
+        .fin_resends = cfg.network.utp_fin_resends,
+        .data_resends = cfg.network.utp_data_resends,
+    };
+    shared_el.utp_preallocate_packet_pool = transport_disp.toEnableUtp();
 
     var dht_state = try initDht(allocator, shared_el, cfg, stdout);
     defer dht_state.deinit(allocator);

@@ -1,5 +1,6 @@
 const std = @import("std");
 const utp = @import("utp.zig");
+const UtpPacketPool = @import("utp_packet_pool.zig").UtpPacketPool;
 const Header = utp.Header;
 const UtpSocket = utp.UtpSocket;
 const State = utp.State;
@@ -32,12 +33,38 @@ pub const UtpManager = struct {
     /// Allocator for any dynamic allocations (reorder buffers, etc.).
     allocator: std.mem.Allocator,
 
+    settings: utp.UtpSettings = .{},
+    packet_pool: UtpPacketPool,
+
     const accept_queue_size: u16 = 128;
 
     pub fn init(allocator: std.mem.Allocator) UtpManager {
+        return initWithSettingsNoPrealloc(allocator, .{});
+    }
+
+    pub fn initWithSettingsNoPrealloc(allocator: std.mem.Allocator, settings: utp.UtpSettings) UtpManager {
         return .{
             .allocator = allocator,
+            .settings = settings,
+            .packet_pool = UtpPacketPool.initEmpty(allocator, .{
+                .initial_bytes = settings.packet_pool_initial_bytes,
+                .max_bytes = settings.packet_pool_max_bytes,
+                .mtu_slot_bytes = utp.max_datagram,
+            }),
         };
+    }
+
+    pub fn initWithSettings(allocator: std.mem.Allocator, settings: utp.UtpSettings, preallocate_pool: bool) !UtpManager {
+        var mgr = initWithSettingsNoPrealloc(allocator, settings);
+        errdefer mgr.deinit();
+        if (preallocate_pool) {
+            try mgr.packet_pool.preallocate(settings.packet_pool_initial_bytes);
+        }
+        return mgr;
+    }
+
+    pub fn ensurePacketPoolPreallocated(self: *UtpManager) !void {
+        try self.packet_pool.preallocate(self.settings.packet_pool_initial_bytes);
     }
 
     /// Free all heap-allocated sockets. Call before destroying the manager.
@@ -49,6 +76,7 @@ pub const UtpManager = struct {
                 self.connections[i] = null;
             }
         }
+        self.packet_pool.deinit();
         self.active_count = 0;
     }
 
@@ -145,10 +173,10 @@ pub const UtpManager = struct {
     }
 
     /// Close a connection gracefully by sending FIN.
-    pub fn close(self: *UtpManager, slot: u16, now_us: u32) ?[Header.size]u8 {
+    pub fn close(self: *UtpManager, slot: u16, now_us: u32) !?[Header.size]u8 {
         if (slot >= max_connections or !self.slot_active[slot]) return null;
         const sock = self.connections[slot].?;
-        const fin = sock.createFinPacket(now_us);
+        const fin = try sock.createFinPacket(now_us);
         return fin;
     }
 
@@ -378,6 +406,8 @@ pub const UtpManager = struct {
             if (!self.slot_active[i]) {
                 const sock = self.allocator.create(UtpSocket) catch return null;
                 sock.* = .{};
+                sock.applySettings(self.settings);
+                sock.packet_pool = &self.packet_pool;
                 self.connections[i] = sock;
                 self.slot_active[i] = true;
                 self.active_count += 1;
@@ -545,7 +575,7 @@ test "manager close sends FIN" {
     // Manually transition to connected for testing.
     mgr.connections[conn.slot].?.state = .connected;
 
-    const fin = mgr.close(conn.slot, 2_000_000);
+    const fin = try mgr.close(conn.slot, 2_000_000);
     try std.testing.expect(fin != null);
 
     const hdr = Header.decode(&fin.?).?;
@@ -683,13 +713,27 @@ test "manager freeSlot cleans up outbound buffers" {
 
     const conn = try mgr.connect(&utp_test_rng, remote, 1_000_000);
 
-    // SYN is buffered inline for retransmission.
+    // SYN is buffered in the manager-owned packet pool for retransmission.
     const sock = mgr.getSocket(conn.slot).?;
     try std.testing.expect(sock.outPacketForSeq(sock.out_seq_start).?.packet_len != 0);
+    try std.testing.expect(mgr.packet_pool.stats().used_bytes > 0);
 
     // Reset frees the slot and the outbound buffers.
     _ = mgr.reset(conn.slot, 2_000_000);
     try std.testing.expectEqual(@as(u16, 0), mgr.connectionCount());
+    try std.testing.expectEqual(@as(u64, 0), mgr.packet_pool.stats().used_bytes);
+}
+
+test "manager can preallocate packet pool after UDP listener already exists" {
+    var mgr = UtpManager.initWithSettingsNoPrealloc(std.testing.allocator, .{
+        .packet_pool_initial_bytes = 1024,
+        .packet_pool_max_bytes = 1024,
+    });
+    defer mgr.deinit();
+
+    try std.testing.expectEqual(@as(u64, 0), mgr.packet_pool.stats().capacity_bytes);
+    try mgr.ensurePacketPoolPreallocated();
+    try std.testing.expectEqual(@as(u64, 1024), mgr.packet_pool.stats().capacity_bytes);
 }
 
 // ── Extension chain regression tests ──────────────────────

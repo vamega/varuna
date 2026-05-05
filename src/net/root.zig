@@ -12,6 +12,8 @@ pub const pex = @import("pex.zig");
 pub const socket = @import("socket.zig");
 pub const ut_metadata = @import("ut_metadata.zig");
 pub const utp = @import("utp.zig");
+pub const utp_packet_pool = @import("utp_packet_pool.zig");
+pub const utp_settings = @import("utp_settings.zig");
 pub const ledbat = @import("ledbat.zig");
 pub const utp_manager = @import("utp_manager.zig");
 pub const web_seed = @import("web_seed.zig");
@@ -36,6 +38,8 @@ test {
     _ = socket;
     _ = ut_metadata;
     _ = utp;
+    _ = utp_packet_pool;
+    _ = utp_settings;
     _ = utp_manager;
     _ = web_seed;
 }

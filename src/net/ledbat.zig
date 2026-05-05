@@ -39,10 +39,13 @@ pub const Ledbat = struct {
     /// on too few samples during startup).
     sample_count: u32 = 0,
 
+    /// Target one-way delay in microseconds.
+    target_delay_us: u32 = default_target_delay_us,
+
     // ── Constants ────────────────────────────────────────
 
-    /// Target one-way delay in microseconds (100 ms per BEP 29).
-    pub const target_delay_us: u32 = 100_000;
+    /// Default target one-way delay in microseconds (100 ms per BEP 29).
+    pub const default_target_delay_us: u32 = 100_000;
 
     /// Minimum congestion window: one packet (MTU).
     pub const min_cwnd: u32 = mss;
@@ -65,8 +68,13 @@ pub const Ledbat = struct {
     // ── Public API ───────────────────────────────────────
 
     pub fn init() Ledbat {
+        return initWithTargetDelay(default_target_delay_us);
+    }
+
+    pub fn initWithTargetDelay(target_delay_us: u32) Ledbat {
         return .{
             .cwnd = mss * 2, // start with 2 segments
+            .target_delay_us = target_delay_us,
         };
     }
 
@@ -97,6 +105,7 @@ pub const Ledbat = struct {
 
         // Off-target: positive means delay is below target (speed up),
         // negative means above target (slow down).
+        const target_delay_us = @max(self.target_delay_us, 1);
         const off_target: i64 = @as(i64, target_delay_us) - queuing_delay;
 
         if (self.cwnd < self.ssthresh) {
