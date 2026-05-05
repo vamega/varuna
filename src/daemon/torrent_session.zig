@@ -1669,9 +1669,8 @@ pub fn TorrentSessionOf(comptime IO: type) type {
                 .key = key_value,
                 .num_want = @intCast(@min(request.numwant, std.math.maxInt(i32))),
                 .listen_port = request.port,
-                .host_len = @intCast(parsed.host.len),
             };
-            @memcpy(job.host[0..parsed.host.len], parsed.host);
+            job.setHost(parsed.host) catch return false;
             executor.submit(job) catch return false;
             return true;
         }
@@ -1814,9 +1813,8 @@ pub fn TorrentSessionOf(comptime IO: type) type {
                 .kind = .scrape,
                 .port = parsed.port,
                 .info_hash = info_hash,
-                .host_len = @intCast(parsed.host.len),
             };
-            @memcpy(job.host[0..parsed.host.len], parsed.host);
+            job.setHost(parsed.host) catch return false;
             executor.submit(job) catch return false;
             return true;
         }

@@ -90,6 +90,7 @@ pub fn HttpExecutorOf(comptime IO: type) type {
         pub const max_cookie_len = 512;
         pub const max_header_len = 256;
         pub const max_extra_headers = 4;
+        pub const max_response_size = 8 * 1024 * 1024;
 
         pub const RequestResult = struct {
             status: u16 = 0,
@@ -1206,8 +1207,8 @@ pub fn HttpExecutorOf(comptime IO: type) type {
                         return;
                     };
                     if (pn == 0) break;
-                    self.appendRecvData(slot, plaintext_buf[0..pn]) catch {
-                        self.completeSlot(slot_idx, .{ .err = error.OutOfMemory });
+                    self.appendRecvData(slot, plaintext_buf[0..pn]) catch |err| {
+                        self.completeSlot(slot_idx, .{ .err = err });
                         return;
                     };
                 }
@@ -1225,8 +1226,8 @@ pub fn HttpExecutorOf(comptime IO: type) type {
                 return;
             }
 
-            self.appendRecvData(slot, slot.recv_tmp[0..n]) catch {
-                self.completeSlot(slot_idx, .{ .err = error.OutOfMemory });
+            self.appendRecvData(slot, slot.recv_tmp[0..n]) catch |err| {
+                self.completeSlot(slot_idx, .{ .err = err });
                 return;
             };
 
@@ -1241,12 +1242,22 @@ pub fn HttpExecutorOf(comptime IO: type) type {
         fn appendRecvData(self: *Self, slot: *RequestSlot, data: []const u8) !void {
             if (slot.job.target_buf == null) {
                 // No target buffer -- accumulate everything in recv_buf as before.
+                if (slot.recv_buf.items.len > max_response_size or
+                    data.len > max_response_size - slot.recv_buf.items.len)
+                {
+                    return error.ResponseTooLarge;
+                }
                 try slot.recv_buf.appendSlice(self.allocator, data);
                 return;
             }
 
             if (!slot.headers_done) {
                 // Haven't found the end of headers yet -- accumulate in recv_buf.
+                if (slot.recv_buf.items.len > max_response_size or
+                    data.len > max_response_size - slot.recv_buf.items.len)
+                {
+                    return error.ResponseTooLarge;
+                }
                 try slot.recv_buf.appendSlice(self.allocator, data);
 
                 // Check if headers are now complete.
@@ -1294,7 +1305,8 @@ pub fn HttpExecutorOf(comptime IO: type) type {
 
             // Without target_buf: everything is in recv_buf.
             if (http.parseContentLength(data[0..body_start])) |cl| {
-                return data.len >= body_start + cl;
+                const body_end = http.bodyEndOffset(body_start, cl) orelse return false;
+                return data.len >= body_end;
             }
             // No Content-Length -- check for Connection: close pattern (wait for EOF).
             return false;

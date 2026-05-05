@@ -421,7 +421,10 @@ pub fn ApiServerOf(comptime IO: type) type {
             };
             const headers = data[first_line_end + 2 .. header_end];
             const content_length = parseContentLength(headers) orelse 0;
-            const total_needed = body_start + content_length;
+            const total_needed = std.math.add(usize, body_start, content_length) catch {
+                self.sendErrorResponse(slot, 413, "Request Too Large");
+                return;
+            };
             if (total_needed > max_request_size) {
                 self.sendErrorResponse(slot, 413, "Request Too Large");
                 return;
@@ -617,9 +620,10 @@ fn parseRequest(data: []const u8) ?ParsedRequest {
     // Extract headers
     const headers = data[first_line_end + 2 .. header_end];
     const content_length = parseContentLength(headers) orelse 0;
-    const consumed_len = header_end + 4 + content_length;
+    const body_start = header_end + 4;
+    const consumed_len = std.math.add(usize, body_start, content_length) catch return null;
     if (consumed_len > data.len) return null;
-    const body = data[header_end + 4 .. consumed_len];
+    const body = data[body_start..consumed_len];
     const cookie_sid = auth.extractSidFromHeaders(headers);
     const content_type = extractHeader(headers, "content-type");
     const keep_alive = requestKeepAlive(version, extractHeader(headers, "connection"));

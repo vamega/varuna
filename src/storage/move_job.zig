@@ -348,6 +348,10 @@ pub const MoveJob = struct {
         return self.runner == .event_loop and self.progress().state == .running;
     }
 
+    pub fn hasPendingEventLoopIo(self: *MoveJob) bool {
+        return self.runner == .event_loop and self.io_pending;
+    }
+
     pub fn tickOnEventLoop(self: *MoveJob, io: anytype) void {
         if (self.runner != .event_loop) return;
         if (self.progress().state != .running) return;

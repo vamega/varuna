@@ -178,6 +178,8 @@ pub fn SessionManagerOf(comptime IO: type) type {
         }
 
         pub fn deinit(self: *Self) void {
+            self.cancelAndDrainMoveJobsForDeinit();
+
             var iter = self.sessions.iterator();
             while (iter.next()) |entry| {
                 entry.value_ptr.*.deinit();
@@ -190,11 +192,21 @@ pub fn SessionManagerOf(comptime IO: type) type {
             self.relocating_torrents.deinit();
 
             // Move jobs: cancel any still-running jobs and join their
-            // worker threads before destroying them. The destroy() call
-            // already joins, so iterating is sufficient.
+            // worker threads before destroying them. Event-loop jobs are
+            // drained above so their embedded completion/userdata is no
+            // longer owned by the IO backend when destroy frees the job.
             var jobs_it = self.move_jobs.iterator();
             while (jobs_it.next()) |entry| {
                 entry.value_ptr.*.requestCancel();
+                if (entry.value_ptr.*.isEventLoopRunning() or
+                    entry.value_ptr.*.hasPendingEventLoopIo())
+                {
+                    std.log.err(
+                        "leaking event-loop move job {d} during teardown to avoid pending-IO use-after-free",
+                        .{entry.key_ptr.*},
+                    );
+                    continue;
+                }
                 entry.value_ptr.*.destroy();
             }
             self.move_jobs.deinit();
@@ -223,6 +235,37 @@ pub fn SessionManagerOf(comptime IO: type) type {
                 self.udp_tracker_executor = null;
             }
             if (self.resume_db) |*db| db.close();
+        }
+
+        fn cancelAndDrainMoveJobsForDeinit(self: *Self) void {
+            if (self.move_jobs.count() == 0) return;
+
+            var cancel_it = self.move_jobs.iterator();
+            while (cancel_it.next()) |entry| {
+                entry.value_ptr.*.requestCancel();
+            }
+
+            const el = self.shared_event_loop orelse return;
+
+            var rounds: u32 = 0;
+            while (rounds < 1024) : (rounds += 1) {
+                var any_running = false;
+                var any_pending = false;
+
+                var tick_it = self.move_jobs.iterator();
+                while (tick_it.next()) |entry| {
+                    const job = entry.value_ptr.*;
+                    if (!job.isEventLoopRunning()) continue;
+                    any_running = true;
+                    job.tickOnEventLoop(&el.io);
+                    any_pending = any_pending or job.hasPendingEventLoopIo();
+                }
+
+                if (!any_running) return;
+                if (any_pending) {
+                    el.io.tick(1) catch return;
+                }
+            }
         }
 
         /// Add a torrent from raw .torrent bytes.

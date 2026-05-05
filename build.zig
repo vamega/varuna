@@ -507,6 +507,171 @@ pub fn build(b: *std.Build) void {
     test_safety_step.dependOn(&run_safety_tests.step);
     test_step.dependOn(&run_safety_tests.step);
 
+    // ── Memory-safety regressions ───────────────────────────
+    //
+    // Focused regressions for the 2026-05-05 memory-safety audit. The
+    // individual steps keep each historical failure easy to rerun, while the
+    // aggregate step is part of the main `zig build test` suite.
+    const memory_safety_tests = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("tests/memory_safety_validation_test.zig"),
+            .target = target,
+            .optimize = optimize,
+            .imports = &varuna_import,
+        }),
+    });
+    const run_memory_safety_tests = b.addRunArtifact(memory_safety_tests);
+    const test_memory_safety_step = b.step(
+        "test-memory-safety",
+        "Run memory-safety regression tests",
+    );
+    test_memory_safety_step.dependOn(&run_memory_safety_tests.step);
+    test_step.dependOn(&run_memory_safety_tests.step);
+
+    const memory_seed_span_tests = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("tests/memory_safety_validation_test.zig"),
+            .target = target,
+            .optimize = optimize,
+            .imports = &varuna_import,
+        }),
+        .filters = &.{"memory safety validation: seed span"},
+    });
+    const run_memory_seed_span_tests = b.addRunArtifact(memory_seed_span_tests);
+    const test_memory_seed_span_step = b.step(
+        "test-memory-seed-spans",
+        "Validate seed-mode multi-span read ownership regressions",
+    );
+    test_memory_seed_span_step.dependOn(&run_memory_seed_span_tests.step);
+
+    const memory_bencode_trailing_tests = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("tests/memory_safety_validation_test.zig"),
+            .target = target,
+            .optimize = optimize,
+            .imports = &varuna_import,
+        }),
+        .filters = &.{"memory safety validation: bencode trailing"},
+    });
+    const run_memory_bencode_trailing_tests = b.addRunArtifact(memory_bencode_trailing_tests);
+    const test_memory_bencode_trailing_step = b.step(
+        "test-memory-bencode-trailing",
+        "Validate bencode root cleanup on trailing data",
+    );
+    test_memory_bencode_trailing_step.dependOn(&run_memory_bencode_trailing_tests.step);
+
+    const memory_bencode_nested_tests = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("tests/memory_safety_validation_test.zig"),
+            .target = target,
+            .optimize = optimize,
+            .imports = &varuna_import,
+        }),
+        .filters = &.{"memory safety validation: bencode nested"},
+    });
+    const run_memory_bencode_nested_tests = b.addRunArtifact(memory_bencode_nested_tests);
+    const test_memory_bencode_nested_step = b.step(
+        "test-memory-bencode-nested",
+        "Validate bencode child cleanup on nested parse errors",
+    );
+    test_memory_bencode_nested_step.dependOn(&run_memory_bencode_nested_tests.step);
+
+    const memory_metainfo_oom_tests = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("tests/memory_safety_validation_test.zig"),
+            .target = target,
+            .optimize = optimize,
+            .imports = &varuna_import,
+        }),
+        .filters = &.{"memory safety validation: metainfo allocation"},
+    });
+    const run_memory_metainfo_oom_tests = b.addRunArtifact(memory_metainfo_oom_tests);
+    const test_memory_metainfo_oom_step = b.step(
+        "test-memory-metainfo-oom",
+        "Probe metainfo partial-initialization cleanup under allocation failure",
+    );
+    test_memory_metainfo_oom_step.dependOn(&run_memory_metainfo_oom_tests.step);
+
+    const memory_udp_host_tests = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("tests/memory_safety_validation_test.zig"),
+            .target = target,
+            .optimize = optimize,
+            .imports = &varuna_import,
+        }),
+        .filters = &.{"memory safety validation: UDP tracker"},
+    });
+    const run_memory_udp_host_tests = b.addRunArtifact(memory_udp_host_tests);
+    const test_memory_udp_host_step = b.step(
+        "test-memory-udp-host-overflow",
+        "Validate UDP tracker host length is bounded before fixed-buffer copy",
+    );
+    test_memory_udp_host_step.dependOn(&run_memory_udp_host_tests.step);
+
+    const memory_rpc_cl_tests = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("tests/memory_safety_validation_test.zig"),
+            .target = target,
+            .optimize = optimize,
+            .imports = &varuna_import,
+        }),
+        .filters = &.{"memory safety validation: RPC Content-Length"},
+    });
+    const run_memory_rpc_cl_tests = b.addRunArtifact(memory_rpc_cl_tests);
+    const test_memory_rpc_cl_step = b.step(
+        "test-memory-rpc-content-length",
+        "Validate RPC Content-Length overflow is rejected",
+    );
+    test_memory_rpc_cl_step.dependOn(&run_memory_rpc_cl_tests.step);
+
+    const memory_http_cl_tests = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("tests/memory_safety_validation_test.zig"),
+            .target = target,
+            .optimize = optimize,
+            .imports = &varuna_import,
+        }),
+        .filters = &.{"memory safety validation: HTTP executor"},
+    });
+    const run_memory_http_cl_tests = b.addRunArtifact(memory_http_cl_tests);
+    const test_memory_http_cl_step = b.step(
+        "test-memory-http-content-length",
+        "Validate HTTP executor Content-Length overflow is rejected",
+    );
+    test_memory_http_cl_step.dependOn(&run_memory_http_cl_tests.step);
+
+    const memory_storage_tests = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("tests/memory_safety_validation_test.zig"),
+            .target = target,
+            .optimize = optimize,
+            .imports = &varuna_import,
+        }),
+        .filters = &.{"memory safety validation: storage"},
+    });
+    const run_memory_storage_tests = b.addRunArtifact(memory_storage_tests);
+    const test_memory_storage_step = b.step(
+        "test-memory-storage-partial-submit",
+        "Validate storage batch partial-submit drains live completions",
+    );
+    test_memory_storage_step.dependOn(&run_memory_storage_tests.step);
+
+    const memory_move_job_tests = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("tests/memory_safety_validation_test.zig"),
+            .target = target,
+            .optimize = optimize,
+            .imports = &varuna_import,
+        }),
+        .filters = &.{"memory safety validation: session manager"},
+    });
+    const run_memory_move_job_tests = b.addRunArtifact(memory_move_job_tests);
+    const test_memory_move_job_step = b.step(
+        "test-memory-move-job-deinit",
+        "Validate move-job teardown drains pending event-loop completions",
+    );
+    test_memory_move_job_step.dependOn(&run_memory_move_job_tests.step);
+
     // ── IO backend parity tests (RealIO vs SimIO) ─────────
     const io_parity_tests = b.addTest(.{
         .root_module = b.createModule(.{

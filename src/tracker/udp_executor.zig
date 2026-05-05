@@ -81,6 +81,8 @@ pub fn UdpTrackerExecutorOf(comptime IO: type) type {
             scrape,
         };
 
+        pub const max_host_len: usize = 253;
+
         pub const Job = struct {
             context: *anyopaque,
             on_complete: CompletionFn,
@@ -100,10 +102,14 @@ pub fn UdpTrackerExecutorOf(comptime IO: type) type {
             num_want: i32 = -1,
             listen_port: u16 = 0,
 
-            const max_host_len = 253;
-
             pub fn hostSlice(self: *const Job) []const u8 {
                 return self.host[0..self.host_len];
+            }
+
+            pub fn setHost(self: *Job, host: []const u8) !void {
+                if (host.len > max_host_len) return error.HostTooLong;
+                @memcpy(self.host[0..host.len], host);
+                self.host_len = @intCast(host.len);
             }
         };
 

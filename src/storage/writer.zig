@@ -458,17 +458,22 @@ pub fn PieceStoreOf(comptime IO: type) type {
             defer self.allocator.free(completions);
             @memset(completions, .{});
 
-            var ctx = SyncContext{ .pending = open_count };
+            var ctx = SyncContext{ .pending = 0 };
 
             var i: usize = 0;
             for (self.files) |maybe_file| {
                 if (maybe_file) |file| {
-                    try io.fsync(
+                    io.fsync(
                         .{ .fd = file.handle, .datasync = true },
                         &completions[i],
                         &ctx,
                         syncCompleteCallback,
-                    );
+                    ) catch |err| {
+                        while (ctx.pending > 0) try io.tick(1);
+                        if (ctx.first_error) |first| return first;
+                        return err;
+                    };
+                    ctx.pending += 1;
                     i += 1;
                 }
             }
@@ -614,7 +619,7 @@ fn preallocateAll(
     for (file_entries, 0..) |fe, i| lengths[i] = fe.length;
 
     var ctx = PreallocCtx{
-        .pending = open_count,
+        .pending = 0,
         .files = files,
         .lengths = lengths,
     };
@@ -623,7 +628,7 @@ fn preallocateAll(
     for (files, 0..) |maybe_file, file_index| {
         const file = maybe_file orelse continue;
         slots[i] = .{ .ctx = &ctx, .file_index = file_index };
-        try io.fallocate(
+        io.fallocate(
             .{
                 .fd = file.handle,
                 .mode = 0,
@@ -633,7 +638,12 @@ fn preallocateAll(
             &completions[i],
             &slots[i],
             preallocCallback,
-        );
+        ) catch |err| {
+            while (ctx.pending > 0) try io.tick(1);
+            if (ctx.first_error) |first| return first;
+            return err;
+        };
+        ctx.pending += 1;
         i += 1;
     }
 
@@ -645,17 +655,22 @@ fn preallocateAll(
     // them all and drain. Re-uses the per-slot completions that just
     // disarmed during the fallocate drain.
     if (ctx.fallback_count > 0) {
-        var t_ctx = TruncateCtx{ .pending = ctx.fallback_count };
+        var t_ctx = TruncateCtx{ .pending = 0 };
         var slot_idx: usize = 0;
         for (slots) |*slot| {
             if (slot.needs_truncate) {
                 const file = ctx.files[slot.file_index].?;
-                try io.truncate(
+                io.truncate(
                     .{ .fd = file.handle, .length = ctx.lengths[slot.file_index] },
                     &completions[slot_idx],
                     &t_ctx,
                     truncateCallback,
-                );
+                ) catch |err| {
+                    while (t_ctx.pending > 0) try io.tick(1);
+                    if (t_ctx.first_error) |first| return first;
+                    return err;
+                };
+                t_ctx.pending += 1;
             }
             slot_idx += 1;
         }

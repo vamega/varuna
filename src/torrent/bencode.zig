@@ -30,6 +30,7 @@ pub fn parse(allocator: std.mem.Allocator, input: []const u8) ParseError!Value {
     };
 
     const value = try parser.parseValue();
+    errdefer freeValue(allocator, value);
     if (!parser.isAtEnd()) {
         return error.TrailingData;
     }
@@ -143,7 +144,12 @@ const Parser = struct {
         defer self.depth -= 1;
 
         var values: std.ArrayListUnmanaged(Value) = .empty;
-        errdefer values.deinit(self.allocator);
+        errdefer {
+            for (values.items) |item| {
+                freeValue(self.allocator, item);
+            }
+            values.deinit(self.allocator);
+        }
 
         while (true) {
             const next = self.peek() orelse return error.UnexpectedEndOfStream;
@@ -153,7 +159,11 @@ const Parser = struct {
             }
             if (values.items.len >= max_container_elements) return error.TooManyElements;
 
-            try values.append(self.allocator, try self.parseValue());
+            const value = try self.parseValue();
+            var value_owned = true;
+            errdefer if (value_owned) freeValue(self.allocator, value);
+            try values.append(self.allocator, value);
+            value_owned = false;
         }
     }
 
@@ -181,10 +191,13 @@ const Parser = struct {
 
             const key = try self.parseBytes();
             const value = try self.parseValue();
+            var value_owned = true;
+            errdefer if (value_owned) freeValue(self.allocator, value);
             try entries.append(self.allocator, .{
                 .key = key,
                 .value = value,
             });
+            value_owned = false;
         }
     }
 

@@ -143,6 +143,10 @@ pub fn parseContentLength(headers: []const u8) ?usize {
     return null;
 }
 
+pub fn bodyEndOffset(body_start: usize, content_length: usize) ?usize {
+    return std.math.add(usize, body_start, content_length) catch null;
+}
+
 /// Check if the Connection header is set to "close".
 pub fn parseConnectionClose(headers: []const u8) bool {
     var iter = std.mem.splitSequence(u8, headers, "\r\n");

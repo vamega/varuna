@@ -36,7 +36,7 @@ fn SeedReadOpOf(comptime EL: type) type {
         completion: io_interface.Completion = .{},
         el: *EL,
         read_id: u32,
-        span_index: u8,
+        span_index: usize,
     };
 }
 
@@ -317,6 +317,13 @@ pub fn servePieceRequest(self: anytype, slot: u16, payload: []const u8) void {
         });
         return;
     };
+    const expected_read_lengths = self.allocator.alloc(u32, plan.spans.len) catch |err| {
+        log.warn("seed: expected read lengths alloc piece={d} spans={d} err={s}", .{
+            piece_index, plan.spans.len, @errorName(err),
+        });
+        self.releasePieceBuffer(piece_buffer);
+        return;
+    };
     const read_id = nextSeedReadId(self);
 
     self.pending_reads.append(self.allocator, .{
@@ -328,14 +335,16 @@ pub fn servePieceRequest(self: anytype, slot: u16, payload: []const u8) void {
         .piece_buffer = piece_buffer,
         .reads_remaining = 0,
         .submitted_span_count = 0,
+        .expected_read_lengths = expected_read_lengths,
     }) catch |err| {
         log.warn("seed: pending_reads.append err={s}; releasing buffer", .{@errorName(err)});
+        self.allocator.free(expected_read_lengths);
         self.releasePieceBuffer(piece_buffer);
         return;
     };
 
     const pending_index = self.pending_reads.items.len - 1;
-    var submitted_reads: u32 = 0;
+    var submitted_reads: usize = 0;
     const EL = @TypeOf(self.*);
     const SeedReadOp = SeedReadOpOf(EL);
 
@@ -343,13 +352,14 @@ pub fn servePieceRequest(self: anytype, slot: u16, payload: []const u8) void {
     // io_interface backend. Each span's SeedReadOp lives on the heap and
     // carries (read_id, span_index) so the callback can locate the
     // owning PendingPieceRead.
-    for (plan.spans, 0..) |span, span_index| {
+    for (plan.spans) |span| {
         const target = piece_buffer.buf[span.piece_offset .. span.piece_offset + span.length];
         const op = self.allocator.create(SeedReadOp) catch |err| {
             log.warn("seed read op alloc for piece {d}: {s}", .{ piece_index, @errorName(err) });
             continue;
         };
-        op.* = .{ .el = self, .read_id = read_id, .span_index = @intCast(span_index) };
+        const submitted_index = submitted_reads;
+        op.* = .{ .el = self, .read_id = read_id, .span_index = submitted_index };
         self.io.read(
             .{ .fd = tc.shared_fds[span.file_index], .buf = target, .offset = span.file_offset },
             &op.completion,
@@ -360,44 +370,69 @@ pub fn servePieceRequest(self: anytype, slot: u16, payload: []const u8) void {
             self.allocator.destroy(op);
             continue;
         };
-        self.pending_reads.items[pending_index].expected_read_lengths[submitted_reads] = @intCast(span.length);
+        self.pending_reads.items[pending_index].expected_read_lengths[submitted_index] = @intCast(span.length);
         submitted_reads += 1;
     }
 
     if (submitted_reads == 0) {
         _ = self.pending_reads.pop();
+        self.allocator.free(expected_read_lengths);
         self.releasePieceBuffer(piece_buffer);
         return;
     }
 
     self.pending_reads.items[pending_index].reads_remaining = submitted_reads;
-    self.pending_reads.items[pending_index].submitted_span_count = @intCast(submitted_reads);
+    self.pending_reads.items[pending_index].submitted_span_count = submitted_reads;
 }
 
-fn handleSeedReadResult(self: anytype, read_id: u32, span_index: u8, res: i32) void {
+fn destroyFailedPendingSeedRead(self: anytype, idx: usize, pending: anytype) void {
+    self.allocator.free(pending.expected_read_lengths);
+    self.releasePieceBuffer(pending.piece_buffer);
+    _ = self.pending_reads.swapRemove(idx);
+}
+
+fn markPendingSeedReadFailed(self: anytype, idx: usize, pending_in: anytype) void {
+    var pending = pending_in;
+    pending.read_failed = true;
+    if (pending.reads_remaining > 0) {
+        pending.reads_remaining -= 1;
+    }
+    if (pending.reads_remaining > 0) {
+        self.pending_reads.items[idx] = pending;
+        return;
+    }
+    destroyFailedPendingSeedRead(self, idx, pending);
+}
+
+fn handleSeedReadResult(self: anytype, read_id: u32, span_index: usize, res: i32) void {
     const idx = findPendingSeedReadIndex(self.pending_reads.items, read_id) orelse return;
     var pending = self.pending_reads.items[idx];
     if (span_index >= pending.submitted_span_count) {
-        self.releasePieceBuffer(pending.piece_buffer);
-        _ = self.pending_reads.swapRemove(idx);
+        markPendingSeedReadFailed(self, idx, pending);
         return;
     }
 
     if (res <= 0) {
-        self.releasePieceBuffer(pending.piece_buffer);
-        _ = self.pending_reads.swapRemove(idx);
+        markPendingSeedReadFailed(self, idx, pending);
         return;
     }
 
     const expected_len = pending.expected_read_lengths[span_index];
     const actual_len: u32 = @intCast(res);
     if (actual_len != expected_len) {
-        self.releasePieceBuffer(pending.piece_buffer);
-        _ = self.pending_reads.swapRemove(idx);
+        markPendingSeedReadFailed(self, idx, pending);
         return;
     }
 
     pending.reads_remaining -= 1;
+    if (pending.read_failed) {
+        if (pending.reads_remaining > 0) {
+            self.pending_reads.items[idx] = pending;
+            return;
+        }
+        destroyFailedPendingSeedRead(self, idx, pending);
+        return;
+    }
     if (pending.reads_remaining > 0) {
         self.pending_reads.items[idx] = pending;
         return;
@@ -405,6 +440,7 @@ fn handleSeedReadResult(self: anytype, read_id: u32, span_index: u8, res: i32) v
 
     // All spans read -- remove from pending list before queueing/sending.
     _ = self.pending_reads.swapRemove(idx);
+    self.allocator.free(pending.expected_read_lengths);
 
     // Update cache
     if (self.cached_piece_buffer) |old| {

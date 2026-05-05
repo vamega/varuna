@@ -189,17 +189,16 @@ pub fn EventLoopOf(comptime IO: type) type {
         /// For multi-span pieces, multiple io_uring reads are submitted.
         /// When all reads complete, the piece response is sent.
         pub const PendingPieceRead = struct {
-            pub const max_spans: usize = 8;
-
             read_id: u32,
             slot: u16,
             piece_index: u32,
             block_offset: u32,
             block_length: u32,
             piece_buffer: *PieceBuffer,
-            reads_remaining: u32, // number of successfully submitted read CQEs still pending
-            submitted_span_count: u8 = 0,
-            expected_read_lengths: [max_spans]u32 = @as([max_spans]u32, @splat(0)),
+            reads_remaining: usize, // number of successfully submitted read CQEs still pending
+            submitted_span_count: usize = 0,
+            expected_read_lengths: []u32 = &.{},
+            read_failed: bool = false,
         };
 
         pub const AnnounceResult = struct {
@@ -753,6 +752,7 @@ pub fn EventLoopOf(comptime IO: type) type {
             self.vectored_send_pool.deinit(self.allocator);
             self.small_send_pool.deinit(self.allocator);
             for (self.pending_reads.items) |pr| {
+                self.allocator.free(pr.expected_read_lengths);
                 self.releasePieceBuffer(pr.piece_buffer);
             }
             self.pending_reads.deinit(self.allocator);

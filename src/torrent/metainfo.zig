@@ -83,7 +83,8 @@ pub const Metainfo = struct {
         var total: u64 = 0;
         for (v2_files) |f| {
             if (f.length > 0) {
-                total += (f.length + self.piece_length - 1) / self.piece_length;
+                const file_piece_count = try std.math.divCeil(u64, f.length, self.piece_length);
+                total = try std.math.add(u64, total, file_piece_count);
             }
         }
         return std.math.cast(u32, total) orelse error.PieceCountOverflow;
@@ -207,10 +208,7 @@ pub fn parseWithOptions(
         else
             try parseSingleFileList(allocator, try expectU64(try getRequired(info, "length")), name);
     }
-    errdefer {
-        for (files) |f| allocator.free(f.path);
-        if (files.len > 0) allocator.free(files);
-    }
+    errdefer freeFiles(allocator, files);
 
     // v2 file tree: required for v2 and hybrid
     var file_tree_v2: ?[]V2File = null;
@@ -226,15 +224,7 @@ pub fn parseWithOptions(
     // For pure v2, populate the v1 files array from the file tree for compatibility
     if (version == .v2) {
         if (file_tree_v2) |ft| {
-            files = try allocator.alloc(Metainfo.File, ft.len);
-            for (ft, 0..) |v2f, i| {
-                const path_copy = try allocator.alloc([]const u8, v2f.path.len);
-                @memcpy(path_copy, v2f.path);
-                files[i] = .{
-                    .length = v2f.length,
-                    .path = path_copy,
-                };
-            }
+            files = try filesFromV2Tree(allocator, ft);
         }
     }
 
@@ -248,18 +238,26 @@ pub fn parseWithOptions(
         try parseAnnounceList(allocator, value)
     else
         try allocator.alloc([]const u8, 0);
+    errdefer allocator.free(announce_list);
 
     // BEP 19: url-list (GetRight-style web seeds)
     const url_list = if (bencode.dictGet(root_dict, "url-list")) |value|
         try parseUrlList(allocator, value)
     else
         try allocator.alloc([]const u8, 0);
+    errdefer allocator.free(url_list);
 
     // BEP 17: httpseeds (Hoffman-style HTTP seeds)
     const http_seeds = if (bencode.dictGet(root_dict, "httpseeds")) |value|
         try parseStringList(allocator, value)
     else
         try allocator.alloc([]const u8, 0);
+    errdefer allocator.free(http_seeds);
+
+    const creation_date = if (bencode.dictGet(root_dict, "creation date")) |value| blk: {
+        const raw = try expectU64(value);
+        break :blk std.math.cast(i64, raw) orelse return error.IntegerOverflow;
+    } else null;
 
     return .{
         .info_hash = digest,
@@ -269,7 +267,7 @@ pub fn parseWithOptions(
         .http_seeds = http_seeds,
         .comment = if (bencode.dictGet(root_dict, "comment")) |value| try expectBytes(value) else null,
         .created_by = if (bencode.dictGet(root_dict, "created by")) |value| try expectBytes(value) else null,
-        .creation_date = if (bencode.dictGet(root_dict, "creation date")) |value| @as(i64, @intCast(try expectU64(value))) else null,
+        .creation_date = creation_date,
         .name = name,
         .piece_length = piece_length,
         .pieces = pieces,
@@ -301,13 +299,40 @@ pub fn freeMetainfo(allocator: std.mem.Allocator, meta: Metainfo) void {
     if (meta.announce_list.len > 0) allocator.free(meta.announce_list);
     if (meta.url_list.len > 0) allocator.free(meta.url_list);
     if (meta.http_seeds.len > 0) allocator.free(meta.http_seeds);
-    for (meta.files) |file| {
-        allocator.free(file.path);
-    }
-    if (meta.files.len > 0) allocator.free(meta.files);
+    freeFiles(allocator, meta.files);
     if (meta.file_tree_v2) |ft| {
         file_tree.freeV2Files(allocator, ft);
     }
+}
+
+fn freeFiles(allocator: std.mem.Allocator, files: []const Metainfo.File) void {
+    for (files) |file| {
+        allocator.free(file.path);
+    }
+    if (files.len > 0) allocator.free(files);
+}
+
+fn filesFromV2Tree(allocator: std.mem.Allocator, ft: []const V2File) ![]Metainfo.File {
+    var files = try allocator.alloc(Metainfo.File, ft.len);
+    var initialized: usize = 0;
+    errdefer {
+        for (files[0..initialized]) |file| {
+            allocator.free(file.path);
+        }
+        allocator.free(files);
+    }
+
+    for (ft, 0..) |v2f, i| {
+        const path_copy = try allocator.alloc([]const u8, v2f.path.len);
+        @memcpy(path_copy, v2f.path);
+        files[i] = .{
+            .length = v2f.length,
+            .path = path_copy,
+        };
+        initialized += 1;
+    }
+
+    return files;
 }
 
 /// Parse BEP 19 url-list: can be a single string or a list of strings.
@@ -365,9 +390,10 @@ fn parseMultiFileList(
     values: []const bencode.Value,
 ) ![]Metainfo.File {
     var files = try allocator.alloc(Metainfo.File, values.len);
+    var initialized: usize = 0;
     errdefer {
-        for (files[0..values.len]) |file| {
-            if (file.path.len != 0) allocator.free(file.path);
+        for (files[0..initialized]) |file| {
+            allocator.free(file.path);
         }
         allocator.free(files);
     }
@@ -380,6 +406,7 @@ fn parseMultiFileList(
             .length = length,
             .path = path,
         };
+        initialized += 1;
     }
 
     return files;
