@@ -143,6 +143,7 @@ See [docs/io_uring_static_violation_analysis.md](docs/io_uring_static_violation_
 ## Key Docs
 - [docs/io-uring-syscalls.md](docs/io-uring-syscalls.md) - syscall reference and current io_uring coverage
 - [docs/future-features.md](docs/future-features.md) - deferred and follow-up work only, not a missing-feature inventory
+- [docs/utp-packet-pool-plan.md](docs/utp-packet-pool-plan.md) - uTP packet-pool, resend-limit, and high-speed transfer memory plan
 - [docs/dht-bep52-plan.md](docs/dht-bep52-plan.md) - planning/follow-up context; check [STATUS.md](STATUS.md) before assuming items are still pending
 - [docs/api-compatibility.md](docs/api-compatibility.md) - endpoint coverage, placeholders, unsupported endpoints
 - [docs/sim-test-setup.md](docs/sim-test-setup.md) - sim test API requirements (Phase 0 smart-ban / `EventLoopOf(SimIO)` baseline)

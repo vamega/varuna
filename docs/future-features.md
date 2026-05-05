@@ -60,6 +60,15 @@ enable_utp = true  # default: true
 
 Runtime toggle via API: `POST /api/v2/app/setPreferences` with `enable_utp=true|false`.
 
+### High-Speed uTP Packet Pool Follow-Up
+
+The current dynamic outbound uTP buffer removes the old fixed inline socket
+footprint, but retained retransmit packets still use per-socket dynamic storage
+with full datagram copies. The next pass should move retained packet bytes into
+a daemon-preallocated two-class packet pool, add libtorrent-compatible timeout
+and resend-limit config, and expose pool pressure diagnostics. See
+[utp-packet-pool-plan.md](utp-packet-pool-plan.md).
+
 ### ~~Advanced Transport Disposition~~ (DONE)
 
 Implemented in `src/config.zig` as `TransportDisposition` packed struct. Inspired by uTorrent's `bt.transp_disposition` bitfield:
