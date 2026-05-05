@@ -229,7 +229,7 @@ test "parse magnet URI with base32 info hash" {
     const result = try parse(std.testing.allocator, uri);
     defer result.deinit(std.testing.allocator);
 
-    const expected_hash = [_]u8{0} ** 20;
+    const expected_hash = @as([20]u8, @splat(0));
     try std.testing.expectEqual(expected_hash, result.info_hash);
 }
 

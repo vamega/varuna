@@ -1664,7 +1664,7 @@ pub fn SessionManagerOf(comptime IO: type) type {
             save_path: []const u8, // owned, caller must free
             comment: []const u8, // owned, caller must free
             piece_size: u32,
-            info_hash_hex: [40]u8 = [_]u8{'0'} ** 40,
+            info_hash_hex: [40]u8 = @as([40]u8, @splat('0')),
             /// BEP 52: full v2 info-hash (32 bytes). null for pure v1.
             info_hash_v2: ?[32]u8 = null,
             name: []const u8, // owned, caller must free
@@ -2188,7 +2188,7 @@ test "formatPeerIp emits bare IPv4 with no port" {
 test "formatPeerIp emits bare IPv6 with no brackets or port" {
     const allocator = std.testing.allocator;
     const addr = std.net.Address.initIp6(
-        .{ 0x20, 0x01, 0x0d, 0xb8 } ++ ([_]u8{0} ** 11) ++ [_]u8{0x01},
+        .{ 0x20, 0x01, 0x0d, 0xb8 } ++ (@as([11]u8, @splat(0))) ++ [_]u8{0x01},
         6881,
         0,
         0,
@@ -2226,14 +2226,14 @@ test "checkTorrentShareLimit ratio enforcement" {
         .allocator = std.testing.allocator,
         .torrent_bytes = &.{},
         .save_path = "",
-        .info_hash = [_]u8{0} ** 20,
-        .info_hash_hex = [_]u8{'0'} ** 40,
+        .info_hash = @as([20]u8, @splat(0)),
+        .info_hash_hex = @as([40]u8, @splat('0')),
         .name = "test",
         .total_size = 1000,
         .piece_count = 10,
         .added_on = 0,
-        .peer_id = [_]u8{0} ** 20,
-        .tracker_key = [_]u8{0} ** 8,
+        .peer_id = @as([20]u8, @splat(0)),
+        .tracker_key = @as([8]u8, @splat(0)),
     };
 
     // Ratio below limit: no action
@@ -2257,11 +2257,11 @@ test "move job reverse map owns hash key bytes" {
     var sm = SessionManager.init(std.testing.allocator);
     defer sm.deinit();
 
-    const original_hash = [_]u8{'a'} ** 40;
+    const original_hash = @as([40]u8, @splat('a'));
     var mutable_hash = original_hash;
     try sm.torrent_move_jobs.put(mutable_hash, 41);
 
-    mutable_hash = [_]u8{'b'} ** 40;
+    mutable_hash = @as([40]u8, @splat('b'));
 
     const got = sm.torrent_move_jobs.get(original_hash) orelse return error.MissingOwnedMoveJobKey;
     try std.testing.expectEqual(@as(MoveJobId, 41), got);
@@ -2281,14 +2281,14 @@ test "checkTorrentShareLimit seeding time enforcement" {
         .allocator = std.testing.allocator,
         .torrent_bytes = &.{},
         .save_path = "",
-        .info_hash = [_]u8{0} ** 20,
-        .info_hash_hex = [_]u8{'0'} ** 40,
+        .info_hash = @as([20]u8, @splat(0)),
+        .info_hash_hex = @as([40]u8, @splat('0')),
         .name = "test",
         .total_size = 1000,
         .piece_count = 10,
         .added_on = 0,
-        .peer_id = [_]u8{0} ** 20,
-        .tracker_key = [_]u8{0} ** 8,
+        .peer_id = @as([20]u8, @splat(0)),
+        .tracker_key = @as([8]u8, @splat(0)),
     };
 
     // Seeding time below limit: no action
@@ -2317,14 +2317,14 @@ test "checkTorrentShareLimit per-torrent override" {
         .allocator = std.testing.allocator,
         .torrent_bytes = &.{},
         .save_path = "",
-        .info_hash = [_]u8{0} ** 20,
-        .info_hash_hex = [_]u8{'0'} ** 40,
+        .info_hash = @as([20]u8, @splat(0)),
+        .info_hash_hex = @as([40]u8, @splat('0')),
         .name = "test",
         .total_size = 1000,
         .piece_count = 10,
         .added_on = 0,
-        .peer_id = [_]u8{0} ** 20,
-        .tracker_key = [_]u8{0} ** 8,
+        .peer_id = @as([20]u8, @splat(0)),
+        .tracker_key = @as([8]u8, @splat(0)),
     };
 
     // Per-torrent override: ratio_limit = 5.0 (higher than global)
@@ -2353,14 +2353,14 @@ test "checkTorrentShareLimit disabled by default" {
         .allocator = std.testing.allocator,
         .torrent_bytes = &.{},
         .save_path = "",
-        .info_hash = [_]u8{0} ** 20,
-        .info_hash_hex = [_]u8{'0'} ** 40,
+        .info_hash = @as([20]u8, @splat(0)),
+        .info_hash_hex = @as([40]u8, @splat('0')),
         .name = "test",
         .total_size = 1000,
         .piece_count = 10,
         .added_on = 0,
-        .peer_id = [_]u8{0} ** 20,
-        .tracker_key = [_]u8{0} ** 8,
+        .peer_id = @as([20]u8, @splat(0)),
+        .tracker_key = @as([8]u8, @splat(0)),
     };
 
     // Even with high ratio and long seeding time, no action

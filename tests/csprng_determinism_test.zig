@@ -50,8 +50,8 @@ test "CSPRNG: simRandomFromKey is byte-deterministic across instances" {
 }
 
 test "CSPRNG: distinct seeds produce distinct streams" {
-    var r1 = Random.simRandomFromKey([_]u8{1} ** 32);
-    var r2 = Random.simRandomFromKey([_]u8{2} ** 32);
+    var r1 = Random.simRandomFromKey(@as([32]u8, @splat(1)));
+    var r2 = Random.simRandomFromKey(@as([32]u8, @splat(2)));
 
     var a: [128]u8 = undefined;
     var b: [128]u8 = undefined;
@@ -122,7 +122,7 @@ test "CSPRNG closes boundary: MSE DH private key is byte-deterministic" {
     // built off two `simRandom(seed)` instances must produce the
     // same `private_key`, `public_key`, and (after seeing the same
     // peer key) the same `shared_secret`.
-    const info_hash = [_]u8{0x42} ** 20;
+    const info_hash = @as([20]u8, @splat(0x42));
 
     var r1 = Random.simRandom(0xb01);
     var r2 = Random.simRandom(0xb01);
@@ -135,7 +135,7 @@ test "CSPRNG closes boundary: MSE DH private key is byte-deterministic" {
 }
 
 test "CSPRNG closes boundary: MSE responder DH private key is byte-deterministic" {
-    const known: [1][20]u8 = .{[_]u8{0xAA} ** 20};
+    const known: [1][20]u8 = .{@as([20]u8, @splat(0xAA))};
 
     var r1 = Random.simRandom(0xb02);
     var r2 = Random.simRandom(0xb02);
@@ -169,7 +169,7 @@ fn runDaemonScenario(seed: u64) !DaemonOutput {
     const token_mgr = TokenManager.initWithTime(&rng, 1_700_000_000);
     var session_store = SessionStore{};
     const sid = session_store.createSession(&rng);
-    const info_hash = [_]u8{0xDE} ** 20;
+    const info_hash = @as([20]u8, @splat(0xDE));
     const hs = mse.MseInitiatorHandshake.init(&rng, info_hash, .preferred);
 
     return .{

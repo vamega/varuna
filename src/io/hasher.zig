@@ -53,7 +53,7 @@ pub const RealHasher = struct {
         piece_buf: []u8,
         piece_length: u32,
         expected_hash: [20]u8,
-        expected_hash_v2: [32]u8 = [_]u8{0} ** 32,
+        expected_hash_v2: [32]u8 = @as([32]u8, @splat(0)),
         hash_type: HashType = .sha1,
         torrent_id: u32,
         is_recheck: bool = false,
@@ -64,7 +64,7 @@ pub const RealHasher = struct {
         piece_index: u32,
         piece_buf: []u8,
         valid: bool,
-        actual_hash_v2: [32]u8 = [_]u8{0} ** 32,
+        actual_hash_v2: [32]u8 = @as([32]u8, @splat(0)),
         torrent_id: u32,
         is_recheck: bool = false,
     };
@@ -177,7 +177,7 @@ pub const RealHasher = struct {
 
     pub const VerifyOptions = struct {
         hash_type: HashType = .sha1,
-        expected_hash_v2: [32]u8 = [_]u8{0} ** 32,
+        expected_hash_v2: [32]u8 = @as([32]u8, @splat(0)),
         is_recheck: bool = false,
     };
 
@@ -244,7 +244,7 @@ pub const RealHasher = struct {
 
     const VerifyOutcome = struct {
         valid: bool,
-        actual_hash_v2: [32]u8 = [_]u8{0} ** 32,
+        actual_hash_v2: [32]u8 = @as([32]u8, @splat(0)),
     };
 
     fn computeValid(job: Job) bool {
@@ -1158,8 +1158,8 @@ test "merkle job hashes file pieces from disk" {
     // Create a temp file with 2 pieces of known data, in a tmpDir so
     // parallel test runs (and stale leftovers in /tmp) don't collide.
     const piece_len: u32 = 64;
-    const piece0_data = "A" ** piece_len;
-    const piece1_data = "B" ** piece_len;
+    const piece0_data = &@as([piece_len]u8, @splat('A'));
+    const piece1_data = &@as([piece_len]u8, @splat('B'));
 
     var tmp_dir = std.testing.tmpDir(.{});
     defer tmp_dir.cleanup();
@@ -1187,7 +1187,7 @@ test "merkle job hashes file pieces from disk" {
         },
     };
     var v2_files = [_]metainfo_mod.V2File{
-        .{ .path = &.{}, .length = piece_len * 2, .pieces_root = [_]u8{0} ** 32 },
+        .{ .path = &.{}, .length = piece_len * 2, .pieces_root = @as([32]u8, @splat(0)) },
     };
     var layout = Layout{
         .piece_length = piece_len,
@@ -1262,7 +1262,7 @@ test "merkle job returns null hashes on bad fd" {
         },
     };
     var v2_files = [_]metainfo_mod.V2File{
-        .{ .path = &.{}, .length = 64, .pieces_root = [_]u8{0} ** 32 },
+        .{ .path = &.{}, .length = 64, .pieces_root = @as([32]u8, @splat(0)) },
     };
     var layout = Layout{
         .piece_length = 64,
@@ -1468,8 +1468,8 @@ test "SimHasher: merkle build hashes file pieces synchronously" {
     // Reuse the same fixture shape as the RealHasher merkle test: 1
     // file, 2 pieces, written to a tmpDir-backed file.
     const piece_len: u32 = 64;
-    const piece0_data = "A" ** piece_len;
-    const piece1_data = "B" ** piece_len;
+    const piece0_data = &@as([piece_len]u8, @splat('A'));
+    const piece1_data = &@as([piece_len]u8, @splat('B'));
 
     var tmp_dir = std.testing.tmpDir(.{});
     defer tmp_dir.cleanup();
@@ -1495,7 +1495,7 @@ test "SimHasher: merkle build hashes file pieces synchronously" {
         },
     };
     var v2_files = [_]metainfo_mod.V2File{
-        .{ .path = &.{}, .length = piece_len * 2, .pieces_root = [_]u8{0} ** 32 },
+        .{ .path = &.{}, .length = piece_len * 2, .pieces_root = @as([32]u8, @splat(0)) },
     };
     var layout = Layout{
         .piece_length = piece_len,
@@ -1545,7 +1545,7 @@ test "SimHasher: merkle pread fault knob fails the job" {
     hasher.setFaults(.{ .merkle_pread_fault_prob = 1.0 });
 
     const piece_len: u32 = 64;
-    const piece0_data = "A" ** piece_len;
+    const piece0_data = &@as([piece_len]u8, @splat('A'));
 
     var tmp_dir = std.testing.tmpDir(.{});
     defer tmp_dir.cleanup();
@@ -1568,7 +1568,7 @@ test "SimHasher: merkle pread fault knob fails the job" {
         },
     };
     var v2_files = [_]metainfo_mod.V2File{
-        .{ .path = &.{}, .length = piece_len, .pieces_root = [_]u8{0} ** 32 },
+        .{ .path = &.{}, .length = piece_len, .pieces_root = @as([32]u8, @splat(0)) },
     };
     var layout = Layout{
         .piece_length = piece_len,

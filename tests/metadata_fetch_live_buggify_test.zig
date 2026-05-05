@@ -92,7 +92,7 @@ fn buildScriptedPeerResponses(
     // BT handshake reply.
     try out.append(allocator, pw.protocol_length);
     try out.appendSlice(allocator, pw.protocol_string);
-    var reserved = [_]u8{0} ** 8;
+    var reserved = @as([8]u8, @splat(0));
     reserved[ext.reserved_byte] |= ext.reserved_mask;
     try out.appendSlice(allocator, &reserved);
     try out.appendSlice(allocator, &info_hash);
@@ -143,7 +143,7 @@ const SeedOutcome = struct {
 
 fn runOneSeed(seed: u64, info_bytes: *const [info_dict_size]u8, info_hash: [20]u8) !SeedOutcome {
     const allocator = testing.allocator;
-    const peer_handshake_id = [_]u8{0xCC} ** 20;
+    const peer_handshake_id = @as([20]u8, @splat(0xCC));
 
     // Build the scripted response stream once; each peer replays it
     // identically.
@@ -205,7 +205,7 @@ fn runOneSeed(seed: u64, info_bytes: *const [info_dict_size]u8, info_hash: [20]u
 
     el.startMetadataFetch(
         info_hash,
-        [_]u8{0xBB} ** 20,
+        @as([20]u8, @splat(0xBB)),
         6881,
         false,
         &peers_buf,

@@ -171,7 +171,7 @@ fn expectU64(value: bencode.Value) BencodeTypeError!u64 {
 test "build announce url percent encodes binary fields" {
     const url = try buildUrl(std.testing.allocator, .{
         .announce_url = "http://tracker.example/announce",
-        .info_hash = [_]u8{ 0x00, 0xff } ++ ([_]u8{1} ** 18),
+        .info_hash = [_]u8{ 0x00, 0xff } ++ @as([18]u8, @splat(1)),
         .peer_id = "ABCDEFGHIJKLMNOPQRST".*,
         .port = 6881,
         .left = 42,
@@ -188,7 +188,7 @@ test "build announce url percent encodes binary fields" {
 test "build url includes key when provided" {
     const url = try buildUrl(std.testing.allocator, .{
         .announce_url = "http://tracker.example/announce",
-        .info_hash = [_]u8{0} ** 20,
+        .info_hash = @as([20]u8, @splat(0)),
         .peer_id = "ABCDEFGHIJKLMNOPQRST".*,
         .port = 6881,
         .left = 100,
@@ -202,7 +202,7 @@ test "build url includes key when provided" {
 test "build url omits key when not provided" {
     const url = try buildUrl(std.testing.allocator, .{
         .announce_url = "http://tracker.example/announce",
-        .info_hash = [_]u8{0} ** 20,
+        .info_hash = @as([20]u8, @splat(0)),
         .peer_id = "ABCDEFGHIJKLMNOPQRST".*,
         .port = 6881,
         .left = 100,
@@ -324,7 +324,7 @@ test "build url includes v2 info_hash when provided" {
     for (&v2_hash, 0..) |*b, i| b.* = @intCast(i);
     const url = try buildUrl(std.testing.allocator, .{
         .announce_url = "http://tracker.example/announce",
-        .info_hash = [_]u8{0xAA} ** 20,
+        .info_hash = @as([20]u8, @splat(0xAA)),
         .peer_id = "ABCDEFGHIJKLMNOPQRST".*,
         .port = 6881,
         .left = 100,
@@ -342,7 +342,7 @@ test "build url includes v2 info_hash when provided" {
 test "build url omits v2 info_hash when not provided" {
     const url = try buildUrl(std.testing.allocator, .{
         .announce_url = "http://tracker.example/announce",
-        .info_hash = [_]u8{0} ** 20,
+        .info_hash = @as([20]u8, @splat(0)),
         .peer_id = "ABCDEFGHIJKLMNOPQRST".*,
         .port = 6881,
         .left = 100,

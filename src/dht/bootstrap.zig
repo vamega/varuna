@@ -55,7 +55,7 @@ pub fn toNodeInfos(allocator: std.mem.Allocator, addrs: []const std.net.Address)
         // Use zero ID -- we don't know their ID yet.
         // It will be learned from their ping response.
         infos[i] = .{
-            .id = [_]u8{0} ** 20,
+            .id = @as([20]u8, @splat(0)),
             .address = addr,
         };
     }

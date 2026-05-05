@@ -53,7 +53,7 @@ fn registerTorrent(
     pt: *PieceTracker,
     fds: []const posix.fd_t,
 ) !u32 {
-    return try el.addTorrent(session, pt, fds, [_]u8{0} ** 20);
+    return try el.addTorrent(session, pt, fds, @as([20]u8, @splat(0)));
 }
 
 test "submitTorrentSync: clean torrent (dirty=0, no force) is no-op" {

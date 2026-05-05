@@ -69,7 +69,7 @@ fn walkFileTree(
 
             // pieces root is required for files with length > 0.
             // For zero-length files, pieces root may be absent.
-            var pieces_root: [32]u8 = [_]u8{0} ** 32;
+            var pieces_root: [32]u8 = @as([32]u8, @splat(0));
             if (bencode.dictGet(file_dict, "pieces root")) |pr_val| {
                 const pr_bytes = switch (pr_val) {
                     .bytes => |b| b,
@@ -121,7 +121,7 @@ fn buildSimpleFileTree(allocator: std.mem.Allocator, input: []const u8) ![]metai
 
 test "parse single file tree" {
     // file tree: { "test.txt": { "": { "length": 1234, "pieces root": <32 zeros> } } }
-    const pieces_root = [_]u8{0xAA} ** 32;
+    const pieces_root = @as([32]u8, @splat(0xAA));
     const input = "d8:test.txtd0:d6:lengthi1234e11:pieces root32:" ++ pieces_root ++ "eee";
 
     const files = try buildSimpleFileTree(std.testing.allocator, input);
@@ -136,7 +136,7 @@ test "parse single file tree" {
 
 test "parse nested directory file tree" {
     // file tree: { "dir": { "sub": { "file.bin": { "": { "length": 42, "pieces root": <32 bytes> } } } } }
-    const pr = [_]u8{0xBB} ** 32;
+    const pr = @as([32]u8, @splat(0xBB));
     const input = "d3:dird3:subd8:file.bind0:d6:lengthi42e11:pieces root32:" ++ pr ++ "eeeee";
 
     const files = try buildSimpleFileTree(std.testing.allocator, input);
@@ -152,8 +152,8 @@ test "parse nested directory file tree" {
 
 test "parse multiple files in file tree" {
     // Two files: dir/a.txt and dir/b.txt
-    const pr1 = [_]u8{0x11} ** 32;
-    const pr2 = [_]u8{0x22} ** 32;
+    const pr1 = @as([32]u8, @splat(0x11));
+    const pr2 = @as([32]u8, @splat(0x22));
     const input = "d3:dird5:a.txtd0:d6:lengthi100e11:pieces root32:" ++ pr1 ++ "ee5:b.txtd0:d6:lengthi200e11:pieces root32:" ++ pr2 ++ "eeee";
 
     const files = try buildSimpleFileTree(std.testing.allocator, input);
@@ -175,7 +175,7 @@ test "parse zero-length file without pieces root" {
 
     try std.testing.expectEqual(@as(usize, 1), files.len);
     try std.testing.expectEqual(@as(u64, 0), files[0].length);
-    try std.testing.expectEqual([_]u8{0} ** 32, files[0].pieces_root);
+    try std.testing.expectEqual(@as([32]u8, @splat(0)), files[0].pieces_root);
 }
 
 test "reject non-zero file without pieces root" {
@@ -198,7 +198,7 @@ test "reject invalid pieces root length" {
 }
 
 test "reject negative file length" {
-    const pr = [_]u8{0} ** 32;
+    const pr = @as([32]u8, @splat(0));
     const input = "d8:test.txtd0:d6:lengthi-5e11:pieces root32:" ++ pr ++ "eee";
 
     try std.testing.expectError(

@@ -12,7 +12,7 @@ pub const SyncState = struct {
     /// Monotonically increasing response ID.
     current_rid: u64 = 0,
     /// Ring buffer of snapshots, indexed by rid % max_snapshots.
-    snapshots: [max_snapshots]?Snapshot = [_]?Snapshot{null} ** max_snapshots,
+    snapshots: [max_snapshots]?Snapshot = @as([max_snapshots]?Snapshot, @splat(null)),
 
     const max_snapshots = 100;
 
@@ -225,7 +225,7 @@ const SyncServerStateResponse = struct {
 pub const PeerSyncState = struct {
     allocator: std.mem.Allocator,
     current_rid: u64 = 0,
-    snapshots: [max_snapshots]?Snapshot = [_]?Snapshot{null} ** max_snapshots,
+    snapshots: [max_snapshots]?Snapshot = @as([max_snapshots]?Snapshot, @splat(null)),
 
     const max_snapshots = 100;
 

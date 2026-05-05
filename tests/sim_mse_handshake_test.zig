@@ -352,7 +352,7 @@ fn runSimultaneousFaults(seed: u64, knobs: FaultKnobs) !RunResult {
     const tid = try el.addTorrentContext(.{
         .shared_fds = empty_fds[0..],
         .info_hash = info_hash,
-        .peer_id = [_]u8{0xAA} ** 20,
+        .peer_id = @as([20]u8, @splat(0xAA)),
     });
 
     // ── Outbound socketpair: EL is the initiator, peer is responder.
@@ -516,7 +516,7 @@ test "MSE removePeer during in-flight handshake — does not crash or corrupt ne
         const tid = try el.addTorrentContext(.{
             .shared_fds = empty_fds[0..],
             .info_hash = info_hash,
-            .peer_id = [_]u8{0xAA} ** 20,
+            .peer_id = @as([20]u8, @splat(0xAA)),
         });
 
         // Step 1: outbound MSE handshake in progress.
@@ -610,7 +610,7 @@ test "MSE removePeer with delayed close CQE quarantines slot until stale recv dr
     const tid = try el.addTorrentContext(.{
         .shared_fds = empty_fds[0..],
         .info_hash = info_hash,
-        .peer_id = [_]u8{0xAA} ** 20,
+        .peer_id = @as([20]u8, @splat(0xAA)),
     });
 
     const out_pair = try el.io.createSocketpair();

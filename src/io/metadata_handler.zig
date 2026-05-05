@@ -54,7 +54,7 @@ pub fn AsyncMetadataFetchOf(comptime IO: type) type {
         next_peer_idx: u32 = 0,
         peers_attempted: u32 = 0,
 
-        slots: [max_slots]Slot = [_]Slot{.{}} ** max_slots,
+        slots: [max_slots]Slot = @as([max_slots]Slot, @splat(.{})),
         active_slots: u8 = 0,
 
         done: bool = false,
@@ -1086,8 +1086,8 @@ test "AsyncMetadataFetch create and destroy with no peers" {
     const mf = try AsyncMetadataFetch.create(
         std.testing.allocator,
         &io,
-        [_]u8{0xAA} ** 20,
-        [_]u8{0xBB} ** 20,
+        @as([20]u8, @splat(0xAA)),
+        @as([20]u8, @splat(0xBB)),
         6881,
         false,
         &peers,
@@ -1110,8 +1110,8 @@ test "AsyncMetadataFetch create and destroy with peers" {
     const mf = try AsyncMetadataFetch.create(
         std.testing.allocator,
         &io,
-        [_]u8{0xAA} ** 20,
-        [_]u8{0xBB} ** 20,
+        @as([20]u8, @splat(0xAA)),
+        @as([20]u8, @splat(0xBB)),
         6881,
         false,
         &peers,
@@ -1141,8 +1141,8 @@ test "AsyncMetadataFetch start with no peers calls finish" {
     const mf = try AsyncMetadataFetch.create(
         std.testing.allocator,
         &io,
-        [_]u8{0xAA} ** 20,
-        [_]u8{0xBB} ** 20,
+        @as([20]u8, @splat(0xAA)),
+        @as([20]u8, @splat(0xBB)),
         6881,
         false,
         &peers,

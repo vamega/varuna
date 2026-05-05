@@ -93,7 +93,7 @@ pub const SelectiveAck = struct {
     /// Bitmask length in bytes (must be a multiple of 4, BEP 29).
     len: u8,
     /// Bitmask data (up to 32 bytes = 256 sequence numbers).
-    bitmask: [sack_bitmask_max]u8 = [_]u8{0} ** sack_bitmask_max,
+    bitmask: [sack_bitmask_max]u8 = @as([sack_bitmask_max]u8, @splat(0)),
 
     /// Minimum overhead: 2 bytes header + 4 bytes bitmask.
     pub const min_size: usize = 6;
@@ -284,14 +284,14 @@ pub const UtpSocket = struct {
     out_seq_start: u16 = 1,
 
     /// Receive reorder buffer.
-    reorder_buf: [max_reorder_buf]ReorderEntry = [_]ReorderEntry{.{ .seq_nr = 0, .data = null, .present = false }} ** max_reorder_buf,
+    reorder_buf: [max_reorder_buf]ReorderEntry = @as([max_reorder_buf]ReorderEntry, @splat(.{ .seq_nr = 0, .data = null, .present = false })),
 
     /// Owned copies of the most recent batch of reorder-buffered payloads
     /// flushed by `deliverReordered`. The slices in `ProcessResult.reorder_data`
     /// reference these. Freed at the start of the next `deliverReordered`
     /// call (so the caller can read them during result handling) and on
     /// `deinit`.
-    delivered_payloads: [max_reorder_buf]?[]u8 = [_]?[]u8{null} ** max_reorder_buf,
+    delivered_payloads: [max_reorder_buf]?[]u8 = @as([max_reorder_buf]?[]u8, @splat(null)),
     delivered_count: u16 = 0,
 
     /// Ordered application byte-stream data waiting for congestion/window
@@ -971,7 +971,7 @@ pub const ProcessResult = struct {
     /// same socket, after which the storage may be freed and reused.
     /// The caller must consume (or copy) these payloads before the next
     /// processPacket invocation.
-    reorder_data: [max_reorder_buf]?[]const u8 = [_]?[]const u8{null} ** max_reorder_buf,
+    reorder_data: [max_reorder_buf]?[]const u8 = @as([max_reorder_buf]?[]const u8, @splat(null)),
 
     pub fn setResponse(self: *ProcessResult, packet: AckPacket) void {
         self.response = packet.bytes;
@@ -980,7 +980,7 @@ pub const ProcessResult = struct {
 };
 
 pub const AckPacket = struct {
-    bytes: [max_ack_size]u8 = [_]u8{0} ** max_ack_size,
+    bytes: [max_ack_size]u8 = @as([max_ack_size]u8, @splat(0)),
     len: u8 = Header.size,
 
     pub fn fromHeader(header: [Header.size]u8) AckPacket {
@@ -1042,7 +1042,7 @@ test "header decode rejects wrong version" {
 }
 
 test "header decode rejects short buffer" {
-    const buf = [_]u8{0} ** 10;
+    const buf = @as([10]u8, @splat(0));
     try std.testing.expect(Header.decode(&buf) == null);
 }
 
@@ -1670,15 +1670,15 @@ test "fuzz uTP header decode" {
             // Valid DATA packet
             &(Header{ .packet_type = .st_data, .extension = .none, .connection_id = 5678, .timestamp_us = 100, .timestamp_diff_us = 50, .wnd_size = 32768, .seq_nr = 10, .ack_nr = 9 }).encode(),
             // Wrong version (should return null)
-            &[_]u8{ 0x42, 0x00 } ++ [_]u8{0} ** 18,
+            &([_]u8{ 0x42, 0x00 } ++ @as([18]u8, @splat(0))),
             // Too short
             "",
             &[_]u8{0x41},
-            &[_]u8{0} ** 19,
+            &@as([19]u8, @splat(0)),
             // All zeros (version 0, should reject)
-            &[_]u8{0} ** 20,
+            &@as([20]u8, @splat(0)),
             // All 0xFF
-            &[_]u8{0xFF} ** 20,
+            &@as([20]u8, @splat(0xFF)),
         },
     });
 }
@@ -1694,7 +1694,7 @@ test "uTP header decode edge cases: single byte inputs" {
 }
 
 test "uTP header decode rejects all invalid versions" {
-    var buf = [_]u8{0} ** 20;
+    var buf = @as([20]u8, @splat(0));
     // Version nibble is low nibble of byte 0
     // Only version 1 is valid
     for (0..16) |v| {

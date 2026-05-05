@@ -243,7 +243,7 @@ pub const ErrorResponse = struct {
 pub const ConnectionCache = struct {
     const max_entries = 32;
 
-    entries: [max_entries]Entry = [_]Entry{.{}} ** max_entries,
+    entries: [max_entries]Entry = @as([max_entries]Entry, @splat(.{})),
 
     const Entry = struct {
         host: [253]u8 = undefined,
@@ -461,8 +461,8 @@ test "decode connect response rejects wrong action" {
 }
 
 test "encode and decode announce request" {
-    const info_hash = [_]u8{0xAA} ** 20;
-    const peer_id = [_]u8{0xBB} ** 20;
+    const info_hash = @as([20]u8, @splat(0xAA));
+    const peer_id = @as([20]u8, @splat(0xBB));
     const req = AnnounceRequest{
         .connection_id = 0x1234567890ABCDEF,
         .transaction_id = 0xFEDCBA98,
@@ -544,7 +544,7 @@ test "decode announce response rejects error action" {
 }
 
 test "encode and decode scrape request single hash" {
-    const info_hash = [_]u8{0xCC} ** 20;
+    const info_hash = @as([20]u8, @splat(0xCC));
     const buf = ScrapeRequest.encodeSingle(0x1122334455667788, 0xAABBCCDD, info_hash);
 
     try std.testing.expectEqual(@as(u64, 0x1122334455667788), std.mem.readInt(u64, buf[0..8], .big));
@@ -554,8 +554,8 @@ test "encode and decode scrape request single hash" {
 }
 
 test "encode scrape request multiple hashes" {
-    const hash1 = [_]u8{0xAA} ** 20;
-    const hash2 = [_]u8{0xBB} ** 20;
+    const hash1 = @as([20]u8, @splat(0xAA));
+    const hash2 = @as([20]u8, @splat(0xBB));
     const hashes = [_][20]u8{ hash1, hash2 };
     var buf: [56]u8 = undefined;
     const encoded = try (ScrapeRequest{
@@ -798,8 +798,8 @@ test "full connect then announce packet flow" {
     const ann_req = AnnounceRequest{
         .connection_id = connect_resp.connection_id,
         .transaction_id = 43,
-        .info_hash = [_]u8{0xFF} ** 20,
-        .peer_id = [_]u8{0x00} ** 20,
+        .info_hash = @as([20]u8, @splat(0xFF)),
+        .peer_id = @as([20]u8, @splat(0x00)),
         .downloaded = 0,
         .left = 1024 * 1024,
         .uploaded = 0,
@@ -851,7 +851,7 @@ test "full connect then scrape packet flow" {
     const connect_resp = try ConnectResponse.decode(&connect_resp_buf);
 
     // 3. Scrape request
-    const scrape_buf = ScrapeRequest.encodeSingle(connect_resp.connection_id, 101, [_]u8{0xDD} ** 20);
+    const scrape_buf = ScrapeRequest.encodeSingle(connect_resp.connection_id, 101, @as([20]u8, @splat(0xDD)));
     try std.testing.expectEqual(@as(usize, 36), scrape_buf.len);
 
     // 4. Scrape response
@@ -899,8 +899,8 @@ test "announce request size is exactly 98 bytes" {
     const req = AnnounceRequest{
         .connection_id = 0,
         .transaction_id = 0,
-        .info_hash = [_]u8{0} ** 20,
-        .peer_id = [_]u8{0} ** 20,
+        .info_hash = @as([20]u8, @splat(0)),
+        .peer_id = @as([20]u8, @splat(0)),
         .downloaded = 0,
         .left = 0,
         .uploaded = 0,
@@ -921,6 +921,6 @@ test "connect request size is exactly 16 bytes" {
 }
 
 test "scrape single request size is exactly 36 bytes" {
-    const buf = ScrapeRequest.encodeSingle(0, 0, [_]u8{0} ** 20);
+    const buf = ScrapeRequest.encodeSingle(0, 0, @as([20]u8, @splat(0)));
     try std.testing.expectEqual(@as(usize, 36), buf.len);
 }

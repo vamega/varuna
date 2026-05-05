@@ -1359,8 +1359,8 @@ test "handshake receive rejects invalid protocol prefix" {
     var el = try EL.initBareWithIO(std.testing.allocator, sim_io, 0);
     defer el.deinit();
 
-    const info_hash = [_]u8{0xAA} ** 20;
-    const peer_id = [_]u8{0xBB} ** 20;
+    const info_hash = @as([20]u8, @splat(0xAA));
+    const peer_id = @as([20]u8, @splat(0xBB));
     const empty_fds = [_]posix.fd_t{};
     const torrent_id = try el.addTorrentContext(.{
         .shared_fds = empty_fds[0..],
@@ -1416,8 +1416,8 @@ test "body completion does not re-arm a slot removed by message processing" {
     const torrent_id = try el.addTorrentContext(.{
         .session = &fake_session,
         .shared_fds = empty_fds[0..],
-        .info_hash = [_]u8{0} ** 20,
-        .peer_id = [_]u8{0} ** 20,
+        .info_hash = @as([20]u8, @splat(0)),
+        .peer_id = @as([20]u8, @splat(0)),
     });
 
     const slot: u16 = 0;
@@ -1461,8 +1461,8 @@ test "handleDiskWrite releases piece when any submit failed" {
     _ = try el.addTorrentContext(.{
         .piece_tracker = &tracker,
         .shared_fds = empty_fds[0..],
-        .info_hash = [_]u8{0} ** 20,
-        .peer_id = [_]u8{0} ** 20,
+        .info_hash = @as([20]u8, @splat(0)),
+        .peer_id = @as([20]u8, @splat(0)),
     });
 
     const buf = try std.testing.allocator.alloc(u8, 16);

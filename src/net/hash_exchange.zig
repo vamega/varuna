@@ -232,7 +232,7 @@ test "encode and decode hash request roundtrip" {
 }
 
 test "decode hash request rejects short payload" {
-    const short = [_]u8{0} ** 19;
+    const short = @as([19]u8, @splat(0));
     try std.testing.expectError(error.MessageTooShort, decodeHashRequest(&short));
 }
 

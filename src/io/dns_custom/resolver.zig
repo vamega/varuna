@@ -120,7 +120,7 @@ pub fn DnsResolverOf(comptime IO: type) type {
             resolver: *Self,
             query: ?*Query = null,
             retired_queries: [message.max_cname_hops + 4]?*Query =
-                [_]?*Query{null} ** (message.max_cname_hops + 4),
+                @as([(message.max_cname_hops + 4)]?*Query, @splat(null)),
             retired_queries_len: u8 = 0,
             callback: *const fn (?*anyopaque, *@This(), ResolveResult) void,
             caller_ctx: ?*anyopaque,

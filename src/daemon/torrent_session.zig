@@ -104,7 +104,7 @@ pub const Stats = struct {
     bytes_uploaded: u64 = 0,
     peers_connected: u16 = 0,
     name: []const u8 = "",
-    info_hash_hex: [40]u8 = [_]u8{'0'} ** 40,
+    info_hash_hex: [40]u8 = @as([40]u8, @splat('0')),
     save_path: []const u8 = "",
     added_on: i64 = 0,
     error_msg: ?[]const u8 = null,
@@ -2538,7 +2538,7 @@ fn deinitTestEventLoop(_: std.mem.Allocator, el: *DefaultEventLoop) void {
 test "announce request reports bytes left while downloading" {
     const allocator = std.testing.allocator;
 
-    const pieces = [_]u8{'x'} ** 60;
+    const pieces = @as([60]u8, @splat('x'));
     var torrent_buf = std.ArrayList(u8).empty;
     defer torrent_buf.deinit(allocator);
     try torrent_buf.appendSlice(allocator, "d8:announce19:http://tracker.test4:infod6:lengthi10e4:name8:test.bin12:piece lengthi4e6:pieces60:");
@@ -2569,7 +2569,7 @@ test "announce request reports bytes left while downloading" {
         .torrent_bytes = "",
         .save_path = "",
         .info_hash = loaded.metainfo.info_hash,
-        .info_hash_hex = [_]u8{'0'} ** 40,
+        .info_hash_hex = @as([40]u8, @splat('0')),
         .name = "test.bin",
         .total_size = loaded.totalSize(),
         .piece_count = loaded.pieceCount(),
@@ -2609,14 +2609,14 @@ test "getStats does not mutate completion state" {
         .state = .downloading,
         .torrent_bytes = "",
         .save_path = "",
-        .info_hash = [_]u8{0} ** 20,
-        .info_hash_hex = [_]u8{'0'} ** 40,
+        .info_hash = @as([20]u8, @splat(0)),
+        .info_hash_hex = @as([40]u8, @splat('0')),
         .name = "",
         .total_size = 16 * 1024,
         .piece_count = 1,
         .added_on = 0,
-        .peer_id = [_]u8{0} ** 20,
-        .tracker_key = [_]u8{0} ** 8,
+        .peer_id = @as([20]u8, @splat(0)),
+        .tracker_key = @as([8]u8, @splat(0)),
         .piece_tracker = piece_tracker,
     };
 
@@ -2647,14 +2647,14 @@ test "checkSeedTransition is the seeding state mutation point" {
         .state = .downloading,
         .torrent_bytes = "",
         .save_path = "",
-        .info_hash = [_]u8{0} ** 20,
-        .info_hash_hex = [_]u8{'0'} ** 40,
+        .info_hash = @as([20]u8, @splat(0)),
+        .info_hash_hex = @as([40]u8, @splat('0')),
         .name = "",
         .total_size = 16 * 1024,
         .piece_count = 1,
         .added_on = 0,
-        .peer_id = [_]u8{0} ** 20,
-        .tracker_key = [_]u8{0} ** 8,
+        .peer_id = @as([20]u8, @splat(0)),
+        .tracker_key = @as([8]u8, @splat(0)),
         .piece_tracker = piece_tracker,
     };
 
@@ -2671,8 +2671,8 @@ test "stop detaches torrent from shared event loop" {
     const empty_fds = [_]posix.fd_t{};
     _ = try el.addTorrentContext(.{
         .shared_fds = empty_fds[0..],
-        .info_hash = [_]u8{0} ** 20,
-        .peer_id = [_]u8{0} ** 20,
+        .info_hash = @as([20]u8, @splat(0)),
+        .peer_id = @as([20]u8, @splat(0)),
     });
 
     var session = TorrentSession{
@@ -2680,14 +2680,14 @@ test "stop detaches torrent from shared event loop" {
         .state = .downloading,
         .torrent_bytes = "",
         .save_path = "",
-        .info_hash = [_]u8{0} ** 20,
-        .info_hash_hex = [_]u8{'0'} ** 40,
+        .info_hash = @as([20]u8, @splat(0)),
+        .info_hash_hex = @as([40]u8, @splat('0')),
         .name = "",
         .total_size = 0,
         .piece_count = 0,
         .added_on = 0,
-        .peer_id = [_]u8{0} ** 20,
-        .tracker_key = [_]u8{0} ** 8,
+        .peer_id = @as([20]u8, @splat(0)),
+        .tracker_key = @as([8]u8, @splat(0)),
         .shared_event_loop = &el,
         .torrent_id_in_shared = 0,
     };
@@ -2710,14 +2710,14 @@ test "unpause preserves shared event loop mode" {
         .state = .paused,
         .torrent_bytes = "",
         .save_path = "",
-        .info_hash = [_]u8{0} ** 20,
-        .info_hash_hex = [_]u8{'0'} ** 40,
+        .info_hash = @as([20]u8, @splat(0)),
+        .info_hash_hex = @as([40]u8, @splat('0')),
         .name = "",
         .total_size = 0,
         .piece_count = 0,
         .added_on = 0,
-        .peer_id = [_]u8{0} ** 20,
-        .tracker_key = [_]u8{0} ** 8,
+        .peer_id = @as([20]u8, @splat(0)),
+        .tracker_key = @as([8]u8, @splat(0)),
         .shared_event_loop = &el,
     };
 
@@ -2748,14 +2748,14 @@ test "buildTrackerUrls includes effective tracker set with overrides" {
         .allocator = std.testing.allocator,
         .torrent_bytes = "",
         .save_path = "",
-        .info_hash = [_]u8{0} ** 20,
-        .info_hash_hex = [_]u8{'0'} ** 40,
+        .info_hash = @as([20]u8, @splat(0)),
+        .info_hash_hex = @as([40]u8, @splat('0')),
         .name = "",
         .total_size = 0,
         .piece_count = 0,
         .added_on = 0,
-        .peer_id = [_]u8{0} ** 20,
-        .tracker_key = [_]u8{0} ** 8,
+        .peer_id = @as([20]u8, @splat(0)),
+        .tracker_key = @as([8]u8, @splat(0)),
         .session = loaded,
     };
     defer ts.tracker_overrides.deinit(std.testing.allocator);

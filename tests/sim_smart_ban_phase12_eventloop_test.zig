@@ -246,9 +246,9 @@ fn runScenario(seed: u64, specs: [num_peers]PeerSpec) !ScenarioResult {
     var peers: [num_peers]SimPeer = undefined;
     var seeder_fds: [num_peers]posix.fd_t = undefined;
     var downloader_fds: [num_peers]posix.fd_t = undefined;
-    var slots: [num_peers]?u16 = .{null} ** num_peers;
-    var connected: [num_peers]bool = .{false} ** num_peers;
-    var disconnected: [num_peers]bool = .{false} ** num_peers;
+    var slots: [num_peers]?u16 = @splat(null);
+    var connected: [num_peers]bool = @splat(false);
+    var disconnected: [num_peers]bool = @splat(false);
 
     var i: u8 = 0;
     while (i < num_peers) : (i += 1) {
@@ -275,7 +275,7 @@ fn runScenario(seed: u64, specs: [num_peers]PeerSpec) !ScenarioResult {
             .role = .seeder,
             .behavior = behaviorFor(specs[i]),
             .info_hash = session.metainfo.info_hash,
-            .peer_id = [_]u8{i} ** 20,
+            .peer_id = @as([20]u8, @splat(i)),
             .piece_count = piece_count,
             .piece_size = piece_size,
             .bitfield = &full_bitfield,

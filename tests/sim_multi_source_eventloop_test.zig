@@ -222,7 +222,7 @@ fn runScenario(seed: u64, opts: ScenarioOpts) !void {
             .role = .seeder,
             .behavior = .{ .honest = {} },
             .info_hash = session.metainfo.info_hash,
-            .peer_id = [_]u8{i} ** 20,
+            .peer_id = @as([20]u8, @splat(i)),
             .piece_count = piece_count,
             .piece_size = piece_size,
             .bitfield = &full_bitfield, // every peer advertises the full piece

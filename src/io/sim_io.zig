@@ -2123,10 +2123,10 @@ test "SimIO multiple timeouts deliver in deadline order" {
     defer io.deinit();
 
     const N: u32 = 8;
-    var completions: [N]Completion = .{Completion{}} ** N;
+    var completions: [N]Completion = @splat(Completion{});
 
     const OrderLog = struct {
-        slots: [N]u32 = .{0} ** N,
+        slots: [N]u32 = @splat(0),
         next_index: u32 = 0,
     };
     var log = OrderLog{};
@@ -2209,7 +2209,7 @@ test "SimIO PendingQueueFull when capacity exhausted" {
     var io = try SimIO.init(testing.allocator, .{ .pending_capacity = 4 });
     defer io.deinit();
 
-    var completions: [5]Completion = .{Completion{}} ** 5;
+    var completions: [5]Completion = @splat(Completion{});
     var ctx = TestCtx{};
 
     var i: usize = 0;

@@ -378,7 +378,7 @@ fn runOneSeed(seed: u64) !void {
     const piece_data_buf = try arena.allocator().alloc(u8, piece_count * piece_size);
     for (piece_data_buf, 0..) |*b, i| b.* = @as(u8, @intCast(i & 0xff));
 
-    const info_hash: [20]u8 = .{0xab} ** 20;
+    const info_hash: [20]u8 = @splat(0xab);
     var bitfield: [1]u8 = .{0xf0}; // 4 pieces, all present
 
     // Spin up 6 SimPeer seeders. Indices 0..4 are honest; index 5 is
@@ -387,7 +387,7 @@ fn runOneSeed(seed: u64) !void {
     var downloader: Downloader = .{
         .io = &sim.io,
         .info_hash = info_hash,
-        .peer_id = .{0x44} ** 20,
+        .peer_id = @splat(0x44),
         .piece_data = piece_data_buf,
     };
 
@@ -421,7 +421,7 @@ fn runOneSeed(seed: u64) !void {
             .role = .seeder,
             .behavior = behavior,
             .info_hash = info_hash,
-            .peer_id = [_]u8{i} ** 20,
+            .peer_id = @as([20]u8, @splat(i)),
             .piece_count = piece_count,
             .piece_size = piece_size,
             .bitfield = &bitfield,

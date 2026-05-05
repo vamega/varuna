@@ -136,7 +136,7 @@ test "zeroPieceHash clobbers a single piece in place (Phase 1 piece-by-piece)" {
 
     sess.zeroPieceHash(1);
 
-    const expect_zero: [20]u8 = [_]u8{0} ** 20;
+    const expect_zero: [20]u8 = @as([20]u8, @splat(0));
     try std.testing.expectEqualSlices(u8, &expect_zero, try sess.layout.pieceHash(1));
 
     // Other pieces are untouched.
@@ -167,7 +167,7 @@ test "zeroPieceHash + allHashesVerified drives the Phase 1 endgame trigger" {
 }
 
 test "zeroPieceHash on a v2 torrent is a safe no-op (no flat hash table)" {
-    const pr = [_]u8{0xAA} ** 32;
+    const pr = @as([32]u8, @splat(0xAA));
     const v2_input = "d4:infod9:file treed8:test.bind0:d6:lengthi5e11:pieces root32:" ++ pr ++ "eee4:name4:test12:piece lengthi16384eee";
     var sess = try Session.loadForDownload(std.testing.allocator, v2_input, "/srv/torrents");
     defer sess.deinit(std.testing.allocator);
@@ -199,7 +199,7 @@ test "smart-ban interaction: hash stays live across failed-piece re-download" {
     // Now the piece passes; the EL would call zeroPieceHash AFTER pt.completePiece.
     sess.zeroPieceHash(0);
     const h0_after = try sess.layout.pieceHash(0);
-    try std.testing.expectEqualSlices(u8, &([_]u8{0} ** 20), h0_after);
+    try std.testing.expectEqualSlices(u8, &(@as([20]u8, @splat(0))), h0_after);
 
     // And piece 1 is still live for its own subsequent verification.
     try std.testing.expectEqualStrings("uvwxyzABCDEFGHIJKLMN", try sess.layout.pieceHash(1));

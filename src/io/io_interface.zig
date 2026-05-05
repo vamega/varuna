@@ -464,7 +464,7 @@ pub const Completion = struct {
     /// Zero-initialised so that backends can safely read flags like
     /// `in_flight` on a fresh Completion without observing 0xaa-pattern
     /// debug fill.
-    _backend_state: [backend_state_size]u8 align(backend_state_align) = [_]u8{0} ** backend_state_size,
+    _backend_state: [backend_state_size]u8 align(backend_state_align) = @as([backend_state_size]u8, @splat(0)),
 
     /// Fluent helper: arm a completion in one call.
     pub fn arm(

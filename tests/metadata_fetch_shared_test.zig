@@ -55,13 +55,13 @@ test "shared assembler: deinit does not free caller-owned slices" {
     var buffer: [ut_metadata.max_metadata_size]u8 = undefined;
     var received: [ut_metadata.max_piece_count]bool = undefined;
 
-    var a = ut_metadata.MetadataAssembler.initShared([_]u8{0} ** 20, buffer[0..], received[0..]);
+    var a = ut_metadata.MetadataAssembler.initShared(@as([20]u8, @splat(0)), buffer[0..], received[0..]);
     a.deinit(); // must NOT free buffer[]/received[]
 
     // If deinit had freed, reusing the same slices would tickle
     // a use-after-free. The test running cleanly under the GPA
     // leak/UAF detector is the assertion.
-    var b = ut_metadata.MetadataAssembler.initShared([_]u8{0} ** 20, buffer[0..], received[0..]);
+    var b = ut_metadata.MetadataAssembler.initShared(@as([20]u8, @splat(0)), buffer[0..], received[0..]);
     defer b.deinit();
     try testing.expect(!b.owns_storage);
 }
@@ -72,7 +72,7 @@ test "shared assembler: rejects size > shared capacity" {
     var buffer: [small_cap]u8 = undefined;
     var received: [piece_cap]bool = undefined;
 
-    var assembler = ut_metadata.MetadataAssembler.initShared([_]u8{0} ** 20, buffer[0..], received[0..]);
+    var assembler = ut_metadata.MetadataAssembler.initShared(@as([20]u8, @splat(0)), buffer[0..], received[0..]);
     defer assembler.deinit();
 
     try testing.expectError(
@@ -87,7 +87,7 @@ test "shared assembler: rejects piece count > shared received capacity" {
     var buffer: [ut_metadata.max_metadata_size]u8 = undefined;
     var received: [1]bool = undefined;
 
-    var assembler = ut_metadata.MetadataAssembler.initShared([_]u8{0} ** 20, buffer[0..], received[0..]);
+    var assembler = ut_metadata.MetadataAssembler.initShared(@as([20]u8, @splat(0)), buffer[0..], received[0..]);
     defer assembler.deinit();
 
     // metadata_piece_size + 1 needs 2 pieces; piece_cap is 1 → reject.
@@ -202,8 +202,8 @@ test "AsyncMetadataFetch with shared buffers: assembler routes through shared pa
     const mf = try metadata_handler.AsyncMetadataFetch.create(
         testing.allocator,
         &io,
-        [_]u8{0xAA} ** 20,
-        [_]u8{0xBB} ** 20,
+        @as([20]u8, @splat(0xAA)),
+        @as([20]u8, @splat(0xBB)),
         6881,
         false,
         &peers,
@@ -228,8 +228,8 @@ test "AsyncMetadataFetch without shared buffers: assembler owns storage" {
     const mf = try metadata_handler.AsyncMetadataFetch.create(
         testing.allocator,
         &io,
-        [_]u8{0xAA} ** 20,
-        [_]u8{0xBB} ** 20,
+        @as([20]u8, @splat(0xAA)),
+        @as([20]u8, @splat(0xBB)),
         6881,
         false,
         &peers,

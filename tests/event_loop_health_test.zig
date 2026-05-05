@@ -185,7 +185,7 @@ fn expectHandshakeBytes(
     try std.testing.expectEqual(pw.protocol_length, actual[0]);
     try std.testing.expectEqualStrings(pw.protocol_string, actual[1..20]);
 
-    var expected_reserved = [_]u8{0} ** 8;
+    var expected_reserved = @as([8]u8, @splat(0));
     expected_reserved[ext.reserved_byte] |= ext.reserved_mask;
     if (expect_v2_support) {
         expected_reserved[pw.v2_reserved_byte] |= pw.v2_reserved_mask;
@@ -223,10 +223,10 @@ fn expectOutboundHandshake(
     const fds = try el.io.createSocketpair();
     defer el.io.closeSocket(fds[1]);
 
-    const peer_id = [_]u8{0x99} ** 20;
+    const peer_id = @as([20]u8, @splat(0x99));
     const empty_fds = [_]posix.fd_t{};
 
-    var full_v2 = [_]u8{0} ** 32;
+    var full_v2 = @as([32]u8, @splat(0));
     if (v2_hash) |truncated| @memcpy(full_v2[0..20], &truncated);
 
     const path = [_][]const u8{"file.bin"};
@@ -267,25 +267,25 @@ fn expectOutboundHandshake(
 }
 
 test "BEP 52 outbound handshake bytes use v1 swarm hash for v1 torrents" {
-    const v1_hash = [_]u8{0x11} ** 20;
+    const v1_hash = @as([20]u8, @splat(0x11));
     try expectDefaultOutboundHandshake(.v1, v1_hash, null, v1_hash, false);
 }
 
 test "BEP 52 outbound handshake bytes use v1 swarm hash for hybrid default peers" {
-    const v1_hash = [_]u8{0x22} ** 20;
-    const v2_hash = [_]u8{0x33} ** 20;
+    const v1_hash = @as([20]u8, @splat(0x22));
+    const v2_hash = @as([20]u8, @splat(0x33));
     try expectDefaultOutboundHandshake(.hybrid, v1_hash, v2_hash, v1_hash, true);
 }
 
 test "BEP 52 outbound handshake bytes use truncated v2 swarm hash for pure v2 torrents" {
-    const v1_hash = [_]u8{0x44} ** 20;
-    const v2_hash = [_]u8{0x55} ** 20;
+    const v1_hash = @as([20]u8, @splat(0x44));
+    const v2_hash = @as([20]u8, @splat(0x55));
     try expectDefaultOutboundHandshake(.v2, v1_hash, v2_hash, v2_hash, true);
 }
 
 test "BEP 52 DHT-selected hybrid handshake bytes use selected v2 swarm hash" {
-    const v1_hash = [_]u8{0x66} ** 20;
-    const v2_hash = [_]u8{0x77} ** 20;
+    const v1_hash = @as([20]u8, @splat(0x66));
+    const v2_hash = @as([20]u8, @splat(0x77));
     try expectOutboundHandshake(.hybrid, v1_hash, v2_hash, v2_hash, v2_hash, true);
 }
 
@@ -297,12 +297,12 @@ test "BEP 52 DHT peer results preserve selected v2 swarm hash" {
     var el = try EL.initBareWithIO(std.testing.allocator, sim_io, 0);
     defer el.deinit();
 
-    const v1_hash = [_]u8{0x88} ** 20;
-    const v2_hash = [_]u8{0x99} ** 20;
-    const peer_id = [_]u8{0xaa} ** 20;
+    const v1_hash = @as([20]u8, @splat(0x88));
+    const v2_hash = @as([20]u8, @splat(0x99));
+    const peer_id = @as([20]u8, @splat(0xaa));
     const empty_fds = [_]posix.fd_t{};
 
-    var full_v2 = [_]u8{0} ** 32;
+    var full_v2 = @as([32]u8, @splat(0));
     @memcpy(full_v2[0..20], &v2_hash);
 
     const path = [_][]const u8{"file.bin"};
@@ -335,7 +335,7 @@ test "BEP 52 DHT peer results preserve selected v2 swarm hash" {
         .peer_id = peer_id,
     });
 
-    var engine = try varuna.dht.DhtEngine.create(std.testing.allocator, &el.random, [_]u8{0xbb} ** 20);
+    var engine = try varuna.dht.DhtEngine.create(std.testing.allocator, &el.random, @as([20]u8, @splat(0xbb)));
     defer {
         el.dht_engine = null;
         engine.deinit();

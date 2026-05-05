@@ -52,7 +52,7 @@ pub fn isUnspecified(addr: *const std.net.Address) bool {
     if (ipv4Bytes(addr)) |ip| return std.mem.eql(u8, &ip, &[_]u8{ 0, 0, 0, 0 });
     if (addr.any.family != posix.AF.INET6) return false;
 
-    const unspecified = [_]u8{0} ** 16;
+    const unspecified = @as([16]u8, @splat(0));
     return std.mem.eql(u8, &addr.in6.sa.addr, &unspecified);
 }
 

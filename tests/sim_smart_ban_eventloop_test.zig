@@ -254,7 +254,7 @@ fn runOneSeedAgainstEventLoop(seed: u64, opts: BuggifyOpts) !SeedOutcome {
             .role = .seeder,
             .behavior = behavior,
             .info_hash = session.metainfo.info_hash,
-            .peer_id = [_]u8{i} ** 20,
+            .peer_id = @as([20]u8, @splat(i)),
             .piece_count = piece_count,
             .piece_size = piece_size,
             .bitfield = bf,

@@ -253,7 +253,7 @@ test "Merkle proof fails with wrong root" {
     const proof = try tree.proofForPiece(std.testing.allocator, 0);
     defer std.testing.allocator.free(proof);
 
-    var wrong_root: [32]u8 = [_]u8{0xff} ** 32;
+    var wrong_root: [32]u8 = @as([32]u8, @splat(0xff));
     _ = &wrong_root;
     try std.testing.expect(!MerkleTree.verifyProof(wrong_root, 0, h0, proof));
 }

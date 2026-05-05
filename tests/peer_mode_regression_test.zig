@@ -41,8 +41,8 @@ test "INTERESTED auto-unchokes an outbound-mode peer (regression: large-20m-64k)
     const empty_fds = [_]std.posix.fd_t{};
     _ = try el.addTorrentContext(.{
         .shared_fds = empty_fds[0..],
-        .info_hash = [_]u8{0} ** 20,
-        .peer_id = [_]u8{0} ** 20,
+        .info_hash = @as([20]u8, @splat(0)),
+        .peer_id = @as([20]u8, @splat(0)),
     });
 
     const slot: u16 = 0;

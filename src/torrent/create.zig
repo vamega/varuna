@@ -622,7 +622,7 @@ fn computeFileMerkleRoot(
     file_size: u64,
     piece_length: u32,
 ) ![32]u8 {
-    if (file_size == 0) return [_]u8{0} ** 32;
+    if (file_size == 0) return @as([32]u8, @splat(0));
 
     const piece_count = computePieceCount(file_size, piece_length);
     const piece_hashes = try allocator.alloc([32]u8, piece_count);
@@ -672,7 +672,7 @@ fn computeMultiFileMerkleRoots(
     for (files, 0..) |entry, i| {
         if (entry.size == 0) {
             v2_infos[i] = .{
-                .pieces_root = [_]u8{0} ** 32,
+                .pieces_root = @as([32]u8, @splat(0)),
                 .file_size = 0,
             };
             continue;
@@ -1213,7 +1213,7 @@ test "create hybrid single file torrent and parse it back" {
     try std.testing.expectEqualStrings("test_hybrid.bin", v2_files[0].path[0]);
 
     // Verify the pieces_root is not all zeros (file has data)
-    try std.testing.expect(!std.mem.eql(u8, &v2_files[0].pieces_root, &([_]u8{0} ** 32)));
+    try std.testing.expect(!std.mem.eql(u8, &v2_files[0].pieces_root, &(@as([32]u8, @splat(0)))));
 }
 
 test "create hybrid multi-file torrent and parse it back" {

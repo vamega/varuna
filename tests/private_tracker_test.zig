@@ -44,7 +44,7 @@ test "announce URL omits key when not provided" {
 }
 
 test "announce URL includes info_hash percent-encoded" {
-    const url = try buildTestUrl(.{ .info_hash = [_]u8{ 0x00, 0xFF } ++ ([_]u8{0xAB} ** 18) });
+    const url = try buildTestUrl(.{ .info_hash = [_]u8{ 0x00, 0xFF } ++ (@as([18]u8, @splat(0xAB))) });
     defer std.testing.allocator.free(url);
     try std.testing.expect(std.mem.indexOf(u8, url, "info_hash=%00%FF") != null);
 }
@@ -278,7 +278,7 @@ test "multiple compact peers parse correctly" {
 // ── Helper ──────────────────────────────────────────────────
 
 const BuildTestUrlOptions = struct {
-    info_hash: [20]u8 = [_]u8{0} ** 20,
+    info_hash: [20]u8 = @as([20]u8, @splat(0)),
     peer_id: [20]u8 = "ABCDEFGHIJKLMNOPQRST".*,
     port: u16 = 6881,
     uploaded: u64 = 0,

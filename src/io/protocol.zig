@@ -1081,8 +1081,8 @@ fn setupTestTorrent(el: *EventLoop, piece_tracker: ?*PieceTracker) !void {
     _ = try el.addTorrentContext(.{
         .piece_tracker = piece_tracker,
         .shared_fds = empty_fds[0..],
-        .info_hash = [_]u8{0} ** 20,
-        .peer_id = [_]u8{0} ** 20,
+        .info_hash = @as([20]u8, @splat(0)),
+        .peer_id = @as([20]u8, @splat(0)),
     });
 }
 

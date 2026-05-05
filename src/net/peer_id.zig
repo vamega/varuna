@@ -232,7 +232,7 @@ test "unknown peer id shows hex prefix" {
 }
 
 test "all-zero peer id" {
-    const id: [20]u8 = [_]u8{0} ** 20;
+    const id: [20]u8 = @as([20]u8, @splat(0));
     const name = try peerIdToClientName(std.testing.allocator, &id);
     defer std.testing.allocator.free(name);
     try std.testing.expect(std.mem.startsWith(u8, name, "Unknown ("));

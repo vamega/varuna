@@ -340,7 +340,7 @@ test "build layout for single file torrent" {
     };
     const hashes = "aaaaaaaaaaaaaaaaaaaabbbbbbbbbbbbbbbbbbbbcccccccccccccccccccc";
     const source = metainfo.Metainfo{
-        .info_hash = [_]u8{0} ** 20,
+        .info_hash = @as([20]u8, @splat(0)),
         .announce = null,
         .created_by = null,
         .comment = null,
@@ -372,7 +372,7 @@ test "map piece across multiple files" {
     };
     const hashes = "aaaaaaaaaaaaaaaaaaaabbbbbbbbbbbbbbbbbbbbcccccccccccccccccccc";
     const source = metainfo.Metainfo{
-        .info_hash = [_]u8{0} ** 20,
+        .info_hash = @as([20]u8, @splat(0)),
         .announce = null,
         .created_by = null,
         .comment = null,
@@ -415,7 +415,7 @@ test "reject mismatched piece hash count" {
         .{ .length = 10, .path = path[0..] },
     };
     const source = metainfo.Metainfo{
-        .info_hash = [_]u8{0} ** 20,
+        .info_hash = @as([20]u8, @splat(0)),
         .announce = null,
         .created_by = null,
         .comment = null,
@@ -437,7 +437,7 @@ test "render relative path for multi file torrent" {
     };
     const hashes = "aaaaaaaaaaaaaaaaaaaabbbbbbbbbbbbbbbbbbbbcccccccccccccccccccc";
     const source = metainfo.Metainfo{
-        .info_hash = [_]u8{0} ** 20,
+        .info_hash = @as([20]u8, @splat(0)),
         .announce = null,
         .created_by = null,
         .comment = null,
@@ -469,11 +469,11 @@ test "build v2 file-aligned layout" {
         .{ .length = 10, .path = path1[0..] },
     };
     const v2_files = [_]metainfo.V2File{
-        .{ .path = path0[0..], .length = 5, .pieces_root = [_]u8{0xAA} ** 32 },
-        .{ .path = path1[0..], .length = 10, .pieces_root = [_]u8{0xBB} ** 32 },
+        .{ .path = path0[0..], .length = 5, .pieces_root = @as([32]u8, @splat(0xAA)) },
+        .{ .path = path1[0..], .length = 10, .pieces_root = @as([32]u8, @splat(0xBB)) },
     };
     const source = metainfo.Metainfo{
-        .info_hash = [_]u8{0} ** 20,
+        .info_hash = @as([20]u8, @splat(0)),
         .announce = null,
         .created_by = null,
         .comment = null,
@@ -508,11 +508,11 @@ test "v2 piece size respects file boundaries" {
         .{ .length = 3, .path = path1[0..] },
     };
     const v2_files = [_]metainfo.V2File{
-        .{ .path = path0[0..], .length = 5, .pieces_root = [_]u8{0} ** 32 },
-        .{ .path = path1[0..], .length = 3, .pieces_root = [_]u8{0} ** 32 },
+        .{ .path = path0[0..], .length = 5, .pieces_root = @as([32]u8, @splat(0)) },
+        .{ .path = path1[0..], .length = 3, .pieces_root = @as([32]u8, @splat(0)) },
     };
     const source = metainfo.Metainfo{
-        .info_hash = [_]u8{0} ** 20,
+        .info_hash = @as([20]u8, @splat(0)),
         .announce = null,
         .created_by = null,
         .comment = null,
@@ -542,11 +542,11 @@ test "v2 mapPiece returns single-file spans" {
         .{ .length = 3, .path = path1[0..] },
     };
     const v2_files = [_]metainfo.V2File{
-        .{ .path = path0[0..], .length = 5, .pieces_root = [_]u8{0} ** 32 },
-        .{ .path = path1[0..], .length = 3, .pieces_root = [_]u8{0} ** 32 },
+        .{ .path = path0[0..], .length = 5, .pieces_root = @as([32]u8, @splat(0)) },
+        .{ .path = path1[0..], .length = 3, .pieces_root = @as([32]u8, @splat(0)) },
     };
     const source = metainfo.Metainfo{
-        .info_hash = [_]u8{0} ** 20,
+        .info_hash = @as([20]u8, @splat(0)),
         .announce = null,
         .created_by = null,
         .comment = null,
@@ -590,10 +590,10 @@ test "v2 pieceSpanCount is always 1" {
         .{ .length = 10, .path = path0[0..] },
     };
     const v2_files = [_]metainfo.V2File{
-        .{ .path = path0[0..], .length = 10, .pieces_root = [_]u8{0} ** 32 },
+        .{ .path = path0[0..], .length = 10, .pieces_root = @as([32]u8, @splat(0)) },
     };
     const source = metainfo.Metainfo{
-        .info_hash = [_]u8{0} ** 20,
+        .info_hash = @as([20]u8, @splat(0)),
         .announce = null,
         .created_by = null,
         .comment = null,
@@ -619,10 +619,10 @@ test "pure v2 layout rejects v1 piece hashes" {
         .{ .length = 4, .path = path0[0..] },
     };
     const v2_files = [_]metainfo.V2File{
-        .{ .path = path0[0..], .length = 4, .pieces_root = [_]u8{0} ** 32 },
+        .{ .path = path0[0..], .length = 4, .pieces_root = @as([32]u8, @splat(0)) },
     };
     const source = metainfo.Metainfo{
-        .info_hash = [_]u8{0} ** 20,
+        .info_hash = @as([20]u8, @splat(0)),
         .announce = null,
         .created_by = null,
         .comment = null,
@@ -647,12 +647,12 @@ test "hybrid layout keeps v1 piece mapping semantics" {
         .{ .length = 5, .path = path1[0..] },
     };
     const v2_files = [_]metainfo.V2File{
-        .{ .path = path0[0..], .length = 3, .pieces_root = [_]u8{0xAA} ** 32 },
-        .{ .path = path1[0..], .length = 5, .pieces_root = [_]u8{0xBB} ** 32 },
+        .{ .path = path0[0..], .length = 3, .pieces_root = @as([32]u8, @splat(0xAA)) },
+        .{ .path = path1[0..], .length = 5, .pieces_root = @as([32]u8, @splat(0xBB)) },
     };
     const hashes = "aaaaaaaaaaaaaaaaaaaabbbbbbbbbbbbbbbbbbbb";
     const source = metainfo.Metainfo{
-        .info_hash = [_]u8{0} ** 20,
+        .info_hash = @as([20]u8, @splat(0)),
         .announce = null,
         .created_by = null,
         .comment = null,
@@ -662,7 +662,7 @@ test "hybrid layout keeps v1 piece mapping semantics" {
         .files = files[0..],
         .version = .hybrid,
         .file_tree_v2 = @constCast(v2_files[0..]),
-        .info_hash_v2 = [_]u8{0x11} ** 32,
+        .info_hash_v2 = @as([32]u8, @splat(0x11)),
     };
 
     const built = try build(std.testing.allocator, &source);

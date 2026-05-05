@@ -182,7 +182,7 @@ test "resume db mark and load pieces" {
     var db = ResumeDb.open(":memory:") catch return error.SkipZigTest;
     defer db.close();
 
-    const info_hash = [_]u8{0xAA} ** 20;
+    const info_hash = @as([20]u8, @splat(0xAA));
 
     try db.markComplete(info_hash, 0);
     try db.markComplete(info_hash, 5);
@@ -205,7 +205,7 @@ test "resume db batch write" {
     var db = ResumeDb.open(":memory:") catch return error.SkipZigTest;
     defer db.close();
 
-    const info_hash = [_]u8{0xBB} ** 20;
+    const info_hash = @as([20]u8, @splat(0xBB));
     const pieces = [_]u32{ 0, 1, 2, 3, 4 };
 
     try db.markCompleteBatch(info_hash, &pieces);
@@ -221,7 +221,7 @@ test "resume db clear torrent" {
     var db = ResumeDb.open(":memory:") catch return error.SkipZigTest;
     defer db.close();
 
-    const info_hash = [_]u8{0xCC} ** 20;
+    const info_hash = @as([20]u8, @splat(0xCC));
     try db.markComplete(info_hash, 0);
     try db.markComplete(info_hash, 1);
 
@@ -239,7 +239,7 @@ test "resume db replaceCompletePieces drops stale entries (recheck pruning)" {
     defer db.close();
 
     // Pre-existing state: pieces 5, 6, 7 marked complete from a previous run.
-    const info_hash = [_]u8{0xC0} ** 20;
+    const info_hash = @as([20]u8, @splat(0xC0));
     const before = [_]u32{ 5, 6, 7 };
     try db.markCompleteBatch(info_hash, &before);
 
@@ -265,7 +265,7 @@ test "resume db replaceCompletePieces with empty set clears all pieces" {
     var db = ResumeDb.open(":memory:") catch return error.SkipZigTest;
     defer db.close();
 
-    const info_hash = [_]u8{0xC1} ** 20;
+    const info_hash = @as([20]u8, @splat(0xC1));
     const before = [_]u32{ 0, 1, 2, 3 };
     try db.markCompleteBatch(info_hash, &before);
 
@@ -285,8 +285,8 @@ test "resume db replaceCompletePieces is per-info_hash isolated" {
 
     // Two torrents share the pieces table; replace on one must not
     // disturb the other's rows.
-    const info_hash_a = [_]u8{0xA0} ** 20;
-    const info_hash_b = [_]u8{0xB0} ** 20;
+    const info_hash_a = @as([20]u8, @splat(0xA0));
+    const info_hash_b = @as([20]u8, @splat(0xB0));
 
     const set_a = [_]u32{ 0, 1, 2 };
     const set_b = [_]u32{ 4, 5, 6, 7 };
@@ -323,7 +323,7 @@ test "resume db replaceCompletePieces is idempotent on no-change" {
 
     // Same pieces before and after — recheck found exactly what fast-resume
     // already had. Result must round-trip cleanly without losing entries.
-    const info_hash = [_]u8{0xC2} ** 20;
+    const info_hash = @as([20]u8, @splat(0xC2));
     const pieces = [_]u32{ 0, 2, 4, 6, 8 };
     try db.markCompleteBatch(info_hash, &pieces);
     try db.replaceCompletePieces(info_hash, &pieces);
@@ -344,9 +344,9 @@ test "resume db clear torrent removes auxiliary state" {
     var db = ResumeDb.open(":memory:") catch return error.SkipZigTest;
     defer db.close();
 
-    const info_hash = [_]u8{0xCD} ** 20;
+    const info_hash = @as([20]u8, @splat(0xCD));
     const info_hash_hex = std.fmt.bytesToHex(info_hash, .lower);
-    const v2_hash = [_]u8{0xEF} ** 32;
+    const v2_hash = @as([32]u8, @splat(0xEF));
 
     try db.markComplete(info_hash, 0);
     try db.saveTransferStats(info_hash, .{ .total_uploaded = 10, .total_downloaded = 20 });
@@ -398,7 +398,7 @@ test "resume db save and load transfer stats" {
     var db = ResumeDb.open(":memory:") catch return error.SkipZigTest;
     defer db.close();
 
-    const info_hash = [_]u8{0xDD} ** 20;
+    const info_hash = @as([20]u8, @splat(0xDD));
 
     // Initially empty -- should return zeros
     const empty = db.loadTransferStats(info_hash);
@@ -424,8 +424,8 @@ test "resume db transfer stats isolated per torrent" {
     var db = ResumeDb.open(":memory:") catch return error.SkipZigTest;
     defer db.close();
 
-    const hash_a = [_]u8{0xEE} ** 20;
-    const hash_b = [_]u8{0xFF} ** 20;
+    const hash_a = @as([20]u8, @splat(0xEE));
+    const hash_b = @as([20]u8, @splat(0xFF));
 
     try db.saveTransferStats(hash_a, .{ .total_uploaded = 100, .total_downloaded = 200 });
     try db.saveTransferStats(hash_b, .{ .total_uploaded = 300, .total_downloaded = 400 });
@@ -495,7 +495,7 @@ test "resume db torrent category persistence" {
     var db = ResumeDb.open(":memory:") catch return error.SkipZigTest;
     defer db.close();
 
-    const info_hash = [_]u8{0xAA} ** 20;
+    const info_hash = @as([20]u8, @splat(0xAA));
 
     // Initially no category
     const empty = try db.loadTorrentCategory(allocator, info_hash);
@@ -518,7 +518,7 @@ test "resume db torrent tags persistence" {
     var db = ResumeDb.open(":memory:") catch return error.SkipZigTest;
     defer db.close();
 
-    const info_hash = [_]u8{0xBB} ** 20;
+    const info_hash = @as([20]u8, @splat(0xBB));
 
     // Add tags
     try db.saveTorrentTag(info_hash, "linux");
@@ -574,8 +574,8 @@ test "resume db clear category from torrents" {
     var db = ResumeDb.open(":memory:") catch return error.SkipZigTest;
     defer db.close();
 
-    const hash_a = [_]u8{0xAA} ** 20;
-    const hash_b = [_]u8{0xBB} ** 20;
+    const hash_a = @as([20]u8, @splat(0xAA));
+    const hash_b = @as([20]u8, @splat(0xBB));
 
     try db.saveTorrentCategory(hash_a, "movies");
     try db.saveTorrentCategory(hash_b, "movies");
@@ -593,7 +593,7 @@ test "resume db save and load rate limits" {
     var db = ResumeDb.open(":memory:") catch return error.SkipZigTest;
     defer db.close();
 
-    const info_hash = [_]u8{0xDD} ** 20;
+    const info_hash = @as([20]u8, @splat(0xDD));
 
     // Initially empty -- should return zeros
     const empty = db.loadRateLimits(info_hash);
@@ -626,8 +626,8 @@ test "resume db remove tag from all torrents" {
     var db = ResumeDb.open(":memory:") catch return error.SkipZigTest;
     defer db.close();
 
-    const hash_a = [_]u8{0xAA} ** 20;
-    const hash_b = [_]u8{0xBB} ** 20;
+    const hash_a = @as([20]u8, @splat(0xAA));
+    const hash_b = @as([20]u8, @splat(0xBB));
 
     try db.saveTorrentTag(hash_a, "linux");
     try db.saveTorrentTag(hash_a, "archived");
@@ -656,7 +656,7 @@ test "resume db save and load v2 info hash" {
     var db = ResumeDb.open(":memory:") catch return error.SkipZigTest;
     defer db.close();
 
-    const v1_hash = [_]u8{0xAA} ** 20;
+    const v1_hash = @as([20]u8, @splat(0xAA));
     var v2_hash: [32]u8 = undefined;
     for (&v2_hash, 0..) |*b, i| b.* = @intCast(i);
 
@@ -680,8 +680,8 @@ test "resume db v2 info hash isolated per torrent" {
     var db = ResumeDb.open(":memory:") catch return error.SkipZigTest;
     defer db.close();
 
-    const hash_a = [_]u8{0xAA} ** 20;
-    const hash_b = [_]u8{0xBB} ** 20;
+    const hash_a = @as([20]u8, @splat(0xAA));
+    const hash_b = @as([20]u8, @splat(0xBB));
     var v2_a: [32]u8 = undefined;
     @memset(&v2_a, 0x11);
     var v2_b: [32]u8 = undefined;
@@ -697,7 +697,7 @@ test "resume db v2 info hash isolated per torrent" {
     try std.testing.expectEqual(v2_b, loaded_b);
 
     // Pure v1 torrent should return null
-    const hash_c = [_]u8{0xCC} ** 20;
+    const hash_c = @as([20]u8, @splat(0xCC));
     try std.testing.expect(db.loadInfoHashV2(hash_c) == null);
 }
 
@@ -794,7 +794,7 @@ test "resume db save and load share limits" {
     var db = ResumeDb.open(":memory:") catch return error.SkipZigTest;
     defer db.close();
 
-    const info_hash = [_]u8{0xAB} ** 20;
+    const info_hash = @as([20]u8, @splat(0xAB));
 
     // Default values when not set
     const default_limits = db.loadShareLimits(info_hash);
@@ -852,7 +852,7 @@ test "resume db tracker overrides add and load" {
     var db = ResumeDb.open(":memory:") catch return error.SkipZigTest;
     defer db.close();
 
-    const info_hash = [_]u8{0xAA} ** 20;
+    const info_hash = @as([20]u8, @splat(0xAA));
 
     // Initially empty
     const empty = try db.loadTrackerOverrides(allocator, info_hash);
@@ -879,7 +879,7 @@ test "resume db tracker overrides edit with orig_url" {
     var db = ResumeDb.open(":memory:") catch return error.SkipZigTest;
     defer db.close();
 
-    const info_hash = [_]u8{0xBB} ** 20;
+    const info_hash = @as([20]u8, @splat(0xBB));
 
     // Save an edit override
     try db.saveTrackerOverride(info_hash, "http://new.example.com/announce", 0, "edit", "http://old.example.com/announce");
@@ -897,7 +897,7 @@ test "resume db tracker overrides remove and clear" {
     var db = ResumeDb.open(":memory:") catch return error.SkipZigTest;
     defer db.close();
 
-    const info_hash = [_]u8{0xCC} ** 20;
+    const info_hash = @as([20]u8, @splat(0xCC));
 
     try db.saveTrackerOverride(info_hash, "http://a.example.com/announce", 0, "add", null);
     try db.saveTrackerOverride(info_hash, "http://b.example.com/announce", 1, "add", null);
@@ -920,8 +920,8 @@ test "resume db tracker overrides isolated per torrent" {
     var db = ResumeDb.open(":memory:") catch return error.SkipZigTest;
     defer db.close();
 
-    const hash_a = [_]u8{0xDD} ** 20;
-    const hash_b = [_]u8{0xEE} ** 20;
+    const hash_a = @as([20]u8, @splat(0xDD));
+    const hash_b = @as([20]u8, @splat(0xEE));
 
     try db.saveTrackerOverride(hash_a, "http://a.example.com/announce", 0, "add", null);
     try db.saveTrackerOverride(hash_b, "http://b.example.com/announce", 0, "add", null);

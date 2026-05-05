@@ -1064,7 +1064,7 @@ test "UdpTrackerExecutor uses independent send and recv completions" {
     defer io.deinit();
 
     var random = Random.simRandom(0x715);
-    var slots = [_]Executor.RequestSlot{.{}} ** 1;
+    var slots = @as([1]Executor.RequestSlot, @splat(.{}));
     var executor = Executor{
         .allocator = allocator,
         .io = &io,

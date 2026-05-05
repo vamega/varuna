@@ -265,8 +265,8 @@ pub const DhtEngine = struct {
     table: RoutingTable,
     tokens: TokenManager,
     next_txn_id: u16 = 1,
-    pending: [max_pending]?PendingQuery = [_]?PendingQuery{null} ** max_pending,
-    active_lookups: [max_lookups]?*Lookup = [_]?*Lookup{null} ** max_lookups,
+    pending: [max_pending]?PendingQuery = @as([max_pending]?PendingQuery, @splat(null)),
+    active_lookups: [max_lookups]?*Lookup = @as([max_lookups]?*Lookup, @splat(null)),
     /// Outbound packet queue. The event loop drains this via dhtDrainSendQueue.
     send_queue: std.ArrayList(OutboundPacket),
     /// Peer results from completed get_peers lookups.
@@ -1154,7 +1154,7 @@ pub const DhtEngine = struct {
             const len = krpc.encodePingQuery(&buf, txn_id, self.own_id) catch continue;
             if (!self.addPending(.{
                 .transaction_id = txn_id,
-                .target_id = [_]u8{0} ** 20, // unknown ID
+                .target_id = @as([20]u8, @splat(0)), // unknown ID
                 .target_addr = addr,
                 .sent_at = now,
                 .lookup_idx = null,
@@ -1293,7 +1293,7 @@ pub const DhtEngine = struct {
 };
 
 const AddressTokenBytes = struct {
-    bytes: [16]u8 = [_]u8{0} ** 16,
+    bytes: [16]u8 = @as([16]u8, @splat(0)),
     len: u8 = 0,
 
     fn slice(self: *const AddressTokenBytes) []const u8 {
@@ -1559,7 +1559,7 @@ test "DHT lookup does not queue untracked packet when pending table is full" {
 
     const now = std.time.timestamp();
     for (&engine.pending, 0..) |*slot, i| {
-        var id: NodeId = [_]u8{0} ** 20;
+        var id: NodeId = @as([20]u8, @splat(0));
         id[19] = @intCast(i % 251);
         slot.* = .{
             .transaction_id = @intCast(i + 1),
@@ -1625,7 +1625,7 @@ test "DHT peer result queue is bounded and batch drained" {
     for (0..max_peer_result_queue + 8) |i| {
         const peers = try allocator.alloc(std.net.Address, 1);
         peers[0] = std.net.Address.initIp4(.{ 10, 1, 0, @intCast(i % 250 + 1) }, 6881);
-        var hash: [20]u8 = [_]u8{0} ** 20;
+        var hash: [20]u8 = @as([20]u8, @splat(0));
         hash[19] = @intCast(i % 251);
         engine.emitPeerResult(hash, peers);
     }
@@ -1645,8 +1645,8 @@ test "DhtEngine requestPeers registers both v1 and v2 hashes for hybrid torrents
     var engine = DhtEngine.init(allocator, &rng, node_id.generateRandom(&rng));
     defer engine.deinit();
 
-    const v1_hash: [20]u8 = [_]u8{0xAA} ** 20;
-    const v2_truncated: [20]u8 = [_]u8{0xBB} ** 20;
+    const v1_hash: [20]u8 = @as([20]u8, @splat(0xAA));
+    const v2_truncated: [20]u8 = @as([20]u8, @splat(0xBB));
 
     engine.requestPeers(v1_hash, v2_truncated);
     try std.testing.expectEqual(@as(usize, 2), engine.registeredSearchCount());
@@ -1664,7 +1664,7 @@ test "DhtEngine requestPeers v1-only (null v2) registers only one hash" {
     var engine = DhtEngine.init(allocator, &rng, node_id.generateRandom(&rng));
     defer engine.deinit();
 
-    const v1_hash: [20]u8 = [_]u8{0xAA} ** 20;
+    const v1_hash: [20]u8 = @as([20]u8, @splat(0xAA));
     engine.requestPeers(v1_hash, null);
     try std.testing.expectEqual(@as(usize, 1), engine.registeredSearchCount());
     try std.testing.expectEqualSlices(u8, &v1_hash, &engine.pending_searches.items[0].hash);
@@ -1676,7 +1676,7 @@ test "DhtEngine diagnostics reports registered search state" {
     var engine = DhtEngine.init(allocator, &rng, node_id.generateRandom(&rng));
     defer engine.deinit();
 
-    const v1_hash: [20]u8 = [_]u8{0xAA} ** 20;
+    const v1_hash: [20]u8 = @as([20]u8, @splat(0xAA));
     engine.requestPeers(v1_hash, null);
     engine.pending_searches.items[0].done = true;
 
@@ -1694,8 +1694,8 @@ test "DhtEngine forceRequery toggles search-done flag for both hashes" {
     var engine = DhtEngine.init(allocator, &rng, node_id.generateRandom(&rng));
     defer engine.deinit();
 
-    const v1_hash: [20]u8 = [_]u8{0xAA} ** 20;
-    const v2_truncated: [20]u8 = [_]u8{0xBB} ** 20;
+    const v1_hash: [20]u8 = @as([20]u8, @splat(0xAA));
+    const v2_truncated: [20]u8 = @as([20]u8, @splat(0xBB));
 
     engine.requestPeers(v1_hash, v2_truncated);
     // Pretend both have already been queried at least once.
@@ -1722,8 +1722,8 @@ test "DhtEngine announcePeer fans out to v1 and v2 hashes" {
         }, now);
     }
 
-    const v1_hash: [20]u8 = [_]u8{0xAA} ** 20;
-    const v2_truncated: [20]u8 = [_]u8{0xBB} ** 20;
+    const v1_hash: [20]u8 = @as([20]u8, @splat(0xAA));
+    const v2_truncated: [20]u8 = @as([20]u8, @splat(0xBB));
     try engine.announcePeer(v1_hash, v2_truncated, 6881);
 
     // Two active lookups should now be running, one for each hash.

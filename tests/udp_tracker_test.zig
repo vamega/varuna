@@ -16,8 +16,8 @@ test "announce request roundtrip" {
     const req = udp.AnnounceRequest{
         .connection_id = 0x1234,
         .transaction_id = 0x5678,
-        .info_hash = [_]u8{1} ** 20,
-        .peer_id = [_]u8{2} ** 20,
+        .info_hash = @as([20]u8, @splat(1)),
+        .peer_id = @as([20]u8, @splat(2)),
         .downloaded = 1000,
         .left = 2000,
         .uploaded = 500,
@@ -36,7 +36,7 @@ test "announce request roundtrip" {
 }
 
 test "scrape single hash request is 36 bytes" {
-    const buf = udp.ScrapeRequest.encodeSingle(0xAABB, 0xCCDD, [_]u8{0xFF} ** 20);
+    const buf = udp.ScrapeRequest.encodeSingle(0xAABB, 0xCCDD, @as([20]u8, @splat(0xFF)));
     try std.testing.expectEqual(@as(usize, 36), buf.len);
     try std.testing.expectEqual(@as(u32, @intFromEnum(udp.Action.scrape)), std.mem.readInt(u32, buf[8..12], .big));
 }

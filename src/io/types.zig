@@ -100,7 +100,7 @@ pub const Peer = struct {
     availability: ?Bitfield = null,
 
     // Remote peer identification (from handshake)
-    remote_peer_id: [20]u8 = [_]u8{0} ** 20,
+    remote_peer_id: [20]u8 = @as([20]u8, @splat(0)),
     has_peer_id: bool = false,
 
     // Timing and stats
@@ -145,7 +145,7 @@ pub const Peer = struct {
     next_blocks_received: u32 = 0,
     next_pipeline_sent: u32 = 0,
     extra_prefetch_pieces: [extra_prefetch_piece_count]PrefetchPiece =
-        [_]PrefetchPiece{.{}} ** extra_prefetch_piece_count,
+        @as([extra_prefetch_piece_count]PrefetchPiece, @splat(.{})),
 
     // BEP 10 extension protocol state
     extensions_supported: bool = false, // peer advertised BEP 10 support

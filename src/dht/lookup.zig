@@ -308,7 +308,7 @@ test "nextToQuery returns alpha nodes" {
     var lk = Lookup.init(node_id.generateRandom(&rng), .find_node);
 
     for (0..5) |i| {
-        var id: NodeId = [_]u8{0} ** 20;
+        var id: NodeId = @as([20]u8, @splat(0));
         id[19] = @intCast(i + 1);
         lk.addCandidate(.{
             .id = id,
@@ -326,7 +326,7 @@ test "nextToQuery respects alpha as concurrent in-flight limit" {
     var lk = Lookup.init(node_id.generateRandom(&rng), .find_node);
 
     for (0..10) |i| {
-        var id: NodeId = [_]u8{0} ** 20;
+        var id: NodeId = @as([20]u8, @splat(0));
         id[19] = @intCast(i + 1);
         lk.addCandidate(.{
             .id = id,
@@ -351,7 +351,7 @@ test "lookup completes when no pending candidates" {
     var rng = Random.simRandom(0x503);
     var lk = Lookup.init(node_id.generateRandom(&rng), .find_node);
 
-    var id: NodeId = [_]u8{0} ** 20;
+    var id: NodeId = @as([20]u8, @splat(0));
     id[19] = 1;
     lk.addCandidate(.{
         .id = id,
@@ -371,7 +371,7 @@ test "handleResponse adds new candidates" {
     var rng = Random.simRandom(0x504);
     var lk = Lookup.init(node_id.generateRandom(&rng), .find_node);
 
-    var id1: NodeId = [_]u8{0} ** 20;
+    var id1: NodeId = @as([20]u8, @splat(0));
     id1[19] = 1;
     lk.addCandidate(.{
         .id = id1,
@@ -383,7 +383,7 @@ test "handleResponse adds new candidates" {
 
     var new_nodes: [2]NodeInfo = undefined;
     for (&new_nodes, 0..) |*n, i| {
-        var nid: NodeId = [_]u8{0} ** 20;
+        var nid: NodeId = @as([20]u8, @splat(0));
         nid[19] = @intCast(i + 10);
         n.* = .{
             .id = nid,
@@ -399,7 +399,7 @@ test "handleResponse collects peers" {
     var rng = Random.simRandom(0x505);
     var lk = Lookup.init(node_id.generateRandom(&rng), .get_peers);
 
-    var id1: NodeId = [_]u8{0} ** 20;
+    var id1: NodeId = @as([20]u8, @splat(0));
     id1[19] = 1;
     lk.addCandidate(.{
         .id = id1,
@@ -422,7 +422,7 @@ test "peer deduplication" {
     var rng = Random.simRandom(0x506);
     var lk = Lookup.init(node_id.generateRandom(&rng), .get_peers);
 
-    var id1: NodeId = [_]u8{0} ** 20;
+    var id1: NodeId = @as([20]u8, @splat(0));
     id1[19] = 1;
     lk.addCandidate(.{
         .id = id1,
@@ -435,7 +435,7 @@ test "peer deduplication" {
     const peer = std.net.Address.initIp4(.{ 172, 16, 0, 1 }, 51413);
 
     lk.handleResponse(id1, null, &[_]std.net.Address{peer}, null);
-    var id2: NodeId = [_]u8{0} ** 20;
+    var id2: NodeId = @as([20]u8, @splat(0));
     id2[19] = 2;
     lk.addCandidate(.{
         .id = id2,
@@ -451,7 +451,7 @@ test "candidate deduplication" {
     var rng = Random.simRandom(0x507);
     var lk = Lookup.init(node_id.generateRandom(&rng), .find_node);
 
-    var id: NodeId = [_]u8{0} ** 20;
+    var id: NodeId = @as([20]u8, @splat(0));
     id[19] = 1;
     const info = NodeInfo{
         .id = id,

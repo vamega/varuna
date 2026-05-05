@@ -185,7 +185,7 @@ fn benchMetainfoParse(stdout: *std.Io.Writer) !void {
     const input =
         "d8:announce14:http://tracker" ++
         "4:infod6:lengthi1048576e4:name8:test.bin12:piece lengthi16384e" ++
-        "6:pieces1280:" ++ ("A" ** 1280) ++ "ee";
+        "6:pieces1280:" ++ @as([1280]u8, @splat('A')) ++ "ee";
 
     const iterations: usize = 1_000;
 

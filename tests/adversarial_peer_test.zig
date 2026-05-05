@@ -30,26 +30,26 @@ test "max_message_length is 1 MiB" {
 // ── Handshake format ───────────────────────────────────────
 
 test "handshake is exactly 68 bytes with correct structure" {
-    const buf = pw.serializeHandshake([_]u8{0xAA} ** 20, [_]u8{0xBB} ** 20);
+    const buf = pw.serializeHandshake(@as([20]u8, @splat(0xAA)), @as([20]u8, @splat(0xBB)));
     try std.testing.expectEqual(@as(usize, 68), buf.len);
     try std.testing.expectEqual(@as(u8, 19), buf[0]);
     try std.testing.expectEqualStrings("BitTorrent protocol", buf[1..20]);
 }
 
 test "handshake with wrong protocol length byte is detectable" {
-    var buf = pw.serializeHandshake([_]u8{0xAA} ** 20, [_]u8{0xBB} ** 20);
+    var buf = pw.serializeHandshake(@as([20]u8, @splat(0xAA)), @as([20]u8, @splat(0xBB)));
     buf[0] = 20;
     try std.testing.expect(buf[0] != pw.protocol_length);
 }
 
 test "handshake with corrupted protocol string is detectable" {
-    var buf = pw.serializeHandshake([_]u8{0xAA} ** 20, [_]u8{0xBB} ** 20);
+    var buf = pw.serializeHandshake(@as([20]u8, @splat(0xAA)), @as([20]u8, @splat(0xBB)));
     buf[1] = 'X';
     try std.testing.expect(!std.mem.eql(u8, buf[1..20], pw.protocol_string));
 }
 
 test "handshake sets BEP 10 extension bit" {
-    const buf = pw.serializeHandshake([_]u8{0} ** 20, [_]u8{0} ** 20);
+    const buf = pw.serializeHandshake(@as([20]u8, @splat(0)), @as([20]u8, @splat(0)));
     // reserved bytes are at offset 20..28, BEP 10 bit is byte 5 mask 0x10
     try std.testing.expect((buf[20 + ext.reserved_byte] & ext.reserved_mask) != 0);
 }
@@ -112,8 +112,8 @@ test "keep-alive is zero-length message" {
 // ── Cancel vs request ──────────────────────────────────────
 
 test "cancel and request have same payload size but different IDs" {
-    const req_header = pw.serializeHeader(6, &([_]u8{0} ** 12));
-    const cancel_header = pw.serializeHeader(8, &([_]u8{0} ** 12));
+    const req_header = pw.serializeHeader(6, &(@as([12]u8, @splat(0))));
+    const cancel_header = pw.serializeHeader(8, &(@as([12]u8, @splat(0))));
     try std.testing.expectEqual(
         std.mem.readInt(u32, req_header[0..4], .big),
         std.mem.readInt(u32, cancel_header[0..4], .big),
@@ -296,9 +296,9 @@ test "private torrent extension handshake omits ut_pex" {
 // ── BEP 10 reserved bit detection ──────────────────────────
 
 test "extension support detection with various reserved byte patterns" {
-    try std.testing.expect(!ext.supportsExtensions([_]u8{0} ** 8));
+    try std.testing.expect(!ext.supportsExtensions(@as([8]u8, @splat(0))));
 
-    var reserved = [_]u8{0} ** 8;
+    var reserved = @as([8]u8, @splat(0));
     reserved[5] = 0x10;
     try std.testing.expect(ext.supportsExtensions(reserved));
 

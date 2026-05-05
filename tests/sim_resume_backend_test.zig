@@ -33,7 +33,7 @@ test "SimResumeBackend: markComplete + loadCompletePieces roundtrip" {
     var db = SimResumeBackend.init(allocator, 0xCAFE);
     defer db.deinit();
 
-    const info_hash = [_]u8{0xAA} ** 20;
+    const info_hash = @as([20]u8, @splat(0xAA));
     try db.markComplete(info_hash, 0);
     try db.markComplete(info_hash, 5);
     try db.markComplete(info_hash, 10);
@@ -55,7 +55,7 @@ test "SimResumeBackend: markCompleteBatch atomically inserts all" {
     var db = SimResumeBackend.init(allocator, 0);
     defer db.deinit();
 
-    const info_hash = [_]u8{0xBB} ** 20;
+    const info_hash = @as([20]u8, @splat(0xBB));
     const pieces = [_]u32{ 0, 1, 2, 3, 4 };
     try db.markCompleteBatch(info_hash, &pieces);
 
@@ -70,7 +70,7 @@ test "SimResumeBackend: replaceCompletePieces is atomic delete-then-insert" {
     var db = SimResumeBackend.init(allocator, 0);
     defer db.deinit();
 
-    const info_hash = [_]u8{0xC0} ** 20;
+    const info_hash = @as([20]u8, @splat(0xC0));
     const before = [_]u32{ 5, 6, 7 };
     try db.markCompleteBatch(info_hash, &before);
 
@@ -95,7 +95,7 @@ test "SimResumeBackend: replaceCompletePieces with empty set clears all pieces" 
     var db = SimResumeBackend.init(allocator, 0);
     defer db.deinit();
 
-    const info_hash = [_]u8{0xC1} ** 20;
+    const info_hash = @as([20]u8, @splat(0xC1));
     const before = [_]u32{ 0, 1, 2, 3 };
     try db.markCompleteBatch(info_hash, &before);
     const empty = [_]u32{};
@@ -112,8 +112,8 @@ test "SimResumeBackend: replaceCompletePieces is per-info_hash isolated" {
     var db = SimResumeBackend.init(allocator, 0);
     defer db.deinit();
 
-    const a = [_]u8{0xA0} ** 20;
-    const b = [_]u8{0xB0} ** 20;
+    const a = @as([20]u8, @splat(0xA0));
+    const b = @as([20]u8, @splat(0xB0));
     try db.markCompleteBatch(a, &[_]u32{ 0, 1, 2 });
     try db.markCompleteBatch(b, &[_]u32{ 4, 5, 6, 7 });
 
@@ -141,7 +141,7 @@ test "SimResumeBackend: transfer stats roundtrip + upsert" {
     var db = SimResumeBackend.init(allocator, 0);
     defer db.deinit();
 
-    const info_hash = [_]u8{0xDD} ** 20;
+    const info_hash = @as([20]u8, @splat(0xDD));
     const empty = db.loadTransferStats(info_hash);
     try testing.expectEqual(@as(u64, 0), empty.total_uploaded);
     try testing.expectEqual(@as(u64, 0), empty.total_downloaded);
@@ -210,8 +210,8 @@ test "SimResumeBackend: torrent category persistence + clearCategoryFromTorrents
     var db = SimResumeBackend.init(allocator, 0);
     defer db.deinit();
 
-    const a = [_]u8{0xAA} ** 20;
-    const b = [_]u8{0xBB} ** 20;
+    const a = @as([20]u8, @splat(0xAA));
+    const b = @as([20]u8, @splat(0xBB));
     try db.saveTorrentCategory(a, "movies");
     try db.saveTorrentCategory(b, "movies");
     try db.saveTorrentCategory(a, "tv"); // overwrite
@@ -235,7 +235,7 @@ test "SimResumeBackend: torrent tags + global tags" {
     var db = SimResumeBackend.init(allocator, 0);
     defer db.deinit();
 
-    const a = [_]u8{0xAA} ** 20;
+    const a = @as([20]u8, @splat(0xAA));
     try db.saveTorrentTag(a, "linux");
     try db.saveTorrentTag(a, "archived");
     try db.saveTorrentTag(a, "linux"); // dup ignored
@@ -268,7 +268,7 @@ test "SimResumeBackend: torrent tags + global tags" {
     try testing.expectEqual(@as(usize, 2), gtags.len);
 
     // removeTagFromTorrents
-    const b = [_]u8{0xBB} ** 20;
+    const b = @as([20]u8, @splat(0xBB));
     try db.saveTorrentTag(b, "archived");
     try db.removeTagFromTorrents("archived");
     const tags_a = try db.loadTorrentTags(allocator, a);
@@ -285,7 +285,7 @@ test "SimResumeBackend: rate limits roundtrip + clear" {
     var db = SimResumeBackend.init(testing.allocator, 0);
     defer db.deinit();
 
-    const info_hash = [_]u8{0xDD} ** 20;
+    const info_hash = @as([20]u8, @splat(0xDD));
     const empty = db.loadRateLimits(info_hash);
     try testing.expectEqual(@as(u64, 0), empty.dl_limit);
     try testing.expectEqual(@as(u64, 0), empty.ul_limit);
@@ -304,7 +304,7 @@ test "SimResumeBackend: share limits roundtrip + defaults" {
     var db = SimResumeBackend.init(testing.allocator, 0);
     defer db.deinit();
 
-    const info_hash = [_]u8{0xAB} ** 20;
+    const info_hash = @as([20]u8, @splat(0xAB));
     const def = db.loadShareLimits(info_hash);
     try testing.expectEqual(@as(f64, -2.0), def.ratio_limit);
     try testing.expectEqual(@as(i64, -2), def.seeding_time_limit);
@@ -327,7 +327,7 @@ test "SimResumeBackend: v2 info hash save/load" {
     var db = SimResumeBackend.init(testing.allocator, 0);
     defer db.deinit();
 
-    const v1 = [_]u8{0xAA} ** 20;
+    const v1 = @as([20]u8, @splat(0xAA));
     var v2: [32]u8 = undefined;
     for (&v2, 0..) |*b, i| b.* = @intCast(i);
     try testing.expect(db.loadInfoHashV2(v1) == null);
@@ -387,7 +387,7 @@ test "SimResumeBackend: tracker overrides add/remove/clear/load (sorted by tier)
     var db = SimResumeBackend.init(allocator, 0);
     defer db.deinit();
 
-    const info_hash = [_]u8{0xAA} ** 20;
+    const info_hash = @as([20]u8, @splat(0xAA));
     try db.saveTrackerOverride(info_hash, "http://t1/announce", 10, "add", null);
     try db.saveTrackerOverride(info_hash, "http://t2/announce", 11, "add", null);
     try db.saveTrackerOverride(info_hash, "http://old/announce", 0, "remove", null);
@@ -400,7 +400,7 @@ test "SimResumeBackend: tracker overrides add/remove/clear/load (sorted by tier)
     try testing.expectEqual(@as(u32, 10), ovs[1].tier);
 
     // Edit override
-    const info_hash_b = [_]u8{0xBB} ** 20;
+    const info_hash_b = @as([20]u8, @splat(0xBB));
     try db.saveTrackerOverride(info_hash_b, "http://new/announce", 0, "edit", "http://old/announce");
     const ovs_b = try db.loadTrackerOverrides(allocator, info_hash_b);
     defer SimResumeBackend.freeTrackerOverrides(allocator, ovs_b);
@@ -450,8 +450,8 @@ test "SimResumeBackend: queue positions save/clear/load (sorted by position)" {
     var db = SimResumeBackend.init(allocator, 0);
     defer db.deinit();
 
-    const a_hex = std.fmt.bytesToHex([_]u8{0xAA} ** 20, .lower);
-    const b_hex = std.fmt.bytesToHex([_]u8{0xBB} ** 20, .lower);
+    const a_hex = std.fmt.bytesToHex(@as([20]u8, @splat(0xAA)), .lower);
+    const b_hex = std.fmt.bytesToHex(@as([20]u8, @splat(0xBB)), .lower);
     try db.saveQueuePosition(a_hex, 5);
     try db.saveQueuePosition(b_hex, 1);
 
@@ -474,7 +474,7 @@ test "SimResumeBackend: clearTorrent cascades across every torrent-keyed table" 
     var db = SimResumeBackend.init(allocator, 0);
     defer db.deinit();
 
-    const info_hash = [_]u8{0xCD} ** 20;
+    const info_hash = @as([20]u8, @splat(0xCD));
     const info_hash_hex = std.fmt.bytesToHex(info_hash, .lower);
     var v2: [32]u8 = undefined;
     @memset(&v2, 0xEF);
@@ -527,7 +527,7 @@ test "SimResumeBackend: commit_failure_probability 1.0 forces every write to fai
     defer db.deinit();
     db.fault_config = .{ .commit_failure_probability = 1.0 };
 
-    const info_hash = [_]u8{0xAA} ** 20;
+    const info_hash = @as([20]u8, @splat(0xAA));
     try testing.expectError(error.SqliteCommitFailed, db.markComplete(info_hash, 0));
     try testing.expectError(error.SqliteCommitFailed, db.markCompleteBatch(info_hash, &[_]u32{ 0, 1 }));
     try testing.expectError(error.SqliteCommitFailed, db.replaceCompletePieces(info_hash, &[_]u32{0}));
@@ -535,7 +535,7 @@ test "SimResumeBackend: commit_failure_probability 1.0 forces every write to fai
     try testing.expectError(error.SqliteCommitFailed, db.saveCategory("c", "/p"));
     try testing.expectError(error.SqliteCommitFailed, db.saveRateLimits(info_hash, 1, 2));
     try testing.expectError(error.SqliteCommitFailed, db.saveShareLimits(info_hash, 1.0, 60, 0));
-    try testing.expectError(error.SqliteCommitFailed, db.saveQueuePosition([_]u8{'a'} ** 40, 0));
+    try testing.expectError(error.SqliteCommitFailed, db.saveQueuePosition(@as([40]u8, @splat('a')), 0));
 }
 
 test "SimResumeBackend: read_failure_probability 1.0 makes every load empty" {
@@ -543,7 +543,7 @@ test "SimResumeBackend: read_failure_probability 1.0 makes every load empty" {
     defer db.deinit();
 
     // Populate honestly first.
-    const info_hash = [_]u8{0xBB} ** 20;
+    const info_hash = @as([20]u8, @splat(0xBB));
     try db.markCompleteBatch(info_hash, &[_]u32{ 0, 1, 2, 3 });
     try db.saveTransferStats(info_hash, .{ .total_uploaded = 100, .total_downloaded = 200 });
     try db.saveRateLimits(info_hash, 1024, 512);
@@ -569,7 +569,7 @@ test "SimResumeBackend: silent_drop_probability 1.0 reports success but never ap
     defer db.deinit();
     db.fault_config = .{ .silent_drop_probability = 1.0 };
 
-    const info_hash = [_]u8{0xCC} ** 20;
+    const info_hash = @as([20]u8, @splat(0xCC));
     try db.markCompleteBatch(info_hash, &[_]u32{ 0, 1, 2 });
     // No fault injection on read — we want to confirm the write was lost.
     db.fault_config = .{};
@@ -586,7 +586,7 @@ test "SimResumeBackend: read_corruption_probability flips loadCompletePieces bit
     defer db.deinit();
 
     // Honest data: pieces {0, 1, 2}.
-    const info_hash = [_]u8{0xDD} ** 20;
+    const info_hash = @as([20]u8, @splat(0xDD));
     try db.markCompleteBatch(info_hash, &[_]u32{ 0, 1, 2 });
 
     db.fault_config = .{ .read_corruption_probability = 1.0 };

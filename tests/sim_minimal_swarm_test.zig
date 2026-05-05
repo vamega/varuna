@@ -257,9 +257,9 @@ test "Simulator + honest SimPeer seeder + hand-rolled downloader transfers a 4-p
     const seeder_fd = fds[0];
     const downloader_fd = fds[1];
 
-    const info_hash: [20]u8 = .{0xab} ** 20;
-    const seeder_peer_id: [20]u8 = .{0x53} ** 20;
-    const downloader_peer_id: [20]u8 = .{0x44} ** 20;
+    const info_hash: [20]u8 = @splat(0xab);
+    const seeder_peer_id: [20]u8 = @splat(0x53);
+    const downloader_peer_id: [20]u8 = @splat(0x44);
     const piece_count: u32 = 4;
     const piece_size: u32 = 1024;
     const block_size: u32 = 256;

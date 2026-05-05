@@ -52,8 +52,8 @@ test "AsyncMetadataFetchOf(SimIO): no peers finishes immediately" {
     // No peers → start() must call finish(false) synchronously.
     const peers = [_]std.net.Address{};
     try el.startMetadataFetch(
-        [_]u8{0xAA} ** 20,
-        [_]u8{0xBB} ** 20,
+        @as([20]u8, @splat(0xAA)),
+        @as([20]u8, @splat(0xBB)),
         6881,
         false,
         &peers,
@@ -112,8 +112,8 @@ test "AsyncMetadataFetchOf(SimIO): connect-error fault drains all peers and fini
     };
 
     el.startMetadataFetch(
-        [_]u8{0xAA} ** 20,
-        [_]u8{0xBB} ** 20,
+        @as([20]u8, @splat(0xAA)),
+        @as([20]u8, @splat(0xBB)),
         6881,
         false,
         &peers,
@@ -182,8 +182,8 @@ test "AsyncMetadataFetchOf(SimIO): legacy-fd send path causes all peers to fail"
     };
 
     el.startMetadataFetch(
-        [_]u8{0xAA} ** 20,
-        [_]u8{0xBB} ** 20,
+        @as([20]u8, @splat(0xAA)),
+        @as([20]u8, @splat(0xBB)),
         6881,
         false,
         &peers,
@@ -240,8 +240,8 @@ test "AsyncMetadataFetchOf(SimIO): cancel drains parked recv before freeing fetc
     };
 
     try el.startMetadataFetch(
-        [_]u8{0xAA} ** 20,
-        [_]u8{0xBB} ** 20,
+        @as([20]u8, @splat(0xAA)),
+        @as([20]u8, @splat(0xBB)),
         6881,
         false,
         &peers,
@@ -289,7 +289,7 @@ fn buildScriptedPeerResponses(
     // ── BT handshake reply (68 bytes) ───────────────────────
     try out.append(allocator, pw.protocol_length);
     try out.appendSlice(allocator, pw.protocol_string);
-    var reserved = [_]u8{0} ** 8;
+    var reserved = @as([8]u8, @splat(0));
     reserved[ext.reserved_byte] |= ext.reserved_mask;
     try out.appendSlice(allocator, &reserved);
     try out.appendSlice(allocator, &info_hash);
@@ -349,7 +349,7 @@ test "AsyncMetadataFetchOf(SimIO): happy-path scripted peer delivers verified in
     var info_hash: [20]u8 = undefined;
     Sha1.hash(&info_bytes, &info_hash, .{});
 
-    const peer_handshake_id = [_]u8{0xCC} ** 20;
+    const peer_handshake_id = @as([20]u8, @splat(0xCC));
 
     var sim_io = try SimIO.init(allocator, .{ .seed = 0xFADE_FACE });
     // Allocate the socketpair BEFORE moving sim_io into the EventLoop.
@@ -390,7 +390,7 @@ test "AsyncMetadataFetchOf(SimIO): happy-path scripted peer delivers verified in
 
     el.startMetadataFetch(
         info_hash,
-        [_]u8{0xBB} ** 20,
+        @as([20]u8, @splat(0xBB)),
         6881,
         false,
         &peers,
@@ -438,7 +438,7 @@ test "AsyncMetadataFetchOf(SimIO): completion drains parked peers after callback
     var info_hash: [20]u8 = undefined;
     Sha1.hash(&info_bytes, &info_hash, .{});
 
-    const peer_handshake_id = [_]u8{0xCC} ** 20;
+    const peer_handshake_id = @as([20]u8, @splat(0xCC));
     const scripted = try buildScriptedPeerResponses(
         allocator,
         info_hash,
@@ -487,7 +487,7 @@ test "AsyncMetadataFetchOf(SimIO): completion drains parked peers after callback
 
     try el.startMetadataFetch(
         info_hash,
-        [_]u8{0xBB} ** 20,
+        @as([20]u8, @splat(0xBB)),
         6881,
         false,
         &peers,

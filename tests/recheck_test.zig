@@ -396,7 +396,7 @@ test "daemon restart with resume data skips recheck (fast resume)" {
         .piece_tracker = &pt,
         .shared_fds = fds,
         .info_hash = session.metainfo.info_hash,
-        .peer_id = [_]u8{0} ** 20,
+        .peer_id = @as([20]u8, @splat(0)),
         .tracker_key = null,
         .is_private = false,
         .info_hash_v2 = null,
@@ -641,7 +641,7 @@ const V2MultiFileRecheckResult = struct {
     completed: bool = false,
     complete_count: u32 = 0,
     bytes_complete: u64 = 0,
-    piece_complete: [4]bool = [_]bool{false} ** 4,
+    piece_complete: [4]bool = @as([4]bool, @splat(false)),
 };
 
 fn runSingleFileV2SimRecheck(

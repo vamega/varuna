@@ -110,7 +110,7 @@ pub const Random = union(enum) {
     /// reproducible. Two `simRandom(s)` values produce the same byte
     /// stream.
     pub fn simRandom(seed_u64: u64) Random {
-        var seed: [seed_length]u8 = [_]u8{0} ** seed_length;
+        var seed: [seed_length]u8 = @as([seed_length]u8, @splat(0));
         std.mem.writeInt(u64, seed[0..8], seed_u64, .little);
         return simRandomFromKey(seed);
     }

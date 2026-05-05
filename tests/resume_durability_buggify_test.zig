@@ -207,7 +207,7 @@ fn runOneSeed(seed: u64) !SeedOutcome {
     defer pt.deinit(allocator);
 
     const fds = [_]posix.fd_t{data_fd};
-    const tid = try el.addTorrent(&session, &pt, &fds, [_]u8{0} ** 20);
+    const tid = try el.addTorrent(&session, &pt, &fds, @as([20]u8, @splat(0)));
 
     // Resume DB stand-in (in-memory, no SQLite link required). Same
     // public surface as the SQLite backend — `markCompleteBatch` /

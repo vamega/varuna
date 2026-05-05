@@ -368,7 +368,7 @@ test "BUGGIFY: RoutingTable invariants under random insertions" {
 }
 
 test "BUGGIFY: RoutingTable findClosest with zero-length out buffer is safe" {
-    var own: NodeId = [_]u8{0} ** 20;
+    var own: NodeId = @as([20]u8, @splat(0));
     var table = routing_table.RoutingTable.init(own);
     own[0] = 1;
     _ = table.addNode(.{
@@ -377,7 +377,7 @@ test "BUGGIFY: RoutingTable findClosest with zero-length out buffer is safe" {
     }, 100);
 
     var out: [0]NodeInfo = undefined;
-    const got = table.findClosest([_]u8{0} ** 20, 5, &out);
+    const got = table.findClosest(@as([20]u8, @splat(0)), 5, &out);
     try testing.expectEqual(@as(u8, 0), got);
 }
 
@@ -394,7 +394,7 @@ test "BUGGIFY: KRPC encoder happy-path output sizes are bounded" {
     const fn_len = try krpc.encodeFindNodeQuery(&ok, 0xAABB, our_id, target);
     try testing.expect(fn_len > 0 and fn_len < ok.len);
 
-    const gp_len = try krpc.encodeGetPeersQuery(&ok, 0xAABB, our_id, [_]u8{0} ** 20);
+    const gp_len = try krpc.encodeGetPeersQuery(&ok, 0xAABB, our_id, @as([20]u8, @splat(0)));
     try testing.expect(gp_len > 0 and gp_len < ok.len);
 
     // BEP 5 token can be up to ~256 bytes; verify a reasonably long
@@ -405,7 +405,7 @@ test "BUGGIFY: KRPC encoder happy-path output sizes are bounded" {
         &ok,
         0xAABB,
         our_id,
-        [_]u8{0} ** 20,
+        @as([20]u8, @splat(0)),
         6881,
         &token_buf,
         false,
@@ -462,11 +462,11 @@ test "encoder: encodeFindNodeQuery returns NoSpaceLeft on tiny buffers" {
 test "encoder: encodeGetPeersQuery returns NoSpaceLeft on tiny buffers" {
     const our_id = testNodeId();
     var probe: [256]u8 = undefined;
-    const ok_len = try krpc.encodeGetPeersQuery(&probe, 0xAABB, our_id, [_]u8{0} ** 20);
+    const ok_len = try krpc.encodeGetPeersQuery(&probe, 0xAABB, our_id, @as([20]u8, @splat(0)));
 
     for ([_]usize{ 0, 1, 16, 32, 64, ok_len - 1 }) |sz| {
         var tiny: [256]u8 = undefined;
-        const result = krpc.encodeGetPeersQuery(tiny[0..sz], 0xAABB, our_id, [_]u8{0} ** 20);
+        const result = krpc.encodeGetPeersQuery(tiny[0..sz], 0xAABB, our_id, @as([20]u8, @splat(0)));
         try testing.expectError(error.NoSpaceLeft, result);
     }
 }
@@ -480,7 +480,7 @@ test "encoder: encodeAnnouncePeerQuery returns NoSpaceLeft on tiny buffers" {
         &probe,
         0xAABB,
         our_id,
-        [_]u8{0} ** 20,
+        @as([20]u8, @splat(0)),
         6881,
         &token_buf,
         false,
@@ -492,7 +492,7 @@ test "encoder: encodeAnnouncePeerQuery returns NoSpaceLeft on tiny buffers" {
             tiny[0..sz],
             0xAABB,
             our_id,
-            [_]u8{0} ** 20,
+            @as([20]u8, @splat(0)),
             6881,
             &token_buf,
             false,
@@ -1131,7 +1131,7 @@ test "DHT search registry accepts registrations beyond the old fixed cap" {
 
     var hashes: [20][20]u8 = undefined;
     for (&hashes, 0..) |*hash, i| {
-        hash.* = [_]u8{0} ** 20;
+        hash.* = @as([20]u8, @splat(0));
         hash.*[0] = @intCast(i);
         hash.*[19] = 0xA5;
         engine.requestPeers(hash.*, null);
@@ -1176,7 +1176,7 @@ test "R2: respondFindNode emits both nodes and nodes6 for mixed routing table" {
     }
     // Add 3 v6 nodes
     for (0..3) |i| {
-        var addr6: [16]u8 = [_]u8{0} ** 16;
+        var addr6: [16]u8 = @as([16]u8, @splat(0));
         addr6[15] = @intCast(i + 1);
         _ = engine.table.addNode(.{
             .id = testNodeId(),
@@ -1231,7 +1231,7 @@ test "R2: respondGetPeers emits both nodes and nodes6 when no peers known" {
             .id = testNodeId(),
             .address = std.net.Address.initIp4(.{ 192, 168, 1, @intCast(i + 1) }, 51413),
         }, now);
-        var addr6: [16]u8 = [_]u8{0} ** 16;
+        var addr6: [16]u8 = @as([16]u8, @splat(0));
         addr6[14] = 0xfe;
         addr6[15] = @intCast(i + 1);
         _ = engine.table.addNode(.{
@@ -1385,7 +1385,7 @@ test "R3: announce_peer with invalid token does not store" {
     var sid: NodeId = undefined;
     @memset(&sid, 0xDE);
     // Forge a token of valid length but wrong bytes.
-    const fake_tok = [_]u8{0xFF} ** 8;
+    const fake_tok = @as([8]u8, @splat(0xFF));
     const ap_len = try krpc.encodeAnnouncePeerQuery(
         &ap_buf,
         0x0010,

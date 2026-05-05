@@ -60,7 +60,7 @@ pub fn AsyncRecheckOf(comptime IO: type) type {
         in_flight_hashes: u32 = 0, // pieces submitted to hasher awaiting result
 
         // Per-slot tracking for pipelined pieces
-        slots: [max_in_flight]Slot = [_]Slot{.{}} ** max_in_flight,
+        slots: [max_in_flight]Slot = @as([max_in_flight]Slot, @splat(.{})),
 
         // Completion
         done: bool = false,
@@ -90,7 +90,7 @@ pub fn AsyncRecheckOf(comptime IO: type) type {
             active: bool = false,
             first_piece: u32 = 0,
             piece_count: u32 = 0,
-            pieces_root: [32]u8 = [_]u8{0} ** 32,
+            pieces_root: [32]u8 = @as([32]u8, @splat(0)),
             piece_hashes: ?[][32]u8 = null,
             seen: ?[]bool = null,
             seen_count: u32 = 0,

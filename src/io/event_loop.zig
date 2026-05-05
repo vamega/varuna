@@ -199,7 +199,7 @@ pub fn EventLoopOf(comptime IO: type) type {
             piece_buffer: *PieceBuffer,
             reads_remaining: u32, // number of successfully submitted read CQEs still pending
             submitted_span_count: u8 = 0,
-            expected_read_lengths: [max_spans]u32 = [_]u32{0} ** max_spans,
+            expected_read_lengths: [max_spans]u32 = @as([max_spans]u32, @splat(0)),
         };
 
         pub const AnnounceResult = struct {
@@ -285,12 +285,12 @@ pub fn EventLoopOf(comptime IO: type) type {
         utp_manager: ?*utp_mgr.UtpManager = null,
         // Persistent recv slots and msghdrs for concurrent io_uring RECVMSGs.
         utp_recv_slots: [utp_recv_slot_count]UtpRecvSlot =
-            [_]UtpRecvSlot{.{}} ** utp_recv_slot_count,
+            @as([utp_recv_slot_count]UtpRecvSlot, @splat(.{})),
         utp_recv_active: u16 = 0,
         utp_recv_next_slot: u16 = 0,
         // Persistent send slots and msghdrs for concurrent io_uring SENDMSGs.
         utp_send_slots: [utp_send_slot_count]UtpSendSlot =
-            [_]UtpSendSlot{.{}} ** utp_send_slot_count,
+            @as([utp_send_slot_count]UtpSendSlot, @splat(.{})),
         utp_send_inflight: u16 = 0,
         utp_send_next_slot: u16 = 0,
         utp_send_pending: bool = false,
@@ -428,7 +428,7 @@ pub fn EventLoopOf(comptime IO: type) type {
 
         // BEP 19: web seed download slots
         web_seed_slots: [web_seed_handler.max_web_seed_slots]web_seed_handler.WebSeedSlot =
-            [_]web_seed_handler.WebSeedSlot{.{}} ** web_seed_handler.max_web_seed_slots,
+            @as([web_seed_handler.max_web_seed_slots]web_seed_handler.WebSeedSlot, @splat(.{})),
         /// Maximum bytes per web seed HTTP Range request (batches multiple pieces).
         web_seed_max_request_bytes: u32 = 16 * 1024 * 1024,
 
@@ -3411,8 +3411,8 @@ test "event loop supports high torrent counts with hashed lookup and slot reuse"
     var reused_hash: [20]u8 = undefined;
 
     for (0..torrent_count) |idx| {
-        var info_hash = [_]u8{0} ** 20;
-        var peer_id = [_]u8{0} ** 20;
+        var info_hash = @as([20]u8, @splat(0));
+        var peer_id = @as([20]u8, @splat(0));
         std.mem.writeInt(u32, info_hash[0..4], @intCast(idx), .little);
         std.mem.writeInt(u32, peer_id[0..4], @intCast(idx), .big);
         info_hash[4] = 0xA5;
@@ -3435,7 +3435,7 @@ test "event loop supports high torrent counts with hashed lookup and slot reuse"
     el.removeTorrent(4_096);
     try std.testing.expect(el.findTorrentIdByInfoHash(&reused_hash) == null);
 
-    var replacement_hash = [_]u8{0} ** 20;
+    var replacement_hash = @as([20]u8, @splat(0));
     replacement_hash[0] = 0xFE;
     replacement_hash[1] = 0xED;
     replacement_hash[2] = 0xFA;
@@ -3445,7 +3445,7 @@ test "event loop supports high torrent counts with hashed lookup and slot reuse"
     const replacement_id = try el.addTorrentContext(.{
         .shared_fds = empty_fds[0..],
         .info_hash = replacement_hash,
-        .peer_id = [_]u8{1} ** 20,
+        .peer_id = @as([20]u8, @splat(1)),
     });
     try std.testing.expectEqual(@as(TorrentId, 4_096), replacement_id);
     try std.testing.expectEqual(@as(?TorrentId, replacement_id), el.findTorrentIdByInfoHash(&replacement_hash));
@@ -3480,8 +3480,8 @@ test "peer candidates persist when connection capacity is exhausted" {
     const empty_fds = [_]posix.fd_t{};
     const tid = try el.addTorrentContext(.{
         .shared_fds = empty_fds[0..],
-        .info_hash = [_]u8{0xA1} ** 20,
-        .peer_id = [_]u8{0xB2} ** 20,
+        .info_hash = @as([20]u8, @splat(0xA1)),
+        .peer_id = @as([20]u8, @splat(0xB2)),
     });
 
     const peer_a = try std.net.Address.parseIp4("127.0.0.10", 6882);
@@ -3506,8 +3506,8 @@ test "established peer count excludes half-open candidates" {
     const empty_fds = [_]posix.fd_t{};
     const tid = try el.addTorrentContext(.{
         .shared_fds = empty_fds[0..],
-        .info_hash = [_]u8{0xA3} ** 20,
-        .peer_id = [_]u8{0xB4} ** 20,
+        .info_hash = @as([20]u8, @splat(0xA3)),
+        .peer_id = @as([20]u8, @splat(0xB4)),
     });
 
     el.peers[0].state = .connecting;
@@ -3533,8 +3533,8 @@ test "private torrents reject DHT and PEX peer candidates" {
     const empty_fds = [_]posix.fd_t{};
     const tid = try el.addTorrentContext(.{
         .shared_fds = empty_fds[0..],
-        .info_hash = [_]u8{0xC1} ** 20,
-        .peer_id = [_]u8{0xD2} ** 20,
+        .info_hash = @as([20]u8, @splat(0xC1)),
+        .peer_id = @as([20]u8, @splat(0xD2)),
         .is_private = true,
     });
 
@@ -3555,13 +3555,13 @@ test "peer and torrent membership indices stay consistent across swap-remove" {
     const empty_fds = [_]posix.fd_t{};
     const tid0 = try el.addTorrentContext(.{
         .shared_fds = empty_fds[0..],
-        .info_hash = [_]u8{0x11} ** 20,
-        .peer_id = [_]u8{0x22} ** 20,
+        .info_hash = @as([20]u8, @splat(0x11)),
+        .peer_id = @as([20]u8, @splat(0x22)),
     });
     const tid1 = try el.addTorrentContext(.{
         .shared_fds = empty_fds[0..],
-        .info_hash = [_]u8{0x33} ** 20,
-        .peer_id = [_]u8{0x44} ** 20,
+        .info_hash = @as([20]u8, @splat(0x33)),
+        .peer_id = @as([20]u8, @splat(0x44)),
     });
 
     const torrent0_slots = [_]u16{ 0, 1, 2 };

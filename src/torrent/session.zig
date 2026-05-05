@@ -407,7 +407,7 @@ test "zeroPieceHash clobbers per-piece bytes and tracks verified state" {
 
     sess.zeroPieceHash(1);
     const after = try sess.layout.pieceHash(1);
-    try std.testing.expectEqualSlices(u8, &([_]u8{0} ** 20), after);
+    try std.testing.expectEqualSlices(u8, &(@as([20]u8, @splat(0))), after);
     // Other piece hashes are untouched.
     try std.testing.expectEqualStrings("abcdefghijklmnopqrst", try sess.layout.pieceHash(0));
 
@@ -419,7 +419,7 @@ test "zeroPieceHash clobbers per-piece bytes and tracks verified state" {
 }
 
 test "pure v2 sessions have no piece hashes regardless of load mode" {
-    const pr = [_]u8{0xAA} ** 32;
+    const pr = @as([32]u8, @splat(0xAA));
     const input = "d4:infod9:file treed8:test.bind0:d6:lengthi5e11:pieces root32:" ++ pr ++ "eee4:name4:test12:piece lengthi16384eee";
 
     var sess = try Session.loadForDownload(std.testing.allocator, input, "/srv/torrents");

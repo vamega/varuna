@@ -256,7 +256,7 @@ test "DhtPersistence format address" {
 
 test "DhtPersistence format IPv6 address" {
     var buf: [46]u8 = undefined;
-    const addr = std.net.Address.initIp6(.{ 0x20, 0x01, 0x0d, 0xb8 } ++ ([_]u8{0} ** 12), 6881, 0, 0);
+    const addr = std.net.Address.initIp6(.{ 0x20, 0x01, 0x0d, 0xb8 } ++ (@as([12]u8, @splat(0))), 6881, 0, 0);
     const result = formatAddress(addr, &buf);
     try std.testing.expect(result != null);
     try std.testing.expect(std.mem.indexOf(u8, result.?, "2001:db8") != null);

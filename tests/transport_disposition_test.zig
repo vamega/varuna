@@ -165,7 +165,7 @@ test "utp_only auto transport does not fall back to tcp when utp setup is unavai
     const empty_fds = [_]posix.fd_t{};
     const tid = try el.addTorrentContext(.{
         .shared_fds = empty_fds[0..],
-        .info_hash = [_]u8{0x42} ** 20,
+        .info_hash = @as([20]u8, @splat(0x42)),
         .peer_id = "-VR0001-test00000001".*,
     });
     const addr = try std.net.Address.parseIp4("127.0.0.1", 6881);
@@ -198,7 +198,7 @@ test "tcp_and_utp auto transport starts with tcp" {
     const empty_fds = [_]posix.fd_t{};
     const tid = try el.addTorrentContext(.{
         .shared_fds = empty_fds[0..],
-        .info_hash = [_]u8{0x55} ** 20,
+        .info_hash = @as([20]u8, @splat(0x55)),
         .peer_id = "-VR0001-test00000002".*,
     });
     const addr = try std.net.Address.parseIp4("127.0.0.1", 6882);
@@ -233,7 +233,7 @@ test "silent utp connect falls back to tcp after connect timeout" {
     const empty_fds = [_]posix.fd_t{};
     const tid = try el.addTorrentContext(.{
         .shared_fds = empty_fds[0..],
-        .info_hash = [_]u8{0x56} ** 20,
+        .info_hash = @as([20]u8, @splat(0x56)),
         .peer_id = "-VR0001-test00000003".*,
     });
     const addr = try std.net.Address.parseIp4("127.0.0.1", 6883);
@@ -272,7 +272,7 @@ test "utp connect fallback is not starved by frequent ticks" {
     const empty_fds = [_]posix.fd_t{};
     const tid = try el.addTorrentContext(.{
         .shared_fds = empty_fds[0..],
-        .info_hash = [_]u8{0x57} ** 20,
+        .info_hash = @as([20]u8, @splat(0x57)),
         .peer_id = "-VR0001-test00000004".*,
     });
     const addr = try std.net.Address.parseIp4("127.0.0.1", 6884);
@@ -307,7 +307,7 @@ test "outbound tcp peer connect carries a deadline" {
     const empty_fds = [_]posix.fd_t{};
     const tid = try el.addTorrentContext(.{
         .shared_fds = empty_fds[0..],
-        .info_hash = [_]u8{0x58} ** 20,
+        .info_hash = @as([20]u8, @splat(0x58)),
         .peer_id = "-VR0001-test00000005".*,
     });
     const addr = try std.net.Address.parseIp4("127.0.0.1", 6885);
@@ -336,7 +336,7 @@ test "outbound tcp peer connect uses configured deadline" {
     const empty_fds = [_]posix.fd_t{};
     const tid = try el.addTorrentContext(.{
         .shared_fds = empty_fds[0..],
-        .info_hash = [_]u8{0x59} ** 20,
+        .info_hash = @as([20]u8, @splat(0x59)),
         .peer_id = "-VR0001-test00000006".*,
     });
     const addr = try std.net.Address.parseIp4("127.0.0.1", 6886);

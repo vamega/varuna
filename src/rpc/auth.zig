@@ -8,7 +8,7 @@ pub const SessionStore = struct {
     const max_sessions = 10;
     pub const sid_len = 32;
 
-    sessions: [max_sessions]?Session = [_]?Session{null} ** max_sessions,
+    sessions: [max_sessions]?Session = @as([max_sessions]?Session, @splat(null)),
     session_timeout_secs: i64 = 3600, // 1 hour default
 
     const Session = struct {
@@ -266,7 +266,7 @@ test "validate session with wrong length returns false" {
     // Too short
     try std.testing.expect(!store.validateSession("abc"));
     // Too long
-    try std.testing.expect(!store.validateSession("a" ** 33));
+    try std.testing.expect(!store.validateSession(&@as([33]u8, @splat('a'))));
     // Empty
     try std.testing.expect(!store.validateSession(""));
     // Exactly 32 but wrong content
@@ -280,7 +280,7 @@ test "remove session with wrong length is no-op" {
 
     // Removing with wrong length should not affect the valid session
     store.removeSession("short");
-    store.removeSession("a" ** 33);
+    store.removeSession(&@as([33]u8, @splat('a')));
     store.removeSession("");
 
     // Original session should still be valid

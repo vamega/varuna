@@ -127,9 +127,9 @@ test "SimPeer seeder responds to handshake with handshake + bitfield" {
     const seeder_fd = fds[0];
     const test_fd = fds[1];
 
-    const info_hash: [20]u8 = .{0xab} ** 20;
-    const seeder_peer_id: [20]u8 = .{0x53} ** 20;
-    const downloader_peer_id: [20]u8 = .{0x44} ** 20;
+    const info_hash: [20]u8 = @splat(0xab);
+    const seeder_peer_id: [20]u8 = @splat(0x53);
+    const downloader_peer_id: [20]u8 = @splat(0x44);
     const piece_count: u32 = 4;
     const piece_size: u32 = 1024;
     var bitfield: [1]u8 = .{0xf0}; // all 4 pieces present
@@ -211,8 +211,8 @@ test "SimPeer seeder unchokes on interested" {
     const seeder_fd = fds[0];
     const test_fd = fds[1];
 
-    const info_hash: [20]u8 = .{0xab} ** 20;
-    const peer_id: [20]u8 = .{0x53} ** 20;
+    const info_hash: [20]u8 = @splat(0xab);
+    const peer_id: [20]u8 = @splat(0x53);
     const piece_count: u32 = 1;
     const piece_size: u32 = 16;
     var bitfield: [1]u8 = .{0x80};
@@ -248,7 +248,7 @@ test "SimPeer seeder unchokes on interested" {
 
     // Send handshake + interested in one batch.
     var combined: [68 + 5]u8 = undefined;
-    const hs = peer_wire.serializeHandshake(info_hash, .{0x44} ** 20);
+    const hs = peer_wire.serializeHandshake(info_hash, @splat(0x44));
     @memcpy(combined[0..68], &hs);
     const interested_header = peer_wire.serializeHeader(2, &.{});
     @memcpy(combined[68..73], &interested_header);
@@ -282,8 +282,8 @@ test "SimPeer seeder responds to request with piece data (honest)" {
     const seeder_fd = fds[0];
     const test_fd = fds[1];
 
-    const info_hash: [20]u8 = .{0xab} ** 20;
-    const peer_id: [20]u8 = .{0x53} ** 20;
+    const info_hash: [20]u8 = @splat(0xab);
+    const peer_id: [20]u8 = @splat(0x53);
     const piece_count: u32 = 2;
     const piece_size: u32 = 32;
     var bitfield: [1]u8 = .{0xc0};
@@ -319,7 +319,7 @@ test "SimPeer seeder responds to request with piece data (honest)" {
 
     // Request piece 0, offset 0, length 16.
     var combined: [68 + 5 + 17]u8 = undefined;
-    const hs = peer_wire.serializeHandshake(info_hash, .{0x44} ** 20);
+    const hs = peer_wire.serializeHandshake(info_hash, @splat(0x44));
     @memcpy(combined[0..68], &hs);
     const interested_header = peer_wire.serializeHeader(2, &.{});
     @memcpy(combined[68..73], &interested_header);
@@ -361,8 +361,8 @@ test "SimPeer wrong_data behaviour replaces block bytes with 0xaa" {
     const seeder_fd = fds[0];
     const test_fd = fds[1];
 
-    const info_hash: [20]u8 = .{0xcc} ** 20;
-    const peer_id: [20]u8 = .{0x99} ** 20;
+    const info_hash: [20]u8 = @splat(0xcc);
+    const peer_id: [20]u8 = @splat(0x99);
     const piece_count: u32 = 1;
     const piece_size: u32 = 16;
     var bitfield: [1]u8 = .{0x80};
@@ -397,7 +397,7 @@ test "SimPeer wrong_data behaviour replaces block bytes with 0xaa" {
     });
 
     var combined: [68 + 5 + 17]u8 = undefined;
-    const hs = peer_wire.serializeHandshake(info_hash, .{0x44} ** 20);
+    const hs = peer_wire.serializeHandshake(info_hash, @splat(0x44));
     @memcpy(combined[0..68], &hs);
     const interested_header = peer_wire.serializeHeader(2, &.{});
     @memcpy(combined[68..73], &interested_header);
@@ -422,7 +422,7 @@ test "SimPeer wrong_data behaviour replaces block bytes with 0xaa" {
     const block_end = block_start + 16;
     var got_block: [16]u8 = undefined;
     @memcpy(&got_block, rx_ctx.bytes[block_start..block_end]);
-    var expected: [16]u8 = .{0xaa} ** 16;
+    var expected: [16]u8 = @splat(0xaa);
     try testing.expectEqualSlices(u8, &expected, &got_block);
 }
 
@@ -436,8 +436,8 @@ test "SimPeer corrupt behaviour with probability 1.0 flips at least one bit" {
     const seeder_fd = fds[0];
     const test_fd = fds[1];
 
-    const info_hash: [20]u8 = .{0xcc} ** 20;
-    const peer_id: [20]u8 = .{0x99} ** 20;
+    const info_hash: [20]u8 = @splat(0xcc);
+    const peer_id: [20]u8 = @splat(0x99);
     const piece_count: u32 = 1;
     const piece_size: u32 = 64;
     var bitfield: [1]u8 = .{0x80};
@@ -472,7 +472,7 @@ test "SimPeer corrupt behaviour with probability 1.0 flips at least one bit" {
     });
 
     var combined: [68 + 5 + 17]u8 = undefined;
-    const hs = peer_wire.serializeHandshake(info_hash, .{0x44} ** 20);
+    const hs = peer_wire.serializeHandshake(info_hash, @splat(0x44));
     @memcpy(combined[0..68], &hs);
     const interested_header = peer_wire.serializeHeader(2, &.{});
     @memcpy(combined[68..73], &interested_header);
@@ -508,8 +508,8 @@ test "SimPeer disconnect_after closes after N blocks" {
     const seeder_fd = fds[0];
     const test_fd = fds[1];
 
-    const info_hash: [20]u8 = .{0xcc} ** 20;
-    const peer_id: [20]u8 = .{0x99} ** 20;
+    const info_hash: [20]u8 = @splat(0xcc);
+    const peer_id: [20]u8 = @splat(0x99);
     const piece_count: u32 = 4;
     const piece_size: u32 = 16;
     var bitfield: [1]u8 = .{0xf0};
@@ -545,7 +545,7 @@ test "SimPeer disconnect_after closes after N blocks" {
 
     // Send handshake + interested + 2 requests.
     var combined: [68 + 5 + 17 + 17]u8 = undefined;
-    const hs = peer_wire.serializeHandshake(info_hash, .{0x44} ** 20);
+    const hs = peer_wire.serializeHandshake(info_hash, @splat(0x44));
     @memcpy(combined[0..68], &hs);
     const interested_header = peer_wire.serializeHeader(2, &.{});
     @memcpy(combined[68..73], &interested_header);
@@ -583,8 +583,8 @@ test "SimPeer lie_bitfield advertises all-pieces-present regardless of stored bi
     const seeder_fd = fds[0];
     const test_fd = fds[1];
 
-    const info_hash: [20]u8 = .{0xab} ** 20;
-    const peer_id: [20]u8 = .{0x53} ** 20;
+    const info_hash: [20]u8 = @splat(0xab);
+    const peer_id: [20]u8 = @splat(0x53);
     const piece_count: u32 = 4;
     const piece_size: u32 = 16;
     // Real bitfield says we only have piece 0.
@@ -619,7 +619,7 @@ test "SimPeer lie_bitfield advertises all-pieces-present regardless of stored bi
         .rng = &rng,
     });
 
-    const my_handshake = peer_wire.serializeHandshake(info_hash, .{0x44} ** 20);
+    const my_handshake = peer_wire.serializeHandshake(info_hash, @splat(0x44));
     var tx_c = Completion{};
     var tx_ctx = TxCtx{};
     try io.send(.{ .fd = test_fd, .buf = &my_handshake }, &tx_c, &tx_ctx, txCallback);
@@ -651,8 +651,8 @@ test "SimPeer silent_after stops responding after N blocks" {
     const seeder_fd = fds[0];
     const test_fd = fds[1];
 
-    const info_hash: [20]u8 = .{0xab} ** 20;
-    const peer_id: [20]u8 = .{0x53} ** 20;
+    const info_hash: [20]u8 = @splat(0xab);
+    const peer_id: [20]u8 = @splat(0x53);
     const piece_count: u32 = 4;
     const piece_size: u32 = 16;
     var bitfield: [1]u8 = .{0xf0};
@@ -689,7 +689,7 @@ test "SimPeer silent_after stops responding after N blocks" {
     // Send handshake + interested + 3 requests; the seeder should respond
     // to the first 2 and silently drop the third.
     var combined: [68 + 5 + 17 * 3]u8 = undefined;
-    const hs = peer_wire.serializeHandshake(info_hash, .{0x44} ** 20);
+    const hs = peer_wire.serializeHandshake(info_hash, @splat(0x44));
     @memcpy(combined[0..68], &hs);
     const interested_header = peer_wire.serializeHeader(2, &.{});
     @memcpy(combined[68..73], &interested_header);
@@ -727,8 +727,8 @@ test "SimPeer greedy accepts requests but never sends pieces" {
     const seeder_fd = fds[0];
     const test_fd = fds[1];
 
-    const info_hash: [20]u8 = .{0xab} ** 20;
-    const peer_id: [20]u8 = .{0x53} ** 20;
+    const info_hash: [20]u8 = @splat(0xab);
+    const peer_id: [20]u8 = @splat(0x53);
     const piece_count: u32 = 4;
     const piece_size: u32 = 16;
     var bitfield: [1]u8 = .{0xf0};
@@ -764,7 +764,7 @@ test "SimPeer greedy accepts requests but never sends pieces" {
 
     // Send handshake + interested + 3 requests.
     var combined: [68 + 5 + 17 * 3]u8 = undefined;
-    const hs = peer_wire.serializeHandshake(info_hash, .{0x44} ** 20);
+    const hs = peer_wire.serializeHandshake(info_hash, @splat(0x44));
     @memcpy(combined[0..68], &hs);
     const interested_header = peer_wire.serializeHeader(2, &.{});
     @memcpy(combined[68..73], &interested_header);
@@ -802,8 +802,8 @@ test "SimPeer slow throttles piece dispatch with delay_per_block_ns" {
     const seeder_fd = fds[0];
     const test_fd = fds[1];
 
-    const info_hash: [20]u8 = .{0xab} ** 20;
-    const peer_id: [20]u8 = .{0x53} ** 20;
+    const info_hash: [20]u8 = @splat(0xab);
+    const peer_id: [20]u8 = @splat(0x53);
     const piece_count: u32 = 2;
     const piece_size: u32 = 16;
     var bitfield: [1]u8 = .{0xc0};
@@ -841,7 +841,7 @@ test "SimPeer slow throttles piece dispatch with delay_per_block_ns" {
 
     // Send handshake + interested + 2 requests.
     var combined: [68 + 5 + 17 * 2]u8 = undefined;
-    const hs = peer_wire.serializeHandshake(info_hash, .{0x44} ** 20);
+    const hs = peer_wire.serializeHandshake(info_hash, @splat(0x44));
     @memcpy(combined[0..68], &hs);
     const interested_header = peer_wire.serializeHeader(2, &.{});
     @memcpy(combined[68..73], &interested_header);
@@ -889,8 +889,8 @@ test "SimPeer block_mask drops requests outside the served range" {
     const seeder_fd = fds[0];
     const test_fd = fds[1];
 
-    const info_hash: [20]u8 = .{0xab} ** 20;
-    const peer_id: [20]u8 = .{0x53} ** 20;
+    const info_hash: [20]u8 = @splat(0xab);
+    const peer_id: [20]u8 = @splat(0x53);
     const piece_count: u32 = 1;
     // Piece is 32 KiB = 2 blocks of 16 KiB each.
     const piece_size: u32 = 32 * 1024;
@@ -932,7 +932,7 @@ test "SimPeer block_mask drops requests outside the served range" {
     // Send handshake + interested + request for block 0 (offset 0)
     // and block 1 (offset 16 KiB).
     var combined: [68 + 5 + 17 * 2]u8 = undefined;
-    const hs = peer_wire.serializeHandshake(info_hash, .{0x44} ** 20);
+    const hs = peer_wire.serializeHandshake(info_hash, @splat(0x44));
     @memcpy(combined[0..68], &hs);
     const interested_header = peer_wire.serializeHeader(2, &.{});
     @memcpy(combined[68..73], &interested_header);
@@ -974,8 +974,8 @@ test "SimPeer corrupt_blocks garbles only the listed block index" {
     const seeder_fd = fds[0];
     const test_fd = fds[1];
 
-    const info_hash: [20]u8 = .{0xab} ** 20;
-    const peer_id: [20]u8 = .{0x53} ** 20;
+    const info_hash: [20]u8 = @splat(0xab);
+    const peer_id: [20]u8 = @splat(0x53);
     const piece_count: u32 = 1;
     const piece_size: u32 = 32 * 1024;
     var bitfield: [1]u8 = .{0x80};
@@ -1015,7 +1015,7 @@ test "SimPeer corrupt_blocks garbles only the listed block index" {
 
     // Request both blocks.
     var combined: [68 + 5 + 17 * 2]u8 = undefined;
-    const hs = peer_wire.serializeHandshake(info_hash, .{0x44} ** 20);
+    const hs = peer_wire.serializeHandshake(info_hash, @splat(0x44));
     @memcpy(combined[0..68], &hs);
     const interested_header = peer_wire.serializeHeader(2, &.{});
     @memcpy(combined[68..73], &interested_header);
@@ -1069,8 +1069,8 @@ test "SimPeer disconnect closes the socketpair fd cleanly" {
     const seeder_fd = fds[0];
     _ = fds[1]; // partner fd; closeSocket on either side is enough
 
-    const info_hash: [20]u8 = .{0xab} ** 20;
-    const peer_id: [20]u8 = .{0x53} ** 20;
+    const info_hash: [20]u8 = @splat(0xab);
+    const peer_id: [20]u8 = @splat(0x53);
     var bitfield: [1]u8 = .{0xc0};
     var piece_data: [32]u8 = undefined;
     @memset(&piece_data, 0x42);

@@ -130,7 +130,7 @@ test "RC4 backend keystream matches XOR with zeros" {
     var rc4b = Rc4.init(key);
     var ks: [32]u8 = undefined;
     rc4a.keystream(&ks);
-    const zeros = [_]u8{0} ** 32;
+    const zeros = @as([32]u8, @splat(0));
     var xored: [32]u8 = undefined;
     rc4b.process(&xored, &zeros);
     try std.testing.expectEqualSlices(u8, &ks, &xored);

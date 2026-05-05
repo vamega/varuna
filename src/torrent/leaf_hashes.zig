@@ -182,9 +182,9 @@ test "LeafHashStore init/get/count" {
     try testing.expect(store.get(0) == null);
     try testing.expect(store.get(99) == null); // out of range -> null
 
-    store.leaves[1] = [_]u8{0xAA} ** 32;
+    store.leaves[1] = @as([32]u8, @splat(0xAA));
     try testing.expectEqual(@as(u32, 1), store.count());
-    try testing.expectEqual([_]u8{0xAA} ** 32, store.get(1).?);
+    try testing.expectEqual(@as([32]u8, @splat(0xAA)), store.get(1).?);
 }
 
 test "verifyAndStoreHashesResponse stores full leaf layer" {
@@ -230,7 +230,7 @@ test "verifyAndStoreHashesResponse rejects wrong root" {
     var store = try LeafHashStore.init(allocator, 2);
     defer store.deinit();
 
-    const wrong_root = [_]u8{0xFF} ** 32;
+    const wrong_root = @as([32]u8, @splat(0xFF));
     const ok = verifyAndStoreHashesResponse(
         &store,
         0,
@@ -314,7 +314,7 @@ test "verifyAndStoreHashesResponse rejects conflicting second store" {
 
     // Manually tamper with stored value, then try to store the *real* hash again.
     // The real hash differs from the tampered value -> conflict rejection.
-    store.leaves[0] = [_]u8{0xCC} ** 32;
+    store.leaves[0] = @as([32]u8, @splat(0xCC));
     try testing.expect(!verifyAndStoreHashesResponse(
         &store,
         0,
@@ -333,13 +333,13 @@ test "verifyAndStoreHashesResponse rejects non-power-of-two length" {
     defer store.deinit();
 
     var hashes: [3][32]u8 = undefined;
-    @memset(&hashes, [_]u8{0} ** 32);
+    @memset(&hashes, @as([32]u8, @splat(0)));
 
     try testing.expect(!verifyAndStoreHashesResponse(
         &store,
         0,
         3,
-        [_]u8{0} ** 32,
+        @as([32]u8, @splat(0)),
         0,
         0,
         &hashes,

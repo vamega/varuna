@@ -469,7 +469,7 @@ test "metadata assembler: single piece torrent" {
 }
 
 test "metadata assembler: hash mismatch" {
-    const wrong_hash = [_]u8{0xFF} ** 20;
+    const wrong_hash = @as([20]u8, @splat(0xFF));
     var assembler = MetadataAssembler.init(std.testing.allocator, wrong_hash);
     defer assembler.deinit();
 
@@ -527,14 +527,14 @@ test "metadata assembler: duplicate piece ignored" {
 }
 
 test "metadata assembler: reject oversized metadata" {
-    var assembler = MetadataAssembler.init(std.testing.allocator, [_]u8{0} ** 20);
+    var assembler = MetadataAssembler.init(std.testing.allocator, @as([20]u8, @splat(0)));
     defer assembler.deinit();
 
     try std.testing.expectError(error.InvalidMetadataSize, assembler.setSize(max_metadata_size + 1));
 }
 
 test "metadata assembler: reject zero size" {
-    var assembler = MetadataAssembler.init(std.testing.allocator, [_]u8{0} ** 20);
+    var assembler = MetadataAssembler.init(std.testing.allocator, @as([20]u8, @splat(0)));
     defer assembler.deinit();
 
     try std.testing.expectError(error.InvalidMetadataSize, assembler.setSize(0));

@@ -1566,10 +1566,10 @@ test "DH public key is not trivial" {
 }
 
 test "reject invalid DH public keys" {
-    const zero = [_]u8{0} ** dh_key_size;
+    const zero = @as([dh_key_size]u8, @splat(0));
     try std.testing.expect(!isValidDhPublicKey(zero));
 
-    var one = [_]u8{0} ** dh_key_size;
+    var one = @as([dh_key_size]u8, @splat(0));
     one[dh_key_size - 1] = 1;
     try std.testing.expect(!isValidDhPublicKey(one));
 
@@ -1578,8 +1578,8 @@ test "reject invalid DH public keys" {
 }
 
 test "hash derivation functions produce different outputs" {
-    const secret = [_]u8{0xAB} ** dh_key_size;
-    const skey = [_]u8{0xCD} ** 20;
+    const secret = @as([dh_key_size]u8, @splat(0xAB));
+    const skey = @as([20]u8, @splat(0xCD));
 
     const r1 = hashReq1(secret);
     const r3 = hashReq3(secret);
@@ -1620,7 +1620,7 @@ test "crypto_provide and crypto_select for disabled mode" {
 }
 
 test "PeerCrypto encrypt/decrypt roundtrip" {
-    const key = [_]u8{0x42} ** 20;
+    const key = @as([20]u8, @splat(0x42));
     var crypto = PeerCrypto{
         .encrypt = Rc4.initDiscardBep6(&key),
         .decrypt = Rc4.initDiscardBep6(&key),
@@ -1655,8 +1655,8 @@ test "PeerCrypto plaintext is no-op" {
 }
 
 test "PeerCrypto bidirectional encrypt/decrypt with separate keys" {
-    const shared_secret = [_]u8{0xDE} ** dh_key_size;
-    const skey = [_]u8{0xAD} ** 20;
+    const shared_secret = @as([dh_key_size]u8, @splat(0xDE));
+    const skey = @as([20]u8, @splat(0xAD));
 
     const key_a = deriveKeyA(shared_secret, skey);
     const key_b = deriveKeyB(shared_secret, skey);
@@ -1816,7 +1816,7 @@ test "threaded full MSE handshake" {
 test "threaded MSE handshake with plaintext fallback" {
     const fds = testSocketPair() catch return error.SkipZigTest;
 
-    const info_hash = [_]u8{0xAA} ** 20;
+    const info_hash = @as([20]u8, @splat(0xAA));
 
     const Responder = struct {
         fn run(fd: posix.fd_t, hash: [20]u8) !void {
@@ -1864,7 +1864,7 @@ test "threaded MSE handshake with plaintext fallback" {
 
 test "MseInitiatorHandshake init produces send action" {
     var rng = Random.simRandom(0x700);
-    const info_hash = [_]u8{0x42} ** 20;
+    const info_hash = @as([20]u8, @splat(0x42));
     var hs = MseInitiatorHandshake.init(&rng, info_hash, .preferred);
     const action = hs.start();
     switch (action) {
@@ -1879,7 +1879,7 @@ test "MseInitiatorHandshake init produces send action" {
 
 test "MseInitiatorHandshake send_dh_key transitions to recv_dh_key" {
     var rng = Random.simRandom(0x701);
-    const info_hash = [_]u8{0x42} ** 20;
+    const info_hash = @as([20]u8, @splat(0x42));
     var hs = MseInitiatorHandshake.init(&rng, info_hash, .preferred);
     _ = hs.start();
 
@@ -1896,7 +1896,7 @@ test "MseInitiatorHandshake send_dh_key transitions to recv_dh_key" {
 
 test "MseInitiatorHandshake recv_dh_key partial recv continues" {
     var rng = Random.simRandom(0x702);
-    const info_hash = [_]u8{0x42} ** 20;
+    const info_hash = @as([20]u8, @splat(0x42));
     var hs = MseInitiatorHandshake.init(&rng, info_hash, .preferred);
     _ = hs.start();
     _ = hs.feedSend(); // -> recv_dh_key
@@ -1915,7 +1915,7 @@ test "MseInitiatorHandshake recv_dh_key partial recv continues" {
 
 test "MseInitiatorHandshake recv_dh_key complete transitions to send_crypto_req" {
     var rng = Random.simRandom(0x703);
-    const info_hash = [_]u8{0x42} ** 20;
+    const info_hash = @as([20]u8, @splat(0x42));
     var hs = MseInitiatorHandshake.init(&rng, info_hash, .preferred);
     _ = hs.start();
     _ = hs.feedSend(); // -> recv_dh_key
@@ -1941,7 +1941,7 @@ test "MseInitiatorHandshake recv_dh_key complete transitions to send_crypto_req"
 
 test "MseInitiatorHandshake zero recv is connection_closed" {
     var rng = Random.simRandom(0x704);
-    const info_hash = [_]u8{0x42} ** 20;
+    const info_hash = @as([20]u8, @splat(0x42));
     var hs = MseInitiatorHandshake.init(&rng, info_hash, .preferred);
     _ = hs.start();
     _ = hs.feedSend(); // -> recv_dh_key
@@ -1957,7 +1957,7 @@ test "MseInitiatorHandshake zero recv is connection_closed" {
 
 test "MseResponderHandshake init starts with recv" {
     var rng = Random.simRandom(0x705);
-    const info_hash = [_]u8{0x42} ** 20;
+    const info_hash = @as([20]u8, @splat(0x42));
     const known = [_][20]u8{info_hash};
     var hs = MseResponderHandshake.init(&rng, &known, .preferred);
     const action = hs.start();
@@ -1971,7 +1971,7 @@ test "MseResponderHandshake init starts with recv" {
 
 test "MseResponderHandshake recv_dh_key transitions to send_dh_key" {
     var rng = Random.simRandom(0x706);
-    const info_hash = [_]u8{0x42} ** 20;
+    const info_hash = @as([20]u8, @splat(0x42));
     const known = [_][20]u8{info_hash};
     var hs = MseResponderHandshake.init(&rng, &known, .preferred);
     _ = hs.start();
@@ -1995,11 +1995,11 @@ test "MseResponderHandshake recv_dh_key transitions to send_dh_key" {
 
 test "MseInitiatorHandshake rejects invalid DH public key" {
     var rng = Random.simRandom(0x707);
-    const info_hash = [_]u8{0x42} ** 20;
+    const info_hash = @as([20]u8, @splat(0x42));
     var hs = MseInitiatorHandshake.init(&rng, info_hash, .preferred);
     _ = hs.start();
     _ = hs.feedSend();
-    hs.peer_public_key = [_]u8{0} ** dh_key_size;
+    hs.peer_public_key = @as([dh_key_size]u8, @splat(0));
 
     const action = hs.feedRecv(dh_key_size);
     switch (action) {
@@ -2010,7 +2010,7 @@ test "MseInitiatorHandshake rejects invalid DH public key" {
 
 test "MseResponderHandshake rejects oversized initial payload" {
     var rng = Random.simRandom(0x708);
-    const info_hash = [_]u8{0x42} ** 20;
+    const info_hash = @as([20]u8, @splat(0x42));
     const known = [_][20]u8{info_hash};
     var hs = MseResponderHandshake.init(&rng, &known, .preferred);
     hs.phase = .recv_pad_c_ia_len;
@@ -2028,7 +2028,7 @@ test "MseResponderHandshake rejects oversized initial payload" {
 
 test "MseResponderHandshake send_dh_key transitions to recv_req1_scan" {
     var rng = Random.simRandom(0x709);
-    const info_hash = [_]u8{0x42} ** 20;
+    const info_hash = @as([20]u8, @splat(0x42));
     const known = [_][20]u8{info_hash};
     var hs = MseResponderHandshake.init(&rng, &known, .preferred);
     _ = hs.start();
@@ -2066,7 +2066,7 @@ test "looksLikeMse detects BT vs MSE first byte" {
 test "MseInitiatorHandshake result returns plaintext for disabled mode" {
     var rng = Random.simRandom(0x70a);
     // When crypto_method is plaintext, result should be plaintext PeerCrypto
-    const info_hash = [_]u8{0x42} ** 20;
+    const info_hash = @as([20]u8, @splat(0x42));
     var hs = MseInitiatorHandshake.init(&rng, info_hash, .disabled);
     hs.crypto_method = crypto_plaintext;
     hs.phase = .done;
@@ -2079,8 +2079,8 @@ test "MseInitiatorHandshake result returns plaintext for disabled mode" {
 
 test "MseResponderHandshake unknown info-hash fails" {
     var rng = Random.simRandom(0x70b);
-    const info_hash = [_]u8{0x42} ** 20;
-    const wrong_hash = [_]u8{0xFF} ** 20;
+    const info_hash = @as([20]u8, @splat(0x42));
+    const wrong_hash = @as([20]u8, @splat(0xFF));
     const known = [_][20]u8{wrong_hash}; // doesn't match info_hash
     var hs = MseResponderHandshake.init(&rng, &known, .preferred);
 
@@ -2125,7 +2125,7 @@ test "encryption mode config: cryptoProvideFromMode coverage" {
 
 test "MseInitiatorHandshake vc_scan exceeds limit returns vc_not_found" {
     var rng = Random.simRandom(0x70c);
-    const info_hash = [_]u8{0x42} ** 20;
+    const info_hash = @as([20]u8, @splat(0x42));
     var hs = MseInitiatorHandshake.init(&rng, info_hash, .preferred);
     _ = hs.start();
     _ = hs.feedSend(); // -> recv_dh_key
@@ -2163,7 +2163,7 @@ test "MseInitiatorHandshake vc_scan exceeds limit returns vc_not_found" {
 test "MseInitiator and MseResponder shared_secret agree after DH exchange" {
     var rng_a = Random.simRandom(0x70d);
     var rng_b = Random.simRandom(0x70e);
-    const info_hash = [_]u8{0x42} ** 20;
+    const info_hash = @as([20]u8, @splat(0x42));
     const known = [_][20]u8{info_hash};
 
     // Create initiator and responder
@@ -2208,7 +2208,7 @@ test "MseInitiator and MseResponder full async handshake completes" {
     var rng_b = Random.simRandom(0x710);
     // Simulate the full async MSE handshake, piping data between both sides.
     // This is the async equivalent of a blocking handshakeInitiator/handshakeResponder pair.
-    const info_hash = [_]u8{0x42} ** 20;
+    const info_hash = @as([20]u8, @splat(0x42));
     const known = [_][20]u8{info_hash};
 
     var ini = MseInitiatorHandshake.init(&rng_a, info_hash, .preferred);

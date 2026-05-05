@@ -144,7 +144,7 @@ pub const RoutingTable = struct {
     pub fn init(own_id: NodeId) RoutingTable {
         return .{
             .own_id = own_id,
-            .buckets = [_]KBucket{KBucket{}} ** 160,
+            .buckets = @as([160]KBucket, @splat(KBucket{})),
         };
     }
 
@@ -304,14 +304,14 @@ test "update existing node" {
 }
 
 test "bucket full returns bucket_full" {
-    var own_id: NodeId = [_]u8{0} ** 20;
+    var own_id: NodeId = @as([20]u8, @splat(0));
     own_id[0] = 0xFF; // own_id starts with 0xFF
     var table = RoutingTable.init(own_id);
     const now: i64 = 1000000;
 
     // Fill bucket 159 (highest bit differs) with K nodes
     for (0..K) |i| {
-        var id: NodeId = [_]u8{0} ** 20;
+        var id: NodeId = @as([20]u8, @splat(0));
         // These all start with 0x0X, so XOR with own_id (0xFF...) has bit 159 set
         id[0] = @intCast(i);
         id[19] = @intCast(i + 1); // ensure unique
@@ -325,7 +325,7 @@ test "bucket full returns bucket_full" {
     try std.testing.expectEqual(@as(usize, K), table.nodeCount());
 
     // Try to add one more to the same bucket
-    var extra_id: NodeId = [_]u8{0} ** 20;
+    var extra_id: NodeId = @as([20]u8, @splat(0));
     extra_id[0] = 0x0A;
     extra_id[19] = 0xFF;
     const result = table.addNode(.{
@@ -337,7 +337,7 @@ test "bucket full returns bucket_full" {
 }
 
 test "bad node gets replaced" {
-    var own_id: NodeId = [_]u8{0} ** 20;
+    var own_id: NodeId = @as([20]u8, @splat(0));
     own_id[0] = 0xFF;
     var table = RoutingTable.init(own_id);
     const now: i64 = 1000000;
@@ -345,7 +345,7 @@ test "bad node gets replaced" {
     // Fill a bucket
     var bad_id: NodeId = undefined;
     for (0..K) |i| {
-        var id: NodeId = [_]u8{0} ** 20;
+        var id: NodeId = @as([20]u8, @splat(0));
         id[0] = @intCast(i);
         id[19] = @intCast(i + 1);
         _ = table.addNode(.{
@@ -360,7 +360,7 @@ test "bad node gets replaced" {
     table.markFailed(bad_id);
 
     // Now add a new node -- it should replace the bad one
-    var new_id: NodeId = [_]u8{0} ** 20;
+    var new_id: NodeId = @as([20]u8, @splat(0));
     new_id[0] = 0x0B;
     new_id[19] = 0xAA;
     const result = table.addNode(.{
@@ -418,7 +418,7 @@ test "findClosest clamps after collecting more than 255 nodes" {
     }
     try std.testing.expect(table.nodeCount() > 255);
 
-    const target = [_]u8{0x55} ** 20;
+    const target = @as([20]u8, @splat(0x55));
     var buf: [8]NodeInfo = undefined;
     const count = table.findClosest(target, 8, &buf);
     try std.testing.expectEqual(@as(u8, 8), count);

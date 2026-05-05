@@ -604,7 +604,7 @@ test "v1 torrent has correct version field" {
 }
 
 test "parse pure v2 torrent" {
-    const pr = [_]u8{0xAA} ** 32;
+    const pr = @as([32]u8, @splat(0xAA));
     // Pure v2: has "file tree" but no "pieces"
     // info dict: { "name": "test", "piece length": 16384, "file tree": { "test.bin": { "": { "length": 5, "pieces root": <32 bytes> } } } }
     const input = "d4:infod9:file treed8:test.bind0:d6:lengthi5e11:pieces root32:" ++ pr ++ "eee4:name4:test12:piece lengthi16384eee";
@@ -634,7 +634,7 @@ test "parse pure v2 torrent" {
 }
 
 test "parse hybrid torrent" {
-    const pr = [_]u8{0xCC} ** 32;
+    const pr = @as([32]u8, @splat(0xCC));
     // Hybrid: has both "pieces" and "file tree"
     const input = "d4:infod9:file treed8:test.bind0:d6:lengthi5e11:pieces root32:" ++ pr ++ "eee6:lengthi5e4:name8:test.bin12:piece lengthi16384e6:pieces20:abcdefghijklmnopqrstee";
 

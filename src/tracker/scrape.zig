@@ -144,7 +144,7 @@ test "derive scrape url returns null for non-announce url" {
 
 test "build scrape url with info hash" {
     const alloc = std.testing.allocator;
-    const info_hash = [_]u8{ 0x00, 0xff } ++ ([_]u8{0x41} ** 18);
+    const info_hash = [_]u8{ 0x00, 0xff } ++ @as([18]u8, @splat(0x41));
 
     const url = try buildScrapeUrl(alloc, "http://tracker.example/announce", info_hash);
     defer alloc.free(url);
@@ -155,7 +155,7 @@ test "build scrape url with info hash" {
 
 test "build scrape url fails for non-announce url" {
     const alloc = std.testing.allocator;
-    const info_hash = [_]u8{0} ** 20;
+    const info_hash = @as([20]u8, @splat(0));
 
     try std.testing.expectError(
         error.ScrapeNotSupported,
@@ -165,7 +165,7 @@ test "build scrape url fails for non-announce url" {
 
 test "parse http scrape response" {
     const alloc = std.testing.allocator;
-    const info_hash = [_]u8{0xAB} ** 20;
+    const info_hash = @as([20]u8, @splat(0xAB));
 
     // Build bencoded response: d5:filesd20:<info_hash>d8:completei10e10:incompletei5e10:downloadedi100eeee
     var response_buf = std.ArrayList(u8).empty;
@@ -183,8 +183,8 @@ test "parse http scrape response" {
 
 test "parse scrape response with unknown hash returns zeros" {
     const alloc = std.testing.allocator;
-    const info_hash = [_]u8{0xAB} ** 20;
-    const other_hash = [_]u8{0xCD} ** 20;
+    const info_hash = @as([20]u8, @splat(0xAB));
+    const other_hash = @as([20]u8, @splat(0xCD));
 
     var response_buf = std.ArrayList(u8).empty;
     defer response_buf.deinit(alloc);
@@ -201,7 +201,7 @@ test "parse scrape response with unknown hash returns zeros" {
 
 test "parse scrape response rejects failure reason" {
     const alloc = std.testing.allocator;
-    const info_hash = [_]u8{0} ** 20;
+    const info_hash = @as([20]u8, @splat(0));
 
     try std.testing.expectError(
         error.TrackerFailure,
@@ -211,7 +211,7 @@ test "parse scrape response rejects failure reason" {
 
 test "parse scrape response rejects non-dict" {
     const alloc = std.testing.allocator;
-    const info_hash = [_]u8{0} ** 20;
+    const info_hash = @as([20]u8, @splat(0));
 
     try std.testing.expectError(
         error.UnexpectedBencodeType,
@@ -224,7 +224,7 @@ test "parse scrape response rejects non-dict" {
 test "fuzz tracker scrape response parser" {
     try std.testing.fuzz({}, struct {
         fn run(_: void, input: []const u8) anyerror!void {
-            const info_hash = [_]u8{0xAB} ** 20;
+            const info_hash = @as([20]u8, @splat(0xAB));
             const result = parseScrapeResponse(std.testing.allocator, input, info_hash) catch return;
             // Result is a value struct, no deallocation needed
             _ = result;
@@ -253,7 +253,7 @@ test "fuzz tracker scrape response parser" {
 }
 
 test "scrape parser edge cases: single byte inputs" {
-    const info_hash = [_]u8{0} ** 20;
+    const info_hash = @as([20]u8, @splat(0));
     var buf: [1]u8 = undefined;
     var byte: u16 = 0;
     while (byte <= 0xFF) : (byte += 1) {
@@ -264,7 +264,7 @@ test "scrape parser edge cases: single byte inputs" {
 
 test "scrape parser handles truncated valid response" {
     const alloc = std.testing.allocator;
-    const info_hash = [_]u8{0xAB} ** 20;
+    const info_hash = @as([20]u8, @splat(0xAB));
 
     // Build a valid response
     var response_buf = std.ArrayList(u8).empty;
@@ -282,7 +282,7 @@ test "scrape parser handles truncated valid response" {
 
 test "scrape parser handles missing files key" {
     const alloc = std.testing.allocator;
-    const info_hash = [_]u8{0} ** 20;
+    const info_hash = @as([20]u8, @splat(0));
 
     try std.testing.expectError(
         error.MissingRequiredField,

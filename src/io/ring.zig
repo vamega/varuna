@@ -11,7 +11,7 @@ pub const max_fixed_buffers = 64;
 pub const FixedBufferPool = struct {
     bufs: ?[]posix.iovec = null,
     alloc: ?[]u8 = null,
-    free: [max_fixed_buffers]bool = [_]bool{true} ** max_fixed_buffers,
+    free: [max_fixed_buffers]bool = @as([max_fixed_buffers]bool, @splat(true)),
 
     /// Register a pool of `count` fixed buffers of `buf_size` bytes each.
     /// These are page-aligned and pinned, suitable for READ_FIXED / WRITE_FIXED.
@@ -32,7 +32,7 @@ pub const FixedBufferPool = struct {
         try ring.register_buffers(iovecs);
         self.bufs = iovecs;
         self.alloc = backing;
-        self.free = [_]bool{true} ** max_fixed_buffers;
+        self.free = @as([max_fixed_buffers]bool, @splat(true));
     }
 
     /// Claim a free fixed buffer slot. Returns the index and a slice to the buffer.

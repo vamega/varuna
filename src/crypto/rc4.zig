@@ -104,7 +104,7 @@ test "RC4 with BEP 6 discard produces different output than plain RC4" {
     var bep6_rc4 = Rc4.initDiscardBep6(key);
     var out1: [16]u8 = undefined;
     var out2: [16]u8 = undefined;
-    const input = [_]u8{0} ** 16;
+    const input = @as([16]u8, @splat(0));
     plain_rc4.process(&out1, &input);
     bep6_rc4.process(&out2, &input);
     // After discarding 1024 bytes, keystream should differ
@@ -132,7 +132,7 @@ test "RC4 keystream generation" {
     var ks: [32]u8 = undefined;
     rc4a.keystream(&ks);
     // XOR with zeros should produce the same keystream
-    const zeros = [_]u8{0} ** 32;
+    const zeros = @as([32]u8, @splat(0));
     var xored: [32]u8 = undefined;
     rc4b.process(&xored, &zeros);
     try std.testing.expectEqualSlices(u8, &ks, &xored);

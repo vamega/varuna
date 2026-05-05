@@ -941,7 +941,7 @@ const FakeHttpExecutor = struct {
         url_len: u16 = 0,
         host: [max_host_len]u8 = undefined,
         host_len: u8 = 0,
-        extra_headers: [max_extra_headers]ExtraHeader = [_]ExtraHeader{.{}} ** max_extra_headers,
+        extra_headers: [max_extra_headers]ExtraHeader = @as([max_extra_headers]ExtraHeader, @splat(.{})),
         target_buf: ?[]u8 = null,
         target_offset: u32 = 0,
 
@@ -1011,7 +1011,7 @@ const FakeEventLoop = struct {
     allocator: std.mem.Allocator,
     clock: FakeClock = .{},
     io: FakeIO = .{},
-    web_seed_slots: [max_web_seed_slots]WebSeedSlot = [_]WebSeedSlot{.{}} ** max_web_seed_slots,
+    web_seed_slots: [max_web_seed_slots]WebSeedSlot = @as([max_web_seed_slots]WebSeedSlot, @splat(.{})),
     torrent_id: TorrentId,
     tc: *TorrentContext,
     hasher: ?*FakeHasher = null,
@@ -1091,8 +1091,8 @@ fn initFakeTorrentContext(wsm: *WebSeedManager, pt: ?*PieceTracker) TorrentConte
         .session = null,
         .piece_tracker = pt,
         .shared_fds = no_fds,
-        .info_hash = [_]u8{0} ** 20,
-        .peer_id = [_]u8{0} ** 20,
+        .info_hash = @as([20]u8, @splat(0)),
+        .peer_id = @as([20]u8, @splat(0)),
         .web_seed_manager = wsm,
     };
 }

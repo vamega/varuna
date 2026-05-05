@@ -6,7 +6,7 @@ pub const U768 = struct {
     limbs: [12]u64,
 
     pub fn zero() U768 {
-        return .{ .limbs = [_]u64{0} ** 12 };
+        return .{ .limbs = @as([12]u64, @splat(0)) };
     }
 
     /// Import from 96-byte big-endian buffer.
@@ -78,7 +78,7 @@ pub const U768 = struct {
     /// Uses schoolbook multiplication with intermediate reduction.
     pub fn mulMod(a: U768, b: U768, p: U768) U768 {
         // Double-width product: 24 limbs
-        var product = [_]u64{0} ** 24;
+        var product = @as([24]u64, @splat(0));
 
         for (0..12) |i| {
             var carry: u64 = 0;
@@ -103,7 +103,7 @@ pub const U768 = struct {
     /// The quotient estimate q = work[top] may be off by 1, so we retry until done.
     fn reduceWide(product: *const [24]u64, p: U768) U768 {
         // Copy to mutable working space
-        var work = [_]u64{0} ** 25; // extra limb for borrow detection
+        var work = @as([25]u64, @splat(0)); // extra limb for borrow detection
         @memcpy(work[0..24], product);
 
         // Find the highest non-zero limb

@@ -395,7 +395,7 @@ pub const BanList = struct {
     /// Convert a std.net.Address to a normalized AddrKey.
     /// IPv4-mapped IPv6 (::ffff:x.x.x.x) is normalized to plain IPv4.
     pub fn addrToKey(addr: std.net.Address) AddrKey {
-        var key: AddrKey = [_]u8{0} ** 17;
+        var key: AddrKey = @as([17]u8, @splat(0));
         switch (addr.any.family) {
             std.posix.AF.INET => {
                 key[0] = 4;

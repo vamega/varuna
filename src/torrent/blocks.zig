@@ -50,7 +50,7 @@ test "derive block geometry from layout" {
     };
     const hashes = "aaaaaaaaaaaaaaaaaaaabbbbbbbbbbbbbbbbbbbbcccccccccccccccccccc";
     const source = @import("metainfo.zig").Metainfo{
-        .info_hash = [_]u8{0} ** 20,
+        .info_hash = @as([20]u8, @splat(0)),
         .announce = null,
         .created_by = null,
         .comment = null,
@@ -83,7 +83,7 @@ test "split large pieces into multiple blocks" {
     const hashes =
         "aaaaaaaaaaaaaaaaaaaabbbbbbbbbbbbbbbbbbbbcccccccccccccccccccc";
     const source = @import("metainfo.zig").Metainfo{
-        .info_hash = [_]u8{0} ** 20,
+        .info_hash = @as([20]u8, @splat(0)),
         .announce = null,
         .created_by = null,
         .comment = null,

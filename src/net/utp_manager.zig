@@ -16,10 +16,10 @@ pub const UtpManager = struct {
     /// Connection table indexed by slot. Sockets are heap-allocated on
     /// demand so that zero-connection baseline is near zero (512 pointers
     /// = 4 KiB instead of 24 MiB for 4096 inline UtpSocket structs).
-    connections: [max_connections]?*UtpSocket = [_]?*UtpSocket{null} ** max_connections,
+    connections: [max_connections]?*UtpSocket = @as([max_connections]?*UtpSocket, @splat(null)),
 
     /// Whether each slot is in use.
-    slot_active: [max_connections]bool = [_]bool{false} ** max_connections,
+    slot_active: [max_connections]bool = @as([max_connections]bool, @splat(false)),
 
     /// Number of active connections.
     active_count: u16 = 0,
@@ -137,7 +137,7 @@ pub const UtpManager = struct {
         // empty `reorder_data` is the only safe outcome here.
         if (sock.state == .closed or sock.state == .reset) {
             packet_result.reorder_delivered = 0;
-            packet_result.reorder_data = [_]?[]const u8{null} ** utp.max_reorder_buf;
+            packet_result.reorder_data = @as([utp.max_reorder_buf]?[]const u8, @splat(null));
             self.freeSlot(slot);
         }
 
@@ -427,7 +427,7 @@ pub const PacketResult = struct {
     /// ascending sequence order). Each slice points into per-socket
     /// owned storage and is only valid until the next call to
     /// `UtpManager.processPacket` on the same connection.
-    reorder_data: [utp.max_reorder_buf]?[]const u8 = [_]?[]const u8{null} ** utp.max_reorder_buf,
+    reorder_data: [utp.max_reorder_buf]?[]const u8 = @as([utp.max_reorder_buf]?[]const u8, @splat(null)),
     remote: std.net.Address,
     new_connection: bool,
 };
@@ -775,7 +775,7 @@ test "stripExtensions: SACK len > sack_bitmask_max is rejected" {
 test "stripExtensions: chain bounded by datagram length" {
     // A chain that never terminates within the datagram is
     // rejected. Each hop here advertises another hop forever.
-    const datagram = [_]u8{ 1, 0 } ** 8; // 8 chained empty extensions, never terminating
+    const datagram = [_]u8{ 1, 0, 1, 0, 1, 0, 1, 0, 1, 0, 1, 0, 1, 0, 1, 0 }; // 8 chained empty extensions, never terminating
     try std.testing.expect(UtpManager.stripExtensions(.selective_ack, &datagram) == null);
 }
 

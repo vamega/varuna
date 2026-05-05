@@ -146,7 +146,7 @@ test "BUGGIFY across many steps with probability 0.5 hits a fraction" {
     // Submit one timeout per iteration and step. The timeout fires on
     // the next step, so injections should land on roughly half of them.
     var i: u32 = 0;
-    var completions: [128]Completion = .{Completion{}} ** 128;
+    var completions: [128]Completion = @splat(Completion{});
     while (i < completions.len) : (i += 1) {
         try sim.io.timeout(.{ .ns = 0 }, &completions[i], null, cb);
         try sim.step(0);

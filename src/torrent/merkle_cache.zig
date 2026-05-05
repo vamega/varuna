@@ -467,7 +467,7 @@ test "merkle cache rejects wrong root" {
     };
     // Wrong root -- all zeros
     var v2_files = [_]metainfo.V2File{
-        .{ .path = &.{}, .length = 1024, .pieces_root = [_]u8{0} ** 32 },
+        .{ .path = &.{}, .length = 1024, .pieces_root = @as([32]u8, @splat(0)) },
     };
     var lo = layout.Layout{
         .piece_length = 512,
@@ -581,8 +581,8 @@ test "merkle cache isFileComplete" {
         .{ .length = 512, .torrent_offset = 1024, .first_piece = 2, .end_piece_exclusive = 3, .path = &.{}, .v2_piece_offset = 2 },
     };
     var v2_files = [_]metainfo.V2File{
-        .{ .path = &.{}, .length = 1024, .pieces_root = [_]u8{0} ** 32 },
-        .{ .path = &.{}, .length = 512, .pieces_root = [_]u8{0} ** 32 },
+        .{ .path = &.{}, .length = 1024, .pieces_root = @as([32]u8, @splat(0)) },
+        .{ .path = &.{}, .length = 512, .pieces_root = @as([32]u8, @splat(0)) },
     };
     var lo = layout.Layout{
         .piece_length = 512,
@@ -627,9 +627,9 @@ test "merkle cache filePieceRange" {
         .{ .length = 512, .torrent_offset = 1024, .first_piece = 2, .end_piece_exclusive = 3, .path = &.{}, .v2_piece_offset = 2 },
     };
     var v2_files = [_]metainfo.V2File{
-        .{ .path = &.{}, .length = 1024, .pieces_root = [_]u8{0} ** 32 },
-        .{ .path = &.{}, .length = 0, .pieces_root = [_]u8{0} ** 32 },
-        .{ .path = &.{}, .length = 512, .pieces_root = [_]u8{0} ** 32 },
+        .{ .path = &.{}, .length = 1024, .pieces_root = @as([32]u8, @splat(0)) },
+        .{ .path = &.{}, .length = 0, .pieces_root = @as([32]u8, @splat(0)) },
+        .{ .path = &.{}, .length = 512, .pieces_root = @as([32]u8, @splat(0)) },
     };
     var lo = layout.Layout{
         .piece_length = 512,
@@ -718,7 +718,7 @@ test "merkle cache pending request tracking" {
         .{ .length = 1024, .torrent_offset = 0, .first_piece = 0, .end_piece_exclusive = 2, .path = &.{}, .v2_piece_offset = 0 },
     };
     var v2_files = [_]metainfo.V2File{
-        .{ .path = &.{}, .length = 1024, .pieces_root = [_]u8{0} ** 32 },
+        .{ .path = &.{}, .length = 1024, .pieces_root = @as([32]u8, @splat(0)) },
     };
     var lo = layout.Layout{
         .piece_length = 512,
@@ -767,8 +767,8 @@ test "merkle cache pending request removal on disconnect" {
         .{ .length = 512, .torrent_offset = 1024, .first_piece = 2, .end_piece_exclusive = 3, .path = &.{}, .v2_piece_offset = 2 },
     };
     var v2_files = [_]metainfo.V2File{
-        .{ .path = &.{}, .length = 1024, .pieces_root = [_]u8{0} ** 32 },
-        .{ .path = &.{}, .length = 512, .pieces_root = [_]u8{0} ** 32 },
+        .{ .path = &.{}, .length = 1024, .pieces_root = @as([32]u8, @splat(0)) },
+        .{ .path = &.{}, .length = 512, .pieces_root = @as([32]u8, @splat(0)) },
     };
     var lo = layout.Layout{
         .piece_length = 512,
@@ -822,7 +822,7 @@ test "merkle cache coalesces multiple peers requesting same file" {
         .{ .length = 2048, .torrent_offset = 0, .first_piece = 0, .end_piece_exclusive = 4, .path = &.{}, .v2_piece_offset = 0 },
     };
     var v2_files = [_]metainfo.V2File{
-        .{ .path = &.{}, .length = 2048, .pieces_root = [_]u8{0} ** 32 },
+        .{ .path = &.{}, .length = 2048, .pieces_root = @as([32]u8, @splat(0)) },
     };
     var lo = layout.Layout{
         .piece_length = 512,

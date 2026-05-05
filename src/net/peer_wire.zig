@@ -368,8 +368,8 @@ fn writeMessageWithPayload(
 // ── Tests ────────────────────────────────────────────────────
 
 test "handshake serialization roundtrip" {
-    const info_hash = [_]u8{0xAA} ** 20;
-    const peer_id = [_]u8{0xBB} ** 20;
+    const info_hash = @as([20]u8, @splat(0xAA));
+    const peer_id = @as([20]u8, @splat(0xBB));
     const buf = serializeHandshake(info_hash, peer_id);
 
     // byte 0: protocol string length
@@ -377,7 +377,7 @@ test "handshake serialization roundtrip" {
     // bytes 1..20: protocol string
     try std.testing.expectEqualStrings("BitTorrent protocol", buf[1..20]);
     // bytes 20..28: reserved (BEP 10 extension bit set at byte 5)
-    var expected_reserved = [_]u8{0} ** 8;
+    var expected_reserved = @as([8]u8, @splat(0));
     expected_reserved[extensions.reserved_byte] = extensions.reserved_mask;
     try std.testing.expectEqualSlices(u8, &expected_reserved, buf[20..28]);
     // bytes 28..48: info_hash
@@ -389,14 +389,14 @@ test "handshake serialization roundtrip" {
 }
 
 test "handshake prefix validation rejects wrong length byte" {
-    var buf = serializeHandshake([_]u8{0xAA} ** 20, [_]u8{0xBB} ** 20);
+    var buf = serializeHandshake(@as([20]u8, @splat(0xAA)), @as([20]u8, @splat(0xBB)));
     buf[0] = protocol_length + 1;
 
     try std.testing.expectError(error.InvalidHandshakeProtocol, validateHandshakePrefix(&buf));
 }
 
 test "handshake prefix validation rejects wrong protocol string" {
-    var buf = serializeHandshake([_]u8{0xAA} ** 20, [_]u8{0xBB} ** 20);
+    var buf = serializeHandshake(@as([20]u8, @splat(0xAA)), @as([20]u8, @splat(0xBB)));
     buf[1] = 'X';
 
     try std.testing.expectError(error.InvalidHandshakeProtocol, validateHandshakePrefix(&buf));
@@ -558,12 +558,12 @@ test "max_message_length is 1 MiB" {
 // ── BEP 52 v2 handshake tests ────────────────────────────
 
 test "serializeHandshakeV2 sets v2 reserved bit when is_v2 is true" {
-    const info_hash = [_]u8{0xAA} ** 20;
-    const peer_id = [_]u8{0xBB} ** 20;
+    const info_hash = @as([20]u8, @splat(0xAA));
+    const peer_id = @as([20]u8, @splat(0xBB));
     const buf = serializeHandshakeV2(info_hash, peer_id, true);
 
     // BEP 10 extension bit should be set
-    var expected_reserved = [_]u8{0} ** 8;
+    var expected_reserved = @as([8]u8, @splat(0));
     expected_reserved[extensions.reserved_byte] = extensions.reserved_mask;
     // BEP 52 v2 bit should be set
     expected_reserved[v2_reserved_byte] |= v2_reserved_mask;
@@ -575,8 +575,8 @@ test "serializeHandshakeV2 sets v2 reserved bit when is_v2 is true" {
 }
 
 test "serializeHandshakeV2 does not set v2 bit when is_v2 is false" {
-    const info_hash = [_]u8{0xCC} ** 20;
-    const peer_id = [_]u8{0xDD} ** 20;
+    const info_hash = @as([20]u8, @splat(0xCC));
+    const peer_id = @as([20]u8, @splat(0xDD));
     const buf = serializeHandshakeV2(info_hash, peer_id, false);
 
     // BEP 52 v2 bit should NOT be set
@@ -587,7 +587,7 @@ test "serializeHandshakeV2 does not set v2 bit when is_v2 is false" {
 }
 
 test "supportsV2 detects v2 capability from reserved bytes" {
-    var reserved = [_]u8{0} ** 8;
+    var reserved = @as([8]u8, @splat(0));
     try std.testing.expect(!supportsV2(reserved));
 
     reserved[v2_reserved_byte] = v2_reserved_mask;
@@ -602,8 +602,8 @@ test "supportsV2 detects v2 capability from reserved bytes" {
 }
 
 test "serializeHandshake is compatible with serializeHandshakeV2 false" {
-    const info_hash = [_]u8{0x11} ** 20;
-    const peer_id = [_]u8{0x22} ** 20;
+    const info_hash = @as([20]u8, @splat(0x11));
+    const peer_id = @as([20]u8, @splat(0x22));
     const v1_buf = serializeHandshake(info_hash, peer_id);
     const v2_buf = serializeHandshakeV2(info_hash, peer_id, false);
     try std.testing.expectEqualSlices(u8, &v1_buf, &v2_buf);

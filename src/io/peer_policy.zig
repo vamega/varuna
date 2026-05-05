@@ -633,7 +633,7 @@ pub fn tryFillPipeline(self: anytype, slot: u16) !void {
     }
 
     // --- Phase 2: prefetch queued pieces if current is fully requested and pipeline has headroom ---
-    var prefetch_counts = [_]u32{0} ** prefetch_piece_count;
+    var prefetch_counts = @as([prefetch_piece_count]u32, @splat(0));
     var prefetch_total: u32 = 0;
     const cur_fully_requested = if (peer.downloading_piece) |dp|
         dp.nextUnrequestedBlock() == null
@@ -2212,7 +2212,7 @@ test "tryFillPipeline prefetches enough small pieces to fill request depth" {
         fn freeOnePendingSend(_: *@This(), _: u16, _: u64) void {}
     };
 
-    var peer_storage = [_]Peer{.{}} ** 1;
+    var peer_storage = @as([1]Peer, @splat(.{}));
     var session = FakeSession{ .layout = .{
         .piece_length = 256 * 1024,
         .piece_count = 8,
@@ -2275,8 +2275,8 @@ test "checkReannounce skips loopback self peer when bound to wildcard" {
     const empty_fds = [_]posix.fd_t{};
     const tid = try el.addTorrentContext(.{
         .shared_fds = empty_fds[0..],
-        .info_hash = [_]u8{0xAA} ** 20,
-        .peer_id = [_]u8{0xBB} ** 20,
+        .info_hash = @as([20]u8, @splat(0xAA)),
+        .peer_id = @as([20]u8, @splat(0xBB)),
     });
 
     el.port = 6881;
@@ -2299,8 +2299,8 @@ test "checkReannounce keeps loopback peer on a different port" {
     const empty_fds = [_]posix.fd_t{};
     const tid = try el.addTorrentContext(.{
         .shared_fds = empty_fds[0..],
-        .info_hash = [_]u8{0xCC} ** 20,
-        .peer_id = [_]u8{0xDD} ** 20,
+        .info_hash = @as([20]u8, @splat(0xCC)),
+        .peer_id = @as([20]u8, @splat(0xDD)),
     });
 
     el.port = 6881;
@@ -2869,7 +2869,7 @@ const v2_test_torrent = blk: {
     // pieces_root is bogus (all 0xAA), but we never verify it in these tests
     // — we drive completeV2PieceDownload directly with a pre-populated
     // LeafHashStore so the proof check is bypassed.
-    const pr = [_]u8{0xAA} ** 32;
+    const pr = @as([32]u8, @splat(0xAA));
     break :blk "d4:infod9:file treed8:test.bind0:d6:lengthi5e11:pieces root32:" ++ pr ++ "eee4:name4:test12:piece lengthi16384eee";
 };
 
@@ -2919,7 +2919,7 @@ const V2Fixture = struct {
         el.* = try EventLoop.initBare(allocator, 0);
         errdefer el.deinit();
 
-        _ = try el.addTorrent(sess, pt, fds, [_]u8{0} ** 20);
+        _ = try el.addTorrent(sess, pt, fds, @as([20]u8, @splat(0)));
 
         return .{ .el = el, .sess = sess, .pt = pt, .fds = fds, .bf = bf };
     }
@@ -2998,7 +2998,7 @@ test "completeV2PieceDownload: stored leaf with mismatched data → fails closed
     const leaf_hashes_mod = @import("../torrent/leaf_hashes.zig");
     const lh = try allocator.create(leaf_hashes_mod.LeafHashStore);
     lh.* = try leaf_hashes_mod.LeafHashStore.init(allocator, 1);
-    lh.leaves[0] = [_]u8{0xCC} ** 32;
+    lh.leaves[0] = @as([32]u8, @splat(0xCC));
     tc.leaf_hashes = lh;
 
     completeV2PieceDownload(fx.el, slot, peer, null, fx.pt, fx.sess, tc, 0, peer.piece_buf.?);

@@ -20,7 +20,7 @@ pub const Ledbat = struct {
 
     /// Ring buffer of recent base-delay samples, one per minute.
     /// We keep `base_history_len` entries and use the minimum.
-    base_history: [base_history_len]u32 = [_]u32{std.math.maxInt(u32)} ** base_history_len,
+    base_history: [base_history_len]u32 = @as([base_history_len]u32, @splat(std.math.maxInt(u32))),
     base_history_idx: u8 = 0,
 
     /// Timestamp (microseconds) of the last base-delay rotation.
@@ -28,7 +28,7 @@ pub const Ledbat = struct {
 
     /// Current delay filter: minimum of the last `current_delay_samples`
     /// delay measurements. This smooths out jitter.
-    current_delay_filter: [current_delay_samples]u32 = [_]u32{0} ** current_delay_samples,
+    current_delay_filter: [current_delay_samples]u32 = @as([current_delay_samples]u32, @splat(0)),
     current_delay_idx: u8 = 0,
 
     /// Number of bytes acked since last cwnd update (for sub-window

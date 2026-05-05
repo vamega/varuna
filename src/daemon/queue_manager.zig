@@ -307,9 +307,9 @@ test "queue position management" {
     var qm = QueueManager.init(allocator);
     defer qm.deinit();
 
-    const hash_a = [_]u8{'a'} ** 40;
-    const hash_b = [_]u8{'b'} ** 40;
-    const hash_c = [_]u8{'c'} ** 40;
+    const hash_a = @as([40]u8, @splat('a'));
+    const hash_b = @as([40]u8, @splat('b'));
+    const hash_c = @as([40]u8, @splat('c'));
 
     // Add three torrents
     const pos1 = try qm.addTorrent(hash_a);
@@ -330,9 +330,9 @@ test "queue remove compacts positions" {
     var qm = QueueManager.init(allocator);
     defer qm.deinit();
 
-    const hash_a = [_]u8{'a'} ** 40;
-    const hash_b = [_]u8{'b'} ** 40;
-    const hash_c = [_]u8{'c'} ** 40;
+    const hash_a = @as([40]u8, @splat('a'));
+    const hash_b = @as([40]u8, @splat('b'));
+    const hash_c = @as([40]u8, @splat('c'));
 
     _ = try qm.addTorrent(hash_a);
     _ = try qm.addTorrent(hash_b);
@@ -350,9 +350,9 @@ test "queue move to top" {
     var qm = QueueManager.init(allocator);
     defer qm.deinit();
 
-    const hash_a = [_]u8{'a'} ** 40;
-    const hash_b = [_]u8{'b'} ** 40;
-    const hash_c = [_]u8{'c'} ** 40;
+    const hash_a = @as([40]u8, @splat('a'));
+    const hash_b = @as([40]u8, @splat('b'));
+    const hash_c = @as([40]u8, @splat('c'));
 
     _ = try qm.addTorrent(hash_a);
     _ = try qm.addTorrent(hash_b);
@@ -370,9 +370,9 @@ test "queue move to bottom" {
     var qm = QueueManager.init(allocator);
     defer qm.deinit();
 
-    const hash_a = [_]u8{'a'} ** 40;
-    const hash_b = [_]u8{'b'} ** 40;
-    const hash_c = [_]u8{'c'} ** 40;
+    const hash_a = @as([40]u8, @splat('a'));
+    const hash_b = @as([40]u8, @splat('b'));
+    const hash_c = @as([40]u8, @splat('c'));
 
     _ = try qm.addTorrent(hash_a);
     _ = try qm.addTorrent(hash_b);
@@ -390,9 +390,9 @@ test "queue increase priority" {
     var qm = QueueManager.init(allocator);
     defer qm.deinit();
 
-    const hash_a = [_]u8{'a'} ** 40;
-    const hash_b = [_]u8{'b'} ** 40;
-    const hash_c = [_]u8{'c'} ** 40;
+    const hash_a = @as([40]u8, @splat('a'));
+    const hash_b = @as([40]u8, @splat('b'));
+    const hash_c = @as([40]u8, @splat('c'));
 
     _ = try qm.addTorrent(hash_a);
     _ = try qm.addTorrent(hash_b);
@@ -411,9 +411,9 @@ test "queue decrease priority" {
     var qm = QueueManager.init(allocator);
     defer qm.deinit();
 
-    const hash_a = [_]u8{'a'} ** 40;
-    const hash_b = [_]u8{'b'} ** 40;
-    const hash_c = [_]u8{'c'} ** 40;
+    const hash_a = @as([40]u8, @splat('a'));
+    const hash_b = @as([40]u8, @splat('b'));
+    const hash_c = @as([40]u8, @splat('c'));
 
     _ = try qm.addTorrent(hash_a);
     _ = try qm.addTorrent(hash_b);
@@ -432,7 +432,7 @@ test "queue increase priority at top is no-op" {
     var qm = QueueManager.init(allocator);
     defer qm.deinit();
 
-    const hash_a = [_]u8{'a'} ** 40;
+    const hash_a = @as([40]u8, @splat('a'));
     _ = try qm.addTorrent(hash_a);
 
     qm.increasePriority(hash_a);
@@ -444,7 +444,7 @@ test "queue decrease priority at bottom is no-op" {
     var qm = QueueManager.init(allocator);
     defer qm.deinit();
 
-    const hash_a = [_]u8{'a'} ** 40;
+    const hash_a = @as([40]u8, @splat('a'));
     _ = try qm.addTorrent(hash_a);
 
     qm.decreasePriority(hash_a);
@@ -461,7 +461,7 @@ test "queue disabled means all torrents active" {
     var sessions = std.StringHashMap(*TorrentSession).init(allocator);
     defer sessions.deinit();
 
-    const hash = [_]u8{'a'} ** 40;
+    const hash = @as([40]u8, @splat('a'));
     _ = try qm.addTorrent(hash);
     try std.testing.expect(qm.shouldBeActive(hash, &sessions));
 }

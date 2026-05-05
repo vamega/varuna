@@ -222,7 +222,7 @@ pub fn serializeExtensionMessage(allocator: std.mem.Allocator, sub_id: u8, paylo
 // ── Tests ────────────────────────────────────────────────────
 
 test "supportsExtensions detects BEP 10 bit" {
-    var reserved = [_]u8{0} ** 8;
+    var reserved = @as([8]u8, @splat(0));
     try std.testing.expect(!supportsExtensions(reserved));
 
     reserved[5] = 0x10;
@@ -237,7 +237,7 @@ test "supportsExtensions detects BEP 10 bit" {
 }
 
 test "setExtensionBit sets only the correct bit" {
-    var reserved = [_]u8{0} ** 8;
+    var reserved = @as([8]u8, @splat(0));
     setExtensionBit(&reserved);
     try std.testing.expectEqual(@as(u8, 0x10), reserved[5]);
 

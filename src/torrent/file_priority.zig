@@ -62,7 +62,7 @@ test "all files wanted produces full mask" {
     };
     const hashes = "aaaaaaaaaaaaaaaaaaaabbbbbbbbbbbbbbbbbbbb";
     const source = metainfo.Metainfo{
-        .info_hash = [_]u8{0} ** 20,
+        .info_hash = @as([20]u8, @splat(0)),
         .announce = null,
         .created_by = null,
         .comment = null,
@@ -98,7 +98,7 @@ test "skip second file still downloads boundary piece" {
     };
     const hashes = "aaaaaaaaaaaaaaaaaaaabbbbbbbbbbbbbbbbbbbbcccccccccccccccccccc";
     const source = metainfo.Metainfo{
-        .info_hash = [_]u8{0} ** 20,
+        .info_hash = @as([20]u8, @splat(0)),
         .announce = null,
         .created_by = null,
         .comment = null,
@@ -131,7 +131,7 @@ test "skip first file, want second file downloads boundary" {
     };
     const hashes = "aaaaaaaaaaaaaaaaaaaabbbbbbbbbbbbbbbbbbbbcccccccccccccccccccc";
     const source = metainfo.Metainfo{
-        .info_hash = [_]u8{0} ** 20,
+        .info_hash = @as([20]u8, @splat(0)),
         .announce = null,
         .created_by = null,
         .comment = null,

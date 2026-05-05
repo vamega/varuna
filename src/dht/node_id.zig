@@ -182,7 +182,7 @@ test "xorDistance with self is zero" {
     var rng = Random.simRandom(0xdead);
     const a = generateRandom(&rng);
     const d = xorDistance(a, a);
-    try std.testing.expectEqual(d, [_]u8{0} ** 20);
+    try std.testing.expectEqual(d, @as([20]u8, @splat(0)));
 }
 
 test "distanceBucket returns null for same ID" {
@@ -200,8 +200,8 @@ test "generateRandom is byte-deterministic under SimRandom" {
 }
 
 test "distanceBucket returns correct bucket" {
-    var a: NodeId = [_]u8{0} ** 20;
-    var b: NodeId = [_]u8{0} ** 20;
+    var a: NodeId = @as([20]u8, @splat(0));
+    var b: NodeId = @as([20]u8, @splat(0));
 
     // Set highest bit in b: byte 0, bit 7 -> bucket 159
     b[0] = 0x80;
@@ -218,20 +218,20 @@ test "distanceBucket returns correct bucket" {
     try std.testing.expectEqual(@as(u8, 76), distanceBucket(a, b).?);
 
     // Reset a for clarity
-    a = [_]u8{0} ** 20;
-    b = [_]u8{0} ** 20;
+    a = @as([20]u8, @splat(0));
+    b = @as([20]u8, @splat(0));
     b[19] = 0x02; // bit 1 -> bucket 1
     try std.testing.expectEqual(@as(u8, 1), distanceBucket(a, b).?);
 }
 
 test "isCloser picks the closer node" {
-    var target: NodeId = [_]u8{0} ** 20;
+    var target: NodeId = @as([20]u8, @splat(0));
     target[19] = 0x10; // target has bit 4 set
 
-    var a: NodeId = [_]u8{0} ** 20;
+    var a: NodeId = @as([20]u8, @splat(0));
     a[19] = 0x11; // distance to target = 0x01
 
-    var b: NodeId = [_]u8{0} ** 20;
+    var b: NodeId = @as([20]u8, @splat(0));
     b[19] = 0x00; // distance to target = 0x10
 
     try std.testing.expect(isCloser(target, a, b)); // a is closer

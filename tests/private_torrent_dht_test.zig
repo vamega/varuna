@@ -73,7 +73,7 @@ fn destroySession(allocator: std.mem.Allocator, session: *TorrentSession) void {
 /// Spin up a heap-allocated `DhtEngine` with a deterministic node ID
 /// so test seed snapshots are stable. Caller frees with `destroyEngine`.
 fn createEngine(allocator: std.mem.Allocator) !*DhtEngine {
-    const node_id: NodeId = [_]u8{0xAB} ** 20;
+    const node_id: NodeId = @as([20]u8, @splat(0xAB));
     return try DhtEngine.create(allocator, &test_random, node_id);
 }
 
@@ -249,7 +249,7 @@ test "private hybrid (v2) torrent's truncated v2 hash also gated" {
     defer destroySession(allocator, sess);
 
     // Force a fake v2 info-hash so we cover the v2-truncation path.
-    sess.info_hash_v2 = [_]u8{0x55} ** 32;
+    sess.info_hash_v2 = @as([32]u8, @splat(0x55));
 
     const engine = try createEngine(allocator);
     defer destroyEngine(allocator, engine);
@@ -273,7 +273,7 @@ test "public hybrid (v2) torrent registers BOTH v1 and v2 hashes" {
     // Inject a deterministic v2 hash so we can verify the truncation
     // travels into the engine. Pure v1 returns a single registration;
     // hybrid registers two.
-    sess.info_hash_v2 = [_]u8{0x77} ** 32;
+    sess.info_hash_v2 = @as([32]u8, @splat(0x77));
 
     const engine = try createEngine(allocator);
     defer destroyEngine(allocator, engine);

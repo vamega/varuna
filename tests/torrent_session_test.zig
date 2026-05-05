@@ -59,7 +59,7 @@ test "addPeersToEventLoop honors uTP-only transport for tracker peers" {
         .piece_count = loaded.pieceCount(),
         .added_on = 0,
         .peer_id = "-VR0001-test00000001".*,
-        .tracker_key = [_]u8{0} ** 8,
+        .tracker_key = @as([8]u8, @splat(0)),
         .session = loaded,
         .piece_tracker = piece_tracker,
         .shared_fds = empty_fds[0..],

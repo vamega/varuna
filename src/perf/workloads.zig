@@ -1168,8 +1168,8 @@ fn runTrackerHttpReusePotential(
 fn makeTrackerAnnounceRequest(allocator: std.mem.Allocator, port: u16) !tracker_announce.Request {
     return .{
         .announce_url = try std.fmt.allocPrint(allocator, "http://127.0.0.1:{}/announce?info_hash=abc", .{port}),
-        .info_hash = [_]u8{1} ** 20,
-        .peer_id = [_]u8{2} ** 20,
+        .info_hash = @as([20]u8, @splat(1)),
+        .peer_id = @as([20]u8, @splat(2)),
         .port = 6881,
         .left = 0,
         .event = null,
@@ -1757,8 +1757,8 @@ fn runTickSparseTorrents(
     var active_torrents: usize = 0;
 
     for (0..torrent_count) |idx| {
-        var info_hash = [_]u8{0} ** 20;
-        var peer_id = [_]u8{0} ** 20;
+        var info_hash = @as([20]u8, @splat(0));
+        var peer_id = @as([20]u8, @splat(0));
         std.mem.writeInt(u32, info_hash[0..4], @intCast(idx), .big);
         std.mem.writeInt(u32, peer_id[0..4], seed, .big);
         seed +%= 1;

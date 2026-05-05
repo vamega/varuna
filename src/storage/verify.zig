@@ -27,14 +27,14 @@ pub const PiecePlan = struct {
     piece_index: u32,
     piece_length: u32,
     expected_hash: [20]u8,
-    expected_hash_v2: [32]u8 = [_]u8{0} ** 32,
+    expected_hash_v2: [32]u8 = @as([32]u8, @splat(0)),
     hash_type: HashType = .sha1,
     spans: []torrent.layout.Layout.Span,
     spans_owned: bool = true,
     /// BEP 52: for multi-piece v2 files, the Merkle root (pieces_root) for the
     /// file this piece belongs to. Used together with piece_in_file and
     /// file_piece_count to verify via Merkle proof.
-    v2_pieces_root: [32]u8 = [_]u8{0} ** 32,
+    v2_pieces_root: [32]u8 = @as([32]u8, @splat(0)),
     /// Index of this piece within its file (0-based).
     v2_piece_in_file: u32 = 0,
     /// Total number of pieces in the file this piece belongs to.
@@ -139,7 +139,7 @@ pub fn planPieceVerificationWithScratch(
         return .{
             .piece_index = piece_spans.piece_index,
             .piece_length = piece_spans.piece_length,
-            .expected_hash = [_]u8{0} ** 20,
+            .expected_hash = @as([20]u8, @splat(0)),
             .expected_hash_v2 = v2_result.pieces_root,
             .hash_type = .sha256,
             .spans = piece_spans.spans,
@@ -561,7 +561,7 @@ test "verify v2 single-piece file uses direct SHA-256 comparison" {
     const plan = PiecePlan{
         .piece_index = 0,
         .piece_length = 4,
-        .expected_hash = [_]u8{0} ** 20,
+        .expected_hash = @as([20]u8, @splat(0)),
         .expected_hash_v2 = expected,
         .hash_type = .sha256,
         .spans = &.{},
@@ -575,11 +575,11 @@ test "verify v2 single-piece file uses direct SHA-256 comparison" {
 }
 
 test "verify v2 multi-piece file requires deferred Merkle verification" {
-    const pieces_root = [_]u8{0xAA} ** 32;
+    const pieces_root = @as([32]u8, @splat(0xAA));
     const plan = PiecePlan{
         .piece_index = 0,
         .piece_length = 4,
-        .expected_hash = [_]u8{0} ** 20,
+        .expected_hash = @as([20]u8, @splat(0)),
         .expected_hash_v2 = pieces_root,
         .hash_type = .sha256,
         .spans = &.{},
@@ -618,7 +618,7 @@ fn buildV2PlanTestTorrent(
 }
 
 test "plan verification for v2 multi-piece file exposes deferred Merkle marker" {
-    const pieces_root = [_]u8{0xA7} ** 32;
+    const pieces_root = @as([32]u8, @splat(0xA7));
     const input = try buildV2PlanTestTorrent(std.testing.allocator, pieces_root, "plan.bin", 8, 4);
     defer std.testing.allocator.free(input);
 

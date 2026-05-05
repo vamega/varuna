@@ -217,7 +217,7 @@ pub const VectoredSendPool = struct {
     };
 
     retained_bytes: usize = 0,
-    classes: [class_capacities.len]RetainedClass = [_]RetainedClass{.{}} ** class_capacities.len,
+    classes: [class_capacities.len]RetainedClass = @as([class_capacities.len]RetainedClass, @splat(.{})),
 
     pub fn acquire(self: *VectoredSendPool, allocator: std.mem.Allocator, batch_len: usize) !*VectoredSendState {
         const selection = selectClass(batch_len);

@@ -108,18 +108,18 @@ pub fn HttpExecutorOf(comptime IO: type) type {
             url_len: u16 = 0,
             host: [max_host_len]u8 = undefined,
             host_len: u8 = 0,
-            method: [max_method_len]u8 = [_]u8{0} ** max_method_len,
+            method: [max_method_len]u8 = @as([max_method_len]u8, @splat(0)),
             method_len: u8 = 0,
             body: []const u8 = "",
-            content_type: [max_content_type_len]u8 = [_]u8{0} ** max_content_type_len,
+            content_type: [max_content_type_len]u8 = @as([max_content_type_len]u8, @splat(0)),
             content_type_len: u8 = 0,
-            cookie: [max_cookie_len]u8 = [_]u8{0} ** max_cookie_len,
+            cookie: [max_cookie_len]u8 = @as([max_cookie_len]u8, @splat(0)),
             cookie_len: u16 = 0,
 
             /// Extra HTTP headers to include in the request.
             /// Each entry is a pre-formatted header line WITHOUT trailing \r\n.
             /// Unused entries must be zero-length.
-            extra_headers: [max_extra_headers]ExtraHeader = [_]ExtraHeader{.{}} ** max_extra_headers,
+            extra_headers: [max_extra_headers]ExtraHeader = @as([max_extra_headers]ExtraHeader, @splat(.{})),
 
             /// When set, response body bytes are written directly into this
             /// buffer instead of being accumulated in recv_buf. Critical for
@@ -281,7 +281,7 @@ pub fn HttpExecutorOf(comptime IO: type) type {
             const max_pooled = 16;
             const max_age_s: i64 = 60;
 
-            entries: [max_pooled]Entry = [_]Entry{.{}} ** max_pooled,
+            entries: [max_pooled]Entry = @as([max_pooled]Entry, @splat(.{})),
 
             const Entry = struct {
                 host: [253]u8 = undefined,

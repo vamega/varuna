@@ -85,7 +85,7 @@ pub const PexState = struct {
 /// Compact peer representation for hashmap keys.
 /// Supports both IPv4 (6 bytes) and IPv6 (18 bytes).
 pub const CompactPeer = struct {
-    data: [18]u8 = [_]u8{0} ** 18,
+    data: [18]u8 = @as([18]u8, @splat(0)),
     len: u8 = 0,
 
     pub fn fromAddress(addr: std.net.Address) CompactPeer {
