@@ -67,6 +67,40 @@ inline fn realState(c: *Completion) *RealState {
 /// (`@intFromPtr(null)` is 0 which would also collide with anything else.)
 const link_timeout_sentinel: u64 = std.math.maxInt(u64);
 
+const ready_capacity = 64;
+const splice_pipe_offset = std.math.maxInt(u64);
+const splice_f_nonblock: u32 = 0x02;
+const pipe_op: linux.IORING_OP = @enumFromInt(62);
+const copy_pipe_flags: u32 = @bitCast(posix.O{ .CLOEXEC = true, .NONBLOCK = true });
+
+const ReadyEntry = struct {
+    completion: *Completion,
+    result: Result,
+};
+
+const RealCopyFileSessionState = struct {
+    state: enum(u8) {
+        closed,
+        opening,
+        open,
+        copying_to_pipe,
+        copying_to_dst,
+        closing,
+    } = .closed,
+    pipe_fds: [2]posix.fd_t = .{ -1, -1 },
+    pipe_result: [2]i32 = .{ -1, -1 },
+    buffered: usize = 0,
+    drained: usize = 0,
+    close_remaining: u8 = 0,
+    close_error: ?anyerror = null,
+    poisoned: bool = false,
+};
+
+comptime {
+    assert(@sizeOf(RealCopyFileSessionState) <= ifc.copy_file_session_state_size);
+    assert(@alignOf(RealCopyFileSessionState) <= ifc.copy_file_session_state_align);
+}
+
 // ── Configuration ─────────────────────────────────────────
 
 pub const Config = struct {
@@ -86,6 +120,9 @@ pub const RealIO = struct {
     /// kernels that compiled in newer ops without bumping their
     /// reported version.
     feature_support: ring_mod.FeatureSupport,
+    ready: [ready_capacity]ReadyEntry = undefined,
+    ready_head: u8 = 0,
+    ready_len: u8 = 0,
 
     pub fn init(config: Config) !RealIO {
         // Fall back to plain init if the kernel doesn't accept the requested
@@ -93,8 +130,13 @@ pub const RealIO = struct {
         // the policy in `ring.zig:initIoUring`.
         var ring = linux.IoUring.init(config.entries, config.flags) catch
             try linux.IoUring.init(config.entries, 0);
+        errdefer ring.deinit();
         const features = ring_mod.probeFeatures(&ring);
-        return .{ .ring = ring, .feature_support = features };
+
+        return .{
+            .ring = ring,
+            .feature_support = features,
+        };
     }
 
     pub fn deinit(self: *RealIO) void {
@@ -117,6 +159,8 @@ pub const RealIO = struct {
     /// `wait_at_least` blocks for at least that many completions before
     /// returning (use 0 for non-blocking, 1 for "advance the loop").
     pub fn tick(self: *RealIO, wait_at_least: u32) !void {
+        if (try self.drainReady(wait_at_least)) return;
+
         _ = try self.ring.submit_and_wait(wait_at_least);
 
         var cqes: [32]linux.io_uring_cqe = undefined;
@@ -128,6 +172,7 @@ pub const RealIO = struct {
             }
             if (count < cqes.len) break;
         }
+        _ = try self.drainReady(0);
     }
 
     fn dispatchCqe(self: *RealIO, cqe: linux.io_uring_cqe) !void {
@@ -136,6 +181,13 @@ pub const RealIO = struct {
 
         const c: *Completion = @ptrFromInt(cqe.user_data);
         const callback = c.callback orelse return;
+
+        switch (c.op) {
+            .open_copy_file_session => return self.dispatchOpenCopyFileSession(c, cqe),
+            .copy_file_chunk => return self.dispatchCopyFileChunk(c, cqe),
+            .close_copy_file_session => return self.dispatchCloseCopyFileSession(c, cqe),
+            else => {},
+        }
 
         // For multishot operations, the CQE may carry IORING_CQE_F_MORE,
         // meaning the kernel will deliver more CQEs against the same SQE.
@@ -165,6 +217,43 @@ pub const RealIO = struct {
         }
     }
 
+    fn drainReady(self: *RealIO, wait_at_least: u32) !bool {
+        var fired: u32 = 0;
+        while (self.popReady()) |entry| {
+            fired += 1;
+            try self.dispatchReadyEntry(entry);
+            if (wait_at_least != 0 and fired >= wait_at_least) return true;
+        }
+        return fired > 0 and wait_at_least != 0;
+    }
+
+    fn queueReady(self: *RealIO, c: *Completion, result: Result) !void {
+        if (self.ready_len >= ready_capacity) return error.PendingQueueFull;
+        const idx = (@as(usize, self.ready_head) + @as(usize, self.ready_len)) % ready_capacity;
+        self.ready[idx] = .{ .completion = c, .result = result };
+        self.ready_len += 1;
+    }
+
+    fn popReady(self: *RealIO) ?ReadyEntry {
+        if (self.ready_len == 0) return null;
+        const entry = self.ready[@as(usize, self.ready_head)];
+        self.ready_head = @intCast((@as(usize, self.ready_head) + 1) % ready_capacity);
+        self.ready_len -= 1;
+        if (self.ready_len == 0) self.ready_head = 0;
+        return entry;
+    }
+
+    fn dispatchReadyEntry(self: *RealIO, entry: ReadyEntry) !void {
+        const c = entry.completion;
+        realState(c).in_flight = false;
+        const cb = c.callback orelse return;
+        const action = cb(c.userdata, c, entry.result);
+        switch (action) {
+            .disarm => {},
+            .rearm => try self.resubmit(c),
+        }
+    }
+
     fn resubmit(self: *RealIO, c: *Completion) !void {
         const userdata = c.userdata;
         const callback = c.callback orelse return;
@@ -186,8 +275,11 @@ pub const RealIO = struct {
             .unlinkat => |op| try self.unlinkat(op, c, userdata, callback),
             .statx => |op| try self.statx(op, c, userdata, callback),
             .getdents => |op| try self.getdents(op, c, userdata, callback),
-            .splice => |op| try self.splice(op, c, userdata, callback),
-            .copy_file_range => |op| try self.copy_file_range(op, c, userdata, callback),
+            .open_copy_file_session => |op| try self.open_copy_file_session(op, c, userdata, callback),
+            .copy_file_chunk => |op| try self.copy_file_chunk(op, c, userdata, callback),
+            .close_copy_file_session => |op| try self.close_copy_file_session(op, c, userdata, callback),
+            .fchown => |op| try self.fchown(op, c, userdata, callback),
+            .fchmod => |op| try self.fchmod(op, c, userdata, callback),
             .socket => |op| try self.socket(op, c, userdata, callback),
             .connect => |op| try self.connect(op, c, userdata, callback),
             .accept => |op| try self.accept(op, c, userdata, callback),
@@ -533,54 +625,198 @@ pub const RealIO = struct {
         }
     }
 
-    /// `IORING_OP_SPLICE` — kernel ≥5.7. Varuna's floor is 6.6 ⇒ always
-    /// available on supported kernels. The kernel signals the special
-    /// "fd is a pipe; ignore offset" sentinel via `std.math.maxInt(u64)`
-    /// in the offset field; that contract is what the io_uring helper
-    /// already expects so we pass through unchanged.
-    pub fn splice(self: *RealIO, op: ifc.SpliceOp, c: *Completion, ud: ?*anyopaque, cb: Callback) !void {
-        try self.armCompletion(c, .{ .splice = op }, ud, cb);
-        const sqe = try self.ring.splice(@intFromPtr(c), op.in_fd, op.in_offset, op.out_fd, op.out_offset, op.len);
-        if (op.flags != 0) sqe.rw_flags = @bitCast(op.flags);
+    pub fn open_copy_file_session(self: *RealIO, op: ifc.OpenCopyFileSessionOp, c: *Completion, ud: ?*anyopaque, cb: Callback) !void {
+        try self.armCompletion(c, .{ .open_copy_file_session = op }, ud, cb);
+        const st = op.session.backendStateAs(RealCopyFileSessionState);
+        if (st.state != .closed) return try self.queueReady(c, .{ .open_copy_file_session = error.InvalidState });
+        st.* = .{ .state = .opening };
+
+        if (self.feature_support.supports_pipe) {
+            const sqe = try self.ring.get_sqe();
+            sqe.prep_rw(pipe_op, 0, @intFromPtr(&st.pipe_result), 0, 0);
+            sqe.rw_flags = copy_pipe_flags;
+            sqe.user_data = @intFromPtr(c);
+            return;
+        }
+
+        // IORING_OP_PIPE is 6.16+, above varuna's current kernel floor.
+        // Synchronous pipe creation is a short setup syscall; completion is
+        // still reported through RealIO's ready queue on the next tick so
+        // callbacks never fire inline.
+        const fds = posix.pipe2(.{ .CLOEXEC = true, .NONBLOCK = true }) catch |err| {
+            st.* = .{};
+            return try self.queueReady(c, .{ .open_copy_file_session = err });
+        };
+        st.pipe_fds = fds;
+        st.state = .open;
+        try self.queueReady(c, .{ .open_copy_file_session = {} });
     }
 
-    /// `copy_file_range(2)` — no native io_uring op exists as of kernel
-    /// 6.x. Submitting a thread-pool offload from the EL is overkill
-    /// for the only daemon caller (the async MoveJob), which already
-    /// runs the syscall on its own worker thread. The contract op is
-    /// implemented for completeness with a synchronous-inline fallback;
-    /// callers that submit it from the EL thread accept the resulting
-    /// stall.
-    pub fn copy_file_range(self: *RealIO, op: ifc.CopyFileRangeOp, c: *Completion, ud: ?*anyopaque, cb: Callback) !void {
-        try self.armCompletion(c, .{ .copy_file_range = op }, ud, cb);
-        const result: Result = blk: {
-            var off_in: i64 = @bitCast(op.in_offset);
-            var off_out: i64 = @bitCast(op.out_offset);
-            const rc = linux.copy_file_range(op.in_fd, &off_in, op.out_fd, &off_out, op.len, op.flags);
-            switch (linux.E.init(rc)) {
-                .SUCCESS => break :blk .{ .copy_file_range = @as(usize, @intCast(rc)) },
-                .BADF => break :blk .{ .copy_file_range = error.BadFileDescriptor },
-                .INVAL => break :blk .{ .copy_file_range = error.InvalidArgument },
-                .XDEV, .NOSYS, .OPNOTSUPP => break :blk .{ .copy_file_range = error.OperationNotSupported },
-                .IO => break :blk .{ .copy_file_range = error.InputOutput },
-                .NOSPC => break :blk .{ .copy_file_range = error.NoSpaceLeft },
-                .ISDIR => break :blk .{ .copy_file_range = error.IsDir },
-                .OVERFLOW => break :blk .{ .copy_file_range = error.FileTooBig },
-                else => |e| break :blk .{ .copy_file_range = posix.unexpectedErrno(e) },
-            }
-        };
-        // Mirror the truncate sync-fallback shape — clear in_flight
-        // before invoking the callback so a callback that re-submits a
-        // new op on the same completion doesn't trip AlreadyInFlight.
-        realState(c).in_flight = false;
-        const action = cb(ud, c, result);
-        switch (action) {
-            .disarm => return,
-            // Honor .rearm only for the same op kind (mirrors truncate).
-            .rearm => switch (c.op) {
-                .copy_file_range => |new_op| try self.copy_file_range(new_op, c, ud, cb),
-                else => return,
+    pub fn copy_file_chunk(self: *RealIO, op: ifc.CopyFileChunkOp, c: *Completion, ud: ?*anyopaque, cb: Callback) !void {
+        try self.armCompletion(c, .{ .copy_file_chunk = op }, ud, cb);
+        const st = op.session.backendStateAs(RealCopyFileSessionState);
+        if (st.state != .open or st.poisoned) return try self.queueReady(c, .{ .copy_file_chunk = error.InvalidState });
+        if (op.len == 0) return try self.queueReady(c, .{ .copy_file_chunk = error.InvalidArgument });
+        st.state = .copying_to_pipe;
+        st.buffered = 0;
+        st.drained = 0;
+        try self.submitCopySpliceToPipe(c);
+    }
+
+    pub fn close_copy_file_session(self: *RealIO, op: ifc.CloseCopyFileSessionOp, c: *Completion, ud: ?*anyopaque, cb: Callback) !void {
+        try self.armCompletion(c, .{ .close_copy_file_session = op }, ud, cb);
+        const st = op.session.backendStateAs(RealCopyFileSessionState);
+        if (st.state == .copying_to_pipe or st.state == .copying_to_dst or st.state == .opening) {
+            return try self.queueReady(c, .{ .close_copy_file_session = error.AlreadyInFlight });
+        }
+        st.state = .closing;
+        st.close_remaining = 0;
+        st.close_error = null;
+
+        if (st.pipe_fds[0] >= 0) {
+            const sqe = try self.ring.close(@intFromPtr(c), st.pipe_fds[0]);
+            _ = sqe;
+            st.pipe_fds[0] = -1;
+            st.close_remaining += 1;
+        }
+        if (st.pipe_fds[1] >= 0) {
+            const sqe = try self.ring.close(@intFromPtr(c), st.pipe_fds[1]);
+            _ = sqe;
+            st.pipe_fds[1] = -1;
+            st.close_remaining += 1;
+        }
+        if (st.close_remaining == 0) {
+            st.* = .{};
+            try self.queueReady(c, .{ .close_copy_file_session = {} });
+        }
+    }
+
+    pub fn fchown(self: *RealIO, op: ifc.FchownOp, c: *Completion, ud: ?*anyopaque, cb: Callback) !void {
+        try self.armCompletion(c, .{ .fchown = op }, ud, cb);
+        try self.queueReady(c, .{ .fchown = fchownResult(op.fd, op.uid, op.gid) });
+    }
+
+    pub fn fchmod(self: *RealIO, op: ifc.FchmodOp, c: *Completion, ud: ?*anyopaque, cb: Callback) !void {
+        try self.armCompletion(c, .{ .fchmod = op }, ud, cb);
+        try self.queueReady(c, .{ .fchmod = fchmodResult(op.fd, op.mode) });
+    }
+
+    fn dispatchOpenCopyFileSession(self: *RealIO, c: *Completion, cqe: linux.io_uring_cqe) !void {
+        const op = c.op.open_copy_file_session;
+        const st = op.session.backendStateAs(RealCopyFileSessionState);
+        if (cqe.res < 0) {
+            st.* = .{};
+            return self.completeCopyOperation(c, .{ .open_copy_file_session = errnoToError(cqe.err()) });
+        }
+        st.pipe_fds = .{ st.pipe_result[0], st.pipe_result[1] };
+        st.state = .open;
+        return self.completeCopyOperation(c, .{ .open_copy_file_session = {} });
+    }
+
+    fn dispatchCopyFileChunk(self: *RealIO, c: *Completion, cqe: linux.io_uring_cqe) !void {
+        const op = c.op.copy_file_chunk;
+        const st = op.session.backendStateAs(RealCopyFileSessionState);
+        switch (st.state) {
+            .copying_to_pipe => {
+                const n = countOrError(cqe) catch |err| {
+                    st.state = .open;
+                    return self.completeCopyOperation(c, .{ .copy_file_chunk = err });
+                };
+                if (n == 0) {
+                    st.state = .open;
+                    return self.completeCopyOperation(c, .{ .copy_file_chunk = @as(usize, 0) });
+                }
+                st.buffered = n;
+                st.drained = 0;
+                st.state = .copying_to_dst;
+                self.submitCopySpliceToDestination(c) catch |err| {
+                    st.poisoned = true;
+                    st.state = .open;
+                    return self.completeCopyOperation(c, .{ .copy_file_chunk = err });
+                };
             },
+            .copying_to_dst => {
+                const n = countOrError(cqe) catch |err| {
+                    st.poisoned = true;
+                    st.state = .open;
+                    return self.completeCopyOperation(c, .{ .copy_file_chunk = err });
+                };
+                const remaining = st.buffered - st.drained;
+                if (n == 0 or n > remaining) {
+                    st.poisoned = true;
+                    st.state = .open;
+                    return self.completeCopyOperation(c, .{ .copy_file_chunk = error.WriteShort });
+                }
+                st.drained += n;
+                if (st.drained < st.buffered) {
+                    self.submitCopySpliceToDestination(c) catch |err| {
+                        st.poisoned = true;
+                        st.state = .open;
+                        return self.completeCopyOperation(c, .{ .copy_file_chunk = err });
+                    };
+                    return;
+                }
+                const copied = st.drained;
+                st.buffered = 0;
+                st.drained = 0;
+                st.state = .open;
+                return self.completeCopyOperation(c, .{ .copy_file_chunk = copied });
+            },
+            else => return self.completeCopyOperation(c, .{ .copy_file_chunk = error.InvalidState }),
+        }
+    }
+
+    fn dispatchCloseCopyFileSession(self: *RealIO, c: *Completion, cqe: linux.io_uring_cqe) !void {
+        const op = c.op.close_copy_file_session;
+        const st = op.session.backendStateAs(RealCopyFileSessionState);
+        if (cqe.res < 0 and st.close_error == null) st.close_error = errnoToError(cqe.err());
+        st.close_remaining -|= 1;
+        if (st.close_remaining > 0) return;
+
+        const maybe_err = st.close_error;
+        st.* = .{};
+        if (maybe_err) |err| {
+            return self.completeCopyOperation(c, .{ .close_copy_file_session = err });
+        }
+        return self.completeCopyOperation(c, .{ .close_copy_file_session = {} });
+    }
+
+    fn submitCopySpliceToPipe(self: *RealIO, c: *Completion) !void {
+        const op = c.op.copy_file_chunk;
+        const st = op.session.backendStateAs(RealCopyFileSessionState);
+        const sqe = try self.ring.splice(
+            @intFromPtr(c),
+            op.src_fd,
+            op.src_offset,
+            st.pipe_fds[1],
+            splice_pipe_offset,
+            op.len,
+        );
+        sqe.rw_flags = splice_f_nonblock;
+    }
+
+    fn submitCopySpliceToDestination(self: *RealIO, c: *Completion) !void {
+        const op = c.op.copy_file_chunk;
+        const st = op.session.backendStateAs(RealCopyFileSessionState);
+        const remaining = st.buffered - st.drained;
+        const sqe = try self.ring.splice(
+            @intFromPtr(c),
+            st.pipe_fds[0],
+            splice_pipe_offset,
+            op.dst_fd,
+            op.dst_offset + st.drained,
+            remaining,
+        );
+        sqe.rw_flags = splice_f_nonblock;
+    }
+
+    fn completeCopyOperation(self: *RealIO, c: *Completion, result: Result) !void {
+        realState(c).in_flight = false;
+        const cb = c.callback orelse return;
+        const action = cb(c.userdata, c, result);
+        switch (action) {
+            .disarm => {},
+            .rearm => try self.resubmit(c),
         }
     }
 
@@ -846,11 +1082,11 @@ fn buildResult(op: Operation, cqe: linux.io_uring_cqe) Result {
         // getdents completes synchronously inside `RealIO.getdents` because
         // Zig 0.15.2 exposes no io_uring getdents helper/op.
         .getdents => .{ .getdents = countOrError(cqe) },
-        .splice => .{ .splice = countOrError(cqe) },
-        // copy_file_range completes synchronously inside `RealIO.copy_file_range`
-        // and never reaches `dispatchCqe`; keep a shaped variant for
-        // exhaustiveness so the union switch stays total.
-        .copy_file_range => .{ .copy_file_range = countOrError(cqe) },
+        .open_copy_file_session => .{ .open_copy_file_session = voidOrError(cqe) },
+        .copy_file_chunk => .{ .copy_file_chunk = countOrError(cqe) },
+        .close_copy_file_session => .{ .close_copy_file_session = voidOrError(cqe) },
+        .fchown => .{ .fchown = voidOrError(cqe) },
+        .fchmod => .{ .fchmod = voidOrError(cqe) },
         .socket => .{ .socket = fdOrError(cqe) },
         .connect => .{ .connect = voidOrError(cqe) },
         .accept => .{ .accept = acceptResult(cqe) },
@@ -919,6 +1155,22 @@ fn cancelResult(cqe: linux.io_uring_cqe) anyerror!void {
 
 fn closeFdResult(fd: posix.fd_t) anyerror!void {
     const rc = linux.close(fd);
+    return switch (linux.E.init(rc)) {
+        .SUCCESS => {},
+        else => |e| errnoToError(e),
+    };
+}
+
+fn fchownResult(fd: posix.fd_t, uid: u32, gid: u32) anyerror!void {
+    const rc = linux.fchown(fd, uid, gid);
+    return switch (linux.E.init(rc)) {
+        .SUCCESS => {},
+        else => |e| errnoToError(e),
+    };
+}
+
+fn fchmodResult(fd: posix.fd_t, mode: posix.mode_t) anyerror!void {
+    const rc = linux.fchmod(fd, mode);
     return switch (linux.E.init(rc)) {
         .SUCCESS => {},
         else => |e| errnoToError(e),
@@ -1443,7 +1695,7 @@ test "RealIO setsockopt SO_REUSEADDR via the runtime-detected path" {
     }
 }
 
-test "bindBlocking helper round-trips on RealIO" {
+test "RealIO bind/listen ops round-trip through caller-owned wait" {
     var io = try skipIfUnavailable();
     defer io.deinit();
 
@@ -1451,8 +1703,25 @@ test "bindBlocking helper round-trips on RealIO" {
     defer posix.close(fd);
     const addr = try std.net.Address.parseIp4("127.0.0.1", 0);
 
-    try ifc.bindBlocking(&io, .{ .fd = fd, .addr = addr });
-    try ifc.listenBlocking(&io, .{ .fd = fd, .backlog = 8 });
+    var bind_c = Completion{};
+    var bind_ctx = TestCtx{};
+    try io.bind(.{ .fd = fd, .addr = addr }, &bind_c, &bind_ctx, testCallback);
+    if (bind_ctx.calls == 0) try io.tick(1);
+    try testing.expectEqual(@as(u32, 1), bind_ctx.calls);
+    switch (bind_ctx.last_result.?) {
+        .bind => |r| try r,
+        else => try testing.expect(false),
+    }
+
+    var listen_c = Completion{};
+    var listen_ctx = TestCtx{};
+    try io.listen(.{ .fd = fd, .backlog = 8 }, &listen_c, &listen_ctx, testCallback);
+    if (listen_ctx.calls == 0) try io.tick(1);
+    try testing.expectEqual(@as(u32, 1), listen_ctx.calls);
+    switch (listen_ctx.last_result.?) {
+        .listen => |r| try r,
+        else => try testing.expect(false),
+    }
 
     // Confirm the socket is in LISTEN by trying to connect from a
     // sibling client socket.

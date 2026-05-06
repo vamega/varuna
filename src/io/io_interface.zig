@@ -86,8 +86,11 @@ pub const Operation = union(enum) {
     unlinkat: UnlinkAtOp,
     statx: StatxOp,
     getdents: GetdentsOp,
-    splice: SpliceOp,
-    copy_file_range: CopyFileRangeOp,
+    open_copy_file_session: OpenCopyFileSessionOp,
+    copy_file_chunk: CopyFileChunkOp,
+    close_copy_file_session: CloseCopyFileSessionOp,
+    fchown: FchownOp,
+    fchmod: FchmodOp,
 
     // Connection lifecycle.
     socket: SocketOp,
@@ -246,45 +249,62 @@ pub const GetdentsOp = struct {
     buf: []align(@alignOf(linux.dirent64)) u8,
 };
 
-/// `splice(2)` — zero-copy move of up to `len` bytes between two fds.
-/// At least one of `in_fd` / `out_fd` must be a pipe. Used for the
-/// async file-move state machine (file → pipe → file copy).
+pub const copy_file_session_state_size: usize = 128;
+pub const copy_file_session_state_align: usize = @alignOf(*usize);
+
+/// Opaque caller-owned state for backend-specific file-copy resources.
 ///
-/// `RealIO` submits this as `IORING_OP_SPLICE` (kernel ≥5.7; varuna's
-/// floor is 6.6). Posix backends route it through the worker thread
-/// pool — the worker calls `splice(2)` directly.
-///
-/// Offset semantics mirror `splice(2)`:
-///   * If the corresponding fd is a pipe, the offset must be
-///     `std.math.maxInt(u64)` (the kernel ignores it).
-///   * Otherwise, the offset selects the byte to start from; the file's
-///     offset is NOT advanced (this matches the io_uring helper's
-///     `pwrite`-style semantics).
-pub const SpliceOp = struct {
-    in_fd: posix.fd_t,
-    in_offset: u64,
-    out_fd: posix.fd_t,
-    out_offset: u64,
-    len: usize,
-    flags: u32 = 0,
+/// Callers own lifetime and sequencing through
+/// `open_copy_file_session` / `copy_file_chunk` /
+/// `close_copy_file_session`; backends own the contents. RealIO stores
+/// pipe fds and splice state here, while backends that copy on a file
+/// worker may store only a small open/closed state. At most one
+/// operation may be in flight for a session at a time.
+pub const CopyFileSession = struct {
+    _backend_state: [copy_file_session_state_size]u8 align(copy_file_session_state_align) = @as([copy_file_session_state_size]u8, @splat(0)),
+
+    pub fn backendStateAs(self: *CopyFileSession, comptime State: type) *State {
+        comptime {
+            std.debug.assert(@sizeOf(State) <= copy_file_session_state_size);
+            std.debug.assert(@alignOf(State) <= copy_file_session_state_align);
+        }
+        return @ptrCast(@alignCast(&self._backend_state));
+    }
 };
 
-/// `copy_file_range(2)` — kernel-side copy between two regular files.
-/// Same-fs copies on btrfs/xfs/etc. may use a reflink and complete in
-/// constant time; cross-fs copies (Linux ≥5.3) fall back to an
-/// in-kernel loop that avoids the userspace round-trip.
+pub const OpenCopyFileSessionOp = struct {
+    session: *CopyFileSession,
+};
+
+/// Backend-appropriate file-to-file copy of at most `len` bytes.
 ///
-/// **No native io_uring op exists** as of kernel 6.x — every backend
-/// routes this through a worker thread (RealIO, Posix backends) or
-/// runs it inline on macOS/BSD where the syscall isn't available
-/// (those backends synthesise it via `read`+`write`).
-pub const CopyFileRangeOp = struct {
-    in_fd: posix.fd_t,
-    in_offset: u64,
-    out_fd: posix.fd_t,
-    out_offset: u64,
+/// This is deliberately semantic rather than syscall-shaped. The source
+/// and destination must be regular-file fds, offsets are explicit, and
+/// `len` must be nonzero. A successful result is the number of bytes
+/// copied into the destination; `0` means source EOF. Backends must not
+/// block the event-loop thread while moving file contents.
+pub const CopyFileChunkOp = struct {
+    session: *CopyFileSession,
+    src_fd: posix.fd_t,
+    src_offset: u64,
+    dst_fd: posix.fd_t,
+    dst_offset: u64,
     len: usize,
-    flags: u32 = 0,
+};
+
+pub const CloseCopyFileSessionOp = struct {
+    session: *CopyFileSession,
+};
+
+pub const FchownOp = struct {
+    fd: posix.fd_t,
+    uid: u32,
+    gid: u32,
+};
+
+pub const FchmodOp = struct {
+    fd: posix.fd_t,
+    mode: posix.mode_t,
 };
 
 pub const SocketOp = struct {
@@ -384,10 +404,12 @@ pub const Result = union(enum) {
     unlinkat: anyerror!void,
     statx: anyerror!void,
     getdents: anyerror!usize,
-    /// Bytes spliced. `0` means EOF on the input side (mirrors `splice(2)`).
-    splice: anyerror!usize,
-    /// Bytes copied. `0` means EOF on the input side (mirrors `copy_file_range(2)`).
-    copy_file_range: anyerror!usize,
+    open_copy_file_session: anyerror!void,
+    /// Bytes copied into the destination. `0` means EOF on the source side.
+    copy_file_chunk: anyerror!usize,
+    close_copy_file_session: anyerror!void,
+    fchown: anyerror!void,
+    fchmod: anyerror!void,
     socket: anyerror!posix.fd_t,
     connect: anyerror!void,
     accept: anyerror!Accepted,
@@ -601,6 +623,11 @@ comptime {
 //   pub fn unlinkat (self: *@This(), op: UnlinkAtOp, c: *Completion, ud: ?*anyopaque, cb: Callback) !void;
 //   pub fn statx    (self: *@This(), op: StatxOp,    c: *Completion, ud: ?*anyopaque, cb: Callback) !void;
 //   pub fn getdents (self: *@This(), op: GetdentsOp, c: *Completion, ud: ?*anyopaque, cb: Callback) !void;
+//   pub fn open_copy_file_session (self: *@This(), op: OpenCopyFileSessionOp, c: *Completion, ud: ?*anyopaque, cb: Callback) !void;
+//   pub fn copy_file_chunk        (self: *@This(), op: CopyFileChunkOp,        c: *Completion, ud: ?*anyopaque, cb: Callback) !void;
+//   pub fn close_copy_file_session(self: *@This(), op: CloseCopyFileSessionOp, c: *Completion, ud: ?*anyopaque, cb: Callback) !void;
+//   pub fn fchown   (self: *@This(), op: FchownOp,   c: *Completion, ud: ?*anyopaque, cb: Callback) !void;
+//   pub fn fchmod   (self: *@This(), op: FchmodOp,   c: *Completion, ud: ?*anyopaque, cb: Callback) !void;
 //   pub fn socket   (self: *@This(), op: SocketOp,   c: *Completion, ud: ?*anyopaque, cb: Callback) !void;
 //   pub fn connect  (self: *@This(), op: ConnectOp,  c: *Completion, ud: ?*anyopaque, cb: Callback) !void;
 //   pub fn accept   (self: *@This(), op: AcceptOp,   c: *Completion, ud: ?*anyopaque, cb: Callback) !void;
@@ -616,82 +643,21 @@ comptime {
 //
 //   pub fn cancel(self: *@This(), op: CancelOp, c: *Completion, ud: ?*anyopaque, cb: Callback) !void;
 
-// ── Blocking-wait helpers for one-shot startup paths ─────
-//
-// Listener bring-up (peer / uTP / RPC server) is intentionally
-// synchronous-shaped at the call site: one socket setup, then `bind`,
-// then `listen`, then a `submitAccept`. The `bind` / `listen` /
-// `setsockopt` ops in this contract are async-shaped (callback-driven)
-// to give RealIO a clean home for the new io_uring ops, but the
-// callsites don't need to be restructured to be callback-driven —
-// these are one-shot startup ops, not state-machine transitions.
-//
-// Both helpers below submit the contract op and then drive `io.tick`
-// until the completion fires, returning the kernel result. On RealIO
-// with kernel ≥6.11 (bind/listen) or ≥6.7 (setsockopt) this routes
-// through io_uring; on older kernels the contract method's sync
-// fallback fires the callback inline and `tick` is a no-op. All other
-// backends fire inline.
-//
-// Use these only for one-shot startup paths — they spin in `tick(1)`
-// which is fine at startup but the wrong primitive for hot paths.
-
-const BlockingCtx = struct {
-    done: bool = false,
-    err: ?anyerror = null,
-};
-
-fn blockingCallback(
-    userdata: ?*anyopaque,
-    _: *Completion,
-    result: Result,
-) CallbackAction {
-    const ctx: *BlockingCtx = @ptrCast(@alignCast(userdata.?));
-    ctx.done = true;
-    ctx.err = switch (result) {
-        .bind => |r| if (r) |_| null else |e| e,
-        .listen => |r| if (r) |_| null else |e| e,
-        .setsockopt => |r| if (r) |_| null else |e| e,
-        else => error.UnexpectedResult,
-    };
-    return .disarm;
-}
-
-/// Submit `bind` and block (via `io.tick(1)`) until the completion
-/// fires. Use this only at one-shot listener bring-up — the spin in
-/// `tick(1)` is appropriate for startup but not for steady state.
-pub fn bindBlocking(io: anytype, op: BindOp) !void {
-    var ctx = BlockingCtx{};
-    var c = Completion{};
-    try io.bind(op, &c, &ctx, blockingCallback);
-    while (!ctx.done) try io.tick(1);
-    if (ctx.err) |e| return e;
-}
-
-/// See `bindBlocking`.
-pub fn listenBlocking(io: anytype, op: ListenOp) !void {
-    var ctx = BlockingCtx{};
-    var c = Completion{};
-    try io.listen(op, &c, &ctx, blockingCallback);
-    while (!ctx.done) try io.tick(1);
-    if (ctx.err) |e| return e;
-}
-
-/// See `bindBlocking`.
-pub fn setsockoptBlocking(io: anytype, op: SetsockoptOp) !void {
-    var ctx = BlockingCtx{};
-    var c = Completion{};
-    try io.setsockopt(op, &c, &ctx, blockingCallback);
-    while (!ctx.done) try io.tick(1);
-    if (ctx.err) |e| return e;
-}
-
 // ── Tests ─────────────────────────────────────────────────
 
 test "Completion size and alignment are reasonable" {
     // Sanity check: a completion is small enough to embed liberally.
     try std.testing.expect(@sizeOf(Completion) <= 256);
     try std.testing.expect(@alignOf(Completion) >= @alignOf(*usize));
+}
+
+test "io_interface exposes only async startup operations" {
+    const Self = @This();
+    try std.testing.expect(!@hasDecl(Self, "socketBlocking"));
+    try std.testing.expect(!@hasDecl(Self, "bindBlocking"));
+    try std.testing.expect(!@hasDecl(Self, "listenBlocking"));
+    try std.testing.expect(!@hasDecl(Self, "setsockoptBlocking"));
+    try std.testing.expect(!@hasDecl(Self, "bindDeviceBlocking"));
 }
 
 test "Completion.arm fills the public fields" {

@@ -124,13 +124,15 @@ State machine: `created → running → {succeeded, failed, canceled}`.
 Every job is in exactly one state at a time; once a terminal state is
 reached the bookkeeping persists until the operator calls `DELETE`.
 
-Same-fs detection uses `fstatat(2)` on src and dst to compare device
-ids (`dev_t`); when they match the worker thread issues a single
-`rename(2)` for constant-time relocation. Cross-fs falls through to a
-recursive walk that copies each file via `copy_file_range(2)` (in-kernel
-on Linux ≥5.3 ⇒ always available on varuna's 6.6 floor; emulated via
-`pread`/`pwrite` on platforms without the syscall) with a 32 MiB chunk
-cap to keep cancellation responsive.
+The MoveJob state machine first tries `renameat(2)` for each manifest
+file, giving same-filesystem moves the constant-time namespace path.
+Cross-filesystem `EXDEV` falls through to an event-loop copy path that
+opens the source/destination and copies via file -> pipe -> file
+`splice(2)` chunks, followed by destination fsync, source unlink, and
+parent-directory fsync. `copy_file_range(2)` is intentionally not used
+on the io_uring backend today because Linux exposes no native io_uring
+opcode for it; a backend-owned threadpool version is only a future
+profiling-driven option.
 
 ## Remaining Placeholder Values
 

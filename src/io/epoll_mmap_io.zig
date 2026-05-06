@@ -60,6 +60,10 @@ const Operation = ifc.Operation;
 const Result = ifc.Result;
 const Callback = ifc.Callback;
 const CallbackAction = ifc.CallbackAction;
+const posix_file_pool = @import("posix_file_pool.zig");
+const PosixFilePool = posix_file_pool.PosixFilePool;
+const FileOp = posix_file_pool.FileOp;
+const PoolCompleted = posix_file_pool.Completed;
 
 // ── Backend state ─────────────────────────────────────────
 //
@@ -73,6 +77,12 @@ const FdInterest = enum(u8) {
     read,
     write,
     poll,
+};
+
+const PosixCopyFileSessionState = struct {
+    open: bool = false,
+    copy_in_flight: bool = false,
+    poisoned: bool = false,
 };
 
 pub const EpollState = struct {
@@ -99,6 +109,11 @@ inline fn epollState(c: *Completion) *EpollState {
 pub const Config = struct {
     /// Initial capacity for the timer heap. Mirrors EpollPosixIO.Config.
     max_completions: u32 = 1024,
+    /// Worker pool used by semantic file-copy and metadata ops. The mmap
+    /// strategy keeps normal read/write on mappings, but copy sessions and
+    /// fchown/fchmod must not run blocking syscalls on the event-loop thread.
+    file_pool_workers: u32 = 4,
+    file_pool_pending_capacity: u32 = 256,
 };
 
 // ── Mmap bookkeeping ──────────────────────────────────────
@@ -228,6 +243,7 @@ const TimerHeap = struct {
 pub const EpollMmapIO = struct {
     allocator: std.mem.Allocator,
     epoll_fd: posix.fd_t,
+    wakeup_ctx: *posix.fd_t,
     /// Cross-thread wakeup primitive (mirrors EpollPosixIO).
     wakeup_fd: posix.fd_t,
     /// Active in-flight count (for `tick(wait_at_least)` semantics).
@@ -238,6 +254,8 @@ pub const EpollMmapIO = struct {
     file_mappings: std.AutoHashMap(posix.fd_t, MmapEntry),
     mmap_completed: std.ArrayListUnmanaged(MmapCompleted) = .{},
     mmap_completed_swap: std.ArrayListUnmanaged(MmapCompleted) = .{},
+    pool: *PosixFilePool,
+    pool_swap: std.ArrayListUnmanaged(PoolCompleted) = .{},
     fd_registrations: std.AutoHashMap(posix.fd_t, FdRegistration),
     /// Completion currently being dispatched on the write lane. If its
     /// callback submits the same completion again (partial send), queue it
@@ -269,6 +287,10 @@ pub const EpollMmapIO = struct {
         const wakeup_fd: posix.fd_t = @intCast(efd_rc);
         errdefer posix.close(wakeup_fd);
 
+        const wakeup_ctx = try allocator.create(posix.fd_t);
+        errdefer allocator.destroy(wakeup_ctx);
+        wakeup_ctx.* = wakeup_fd;
+
         var ev: linux.epoll_event = .{
             .events = linux.EPOLL.IN,
             .data = .{ .fd = wakeup_fd },
@@ -279,17 +301,28 @@ pub const EpollMmapIO = struct {
             else => |e| return posix.unexpectedErrno(e),
         }
 
+        const pool = try PosixFilePool.create(allocator, .{
+            .worker_count = config.file_pool_workers,
+            .pending_capacity = config.file_pool_pending_capacity,
+        });
+        errdefer pool.deinit();
+        pool.setWakeup(wakeup_ctx, wakeFromPool);
+
         return .{
             .allocator = allocator,
             .epoll_fd = epoll_fd,
+            .wakeup_ctx = wakeup_ctx,
             .wakeup_fd = wakeup_fd,
             .timers = try TimerHeap.init(allocator, config.max_completions),
             .file_mappings = std.AutoHashMap(posix.fd_t, MmapEntry).init(allocator),
+            .pool = pool,
             .fd_registrations = std.AutoHashMap(posix.fd_t, FdRegistration).init(allocator),
         };
     }
 
     pub fn deinit(self: *EpollMmapIO) void {
+        self.pool.deinit();
+        self.pool_swap.deinit(self.allocator);
         // Tear down any remaining mappings before freeing the map itself.
         var it = self.file_mappings.valueIterator();
         while (it.next()) |entry| {
@@ -300,9 +333,16 @@ pub const EpollMmapIO = struct {
         self.mmap_completed_swap.deinit(self.allocator);
         self.fd_registrations.deinit();
         self.timers.deinit();
+        self.allocator.destroy(self.wakeup_ctx);
         posix.close(self.wakeup_fd);
         posix.close(self.epoll_fd);
         self.* = undefined;
+    }
+
+    fn wakeFromPool(ctx: ?*anyopaque) void {
+        const wakeup_fd: *const posix.fd_t = @ptrCast(@alignCast(ctx.?));
+        const val: u64 = 1;
+        _ = posix.write(wakeup_fd.*, std.mem.asBytes(&val)) catch {};
     }
 
     /// Synchronously close a file descriptor. Used for both sockets and
@@ -327,6 +367,7 @@ pub const EpollMmapIO = struct {
         var fired: u32 = 0;
         try self.fireExpiredTimers(&fired);
         try self.drainMmapCompletions(&fired);
+        try self.drainPool(&fired);
 
         if (self.active == 0) return;
         if (wait_at_least != 0 and fired >= wait_at_least) return;
@@ -354,6 +395,39 @@ pub const EpollMmapIO = struct {
 
         try self.fireExpiredTimers(&fired);
         try self.drainMmapCompletions(&fired);
+        try self.drainPool(&fired);
+    }
+
+    fn drainPool(self: *EpollMmapIO, fired: *u32) !void {
+        try self.pool.drainCompletedInto(&self.pool_swap);
+        defer self.pool_swap.clearRetainingCapacity();
+        for (self.pool_swap.items) |entry| {
+            try self.dispatchPoolEntry(entry, fired);
+        }
+    }
+
+    fn dispatchPoolEntry(self: *EpollMmapIO, entry: PoolCompleted, fired: *u32) !void {
+        const c = entry.completion;
+        const st = epollState(c);
+        st.in_flight = false;
+        self.active -|= 1;
+        fired.* += 1;
+        switch (c.op) {
+            .copy_file_chunk => |op| op.session.backendStateAs(PosixCopyFileSessionState).copy_in_flight = false,
+            else => {},
+        }
+
+        const cb = c.callback orelse return;
+        const action = cb(c.userdata, c, entry.result);
+        switch (action) {
+            .disarm => {},
+            .rearm => switch (c.op) {
+                .copy_file_chunk => |op| try self.copy_file_chunk(op, c, c.userdata, cb),
+                .fchown => |op| try self.fchown(op, c, c.userdata, cb),
+                .fchmod => |op| try self.fchmod(op, c, c.userdata, cb),
+                else => {},
+            },
+        }
     }
 
     fn drainMmapCompletions(self: *EpollMmapIO, fired: *u32) !void {
@@ -388,8 +462,11 @@ pub const EpollMmapIO = struct {
                 .fsync => |op| try self.fsync(op, c, c.userdata, cb),
                 .fallocate => |op| try self.fallocate(op, c, c.userdata, cb),
                 .truncate => |op| try self.truncate(op, c, c.userdata, cb),
-                .splice => |op| try self.splice(op, c, c.userdata, cb),
-                .copy_file_range => |op| try self.copy_file_range(op, c, c.userdata, cb),
+                .open_copy_file_session => |op| try self.open_copy_file_session(op, c, c.userdata, cb),
+                .copy_file_chunk => |op| try self.copy_file_chunk(op, c, c.userdata, cb),
+                .close_copy_file_session => |op| try self.close_copy_file_session(op, c, c.userdata, cb),
+                .fchown => |op| try self.fchown(op, c, c.userdata, cb),
+                .fchmod => |op| try self.fchmod(op, c, c.userdata, cb),
                 else => {},
             },
         }
@@ -529,8 +606,11 @@ pub const EpollMmapIO = struct {
             .unlinkat => |op| try self.unlinkat(op, c, userdata, callback),
             .statx => |op| try self.statx(op, c, userdata, callback),
             .getdents => |op| try self.getdents(op, c, userdata, callback),
-            .splice => |op| try self.splice(op, c, userdata, callback),
-            .copy_file_range => |op| try self.copy_file_range(op, c, userdata, callback),
+            .open_copy_file_session => |op| try self.open_copy_file_session(op, c, userdata, callback),
+            .copy_file_chunk => |op| try self.copy_file_chunk(op, c, userdata, callback),
+            .close_copy_file_session => |op| try self.close_copy_file_session(op, c, userdata, callback),
+            .fchown => |op| try self.fchown(op, c, userdata, callback),
+            .fchmod => |op| try self.fchmod(op, c, userdata, callback),
             .socket => |op| try self.socket(op, c, userdata, callback),
             .connect => |op| try self.connect(op, c, userdata, callback),
             .accept => |op| try self.accept(op, c, userdata, callback),
@@ -866,6 +946,16 @@ pub const EpollMmapIO = struct {
             }
         }
 
+        if (!found) {
+            const target_is_file = switch (target.op) {
+                .copy_file_chunk, .fchown, .fchmod => true,
+                else => false,
+            };
+            if (target_is_file and self.pool.tryCancelPending(target)) {
+                found = true;
+            }
+        }
+
         const result: Result = if (found) .{ .cancel = {} } else .{ .cancel = error.OperationNotFound };
         const action = try self.deliverInline(c, result);
         switch (action) {
@@ -993,61 +1083,54 @@ pub const EpollMmapIO = struct {
         try self.enqueueMmapCompletion(c, result);
     }
 
-    pub fn splice(self: *EpollMmapIO, op: ifc.SpliceOp, c: *Completion, ud: ?*anyopaque, cb: Callback) !void {
-        try self.armCompletion(c, .{ .splice = op }, ud, cb);
-        // The mmap backends don't host a thread pool — splice runs on
-        // the EL thread. The only daemon caller is the async file-move
-        // job, which is one-shot per torrent relocation; the resulting
-        // EL stall is bounded and observably acceptable.
-        const result: Result = blk: {
-            var off_in: i64 = @bitCast(op.in_offset);
-            var off_out: i64 = @bitCast(op.out_offset);
-            const off_in_ptr: ?*i64 = if (op.in_offset == std.math.maxInt(u64)) null else &off_in;
-            const off_out_ptr: ?*i64 = if (op.out_offset == std.math.maxInt(u64)) null else &off_out;
-            const rc = linux.syscall6(
-                .splice,
-                @as(usize, @bitCast(@as(isize, op.in_fd))),
-                @intFromPtr(off_in_ptr),
-                @as(usize, @bitCast(@as(isize, op.out_fd))),
-                @intFromPtr(off_out_ptr),
-                op.len,
-                op.flags,
-            );
-            switch (linux.E.init(rc)) {
-                .SUCCESS => break :blk .{ .splice = @as(usize, @intCast(rc)) },
-                .BADF => break :blk .{ .splice = error.BadFileDescriptor },
-                .INVAL => break :blk .{ .splice = error.InvalidArgument },
-                .NOMEM => break :blk .{ .splice = error.SystemResources },
-                .SPIPE => break :blk .{ .splice = error.InvalidArgument },
-                .IO => break :blk .{ .splice = error.InputOutput },
-                .NOSPC => break :blk .{ .splice = error.NoSpaceLeft },
-                .PIPE => break :blk .{ .splice = error.BrokenPipe },
-                .AGAIN => break :blk .{ .splice = error.WouldBlock },
-                else => |e| break :blk .{ .splice = posix.unexpectedErrno(e) },
-            }
-        };
-        try self.enqueueMmapCompletion(c, result);
+    pub fn open_copy_file_session(self: *EpollMmapIO, op: ifc.OpenCopyFileSessionOp, c: *Completion, ud: ?*anyopaque, cb: Callback) !void {
+        try self.armCompletion(c, .{ .open_copy_file_session = op }, ud, cb);
+        const st = op.session.backendStateAs(PosixCopyFileSessionState);
+        if (st.copy_in_flight) return try self.enqueueMmapCompletion(c, .{ .open_copy_file_session = error.AlreadyInFlight });
+        if (st.open) return try self.enqueueMmapCompletion(c, .{ .open_copy_file_session = error.InvalidState });
+        st.* = .{ .open = true };
+        try self.enqueueMmapCompletion(c, .{ .open_copy_file_session = {} });
     }
 
-    pub fn copy_file_range(self: *EpollMmapIO, op: ifc.CopyFileRangeOp, c: *Completion, ud: ?*anyopaque, cb: Callback) !void {
-        try self.armCompletion(c, .{ .copy_file_range = op }, ud, cb);
-        const result: Result = blk: {
-            var off_in: i64 = @bitCast(op.in_offset);
-            var off_out: i64 = @bitCast(op.out_offset);
-            const rc = linux.copy_file_range(op.in_fd, &off_in, op.out_fd, &off_out, op.len, op.flags);
-            switch (linux.E.init(rc)) {
-                .SUCCESS => break :blk .{ .copy_file_range = @as(usize, @intCast(rc)) },
-                .BADF => break :blk .{ .copy_file_range = error.BadFileDescriptor },
-                .INVAL => break :blk .{ .copy_file_range = error.InvalidArgument },
-                .XDEV, .NOSYS, .OPNOTSUPP => break :blk .{ .copy_file_range = error.OperationNotSupported },
-                .IO => break :blk .{ .copy_file_range = error.InputOutput },
-                .NOSPC => break :blk .{ .copy_file_range = error.NoSpaceLeft },
-                .ISDIR => break :blk .{ .copy_file_range = error.IsDir },
-                .OVERFLOW => break :blk .{ .copy_file_range = error.FileTooBig },
-                else => |e| break :blk .{ .copy_file_range = posix.unexpectedErrno(e) },
+    pub fn copy_file_chunk(self: *EpollMmapIO, op: ifc.CopyFileChunkOp, c: *Completion, ud: ?*anyopaque, cb: Callback) !void {
+        try self.armCompletion(c, .{ .copy_file_chunk = op }, ud, cb);
+        const st = op.session.backendStateAs(PosixCopyFileSessionState);
+        if (!st.open or st.poisoned) return try self.enqueueMmapCompletion(c, .{ .copy_file_chunk = error.InvalidState });
+        if (st.copy_in_flight) return try self.enqueueMmapCompletion(c, .{ .copy_file_chunk = error.AlreadyInFlight });
+        if (op.len == 0) return try self.enqueueMmapCompletion(c, .{ .copy_file_chunk = error.InvalidArgument });
+        st.copy_in_flight = true;
+        try self.submitFileOp(.{ .copy_file_chunk = op }, c);
+    }
+
+    pub fn close_copy_file_session(self: *EpollMmapIO, op: ifc.CloseCopyFileSessionOp, c: *Completion, ud: ?*anyopaque, cb: Callback) !void {
+        try self.armCompletion(c, .{ .close_copy_file_session = op }, ud, cb);
+        const st = op.session.backendStateAs(PosixCopyFileSessionState);
+        if (st.copy_in_flight) return try self.enqueueMmapCompletion(c, .{ .close_copy_file_session = error.AlreadyInFlight });
+        st.* = .{};
+        try self.enqueueMmapCompletion(c, .{ .close_copy_file_session = {} });
+    }
+
+    pub fn fchown(self: *EpollMmapIO, op: ifc.FchownOp, c: *Completion, ud: ?*anyopaque, cb: Callback) !void {
+        try self.armCompletion(c, .{ .fchown = op }, ud, cb);
+        try self.submitFileOp(.{ .fchown = op }, c);
+    }
+
+    pub fn fchmod(self: *EpollMmapIO, op: ifc.FchmodOp, c: *Completion, ud: ?*anyopaque, cb: Callback) !void {
+        try self.armCompletion(c, .{ .fchmod = op }, ud, cb);
+        try self.submitFileOp(.{ .fchmod = op }, c);
+    }
+
+    fn submitFileOp(self: *EpollMmapIO, op: FileOp, c: *Completion) !void {
+        self.active += 1;
+        self.pool.submit(op, c) catch |err| {
+            self.active -|= 1;
+            epollState(c).in_flight = false;
+            switch (op) {
+                .copy_file_chunk => |p| p.session.backendStateAs(PosixCopyFileSessionState).copy_in_flight = false,
+                else => {},
             }
+            return err;
         };
-        try self.enqueueMmapCompletion(c, result);
     }
 
     // ── Mmap helpers ──────────────────────────────────────
@@ -1325,8 +1408,11 @@ fn makeCancelledResult(op: Operation) Result {
         .unlinkat => .{ .unlinkat = error.OperationCanceled },
         .statx => .{ .statx = error.OperationCanceled },
         .getdents => .{ .getdents = error.OperationCanceled },
-        .splice => .{ .splice = error.OperationCanceled },
-        .copy_file_range => .{ .copy_file_range = error.OperationCanceled },
+        .open_copy_file_session => .{ .open_copy_file_session = error.OperationCanceled },
+        .copy_file_chunk => .{ .copy_file_chunk = error.OperationCanceled },
+        .close_copy_file_session => .{ .close_copy_file_session = error.OperationCanceled },
+        .fchown => .{ .fchown = error.OperationCanceled },
+        .fchmod => .{ .fchmod = error.OperationCanceled },
         .socket => .{ .socket = error.OperationCanceled },
         .connect => .{ .connect = error.OperationCanceled },
         .accept => .{ .accept = error.OperationCanceled },

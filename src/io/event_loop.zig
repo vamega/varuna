@@ -12,7 +12,6 @@ const ext = @import("../net/extensions.zig");
 const Hasher = @import("hasher.zig").Hasher;
 const RateLimiter = @import("rate_limiter.zig").RateLimiter;
 const pex_mod = @import("../net/pex.zig");
-const socket_util = @import("../net/socket.zig");
 const addr_mod = @import("../net/address.zig");
 const utp_mod = @import("../net/utp.zig");
 const utp_mgr = @import("../net/utp_manager.zig");
@@ -686,11 +685,11 @@ pub fn EventLoopOf(comptime IO: type) type {
             // Note: listen_fd is NOT closed here -- it is owned by the caller
             // (e.g. std.net.Server in client.zig) and will be closed by the caller's defer.
             if (self.udp_fd >= 0) {
-                posix.close(self.udp_fd);
+                self.io.closeSocket(self.udp_fd);
                 self.udp_fd = -1;
             }
             if (self.signal_fd >= 0) {
-                posix.close(self.signal_fd);
+                self.io.closeSocket(self.signal_fd);
                 self.signal_fd = -1;
             }
 
@@ -1686,6 +1685,86 @@ pub fn EventLoopOf(comptime IO: type) type {
             try self.submitAccept();
         }
 
+        const StartupWaitCtx = struct {
+            done: bool = false,
+            err: ?anyerror = null,
+            fd: posix.fd_t = -1,
+        };
+
+        fn startupWaitComplete(
+            userdata: ?*anyopaque,
+            _: *io_interface.Completion,
+            result: io_interface.Result,
+        ) io_interface.CallbackAction {
+            const ctx: *StartupWaitCtx = @ptrCast(@alignCast(userdata.?));
+            ctx.done = true;
+            ctx.err = switch (result) {
+                .socket => |r| if (r) |fd| blk: {
+                    ctx.fd = fd;
+                    break :blk null;
+                } else |err| err,
+                .bind => |r| if (r) |_| null else |err| err,
+                .listen => |r| if (r) |_| null else |err| err,
+                .setsockopt => |r| if (r) |_| null else |err| err,
+                else => error.UnexpectedResult,
+            };
+            return .disarm;
+        }
+
+        fn waitStartupOp(self: *Self, ctx: *StartupWaitCtx) !void {
+            while (!ctx.done) try self.io.tick(1);
+            if (ctx.err) |err| return err;
+        }
+
+        fn socketForStartup(self: *Self, op: io_interface.SocketOp) !posix.fd_t {
+            var ctx = StartupWaitCtx{};
+            var completion = io_interface.Completion{};
+            try self.io.socket(op, &completion, &ctx, startupWaitComplete);
+            try self.waitStartupOp(&ctx);
+            return ctx.fd;
+        }
+
+        fn bindForStartup(self: *Self, op: io_interface.BindOp) !void {
+            var ctx = StartupWaitCtx{};
+            var completion = io_interface.Completion{};
+            try self.io.bind(op, &completion, &ctx, startupWaitComplete);
+            try self.waitStartupOp(&ctx);
+        }
+
+        fn listenForStartup(self: *Self, op: io_interface.ListenOp) !void {
+            var ctx = StartupWaitCtx{};
+            var completion = io_interface.Completion{};
+            try self.io.listen(op, &completion, &ctx, startupWaitComplete);
+            try self.waitStartupOp(&ctx);
+        }
+
+        fn setsockoptForStartup(self: *Self, op: io_interface.SetsockoptOp) !void {
+            var ctx = StartupWaitCtx{};
+            var completion = io_interface.Completion{};
+            try self.io.setsockopt(op, &completion, &ctx, startupWaitComplete);
+            try self.waitStartupOp(&ctx);
+        }
+
+        fn bindDeviceForStartup(self: *Self, fd: posix.fd_t, device: []const u8) !void {
+            const IFNAMSIZ = 16;
+            if (device.len == 0 or device.len >= IFNAMSIZ) return error.InvalidInterfaceName;
+
+            var buf: [IFNAMSIZ]u8 = undefined;
+            @memcpy(buf[0..device.len], device);
+            buf[device.len] = 0;
+
+            self.setsockoptForStartup(.{
+                .fd = fd,
+                .level = posix.SOL.SOCKET,
+                .optname = posix.SO.BINDTODEVICE,
+                .optval = buf[0 .. device.len + 1],
+            }) catch |err| switch (err) {
+                error.PermissionDenied => return error.BindDevicePermissionDenied,
+                error.NoDevice => return error.BindDeviceNotFound,
+                else => return err,
+            };
+        }
+
         /// Start listening for inbound uTP/DHT connections on a UDP socket.
         /// Creates a dual-stack IPv6 UDP socket (handles IPv4-mapped addresses too),
         /// binds to the daemon's listen port, initializes the UtpManager, and
@@ -1695,12 +1774,12 @@ pub fn EventLoopOf(comptime IO: type) type {
 
             // Create a dual-stack IPv6 UDP socket. When IPV6_V6ONLY is 0, the
             // kernel also accepts IPv4 connections via IPv4-mapped addresses.
-            const fd = try posix.socket(
-                posix.AF.INET6,
-                posix.SOCK.DGRAM | posix.SOCK.CLOEXEC | posix.SOCK.NONBLOCK,
-                posix.IPPROTO.UDP,
-            );
-            errdefer posix.close(fd);
+            const fd = try self.socketForStartup(.{
+                .domain = posix.AF.INET6,
+                .sock_type = posix.SOCK.DGRAM | posix.SOCK.CLOEXEC | posix.SOCK.NONBLOCK,
+                .protocol = posix.IPPROTO.UDP,
+            });
+            errdefer self.io.closeSocket(fd);
 
             // Allow address reuse. Routes through `IORING_OP_URING_CMD`
             // + `SOCKET_URING_OP_SETSOCKOPT` on kernel ≥6.7
@@ -1708,7 +1787,7 @@ pub fn EventLoopOf(comptime IO: type) type {
             // `posix.setsockopt(2)` fallback otherwise. Best-effort —
             // log on failure but proceed (matching prior behaviour).
             const reuse_one = std.mem.toBytes(@as(c_int, 1));
-            io_interface.setsockoptBlocking(&self.io, .{
+            self.setsockoptForStartup(.{
                 .fd = fd,
                 .level = posix.SOL.SOCKET,
                 .optname = posix.SO.REUSEADDR,
@@ -1717,7 +1796,7 @@ pub fn EventLoopOf(comptime IO: type) type {
 
             // Disable IPV6_V6ONLY so IPv4 connections arrive as IPv4-mapped addresses.
             const v6only_zero = std.mem.toBytes(@as(c_int, 0));
-            io_interface.setsockoptBlocking(&self.io, .{
+            self.setsockoptForStartup(.{
                 .fd = fd,
                 .level = linux.IPPROTO.IPV6,
                 .optname = linux.IPV6.V6ONLY,
@@ -1729,7 +1808,7 @@ pub fn EventLoopOf(comptime IO: type) type {
             // swarm fan-in well before the daemon saturates the link. Ask for
             // a larger buffer; the kernel may cap it at net.core.rmem_max.
             const recv_buf_bytes = std.mem.toBytes(@as(c_int, 8 * 1024 * 1024));
-            io_interface.setsockoptBlocking(&self.io, .{
+            self.setsockoptForStartup(.{
                 .fd = fd,
                 .level = posix.SOL.SOCKET,
                 .optname = posix.SO.RCVBUF,
@@ -1740,7 +1819,7 @@ pub fn EventLoopOf(comptime IO: type) type {
 
             // Apply SO_BINDTODEVICE if configured (keeps traffic on a specific interface).
             if (self.bind_device) |device| {
-                socket_util.applyBindDevice(fd, device) catch |err| {
+                self.bindDeviceForStartup(fd, device) catch |err| {
                     log.warn("UDP socket SO_BINDTODEVICE({s}) failed: {s}", .{ device, @errorName(err) });
                 };
             }
@@ -1755,8 +1834,8 @@ pub fn EventLoopOf(comptime IO: type) type {
             // Routes through `IORING_OP_BIND` on kernel ≥6.11
             // (`feature_support.supports_bind == true`); on older
             // kernels the contract method falls back to `posix.bind(2)`
-            // inline. See `io_interface.bindBlocking`.
-            try io_interface.bindBlocking(&self.io, .{ .fd = fd, .addr = bind_addr });
+            // inline.
+            try self.bindForStartup(.{ .fd = fd, .addr = bind_addr });
 
             self.udp_fd = fd;
 
@@ -1784,7 +1863,7 @@ pub fn EventLoopOf(comptime IO: type) type {
             const fd = self.udp_fd;
             self.udp_fd = -1;
 
-            posix.close(fd);
+            self.io.closeSocket(fd);
 
             if (self.utp_manager) |mgr| {
                 mgr.deinit();
@@ -1805,15 +1884,15 @@ pub fn EventLoopOf(comptime IO: type) type {
                 std.net.Address.parseIp6(bind_addr_str, self.port) catch
                 return error.InvalidBindAddress;
 
-            const fd = try posix.socket(
-                addr.any.family,
-                posix.SOCK.STREAM | posix.SOCK.CLOEXEC | posix.SOCK.NONBLOCK,
-                posix.IPPROTO.TCP,
-            );
-            errdefer posix.close(fd);
+            const fd = try self.socketForStartup(.{
+                .domain = addr.any.family,
+                .sock_type = posix.SOCK.STREAM | posix.SOCK.CLOEXEC | posix.SOCK.NONBLOCK,
+                .protocol = posix.IPPROTO.TCP,
+            });
+            errdefer self.io.closeSocket(fd);
 
             const one: u32 = 1;
-            io_interface.setsockoptBlocking(&self.io, .{
+            self.setsockoptForStartup(.{
                 .fd = fd,
                 .level = posix.SOL.SOCKET,
                 .optname = posix.SO.REUSEADDR,
@@ -1821,13 +1900,13 @@ pub fn EventLoopOf(comptime IO: type) type {
             }) catch {};
 
             if (self.bind_device) |device| {
-                try socket_util.applyBindDevice(fd, device);
+                try self.bindDeviceForStartup(fd, device);
             }
 
             // Routes through io_uring on kernel ≥6.11; sync fallback
-            // otherwise. See `io_interface.bindBlocking`.
-            try io_interface.bindBlocking(&self.io, .{ .fd = fd, .addr = addr });
-            try io_interface.listenBlocking(&self.io, .{ .fd = fd, .backlog = 128 });
+            // otherwise.
+            try self.bindForStartup(.{ .fd = fd, .addr = addr });
+            try self.listenForStartup(.{ .fd = fd, .backlog = 128 });
 
             self.listen_fd = fd;
             try self.submitAccept();
@@ -1849,7 +1928,7 @@ pub fn EventLoopOf(comptime IO: type) type {
                 null,
                 ignoredCancelComplete,
             ) catch {};
-            posix.close(fd);
+            self.io.closeSocket(fd);
 
             log.info("TCP listener stopped", .{});
         }
@@ -3412,6 +3491,36 @@ pub fn EventLoopOf(comptime IO: type) type {
 pub const EventLoop = EventLoopOf(RealIO);
 
 // ── Tests ─────────────────────────────────────────────────
+
+test "stopTcpListener closes SimIO listen fd through IO contract" {
+    const SimIO = @import("sim_io.zig").SimIO;
+    const SimEventLoop = EventLoopOf(SimIO);
+    const allocator = std.testing.allocator;
+    const io = try SimIO.init(allocator, .{ .socket_capacity = 4 });
+    var el = try SimEventLoop.initBareWithIO(allocator, io, 0);
+    defer el.deinit();
+
+    const fds = try el.io.createSocketpair();
+    el.listen_fd = fds[0];
+
+    el.stopTcpListener();
+    try std.testing.expectError(error.SocketClosed, el.io.pushSocketRecvBytes(fds[0], "x"));
+}
+
+test "stopUtpListener closes SimIO UDP fd through IO contract" {
+    const SimIO = @import("sim_io.zig").SimIO;
+    const SimEventLoop = EventLoopOf(SimIO);
+    const allocator = std.testing.allocator;
+    const io = try SimIO.init(allocator, .{ .socket_capacity = 4 });
+    var el = try SimEventLoop.initBareWithIO(allocator, io, 0);
+    defer el.deinit();
+
+    const fds = try el.io.createSocketpair();
+    el.udp_fd = fds[0];
+
+    el.stopUtpListener();
+    try std.testing.expectError(error.SocketClosed, el.io.pushSocketRecvBytes(fds[0], "x"));
+}
 
 test "event loop supports high torrent counts with hashed lookup and slot reuse" {
     var el = try EventLoop.initBare(std.testing.allocator, 0);

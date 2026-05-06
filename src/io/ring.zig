@@ -171,6 +171,10 @@ pub const FeatureSupport = struct {
     supports_renameat: bool = false,
     supports_unlinkat: bool = false,
     supports_statx: bool = false,
+    /// `IORING_OP_PIPE`, kernel 6.16+. Below that, RealIO falls back to
+    /// a synchronous `pipe2(O_CLOEXEC|O_NONBLOCK)` and reports completion
+    /// from its ready queue on the next tick.
+    supports_pipe: bool = false,
 
     /// All-false sentinel used when the probe register itself isn't
     /// supported (kernel <5.6) or fails for any other reason. Every op
@@ -187,6 +191,7 @@ pub const FeatureSupport = struct {
 /// supported".
 pub fn probeFeatures(ring: *linux.IoUring) FeatureSupport {
     const p = ring.get_probe() catch return FeatureSupport.none;
+    const io_uring_op_pipe: linux.IORING_OP = @enumFromInt(62);
     return .{
         .supports_ftruncate = p.is_supported(.FTRUNCATE),
         .supports_bind = p.is_supported(.BIND),
@@ -202,6 +207,7 @@ pub fn probeFeatures(ring: *linux.IoUring) FeatureSupport {
         .supports_renameat = p.is_supported(.RENAMEAT),
         .supports_unlinkat = p.is_supported(.UNLINKAT),
         .supports_statx = p.is_supported(.STATX),
+        .supports_pipe = p.is_supported(io_uring_op_pipe),
     };
 }
 

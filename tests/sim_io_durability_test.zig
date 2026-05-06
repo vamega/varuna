@@ -155,8 +155,9 @@ fn expectFallocateError(
     }
 }
 
-fn copyFileRangeSync(
+fn copyFileChunkSync(
     io: *SimIO,
+    session: *ifc.CopyFileSession,
     in_fd: posix.fd_t,
     in_offset: u64,
     out_fd: posix.fd_t,
@@ -165,17 +166,42 @@ fn copyFileRangeSync(
 ) !usize {
     var c = Completion{};
     var ctx = TestCtx{};
-    try io.copy_file_range(.{
-        .in_fd = in_fd,
-        .in_offset = in_offset,
-        .out_fd = out_fd,
-        .out_offset = out_offset,
+    try io.copy_file_chunk(.{
+        .session = session,
+        .src_fd = in_fd,
+        .src_offset = in_offset,
+        .dst_fd = out_fd,
+        .dst_offset = out_offset,
         .len = len,
     }, &c, &ctx, testCallback);
     try io.tick(0);
     try testing.expectEqual(@as(u32, 1), ctx.calls);
     return switch (ctx.last_result.?) {
-        .copy_file_range => |r| try r,
+        .copy_file_chunk => |r| try r,
+        else => unreachable,
+    };
+}
+
+fn openCopyFileSessionSync(io: *SimIO, session: *ifc.CopyFileSession) !void {
+    var c = Completion{};
+    var ctx = TestCtx{};
+    try io.open_copy_file_session(.{ .session = session }, &c, &ctx, testCallback);
+    try io.tick(0);
+    try testing.expectEqual(@as(u32, 1), ctx.calls);
+    return switch (ctx.last_result.?) {
+        .open_copy_file_session => |r| try r,
+        else => unreachable,
+    };
+}
+
+fn closeCopyFileSessionSync(io: *SimIO, session: *ifc.CopyFileSession) !void {
+    var c = Completion{};
+    var ctx = TestCtx{};
+    try io.close_copy_file_session(.{ .session = session }, &c, &ctx, testCallback);
+    try io.tick(0);
+    try testing.expectEqual(@as(u32, 1), ctx.calls);
+    return switch (ctx.last_result.?) {
+        .close_copy_file_session => |r| try r,
         else => unreachable,
     };
 }
@@ -511,7 +537,7 @@ test "SimIO durability: fsynced fallocate exposes durable zero length" {
     try testing.expectEqualSlices(u8, "\x00\x00\x00\x00\x00\x00\x00\x00", &buf);
 }
 
-test "SimIO durability: copy_file_range copies source bytes into destination pending layer" {
+test "SimIO durability: copy_file_chunk copies source bytes into destination pending layer" {
     var io = try SimIO.init(testing.allocator, .{});
     defer io.deinit();
 
@@ -520,7 +546,11 @@ test "SimIO durability: copy_file_range copies source bytes into destination pen
     try io.setFileBytes(src_fd, "0123456789");
     try io.setFileBytes(dst_fd, "XXXXXXXXXX");
 
-    const copied = try copyFileRangeSync(&io, src_fd, 2, dst_fd, 3, 4);
+    var session = ifc.CopyFileSession{};
+    try openCopyFileSessionSync(&io, &session);
+    defer closeCopyFileSessionSync(&io, &session) catch {};
+
+    const copied = try copyFileChunkSync(&io, &session, src_fd, 2, dst_fd, 3, 4);
     try testing.expectEqual(@as(usize, 4), copied);
 
     var pre_buf: [10]u8 = undefined;
@@ -546,7 +576,11 @@ test "SimIO durability: crash before fsync drops copied bytes" {
     try io.setFileBytes(src_fd, "ABCDE");
     try io.setFileBytes(dst_fd, "AAAAAA");
 
-    const copied = try copyFileRangeSync(&io, src_fd, 1, dst_fd, 2, 3);
+    var session = ifc.CopyFileSession{};
+    try openCopyFileSessionSync(&io, &session);
+    defer closeCopyFileSessionSync(&io, &session) catch {};
+
+    const copied = try copyFileChunkSync(&io, &session, src_fd, 1, dst_fd, 2, 3);
     try testing.expectEqual(@as(usize, 3), copied);
 
     var pre_buf: [6]u8 = undefined;

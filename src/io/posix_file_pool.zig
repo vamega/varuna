@@ -1,9 +1,9 @@
 //! Posix file-op thread pool.
 //!
-//! Shared by `EpollPosixIO` (Linux) and `KqueuePosixIO` (macOS/BSD): both
-//! readiness-style backends own a `PosixFilePool` and submit file ops
-//! (`read`/`write`/`fsync`/`fallocate`/`truncate`) to it. The pool's worker
-//! threads execute the syscall, push the result back, and signal a
+//! Shared by backends that need backend-owned syscall offload:
+//! `EpollPosixIO` / `KqueuePosixIO` use it for regular file ops because
+//! readiness APIs cannot make those syscalls nonblocking. The pool's
+//! worker threads execute the syscall, push the result back, and signal a
 //! backend-provided wakeup callback. The backend drains the result queue
 //! from its `tick()` and fires the user's callbacks.
 //!
@@ -19,12 +19,11 @@
 //!
 //! ## Design choices (read STYLE.md pattern #15 first)
 //!
-//! 1. **One module, two consumers.** The work the pool performs (positioned
-//!    reads/writes against an fd) is identical between EpollPosixIO and
-//!    KqueuePosixIO; only the *wakeup primitive* differs (eventfd on Linux,
-//!    `EVFILT_USER` on macOS/BSD). The pool exposes a callback-shaped
-//!    wakeup hook (`WakeFn`) so each backend wires it to whatever signal
-//!    its readiness loop already understands.
+//! 1. **One module, multiple consumers.** The work the pool performs is
+//!    syscall-shaped and independent of the readiness primitive. Epoll
+//!    uses eventfd and kqueue uses `EVFILT_USER`. The pool exposes a
+//!    callback-shaped wakeup hook (`WakeFn`) so each backend wires it to
+//!    whatever signal its loop already understands.
 //!
 //! 2. **Caller-owned `Completion`s.** Same contract as the rest of the IO
 //!    interface — the pool stores a `*Completion` pointer in each pending
@@ -84,8 +83,9 @@ pub const FileOp = union(enum) {
     close: ifc.CloseOp,
     fallocate: ifc.FallocateOp,
     truncate: ifc.TruncateOp,
-    splice: ifc.SpliceOp,
-    copy_file_range: ifc.CopyFileRangeOp,
+    copy_file_chunk: ifc.CopyFileChunkOp,
+    fchown: ifc.FchownOp,
+    fchmod: ifc.FchmodOp,
 };
 
 /// A completed op ready to fire its callback. The pool stages these in
@@ -114,6 +114,9 @@ pub const Config = struct {
     /// Bound on simultaneously-pending submissions. Beyond this,
     /// `submit` returns `error.PendingQueueFull`.
     pending_capacity: u32 = 256,
+    /// Per-worker scratch buffer used only when `copy_file_chunk` falls
+    /// back to positioned read/write. Allocated once at pool creation.
+    copy_scratch_bytes: usize = 1024 * 1024,
 };
 
 /// Per-pool errors returned at the public surface. Worker-thread errors
@@ -135,6 +138,7 @@ const PendingEntry = struct {
 pub const PosixFilePool = struct {
     allocator: std.mem.Allocator,
     workers: []std.Thread,
+    worker_scratch: [][]u8,
     running: std.atomic.Value(bool) = std.atomic.Value(bool).init(true),
 
     // Submission queue: backend pushes (under EL thread), workers pop.
@@ -168,9 +172,23 @@ pub const PosixFilePool = struct {
         const workers = try allocator.alloc(std.Thread, cfg.worker_count);
         errdefer allocator.free(workers);
 
+        const worker_scratch = try allocator.alloc([]u8, cfg.worker_count);
+        errdefer allocator.free(worker_scratch);
+        for (worker_scratch) |*buf| buf.* = &.{};
+        var scratch_allocated: usize = 0;
+        errdefer {
+            for (worker_scratch[0..scratch_allocated]) |buf| allocator.free(buf);
+        }
+        const scratch_bytes = @max(cfg.copy_scratch_bytes, 1);
+        for (worker_scratch) |*buf| {
+            buf.* = try allocator.alloc(u8, scratch_bytes);
+            scratch_allocated += 1;
+        }
+
         self.* = .{
             .allocator = allocator,
             .workers = workers,
+            .worker_scratch = worker_scratch,
             .pending_capacity = cfg.pending_capacity,
         };
         errdefer self.pending.deinit(allocator);
@@ -187,8 +205,8 @@ pub const PosixFilePool = struct {
             self.pending_cond.broadcast();
             for (self.workers[0..spawned]) |t| t.join();
         }
-        for (self.workers) |*t| {
-            t.* = try std.Thread.spawn(.{}, workerFn, .{self});
+        for (self.workers, 0..) |*t, worker_index| {
+            t.* = try std.Thread.spawn(.{}, workerFn, .{ self, worker_index });
             spawned += 1;
         }
         return self;
@@ -221,6 +239,8 @@ pub const PosixFilePool = struct {
 
         self.pending.deinit(self.allocator);
         self.completed.deinit(self.allocator);
+        for (self.worker_scratch) |buf| self.allocator.free(buf);
+        self.allocator.free(self.worker_scratch);
         const allocator = self.allocator;
         // Note: don't dereference `self` after destroy.
         allocator.destroy(self);
@@ -315,7 +335,8 @@ pub const PosixFilePool = struct {
 
     // ── Worker loop ───────────────────────────────────────
 
-    fn workerFn(self: *PosixFilePool) void {
+    fn workerFn(self: *PosixFilePool, worker_index: usize) void {
+        const scratch = self.worker_scratch[worker_index];
         while (true) {
             self.pending_mutex.lock();
             while (self.pending.items.len == 0 and self.running.load(.acquire)) {
@@ -334,7 +355,7 @@ pub const PosixFilePool = struct {
             _ = self.in_flight.fetchAdd(1, .acq_rel);
             self.pending_mutex.unlock();
 
-            const result = executeOp(entry.op);
+            const result = executeOp(entry.op, scratch);
 
             self.completed_mutex.lock();
             self.completed.appendAssumeCapacity(.{
@@ -355,7 +376,7 @@ pub const PosixFilePool = struct {
 // **Runs on a worker thread** — must not touch the pool's mutexes, must
 // not take locks anywhere else.
 
-fn executeOp(op: FileOp) Result {
+fn executeOp(op: FileOp, scratch: []u8) Result {
     return switch (op) {
         .read => |p| .{ .read = executeRead(p) },
         .write => |p| .{ .write = executeWrite(p) },
@@ -363,8 +384,9 @@ fn executeOp(op: FileOp) Result {
         .close => |p| .{ .close = executeClose(p) },
         .fallocate => |p| .{ .fallocate = executeFallocate(p) },
         .truncate => |p| .{ .truncate = executeTruncate(p) },
-        .splice => |p| .{ .splice = executeSplice(p) },
-        .copy_file_range => |p| .{ .copy_file_range = executeCopyFileRange(p) },
+        .copy_file_chunk => |p| .{ .copy_file_chunk = executeCopyFileChunk(p, scratch) },
+        .fchown => |p| .{ .fchown = executeFchown(p) },
+        .fchmod => |p| .{ .fchmod = executeFchmod(p) },
     };
 }
 
@@ -452,83 +474,74 @@ fn executeTruncate(op: ifc.TruncateOp) anyerror!void {
     return posix.ftruncate(op.fd, op.length);
 }
 
-fn executeSplice(op: ifc.SpliceOp) anyerror!usize {
-    if (comptime builtin.target.os.tag != .linux) {
-        // splice(2) is Linux-only. Posix-not-Linux backends report the
-        // op as unsupported; callers fall back to copy_file_range or
-        // read/write loops.
-        return error.OperationNotSupported;
+fn executeCopyFileChunk(op: ifc.CopyFileChunkOp, scratch: []u8) anyerror!usize {
+    if (op.len == 0) return error.InvalidArgument;
+    if (comptime builtin.target.os.tag == .linux) {
+        var total: usize = 0;
+        while (total < op.len) {
+            const remaining = op.len - total;
+            var off_in: i64 = @intCast(op.src_offset + total);
+            var off_out: i64 = @intCast(op.dst_offset + total);
+            const rc = std.os.linux.copy_file_range(op.src_fd, &off_in, op.dst_fd, &off_out, remaining, 0);
+            switch (std.os.linux.E.init(rc)) {
+                .SUCCESS => {
+                    const n: usize = @intCast(rc);
+                    if (n == 0) return total;
+                    total += n;
+                },
+                .XDEV, .NOSYS, .OPNOTSUPP => {
+                    if (total > 0) return total;
+                    return executeCopyFileChunkReadWrite(op, scratch);
+                },
+                .BADF => if (total > 0) return total else return error.BadFileDescriptor,
+                .INVAL => if (total > 0) return total else return error.InvalidArgument,
+                .IO => if (total > 0) return total else return error.InputOutput,
+                .NOSPC => if (total > 0) return total else return error.NoSpaceLeft,
+                .ISDIR => if (total > 0) return total else return error.IsDir,
+                .OVERFLOW => if (total > 0) return total else return error.FileTooBig,
+                .TXTBSY => if (total > 0) return total else return error.WouldBlock,
+                else => |e| if (total > 0) return total else return posix.unexpectedErrno(e),
+            }
+        }
+        return total;
     }
-    const linux = std.os.linux;
-    // Pass nullable offsets per `splice(2)` semantics: maxInt(u64) means
-    // "the corresponding fd is a pipe; ignore the offset".
-    var off_in: i64 = @bitCast(op.in_offset);
-    var off_out: i64 = @bitCast(op.out_offset);
-    const off_in_ptr: ?*i64 = if (op.in_offset == std.math.maxInt(u64)) null else &off_in;
-    const off_out_ptr: ?*i64 = if (op.out_offset == std.math.maxInt(u64)) null else &off_out;
-    // splice isn't in std.os.linux's wrapped syscalls, so we issue it
-    // directly via syscall6 and decode the errno.
-    const rc = linux.syscall6(
-        .splice,
-        @as(usize, @bitCast(@as(isize, op.in_fd))),
-        @intFromPtr(off_in_ptr),
-        @as(usize, @bitCast(@as(isize, op.out_fd))),
-        @intFromPtr(off_out_ptr),
-        op.len,
-        op.flags,
-    );
-    switch (linux.E.init(rc)) {
-        .SUCCESS => return @intCast(rc),
-        .BADF => return error.BadFileDescriptor,
-        .INVAL => return error.InvalidArgument,
-        .NOMEM => return error.SystemResources,
-        .SPIPE => return error.InvalidArgument,
-        .IO => return error.InputOutput,
-        .NOSPC => return error.NoSpaceLeft,
-        .PIPE => return error.BrokenPipe,
-        .AGAIN => return error.WouldBlock,
-        else => |e| return posix.unexpectedErrno(e),
-    }
+    return executeCopyFileChunkReadWrite(op, scratch);
 }
 
-fn executeCopyFileRange(op: ifc.CopyFileRangeOp) anyerror!usize {
-    if (comptime builtin.target.os.tag == .linux) {
-        const linux = std.os.linux;
-        // copy_file_range(2): fast in-kernel copy. With offset pointers,
-        // the file's own offset isn't advanced. The kernel returns the
-        // number of bytes transferred (0 indicates EOF).
-        var off_in: i64 = @intCast(op.in_offset);
-        var off_out: i64 = @intCast(op.out_offset);
-        const rc = linux.copy_file_range(op.in_fd, &off_in, op.out_fd, &off_out, op.len, op.flags);
-        switch (linux.E.init(rc)) {
-            .SUCCESS => return @intCast(rc),
-            .BADF => return error.BadFileDescriptor,
-            .INVAL => return error.InvalidArgument,
-            .XDEV => return error.OperationNotSupported,
-            .NOSYS => return error.OperationNotSupported,
-            .OPNOTSUPP => return error.OperationNotSupported,
-            .IO => return error.InputOutput,
-            .NOSPC => return error.NoSpaceLeft,
-            .ISDIR => return error.IsDir,
-            .OVERFLOW => return error.FileTooBig,
-            .TXTBSY => return error.WouldBlock,
-            else => |e| return posix.unexpectedErrno(e),
+fn executeCopyFileChunkReadWrite(op: ifc.CopyFileChunkOp, scratch: []u8) anyerror!usize {
+    assert(scratch.len > 0);
+    var total: usize = 0;
+    while (total < op.len) {
+        const want = @min(op.len - total, scratch.len);
+        const n_read = posix.pread(op.src_fd, scratch[0..want], op.src_offset + total) catch |err| {
+            if (total > 0) return total;
+            return err;
+        };
+        if (n_read == 0) return total;
+
+        var written: usize = 0;
+        while (written < n_read) {
+            const w = posix.pwrite(op.dst_fd, scratch[written..n_read], op.dst_offset + total + written) catch |err| {
+                if (total + written > 0) return total + written;
+                return err;
+            };
+            if (w == 0) {
+                if (total + written > 0) return total + written;
+                return error.WriteShort;
+            }
+            written += w;
         }
+        total += n_read;
     }
-    // Non-Linux: emulate via a single positioned read/write pair. The
-    // worker thread loop in `MoveJob` chunks larger transfers, so a
-    // single `pread` / `pwrite` here is sufficient.
-    var stack_buf: [128 * 1024]u8 = undefined;
-    const want = @min(op.len, stack_buf.len);
-    const n_read = try posix.pread(op.in_fd, stack_buf[0..want], op.in_offset);
-    if (n_read == 0) return 0;
-    var written: usize = 0;
-    while (written < n_read) {
-        const w = try posix.pwrite(op.out_fd, stack_buf[written..n_read], op.out_offset + written);
-        if (w == 0) return error.WriteShort;
-        written += w;
-    }
-    return n_read;
+    return total;
+}
+
+fn executeFchown(op: ifc.FchownOp) anyerror!void {
+    return posix.fchown(op.fd, @as(posix.uid_t, @intCast(op.uid)), @as(posix.gid_t, @intCast(op.gid)));
+}
+
+fn executeFchmod(op: ifc.FchmodOp) anyerror!void {
+    return posix.fchmod(op.fd, op.mode);
 }
 
 fn makeCancelledResult(op: FileOp) Result {
@@ -539,8 +552,9 @@ fn makeCancelledResult(op: FileOp) Result {
         .close => .{ .close = error.OperationCanceled },
         .fallocate => .{ .fallocate = error.OperationCanceled },
         .truncate => .{ .truncate = error.OperationCanceled },
-        .splice => .{ .splice = error.OperationCanceled },
-        .copy_file_range => .{ .copy_file_range = error.OperationCanceled },
+        .copy_file_chunk => .{ .copy_file_chunk = error.OperationCanceled },
+        .fchown => .{ .fchown = error.OperationCanceled },
+        .fchmod => .{ .fchmod = error.OperationCanceled },
     };
 }
 

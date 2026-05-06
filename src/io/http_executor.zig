@@ -299,9 +299,9 @@ pub fn HttpExecutorOf(comptime IO: type) type {
                 tls_stream: ?TlsStream = null,
             };
 
-            fn dropEntry(e: *Entry) void {
+            fn dropEntry(io: anytype, e: *Entry) void {
                 if (e.fd >= 0) {
-                    posix.close(e.fd);
+                    io.closeSocket(e.fd);
                     e.fd = -1;
                 }
                 if (e.tls_stream) |*tls| {
@@ -311,11 +311,11 @@ pub fn HttpExecutorOf(comptime IO: type) type {
                 e.host_len = 0;
             }
 
-            fn get(self: *ConnectionPool, host_str: []const u8, port: u16, is_https: bool, now: i64) ?PooledConnection {
+            fn get(self: *ConnectionPool, io: anytype, host_str: []const u8, port: u16, is_https: bool, now: i64) ?PooledConnection {
                 for (&self.entries) |*e| {
                     if (e.fd < 0) continue;
                     if (now - e.stored_at > max_age_s) {
-                        dropEntry(e);
+                        dropEntry(io, e);
                         continue;
                     }
                     if (e.port == port and e.is_https == is_https and e.host_len == host_str.len and
@@ -332,7 +332,7 @@ pub fn HttpExecutorOf(comptime IO: type) type {
                 return null;
             }
 
-            fn put(self: *ConnectionPool, host_str: []const u8, port: u16, is_https: bool, fd: posix.fd_t, tls_stream: ?TlsStream, now: i64) void {
+            fn put(self: *ConnectionPool, io: anytype, host_str: []const u8, port: u16, is_https: bool, fd: posix.fd_t, tls_stream: ?TlsStream, now: i64) void {
                 // Find empty slot or evict oldest
                 var oldest_idx: usize = 0;
                 var oldest_time: i64 = std.math.maxInt(i64);
@@ -346,7 +346,7 @@ pub fn HttpExecutorOf(comptime IO: type) type {
                         oldest_idx = i;
                     }
                 }
-                dropEntry(&self.entries[oldest_idx]);
+                dropEntry(io, &self.entries[oldest_idx]);
                 self.storeAt(oldest_idx, host_str, port, is_https, fd, tls_stream, now);
             }
 
@@ -361,9 +361,9 @@ pub fn HttpExecutorOf(comptime IO: type) type {
                 @memcpy(e.host[0..host_str.len], host_str);
             }
 
-            fn closeAll(self: *ConnectionPool) void {
+            fn closeAll(self: *ConnectionPool, io: anytype) void {
                 for (&self.entries) |*e| {
-                    dropEntry(e);
+                    dropEntry(io, e);
                 }
             }
         };
@@ -436,14 +436,14 @@ pub fn HttpExecutorOf(comptime IO: type) type {
             // Clean up in-flight slots.
             for (self.slots) |*slot| {
                 if (slot.state != .free) {
-                    if (slot.fd >= 0) posix.close(slot.fd);
+                    if (slot.fd >= 0) self.closeFd(slot.fd);
                     self.detachDnsJob(slot, true);
                     slot.reset(self.allocator);
                 }
             }
             self.allocator.free(self.slots);
 
-            self.pool.closeAll();
+            self.pool.closeAll(self.io);
 
             var iter = self.host_active.keyIterator();
             while (iter.next()) |key| self.allocator.free(key.*);
@@ -592,12 +592,12 @@ pub fn HttpExecutorOf(comptime IO: type) type {
 
             // Check connection pool first.
             const now = std.time.timestamp();
-            if (self.pool.get(host, slot.parsed.port, slot.parsed.is_https, now)) |pooled| {
+            if (self.pool.get(self.io, host, slot.parsed.port, slot.parsed.is_https, now)) |pooled| {
                 slot.fd = pooled.fd;
                 slot.pooled = true;
                 if (slot.parsed.is_https) {
                     slot.tls_stream = pooled.tls_stream orelse {
-                        posix.close(slot.fd);
+                        self.closeFd(slot.fd);
                         slot.fd = -1;
                         slot.pooled = false;
                         self.startConnect(slot, slot_idx);
@@ -849,7 +849,7 @@ pub fn HttpExecutorOf(comptime IO: type) type {
                 self,
                 httpConnectComplete,
             ) catch {
-                posix.close(fd);
+                self.closeFd(fd);
                 slot.fd = -1;
                 self.completeSlot(slot_idx, .{ .err = error.SubmitFailed });
             };
@@ -1058,7 +1058,7 @@ pub fn HttpExecutorOf(comptime IO: type) type {
                 .send => |r| r catch |err| {
                     // If pooled connection was stale, retry with fresh connect.
                     if (slot.pooled and slot.state == .sending and slot.send_offset == 0) {
-                        posix.close(slot.fd);
+                        self.closeFd(slot.fd);
                         slot.fd = -1;
                         slot.pooled = false;
                         if (slot.tls_stream) |*tls| {
@@ -1363,6 +1363,7 @@ pub fn HttpExecutorOf(comptime IO: type) type {
                     break :blk tls;
                 } else null;
                 self.pool.put(
+                    self.io,
                     slot.job.hostSlice(),
                     slot.parsed.port,
                     slot.parsed.is_https,
@@ -1436,7 +1437,7 @@ pub fn HttpExecutorOf(comptime IO: type) type {
 
             // Close fd if not returned to pool.
             if (slot.fd >= 0) {
-                posix.close(slot.fd);
+                self.closeFd(slot.fd);
             }
             self.detachDnsJob(slot, false);
             slot.reset(self.allocator);
@@ -1446,6 +1447,10 @@ pub fn HttpExecutorOf(comptime IO: type) type {
 
             // Invoke callback with the owned copy.
             job.on_complete(job.context, result_copy);
+        }
+
+        fn closeFd(self: *Self, fd: posix.fd_t) void {
+            self.io.closeSocket(fd);
         }
 
         fn incrementHostActive(self: *Self, host: []const u8) void {
@@ -1695,6 +1700,58 @@ pub fn HttpExecutorOf(comptime IO: type) type {
 
             slot.recv_buf.deinit(allocator);
         }
+
+        pub fn testCompleteSlotClosesSimSocketThroughContract() !void {
+            const allocator = std.testing.allocator;
+            var io = try IO.init(allocator, .{ .socket_capacity = 4 });
+            defer io.deinit();
+
+            const fds = try io.createSocketpair();
+            const host = "example.test";
+
+            var slots = try allocator.alloc(RequestSlot, 1);
+            defer allocator.free(slots);
+            slots[0] = .{};
+            slots[0].state = .receiving;
+            slots[0].fd = fds[0];
+            slots[0].job = Job{
+                .context = undefined,
+                .on_complete = struct {
+                    fn cb(_: *anyopaque, _: RequestResult) void {}
+                }.cb,
+            };
+            @memcpy(slots[0].job.host[0..host.len], host);
+            slots[0].job.host_len = @intCast(host.len);
+
+            var self = Self{
+                .allocator = allocator,
+                .io = &io,
+                .dns_event_fd = -1,
+                .pending_jobs = std.ArrayList(Job).empty,
+                .slots = slots,
+                .free_slot_count = 0,
+                .max_concurrent = 1,
+                .max_per_host = 1,
+                .dns_resolver = try initDnsResolver(allocator, &io, .{}),
+                .retired_dns_jobs = if (use_custom_dns) std.ArrayList(*DnsJob).empty else {},
+                .deferred_jobs = std.ArrayList(Job).empty,
+            };
+            defer {
+                self.dns_resolver.deinit(allocator);
+                if (comptime use_custom_dns) self.retired_dns_jobs.deinit(allocator);
+                self.host_active.deinit(allocator);
+            }
+
+            self.active_count = 1;
+            try self.host_active.put(allocator, try allocator.dupe(u8, host), 1);
+            defer {
+                var iter = self.host_active.keyIterator();
+                while (iter.next()) |key| allocator.free(key.*);
+            }
+
+            self.completeSlot(0, .{ .err = error.ConnectionClosed });
+            try std.testing.expectError(error.SocketClosed, io.pushSocketRecvBytes(fds[0], "x"));
+        }
     };
 }
 
@@ -1702,3 +1759,7 @@ pub fn HttpExecutorOf(comptime IO: type) type {
 /// Sim tests instantiate `HttpExecutorOf(SimIO)` directly; production code
 /// references this alias unchanged.
 pub const HttpExecutor = HttpExecutorOf(RealIO);
+
+test "completeSlot closes SimIO socket through IO contract" {
+    try HttpExecutorOf(@import("sim_io.zig").SimIO).testCompleteSlotClosesSimSocketThroughContract();
+}

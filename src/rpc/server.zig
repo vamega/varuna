@@ -1,6 +1,5 @@
 const std = @import("std");
 const posix = std.posix;
-const socket_util = @import("../net/socket.zig");
 const auth = @import("auth.zig");
 const io_interface = @import("../io/io_interface.zig");
 const backend = @import("../io/backend.zig");
@@ -80,21 +79,101 @@ pub fn ApiServerOf(comptime IO: type) type {
             return server;
         }
 
+        const StartupWaitCtx = struct {
+            done: bool = false,
+            err: ?anyerror = null,
+            fd: posix.fd_t = -1,
+        };
+
+        fn startupWaitComplete(
+            userdata: ?*anyopaque,
+            _: *io_interface.Completion,
+            result: io_interface.Result,
+        ) io_interface.CallbackAction {
+            const ctx: *StartupWaitCtx = @ptrCast(@alignCast(userdata.?));
+            ctx.done = true;
+            ctx.err = switch (result) {
+                .socket => |r| if (r) |fd| blk: {
+                    ctx.fd = fd;
+                    break :blk null;
+                } else |err| err,
+                .bind => |r| if (r) |_| null else |err| err,
+                .listen => |r| if (r) |_| null else |err| err,
+                .setsockopt => |r| if (r) |_| null else |err| err,
+                else => error.UnexpectedResult,
+            };
+            return .disarm;
+        }
+
+        fn waitStartupOp(io: *IO, ctx: *StartupWaitCtx) !void {
+            while (!ctx.done) try io.tick(1);
+            if (ctx.err) |err| return err;
+        }
+
+        fn socketForStartup(io: *IO, op: io_interface.SocketOp) !posix.fd_t {
+            var ctx = StartupWaitCtx{};
+            var completion = io_interface.Completion{};
+            try io.socket(op, &completion, &ctx, startupWaitComplete);
+            try waitStartupOp(io, &ctx);
+            return ctx.fd;
+        }
+
+        fn bindForStartup(io: *IO, op: io_interface.BindOp) !void {
+            var ctx = StartupWaitCtx{};
+            var completion = io_interface.Completion{};
+            try io.bind(op, &completion, &ctx, startupWaitComplete);
+            try waitStartupOp(io, &ctx);
+        }
+
+        fn listenForStartup(io: *IO, op: io_interface.ListenOp) !void {
+            var ctx = StartupWaitCtx{};
+            var completion = io_interface.Completion{};
+            try io.listen(op, &completion, &ctx, startupWaitComplete);
+            try waitStartupOp(io, &ctx);
+        }
+
+        fn setsockoptForStartup(io: *IO, op: io_interface.SetsockoptOp) !void {
+            var ctx = StartupWaitCtx{};
+            var completion = io_interface.Completion{};
+            try io.setsockopt(op, &completion, &ctx, startupWaitComplete);
+            try waitStartupOp(io, &ctx);
+        }
+
+        fn bindDeviceForStartup(io: *IO, fd: posix.fd_t, device: []const u8) !void {
+            const IFNAMSIZ = 16;
+            if (device.len == 0 or device.len >= IFNAMSIZ) return error.InvalidInterfaceName;
+
+            var buf: [IFNAMSIZ]u8 = undefined;
+            @memcpy(buf[0..device.len], device);
+            buf[device.len] = 0;
+
+            setsockoptForStartup(io, .{
+                .fd = fd,
+                .level = posix.SOL.SOCKET,
+                .optname = posix.SO.BINDTODEVICE,
+                .optval = buf[0 .. device.len + 1],
+            }) catch |err| switch (err) {
+                error.PermissionDenied => return error.BindDevicePermissionDenied,
+                error.NoDevice => return error.BindDeviceNotFound,
+                else => return err,
+            };
+        }
+
         pub fn initWithDevice(allocator: std.mem.Allocator, io: *IO, bind_addr: []const u8, port: u16, bind_device: ?[]const u8) !Self {
             // Create and bind listen socket
             const addr = try std.net.Address.parseIp4(bind_addr, port);
-            const fd = try posix.socket(
-                addr.any.family,
-                posix.SOCK.STREAM | posix.SOCK.CLOEXEC | posix.SOCK.NONBLOCK,
-                posix.IPPROTO.TCP,
-            );
-            errdefer posix.close(fd);
+            const fd = try socketForStartup(io, .{
+                .domain = addr.any.family,
+                .sock_type = posix.SOCK.STREAM | posix.SOCK.CLOEXEC | posix.SOCK.NONBLOCK,
+                .protocol = posix.IPPROTO.TCP,
+            });
+            errdefer io.closeSocket(fd);
 
             // SO_REUSEADDR. Routes through io_uring URING_CMD setsockopt on
             // kernel ≥6.7 (`feature_support.supports_setsockopt == true`),
             // sync `posix.setsockopt(2)` fallback otherwise.
             const enable: u32 = 1;
-            try io_interface.setsockoptBlocking(io, .{
+            try setsockoptForStartup(io, .{
                 .fd = fd,
                 .level = posix.SOL.SOCKET,
                 .optname = posix.SO.REUSEADDR,
@@ -103,12 +182,12 @@ pub fn ApiServerOf(comptime IO: type) type {
 
             // SO_BINDTODEVICE if configured
             if (bind_device) |device| {
-                try socket_util.applyBindDevice(fd, device);
+                try bindDeviceForStartup(io, fd, device);
             }
 
             // Routes through io_uring on kernel ≥6.11; sync fallback otherwise.
-            try io_interface.bindBlocking(io, .{ .fd = fd, .addr = addr });
-            try io_interface.listenBlocking(io, .{ .fd = fd, .backlog = 128 });
+            try bindForStartup(io, .{ .fd = fd, .addr = addr });
+            try listenForStartup(io, .{ .fd = fd, .backlog = 128 });
 
             var server: Self = .{
                 .io = io,
@@ -122,7 +201,7 @@ pub fn ApiServerOf(comptime IO: type) type {
         pub fn deinit(self: *Self) void {
             for (&self.clients) |*client| {
                 if (client.fd >= 0) {
-                    posix.close(client.fd);
+                    self.closeFd(client.fd);
                     client.fd = -1;
                 }
                 if (client.recv_buf) |buf| {
@@ -135,7 +214,7 @@ pub fn ApiServerOf(comptime IO: type) type {
                     client.request_arena = null;
                 }
             }
-            if (self.listen_fd >= 0) posix.close(self.listen_fd);
+            if (self.listen_fd >= 0) self.closeFd(self.listen_fd);
             // io is shared, not owned — don't deinit it
         }
 
@@ -196,7 +275,7 @@ pub fn ApiServerOf(comptime IO: type) type {
             const accepted_fd = new_fd.fd;
 
             const slot = self.allocClientSlot() orelse {
-                posix.close(accepted_fd);
+                self.closeFd(accepted_fd);
                 return .rearm;
             };
 
@@ -483,7 +562,7 @@ pub fn ApiServerOf(comptime IO: type) type {
             var retained_recv_buf: ?[]u8 = null;
             var retained_arena: ?scratch.TieredArena = null;
             if (client.fd >= 0) {
-                posix.close(client.fd);
+                self.closeFd(client.fd);
                 client.fd = -1;
             }
             if (client.recv_buf) |buf| {
@@ -519,10 +598,34 @@ pub fn ApiServerOf(comptime IO: type) type {
         fn isLiveClient(self: *const Self, slot: u8, generation: u32) bool {
             return self.client_generations[slot] == generation and self.clients[slot].fd >= 0;
         }
+
+        fn closeFd(self: *Self, fd: posix.fd_t) void {
+            self.io.closeSocket(fd);
+        }
+
+        pub fn testCloseClientClosesSimSocketThroughContract() !void {
+            const allocator = std.testing.allocator;
+            var io = try IO.init(allocator, .{ .socket_capacity = 4 });
+            defer io.deinit();
+
+            const fds = try io.createSocketpair();
+            var server = Self{
+                .io = &io,
+                .allocator = allocator,
+            };
+            server.clients[0].fd = fds[0];
+
+            server.closeClient(0);
+            try std.testing.expectError(error.SocketClosed, io.pushSocketRecvBytes(fds[0], "x"));
+        }
     };
 }
 
 pub const ApiServer = ApiServerOf(RealIO);
+
+test "closeClient closes SimIO socket through IO contract" {
+    try ApiServerOf(@import("../io/sim_io.zig").SimIO).testCloseClientClosesSimSocketThroughContract();
+}
 
 // ── HTTP types ────────────────────────────────────────────
 

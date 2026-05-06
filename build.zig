@@ -686,6 +686,21 @@ pub fn build(b: *std.Build) void {
     test_io_parity_step.dependOn(&run_io_parity.step);
     test_step.dependOn(&run_io_parity.step);
 
+    const io_contract_tests = b.addTest(.{
+        .root_module = varuna_mod,
+        .filters = &.{
+            "completeSlot closes SimIO",
+            "closeClient closes SimIO",
+            "closeAcceptedFd closes SimIO",
+            "stopTcpListener closes SimIO",
+            "stopUtpListener closes SimIO",
+            "io_interface exposes only async startup operations",
+        },
+    });
+    const run_io_contract_tests = b.addRunArtifact(io_contract_tests);
+    const test_io_contract_step = b.step("test-io-contract", "Run focused IO-contract lifecycle tests");
+    test_io_contract_step.dependOn(&run_io_contract_tests.step);
+
     // ── EpollPosixIO smoke tests (real socketpair, real epoll fd) ───
     //
     // Backend-specific coverage for `src/io/epoll_posix_io.zig`. Only
@@ -1875,8 +1890,7 @@ pub const IoBackend = enum {
     io_uring,
     /// Linux epoll readiness + POSIX file-op thread pool via
     /// `src/io/epoll_posix_io.zig`. Used in sandboxes or seccomp policies
-    /// that block io_uring. Sockets + timers + cancel today; file-op
-    /// pool is a follow-up.
+    /// that block io_uring.
     epoll_posix,
     /// Linux epoll readiness + mmap-backed file I/O via
     /// `src/io/epoll_mmap_io.zig`. Same readiness layer as `epoll_posix`;
@@ -1884,8 +1898,7 @@ pub const IoBackend = enum {
     /// `msync(MS_SYNC)` durability.
     epoll_mmap,
     /// macOS / BSD kqueue readiness + POSIX file-op thread pool via
-    /// `src/io/kqueue_posix_io.zig`. Sockets + timers + cancel today;
-    /// file-op pool is a follow-up.
+    /// `src/io/kqueue_posix_io.zig`.
     kqueue_posix,
     /// macOS / BSD kqueue readiness + mmap-backed file I/O via
     /// `src/io/kqueue_mmap_io.zig` (memcpy + msync, F_PREALLOCATE for

@@ -77,7 +77,7 @@ fn handleAccepted(self: anytype, new_fd: posix.fd_t) void {
     const getpeername_rc = std.os.linux.getpeername(new_fd, @ptrCast(&peer_addr_storage), &addr_len);
     if (@as(i32, @bitCast(@as(u32, @truncate(getpeername_rc)))) < 0) {
         log.debug("rejected inbound: getpeername failed", .{});
-        posix.close(new_fd);
+        closeAcceptedFd(self, new_fd);
         return;
     }
     const peer_address = std.net.Address{ .any = @as(*posix.sockaddr, @ptrCast(&peer_addr_storage)).* };
@@ -86,7 +86,7 @@ fn handleAccepted(self: anytype, new_fd: posix.fd_t) void {
     if (self.ban_list) |bl| {
         if (bl.isBanned(peer_address)) {
             log.debug("rejected banned inbound peer", .{});
-            posix.close(new_fd);
+            closeAcceptedFd(self, new_fd);
             return;
         }
     }
@@ -94,14 +94,14 @@ fn handleAccepted(self: anytype, new_fd: posix.fd_t) void {
     // Reject inbound connections during graceful shutdown drain
     if (self.draining) {
         log.debug("rejected inbound connection: shutting down", .{});
-        posix.close(new_fd);
+        closeAcceptedFd(self, new_fd);
         return;
     }
 
     // Reject inbound TCP if transport disposition disables it
     if (!self.transport_disposition.incoming_tcp) {
         log.debug("rejected inbound TCP connection: incoming_tcp disabled", .{});
-        posix.close(new_fd);
+        closeAcceptedFd(self, new_fd);
         return;
     }
 
@@ -111,13 +111,13 @@ fn handleAccepted(self: anytype, new_fd: posix.fd_t) void {
             self.peer_count,
             self.max_connections,
         });
-        posix.close(new_fd);
+        closeAcceptedFd(self, new_fd);
         return;
     }
 
     // Allocate a peer slot for the inbound connection
     const slot = self.allocSlot() orelse {
-        posix.close(new_fd);
+        closeAcceptedFd(self, new_fd);
         return;
     };
 
@@ -139,6 +139,25 @@ fn handleAccepted(self: anytype, new_fd: posix.fd_t) void {
     protocol.submitHandshakeRecv(self, slot) catch {
         self.removePeer(slot);
     };
+}
+
+fn closeAcceptedFd(self: anytype, new_fd: posix.fd_t) void {
+    self.io.closeSocket(new_fd);
+}
+
+test "closeAcceptedFd closes SimIO fd through IO contract" {
+    const sim_io_mod = @import("sim_io.zig");
+    const allocator = std.testing.allocator;
+    var io = try sim_io_mod.SimIO.init(allocator, .{ .socket_capacity = 4 });
+    defer io.deinit();
+
+    const fds = try io.createSocketpair();
+    var fake = struct {
+        io: *sim_io_mod.SimIO,
+    }{ .io = &io };
+
+    closeAcceptedFd(&fake, fds[0]);
+    try std.testing.expectError(error.SocketClosed, io.pushSocketRecvBytes(fds[0], "x"));
 }
 
 /// Factory: callback bound to `Peer.connect_completion`. Invoked when

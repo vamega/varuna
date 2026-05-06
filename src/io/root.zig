@@ -82,6 +82,7 @@ test {
     _ = event_loop;
     _ = hasher;
     _ = http_parse;
+    _ = http_executor;
     _ = io_interface;
     _ = metadata_handler;
     _ = peer_candidates;

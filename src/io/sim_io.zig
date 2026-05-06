@@ -114,13 +114,12 @@ pub const FaultConfig = struct {
     /// `PieceStore.init` fallback path that fires on filesystems
     /// rejecting fallocate (tmpfs <5.10, FAT32, certain FUSE FSes).
     truncate_error_probability: f32 = 0.0,
-    /// Probability that a splice completes with `error.InputOutput`.
-    /// Used by MoveJob fault tests to exercise the cross-fs copy
-    /// path's error handling.
-    splice_error_probability: f32 = 0.0,
-    /// Probability that a copy_file_range completes with
-    /// `error.InputOutput`. Used by MoveJob fault tests.
-    copy_file_range_error_probability: f32 = 0.0,
+    /// Probability that a copy_file_chunk completes with
+    /// `error.InputOutput`. Used by MoveJob fault tests to exercise the
+    /// cross-fs copy path's error handling.
+    copy_file_chunk_error_probability: f32 = 0.0,
+    fchown_error_probability: f32 = 0.0,
+    fchmod_error_probability: f32 = 0.0,
     /// Directory-op fault knobs used by future MoveJob/PieceStore.init
     /// state-machine tests. Each successful op still mutates the virtual
     /// filesystem deterministically; a fault returns `error.InputOutput`
@@ -281,6 +280,28 @@ pub const SimSocket = struct {
     recv_queue: RecvQueue = .{},
 };
 
+const SimPipeEndpointKind = enum {
+    read,
+    write,
+};
+
+const SimPipeEndpoint = struct {
+    pipe: *SimPipe,
+    kind: SimPipeEndpointKind,
+};
+
+const SimPipe = struct {
+    read_fd: posix.fd_t,
+    write_fd: posix.fd_t,
+    read_closed: bool = false,
+    write_closed: bool = false,
+    buffer: std.ArrayListUnmanaged(u8) = .{},
+
+    fn deinit(self: *SimPipe, allocator: std.mem.Allocator) void {
+        self.buffer.deinit(allocator);
+    }
+};
+
 // ── Constants ─────────────────────────────────────────────
 
 /// Base value for fake socket fds. Chosen large enough that it never
@@ -293,6 +314,8 @@ const socket_fd_base: i32 = 1000;
 /// through it). Far above the `[socket_fd_base, socket_fd_base + cap)`
 /// range so legacy callers never collide with sim-socket fds.
 const synthetic_fd_base: i32 = 100_000;
+
+const pipe_fd_base: i32 = 200_000;
 
 // ── Sim file state (durability model) ─────────────────────
 //
@@ -484,6 +507,29 @@ const SimFsKind = enum {
     dir,
 };
 
+const SimMetadata = struct {
+    uid: u32 = 0,
+    gid: u32 = 0,
+    mode: u16,
+
+    fn default(kind: SimFsKind) SimMetadata {
+        return .{
+            .uid = 0,
+            .gid = 0,
+            .mode = switch (kind) {
+                .file => 0o644,
+                .dir => 0o755,
+            },
+        };
+    }
+};
+
+const SimCopyFileSessionState = struct {
+    open: bool = false,
+    in_flight: bool = false,
+    poisoned: bool = false,
+};
+
 // ── SimIO ─────────────────────────────────────────────────
 
 pub const SimIO = struct {
@@ -522,6 +568,14 @@ pub const SimIO = struct {
     /// Head of the free-list of unallocated socket slots.
     free_socket_head: u32 = sentinel_index,
 
+    /// Synthetic pipes used by MoveJob's file -> pipe -> file splice
+    /// fallback. These are not socket-pool entries; they exist only so
+    /// SimIO can model byte movement through `splice` without touching
+    /// the host kernel.
+    pipe_endpoints: std.AutoHashMap(posix.fd_t, SimPipeEndpoint),
+    pipe_states: std.ArrayListUnmanaged(*SimPipe) = .{},
+    next_pipe_id: u32 = 0,
+
     /// Optional per-fd file state, populated by `setFileBytes` (seed)
     /// and by subsequent `write` / `fsync` ops (durability model). When
     /// a `read` op targets a registered fd, SimIO returns the union of
@@ -555,6 +609,7 @@ pub const SimIO = struct {
     /// normalized path strings owned by SimIO; fd handles opened through
     /// `openat` store an owned copy in `fd_paths`.
     fs_nodes: std.StringHashMapUnmanaged(SimFsKind) = .{},
+    fs_metadata: std.StringHashMapUnmanaged(SimMetadata) = .{},
     path_file_state: std.StringHashMapUnmanaged(SimFile) = .{},
     fd_paths: std.AutoHashMap(posix.fd_t, []u8),
     fd_dir_offsets: std.AutoHashMap(posix.fd_t, usize),
@@ -623,6 +678,7 @@ pub const SimIO = struct {
             .sockets = sockets,
             .recv_queue_pool = queue_buf,
             .free_socket_head = head,
+            .pipe_endpoints = std.AutoHashMap(posix.fd_t, SimPipeEndpoint).init(allocator),
             .file_state = std.AutoHashMap(posix.fd_t, SimFile).init(allocator),
             .fd_paths = std.AutoHashMap(posix.fd_t, []u8).init(allocator),
             .fd_dir_offsets = std.AutoHashMap(posix.fd_t, usize).init(allocator),
@@ -645,6 +701,9 @@ pub const SimIO = struct {
             entry.value_ptr.deinit(self.allocator);
         }
         self.path_file_state.deinit(self.allocator);
+        var meta_it = self.fs_metadata.iterator();
+        while (meta_it.next()) |entry| self.allocator.free(entry.key_ptr.*);
+        self.fs_metadata.deinit(self.allocator);
         var node_it = self.fs_nodes.iterator();
         while (node_it.next()) |entry| self.allocator.free(entry.key_ptr.*);
         self.fs_nodes.deinit(self.allocator);
@@ -653,6 +712,12 @@ pub const SimIO = struct {
         self.fd_paths.deinit();
         self.fd_dir_offsets.deinit();
         self.closed_fds.deinit();
+        for (self.pipe_states.items) |pipe| {
+            pipe.deinit(self.allocator);
+            self.allocator.destroy(pipe);
+        }
+        self.pipe_states.deinit(self.allocator);
+        self.pipe_endpoints.deinit();
         self.prepared_socket_fds.deinit(self.allocator);
         self.allocator.free(self.pending);
         self.allocator.free(self.recv_queue_pool);
@@ -838,8 +903,11 @@ pub const SimIO = struct {
             .unlinkat => |op| try self.unlinkat(op, c, ud, cb),
             .statx => |op| try self.statx(op, c, ud, cb),
             .getdents => |op| try self.getdents(op, c, ud, cb),
-            .splice => |op| try self.splice(op, c, ud, cb),
-            .copy_file_range => |op| try self.copy_file_range(op, c, ud, cb),
+            .open_copy_file_session => |op| try self.open_copy_file_session(op, c, ud, cb),
+            .copy_file_chunk => |op| try self.copy_file_chunk(op, c, ud, cb),
+            .close_copy_file_session => |op| try self.close_copy_file_session(op, c, ud, cb),
+            .fchown => |op| try self.fchown(op, c, ud, cb),
+            .fchmod => |op| try self.fchmod(op, c, ud, cb),
             .socket => |op| try self.socket(op, c, ud, cb),
             .connect => |op| try self.connect(op, c, ud, cb),
             .accept => |op| try self.accept(op, c, ud, cb),
@@ -1029,15 +1097,56 @@ pub const SimIO = struct {
     fn putFsNode(self: *SimIO, path: []const u8, kind: SimFsKind) !void {
         if (self.fs_nodes.getPtr(path)) |existing| {
             existing.* = kind;
+            try self.ensureMetadata(path, kind);
             return;
         }
         const owned = try self.allocator.dupe(u8, path);
         errdefer self.allocator.free(owned);
         try self.fs_nodes.put(self.allocator, owned, kind);
+        try self.putMetadata(path, SimMetadata.default(kind));
     }
 
     fn removeFsNode(self: *SimIO, path: []const u8) void {
         if (self.fs_nodes.fetchRemove(path)) |kv| self.allocator.free(kv.key);
+        if (self.fs_metadata.fetchRemove(path)) |kv| self.allocator.free(kv.key);
+    }
+
+    fn ensureMetadata(self: *SimIO, path: []const u8, kind: SimFsKind) !void {
+        if (self.fs_metadata.contains(path)) return;
+        try self.putMetadata(path, SimMetadata.default(kind));
+    }
+
+    fn putMetadata(self: *SimIO, path: []const u8, metadata: SimMetadata) !void {
+        if (self.fs_metadata.getPtr(path)) |existing| {
+            existing.* = metadata;
+            return;
+        }
+        const owned = try self.allocator.dupe(u8, path);
+        errdefer self.allocator.free(owned);
+        try self.fs_metadata.put(self.allocator, owned, metadata);
+    }
+
+    fn setPathMode(self: *SimIO, path: []const u8, kind: SimFsKind, mode: posix.mode_t) !void {
+        try self.ensureMetadata(path, kind);
+        const metadata = self.fs_metadata.getPtr(path).?;
+        metadata.mode = @intCast(mode & 0o7777);
+    }
+
+    fn setFdMode(self: *SimIO, fd: posix.fd_t, mode: posix.mode_t) !void {
+        if (self.closed_fds.contains(fd)) return error.BadFileDescriptor;
+        const path = self.fd_paths.get(fd) orelse return error.BadFileDescriptor;
+        const kind = self.fs_nodes.get(path) orelse return error.FileNotFound;
+        try self.setPathMode(path, kind, mode);
+    }
+
+    fn setFdOwner(self: *SimIO, fd: posix.fd_t, uid: u32, gid: u32) !void {
+        if (self.closed_fds.contains(fd)) return error.BadFileDescriptor;
+        const path = self.fd_paths.get(fd) orelse return error.BadFileDescriptor;
+        const kind = self.fs_nodes.get(path) orelse return error.FileNotFound;
+        try self.ensureMetadata(path, kind);
+        const metadata = self.fs_metadata.getPtr(path).?;
+        metadata.uid = uid;
+        metadata.gid = gid;
     }
 
     fn getOrPutPathFileState(self: *SimIO, path: []const u8) !*SimFile {
@@ -1093,6 +1202,17 @@ pub const SimIO = struct {
         const owned_new = try self.allocator.dupe(u8, new_path);
         errdefer self.allocator.free(owned_new);
         try self.path_file_state.put(self.allocator, owned_new, value);
+    }
+
+    fn movePathMetadata(self: *SimIO, old_path: []const u8, new_path: []const u8) !void {
+        const kv = self.fs_metadata.fetchRemove(old_path) orelse return;
+        const value = kv.value;
+        self.allocator.free(kv.key);
+
+        if (self.fs_metadata.fetchRemove(new_path)) |existing| self.allocator.free(existing.key);
+        const owned_new = try self.allocator.dupe(u8, new_path);
+        errdefer self.allocator.free(owned_new);
+        try self.fs_metadata.put(self.allocator, owned_new, value);
     }
 
     fn resolveAt(self: *SimIO, dir_fd: posix.fd_t, path: [:0]const u8) ![]u8 {
@@ -1223,6 +1343,52 @@ pub const SimIO = struct {
         return .{ self.fdForSlot(a), self.fdForSlot(b) };
     }
 
+    pub fn createPipe(self: *SimIO) ![2]posix.fd_t {
+        const id = self.next_pipe_id;
+        self.next_pipe_id +%= 1;
+        const read_fd: posix.fd_t = pipe_fd_base + @as(posix.fd_t, @intCast(id * 2));
+        const write_fd: posix.fd_t = read_fd + 1;
+
+        const pipe = try self.allocator.create(SimPipe);
+        errdefer self.allocator.destroy(pipe);
+        pipe.* = .{
+            .read_fd = read_fd,
+            .write_fd = write_fd,
+        };
+        errdefer pipe.deinit(self.allocator);
+
+        try self.pipe_states.append(self.allocator, pipe);
+        errdefer _ = self.pipe_states.pop();
+
+        try self.pipe_endpoints.put(read_fd, .{ .pipe = pipe, .kind = .read });
+        errdefer _ = self.pipe_endpoints.remove(read_fd);
+        try self.pipe_endpoints.put(write_fd, .{ .pipe = pipe, .kind = .write });
+
+        _ = self.closed_fds.remove(read_fd);
+        _ = self.closed_fds.remove(write_fd);
+        return .{ read_fd, write_fd };
+    }
+
+    fn closePipeEndpoint(self: *SimIO, fd: posix.fd_t) bool {
+        const kv = self.pipe_endpoints.fetchRemove(fd) orelse return false;
+        switch (kv.value.kind) {
+            .read => kv.value.pipe.read_closed = true,
+            .write => kv.value.pipe.write_closed = true,
+        }
+        self.closed_fds.put(fd, {}) catch {};
+        if (kv.value.pipe.read_closed and kv.value.pipe.write_closed) {
+            for (self.pipe_states.items, 0..) |pipe, idx| {
+                if (pipe == kv.value.pipe) {
+                    _ = self.pipe_states.swapRemove(idx);
+                    break;
+                }
+            }
+            kv.value.pipe.deinit(self.allocator);
+            self.allocator.destroy(kv.value.pipe);
+        }
+        return true;
+    }
+
     /// Mark a socket as closed. Any parked recv on that slot is failed
     /// with `error.ConnectionResetByPeer`. The partner's parked recv (if
     /// any) is also failed — modelling the peer-reset semantics that the
@@ -1234,6 +1400,8 @@ pub const SimIO = struct {
             self.closed_fds.put(fd, {}) catch {};
             return;
         }
+
+        if (self.closePipeEndpoint(fd)) return;
 
         const slot = self.slotForFd(fd) orelse return;
         const sock = &self.sockets[slot];
@@ -1281,6 +1449,10 @@ pub const SimIO = struct {
             self.allocator.free(kv.value);
             _ = self.fd_dir_offsets.remove(op.fd);
             try self.closed_fds.put(op.fd, {});
+            return self.schedule(c, .{ .close = {} }, 0);
+        }
+
+        if (self.closePipeEndpoint(op.fd)) {
             return self.schedule(c, .{ .close = {} }, 0);
         }
 
@@ -1582,65 +1754,77 @@ pub const SimIO = struct {
         return self.schedule(c, .{ .truncate = {} }, 0);
     }
 
-    /// Sim splice models a successful "all bytes transferred" completion
-    /// (`op.len`). The fault knob delivers `error.InputOutput`. SimIO
-    /// doesn't model on-disk file content, so the actual data movement
-    /// is observably opaque — only the byte count and the error path
-    /// matter for state-machine tests.
-    pub fn splice(self: *SimIO, op: ifc.SpliceOp, c: *Completion, ud: ?*anyopaque, cb: Callback) !void {
-        try self.armCompletion(c, .{ .splice = op }, ud, cb);
-        const r = self.rng.random();
-        if (r.float(f32) < self.config.faults.splice_error_probability) {
-            return self.schedule(c, .{ .splice = error.InputOutput }, 0);
-        }
-        return self.schedule(c, .{ .splice = op.len }, 0);
+    pub fn open_copy_file_session(self: *SimIO, op: ifc.OpenCopyFileSessionOp, c: *Completion, ud: ?*anyopaque, cb: Callback) !void {
+        try self.armCompletion(c, .{ .open_copy_file_session = op }, ud, cb);
+        const st = op.session.backendStateAs(SimCopyFileSessionState);
+        if (st.in_flight) return self.schedule(c, .{ .open_copy_file_session = error.AlreadyInFlight }, 0);
+        if (st.open) return self.schedule(c, .{ .open_copy_file_session = error.InvalidState }, 0);
+        st.* = .{ .open = true };
+        return self.schedule(c, .{ .open_copy_file_session = {} }, 0);
     }
 
-    /// Sim copy_file_range copies visible source bytes into the
+    /// Sim copy_file_chunk copies visible source bytes into the
     /// destination's pending layer when the source fd is content-aware.
     /// The copied bytes are readable immediately but need `fsync` to
     /// become durable; `crash()` drops them like write-accepted bytes.
     /// If the source fd has no SimFile state, preserve the legacy opaque
     /// full-count success used by state-machine tests that do not inspect
     /// file content.
-    pub fn copy_file_range(self: *SimIO, op: ifc.CopyFileRangeOp, c: *Completion, ud: ?*anyopaque, cb: Callback) !void {
-        try self.armCompletion(c, .{ .copy_file_range = op }, ud, cb);
+    pub fn copy_file_chunk(self: *SimIO, op: ifc.CopyFileChunkOp, c: *Completion, ud: ?*anyopaque, cb: Callback) !void {
+        try self.armCompletion(c, .{ .copy_file_chunk = op }, ud, cb);
+        const st = op.session.backendStateAs(SimCopyFileSessionState);
+        if (!st.open or st.poisoned) return self.schedule(c, .{ .copy_file_chunk = error.InvalidState }, 0);
+        if (st.in_flight) return self.schedule(c, .{ .copy_file_chunk = error.AlreadyInFlight }, 0);
+        st.in_flight = true;
+        defer st.in_flight = false;
+
+        if (op.len == 0) return self.schedule(c, .{ .copy_file_chunk = error.InvalidArgument }, 0);
+
         const r = self.rng.random();
-        if (r.float(f32) < self.config.faults.copy_file_range_error_probability) {
-            return self.schedule(c, .{ .copy_file_range = error.InputOutput }, 0);
+        if (r.float(f32) < self.config.faults.copy_file_chunk_error_probability) {
+            st.poisoned = true;
+            return self.schedule(c, .{ .copy_file_chunk = error.InputOutput }, 0);
         }
 
-        const src = (self.fileStatePtrForFd(op.in_fd) catch |err| {
-            return self.schedule(c, .{ .copy_file_range = err }, 0);
+        const src = (self.fileStatePtrForFd(op.src_fd) catch |err| {
+            return self.schedule(c, .{ .copy_file_chunk = err }, 0);
         }) orelse {
-            return self.schedule(c, .{ .copy_file_range = op.len }, 0);
+            return self.schedule(c, .{ .copy_file_chunk = op.len }, 0);
         };
 
-        const in_off: usize = @intCast(op.in_offset);
+        const in_off: usize = @intCast(op.src_offset);
         const visible = src.visibleLen();
-        if (in_off >= visible or op.len == 0) {
-            return self.schedule(c, .{ .copy_file_range = @as(usize, 0) }, 0);
+        if (in_off >= visible) {
+            return self.schedule(c, .{ .copy_file_chunk = @as(usize, 0) }, 0);
         }
 
         const copied_len = @min(op.len, visible - in_off);
         const scratch = self.allocator.alloc(u8, copied_len) catch {
-            return self.schedule(c, .{ .copy_file_range = error.NoSpaceLeft }, 0);
+            return self.schedule(c, .{ .copy_file_chunk = error.NoSpaceLeft }, 0);
         };
         defer self.allocator.free(scratch);
 
         const read_n = src.readUnion(in_off, scratch);
         assert(read_n == copied_len);
 
-        const out_off: usize = @intCast(op.out_offset);
-        const dst = self.getOrPutFileStateForFd(op.out_fd) catch |err| {
+        const out_off: usize = @intCast(op.dst_offset);
+        const dst = self.getOrPutFileStateForFd(op.dst_fd) catch |err| {
             const result_err = if (err == error.BadFileDescriptor) err else error.NoSpaceLeft;
-            return self.schedule(c, .{ .copy_file_range = result_err }, 0);
+            return self.schedule(c, .{ .copy_file_chunk = result_err }, 0);
         };
         dst.writePendingBytes(self.allocator, out_off, scratch) catch {
-            return self.schedule(c, .{ .copy_file_range = error.NoSpaceLeft }, 0);
+            return self.schedule(c, .{ .copy_file_chunk = error.NoSpaceLeft }, 0);
         };
 
-        return self.schedule(c, .{ .copy_file_range = copied_len }, 0);
+        return self.schedule(c, .{ .copy_file_chunk = copied_len }, 0);
+    }
+
+    pub fn close_copy_file_session(self: *SimIO, op: ifc.CloseCopyFileSessionOp, c: *Completion, ud: ?*anyopaque, cb: Callback) !void {
+        try self.armCompletion(c, .{ .close_copy_file_session = op }, ud, cb);
+        const st = op.session.backendStateAs(SimCopyFileSessionState);
+        if (st.in_flight) return self.schedule(c, .{ .close_copy_file_session = error.AlreadyInFlight }, 0);
+        st.* = .{};
+        return self.schedule(c, .{ .close_copy_file_session = {} }, 0);
     }
 
     pub fn openat(self: *SimIO, op: ifc.OpenAtOp, c: *Completion, ud: ?*anyopaque, cb: Callback) !void {
@@ -1660,6 +1844,9 @@ pub const SimIO = struct {
             if (!op.flags.CREAT) return self.schedule(c, .{ .openat = error.FileNotFound }, 0);
             if (!self.hasDir(parentPath(path))) return self.schedule(c, .{ .openat = error.FileNotFound }, 0);
             self.putFsNode(path, .file) catch {
+                return self.schedule(c, .{ .openat = error.NoSpaceLeft }, 0);
+            };
+            self.setPathMode(path, .file, op.mode) catch {
                 return self.schedule(c, .{ .openat = error.NoSpaceLeft }, 0);
             };
             _ = self.getOrPutPathFileState(path) catch {
@@ -1715,6 +1902,9 @@ pub const SimIO = struct {
         self.putFsNode(path, .dir) catch {
             return self.schedule(c, .{ .mkdirat = error.NoSpaceLeft }, 0);
         };
+        self.setPathMode(path, .dir, op.mode) catch {
+            return self.schedule(c, .{ .mkdirat = error.NoSpaceLeft }, 0);
+        };
         return self.schedule(c, .{ .mkdirat = {} }, 0);
     }
 
@@ -1742,9 +1932,13 @@ pub const SimIO = struct {
             return self.schedule(c, .{ .renameat = error.FileNotFound }, 0);
         };
         if (!self.hasDir(parentPath(new_path))) return self.schedule(c, .{ .renameat = error.FileNotFound }, 0);
+        const metadata = self.fs_metadata.get(old_path) orelse SimMetadata.default(kind);
 
         self.removeFsNode(old_path);
         self.putFsNode(new_path, kind) catch {
+            return self.schedule(c, .{ .renameat = error.NoSpaceLeft }, 0);
+        };
+        self.putMetadata(new_path, metadata) catch {
             return self.schedule(c, .{ .renameat = error.NoSpaceLeft }, 0);
         };
         self.movePathFileState(old_path, new_path) catch {
@@ -1794,18 +1988,45 @@ pub const SimIO = struct {
         };
 
         op.buf.* = std.mem.zeroes(linux.Statx);
+        const metadata = self.fs_metadata.get(path) orelse SimMetadata.default(kind);
         op.buf.mask = op.mask & linux.STATX_BASIC_STATS;
         op.buf.blksize = 4096;
         op.buf.nlink = 1;
+        op.buf.uid = metadata.uid;
+        op.buf.gid = metadata.gid;
         op.buf.mode = switch (kind) {
-            .file => linux.S.IFREG | 0o644,
-            .dir => linux.S.IFDIR | 0o755,
+            .file => linux.S.IFREG | metadata.mode,
+            .dir => linux.S.IFDIR | metadata.mode,
         };
         op.buf.size = if (kind == .file)
             @intCast(if (self.path_file_state.getPtr(path)) |sf| sf.visibleLen() else 0)
         else
             0;
         return self.schedule(c, .{ .statx = {} }, 0);
+    }
+
+    pub fn fchown(self: *SimIO, op: ifc.FchownOp, c: *Completion, ud: ?*anyopaque, cb: Callback) !void {
+        try self.armCompletion(c, .{ .fchown = op }, ud, cb);
+        const r = self.rng.random();
+        if (r.float(f32) < self.config.faults.fchown_error_probability) {
+            return self.schedule(c, .{ .fchown = error.PermissionDenied }, 0);
+        }
+        self.setFdOwner(op.fd, op.uid, op.gid) catch |err| {
+            return self.schedule(c, .{ .fchown = err }, 0);
+        };
+        return self.schedule(c, .{ .fchown = {} }, 0);
+    }
+
+    pub fn fchmod(self: *SimIO, op: ifc.FchmodOp, c: *Completion, ud: ?*anyopaque, cb: Callback) !void {
+        try self.armCompletion(c, .{ .fchmod = op }, ud, cb);
+        const r = self.rng.random();
+        if (r.float(f32) < self.config.faults.fchmod_error_probability) {
+            return self.schedule(c, .{ .fchmod = error.PermissionDenied }, 0);
+        }
+        self.setFdMode(op.fd, op.mode) catch |err| {
+            return self.schedule(c, .{ .fchmod = err }, 0);
+        };
+        return self.schedule(c, .{ .fchmod = {} }, 0);
     }
 
     pub fn getdents(self: *SimIO, op: ifc.GetdentsOp, c: *Completion, ud: ?*anyopaque, cb: Callback) !void {
@@ -2019,8 +2240,11 @@ fn cancelResultFor(op: Operation) Result {
         .unlinkat => .{ .unlinkat = error.OperationCanceled },
         .statx => .{ .statx = error.OperationCanceled },
         .getdents => .{ .getdents = error.OperationCanceled },
-        .splice => .{ .splice = error.OperationCanceled },
-        .copy_file_range => .{ .copy_file_range = error.OperationCanceled },
+        .open_copy_file_session => .{ .open_copy_file_session = error.OperationCanceled },
+        .copy_file_chunk => .{ .copy_file_chunk = error.OperationCanceled },
+        .close_copy_file_session => .{ .close_copy_file_session = error.OperationCanceled },
+        .fchown => .{ .fchown = error.OperationCanceled },
+        .fchmod => .{ .fchmod = error.OperationCanceled },
         .socket => .{ .socket = error.OperationCanceled },
         .connect => .{ .connect = error.OperationCanceled },
         .accept => .{ .accept = error.OperationCanceled },
@@ -2055,8 +2279,11 @@ fn buggifyResultFor(op: Operation) Result {
         .unlinkat => .{ .unlinkat = error.InputOutput },
         .statx => .{ .statx = error.InputOutput },
         .getdents => .{ .getdents = error.InputOutput },
-        .splice => .{ .splice = error.InputOutput },
-        .copy_file_range => .{ .copy_file_range = error.InputOutput },
+        .open_copy_file_session => .{ .open_copy_file_session = error.InputOutput },
+        .copy_file_chunk => .{ .copy_file_chunk = error.InputOutput },
+        .close_copy_file_session => .{ .close_copy_file_session = error.InputOutput },
+        .fchown => .{ .fchown = error.PermissionDenied },
+        .fchmod => .{ .fchmod = error.PermissionDenied },
         .socket => .{ .socket = error.ProcessFdQuotaExceeded },
         .connect => .{ .connect = error.ConnectionRefused },
         .accept => .{ .accept = error.ConnectionAborted },

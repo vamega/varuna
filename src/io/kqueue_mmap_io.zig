@@ -28,6 +28,10 @@
 //!   * `truncate` → unmap-if-mapped + `ftruncate`. macOS lacks `mremap`,
 //!     so resizing a mapped file requires `munmap` followed by a fresh
 //!     `mmap` on the next access.
+//!   * `copy_file_chunk` / `fchown` / `fchmod` → backend-owned
+//!     `PosixFilePool`. These operations are mandatory parts of the IO
+//!     contract and may block, so the mmap strategy does not run them
+//!     inline on the event-loop thread.
 //!
 //! ## Why mmap for a dev backend
 //!
@@ -51,8 +55,9 @@
 //!
 //! ## Per-completion state
 //!
-//! Same `KqueueState` as KqueuePosixIO (file ops are synchronous — no
-//! parked-filter or timer-heap entries needed for them).
+//! Same `KqueueState` as KqueuePosixIO. Mmap hot-path file ops complete
+//! through the local completed queue; pool-routed copy/metadata ops use
+//! the same in-flight bit and wake the kqueue with `EVFILT_USER`.
 
 const std = @import("std");
 const builtin = @import("builtin");
@@ -66,6 +71,17 @@ const Operation = ifc.Operation;
 const Result = ifc.Result;
 const Callback = ifc.Callback;
 const CallbackAction = ifc.CallbackAction;
+const posix_file_pool = @import("posix_file_pool.zig");
+const PosixFilePool = posix_file_pool.PosixFilePool;
+const FileOp = posix_file_pool.FileOp;
+const PoolCompleted = posix_file_pool.Completed;
+
+const evfilt_user: i16 = switch (builtin.target.os.tag) {
+    .netbsd => 8,
+    else => if (@hasDecl(std.c, "EVFILT")) std.c.EVFILT.USER else 0,
+};
+const note_trigger: u32 = 0x01000000;
+const waker_ident: usize = 0xFADEFADE;
 
 /// True when the current target supports kqueue. Same gate as KqueuePosixIO
 /// — keeps the file compilable on Linux while letting Zig's lazy semantic
@@ -120,6 +136,12 @@ fn fileKindToDirentType(kind: std.fs.File.Kind) u8 {
 
 const sentinel_index: u32 = std.math.maxInt(u32);
 
+const PosixCopyFileSessionState = struct {
+    open: bool = false,
+    copy_in_flight: bool = false,
+    poisoned: bool = false,
+};
+
 // ── Configuration ─────────────────────────────────────────
 
 pub const Config = struct {
@@ -135,6 +157,11 @@ pub const Config = struct {
     /// Whether to issue `madvise(WILLNEED)` after mmap. Darwin lacks
     /// `MAP_POPULATE`; this is the closest equivalent.
     advise_willneed: bool = true,
+    /// Worker pool used by semantic file-copy and metadata ops. The mmap
+    /// strategy keeps normal read/write on mappings, but copy sessions and
+    /// fchown/fchmod must not run blocking syscalls on the event-loop thread.
+    file_pool_workers: u32 = 4,
+    file_pool_pending_capacity: u32 = 256,
 };
 
 // ── Pending change / completed entries ────────────────────
@@ -205,6 +232,9 @@ pub const KqueueMmapIO = struct {
 
     cfg: Config,
     allocator: std.mem.Allocator,
+    pool: *PosixFilePool,
+    pool_swap: std.ArrayListUnmanaged(PoolCompleted) = .{},
+    pool_in_flight: u32 = 0,
 
     pub fn init(allocator: std.mem.Allocator, cfg: Config) !KqueueMmapIO {
         if (comptime !is_kqueue_platform) return error.UnsupportedPlatform;
@@ -212,10 +242,27 @@ pub const KqueueMmapIO = struct {
         const kq = try posix.kqueue();
         errdefer posix.close(kq);
 
+        const pool = try PosixFilePool.create(allocator, .{
+            .worker_count = cfg.file_pool_workers,
+            .pending_capacity = cfg.file_pool_pending_capacity,
+        });
+        errdefer pool.deinit();
+
+        var change: [1]posix.Kevent = .{.{
+            .ident = waker_ident,
+            .filter = evfilt_user,
+            .flags = std.c.EV.ADD | std.c.EV.ENABLE | std.c.EV.CLEAR,
+            .fflags = 0,
+            .data = 0,
+            .udata = 0,
+        }};
+        _ = try posix.kevent(kq, &change, &.{}, null);
+
         var self = KqueueMmapIO{
             .kq = kq,
             .cfg = cfg,
             .allocator = allocator,
+            .pool = pool,
         };
 
         try self.pending_changes.ensureTotalCapacity(allocator, cfg.pending_capacity);
@@ -229,7 +276,28 @@ pub const KqueueMmapIO = struct {
         return self;
     }
 
+    pub fn bindWakeup(self: *KqueueMmapIO) void {
+        self.pool.setWakeup(self, wakeFromPool);
+    }
+
+    fn wakeFromPool(ctx: ?*anyopaque) void {
+        if (comptime !is_kqueue_platform) return;
+        const self: *KqueueMmapIO = @ptrCast(@alignCast(ctx.?));
+        var change: [1]posix.Kevent = .{.{
+            .ident = waker_ident,
+            .filter = evfilt_user,
+            .flags = 0,
+            .fflags = note_trigger,
+            .data = 0,
+            .udata = 0,
+        }};
+        _ = posix.kevent(self.kq, &change, &.{}, null) catch {};
+    }
+
     pub fn deinit(self: *KqueueMmapIO) void {
+        self.pool.deinit();
+        self.pool_swap.deinit(self.allocator);
+
         // Unmap before closing the kqueue fd. Callers are responsible
         // for closing the underlying file fds (the contract has no
         // close-file hook); our mappings outlive the fds in the worst
@@ -260,6 +328,7 @@ pub const KqueueMmapIO = struct {
 
         const now = monotonicNs();
         try self.expireTimers(now);
+        try self.drainPool();
         self.drainCompleted();
 
         var change_buf: [256]posix.Kevent = undefined;
@@ -305,6 +374,7 @@ pub const KqueueMmapIO = struct {
         try self.expireTimers(monotonicNs());
 
         for (event_buf[0..got]) |ev| {
+            if (ev.filter == evfilt_user and ev.ident == waker_ident) continue;
             const c: *Completion = @ptrFromInt(ev.udata);
             const st = kqueueState(c);
             st.parked_filter = 0;
@@ -315,10 +385,40 @@ pub const KqueueMmapIO = struct {
             try self.retrySyscall(c, ev);
         }
 
+        try self.drainPool();
         self.drainCompleted();
     }
 
     // ── Internal: completed queue + dispatch ───────────────
+
+    fn drainPool(self: *KqueueMmapIO) !void {
+        try self.pool.drainCompletedInto(&self.pool_swap);
+        defer self.pool_swap.clearRetainingCapacity();
+        for (self.pool_swap.items) |entry| {
+            self.dispatchPoolEntry(entry);
+        }
+    }
+
+    fn dispatchPoolEntry(self: *KqueueMmapIO, entry: PoolCompleted) void {
+        const c = entry.completion;
+        const cb = c.callback orelse return;
+        kqueueState(c).in_flight = false;
+        self.pool_in_flight -|= 1;
+        switch (c.op) {
+            .copy_file_chunk => |op| op.session.backendStateAs(PosixCopyFileSessionState).copy_in_flight = false,
+            else => {},
+        }
+        const action = cb(c.userdata, c, entry.result);
+        switch (action) {
+            .disarm => {},
+            .rearm => switch (c.op) {
+                .copy_file_chunk => |op| self.copy_file_chunk(op, c, c.userdata, cb) catch {},
+                .fchown => |op| self.fchown(op, c, c.userdata, cb) catch {},
+                .fchmod => |op| self.fchmod(op, c, c.userdata, cb) catch {},
+                else => {},
+            },
+        }
+    }
 
     fn drainCompleted(self: *KqueueMmapIO) void {
         while (self.completed.items.len > 0) {
@@ -365,6 +465,11 @@ pub const KqueueMmapIO = struct {
             .unlinkat => |op| try self.unlinkat(op, c, ud, cb),
             .statx => |op| try self.statx(op, c, ud, cb),
             .getdents => |op| try self.getdents(op, c, ud, cb),
+            .open_copy_file_session => |op| try self.open_copy_file_session(op, c, ud, cb),
+            .copy_file_chunk => |op| try self.copy_file_chunk(op, c, ud, cb),
+            .close_copy_file_session => |op| try self.close_copy_file_session(op, c, ud, cb),
+            .fchown => |op| try self.fchown(op, c, ud, cb),
+            .fchmod => |op| try self.fchmod(op, c, ud, cb),
             .bind => |op| try self.bind(op, c, ud, cb),
             .listen => |op| try self.listen(op, c, ud, cb),
             .setsockopt => |op| try self.setsockopt(op, c, ud, cb),
@@ -913,6 +1018,14 @@ pub const KqueueMmapIO = struct {
             tst.cancelled = true;
             self.pushCompleted(target, makeCancelledResult(target.op));
             found = true;
+        } else {
+            const target_is_pool_op = switch (target.op) {
+                .copy_file_chunk, .fchown, .fchmod => true,
+                else => false,
+            };
+            if (target_is_pool_op and self.pool.tryCancelPending(target)) {
+                found = true;
+            }
         }
 
         const result: anyerror!void = if (found) {} else error.OperationNotFound;
@@ -1049,34 +1162,54 @@ pub const KqueueMmapIO = struct {
         self.pushCompleted(c, r);
     }
 
-    /// `splice(2)` is Linux-only. Always returns `error.OperationNotSupported`
-    /// on macOS/BSD; callers fall back to `copy_file_range` (which we
-    /// emulate with read+write below) or to a plain read/write loop.
-    pub fn splice(self: *KqueueMmapIO, op: ifc.SpliceOp, c: *Completion, ud: ?*anyopaque, cb: Callback) !void {
-        _ = op;
-        try self.armCompletion(c, .{ .splice = .{ .in_fd = -1, .in_offset = 0, .out_fd = -1, .out_offset = 0, .len = 0 } }, ud, cb);
-        self.pushCompleted(c, .{ .splice = error.OperationNotSupported });
+    pub fn open_copy_file_session(self: *KqueueMmapIO, op: ifc.OpenCopyFileSessionOp, c: *Completion, ud: ?*anyopaque, cb: Callback) !void {
+        try self.armCompletion(c, .{ .open_copy_file_session = op }, ud, cb);
+        const st = op.session.backendStateAs(PosixCopyFileSessionState);
+        if (st.copy_in_flight) return self.pushCompleted(c, .{ .open_copy_file_session = error.AlreadyInFlight });
+        if (st.open) return self.pushCompleted(c, .{ .open_copy_file_session = error.InvalidState });
+        st.* = .{ .open = true };
+        self.pushCompleted(c, .{ .open_copy_file_session = {} });
     }
 
-    /// Emulate `copy_file_range` on Darwin via a positioned read+write
-    /// pair (the daemon's MoveJob caller chunks larger transfers, so a
-    /// single bounded transfer is sufficient).
-    pub fn copy_file_range(self: *KqueueMmapIO, op: ifc.CopyFileRangeOp, c: *Completion, ud: ?*anyopaque, cb: Callback) !void {
-        try self.armCompletion(c, .{ .copy_file_range = op }, ud, cb);
-        const result: Result = blk: {
-            var stack_buf: [128 * 1024]u8 = undefined;
-            const want = @min(op.len, stack_buf.len);
-            const n_read = posix.pread(op.in_fd, stack_buf[0..want], op.in_offset) catch |err| break :blk .{ .copy_file_range = err };
-            if (n_read == 0) break :blk .{ .copy_file_range = @as(usize, 0) };
-            var written: usize = 0;
-            while (written < n_read) {
-                const w = posix.pwrite(op.out_fd, stack_buf[written..n_read], op.out_offset + written) catch |err| break :blk .{ .copy_file_range = err };
-                if (w == 0) break :blk .{ .copy_file_range = error.WriteShort };
-                written += w;
-            }
-            break :blk .{ .copy_file_range = n_read };
+    pub fn copy_file_chunk(self: *KqueueMmapIO, op: ifc.CopyFileChunkOp, c: *Completion, ud: ?*anyopaque, cb: Callback) !void {
+        try self.armCompletion(c, .{ .copy_file_chunk = op }, ud, cb);
+        const st = op.session.backendStateAs(PosixCopyFileSessionState);
+        if (!st.open or st.poisoned) return self.pushCompleted(c, .{ .copy_file_chunk = error.InvalidState });
+        if (st.copy_in_flight) return self.pushCompleted(c, .{ .copy_file_chunk = error.AlreadyInFlight });
+        if (op.len == 0) return self.pushCompleted(c, .{ .copy_file_chunk = error.InvalidArgument });
+
+        st.copy_in_flight = true;
+        self.submitFileOp(.{ .copy_file_chunk = op }, c) catch |err| {
+            st.copy_in_flight = false;
+            return err;
         };
-        self.pushCompleted(c, result);
+    }
+
+    pub fn close_copy_file_session(self: *KqueueMmapIO, op: ifc.CloseCopyFileSessionOp, c: *Completion, ud: ?*anyopaque, cb: Callback) !void {
+        try self.armCompletion(c, .{ .close_copy_file_session = op }, ud, cb);
+        const st = op.session.backendStateAs(PosixCopyFileSessionState);
+        if (st.copy_in_flight) return self.pushCompleted(c, .{ .close_copy_file_session = error.AlreadyInFlight });
+        st.* = .{};
+        self.pushCompleted(c, .{ .close_copy_file_session = {} });
+    }
+
+    pub fn fchown(self: *KqueueMmapIO, op: ifc.FchownOp, c: *Completion, ud: ?*anyopaque, cb: Callback) !void {
+        try self.armCompletion(c, .{ .fchown = op }, ud, cb);
+        try self.submitFileOp(.{ .fchown = op }, c);
+    }
+
+    pub fn fchmod(self: *KqueueMmapIO, op: ifc.FchmodOp, c: *Completion, ud: ?*anyopaque, cb: Callback) !void {
+        try self.armCompletion(c, .{ .fchmod = op }, ud, cb);
+        try self.submitFileOp(.{ .fchmod = op }, c);
+    }
+
+    fn submitFileOp(self: *KqueueMmapIO, op: FileOp, c: *Completion) !void {
+        self.pool_in_flight += 1;
+        self.pool.submit(op, c) catch |err| {
+            self.pool_in_flight -|= 1;
+            kqueueState(c).in_flight = false;
+            return err;
+        };
     }
 };
 
@@ -1127,11 +1260,14 @@ fn makeCancelledResult(op: Operation) Result {
         .unlinkat => .{ .unlinkat = error.OperationCanceled },
         .statx => .{ .statx = error.OperationCanceled },
         .getdents => .{ .getdents = error.OperationCanceled },
+        .open_copy_file_session => .{ .open_copy_file_session = error.OperationCanceled },
+        .copy_file_chunk => .{ .copy_file_chunk = error.OperationCanceled },
+        .close_copy_file_session => .{ .close_copy_file_session = error.OperationCanceled },
+        .fchown => .{ .fchown = error.OperationCanceled },
+        .fchmod => .{ .fchmod = error.OperationCanceled },
         .bind => .{ .bind = error.OperationCanceled },
         .listen => .{ .listen = error.OperationCanceled },
         .setsockopt => .{ .setsockopt = error.OperationCanceled },
-        .splice => .{ .splice = error.OperationCanceled },
-        .copy_file_range => .{ .copy_file_range = error.OperationCanceled },
         .socket => .{ .socket = error.OperationCanceled },
         .connect => .{ .connect = error.OperationCanceled },
         .accept => .{ .accept = error.OperationCanceled },

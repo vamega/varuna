@@ -151,6 +151,12 @@ pub const KqueueState = struct {
     seq: u32 = 0,
 };
 
+const PosixCopyFileSessionState = struct {
+    open: bool = false,
+    copy_in_flight: bool = false,
+    poisoned: bool = false,
+};
+
 comptime {
     assert(@sizeOf(KqueueState) <= ifc.backend_state_size);
     assert(@alignOf(KqueueState) <= ifc.backend_state_align);
@@ -475,6 +481,10 @@ pub const KqueuePosixIO = struct {
         const cb = c.callback orelse return;
         kqueueState(c).in_flight = false;
         self.pool_in_flight -|= 1;
+        switch (c.op) {
+            .copy_file_chunk => |op| op.session.backendStateAs(PosixCopyFileSessionState).copy_in_flight = false,
+            else => {},
+        }
         const action = cb(c.userdata, c, entry.result);
         switch (action) {
             .disarm => {},
@@ -484,6 +494,9 @@ pub const KqueuePosixIO = struct {
                 .fsync => |op| self.fsync(op, c, c.userdata, cb) catch {},
                 .fallocate => |op| self.fallocate(op, c, c.userdata, cb) catch {},
                 .truncate => |op| self.truncate(op, c, c.userdata, cb) catch {},
+                .copy_file_chunk => |op| self.copy_file_chunk(op, c, c.userdata, cb) catch {},
+                .fchown => |op| self.fchown(op, c, c.userdata, cb) catch {},
+                .fchmod => |op| self.fchmod(op, c, c.userdata, cb) catch {},
                 else => {}, // callback overwrote c.op with a non-file op
             },
         }
@@ -551,6 +564,11 @@ pub const KqueuePosixIO = struct {
             .unlinkat => |op| try self.unlinkat(op, c, ud, cb),
             .statx => |op| try self.statx(op, c, ud, cb),
             .getdents => |op| try self.getdents(op, c, ud, cb),
+            .open_copy_file_session => |op| try self.open_copy_file_session(op, c, ud, cb),
+            .copy_file_chunk => |op| try self.copy_file_chunk(op, c, ud, cb),
+            .close_copy_file_session => |op| try self.close_copy_file_session(op, c, ud, cb),
+            .fchown => |op| try self.fchown(op, c, ud, cb),
+            .fchmod => |op| try self.fchmod(op, c, ud, cb),
             .socket => |op| try self.socket(op, c, ud, cb),
             .connect => |op| try self.connect(op, c, ud, cb),
             .accept => |op| try self.accept(op, c, ud, cb),
@@ -1135,14 +1153,44 @@ pub const KqueuePosixIO = struct {
         try self.submitFileOp(.{ .truncate = op }, c);
     }
 
-    pub fn splice(self: *KqueuePosixIO, op: ifc.SpliceOp, c: *Completion, ud: ?*anyopaque, cb: Callback) !void {
-        try self.armCompletion(c, .{ .splice = op }, ud, cb);
-        try self.submitFileOp(.{ .splice = op }, c);
+    pub fn open_copy_file_session(self: *KqueuePosixIO, op: ifc.OpenCopyFileSessionOp, c: *Completion, ud: ?*anyopaque, cb: Callback) !void {
+        try self.armCompletion(c, .{ .open_copy_file_session = op }, ud, cb);
+        const st = op.session.backendStateAs(PosixCopyFileSessionState);
+        if (st.copy_in_flight) return self.completeInline(c, .{ .open_copy_file_session = error.AlreadyInFlight });
+        if (st.open) return self.completeInline(c, .{ .open_copy_file_session = error.InvalidState });
+        st.* = .{ .open = true };
+        self.completeInline(c, .{ .open_copy_file_session = {} });
     }
 
-    pub fn copy_file_range(self: *KqueuePosixIO, op: ifc.CopyFileRangeOp, c: *Completion, ud: ?*anyopaque, cb: Callback) !void {
-        try self.armCompletion(c, .{ .copy_file_range = op }, ud, cb);
-        try self.submitFileOp(.{ .copy_file_range = op }, c);
+    pub fn copy_file_chunk(self: *KqueuePosixIO, op: ifc.CopyFileChunkOp, c: *Completion, ud: ?*anyopaque, cb: Callback) !void {
+        try self.armCompletion(c, .{ .copy_file_chunk = op }, ud, cb);
+        const st = op.session.backendStateAs(PosixCopyFileSessionState);
+        if (!st.open or st.poisoned) return self.completeInline(c, .{ .copy_file_chunk = error.InvalidState });
+        if (st.copy_in_flight) return self.completeInline(c, .{ .copy_file_chunk = error.AlreadyInFlight });
+        if (op.len == 0) return self.completeInline(c, .{ .copy_file_chunk = error.InvalidArgument });
+        st.copy_in_flight = true;
+        self.submitFileOp(.{ .copy_file_chunk = op }, c) catch |err| {
+            st.copy_in_flight = false;
+            return err;
+        };
+    }
+
+    pub fn close_copy_file_session(self: *KqueuePosixIO, op: ifc.CloseCopyFileSessionOp, c: *Completion, ud: ?*anyopaque, cb: Callback) !void {
+        try self.armCompletion(c, .{ .close_copy_file_session = op }, ud, cb);
+        const st = op.session.backendStateAs(PosixCopyFileSessionState);
+        if (st.copy_in_flight) return self.completeInline(c, .{ .close_copy_file_session = error.AlreadyInFlight });
+        st.* = .{};
+        self.completeInline(c, .{ .close_copy_file_session = {} });
+    }
+
+    pub fn fchown(self: *KqueuePosixIO, op: ifc.FchownOp, c: *Completion, ud: ?*anyopaque, cb: Callback) !void {
+        try self.armCompletion(c, .{ .fchown = op }, ud, cb);
+        try self.submitFileOp(.{ .fchown = op }, c);
+    }
+
+    pub fn fchmod(self: *KqueuePosixIO, op: ifc.FchmodOp, c: *Completion, ud: ?*anyopaque, cb: Callback) !void {
+        try self.armCompletion(c, .{ .fchmod = op }, ud, cb);
+        try self.submitFileOp(.{ .fchmod = op }, c);
     }
 
     fn submitFileOp(self: *KqueuePosixIO, op: FileOp, c: *Completion) !void {
@@ -1152,6 +1200,16 @@ pub const KqueuePosixIO = struct {
             kqueueState(c).in_flight = false;
             return err;
         };
+    }
+
+    fn completeInline(self: *KqueuePosixIO, c: *Completion, result: Result) void {
+        kqueueState(c).in_flight = false;
+        const cb = c.callback orelse return;
+        const action = cb(c.userdata, c, result);
+        switch (action) {
+            .disarm => {},
+            .rearm => self.resubmit(c) catch {},
+        }
     }
 };
 
@@ -1203,8 +1261,11 @@ fn makeCancelledResult(op: Operation) Result {
         .unlinkat => .{ .unlinkat = error.OperationCanceled },
         .statx => .{ .statx = error.OperationCanceled },
         .getdents => .{ .getdents = error.OperationCanceled },
-        .splice => .{ .splice = error.OperationCanceled },
-        .copy_file_range => .{ .copy_file_range = error.OperationCanceled },
+        .open_copy_file_session => .{ .open_copy_file_session = error.OperationCanceled },
+        .copy_file_chunk => .{ .copy_file_chunk = error.OperationCanceled },
+        .close_copy_file_session => .{ .close_copy_file_session = error.OperationCanceled },
+        .fchown => .{ .fchown = error.OperationCanceled },
+        .fchmod => .{ .fchmod = error.OperationCanceled },
         .socket => .{ .socket = error.OperationCanceled },
         .connect => .{ .connect = error.OperationCanceled },
         .accept => .{ .accept = error.OperationCanceled },
