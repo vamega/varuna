@@ -42,7 +42,7 @@ test "KqueuePosixIO bridge: init / deinit (kqueue platforms only)" {
     try testing.expect(io.kq >= 0);
 }
 
-test "KqueuePosixIO bridge: fsync round-trips through PosixFilePool (kqueue platforms only)" {
+test "KqueuePosixIO bridge: fsync round-trips through BlockingOpPool (kqueue platforms only)" {
     if (comptime !is_kqueue_platform) return error.SkipZigTest;
     var io = try KqueuePosixIO.init(testing.allocator, .{});
     defer io.deinit();

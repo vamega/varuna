@@ -38,6 +38,15 @@ file-I/O-heavy workload — varuna's piece store, recheck verification — has t
 route those calls through a worker thread pool to keep the event loop
 responsive. This is what libxev and ZIO do, and it is unavoidable.
 
+The mmap readiness backends are a deliberate exception for page faults: a
+mapped `memcpy` can still fault and stall the event-loop thread. That risk is
+documented on the mmap backends and is not the first cleanup target. The
+blocking-syscall cleanup landed on 2026-05-06: namespace/metadata/socket setup,
+fd teardown, and mmap mapping setup now route through the backend-owned
+blocking-op pool. If profiling later shows mmap page faults are a practical
+problem and the mmap strategy is still worth keeping, the mapped copy path can
+be worker-routed as a separate mitigation.
+
 ---
 
 ## 1. EpollIO sketch (Linux fallback)
@@ -50,7 +59,7 @@ pub const EpollIO = struct {
     timer_heap: TimerHeap,                    // min-heap of pending timeouts
     eventfd_wakeup: posix.fd_t,               // wake epoll_wait from another thread
     pending_socket_ops: SockOpQueue,          // ops parked on EAGAIN
-    file_pool: ?*ThreadPool,                  // for read/write/fsync/fallocate
+    blocking_pool: ?*ThreadPool,              // blocking syscall-shaped ops
     completed: Queue(*Completion),            // ready-to-fire callbacks
     // ... bookkeeping for active counts, in_flight markers
 };
@@ -65,7 +74,7 @@ retry their syscall, and on success deliver via the callback path.
 
 | Op | Path | Notes |
 |---|---|---|
-| `socket` | inline `posix.socket(SOCK_NONBLOCK\|SOCK_CLOEXEC)` | Result delivered same tick; no epoll involved. Equivalent to `IORING_OP_SOCKET` returning a CQE before the next `tick`. |
+| `socket` | Blocking-op pool. Worker creates `SOCK_NONBLOCK\|SOCK_CLOEXEC`; completion wakes epoll via `eventfd`. | Socket creation can still hit blocking fd-allocation paths, so it follows the pool rule with bind/listen/setsockopt. |
 | `connect` | non-blocking `connect`; `EINPROGRESS` → register fd for `EPOLLOUT`; on readiness, `getsockopt(SO_ERROR)` to capture connect outcome. | `deadline_ns` implemented via the existing timer heap (cancel the connect's parked entry on timeout). |
 | `accept` (single-shot) | non-blocking `accept4`; `EAGAIN` → register `EPOLLIN`. | After delivery, `accept_multishot=false` honors `.disarm`/`.rearm` like RealIO. |
 | `accept` (multishot) | Loop: `accept4` until `EAGAIN`, deliver each fd as a separate callback invocation, then re-register `EPOLLIN` and wait for the next ready edge. | Native multishot doesn't exist on epoll. The contract's `multishot: bool` flag is honored semantically. |
@@ -75,7 +84,7 @@ retry their syscall, and on success deliver via the callback path.
 | `fsync` / `fallocate` | Thread pool. | Same reasoning. |
 | `timeout` | Insert into `timer_heap`; deadline drives the next `epoll_wait` timeout argument. | No timerfd needed for the heap-based design (libxev uses this approach too). A timerfd is still useful if the heap grows large; not required for first cut. |
 | `poll` | Register fd for `op.events`; deliver `revents` from `epoll_event.events`. | Direct, native mapping. |
-| `cancel` | Best-effort. Find target completion in `pending_socket_ops` or `timer_heap`; remove it; deliver `error.OperationCanceled` on the target completion and `void` on the cancel completion. If the target is in flight on a worker thread (file op), mark a "cancelled" flag and let the worker see it on its way back. | Cannot truly interrupt a syscall in progress on a worker thread. Document as a best-effort semantic. |
+| `cancel` | Best-effort. Find target completion in `pending_socket_ops`, `timer_heap`, or the blocking-op pool; remove it when still pending; deliver `error.OperationCanceled` on the target completion and `void` on the cancel completion. If the target is already running on a worker thread, let its real result arrive when the worker finishes. | Cannot truly interrupt a syscall in progress on a worker thread. Document as a best-effort semantic. |
 
 ### 1.3 Subtleties
 
@@ -88,9 +97,9 @@ retry their syscall, and on success deliver via the callback path.
 - **fd lifetime.** Closing an fd while it is still in epoll is a known Linux
   footgun; remove via `EPOLL_CTL_DEL` before close. RealIO doesn't have this
   concern because the SQE/CQE pair self-tracks.
-- **Wakeup eventfd.** Required so background threads (the file-op pool, DNS,
-  SQLite) can wake `epoll_wait` deterministically when they push completions
-  to `completed`.
+- **Wakeup eventfd.** Required so background threads (the blocking-op pool,
+  DNS, SQLite) can wake `epoll_wait` deterministically when they push
+  completions to `completed`.
 - **Per-completion backend state.** Fits in `_backend_state` (64 bytes). State
   needed: linkage in pending queues + a "registered with epoll" flag + the
   retry callback. ~24-32 bytes — well under budget.
@@ -124,7 +133,7 @@ Mirrors EpollIO with three substitutions:
 
 | Op | Path | Notes |
 |---|---|---|
-| `socket` | inline `posix.socket`. Set `SOCK_NONBLOCK` via `fcntl(F_SETFL, O_NONBLOCK)` and `FD_CLOEXEC` via `fcntl(F_SETFD)` — macOS lacks `accept4`/`SOCK_NONBLOCK`/`SOCK_CLOEXEC` flags. | Two extra fcntls per socket. |
+| `socket` | Blocking-op pool. Worker calls `posix.socket`, then sets nonblocking and close-on-exec with `fcntl`. | macOS lacks `SOCK_NONBLOCK`/`SOCK_CLOEXEC` flags; keep those fcntls off the event-loop thread. |
 | `connect` | Non-blocking connect; on `EINPROGRESS` register with `EVFILT_WRITE` + `EV_ONESHOT`. On readiness, `getsockopt(SO_ERROR)`. | Same shape as epoll. `deadline_ns` via timer heap. |
 | `accept` | Register `EVFILT_READ` with `EV_ONESHOT`; on fire, accept-until-`EAGAIN`. fcntl the accepted fds non-blocking. | Multishot semantics emulated identically to EpollIO. |
 | `recv` / `send` | Non-blocking syscall; `EAGAIN` → register `EVFILT_READ` / `EVFILT_WRITE`. | Identical pattern. |
@@ -214,7 +223,7 @@ flags or external synchronisation). epoll fds and kqueue fds have similar
 norms. The current event-loop thread is the only thread that should own the
 backend's primary fd, with explicit wakeup mechanisms (`eventfd` on Linux,
 `EVFILT_USER` or Mach port on macOS) for cross-thread completions from the
-file-op pool / DNS / SQLite.
+blocking-op pool / DNS / SQLite.
 
 No contract change required — single-threaded ownership is already the
 operating model.

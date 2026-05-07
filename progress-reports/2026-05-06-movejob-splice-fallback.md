@@ -18,7 +18,7 @@
 
 - Consider `copy_file_range` on a backend threadpool only if profiling finds a concrete reason.
 - Investigate whether timestamp, xattr, and ACL preservation are needed for relocation fidelity.
-- Migrate remaining older RealIO synchronous fallback paths onto the ready-completion queue so fallback callbacks do not fire inline.
+- Completed after this report: older RealIO synchronous fallback callbacks now complete through the ready queue instead of firing inline; see `progress-reports/2026-05-06-realio-ready-fallbacks.md`.
 - `remove_delete_files` still needs its own event-loop delete job.
 - Peer `getpeername` and per-peer socket option setup remain separate IO-contract cleanup candidates.
 

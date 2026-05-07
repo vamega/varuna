@@ -64,14 +64,15 @@
 //!   - Lifecycle: init / deinit / tick / closeSocket / bindWakeup
 //!   - Timers: heap-of-deadlines + `timeout` op
 //!   - Cancellation: best-effort `cancel` op (timer / kevent / pool)
-//!   - Socket lifecycle: `socket` (sync), `connect` (with deadline),
+//!   - Socket lifecycle: `socket` (pool-routed), `connect` (with deadline),
 //!     `accept` (single-shot + multishot emulation)
 //!   - Stream IO: `recv`, `send`
 //!   - Datagram IO: `recvmsg`, `sendmsg`
 //!   - Readiness: `poll`
-//!   - File ops: `read`, `write`, `fsync`, `fallocate`, `truncate`
-//!     routed through `PosixFilePool`. Workers signal back via
-//!     `EVFILT_USER` + `NOTE_TRIGGER` so `kevent()` returns. See
+//!   - Blocking syscall-shaped ops: `read`, `write`, `fsync`, `fallocate`,
+//!     `truncate`, namespace/metadata ops, and socket setup routed through
+//!     `BlockingOpPool`. Workers signal back via `EVFILT_USER` +
+//!     `NOTE_TRIGGER` so `kevent()` returns. See
 //!     `src/io/posix_file_pool.zig` for the pool itself; `EpollPosixIO`
 //!     uses the same pool with eventfd as the wake primitive.
 //!
@@ -99,8 +100,8 @@ const Result = ifc.Result;
 const Callback = ifc.Callback;
 const CallbackAction = ifc.CallbackAction;
 const posix_file_pool = @import("posix_file_pool.zig");
-const PosixFilePool = posix_file_pool.PosixFilePool;
-const FileOp = posix_file_pool.FileOp;
+const BlockingOpPool = posix_file_pool.BlockingOpPool;
+const BlockingOp = posix_file_pool.BlockingOp;
 const PoolCompleted = posix_file_pool.Completed;
 
 // EVFILT_USER + NOTE_TRIGGER constants used to wake `kevent()` from
@@ -195,11 +196,11 @@ pub const Config = struct {
     /// `kevent()` in a single call. Mirrors tigerbeetle's 256.
     change_batch: u32 = 256,
 
-    /// Number of worker threads in the file-op pool. Default 4 mirrors
+    /// Number of worker threads in the blocking-op pool. Default 4 mirrors
     /// `hasher.zig`. Set to 0 only in tests that want inline-mode op
     /// execution.
     file_pool_workers: u32 = 4,
-    /// Bound on outstanding file ops awaiting worker pickup. `submit`
+    /// Bound on outstanding blocking ops awaiting worker pickup. `submit`
     /// returns `error.PendingQueueFull` past this.
     file_pool_pending_capacity: u32 = 256,
 };
@@ -262,13 +263,13 @@ pub const KqueuePosixIO = struct {
     cfg: Config,
     allocator: std.mem.Allocator,
 
-    /// File-op worker thread pool. read/write/fsync/fallocate/truncate
-    /// route here; workers signal via NOTE_TRIGGER on the registered
-    /// EVFILT_USER kevent.
-    pool: *PosixFilePool,
+    /// Blocking-op worker thread pool. Regular-file operations and blocking
+    /// namespace/metadata/socket setup syscalls run here. Workers signal via
+    /// NOTE_TRIGGER on the registered EVFILT_USER kevent.
+    pool: *BlockingOpPool,
     /// Scratch buffer reused across ticks for `pool.drainCompletedInto`.
     pool_swap: std.ArrayListUnmanaged(PoolCompleted) = .{},
-    /// Counts file ops in flight on the pool. Used by the kevent
+    /// Counts blocking ops in flight on the pool. Used by the kevent
     /// timeout calc so we wait for the EVFILT_USER wake when the
     /// readiness side has nothing else to do.
     pool_in_flight: u32 = 0,
@@ -279,7 +280,7 @@ pub const KqueuePosixIO = struct {
         const kq = try posix.kqueue();
         errdefer posix.close(kq);
 
-        const pool = try PosixFilePool.create(allocator, .{
+        const pool = try BlockingOpPool.create(allocator, .{
             .worker_count = cfg.file_pool_workers,
             .pending_capacity = cfg.file_pool_pending_capacity,
         });
@@ -314,14 +315,14 @@ pub const KqueuePosixIO = struct {
         return self;
     }
 
-    /// Bind the file-op pool's wakeup callback to this kqueue. Must be
+    /// Bind the blocking-op pool's wakeup callback to this kqueue. Must be
     /// called after `init` (which returns by value, so we need a stable
     /// `*KqueuePosixIO` for the wake closure to address).
     pub fn bindWakeup(self: *KqueuePosixIO) void {
         self.pool.setWakeup(self, wakeFromPool);
     }
 
-    /// Wakeup hook handed to the file-op pool. Workers invoke this
+    /// Wakeup hook handed to the blocking-op pool. Workers invoke this
     /// after pushing a result; a NOTE_TRIGGER on the registered
     /// EVFILT_USER ident makes `kevent()` return so `tick` drains the
     /// pool's completed queue.
@@ -355,10 +356,11 @@ pub const KqueuePosixIO = struct {
         self.* = undefined;
     }
 
-    /// Synchronous fd close. Symmetric with `RealIO.closeSocket` so
-    /// `EventLoop.deinit` can call it uniformly.
-    pub fn closeSocket(_: *KqueuePosixIO, fd: posix.fd_t) void {
-        posix.close(fd);
+    /// Fire-and-forget fd close used by legacy socket teardown paths.
+    pub fn closeSocket(self: *KqueuePosixIO, fd: posix.fd_t) void {
+        self.pool.submitDetached(.{ .close = .{ .fd = fd } }) catch {
+            posix.close(fd);
+        };
     }
 
     /// Drive the loop forward by one batch:
@@ -378,7 +380,7 @@ pub const KqueuePosixIO = struct {
         // Expire any timers whose deadline has passed.
         try self.expireTimers(now);
 
-        // Drain the file-op pool first so any callbacks they fire land
+        // Drain the blocking-op pool first so any callbacks they fire land
         // alongside synchronous completions in a single tick. Pool
         // completions go through `dispatchPoolEntry` (separate from
         // `drainCompleted` because pool entries already carry a
@@ -440,7 +442,7 @@ pub const KqueuePosixIO = struct {
 
         // Process ready events.
         for (event_buf[0..got]) |ev| {
-            // Cross-thread wake from the file-op pool. The pool's
+            // Cross-thread wake from the blocking-op pool. The pool's
             // workers have pushed results onto `pool.completed`; the
             // post-loop `drainPool` call below picks them up.
             if (ev.filter == evfilt_user and ev.ident == waker_ident) continue;
@@ -492,11 +494,22 @@ pub const KqueuePosixIO = struct {
                 .read => |op| self.read(op, c, c.userdata, cb) catch {},
                 .write => |op| self.write(op, c, c.userdata, cb) catch {},
                 .fsync => |op| self.fsync(op, c, c.userdata, cb) catch {},
+                .close => |op| self.close(op, c, c.userdata, cb) catch {},
                 .fallocate => |op| self.fallocate(op, c, c.userdata, cb) catch {},
                 .truncate => |op| self.truncate(op, c, c.userdata, cb) catch {},
+                .openat => |op| self.openat(op, c, c.userdata, cb) catch {},
+                .mkdirat => |op| self.mkdirat(op, c, c.userdata, cb) catch {},
+                .renameat => |op| self.renameat(op, c, c.userdata, cb) catch {},
+                .unlinkat => |op| self.unlinkat(op, c, c.userdata, cb) catch {},
+                .statx => |op| self.statx(op, c, c.userdata, cb) catch {},
+                .getdents => |op| self.getdents(op, c, c.userdata, cb) catch {},
                 .copy_file_chunk => |op| self.copy_file_chunk(op, c, c.userdata, cb) catch {},
                 .fchown => |op| self.fchown(op, c, c.userdata, cb) catch {},
                 .fchmod => |op| self.fchmod(op, c, c.userdata, cb) catch {},
+                .socket => |op| self.socket(op, c, c.userdata, cb) catch {},
+                .bind => |op| self.bind(op, c, c.userdata, cb) catch {},
+                .listen => |op| self.listen(op, c, c.userdata, cb) catch {},
+                .setsockopt => |op| self.setsockopt(op, c, c.userdata, cb) catch {},
                 else => {}, // callback overwrote c.op with a non-file op
             },
         }
@@ -806,128 +819,54 @@ pub const KqueuePosixIO = struct {
         try self.pushTimer(deadline, c);
     }
 
-    /// Synchronous fallback. kqueue has no equivalent ring; bind is a
-    /// fast in-kernel call so we run it inline and post the result via
-    /// the completed queue.
     pub fn bind(self: *KqueuePosixIO, op: ifc.BindOp, c: *Completion, ud: ?*anyopaque, cb: Callback) !void {
         try self.armCompletion(c, .{ .bind = op }, ud, cb);
-        const result: Result = if (posix.bind(op.fd, &op.addr.any, op.addr.getOsSockLen())) |_|
-            .{ .bind = {} }
-        else |err|
-            .{ .bind = err };
-        self.pushCompleted(c, result);
+        try self.submitBlockingOp(.{ .bind = op }, c);
     }
 
     pub fn listen(self: *KqueuePosixIO, op: ifc.ListenOp, c: *Completion, ud: ?*anyopaque, cb: Callback) !void {
         try self.armCompletion(c, .{ .listen = op }, ud, cb);
-        const result: Result = if (posix.listen(op.fd, op.backlog)) |_|
-            .{ .listen = {} }
-        else |err|
-            .{ .listen = err };
-        self.pushCompleted(c, result);
+        try self.submitBlockingOp(.{ .listen = op }, c);
     }
 
     pub fn setsockopt(self: *KqueuePosixIO, op: ifc.SetsockoptOp, c: *Completion, ud: ?*anyopaque, cb: Callback) !void {
         try self.armCompletion(c, .{ .setsockopt = op }, ud, cb);
-        const result: Result = if (posix.setsockopt(op.fd, @intCast(op.level), op.optname, op.optval)) |_|
-            .{ .setsockopt = {} }
-        else |err|
-            .{ .setsockopt = err };
-        self.pushCompleted(c, result);
+        try self.submitBlockingOp(.{ .setsockopt = op }, c);
     }
 
     pub fn openat(self: *KqueuePosixIO, op: ifc.OpenAtOp, c: *Completion, ud: ?*anyopaque, cb: Callback) !void {
         try self.armCompletion(c, .{ .openat = op }, ud, cb);
-        const result: Result = if (posix.openat(op.dir_fd, op.path, op.flags, op.mode)) |fd|
-            .{ .openat = fd }
-        else |err|
-            .{ .openat = err };
-        self.pushCompleted(c, result);
+        try self.submitBlockingOp(.{ .openat = op }, c);
     }
 
     pub fn mkdirat(self: *KqueuePosixIO, op: ifc.MkdirAtOp, c: *Completion, ud: ?*anyopaque, cb: Callback) !void {
         try self.armCompletion(c, .{ .mkdirat = op }, ud, cb);
-        const result: Result = if (posix.mkdirat(op.dir_fd, op.path, op.mode)) |_|
-            .{ .mkdirat = {} }
-        else |err|
-            .{ .mkdirat = err };
-        self.pushCompleted(c, result);
+        try self.submitBlockingOp(.{ .mkdirat = op }, c);
     }
 
     pub fn renameat(self: *KqueuePosixIO, op: ifc.RenameAtOp, c: *Completion, ud: ?*anyopaque, cb: Callback) !void {
         try self.armCompletion(c, .{ .renameat = op }, ud, cb);
-        const result: Result = if (op.flags != 0)
-            .{ .renameat = error.OperationNotSupported }
-        else if (posix.renameat(op.old_dir_fd, op.old_path, op.new_dir_fd, op.new_path)) |_|
-            .{ .renameat = {} }
-        else |err|
-            .{ .renameat = err };
-        self.pushCompleted(c, result);
+        try self.submitBlockingOp(.{ .renameat = op }, c);
     }
 
     pub fn unlinkat(self: *KqueuePosixIO, op: ifc.UnlinkAtOp, c: *Completion, ud: ?*anyopaque, cb: Callback) !void {
         try self.armCompletion(c, .{ .unlinkat = op }, ud, cb);
-        const result: Result = if (posix.unlinkat(op.dir_fd, op.path, op.flags)) |_|
-            .{ .unlinkat = {} }
-        else |err|
-            .{ .unlinkat = err };
-        self.pushCompleted(c, result);
+        try self.submitBlockingOp(.{ .unlinkat = op }, c);
     }
 
     pub fn statx(self: *KqueuePosixIO, op: ifc.StatxOp, c: *Completion, ud: ?*anyopaque, cb: Callback) !void {
         try self.armCompletion(c, .{ .statx = op }, ud, cb);
-        const result: Result = if (posix.fstatatZ(op.dir_fd, op.path, op.flags)) |st| blk: {
-            op.buf.* = std.mem.zeroes(linux.Statx);
-            op.buf.mask = op.mask & linux.STATX_BASIC_STATS;
-            op.buf.blksize = @intCast(@max(st.blksize, 0));
-            op.buf.nlink = @intCast(@max(st.nlink, 0));
-            op.buf.uid = @intCast(st.uid);
-            op.buf.gid = @intCast(st.gid);
-            op.buf.mode = @intCast(st.mode);
-            op.buf.ino = @intCast(@max(st.ino, 0));
-            op.buf.size = @intCast(@max(st.size, 0));
-            op.buf.blocks = @intCast(@max(st.blocks, 0));
-            break :blk .{ .statx = {} };
-        } else |err| .{ .statx = err };
-        self.pushCompleted(c, result);
+        try self.submitBlockingOp(.{ .statx = op }, c);
     }
 
     pub fn getdents(self: *KqueuePosixIO, op: ifc.GetdentsOp, c: *Completion, ud: ?*anyopaque, cb: Callback) !void {
         try self.armCompletion(c, .{ .getdents = op }, ud, cb);
-        var dir: std.fs.Dir = .{ .fd = op.fd };
-        var iter = dir.iterateAssumeFirstIteration();
-        var out: usize = 0;
-        var index: usize = 0;
-        const result: Result = blk: {
-            while (true) {
-                const maybe_entry = iter.next() catch |err| break :blk .{ .getdents = err };
-                const entry = maybe_entry orelse break :blk .{ .getdents = out };
-                const next = ifc.appendDirent64(op.buf, out, @as(u64, index + 1), @as(u64, index + 1), fileKindToDirentType(entry.kind), entry.name) orelse {
-                    if (out == 0) break :blk .{ .getdents = error.InvalidArgument };
-                    break :blk .{ .getdents = out };
-                };
-                out = next;
-                index += 1;
-            }
-        };
-        self.pushCompleted(c, result);
+        try self.submitBlockingOp(.{ .getdents = op }, c);
     }
 
     pub fn socket(self: *KqueuePosixIO, op: ifc.SocketOp, c: *Completion, ud: ?*anyopaque, cb: Callback) !void {
         try self.armCompletion(c, .{ .socket = op }, ud, cb);
-        // macOS lacks SOCK_NONBLOCK / SOCK_CLOEXEC flags. Open the socket
-        // first, then fcntl.
-        const result: Result = blk: {
-            const fd = posix.socket(@intCast(op.domain), @intCast(op.sock_type), @intCast(op.protocol)) catch |err| {
-                break :blk .{ .socket = err };
-            };
-            setNonblockCloexec(fd) catch |err| {
-                posix.close(fd);
-                break :blk .{ .socket = err };
-            };
-            break :blk .{ .socket = fd };
-        };
-        self.pushCompleted(c, result);
+        try self.submitBlockingOp(.{ .socket = op }, c);
     }
 
     pub fn connect(self: *KqueuePosixIO, op: ifc.ConnectOp, c: *Completion, ud: ?*anyopaque, cb: Callback) !void {
@@ -964,7 +903,7 @@ pub const KqueuePosixIO = struct {
         const accepted = posix.accept(op.fd, @ptrCast(&addr), &addrlen, 0);
         if (accepted) |fd| {
             setNonblockCloexec(fd) catch |err| {
-                posix.close(fd);
+                self.closeSocket(fd);
                 self.pushCompleted(c, .{ .accept = err });
                 return;
             };
@@ -1079,7 +1018,7 @@ pub const KqueuePosixIO = struct {
         //   * Parked on kevent → mark cancelled; tick will deliver
         //     OperationCanceled when the filter fires (or never, if it
         //     doesn't — this is the "best-effort" gap from the design doc).
-        //   * Pending on the file-op pool → tryCancelPending pulls it
+        //   * Pending on the blocking-op pool → tryCancelPending pulls it
         //     off the queue and pushes Cancelled. Workers that have
         //     already picked up the op cannot be interrupted.
         //   * Already completed / not in flight → OperationNotFound.
@@ -1098,7 +1037,26 @@ pub const KqueuePosixIO = struct {
             found = true;
         } else {
             const target_is_file = switch (target.op) {
-                .read, .write, .fsync, .fallocate, .truncate => true,
+                .read,
+                .write,
+                .fsync,
+                .close,
+                .fallocate,
+                .truncate,
+                .openat,
+                .mkdirat,
+                .renameat,
+                .unlinkat,
+                .statx,
+                .getdents,
+                .copy_file_chunk,
+                .fchown,
+                .fchmod,
+                .socket,
+                .bind,
+                .listen,
+                .setsockopt,
+                => true,
                 else => false,
             };
             if (target_is_file and self.pool.tryCancelPending(target)) {
@@ -1114,7 +1072,7 @@ pub const KqueuePosixIO = struct {
         self.pushCompleted(c, .{ .cancel = result });
     }
 
-    // ── File ops (PosixFilePool-routed) ───────────────────
+    // ── Blocking-op pool submissions ──────────────────────
     //
     // kevent reports regular files as always-ready; the actual
     // `pread`/`pwrite`/`fsync`/etc. syscall blocks on page faults. We
@@ -1125,32 +1083,32 @@ pub const KqueuePosixIO = struct {
 
     pub fn read(self: *KqueuePosixIO, op: ifc.ReadOp, c: *Completion, ud: ?*anyopaque, cb: Callback) !void {
         try self.armCompletion(c, .{ .read = op }, ud, cb);
-        try self.submitFileOp(.{ .read = op }, c);
+        try self.submitBlockingOp(.{ .read = op }, c);
     }
 
     pub fn write(self: *KqueuePosixIO, op: ifc.WriteOp, c: *Completion, ud: ?*anyopaque, cb: Callback) !void {
         try self.armCompletion(c, .{ .write = op }, ud, cb);
-        try self.submitFileOp(.{ .write = op }, c);
+        try self.submitBlockingOp(.{ .write = op }, c);
     }
 
     pub fn fsync(self: *KqueuePosixIO, op: ifc.FsyncOp, c: *Completion, ud: ?*anyopaque, cb: Callback) !void {
         try self.armCompletion(c, .{ .fsync = op }, ud, cb);
-        try self.submitFileOp(.{ .fsync = op }, c);
+        try self.submitBlockingOp(.{ .fsync = op }, c);
     }
 
     pub fn close(self: *KqueuePosixIO, op: ifc.CloseOp, c: *Completion, ud: ?*anyopaque, cb: Callback) !void {
         try self.armCompletion(c, .{ .close = op }, ud, cb);
-        try self.submitFileOp(.{ .close = op }, c);
+        try self.submitBlockingOp(.{ .close = op }, c);
     }
 
     pub fn fallocate(self: *KqueuePosixIO, op: ifc.FallocateOp, c: *Completion, ud: ?*anyopaque, cb: Callback) !void {
         try self.armCompletion(c, .{ .fallocate = op }, ud, cb);
-        try self.submitFileOp(.{ .fallocate = op }, c);
+        try self.submitBlockingOp(.{ .fallocate = op }, c);
     }
 
     pub fn truncate(self: *KqueuePosixIO, op: ifc.TruncateOp, c: *Completion, ud: ?*anyopaque, cb: Callback) !void {
         try self.armCompletion(c, .{ .truncate = op }, ud, cb);
-        try self.submitFileOp(.{ .truncate = op }, c);
+        try self.submitBlockingOp(.{ .truncate = op }, c);
     }
 
     pub fn open_copy_file_session(self: *KqueuePosixIO, op: ifc.OpenCopyFileSessionOp, c: *Completion, ud: ?*anyopaque, cb: Callback) !void {
@@ -1169,7 +1127,7 @@ pub const KqueuePosixIO = struct {
         if (st.copy_in_flight) return self.completeInline(c, .{ .copy_file_chunk = error.AlreadyInFlight });
         if (op.len == 0) return self.completeInline(c, .{ .copy_file_chunk = error.InvalidArgument });
         st.copy_in_flight = true;
-        self.submitFileOp(.{ .copy_file_chunk = op }, c) catch |err| {
+        self.submitBlockingOp(.{ .copy_file_chunk = op }, c) catch |err| {
             st.copy_in_flight = false;
             return err;
         };
@@ -1185,15 +1143,15 @@ pub const KqueuePosixIO = struct {
 
     pub fn fchown(self: *KqueuePosixIO, op: ifc.FchownOp, c: *Completion, ud: ?*anyopaque, cb: Callback) !void {
         try self.armCompletion(c, .{ .fchown = op }, ud, cb);
-        try self.submitFileOp(.{ .fchown = op }, c);
+        try self.submitBlockingOp(.{ .fchown = op }, c);
     }
 
     pub fn fchmod(self: *KqueuePosixIO, op: ifc.FchmodOp, c: *Completion, ud: ?*anyopaque, cb: Callback) !void {
         try self.armCompletion(c, .{ .fchmod = op }, ud, cb);
-        try self.submitFileOp(.{ .fchmod = op }, c);
+        try self.submitBlockingOp(.{ .fchmod = op }, c);
     }
 
-    fn submitFileOp(self: *KqueuePosixIO, op: FileOp, c: *Completion) !void {
+    fn submitBlockingOp(self: *KqueuePosixIO, op: BlockingOp, c: *Completion) !void {
         self.pool_in_flight += 1;
         self.pool.submit(op, c) catch |err| {
             self.pool_in_flight -|= 1;

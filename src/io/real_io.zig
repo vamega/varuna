@@ -25,6 +25,10 @@ const Result = ifc.Result;
 const Callback = ifc.Callback;
 const CallbackAction = ifc.CallbackAction;
 const ring_mod = @import("ring.zig");
+const posix_file_pool = @import("posix_file_pool.zig");
+const BlockingOpPool = posix_file_pool.BlockingOpPool;
+const BlockingOp = posix_file_pool.BlockingOp;
+const PoolCompleted = posix_file_pool.Completed;
 
 // ── Backend state ─────────────────────────────────────────
 //
@@ -66,6 +70,8 @@ inline fn realState(c: *Completion) *RealState {
 /// deadline-bounded connect. The CQE for the timeout is silently consumed.
 /// (`@intFromPtr(null)` is 0 which would also collide with anything else.)
 const link_timeout_sentinel: u64 = std.math.maxInt(u64);
+const pool_wakeup_sentinel: u64 = std.math.maxInt(u64) - 1;
+const detached_close_sentinel: u64 = std.math.maxInt(u64) - 2;
 
 const ready_capacity = 64;
 const splice_pipe_offset = std.math.maxInt(u64);
@@ -108,11 +114,19 @@ pub const Config = struct {
     entries: u16 = 1024,
     /// Optional ring init flags (e.g. IORING_SETUP_COOP_TASKRUN).
     flags: u32 = 0,
+    /// Allocator for the fallback blocking-op pool and wake context. The
+    /// production backend normally passes the event-loop allocator; tests
+    /// that instantiate RealIO directly can rely on this default.
+    allocator: std.mem.Allocator = std.heap.page_allocator,
+    file_pool_workers: u32 = 4,
+    file_pool_pending_capacity: u32 = 256,
+    file_pool_copy_scratch_bytes: usize = 1024 * 1024,
 };
 
 // ── RealIO ────────────────────────────────────────────────
 
 pub const RealIO = struct {
+    allocator: std.mem.Allocator,
     ring: linux.IoUring,
     /// Per-op feature flags determined once via `IORING_REGISTER_PROBE`
     /// at init. Branch points consult this instead of doing version
@@ -123,6 +137,11 @@ pub const RealIO = struct {
     ready: [ready_capacity]ReadyEntry = undefined,
     ready_head: u8 = 0,
     ready_len: u8 = 0,
+    pool: *BlockingOpPool,
+    pool_swap: std.ArrayListUnmanaged(PoolCompleted) = .{},
+    pool_wakeup_ctx: *posix.fd_t,
+    pool_wakeup_fd: posix.fd_t,
+    pool_wakeup_armed: bool = false,
 
     pub fn init(config: Config) !RealIO {
         // Fall back to plain init if the kernel doesn't accept the requested
@@ -133,23 +152,53 @@ pub const RealIO = struct {
         errdefer ring.deinit();
         const features = ring_mod.probeFeatures(&ring);
 
-        return .{
+        const efd = try posix.eventfd(0, linux.EFD.NONBLOCK | linux.EFD.CLOEXEC);
+        errdefer posix.close(efd);
+
+        const wakeup_ctx = try config.allocator.create(posix.fd_t);
+        errdefer config.allocator.destroy(wakeup_ctx);
+        wakeup_ctx.* = efd;
+
+        const pool = try BlockingOpPool.create(config.allocator, .{
+            .worker_count = config.file_pool_workers,
+            .pending_capacity = config.file_pool_pending_capacity,
+            .copy_scratch_bytes = config.file_pool_copy_scratch_bytes,
+        });
+        errdefer pool.deinit();
+        pool.setWakeup(wakeup_ctx, wakeFromPool);
+
+        var self = RealIO{
+            .allocator = config.allocator,
             .ring = ring,
             .feature_support = features,
+            .pool = pool,
+            .pool_wakeup_ctx = wakeup_ctx,
+            .pool_wakeup_fd = efd,
         };
+        try self.armPoolWakeup();
+        return self;
     }
 
     pub fn deinit(self: *RealIO) void {
+        self.pool.deinit();
+        self.pool_swap.deinit(self.allocator);
+        self.allocator.destroy(self.pool_wakeup_ctx);
+        posix.close(self.pool_wakeup_fd);
         self.ring.deinit();
         self.* = undefined;
     }
 
-    /// Synchronously close a file descriptor. The signature matches
-    /// `SimIO.closeSocket` so EventLoop.deinit can use `self.io.closeSocket(fd)`
-    /// uniformly across both backends. RealIO calls `posix.close`; SimIO
-    /// marks its slot closed and fails any parked recv on it.
-    pub fn closeSocket(_: *RealIO, fd: posix.fd_t) void {
-        posix.close(fd);
+    /// Fire-and-forget fd close used by legacy socket teardown paths. Prefer
+    /// `IORING_OP_CLOSE`; if the SQ ring cannot accept the detached close, use
+    /// the backend blocking pool. The final inline close is an overflow escape
+    /// hatch to avoid leaking an fd if both queues are saturated.
+    pub fn closeSocket(self: *RealIO, fd: posix.fd_t) void {
+        if (self.feature_support.supports_close) {
+            if (self.ring.close(detached_close_sentinel, fd)) |_| return else |_| {}
+        }
+        self.pool.submitDetached(.{ .close = .{ .fd = fd } }) catch {
+            posix.close(fd);
+        };
     }
 
     /// Submit any pending SQEs and dispatch all available CQEs by
@@ -159,33 +208,59 @@ pub const RealIO = struct {
     /// `wait_at_least` blocks for at least that many completions before
     /// returning (use 0 for non-blocking, 1 for "advance the loop").
     pub fn tick(self: *RealIO, wait_at_least: u32) !void {
-        if (try self.drainReady(wait_at_least)) return;
-
-        _ = try self.ring.submit_and_wait(wait_at_least);
-
-        var cqes: [32]linux.io_uring_cqe = undefined;
         while (true) {
-            const count = try self.ring.copy_cqes(&cqes, 0);
-            if (count == 0) break;
-            for (cqes[0..count]) |cqe| {
-                try self.dispatchCqe(cqe);
+            var fired: u32 = 0;
+            fired += try self.drainReadyCount();
+            fired += try self.drainPoolCount();
+            if (wait_at_least != 0 and fired > 0) return;
+
+            try self.armPoolWakeup();
+            _ = try self.ring.submit_and_wait(if (wait_at_least == 0) 0 else 1);
+
+            var cqes: [32]linux.io_uring_cqe = undefined;
+            while (true) {
+                const count = try self.ring.copy_cqes(&cqes, 0);
+                if (count == 0) break;
+                for (cqes[0..count]) |cqe| {
+                    fired += try self.dispatchCqe(cqe);
+                }
+                if (count < cqes.len) break;
             }
-            if (count < cqes.len) break;
+
+            fired += try self.drainPoolCount();
+            fired += try self.drainReadyCount();
+            if (wait_at_least == 0 or fired > 0) return;
         }
-        _ = try self.drainReady(0);
     }
 
-    fn dispatchCqe(self: *RealIO, cqe: linux.io_uring_cqe) !void {
+    fn dispatchCqe(self: *RealIO, cqe: linux.io_uring_cqe) !u32 {
         // Silently swallow link_timeout CQEs paired with connect.
-        if (cqe.user_data == link_timeout_sentinel) return;
+        if (cqe.user_data == link_timeout_sentinel) return 0;
+        if (cqe.user_data == detached_close_sentinel) return 0;
+        if (cqe.user_data == pool_wakeup_sentinel) {
+            self.pool_wakeup_armed = false;
+            self.drainPoolWakeup();
+            const fired = try self.drainPoolCount();
+            try self.armPoolWakeup();
+            return fired;
+        }
 
         const c: *Completion = @ptrFromInt(cqe.user_data);
-        const callback = c.callback orelse return;
+        const callback = c.callback orelse return 0;
 
         switch (c.op) {
-            .open_copy_file_session => return self.dispatchOpenCopyFileSession(c, cqe),
-            .copy_file_chunk => return self.dispatchCopyFileChunk(c, cqe),
-            .close_copy_file_session => return self.dispatchCloseCopyFileSession(c, cqe),
+            .open_copy_file_session => {
+                try self.dispatchOpenCopyFileSession(c, cqe);
+                return 1;
+            },
+            .copy_file_chunk => {
+                try self.dispatchCopyFileChunk(c, cqe);
+                return 1;
+            },
+            .close_copy_file_session => {
+                try self.dispatchCloseCopyFileSession(c, cqe);
+                return 1;
+            },
             else => {},
         }
 
@@ -211,10 +286,11 @@ pub const RealIO = struct {
         switch (action) {
             .disarm => {},
             .rearm => {
-                if (more) return; // multishot: next CQE comes from the kernel
+                if (more) return 1; // multishot: next CQE comes from the kernel
                 try self.resubmit(c);
             },
         }
+        return 1;
     }
 
     fn drainReady(self: *RealIO, wait_at_least: u32) !bool {
@@ -225,6 +301,15 @@ pub const RealIO = struct {
             if (wait_at_least != 0 and fired >= wait_at_least) return true;
         }
         return fired > 0 and wait_at_least != 0;
+    }
+
+    fn drainReadyCount(self: *RealIO) !u32 {
+        var fired: u32 = 0;
+        while (self.popReady()) |entry| {
+            fired += 1;
+            try self.dispatchReadyEntry(entry);
+        }
+        return fired;
     }
 
     fn queueReady(self: *RealIO, c: *Completion, result: Result) !void {
@@ -252,6 +337,58 @@ pub const RealIO = struct {
             .disarm => {},
             .rearm => try self.resubmit(c),
         }
+    }
+
+    fn armPoolWakeup(self: *RealIO) !void {
+        if (self.pool_wakeup_armed) return;
+        const sqe = try self.ring.poll_add(pool_wakeup_sentinel, self.pool_wakeup_fd, linux.POLL.IN);
+        _ = sqe;
+        self.pool_wakeup_armed = true;
+    }
+
+    fn drainPoolWakeup(self: *RealIO) void {
+        var value: u64 = 0;
+        while (true) {
+            _ = posix.read(self.pool_wakeup_fd, std.mem.asBytes(&value)) catch |err| switch (err) {
+                error.WouldBlock => return,
+                else => return,
+            };
+        }
+    }
+
+    fn drainPoolCount(self: *RealIO) !u32 {
+        var fired: u32 = 0;
+        try self.pool.drainCompletedInto(&self.pool_swap);
+        defer self.pool_swap.clearRetainingCapacity();
+        for (self.pool_swap.items) |entry| {
+            fired += 1;
+            try self.dispatchPoolEntry(entry);
+        }
+        return fired;
+    }
+
+    fn dispatchPoolEntry(self: *RealIO, entry: PoolCompleted) !void {
+        const c = entry.completion;
+        realState(c).in_flight = false;
+        const cb = c.callback orelse return;
+        const action = cb(c.userdata, c, entry.result);
+        switch (action) {
+            .disarm => {},
+            .rearm => try self.resubmit(c),
+        }
+    }
+
+    fn submitBlockingOp(self: *RealIO, op: BlockingOp, c: *Completion) !void {
+        self.pool.submit(op, c) catch |err| {
+            realState(c).in_flight = false;
+            return err;
+        };
+    }
+
+    fn wakeFromPool(ctx: ?*anyopaque) void {
+        const wakeup_fd: *const posix.fd_t = @ptrCast(@alignCast(ctx.?));
+        const value: u64 = 1;
+        _ = posix.write(wakeup_fd.*, std.mem.asBytes(&value)) catch {};
     }
 
     fn resubmit(self: *RealIO, c: *Completion) !void {
@@ -345,20 +482,8 @@ pub const RealIO = struct {
             return;
         }
 
-        var op = op_in;
-        while (true) {
-            try self.armCompletion(c, .{ .close = op }, ud, cb);
-            const result: Result = .{ .close = closeFdResult(op.fd) };
-            realState(c).in_flight = false;
-            const action = cb(ud, c, result);
-            switch (action) {
-                .disarm => return,
-                .rearm => switch (c.op) {
-                    .close => |new_op| op = new_op,
-                    else => return,
-                },
-            }
-        }
+        try self.armCompletion(c, .{ .close = op_in }, ud, cb);
+        try self.submitBlockingOp(.{ .close = op_in }, c);
     }
 
     /// `IORING_OP_FALLOCATE` (kernel ≥5.6). The CQE delivers `0` on
@@ -381,23 +506,16 @@ pub const RealIO = struct {
     ///     `voidOrError(cqe)` for `.truncate`. Matches the existing
     ///     `IORING_OP_FALLOCATE` shape exactly.
     ///
-    ///   * **Sync path** (kernel <6.9, or any kernel where the probe
-    ///     register itself is unsupported): fall back to a direct
-    ///     `posix.ftruncate(2)` and fire the completion's callback
-    ///     inline. In_flight is cleared before invoking the callback so
-    ///     a callback that re-submits a new op on the same completion
-    ///     doesn't trip `error.AlreadyInFlight` against itself
-    ///     (mirrors `dispatchCqe`). `.rearm` is iterated via an inner
-    ///     loop rather than recursing through `resubmit` to dodge the
-    ///     inferred-error-set cycle that truncate→resubmit→truncate
-    ///     would create.
+    ///   * **Fallback path** (kernel <6.9, or any kernel where the probe
+    ///     register itself is unsupported): offload `ftruncate(2)` to the
+    ///     backend-owned `BlockingOpPool` so the event-loop thread does not
+    ///     run the syscall.
     ///
     /// The only daemon caller is `PieceStore.init`'s filesystem-
     /// portability fallback (when fallocate returns
     /// `error.OperationNotSupported` on tmpfs <5.10, FAT32, certain FUSE
     /// FSes). That path already runs on a background thread (see
-    /// `doStartBackground` in `src/daemon/torrent_session.zig`), so the
-    /// sync fallback has zero event-loop-thread impact when it fires.
+    /// `doStartBackground` in `src/daemon/torrent_session.zig`).
     pub fn truncate(self: *RealIO, op_in: ifc.TruncateOp, c: *Completion, ud: ?*anyopaque, cb: Callback) !void {
         if (self.feature_support.supports_ftruncate) {
             try self.armCompletion(c, .{ .truncate = op_in }, ud, cb);
@@ -412,34 +530,13 @@ pub const RealIO = struct {
             return;
         }
 
-        var op = op_in;
-        while (true) {
-            try self.armCompletion(c, .{ .truncate = op }, ud, cb);
-
-            const result: Result = if (posix.ftruncate(op.fd, op.length)) |_|
-                .{ .truncate = {} }
-            else |err|
-                .{ .truncate = err };
-
-            // Clear in_flight before invoking the callback (mirrors
-            // dispatchCqe — see the Operation doc-comment in
-            // io_interface.zig).
-            realState(c).in_flight = false;
-
-            const action = cb(ud, c, result);
-            switch (action) {
-                .disarm => return,
-                .rearm => switch (c.op) {
-                    .truncate => |new_op| op = new_op,
-                    else => return, // callback overwrote c.op with a different op (illegal under the contract)
-                },
-            }
-        }
+        try self.armCompletion(c, .{ .truncate = op_in }, ud, cb);
+        try self.submitBlockingOp(.{ .truncate = op_in }, c);
     }
 
     /// `openat` dispatches through `IORING_OP_OPENAT` when the runtime
-    /// probe reports support (kernel ≥5.6), otherwise it falls back to
-    /// `posix.openat(2)` and fires the callback inline. The async path
+    /// probe reports support (kernel ≥5.6), otherwise it offloads
+    /// `openat(2)` to the backend-owned `BlockingOpPool`. The async path
     /// requires a sentinel-terminated path owned by the caller until CQE.
     pub fn openat(self: *RealIO, op_in: ifc.OpenAtOp, c: *Completion, ud: ?*anyopaque, cb: Callback) !void {
         if (self.feature_support.supports_openat) {
@@ -450,24 +547,8 @@ pub const RealIO = struct {
             return;
         }
 
-        var op = op_in;
-        while (true) {
-            try self.armCompletion(c, .{ .openat = op }, ud, cb);
-            const result: Result = if (posix.openat(op.dir_fd, op.path, op.flags, op.mode)) |fd|
-                .{ .openat = fd }
-            else |err|
-                .{ .openat = err };
-
-            realState(c).in_flight = false;
-            const action = cb(ud, c, result);
-            switch (action) {
-                .disarm => return,
-                .rearm => switch (c.op) {
-                    .openat => |new_op| op = new_op,
-                    else => return,
-                },
-            }
-        }
+        try self.armCompletion(c, .{ .openat = op_in }, ud, cb);
+        try self.submitBlockingOp(.{ .openat = op_in }, c);
     }
 
     pub fn mkdirat(self: *RealIO, op_in: ifc.MkdirAtOp, c: *Completion, ud: ?*anyopaque, cb: Callback) !void {
@@ -479,24 +560,8 @@ pub const RealIO = struct {
             return;
         }
 
-        var op = op_in;
-        while (true) {
-            try self.armCompletion(c, .{ .mkdirat = op }, ud, cb);
-            const result: Result = if (posix.mkdirat(op.dir_fd, op.path, op.mode)) |_|
-                .{ .mkdirat = {} }
-            else |err|
-                .{ .mkdirat = err };
-
-            realState(c).in_flight = false;
-            const action = cb(ud, c, result);
-            switch (action) {
-                .disarm => return,
-                .rearm => switch (c.op) {
-                    .mkdirat => |new_op| op = new_op,
-                    else => return,
-                },
-            }
-        }
+        try self.armCompletion(c, .{ .mkdirat = op_in }, ud, cb);
+        try self.submitBlockingOp(.{ .mkdirat = op_in }, c);
     }
 
     pub fn renameat(self: *RealIO, op_in: ifc.RenameAtOp, c: *Completion, ud: ?*anyopaque, cb: Callback) !void {
@@ -515,26 +580,8 @@ pub const RealIO = struct {
             return;
         }
 
-        var op = op_in;
-        while (true) {
-            try self.armCompletion(c, .{ .renameat = op }, ud, cb);
-            const result: Result = if (op.flags != 0)
-                .{ .renameat = error.OperationNotSupported }
-            else if (posix.renameat(op.old_dir_fd, op.old_path, op.new_dir_fd, op.new_path)) |_|
-                .{ .renameat = {} }
-            else |err|
-                .{ .renameat = err };
-
-            realState(c).in_flight = false;
-            const action = cb(ud, c, result);
-            switch (action) {
-                .disarm => return,
-                .rearm => switch (c.op) {
-                    .renameat => |new_op| op = new_op,
-                    else => return,
-                },
-            }
-        }
+        try self.armCompletion(c, .{ .renameat = op_in }, ud, cb);
+        try self.submitBlockingOp(.{ .renameat = op_in }, c);
     }
 
     pub fn unlinkat(self: *RealIO, op_in: ifc.UnlinkAtOp, c: *Completion, ud: ?*anyopaque, cb: Callback) !void {
@@ -546,24 +593,8 @@ pub const RealIO = struct {
             return;
         }
 
-        var op = op_in;
-        while (true) {
-            try self.armCompletion(c, .{ .unlinkat = op }, ud, cb);
-            const result: Result = if (posix.unlinkat(op.dir_fd, op.path, op.flags)) |_|
-                .{ .unlinkat = {} }
-            else |err|
-                .{ .unlinkat = err };
-
-            realState(c).in_flight = false;
-            const action = cb(ud, c, result);
-            switch (action) {
-                .disarm => return,
-                .rearm => switch (c.op) {
-                    .unlinkat => |new_op| op = new_op,
-                    else => return,
-                },
-            }
-        }
+        try self.armCompletion(c, .{ .unlinkat = op_in }, ud, cb);
+        try self.submitBlockingOp(.{ .unlinkat = op_in }, c);
     }
 
     pub fn statx(self: *RealIO, op_in: ifc.StatxOp, c: *Completion, ud: ?*anyopaque, cb: Callback) !void {
@@ -582,47 +613,13 @@ pub const RealIO = struct {
             return;
         }
 
-        var op = op_in;
-        while (true) {
-            try self.armCompletion(c, .{ .statx = op }, ud, cb);
-            const rc = linux.statx(op.dir_fd, op.path, op.flags, op.mask, op.buf);
-            const result: Result = switch (linux.E.init(rc)) {
-                .SUCCESS => .{ .statx = {} },
-                else => |err| .{ .statx = errnoToError(err) },
-            };
-
-            realState(c).in_flight = false;
-            const action = cb(ud, c, result);
-            switch (action) {
-                .disarm => return,
-                .rearm => switch (c.op) {
-                    .statx => |new_op| op = new_op,
-                    else => return,
-                },
-            }
-        }
+        try self.armCompletion(c, .{ .statx = op_in }, ud, cb);
+        try self.submitBlockingOp(.{ .statx = op_in }, c);
     }
 
     pub fn getdents(self: *RealIO, op_in: ifc.GetdentsOp, c: *Completion, ud: ?*anyopaque, cb: Callback) !void {
-        var op = op_in;
-        while (true) {
-            try self.armCompletion(c, .{ .getdents = op }, ud, cb);
-            const rc = linux.getdents64(op.fd, op.buf.ptr, op.buf.len);
-            const result: Result = switch (linux.E.init(rc)) {
-                .SUCCESS => .{ .getdents = rc },
-                else => |err| .{ .getdents = errnoToError(err) },
-            };
-
-            realState(c).in_flight = false;
-            const action = cb(ud, c, result);
-            switch (action) {
-                .disarm => return,
-                .rearm => switch (c.op) {
-                    .getdents => |new_op| op = new_op,
-                    else => return,
-                },
-            }
-        }
+        try self.armCompletion(c, .{ .getdents = op_in }, ud, cb);
+        try self.submitBlockingOp(.{ .getdents = op_in }, c);
     }
 
     pub fn open_copy_file_session(self: *RealIO, op: ifc.OpenCopyFileSessionOp, c: *Completion, ud: ?*anyopaque, cb: Callback) !void {
@@ -693,12 +690,12 @@ pub const RealIO = struct {
 
     pub fn fchown(self: *RealIO, op: ifc.FchownOp, c: *Completion, ud: ?*anyopaque, cb: Callback) !void {
         try self.armCompletion(c, .{ .fchown = op }, ud, cb);
-        try self.queueReady(c, .{ .fchown = fchownResult(op.fd, op.uid, op.gid) });
+        try self.submitBlockingOp(.{ .fchown = op }, c);
     }
 
     pub fn fchmod(self: *RealIO, op: ifc.FchmodOp, c: *Completion, ud: ?*anyopaque, cb: Callback) !void {
         try self.armCompletion(c, .{ .fchmod = op }, ud, cb);
-        try self.queueReady(c, .{ .fchmod = fchmodResult(op.fd, op.mode) });
+        try self.submitBlockingOp(.{ .fchmod = op }, c);
     }
 
     fn dispatchOpenCopyFileSession(self: *RealIO, c: *Completion, cqe: linux.io_uring_cqe) !void {
@@ -821,8 +818,15 @@ pub const RealIO = struct {
     }
 
     pub fn socket(self: *RealIO, op: ifc.SocketOp, c: *Completion, ud: ?*anyopaque, cb: Callback) !void {
+        if (!self.feature_support.supports_socket) {
+            try self.armCompletion(c, .{ .socket = op }, ud, cb);
+            try self.submitBlockingOp(.{ .socket = op }, c);
+            return;
+        }
+
         try self.armCompletion(c, .{ .socket = op }, ud, cb);
-        const sqe = try self.ring.socket(@intFromPtr(c), op.domain, op.sock_type, op.protocol, 0);
+        const sock_type = op.sock_type | posix.SOCK.NONBLOCK | posix.SOCK.CLOEXEC;
+        const sqe = try self.ring.socket(@intFromPtr(c), op.domain, sock_type, op.protocol, 0);
         _ = sqe;
     }
 
@@ -877,13 +881,9 @@ pub const RealIO = struct {
     ///     stable while the SQE is in flight — the kernel reads
     ///     `addr.any` asynchronously.
     ///
-    ///   * **Sync path** (kernel <6.11): fall back to `posix.bind(2)`
-    ///     and fire the callback inline. Mirrors the `truncate`
-    ///     fallback shape — clears `in_flight` before invoking the
-    ///     callback so a callback that re-submits a new op on the same
-    ///     completion doesn't trip `error.AlreadyInFlight` against
-    ///     itself, and uses an inner loop rather than recursing through
-    ///     `resubmit` to dodge the inferred-error-set cycle.
+    ///   * **Fallback path** (kernel <6.11): offload `bind(2)` to the
+    ///     backend-owned `BlockingOpPool`. Callback/rearm handling stays
+    ///     centralized in the pool-completion dispatcher.
     ///
     /// Daemon callers today are listen-socket bring-up paths
     /// (`event_loop.zig` peer / uTP listeners, `rpc/server.zig` API
@@ -906,30 +906,13 @@ pub const RealIO = struct {
             return;
         }
 
-        var op = op_in;
-        while (true) {
-            try self.armCompletion(c, .{ .bind = op }, ud, cb);
-
-            const result: Result = if (posix.bind(op.fd, &op.addr.any, op.addr.getOsSockLen())) |_|
-                .{ .bind = {} }
-            else |err|
-                .{ .bind = err };
-
-            realState(c).in_flight = false;
-            const action = cb(ud, c, result);
-            switch (action) {
-                .disarm => return,
-                .rearm => switch (c.op) {
-                    .bind => |new_op| op = new_op,
-                    else => return,
-                },
-            }
-        }
+        try self.armCompletion(c, .{ .bind = op_in }, ud, cb);
+        try self.submitBlockingOp(.{ .bind = op_in }, c);
     }
 
     /// `listen` mirrors `bind`: branches on
     /// `feature_support.supports_listen` (kernel ≥6.11 →
-    /// `IORING_OP_LISTEN`, else `posix.listen(2)` inline).
+    /// `IORING_OP_LISTEN`, else `listen(2)` on the blocking-op pool).
     pub fn listen(self: *RealIO, op_in: ifc.ListenOp, c: *Completion, ud: ?*anyopaque, cb: Callback) !void {
         if (self.feature_support.supports_listen) {
             try self.armCompletion(c, .{ .listen = op_in }, ud, cb);
@@ -938,25 +921,8 @@ pub const RealIO = struct {
             return;
         }
 
-        var op = op_in;
-        while (true) {
-            try self.armCompletion(c, .{ .listen = op }, ud, cb);
-
-            const result: Result = if (posix.listen(op.fd, op.backlog)) |_|
-                .{ .listen = {} }
-            else |err|
-                .{ .listen = err };
-
-            realState(c).in_flight = false;
-            const action = cb(ud, c, result);
-            switch (action) {
-                .disarm => return,
-                .rearm => switch (c.op) {
-                    .listen => |new_op| op = new_op,
-                    else => return,
-                },
-            }
-        }
+        try self.armCompletion(c, .{ .listen = op_in }, ud, cb);
+        try self.submitBlockingOp(.{ .listen = op_in }, c);
     }
 
     /// `setsockopt` dispatches based on `feature_support.supports_setsockopt`,
@@ -974,9 +940,8 @@ pub const RealIO = struct {
     ///     still return `ENOTSUP`/`EINVAL` for the subcmd itself if it
     ///     pre-dates 6.7. Callers must handle that at completion time.
     ///
-    ///   * **Sync path** (URING_CMD unsupported): fall back to
-    ///     `posix.setsockopt(2)` inline. Same loop+rearm shape as
-    ///     `bind`/`listen`/`truncate`.
+    ///   * **Fallback path** (URING_CMD unsupported): offload
+    ///     `setsockopt(2)` to the backend-owned `BlockingOpPool`.
     pub fn setsockopt(self: *RealIO, op_in: ifc.SetsockoptOp, c: *Completion, ud: ?*anyopaque, cb: Callback) !void {
         if (self.feature_support.supports_setsockopt) {
             try self.armCompletion(c, .{ .setsockopt = op_in }, ud, cb);
@@ -992,25 +957,8 @@ pub const RealIO = struct {
             return;
         }
 
-        var op = op_in;
-        while (true) {
-            try self.armCompletion(c, .{ .setsockopt = op }, ud, cb);
-
-            const result: Result = if (posix.setsockopt(op.fd, @intCast(op.level), op.optname, op.optval)) |_|
-                .{ .setsockopt = {} }
-            else |err|
-                .{ .setsockopt = err };
-
-            realState(c).in_flight = false;
-            const action = cb(ud, c, result);
-            switch (action) {
-                .disarm => return,
-                .rearm => switch (c.op) {
-                    .setsockopt => |new_op| op = new_op,
-                    else => return,
-                },
-            }
-        }
+        try self.armCompletion(c, .{ .setsockopt = op_in }, ud, cb);
+        try self.submitBlockingOp(.{ .setsockopt = op_in }, c);
     }
 
     pub fn timeout(self: *RealIO, op: ifc.TimeoutOp, c: *Completion, ud: ?*anyopaque, cb: Callback) !void {
@@ -1036,6 +984,10 @@ pub const RealIO = struct {
     /// tick that drains its CQE.
     pub fn cancel(self: *RealIO, op: ifc.CancelOp, c: *Completion, ud: ?*anyopaque, cb: Callback) !void {
         try self.armCompletion(c, .{ .cancel = op }, ud, cb);
+        if (isBlockingPoolOp(op.target.op) and self.pool.tryCancelPending(op.target)) {
+            try self.queueReady(c, .{ .cancel = {} });
+            return;
+        }
         const sqe = try self.ring.cancel(@intFromPtr(c), @intFromPtr(op.target), 0);
         _ = sqe;
     }
@@ -1068,19 +1020,17 @@ fn buildResult(op: Operation, cqe: linux.io_uring_cqe) Result {
         .fallocate => .{ .fallocate = voidOrError(cqe) },
         // On kernels with `IORING_OP_FTRUNCATE` support
         // (`feature_support.supports_ftruncate == true`), truncate flows
-        // through the ring exactly like fallocate/fsync — the CQE
-        // carries either 0 (success) or a negative errno. On older
-        // kernels truncate completes synchronously inside
-        // `RealIO.truncate` and never reaches `dispatchCqe`, so this
-        // branch is unreachable in that case.
+        // through the ring exactly like fallocate/fsync. On older kernels
+        // truncate completes through the blocking-op pool and never reaches
+        // `dispatchCqe`, so this branch is unreachable in that case.
         .truncate => .{ .truncate = voidOrError(cqe) },
         .openat => .{ .openat = fdOrError(cqe) },
         .mkdirat => .{ .mkdirat = voidOrError(cqe) },
         .renameat => .{ .renameat = voidOrError(cqe) },
         .unlinkat => .{ .unlinkat = voidOrError(cqe) },
         .statx => .{ .statx = voidOrError(cqe) },
-        // getdents completes synchronously inside `RealIO.getdents` because
-        // Zig 0.15.2 exposes no io_uring getdents helper/op.
+        // getdents completes through the blocking-op pool because Zig
+        // 0.15.2 exposes no io_uring getdents helper/op.
         .getdents => .{ .getdents = countOrError(cqe) },
         .open_copy_file_session => .{ .open_copy_file_session = voidOrError(cqe) },
         .copy_file_chunk => .{ .copy_file_chunk = countOrError(cqe) },
@@ -1090,12 +1040,9 @@ fn buildResult(op: Operation, cqe: linux.io_uring_cqe) Result {
         .socket => .{ .socket = fdOrError(cqe) },
         .connect => .{ .connect = voidOrError(cqe) },
         .accept => .{ .accept = acceptResult(cqe) },
-        // Bind / listen / setsockopt either come back from the async
-        // ring (kernel ≥6.11 for bind/listen, ≥6.7 for setsockopt) or
-        // never reach `dispatchCqe` because the sync fallback fired the
-        // callback inline. Either way, when the CQE *does* land we
-        // translate it the same way as fallocate / fsync — `0` on
-        // success, negative errno on failure.
+        // Bind / listen / setsockopt either come back from the async ring
+        // or complete through the blocking-op pool. When a CQE does land,
+        // translate it the same way as fallocate / fsync.
         .bind => .{ .bind = voidOrError(cqe) },
         .listen => .{ .listen = voidOrError(cqe) },
         .setsockopt => .{ .setsockopt = voidOrError(cqe) },
@@ -1153,27 +1100,24 @@ fn cancelResult(cqe: linux.io_uring_cqe) anyerror!void {
     };
 }
 
-fn closeFdResult(fd: posix.fd_t) anyerror!void {
-    const rc = linux.close(fd);
-    return switch (linux.E.init(rc)) {
-        .SUCCESS => {},
-        else => |e| errnoToError(e),
-    };
-}
-
-fn fchownResult(fd: posix.fd_t, uid: u32, gid: u32) anyerror!void {
-    const rc = linux.fchown(fd, uid, gid);
-    return switch (linux.E.init(rc)) {
-        .SUCCESS => {},
-        else => |e| errnoToError(e),
-    };
-}
-
-fn fchmodResult(fd: posix.fd_t, mode: posix.mode_t) anyerror!void {
-    const rc = linux.fchmod(fd, mode);
-    return switch (linux.E.init(rc)) {
-        .SUCCESS => {},
-        else => |e| errnoToError(e),
+fn isBlockingPoolOp(op: Operation) bool {
+    return switch (op) {
+        .close,
+        .truncate,
+        .openat,
+        .mkdirat,
+        .renameat,
+        .unlinkat,
+        .statx,
+        .getdents,
+        .fchown,
+        .fchmod,
+        .socket,
+        .bind,
+        .listen,
+        .setsockopt,
+        => true,
+        else => false,
     };
 }
 
@@ -1241,6 +1185,189 @@ fn testCallback(
     ctx.calls += 1;
     ctx.last_result = result;
     return .disarm;
+}
+
+fn expectNoInlineThenTick(io: *RealIO, ctx: *TestCtx) !void {
+    try testing.expectEqual(@as(u32, 0), ctx.calls);
+    try io.tick(1);
+    try testing.expectEqual(@as(u32, 1), ctx.calls);
+}
+
+test "RealIO unsupported ring fallbacks complete from tick" {
+    var io = try skipIfUnavailable();
+    defer io.deinit();
+    io.feature_support = .{};
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    {
+        const file = try tmp.dir.createFile("truncate", .{ .truncate = true });
+        defer file.close();
+
+        var c = Completion{};
+        var ctx = TestCtx{};
+        try io.truncate(.{ .fd = file.handle, .length = 4096 }, &c, &ctx, testCallback);
+        try expectNoInlineThenTick(&io, &ctx);
+        switch (ctx.last_result.?) {
+            .truncate => |r| try r,
+            else => try testing.expect(false),
+        }
+    }
+
+    {
+        const file = try tmp.dir.createFile("openat", .{ .truncate = true });
+        file.close();
+
+        var c = Completion{};
+        var ctx = TestCtx{};
+        try io.openat(.{
+            .dir_fd = tmp.dir.fd,
+            .path = "openat",
+            .flags = .{ .ACCMODE = .RDONLY },
+        }, &c, &ctx, testCallback);
+        try expectNoInlineThenTick(&io, &ctx);
+        switch (ctx.last_result.?) {
+            .openat => |r| posix.close(try r),
+            else => try testing.expect(false),
+        }
+    }
+
+    {
+        var c = Completion{};
+        var ctx = TestCtx{};
+        try io.mkdirat(.{
+            .dir_fd = tmp.dir.fd,
+            .path = "made",
+            .mode = 0o755,
+        }, &c, &ctx, testCallback);
+        try expectNoInlineThenTick(&io, &ctx);
+        switch (ctx.last_result.?) {
+            .mkdirat => |r| try r,
+            else => try testing.expect(false),
+        }
+    }
+
+    {
+        const file = try tmp.dir.createFile("rename-old", .{ .truncate = true });
+        file.close();
+
+        var c = Completion{};
+        var ctx = TestCtx{};
+        try io.renameat(.{
+            .old_dir_fd = tmp.dir.fd,
+            .old_path = "rename-old",
+            .new_dir_fd = tmp.dir.fd,
+            .new_path = "rename-new",
+        }, &c, &ctx, testCallback);
+        try expectNoInlineThenTick(&io, &ctx);
+        switch (ctx.last_result.?) {
+            .renameat => |r| try r,
+            else => try testing.expect(false),
+        }
+    }
+
+    {
+        const file = try tmp.dir.createFile("unlink-me", .{ .truncate = true });
+        file.close();
+
+        var c = Completion{};
+        var ctx = TestCtx{};
+        try io.unlinkat(.{
+            .dir_fd = tmp.dir.fd,
+            .path = "unlink-me",
+            .flags = 0,
+        }, &c, &ctx, testCallback);
+        try expectNoInlineThenTick(&io, &ctx);
+        switch (ctx.last_result.?) {
+            .unlinkat => |r| try r,
+            else => try testing.expect(false),
+        }
+    }
+
+    {
+        var stat_buf: linux.Statx = undefined;
+        var c = Completion{};
+        var ctx = TestCtx{};
+        try io.statx(.{
+            .dir_fd = tmp.dir.fd,
+            .path = "rename-new",
+            .flags = linux.AT.SYMLINK_NOFOLLOW,
+            .mask = linux.STATX_BASIC_STATS,
+            .buf = &stat_buf,
+        }, &c, &ctx, testCallback);
+        try expectNoInlineThenTick(&io, &ctx);
+        switch (ctx.last_result.?) {
+            .statx => |r| try r,
+            else => try testing.expect(false),
+        }
+    }
+
+    {
+        var buf: [512]u8 align(@alignOf(linux.dirent64)) = undefined;
+        var c = Completion{};
+        var ctx = TestCtx{};
+        try io.getdents(.{
+            .fd = tmp.dir.fd,
+            .buf = &buf,
+        }, &c, &ctx, testCallback);
+        try expectNoInlineThenTick(&io, &ctx);
+        switch (ctx.last_result.?) {
+            .getdents => {},
+            else => try testing.expect(false),
+        }
+    }
+
+    {
+        const file = try tmp.dir.createFile("close-me", .{ .truncate = true });
+        var c = Completion{};
+        var ctx = TestCtx{};
+        try io.close(.{ .fd = file.handle }, &c, &ctx, testCallback);
+        try expectNoInlineThenTick(&io, &ctx);
+        switch (ctx.last_result.?) {
+            .close => |r| try r,
+            else => try testing.expect(false),
+        }
+    }
+
+    {
+        const fd = try posix.socket(posix.AF.INET, posix.SOCK.STREAM | posix.SOCK.CLOEXEC, posix.IPPROTO.TCP);
+        defer posix.close(fd);
+        const addr = try std.net.Address.parseIp4("127.0.0.1", 0);
+
+        var bind_c = Completion{};
+        var bind_ctx = TestCtx{};
+        try io.bind(.{ .fd = fd, .addr = addr }, &bind_c, &bind_ctx, testCallback);
+        try expectNoInlineThenTick(&io, &bind_ctx);
+        switch (bind_ctx.last_result.?) {
+            .bind => |r| try r,
+            else => try testing.expect(false),
+        }
+
+        var listen_c = Completion{};
+        var listen_ctx = TestCtx{};
+        try io.listen(.{ .fd = fd, .backlog = 16 }, &listen_c, &listen_ctx, testCallback);
+        try expectNoInlineThenTick(&io, &listen_ctx);
+        switch (listen_ctx.last_result.?) {
+            .listen => |r| try r,
+            else => try testing.expect(false),
+        }
+
+        const enable = std.mem.toBytes(@as(c_int, 1));
+        var set_c = Completion{};
+        var set_ctx = TestCtx{};
+        try io.setsockopt(.{
+            .fd = fd,
+            .level = posix.SOL.SOCKET,
+            .optname = posix.SO.REUSEADDR,
+            .optval = &enable,
+        }, &set_c, &set_ctx, testCallback);
+        try expectNoInlineThenTick(&io, &set_ctx);
+        switch (set_ctx.last_result.?) {
+            .setsockopt => |r| try r,
+            else => try testing.expect(false),
+        }
+    }
 }
 
 test "RealIO timeout fires on real ring" {
@@ -1435,11 +1562,9 @@ test "RealIO truncate extends a tempfile via the runtime-detected path" {
     // Truncate dispatches at runtime based on
     // `feature_support.supports_ftruncate` (probed at init via
     // IORING_REGISTER_PROBE). On kernel ≥6.9 it submits
-    // `IORING_OP_FTRUNCATE` and the CQE flows through dispatchCqe
-    // (test must `tick(1)`). On older kernels it falls back to a
-    // synchronous `posix.ftruncate(2)` and fires the callback inline
-    // (no tick needed). This test handles both paths and confirms the
-    // fd's size matches the requested length either way.
+    // `IORING_OP_FTRUNCATE` and the CQE flows through dispatchCqe. On
+    // older kernels it falls back through the blocking-op pool. Either path
+    // must deliver the callback from `tick`.
     var io = try skipIfUnavailable();
     defer io.deinit();
 
@@ -1452,13 +1577,7 @@ test "RealIO truncate extends a tempfile via the runtime-detected path" {
     var c = Completion{};
     var ctx = TestCtx{};
     try io.truncate(.{ .fd = file.handle, .length = 4096 }, &c, &ctx, testCallback);
-
-    if (ctx.calls == 0) {
-        // Async path: callback fires from the CQE, drive one tick.
-        try io.tick(1);
-    }
-
-    try testing.expectEqual(@as(u32, 1), ctx.calls);
+    try expectNoInlineThenTick(&io, &ctx);
     switch (ctx.last_result.?) {
         .truncate => |r| try r,
         else => try testing.expect(false),
@@ -1533,10 +1652,10 @@ test "RealIO truncate shrinks file via async path" {
 test "RealIO bind on a fresh socket via the runtime-detected path" {
     // Mirror of the truncate test: the bind path branches on
     // `feature_support.supports_bind`. On 6.11+ kernels we submit
-    // IORING_OP_BIND; the CQE flows through dispatchCqe and the test
-    // must `tick(1)`. On older kernels the synchronous fallback fires
-    // the callback inline and no tick is needed. Either way the bind
-    // must succeed against an ephemeral 127.0.0.1:0 address.
+    // IORING_OP_BIND; the CQE flows through dispatchCqe. On older kernels
+    // the fallback runs on the blocking-op pool. Either way the callback
+    // must be delivered from `tick` and the bind must succeed
+    // against an ephemeral 127.0.0.1:0 address.
     var io = try skipIfUnavailable();
     defer io.deinit();
 
@@ -1547,9 +1666,7 @@ test "RealIO bind on a fresh socket via the runtime-detected path" {
     var c = Completion{};
     var ctx = TestCtx{};
     try io.bind(.{ .fd = fd, .addr = addr }, &c, &ctx, testCallback);
-    if (ctx.calls == 0) try io.tick(1);
-
-    try testing.expectEqual(@as(u32, 1), ctx.calls);
+    try expectNoInlineThenTick(&io, &ctx);
     switch (ctx.last_result.?) {
         .bind => |r| try r,
         else => try testing.expect(false),
@@ -1601,9 +1718,7 @@ test "RealIO listen on a bound socket via the runtime-detected path" {
     var c = Completion{};
     var ctx = TestCtx{};
     try io.listen(.{ .fd = fd, .backlog = 16 }, &c, &ctx, testCallback);
-    if (ctx.calls == 0) try io.tick(1);
-
-    try testing.expectEqual(@as(u32, 1), ctx.calls);
+    try expectNoInlineThenTick(&io, &ctx);
     switch (ctx.last_result.?) {
         .listen => |r| try r,
         else => try testing.expect(false),
@@ -1678,9 +1793,7 @@ test "RealIO setsockopt SO_REUSEADDR via the runtime-detected path" {
         .optname = posix.SO.REUSEADDR,
         .optval = &enable,
     }, &c, &ctx, testCallback);
-    if (ctx.calls == 0) try io.tick(1);
-
-    try testing.expectEqual(@as(u32, 1), ctx.calls);
+    try expectNoInlineThenTick(&io, &ctx);
     switch (ctx.last_result.?) {
         // URING_CMD setsockopt may surface ENOTSUP / EINVAL when the
         // kernel supports URING_CMD but not the SETSOCKOPT subcmd
@@ -1706,8 +1819,7 @@ test "RealIO bind/listen ops round-trip through caller-owned wait" {
     var bind_c = Completion{};
     var bind_ctx = TestCtx{};
     try io.bind(.{ .fd = fd, .addr = addr }, &bind_c, &bind_ctx, testCallback);
-    if (bind_ctx.calls == 0) try io.tick(1);
-    try testing.expectEqual(@as(u32, 1), bind_ctx.calls);
+    try expectNoInlineThenTick(&io, &bind_ctx);
     switch (bind_ctx.last_result.?) {
         .bind => |r| try r,
         else => try testing.expect(false),
@@ -1716,8 +1828,7 @@ test "RealIO bind/listen ops round-trip through caller-owned wait" {
     var listen_c = Completion{};
     var listen_ctx = TestCtx{};
     try io.listen(.{ .fd = fd, .backlog = 8 }, &listen_c, &listen_ctx, testCallback);
-    if (listen_ctx.calls == 0) try io.tick(1);
-    try testing.expectEqual(@as(u32, 1), listen_ctx.calls);
+    try expectNoInlineThenTick(&io, &listen_ctx);
     switch (listen_ctx.last_result.?) {
         .listen => |r| try r,
         else => try testing.expect(false),

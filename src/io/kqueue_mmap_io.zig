@@ -9,29 +9,22 @@
 //! ## File-op strategy
 //!
 //! Every file fd that the daemon reads/writes is `mmap`'d into the process
-//! address space at first access:
+//! address space at first access by a backend-owned `BlockingOpPool` worker:
 //!
 //!   * `read` / `write` (positional) → bounds-checked `memcpy` against the
 //!     mapping. No syscall on the hot path; the OS pagecache services
 //!     misses via page faults.
-//!   * `fsync` → `msync(memory, MS_SYNC)` over the mapping. Darwin's
-//!     `msync` does not distinguish data-only from data+metadata; we issue
-//!     `MSF.SYNC` for both `datasync=true` and `datasync=false`. (Apple's
-//!     `F_FULLFSYNC` would give true durability — out of scope for a dev
-//!     backend.)
-//!   * `fallocate` → `fcntl(F_PREALLOCATE)` + `ftruncate`. Darwin lacks
-//!     Linux-style `fallocate`; this is the documented dev-backend
-//!     emulation (matches `tigerbeetle/src/io/darwin.zig:fs_allocate`).
-//!     `error.OperationNotSupported` is delivered if the underlying
-//!     filesystem rejects F_PREALLOCATE (the daemon's fallback path then
-//!     trips through `truncate`, identical to Linux's tmpfs<5.10 path).
-//!   * `truncate` → unmap-if-mapped + `ftruncate`. macOS lacks `mremap`,
-//!     so resizing a mapped file requires `munmap` followed by a fresh
-//!     `mmap` on the next access.
-//!   * `copy_file_chunk` / `fchown` / `fchmod` → backend-owned
-//!     `PosixFilePool`. These operations are mandatory parts of the IO
-//!     contract and may block, so the mmap strategy does not run them
-//!     inline on the event-loop thread.
+//!   * `fsync` → backend-owned `BlockingOpPool`: `msync(memory, MS_SYNC)`
+//!     when a mapping exists, or `fsync` otherwise. Darwin's `msync` does
+//!     not distinguish data-only from data+metadata; we issue `MSF.SYNC`
+//!     for both `datasync=true` and `datasync=false`.
+//!   * `fallocate` / `truncate` / `close` → backend-owned
+//!     `BlockingOpPool`. Workers unmap any existing mapping before
+//!     resizing or closing.
+//!   * `copy_file_chunk`, ownership/permission ops, namespace/metadata ops,
+//!     and socket setup → backend-owned `BlockingOpPool`. These operations
+//!     are mandatory parts of the IO contract and may block, so the mmap
+//!     strategy does not run them inline on the event-loop thread.
 //!
 //! ## Why mmap for a dev backend
 //!
@@ -47,6 +40,11 @@
 //!      steady state, but the page-fault cost lands on the EL thread
 //!      when the working set exceeds RAM. Acceptable for development
 //!      where torrents are small relative to RAM.
+//!      This page-fault blocking is a documented mmap-backend limitation,
+//!      not part of the first syscall-blocking cleanup. Syscalls that can
+//!      block should move to the backend-owned blocking-op pool first; if
+//!      profiling later justifies keeping mmap and page faults matter, the
+//!      memcpy path can be worker-routed too.
 //!
 //! Production stays on Linux/io_uring regardless. The two macOS variants
 //! exist to let developers compare strategies under a real workload —
@@ -72,8 +70,10 @@ const Result = ifc.Result;
 const Callback = ifc.Callback;
 const CallbackAction = ifc.CallbackAction;
 const posix_file_pool = @import("posix_file_pool.zig");
-const PosixFilePool = posix_file_pool.PosixFilePool;
-const FileOp = posix_file_pool.FileOp;
+const BlockingOpPool = posix_file_pool.BlockingOpPool;
+const BlockingOp = posix_file_pool.BlockingOp;
+const MappedRegion = posix_file_pool.MappedRegion;
+const MmapSetupResult = posix_file_pool.MmapSetupResult;
 const PoolCompleted = posix_file_pool.Completed;
 
 const evfilt_user: i16 = switch (builtin.target.os.tag) {
@@ -101,6 +101,7 @@ pub const KqueueState = struct {
     in_flight: bool = false,
     multishot: bool = false,
     cancelled: bool = false,
+    mmap_setup_phase: MmapSetupPhase = .none,
     /// EVFILT_READ (=-1), EVFILT_WRITE (=-2), or 0 if not parked.
     parked_filter: i16 = 0,
     /// Index in the timer heap, `sentinel_index` if not in the heap.
@@ -108,6 +109,7 @@ pub const KqueueState = struct {
     /// Absolute deadline in monotonic nanoseconds (timeouts and
     /// connect-with-deadline both use this field).
     deadline_ns: u64 = 0,
+    mmap_setup_result: MmapSetupResult = error.OperationCanceled,
     /// Sequence number used to break heap ties deterministically.
     seq: u32 = 0,
 };
@@ -142,6 +144,12 @@ const PosixCopyFileSessionState = struct {
     poisoned: bool = false,
 };
 
+const MmapSetupPhase = enum(u8) {
+    none,
+    read,
+    write,
+};
+
 // ── Configuration ─────────────────────────────────────────
 
 pub const Config = struct {
@@ -157,9 +165,9 @@ pub const Config = struct {
     /// Whether to issue `madvise(WILLNEED)` after mmap. Darwin lacks
     /// `MAP_POPULATE`; this is the closest equivalent.
     advise_willneed: bool = true,
-    /// Worker pool used by semantic file-copy and metadata ops. The mmap
-    /// strategy keeps normal read/write on mappings, but copy sessions and
-    /// fchown/fchmod must not run blocking syscalls on the event-loop thread.
+    /// Worker pool used by blocking syscall-shaped ops. The mmap strategy
+    /// keeps normal read/write on mappings, but explicit file, metadata,
+    /// copy, and socket setup syscalls must not run on the event-loop thread.
     file_pool_workers: u32 = 4,
     file_pool_pending_capacity: u32 = 256,
 };
@@ -232,7 +240,7 @@ pub const KqueueMmapIO = struct {
 
     cfg: Config,
     allocator: std.mem.Allocator,
-    pool: *PosixFilePool,
+    pool: *BlockingOpPool,
     pool_swap: std.ArrayListUnmanaged(PoolCompleted) = .{},
     pool_in_flight: u32 = 0,
 
@@ -242,7 +250,7 @@ pub const KqueueMmapIO = struct {
         const kq = try posix.kqueue();
         errdefer posix.close(kq);
 
-        const pool = try PosixFilePool.create(allocator, .{
+        const pool = try BlockingOpPool.create(allocator, .{
             .worker_count = cfg.file_pool_workers,
             .pending_capacity = cfg.file_pool_pending_capacity,
         });
@@ -319,8 +327,15 @@ pub const KqueueMmapIO = struct {
         self.* = undefined;
     }
 
-    pub fn closeSocket(_: *KqueueMmapIO, fd: posix.fd_t) void {
-        posix.close(fd);
+    pub fn closeSocket(self: *KqueueMmapIO, fd: posix.fd_t) void {
+        const mapping = self.takeMappedRegion(fd);
+        self.pool.submitDetached(.{ .mmap_close = .{
+            .fd = fd,
+            .mapping = mapping,
+        } }) catch {
+            if (mapping) |m| posix.munmap(m.base[0..m.len]);
+            posix.close(fd);
+        };
     }
 
     pub fn tick(self: *KqueueMmapIO, wait_at_least: u32) !void {
@@ -401,20 +416,64 @@ pub const KqueueMmapIO = struct {
 
     fn dispatchPoolEntry(self: *KqueueMmapIO, entry: PoolCompleted) void {
         const c = entry.completion;
-        const cb = c.callback orelse return;
-        kqueueState(c).in_flight = false;
+        const st = kqueueState(c);
+        st.in_flight = false;
         self.pool_in_flight -|= 1;
+        if (st.mmap_setup_phase != .none) {
+            self.dispatchMmapSetupEntry(c);
+            return;
+        }
         switch (c.op) {
             .copy_file_chunk => |op| op.session.backendStateAs(PosixCopyFileSessionState).copy_in_flight = false,
             else => {},
         }
+        const cb = c.callback orelse return;
         const action = cb(c.userdata, c, entry.result);
         switch (action) {
             .disarm => {},
             .rearm => switch (c.op) {
+                .fsync => |op| self.fsync(op, c, c.userdata, cb) catch {},
+                .close => |op| self.close(op, c, c.userdata, cb) catch {},
+                .fallocate => |op| self.fallocate(op, c, c.userdata, cb) catch {},
+                .truncate => |op| self.truncate(op, c, c.userdata, cb) catch {},
+                .openat => |op| self.openat(op, c, c.userdata, cb) catch {},
+                .mkdirat => |op| self.mkdirat(op, c, c.userdata, cb) catch {},
+                .renameat => |op| self.renameat(op, c, c.userdata, cb) catch {},
+                .unlinkat => |op| self.unlinkat(op, c, c.userdata, cb) catch {},
+                .statx => |op| self.statx(op, c, c.userdata, cb) catch {},
+                .getdents => |op| self.getdents(op, c, c.userdata, cb) catch {},
                 .copy_file_chunk => |op| self.copy_file_chunk(op, c, c.userdata, cb) catch {},
                 .fchown => |op| self.fchown(op, c, c.userdata, cb) catch {},
                 .fchmod => |op| self.fchmod(op, c, c.userdata, cb) catch {},
+                .socket => |op| self.socket(op, c, c.userdata, cb) catch {},
+                .bind => |op| self.bind(op, c, c.userdata, cb) catch {},
+                .listen => |op| self.listen(op, c, c.userdata, cb) catch {},
+                .setsockopt => |op| self.setsockopt(op, c, c.userdata, cb) catch {},
+                else => {},
+            },
+        }
+    }
+
+    fn dispatchMmapSetupEntry(self: *KqueueMmapIO, c: *Completion) void {
+        const st = kqueueState(c);
+        const phase = st.mmap_setup_phase;
+        st.mmap_setup_phase = .none;
+        const setup_result = st.mmap_setup_result;
+        st.mmap_setup_result = error.OperationCanceled;
+
+        const result: Result = switch (phase) {
+            .none => unreachable,
+            .read => .{ .read = self.finishMmapSetupForRead(c.op.read, setup_result) },
+            .write => .{ .write = self.finishMmapSetupForWrite(c.op.write, setup_result) },
+        };
+
+        const cb = c.callback orelse return;
+        const action = cb(c.userdata, c, result);
+        switch (action) {
+            .disarm => {},
+            .rearm => switch (c.op) {
+                .read => |op| self.read(op, c, c.userdata, cb) catch {},
+                .write => |op| self.write(op, c, c.userdata, cb) catch {},
                 else => {},
             },
         }
@@ -685,63 +744,41 @@ pub const KqueueMmapIO = struct {
 
     // ── File-mapping helpers ──────────────────────────────
 
-    /// Look up an existing mapping; if absent, fstat the fd and `mmap`
-    /// the entire file. Returns the live mapping. Callers bounds-check
-    /// against `len` themselves.
-    ///
-    /// Errors propagate through the caller's `Result.read|write|fsync`
-    /// variant. We do not park on kqueue for files — readiness is
-    /// undefined for regular files on darwin (always reports ready;
-    /// the syscall blocks), so the synchronous path is the right one.
-    fn getOrMap(self: *KqueueMmapIO, fd: posix.fd_t) !FileMapping {
+    fn installMappedRegion(self: *KqueueMmapIO, fd: posix.fd_t, region: MappedRegion) !FileMapping {
         if (comptime !is_kqueue_platform) return error.UnsupportedPlatform;
-        if (self.file_mappings.get(fd)) |existing| return existing;
-
-        const stat = try posix.fstat(fd);
-        const file_len: usize = @intCast(stat.size);
-        // mmap rejects length=0; deliver an empty mapping that
-        // bounds-checks correctly for read(off=0, len=0) but
-        // short-reads anything else.
-        if (file_len == 0) {
-            const empty = FileMapping{
-                .base = @as([*]align(std.heap.page_size_min) u8, @ptrFromInt(std.heap.page_size_min)),
-                .len = 0,
-            };
-            // Don't insert empty mappings into the table — they'll be
-            // remapped at non-zero size by the next access after a
-            // truncate or fallocate.
-            return empty;
-        }
-
-        const mapped = try posix.mmap(
-            null,
-            file_len,
-            posix.PROT.READ | posix.PROT.WRITE,
-            .{ .TYPE = .SHARED },
-            fd,
-            0,
-        );
-
-        if (self.cfg.advise_willneed) {
-            // Best-effort hint — Darwin honors WILLNEED as a readahead
-            // pump; failure is non-fatal.
-            posix.madvise(mapped.ptr, mapped.len, posix.MADV.WILLNEED) catch {};
-        }
-
-        const entry = FileMapping{ .base = mapped.ptr, .len = mapped.len };
-        // Pre-allocated capacity in init; this should never fail.
-        try self.file_mappings.put(self.allocator, fd, entry);
+        const entry = FileMapping{ .base = region.base, .len = region.len };
+        if (region.len == 0) return entry;
+        self.file_mappings.put(self.allocator, fd, entry) catch |err| {
+            posix.munmap(region.base[0..region.len]);
+            return err;
+        };
         return entry;
     }
 
-    /// Drop a mapping for `fd`, if any. Used before truncate so the
-    /// next access remaps at the new size. Callers responsible for
-    /// triggering this themselves — the contract has no "fd resized
-    /// outside the contract" hook.
-    fn unmapFile(self: *KqueueMmapIO, fd: posix.fd_t) void {
-        if (comptime !is_kqueue_platform) return;
-        const entry = self.file_mappings.fetchRemove(fd) orelse return;
-        if (entry.value.len > 0) posix.munmap(entry.value.base[0..entry.value.len]);
+    fn mappedRegion(self: *KqueueMmapIO, fd: posix.fd_t) ?MappedRegion {
+        const entry = self.file_mappings.get(fd) orelse return null;
+        if (entry.len == 0) return null;
+        return .{
+            .base = entry.base,
+            .len = entry.len,
+        };
+    }
+
+    fn takeMappedRegion(self: *KqueueMmapIO, fd: posix.fd_t) ?MappedRegion {
+        const entry = self.file_mappings.fetchRemove(fd) orelse return null;
+        if (entry.value.len == 0) return null;
+        return .{
+            .base = entry.value.base,
+            .len = entry.value.len,
+        };
+    }
+
+    fn restoreMappedRegion(self: *KqueueMmapIO, fd: posix.fd_t, mapping: ?MappedRegion) void {
+        const m = mapping orelse return;
+        self.file_mappings.put(self.allocator, fd, .{
+            .base = m.base,
+            .len = m.len,
+        }) catch unreachable;
     }
 
     // ── Submission methods: socket / timer / cancel (mirrors POSIX) ───
@@ -752,124 +789,54 @@ pub const KqueueMmapIO = struct {
         try self.pushTimer(deadline, c);
     }
 
-    /// Synchronous fallback. See `KqueuePosixIO.bind`.
     pub fn bind(self: *KqueueMmapIO, op: ifc.BindOp, c: *Completion, ud: ?*anyopaque, cb: Callback) !void {
         try self.armCompletion(c, .{ .bind = op }, ud, cb);
-        const result: Result = if (posix.bind(op.fd, &op.addr.any, op.addr.getOsSockLen())) |_|
-            .{ .bind = {} }
-        else |err|
-            .{ .bind = err };
-        self.pushCompleted(c, result);
+        try self.submitBlockingOp(.{ .bind = op }, c);
     }
 
     pub fn listen(self: *KqueueMmapIO, op: ifc.ListenOp, c: *Completion, ud: ?*anyopaque, cb: Callback) !void {
         try self.armCompletion(c, .{ .listen = op }, ud, cb);
-        const result: Result = if (posix.listen(op.fd, op.backlog)) |_|
-            .{ .listen = {} }
-        else |err|
-            .{ .listen = err };
-        self.pushCompleted(c, result);
+        try self.submitBlockingOp(.{ .listen = op }, c);
     }
 
     pub fn setsockopt(self: *KqueueMmapIO, op: ifc.SetsockoptOp, c: *Completion, ud: ?*anyopaque, cb: Callback) !void {
         try self.armCompletion(c, .{ .setsockopt = op }, ud, cb);
-        const result: Result = if (posix.setsockopt(op.fd, @intCast(op.level), op.optname, op.optval)) |_|
-            .{ .setsockopt = {} }
-        else |err|
-            .{ .setsockopt = err };
-        self.pushCompleted(c, result);
+        try self.submitBlockingOp(.{ .setsockopt = op }, c);
     }
 
     pub fn openat(self: *KqueueMmapIO, op: ifc.OpenAtOp, c: *Completion, ud: ?*anyopaque, cb: Callback) !void {
         try self.armCompletion(c, .{ .openat = op }, ud, cb);
-        const result: Result = if (posix.openat(op.dir_fd, op.path, op.flags, op.mode)) |fd|
-            .{ .openat = fd }
-        else |err|
-            .{ .openat = err };
-        self.pushCompleted(c, result);
+        try self.submitBlockingOp(.{ .openat = op }, c);
     }
 
     pub fn mkdirat(self: *KqueueMmapIO, op: ifc.MkdirAtOp, c: *Completion, ud: ?*anyopaque, cb: Callback) !void {
         try self.armCompletion(c, .{ .mkdirat = op }, ud, cb);
-        const result: Result = if (posix.mkdirat(op.dir_fd, op.path, op.mode)) |_|
-            .{ .mkdirat = {} }
-        else |err|
-            .{ .mkdirat = err };
-        self.pushCompleted(c, result);
+        try self.submitBlockingOp(.{ .mkdirat = op }, c);
     }
 
     pub fn renameat(self: *KqueueMmapIO, op: ifc.RenameAtOp, c: *Completion, ud: ?*anyopaque, cb: Callback) !void {
         try self.armCompletion(c, .{ .renameat = op }, ud, cb);
-        const result: Result = if (op.flags != 0)
-            .{ .renameat = error.OperationNotSupported }
-        else if (posix.renameat(op.old_dir_fd, op.old_path, op.new_dir_fd, op.new_path)) |_|
-            .{ .renameat = {} }
-        else |err|
-            .{ .renameat = err };
-        self.pushCompleted(c, result);
+        try self.submitBlockingOp(.{ .renameat = op }, c);
     }
 
     pub fn unlinkat(self: *KqueueMmapIO, op: ifc.UnlinkAtOp, c: *Completion, ud: ?*anyopaque, cb: Callback) !void {
         try self.armCompletion(c, .{ .unlinkat = op }, ud, cb);
-        const result: Result = if (posix.unlinkat(op.dir_fd, op.path, op.flags)) |_|
-            .{ .unlinkat = {} }
-        else |err|
-            .{ .unlinkat = err };
-        self.pushCompleted(c, result);
+        try self.submitBlockingOp(.{ .unlinkat = op }, c);
     }
 
     pub fn statx(self: *KqueueMmapIO, op: ifc.StatxOp, c: *Completion, ud: ?*anyopaque, cb: Callback) !void {
         try self.armCompletion(c, .{ .statx = op }, ud, cb);
-        const result: Result = if (posix.fstatatZ(op.dir_fd, op.path, op.flags)) |st| blk: {
-            op.buf.* = std.mem.zeroes(linux.Statx);
-            op.buf.mask = op.mask & linux.STATX_BASIC_STATS;
-            op.buf.blksize = @intCast(@max(st.blksize, 0));
-            op.buf.nlink = @intCast(@max(st.nlink, 0));
-            op.buf.uid = @intCast(st.uid);
-            op.buf.gid = @intCast(st.gid);
-            op.buf.mode = @intCast(st.mode);
-            op.buf.ino = @intCast(@max(st.ino, 0));
-            op.buf.size = @intCast(@max(st.size, 0));
-            op.buf.blocks = @intCast(@max(st.blocks, 0));
-            break :blk .{ .statx = {} };
-        } else |err| .{ .statx = err };
-        self.pushCompleted(c, result);
+        try self.submitBlockingOp(.{ .statx = op }, c);
     }
 
     pub fn getdents(self: *KqueueMmapIO, op: ifc.GetdentsOp, c: *Completion, ud: ?*anyopaque, cb: Callback) !void {
         try self.armCompletion(c, .{ .getdents = op }, ud, cb);
-        var dir: std.fs.Dir = .{ .fd = op.fd };
-        var iter = dir.iterateAssumeFirstIteration();
-        var out: usize = 0;
-        var index: usize = 0;
-        const result: Result = blk: {
-            while (true) {
-                const maybe_entry = iter.next() catch |err| break :blk .{ .getdents = err };
-                const entry = maybe_entry orelse break :blk .{ .getdents = out };
-                const next = ifc.appendDirent64(op.buf, out, @as(u64, index + 1), @as(u64, index + 1), fileKindToDirentType(entry.kind), entry.name) orelse {
-                    if (out == 0) break :blk .{ .getdents = error.InvalidArgument };
-                    break :blk .{ .getdents = out };
-                };
-                out = next;
-                index += 1;
-            }
-        };
-        self.pushCompleted(c, result);
+        try self.submitBlockingOp(.{ .getdents = op }, c);
     }
 
     pub fn socket(self: *KqueueMmapIO, op: ifc.SocketOp, c: *Completion, ud: ?*anyopaque, cb: Callback) !void {
         try self.armCompletion(c, .{ .socket = op }, ud, cb);
-        const result: Result = blk: {
-            const fd = posix.socket(@intCast(op.domain), @intCast(op.sock_type), @intCast(op.protocol)) catch |err| {
-                break :blk .{ .socket = err };
-            };
-            setNonblockCloexec(fd) catch |err| {
-                posix.close(fd);
-                break :blk .{ .socket = err };
-            };
-            break :blk .{ .socket = fd };
-        };
-        self.pushCompleted(c, result);
+        try self.submitBlockingOp(.{ .socket = op }, c);
     }
 
     pub fn connect(self: *KqueueMmapIO, op: ifc.ConnectOp, c: *Completion, ud: ?*anyopaque, cb: Callback) !void {
@@ -904,7 +871,7 @@ pub const KqueueMmapIO = struct {
         const accepted = posix.accept(op.fd, @ptrCast(&addr), &addrlen, 0);
         if (accepted) |fd| {
             setNonblockCloexec(fd) catch |err| {
-                posix.close(fd);
+                self.closeSocket(fd);
                 self.pushCompleted(c, .{ .accept = err });
                 return;
             };
@@ -1020,7 +987,26 @@ pub const KqueueMmapIO = struct {
             found = true;
         } else {
             const target_is_pool_op = switch (target.op) {
-                .copy_file_chunk, .fchown, .fchmod => true,
+                .read,
+                .write,
+                .close,
+                .fallocate,
+                .truncate,
+                .openat,
+                .mkdirat,
+                .renameat,
+                .unlinkat,
+                .statx,
+                .getdents,
+                .fsync,
+                .copy_file_chunk,
+                .fchown,
+                .fchmod,
+                .socket,
+                .bind,
+                .listen,
+                .setsockopt,
+                => true,
                 else => false,
             };
             if (target_is_pool_op and self.pool.tryCancelPending(target)) {
@@ -1036,130 +1022,131 @@ pub const KqueueMmapIO = struct {
 
     pub fn read(self: *KqueueMmapIO, op: ifc.ReadOp, c: *Completion, ud: ?*anyopaque, cb: Callback) !void {
         try self.armCompletion(c, .{ .read = op }, ud, cb);
-        const r: Result = blk: {
-            if (comptime !is_kqueue_platform) break :blk .{ .read = error.UnsupportedPlatform };
-            const mapping = self.getOrMap(op.fd) catch |err| break :blk .{ .read = err };
-            // Bounds-check against the mapped length. Reads past EOF
-            // short-read; reads entirely past EOF return 0 bytes (matches
-            // pread semantics).
-            const off: usize = @intCast(op.offset);
-            if (off >= mapping.len) break :blk .{ .read = @as(usize, 0) };
-            const available = mapping.len - off;
-            const n = @min(op.buf.len, available);
-            @memcpy(op.buf[0..n], mapping.base[off .. off + n]);
-            break :blk .{ .read = n };
+        if (comptime !is_kqueue_platform) {
+            return self.pushCompleted(c, .{ .read = error.UnsupportedPlatform });
+        }
+        const mapping = self.file_mappings.get(op.fd) orelse {
+            return self.submitMmapSetup(c, op.fd, null, .read);
         };
-        self.pushCompleted(c, r);
+        self.pushCompleted(c, .{ .read = readFromMapping(op, mapping) });
     }
 
     pub fn write(self: *KqueueMmapIO, op: ifc.WriteOp, c: *Completion, ud: ?*anyopaque, cb: Callback) !void {
         try self.armCompletion(c, .{ .write = op }, ud, cb);
-        const r: Result = blk: {
-            if (comptime !is_kqueue_platform) break :blk .{ .write = error.UnsupportedPlatform };
-            const mapping = self.getOrMap(op.fd) catch |err| break :blk .{ .write = err };
+        if (comptime !is_kqueue_platform) {
+            return self.pushCompleted(c, .{ .write = error.UnsupportedPlatform });
+        }
+        if (self.file_mappings.get(op.fd)) |mapping| {
             const off: usize = @intCast(op.offset);
-            // Writes past mapped EOF are not supported in this MVP.
-            // Callers should size the file via fallocate / truncate
-            // first (PieceStore.init does this).
-            if (off >= mapping.len) break :blk .{ .write = error.NoSpaceLeft };
-            const available = mapping.len - off;
-            const n = @min(op.buf.len, available);
-            @memcpy(mapping.base[off .. off + n], op.buf[0..n]);
-            break :blk .{ .write = n };
+            const required = off + op.buf.len;
+            if (required <= mapping.len) {
+                return self.pushCompleted(c, .{ .write = writeToMapping(op, mapping) });
+            }
+        }
+
+        const mapping = self.takeMappedRegion(op.fd);
+        self.submitMmapSetup(c, op.fd, mapping, .write) catch |err| {
+            self.restoreMappedRegion(op.fd, mapping);
+            return err;
         };
-        self.pushCompleted(c, r);
+    }
+
+    fn submitMmapSetup(
+        self: *KqueueMmapIO,
+        c: *Completion,
+        fd: posix.fd_t,
+        mapping: ?MappedRegion,
+        phase: MmapSetupPhase,
+    ) !void {
+        const st = kqueueState(c);
+        st.mmap_setup_phase = phase;
+        st.mmap_setup_result = error.OperationCanceled;
+        self.submitBlockingOp(.{ .mmap_setup = .{
+            .fd = fd,
+            .mapping = mapping,
+            .advise_willneed = self.cfg.advise_willneed,
+            .result = &st.mmap_setup_result,
+        } }, c) catch |err| {
+            st.mmap_setup_phase = .none;
+            st.mmap_setup_result = error.OperationCanceled;
+            return err;
+        };
+    }
+
+    fn finishMmapSetupForRead(self: *KqueueMmapIO, op: ifc.ReadOp, setup_result: MmapSetupResult) anyerror!usize {
+        const mapping = try self.installMappedRegion(op.fd, try setup_result);
+        return readFromMapping(op, mapping);
+    }
+
+    fn finishMmapSetupForWrite(self: *KqueueMmapIO, op: ifc.WriteOp, setup_result: MmapSetupResult) anyerror!usize {
+        const mapping = try self.installMappedRegion(op.fd, try setup_result);
+        return writeToMapping(op, mapping);
+    }
+
+    fn readFromMapping(op: ifc.ReadOp, mapping: FileMapping) anyerror!usize {
+        const off: usize = @intCast(op.offset);
+        if (off >= mapping.len) return 0;
+        const available = mapping.len - off;
+        const n = @min(op.buf.len, available);
+        @memcpy(op.buf[0..n], mapping.base[off .. off + n]);
+        return n;
+    }
+
+    fn writeToMapping(op: ifc.WriteOp, mapping: FileMapping) anyerror!usize {
+        const off: usize = @intCast(op.offset);
+        const required = off + op.buf.len;
+        if (required > mapping.len) return error.NoSpaceLeft;
+        @memcpy(mapping.base[off .. off + op.buf.len], op.buf);
+        return op.buf.len;
     }
 
     pub fn fsync(self: *KqueueMmapIO, op: ifc.FsyncOp, c: *Completion, ud: ?*anyopaque, cb: Callback) !void {
         try self.armCompletion(c, .{ .fsync = op }, ud, cb);
-        const r: Result = blk: {
-            if (comptime !is_kqueue_platform) break :blk .{ .fsync = error.UnsupportedPlatform };
-            // Darwin's msync flushes the dirty pages in the mapping to
-            // disk. There is no datasync vs full-sync distinction at
-            // the msync layer — both `op.datasync = true` and `false`
-            // map to MSF.SYNC. For true durability the call would be
-            // `fcntl(F_FULLFSYNC)`; out of scope for the dev backend.
-            const entry = self.file_mappings.get(op.fd) orelse {
-                // No mapping → nothing buffered through us → no-op success.
-                // (PieceStore.init may fsync before any read/write —
-                // that's a legitimate "ensure metadata is on disk" call.
-                // Issue a plain `fsync(2)` for that case via std.c.)
-                const rc = std.c.fsync(op.fd);
-                if (rc == 0) break :blk .{ .fsync = {} };
-                break :blk .{ .fsync = posix.unexpectedErrno(posix.errno(rc)) };
-            };
-            if (entry.len == 0) break :blk .{ .fsync = {} };
-            posix.msync(entry.base[0..entry.len], posix.MSF.SYNC) catch |err| {
-                break :blk .{ .fsync = err };
-            };
-            break :blk .{ .fsync = {} };
-        };
-        self.pushCompleted(c, r);
+        if (self.mappedRegion(op.fd)) |mapping| {
+            try self.submitBlockingOp(.{ .msync = .{ .mapping = mapping } }, c);
+        } else {
+            try self.submitBlockingOp(.{ .fsync = op }, c);
+        }
     }
 
     pub fn close(self: *KqueueMmapIO, op: ifc.CloseOp, c: *Completion, ud: ?*anyopaque, cb: Callback) !void {
         try self.armCompletion(c, .{ .close = op }, ud, cb);
-        self.unmapFile(op.fd);
-        if (comptime is_kqueue_platform) posix.close(op.fd);
-        self.pushCompleted(c, .{ .close = {} });
+        const mapping = self.takeMappedRegion(op.fd);
+        self.submitBlockingOp(.{ .mmap_close = .{
+            .fd = op.fd,
+            .mapping = mapping,
+        } }, c) catch |err| {
+            self.restoreMappedRegion(op.fd, mapping);
+            return err;
+        };
     }
 
     pub fn fallocate(self: *KqueueMmapIO, op: ifc.FallocateOp, c: *Completion, ud: ?*anyopaque, cb: Callback) !void {
         try self.armCompletion(c, .{ .fallocate = op }, ud, cb);
-        const r: Result = blk: {
-            if (comptime !is_kqueue_platform) break :blk .{ .fallocate = error.UnsupportedPlatform };
-            // Darwin has no Linux-style fallocate. Emulate with
-            // F_PREALLOCATE + ftruncate. Pattern from
-            // tigerbeetle/src/io/darwin.zig:fs_allocate.
-            //
-            // The contract's `op.offset + op.len` is the desired file
-            // size; we attempt contiguous allocation first, fall back
-            // to non-contiguous, then ftruncate to set the actual size.
-            const target_size: posix.off_t = @intCast(op.offset + op.len);
-            var store = fstore_t{
-                .fst_flags = F_ALLOCATECONTIG | F_ALLOCATEALL,
-                .fst_posmode = F_PEOFPOSMODE,
-                .fst_offset = 0,
-                .fst_length = target_size,
-                .fst_bytesalloc = 0,
-            };
-            var rc = posix.system.fcntl(op.fd, posix.F.PREALLOCATE, @intFromPtr(&store));
-            if (posix.errno(rc) != .SUCCESS) {
-                // Retry without contiguous constraint.
-                store.fst_flags = F_ALLOCATEALL;
-                rc = posix.system.fcntl(op.fd, posix.F.PREALLOCATE, @intFromPtr(&store));
-            }
-            switch (posix.errno(rc)) {
-                .SUCCESS => {},
-                // Darwin spells the "not supported" errno EOPNOTSUPP;
-                // there's no separate ENOTSUP on this platform.
-                .OPNOTSUPP => break :blk .{ .fallocate = error.OperationNotSupported },
-                .BADF => break :blk .{ .fallocate = error.BadFileDescriptor },
-                .INVAL => break :blk .{ .fallocate = error.InvalidArgument },
-                .OVERFLOW => break :blk .{ .fallocate = error.FileTooBig },
-                else => |e| break :blk .{ .fallocate = posix.unexpectedErrno(e) },
-            }
-            // Drop any mapping; the next access remaps at the new size.
-            self.unmapFile(op.fd);
-            posix.ftruncate(op.fd, op.offset + op.len) catch |err| {
-                break :blk .{ .fallocate = err };
-            };
-            break :blk .{ .fallocate = {} };
+        const mapping = self.takeMappedRegion(op.fd);
+        self.submitBlockingOp(.{ .mmap_fallocate = .{
+            .fd = op.fd,
+            .mode = op.mode,
+            .offset = op.offset,
+            .len = op.len,
+            .mapping = mapping,
+        } }, c) catch |err| {
+            self.restoreMappedRegion(op.fd, mapping);
+            return err;
         };
-        self.pushCompleted(c, r);
     }
 
     pub fn truncate(self: *KqueueMmapIO, op: ifc.TruncateOp, c: *Completion, ud: ?*anyopaque, cb: Callback) !void {
         try self.armCompletion(c, .{ .truncate = op }, ud, cb);
-        // Darwin lacks `mremap`; the only safe path is to drop the
-        // mapping before the file is resized and let the next access
-        // remap at the new size.
-        self.unmapFile(op.fd);
-        const r: Result = if (posix.ftruncate(op.fd, op.length)) |_|
-            .{ .truncate = {} }
-        else |err|
-            .{ .truncate = err };
-        self.pushCompleted(c, r);
+        const mapping = self.takeMappedRegion(op.fd);
+        self.submitBlockingOp(.{ .mmap_truncate = .{
+            .fd = op.fd,
+            .length = op.length,
+            .mapping = mapping,
+        } }, c) catch |err| {
+            self.restoreMappedRegion(op.fd, mapping);
+            return err;
+        };
     }
 
     pub fn open_copy_file_session(self: *KqueueMmapIO, op: ifc.OpenCopyFileSessionOp, c: *Completion, ud: ?*anyopaque, cb: Callback) !void {
@@ -1179,7 +1166,7 @@ pub const KqueueMmapIO = struct {
         if (op.len == 0) return self.pushCompleted(c, .{ .copy_file_chunk = error.InvalidArgument });
 
         st.copy_in_flight = true;
-        self.submitFileOp(.{ .copy_file_chunk = op }, c) catch |err| {
+        self.submitBlockingOp(.{ .copy_file_chunk = op }, c) catch |err| {
             st.copy_in_flight = false;
             return err;
         };
@@ -1195,15 +1182,15 @@ pub const KqueueMmapIO = struct {
 
     pub fn fchown(self: *KqueueMmapIO, op: ifc.FchownOp, c: *Completion, ud: ?*anyopaque, cb: Callback) !void {
         try self.armCompletion(c, .{ .fchown = op }, ud, cb);
-        try self.submitFileOp(.{ .fchown = op }, c);
+        try self.submitBlockingOp(.{ .fchown = op }, c);
     }
 
     pub fn fchmod(self: *KqueueMmapIO, op: ifc.FchmodOp, c: *Completion, ud: ?*anyopaque, cb: Callback) !void {
         try self.armCompletion(c, .{ .fchmod = op }, ud, cb);
-        try self.submitFileOp(.{ .fchmod = op }, c);
+        try self.submitBlockingOp(.{ .fchmod = op }, c);
     }
 
-    fn submitFileOp(self: *KqueueMmapIO, op: FileOp, c: *Completion) !void {
+    fn submitBlockingOp(self: *KqueueMmapIO, op: BlockingOp, c: *Completion) !void {
         self.pool_in_flight += 1;
         self.pool.submit(op, c) catch |err| {
             self.pool_in_flight -|= 1;

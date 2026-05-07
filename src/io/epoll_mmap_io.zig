@@ -14,34 +14,29 @@
 //!
 //! ## Mapping lifecycle
 //!
-//!   1. First file op against `fd` runs `fstat(fd)` to get the file size,
-//!      then `mmap(fd, 0..size, PROT_READ | PROT_WRITE, MAP_SHARED)` and
-//!      records `(ptr, size)` in `file_mappings`.
+//!   1. First file op against `fd` submits mapping setup to `BlockingOpPool`;
+//!      the worker runs `fstat(fd)`, `mmap(fd, 0..size, PROT_READ |
+//!      PROT_WRITE, MAP_SHARED)`, and reports `(ptr, size)` back to the EL.
 //!   2. Subsequent reads/writes do `@memcpy` against the recorded mapping.
 //!      If a write would extend past `size` we tear down the mapping and
 //!      remap (the file should already have been `fallocate`d / `ftruncate`d
 //!      to the necessary size; otherwise the write returns
 //!      `error.AccessDenied` for SIGBUS-equivalent semantics).
-//!   3. `fsync` runs `msync(ptr, size, MS_SYNC)` — stronger than
-//!      `fdatasync` since `msync` flushes both data and any metadata
-//!      changes accumulated against the mapping.
-//!   4. `fallocate` calls `posix.fallocate` synchronously; if the file's
-//!      mapping is now stale (size grew) the next access remaps.
-//!   5. `truncate` calls `posix.ftruncate` synchronously; the existing
-//!      mapping is unmapped so the next access remaps.
-//!   6. `closeSocket` (used for files too — naming is historical) tears
-//!      down any mapping for `fd` before `posix.close`.
+//!   3. `fsync` submits `msync(ptr, size, MS_SYNC)` to `BlockingOpPool`
+//!      when a mapping exists, or `fsync`/`fdatasync` otherwise.
+//!   4. `fallocate` / `truncate` / `close` transfer any existing mapping
+//!      to `BlockingOpPool`; the worker unmaps before resizing or closing.
+//!      The next read/write remaps at the new size.
 //!
 //! ## Page-fault discussion (deliberate MVP limitation)
 //!
-//! In the MVP, page faults block the EL thread. For varuna's workload
-//! (large piece reads/writes from a small set of files) this is rarely a
-//! problem if `madvise(MADV_WILLNEED)` is used proactively to warm the
-//! pagecache before the read fires. None of varuna's reference codebases
-//! (libxev, tigerbeetle, ZIO) use mmap for data-path file I/O — that's a
-//! signal worth respecting. If profiling shows page-fault stalls matter,
-//! the mitigation is to run the `memcpy` itself on a thread pool so the
-//! EL keeps making progress while a fault resolves. Tracked under
+//! Page faults can block the EL thread. That is an explicit limitation of
+//! the mmap backends for now. Explicit syscall-shaped operations, including
+//! lazy mapping setup, move to the backend-owned blocking-op pool;
+//! page-faulting `memcpy` mitigation is deferred until profiling says the
+//! mmap strategy itself is still worth keeping. If needed, the mitigation is
+//! to run the whole mapped copy path on a worker so the EL keeps making
+//! progress while faults resolve. Tracked under
 //! "EpollMmapIO file-op page-fault mitigation" in
 //! `progress-reports/2026-04-30-epoll-bifurcation.md`.
 //!
@@ -61,8 +56,10 @@ const Result = ifc.Result;
 const Callback = ifc.Callback;
 const CallbackAction = ifc.CallbackAction;
 const posix_file_pool = @import("posix_file_pool.zig");
-const PosixFilePool = posix_file_pool.PosixFilePool;
-const FileOp = posix_file_pool.FileOp;
+const BlockingOpPool = posix_file_pool.BlockingOpPool;
+const BlockingOp = posix_file_pool.BlockingOp;
+const MappedRegion = posix_file_pool.MappedRegion;
+const MmapSetupResult = posix_file_pool.MmapSetupResult;
 const PoolCompleted = posix_file_pool.Completed;
 
 // ── Backend state ─────────────────────────────────────────
@@ -79,6 +76,12 @@ const FdInterest = enum(u8) {
     poll,
 };
 
+const MmapSetupPhase = enum(u8) {
+    none,
+    read,
+    write,
+};
+
 const PosixCopyFileSessionState = struct {
     open: bool = false,
     copy_in_flight: bool = false,
@@ -90,8 +93,10 @@ pub const EpollState = struct {
     epoll_registered: bool = false,
     accept_multishot: bool = false,
     interest: FdInterest = .none,
+    mmap_setup_phase: MmapSetupPhase = .none,
     registered_fd: posix.fd_t = -1,
     deadline_ns: u64 = 0,
+    mmap_setup_result: MmapSetupResult = error.OperationCanceled,
     timer_heap_index: u32 = sentinel_index,
 };
 
@@ -109,9 +114,9 @@ inline fn epollState(c: *Completion) *EpollState {
 pub const Config = struct {
     /// Initial capacity for the timer heap. Mirrors EpollPosixIO.Config.
     max_completions: u32 = 1024,
-    /// Worker pool used by semantic file-copy and metadata ops. The mmap
-    /// strategy keeps normal read/write on mappings, but copy sessions and
-    /// fchown/fchmod must not run blocking syscalls on the event-loop thread.
+    /// Worker pool used by blocking syscall-shaped ops. The mmap strategy
+    /// keeps normal read/write on mappings, but explicit file, metadata,
+    /// copy, and socket setup syscalls must not run on the event-loop thread.
     file_pool_workers: u32 = 4,
     file_pool_pending_capacity: u32 = 256,
 };
@@ -254,7 +259,7 @@ pub const EpollMmapIO = struct {
     file_mappings: std.AutoHashMap(posix.fd_t, MmapEntry),
     mmap_completed: std.ArrayListUnmanaged(MmapCompleted) = .{},
     mmap_completed_swap: std.ArrayListUnmanaged(MmapCompleted) = .{},
-    pool: *PosixFilePool,
+    pool: *BlockingOpPool,
     pool_swap: std.ArrayListUnmanaged(PoolCompleted) = .{},
     fd_registrations: std.AutoHashMap(posix.fd_t, FdRegistration),
     /// Completion currently being dispatched on the write lane. If its
@@ -301,7 +306,7 @@ pub const EpollMmapIO = struct {
             else => |e| return posix.unexpectedErrno(e),
         }
 
-        const pool = try PosixFilePool.create(allocator, .{
+        const pool = try BlockingOpPool.create(allocator, .{
             .worker_count = config.file_pool_workers,
             .pending_capacity = config.file_pool_pending_capacity,
         });
@@ -345,18 +350,24 @@ pub const EpollMmapIO = struct {
         _ = posix.write(wakeup_fd.*, std.mem.asBytes(&val)) catch {};
     }
 
-    /// Synchronously close a file descriptor. Used for both sockets and
-    /// regular files (the contract method is named `closeSocket` for
-    /// historical reasons). Tears down any mmap mapping for `fd` first.
+    /// Fire-and-forget fd close. Used for both sockets and regular files
+    /// (the contract method is named `closeSocket` for historical reasons).
+    /// Removes readiness state inline, then offloads any `munmap` + `close(2)`.
     pub fn closeSocket(self: *EpollMmapIO, fd: posix.fd_t) void {
-        self.unmapFile(fd);
+        const mapping = self.takeMappedRegion(fd);
         _ = linux.epoll_ctl(self.epoll_fd, linux.EPOLL.CTL_DEL, fd, null);
         if (self.fd_registrations.fetchRemove(fd)) |entry| {
             self.cancelRegisteredCompletion(entry.value.read);
             self.cancelWriteQueue(entry.value.write_head);
             self.cancelRegisteredCompletion(entry.value.poll);
         }
-        posix.close(fd);
+        self.pool.submitDetached(.{ .mmap_close = .{
+            .fd = fd,
+            .mapping = mapping,
+        } }) catch {
+            if (mapping) |m| posix.munmap(m.base[0..m.len]);
+            posix.close(fd);
+        };
     }
 
     // ── Main loop ─────────────────────────────────────────
@@ -412,6 +423,10 @@ pub const EpollMmapIO = struct {
         st.in_flight = false;
         self.active -|= 1;
         fired.* += 1;
+        if (st.mmap_setup_phase != .none) {
+            try self.dispatchMmapSetupEntry(c);
+            return;
+        }
         switch (c.op) {
             .copy_file_chunk => |op| op.session.backendStateAs(PosixCopyFileSessionState).copy_in_flight = false,
             else => {},
@@ -422,9 +437,48 @@ pub const EpollMmapIO = struct {
         switch (action) {
             .disarm => {},
             .rearm => switch (c.op) {
+                .fsync => |op| try self.fsync(op, c, c.userdata, cb),
+                .close => |op| try self.close(op, c, c.userdata, cb),
+                .fallocate => |op| try self.fallocate(op, c, c.userdata, cb),
+                .truncate => |op| try self.truncate(op, c, c.userdata, cb),
+                .openat => |op| try self.openat(op, c, c.userdata, cb),
+                .mkdirat => |op| try self.mkdirat(op, c, c.userdata, cb),
+                .renameat => |op| try self.renameat(op, c, c.userdata, cb),
+                .unlinkat => |op| try self.unlinkat(op, c, c.userdata, cb),
+                .statx => |op| try self.statx(op, c, c.userdata, cb),
+                .getdents => |op| try self.getdents(op, c, c.userdata, cb),
                 .copy_file_chunk => |op| try self.copy_file_chunk(op, c, c.userdata, cb),
                 .fchown => |op| try self.fchown(op, c, c.userdata, cb),
                 .fchmod => |op| try self.fchmod(op, c, c.userdata, cb),
+                .socket => |op| try self.socket(op, c, c.userdata, cb),
+                .bind => |op| try self.bind(op, c, c.userdata, cb),
+                .listen => |op| try self.listen(op, c, c.userdata, cb),
+                .setsockopt => |op| try self.setsockopt(op, c, c.userdata, cb),
+                else => {},
+            },
+        }
+    }
+
+    fn dispatchMmapSetupEntry(self: *EpollMmapIO, c: *Completion) !void {
+        const st = epollState(c);
+        const phase = st.mmap_setup_phase;
+        st.mmap_setup_phase = .none;
+        const setup_result = st.mmap_setup_result;
+        st.mmap_setup_result = error.OperationCanceled;
+
+        const result: Result = switch (phase) {
+            .none => unreachable,
+            .read => .{ .read = self.finishMmapSetupForRead(c.op.read, setup_result) },
+            .write => .{ .write = self.finishMmapSetupForWrite(c.op.write, setup_result) },
+        };
+
+        const cb = c.callback orelse return;
+        const action = cb(c.userdata, c, result);
+        switch (action) {
+            .disarm => {},
+            .rearm => switch (c.op) {
+                .read => |op| try self.read(op, c, c.userdata, cb),
+                .write => |op| try self.write(op, c, c.userdata, cb),
                 else => {},
             },
         }
@@ -626,25 +680,8 @@ pub const EpollMmapIO = struct {
     // ── Submission methods (sockets, mirrored from EpollPosixIO) ──
 
     pub fn socket(self: *EpollMmapIO, op_in: ifc.SocketOp, c: *Completion, ud: ?*anyopaque, cb: Callback) !void {
-        var op = op_in;
-        while (true) {
-            try self.armCompletion(c, .{ .socket = op }, ud, cb);
-            const sock_type = op.sock_type | posix.SOCK.NONBLOCK | posix.SOCK.CLOEXEC;
-            const result: Result = if (posix.socket(@intCast(op.domain), sock_type, op.protocol)) |fd|
-                .{ .socket = fd }
-            else |err|
-                .{ .socket = err };
-            switch (try self.deliverInline(c, result)) {
-                .disarm => return,
-                .rearm => switch (c.op) {
-                    .socket => |new_op| {
-                        op = new_op;
-                        continue;
-                    },
-                    else => return,
-                },
-            }
-        }
+        try self.armCompletion(c, .{ .socket = op_in }, ud, cb);
+        try self.submitBlockingOp(.{ .socket = op_in }, c);
     }
 
     pub fn connect(self: *EpollMmapIO, op: ifc.ConnectOp, c: *Completion, ud: ?*anyopaque, cb: Callback) !void {
@@ -704,204 +741,49 @@ pub const EpollMmapIO = struct {
         try self.registerFd(c, op_in.fd, linux.EPOLL.OUT);
     }
 
-    /// Synchronous fallback. Same shape as `EpollPosixIO.bind`.
     pub fn bind(self: *EpollMmapIO, op_in: ifc.BindOp, c: *Completion, ud: ?*anyopaque, cb: Callback) !void {
-        var op = op_in;
-        while (true) {
-            try self.armCompletion(c, .{ .bind = op }, ud, cb);
-
-            const result: Result = if (posix.bind(op.fd, &op.addr.any, op.addr.getOsSockLen())) |_|
-                .{ .bind = {} }
-            else |err|
-                .{ .bind = err };
-
-            switch (try self.deliverInline(c, result)) {
-                .disarm => return,
-                .rearm => switch (c.op) {
-                    .bind => |new_op| {
-                        op = new_op;
-                        continue;
-                    },
-                    else => return,
-                },
-            }
-        }
+        try self.armCompletion(c, .{ .bind = op_in }, ud, cb);
+        try self.submitBlockingOp(.{ .bind = op_in }, c);
     }
 
     pub fn listen(self: *EpollMmapIO, op_in: ifc.ListenOp, c: *Completion, ud: ?*anyopaque, cb: Callback) !void {
-        var op = op_in;
-        while (true) {
-            try self.armCompletion(c, .{ .listen = op }, ud, cb);
-
-            const result: Result = if (posix.listen(op.fd, op.backlog)) |_|
-                .{ .listen = {} }
-            else |err|
-                .{ .listen = err };
-
-            switch (try self.deliverInline(c, result)) {
-                .disarm => return,
-                .rearm => switch (c.op) {
-                    .listen => |new_op| {
-                        op = new_op;
-                        continue;
-                    },
-                    else => return,
-                },
-            }
-        }
+        try self.armCompletion(c, .{ .listen = op_in }, ud, cb);
+        try self.submitBlockingOp(.{ .listen = op_in }, c);
     }
 
     pub fn setsockopt(self: *EpollMmapIO, op_in: ifc.SetsockoptOp, c: *Completion, ud: ?*anyopaque, cb: Callback) !void {
-        var op = op_in;
-        while (true) {
-            try self.armCompletion(c, .{ .setsockopt = op }, ud, cb);
-
-            const result: Result = if (posix.setsockopt(op.fd, @intCast(op.level), op.optname, op.optval)) |_|
-                .{ .setsockopt = {} }
-            else |err|
-                .{ .setsockopt = err };
-
-            switch (try self.deliverInline(c, result)) {
-                .disarm => return,
-                .rearm => switch (c.op) {
-                    .setsockopt => |new_op| {
-                        op = new_op;
-                        continue;
-                    },
-                    else => return,
-                },
-            }
-        }
+        try self.armCompletion(c, .{ .setsockopt = op_in }, ud, cb);
+        try self.submitBlockingOp(.{ .setsockopt = op_in }, c);
     }
 
     pub fn openat(self: *EpollMmapIO, op_in: ifc.OpenAtOp, c: *Completion, ud: ?*anyopaque, cb: Callback) !void {
-        var op = op_in;
-        while (true) {
-            try self.armCompletion(c, .{ .openat = op }, ud, cb);
-            const result: Result = if (posix.openat(op.dir_fd, op.path, op.flags, op.mode)) |fd|
-                .{ .openat = fd }
-            else |err|
-                .{ .openat = err };
-            switch (try self.deliverInline(c, result)) {
-                .disarm => return,
-                .rearm => switch (c.op) {
-                    .openat => |new_op| {
-                        op = new_op;
-                        continue;
-                    },
-                    else => return,
-                },
-            }
-        }
+        try self.armCompletion(c, .{ .openat = op_in }, ud, cb);
+        try self.submitBlockingOp(.{ .openat = op_in }, c);
     }
 
     pub fn mkdirat(self: *EpollMmapIO, op_in: ifc.MkdirAtOp, c: *Completion, ud: ?*anyopaque, cb: Callback) !void {
-        var op = op_in;
-        while (true) {
-            try self.armCompletion(c, .{ .mkdirat = op }, ud, cb);
-            const result: Result = if (posix.mkdirat(op.dir_fd, op.path, op.mode)) |_|
-                .{ .mkdirat = {} }
-            else |err|
-                .{ .mkdirat = err };
-            switch (try self.deliverInline(c, result)) {
-                .disarm => return,
-                .rearm => switch (c.op) {
-                    .mkdirat => |new_op| {
-                        op = new_op;
-                        continue;
-                    },
-                    else => return,
-                },
-            }
-        }
+        try self.armCompletion(c, .{ .mkdirat = op_in }, ud, cb);
+        try self.submitBlockingOp(.{ .mkdirat = op_in }, c);
     }
 
     pub fn renameat(self: *EpollMmapIO, op_in: ifc.RenameAtOp, c: *Completion, ud: ?*anyopaque, cb: Callback) !void {
-        var op = op_in;
-        while (true) {
-            try self.armCompletion(c, .{ .renameat = op }, ud, cb);
-            const result: Result = if (op.flags != 0)
-                .{ .renameat = error.OperationNotSupported }
-            else if (posix.renameat(op.old_dir_fd, op.old_path, op.new_dir_fd, op.new_path)) |_|
-                .{ .renameat = {} }
-            else |err|
-                .{ .renameat = err };
-            switch (try self.deliverInline(c, result)) {
-                .disarm => return,
-                .rearm => switch (c.op) {
-                    .renameat => |new_op| {
-                        op = new_op;
-                        continue;
-                    },
-                    else => return,
-                },
-            }
-        }
+        try self.armCompletion(c, .{ .renameat = op_in }, ud, cb);
+        try self.submitBlockingOp(.{ .renameat = op_in }, c);
     }
 
     pub fn unlinkat(self: *EpollMmapIO, op_in: ifc.UnlinkAtOp, c: *Completion, ud: ?*anyopaque, cb: Callback) !void {
-        var op = op_in;
-        while (true) {
-            try self.armCompletion(c, .{ .unlinkat = op }, ud, cb);
-            const result: Result = if (posix.unlinkat(op.dir_fd, op.path, op.flags)) |_|
-                .{ .unlinkat = {} }
-            else |err|
-                .{ .unlinkat = err };
-            switch (try self.deliverInline(c, result)) {
-                .disarm => return,
-                .rearm => switch (c.op) {
-                    .unlinkat => |new_op| {
-                        op = new_op;
-                        continue;
-                    },
-                    else => return,
-                },
-            }
-        }
+        try self.armCompletion(c, .{ .unlinkat = op_in }, ud, cb);
+        try self.submitBlockingOp(.{ .unlinkat = op_in }, c);
     }
 
     pub fn statx(self: *EpollMmapIO, op_in: ifc.StatxOp, c: *Completion, ud: ?*anyopaque, cb: Callback) !void {
-        var op = op_in;
-        while (true) {
-            try self.armCompletion(c, .{ .statx = op }, ud, cb);
-            const rc = linux.statx(op.dir_fd, op.path, op.flags, op.mask, op.buf);
-            const result: Result = switch (linux.E.init(rc)) {
-                .SUCCESS => .{ .statx = {} },
-                else => |err| .{ .statx = ifc.linuxErrnoToError(err) },
-            };
-            switch (try self.deliverInline(c, result)) {
-                .disarm => return,
-                .rearm => switch (c.op) {
-                    .statx => |new_op| {
-                        op = new_op;
-                        continue;
-                    },
-                    else => return,
-                },
-            }
-        }
+        try self.armCompletion(c, .{ .statx = op_in }, ud, cb);
+        try self.submitBlockingOp(.{ .statx = op_in }, c);
     }
 
     pub fn getdents(self: *EpollMmapIO, op_in: ifc.GetdentsOp, c: *Completion, ud: ?*anyopaque, cb: Callback) !void {
-        var op = op_in;
-        while (true) {
-            try self.armCompletion(c, .{ .getdents = op }, ud, cb);
-            const rc = linux.getdents64(op.fd, op.buf.ptr, op.buf.len);
-            const result: Result = switch (linux.E.init(rc)) {
-                .SUCCESS => .{ .getdents = rc },
-                else => |err| .{ .getdents = ifc.linuxErrnoToError(err) },
-            };
-            switch (try self.deliverInline(c, result)) {
-                .disarm => return,
-                .rearm => switch (c.op) {
-                    .getdents => |new_op| {
-                        op = new_op;
-                        continue;
-                    },
-                    else => return,
-                },
-            }
-        }
+        try self.armCompletion(c, .{ .getdents = op_in }, ud, cb);
+        try self.submitBlockingOp(.{ .getdents = op_in }, c);
     }
 
     pub fn timeout(self: *EpollMmapIO, op: ifc.TimeoutOp, c: *Completion, ud: ?*anyopaque, cb: Callback) !void {
@@ -948,7 +830,26 @@ pub const EpollMmapIO = struct {
 
         if (!found) {
             const target_is_file = switch (target.op) {
-                .copy_file_chunk, .fchown, .fchmod => true,
+                .read,
+                .write,
+                .close,
+                .fallocate,
+                .truncate,
+                .openat,
+                .mkdirat,
+                .renameat,
+                .unlinkat,
+                .statx,
+                .getdents,
+                .fsync,
+                .copy_file_chunk,
+                .fchown,
+                .fchmod,
+                .socket,
+                .bind,
+                .listen,
+                .setsockopt,
+                => true,
                 else => false,
             };
             if (target_is_file and self.pool.tryCancelPending(target)) {
@@ -973,114 +874,140 @@ pub const EpollMmapIO = struct {
     // against the per-fd mapping. Page faults block this thread; see the
     // file header for the mitigation discussion.
     //
-    // The mapping is established lazily on first access (`fstat` to size
-    // the mapping; `mmap` PROT_READ | PROT_WRITE). A subsequent `pwrite`
-    // that needs to extend past the current mapping triggers a remap if
-    // the file has already been resized via `fallocate` / `truncate`.
+    // The mapping is established lazily on first access by a BlockingOpPool
+    // worker (`fstat` to size the mapping; `mmap` PROT_READ | PROT_WRITE).
+    // A subsequent `pwrite` that needs to extend past the current mapping
+    // triggers a worker remap if the file has already been resized via
+    // `fallocate` / `truncate`.
 
     pub fn read(self: *EpollMmapIO, op: ifc.ReadOp, c: *Completion, ud: ?*anyopaque, cb: Callback) !void {
         try self.armCompletion(c, .{ .read = op }, ud, cb);
-        const result: Result = blk: {
-            const entry = self.ensureMapping(op.fd) catch |err| break :blk .{ .read = err };
-            const offset_us: usize = @intCast(op.offset);
-            if (offset_us >= entry.size) break :blk .{ .read = @as(usize, 0) };
-            const available = entry.size - offset_us;
-            const n = @min(op.buf.len, available);
-            @memcpy(op.buf[0..n], entry.ptr[offset_us..][0..n]);
-            break :blk .{ .read = n };
+        const entry = self.file_mappings.get(op.fd) orelse {
+            return self.submitMmapSetup(c, op.fd, null, .read);
         };
+        const result: Result = .{ .read = readFromMapping(op, entry) };
         try self.enqueueMmapCompletion(c, result);
     }
 
     pub fn write(self: *EpollMmapIO, op: ifc.WriteOp, c: *Completion, ud: ?*anyopaque, cb: Callback) !void {
         try self.armCompletion(c, .{ .write = op }, ud, cb);
-        const result: Result = blk: {
+        if (self.file_mappings.get(op.fd)) |entry| {
             const offset_us: usize = @intCast(op.offset);
             const required = offset_us + op.buf.len;
+            if (required <= entry.size) {
+                const result: Result = .{ .write = writeToMapping(op, entry) };
+                return self.enqueueMmapCompletion(c, result);
+            }
+        }
 
-            // Refresh mapping; if the file has grown beyond the current
-            // mapping we remap to pick up the new size.
-            var entry = self.ensureMapping(op.fd) catch |err| break :blk .{ .write = err };
-            if (required > entry.size) {
-                self.unmapFile(op.fd);
-                entry = self.ensureMapping(op.fd) catch |err| break :blk .{ .write = err };
-            }
-            if (required > entry.size) {
-                // File still too small; caller must `fallocate` /
-                // `truncate` first. Surface ENOSPC-equivalent so callers'
-                // existing fallocate-fallback paths can react.
-                break :blk .{ .write = error.NoSpaceLeft };
-            }
-            @memcpy(entry.ptr[offset_us..][0..op.buf.len], op.buf);
-            break :blk .{ .write = op.buf.len };
+        const mapping = self.takeMappedRegion(op.fd);
+        self.submitMmapSetup(c, op.fd, mapping, .write) catch |err| {
+            self.restoreMappedRegion(op.fd, mapping);
+            return err;
         };
-        try self.enqueueMmapCompletion(c, result);
+    }
+
+    fn submitMmapSetup(
+        self: *EpollMmapIO,
+        c: *Completion,
+        fd: posix.fd_t,
+        mapping: ?MappedRegion,
+        phase: MmapSetupPhase,
+    ) !void {
+        const st = epollState(c);
+        st.mmap_setup_phase = phase;
+        st.mmap_setup_result = error.OperationCanceled;
+        self.submitBlockingOp(.{ .mmap_setup = .{
+            .fd = fd,
+            .mapping = mapping,
+            .advise_willneed = true,
+            .result = &st.mmap_setup_result,
+        } }, c) catch |err| {
+            st.mmap_setup_phase = .none;
+            st.mmap_setup_result = error.OperationCanceled;
+            return err;
+        };
+    }
+
+    fn finishMmapSetupForRead(self: *EpollMmapIO, op: ifc.ReadOp, setup_result: MmapSetupResult) anyerror!usize {
+        const entry = try self.installMappedRegion(op.fd, try setup_result);
+        return readFromMapping(op, entry);
+    }
+
+    fn finishMmapSetupForWrite(self: *EpollMmapIO, op: ifc.WriteOp, setup_result: MmapSetupResult) anyerror!usize {
+        const entry = try self.installMappedRegion(op.fd, try setup_result);
+        return writeToMapping(op, entry);
+    }
+
+    fn readFromMapping(op: ifc.ReadOp, entry: MmapEntry) anyerror!usize {
+        const offset_us: usize = @intCast(op.offset);
+        if (offset_us >= entry.size) return 0;
+        const available = entry.size - offset_us;
+        const n = @min(op.buf.len, available);
+        @memcpy(op.buf[0..n], entry.ptr[offset_us..][0..n]);
+        return n;
+    }
+
+    fn writeToMapping(op: ifc.WriteOp, entry: MmapEntry) anyerror!usize {
+        const offset_us: usize = @intCast(op.offset);
+        const required = offset_us + op.buf.len;
+        if (required > entry.size) {
+            // File still too small; caller must `fallocate` / `truncate`
+            // first. Surface ENOSPC-equivalent so callers' existing
+            // fallocate-fallback paths can react.
+            return error.NoSpaceLeft;
+        }
+        @memcpy(entry.ptr[offset_us..][0..op.buf.len], op.buf);
+        return op.buf.len;
     }
 
     pub fn fsync(self: *EpollMmapIO, op: ifc.FsyncOp, c: *Completion, ud: ?*anyopaque, cb: Callback) !void {
         try self.armCompletion(c, .{ .fsync = op }, ud, cb);
-        const result: Result = blk: {
-            // If we have a mapping, msync flushes both data and metadata
-            // changes accumulated against the mapping (stronger than
-            // fdatasync — `op.datasync` is honoured semantically by virtue
-            // of the call still flushing dirty pages).
-            if (self.file_mappings.get(op.fd)) |entry| {
-                const slice: []align(std.heap.page_size_min) u8 = @alignCast(entry.ptr[0..entry.size]);
-                posix.msync(slice, posix.MSF.SYNC) catch |err| break :blk .{ .fsync = err };
-                break :blk .{ .fsync = {} };
-            }
-            // Fall back to plain fsync/fdatasync if no mapping established
-            // yet (e.g. a freshly-truncated file with no reads/writes
-            // pending).
-            const rc = if (op.datasync) linux.fdatasync(op.fd) else linux.fsync(op.fd);
-            switch (linux.E.init(rc)) {
-                .SUCCESS => break :blk .{ .fsync = {} },
-                .IO => break :blk .{ .fsync = error.InputOutput },
-                .NOSPC => break :blk .{ .fsync = error.NoSpaceLeft },
-                else => |e| break :blk .{ .fsync = posix.unexpectedErrno(e) },
-            }
-        };
-        try self.enqueueMmapCompletion(c, result);
+        if (self.mappedRegion(op.fd)) |mapping| {
+            try self.submitBlockingOp(.{ .msync = .{ .mapping = mapping } }, c);
+        } else {
+            try self.submitBlockingOp(.{ .fsync = op }, c);
+        }
     }
 
     pub fn close(self: *EpollMmapIO, op: ifc.CloseOp, c: *Completion, ud: ?*anyopaque, cb: Callback) !void {
         try self.armCompletion(c, .{ .close = op }, ud, cb);
-        self.unmapFile(op.fd);
-        posix.close(op.fd);
-        try self.enqueueMmapCompletion(c, .{ .close = {} });
+        const mapping = self.takeMappedRegion(op.fd);
+        self.submitBlockingOp(.{ .mmap_close = .{
+            .fd = op.fd,
+            .mapping = mapping,
+        } }, c) catch |err| {
+            self.restoreMappedRegion(op.fd, mapping);
+            return err;
+        };
     }
 
     pub fn fallocate(self: *EpollMmapIO, op: ifc.FallocateOp, c: *Completion, ud: ?*anyopaque, cb: Callback) !void {
         try self.armCompletion(c, .{ .fallocate = op }, ud, cb);
-        const result: Result = blk: {
-            // Drop any stale mapping; the next access remaps to the new
-            // size.
-            self.unmapFile(op.fd);
-            const rc = linux.fallocate(
-                op.fd,
-                op.mode,
-                @intCast(op.offset),
-                @intCast(op.len),
-            );
-            switch (linux.E.init(rc)) {
-                .SUCCESS => break :blk .{ .fallocate = {} },
-                .NOSPC => break :blk .{ .fallocate = error.NoSpaceLeft },
-                .OPNOTSUPP => break :blk .{ .fallocate = error.OperationNotSupported },
-                .IO => break :blk .{ .fallocate = error.InputOutput },
-                else => |e| break :blk .{ .fallocate = posix.unexpectedErrno(e) },
-            }
+        const mapping = self.takeMappedRegion(op.fd);
+        self.submitBlockingOp(.{ .mmap_fallocate = .{
+            .fd = op.fd,
+            .mode = op.mode,
+            .offset = op.offset,
+            .len = op.len,
+            .mapping = mapping,
+        } }, c) catch |err| {
+            self.restoreMappedRegion(op.fd, mapping);
+            return err;
         };
-        try self.enqueueMmapCompletion(c, result);
     }
 
     pub fn truncate(self: *EpollMmapIO, op: ifc.TruncateOp, c: *Completion, ud: ?*anyopaque, cb: Callback) !void {
         try self.armCompletion(c, .{ .truncate = op }, ud, cb);
-        const result: Result = blk: {
-            self.unmapFile(op.fd);
-            posix.ftruncate(op.fd, op.length) catch |err| break :blk .{ .truncate = err };
-            break :blk .{ .truncate = {} };
+        const mapping = self.takeMappedRegion(op.fd);
+        self.submitBlockingOp(.{ .mmap_truncate = .{
+            .fd = op.fd,
+            .length = op.length,
+            .mapping = mapping,
+        } }, c) catch |err| {
+            self.restoreMappedRegion(op.fd, mapping);
+            return err;
         };
-        try self.enqueueMmapCompletion(c, result);
     }
 
     pub fn open_copy_file_session(self: *EpollMmapIO, op: ifc.OpenCopyFileSessionOp, c: *Completion, ud: ?*anyopaque, cb: Callback) !void {
@@ -1099,7 +1026,7 @@ pub const EpollMmapIO = struct {
         if (st.copy_in_flight) return try self.enqueueMmapCompletion(c, .{ .copy_file_chunk = error.AlreadyInFlight });
         if (op.len == 0) return try self.enqueueMmapCompletion(c, .{ .copy_file_chunk = error.InvalidArgument });
         st.copy_in_flight = true;
-        try self.submitFileOp(.{ .copy_file_chunk = op }, c);
+        try self.submitBlockingOp(.{ .copy_file_chunk = op }, c);
     }
 
     pub fn close_copy_file_session(self: *EpollMmapIO, op: ifc.CloseCopyFileSessionOp, c: *Completion, ud: ?*anyopaque, cb: Callback) !void {
@@ -1112,15 +1039,15 @@ pub const EpollMmapIO = struct {
 
     pub fn fchown(self: *EpollMmapIO, op: ifc.FchownOp, c: *Completion, ud: ?*anyopaque, cb: Callback) !void {
         try self.armCompletion(c, .{ .fchown = op }, ud, cb);
-        try self.submitFileOp(.{ .fchown = op }, c);
+        try self.submitBlockingOp(.{ .fchown = op }, c);
     }
 
     pub fn fchmod(self: *EpollMmapIO, op: ifc.FchmodOp, c: *Completion, ud: ?*anyopaque, cb: Callback) !void {
         try self.armCompletion(c, .{ .fchmod = op }, ud, cb);
-        try self.submitFileOp(.{ .fchmod = op }, c);
+        try self.submitBlockingOp(.{ .fchmod = op }, c);
     }
 
-    fn submitFileOp(self: *EpollMmapIO, op: FileOp, c: *Completion) !void {
+    fn submitBlockingOp(self: *EpollMmapIO, op: BlockingOp, c: *Completion) !void {
         self.active += 1;
         self.pool.submit(op, c) catch |err| {
             self.active -|= 1;
@@ -1135,52 +1062,40 @@ pub const EpollMmapIO = struct {
 
     // ── Mmap helpers ──────────────────────────────────────
 
-    fn ensureMapping(self: *EpollMmapIO, fd: posix.fd_t) !MmapEntry {
-        if (self.file_mappings.get(fd)) |entry| return entry;
-
-        // `fstat` to size the mapping. A zero-byte file produces a
-        // zero-byte mapping; mmap rejects that, so we treat it as a
-        // valid empty mapping (no allocation; reads/writes against the
-        // zero region naturally return zero / NoSpaceLeft).
-        var st: linux.Stat = undefined;
-        const rc = linux.fstat(fd, &st);
-        switch (linux.E.init(rc)) {
-            .SUCCESS => {},
-            .BADF => return error.BadFileDescriptor,
-            else => |e| return posix.unexpectedErrno(e),
-        }
-        const size: usize = @intCast(st.size);
-        if (size == 0) {
-            const entry: MmapEntry = .{ .ptr = @ptrFromInt(@alignOf(usize)), .size = 0 };
-            try self.file_mappings.put(fd, entry);
-            return entry;
-        }
-
-        const slice = try posix.mmap(
-            null,
-            size,
-            posix.PROT.READ | posix.PROT.WRITE,
-            .{ .TYPE = .SHARED },
-            fd,
-            0,
-        );
-        // `madvise(MADV_WILLNEED)` warms the pagecache so the first
-        // memcpy doesn't stall on a synchronous page fault. Best-effort
-        // — failure is fine.
-        _ = posix.madvise(slice.ptr, slice.len, posix.MADV.WILLNEED) catch {};
-
-        const entry: MmapEntry = .{ .ptr = slice.ptr, .size = slice.len };
-        try self.file_mappings.put(fd, entry);
+    fn installMappedRegion(self: *EpollMmapIO, fd: posix.fd_t, region: MappedRegion) !MmapEntry {
+        const entry: MmapEntry = .{ .ptr = region.base, .size = region.len };
+        if (region.len == 0) return entry;
+        self.file_mappings.put(fd, entry) catch |err| {
+            posix.munmap(region.base[0..region.len]);
+            return err;
+        };
         return entry;
     }
 
-    fn unmapFile(self: *EpollMmapIO, fd: posix.fd_t) void {
-        if (self.file_mappings.fetchRemove(fd)) |kv| {
-            if (kv.value.size > 0) {
-                const slice: []align(std.heap.page_size_min) u8 = @alignCast(kv.value.ptr[0..kv.value.size]);
-                posix.munmap(slice);
-            }
-        }
+    fn mappedRegion(self: *EpollMmapIO, fd: posix.fd_t) ?MappedRegion {
+        const entry = self.file_mappings.get(fd) orelse return null;
+        if (entry.size == 0) return null;
+        return .{
+            .base = @alignCast(entry.ptr),
+            .len = entry.size,
+        };
+    }
+
+    fn takeMappedRegion(self: *EpollMmapIO, fd: posix.fd_t) ?MappedRegion {
+        const kv = self.file_mappings.fetchRemove(fd) orelse return null;
+        if (kv.value.size == 0) return null;
+        return .{
+            .base = @alignCast(kv.value.ptr),
+            .len = kv.value.size,
+        };
+    }
+
+    fn restoreMappedRegion(self: *EpollMmapIO, fd: posix.fd_t, mapping: ?MappedRegion) void {
+        const m = mapping orelse return;
+        self.file_mappings.put(fd, .{
+            .ptr = m.base,
+            .size = m.len,
+        }) catch unreachable;
     }
 
     // ── Internal helpers (mirrored from EpollPosixIO) ─────
@@ -1594,6 +1509,8 @@ test "EpollMmapIO socket creates non-blocking fd" {
         .protocol = 0,
     }, &c, &ctx, testCallback);
 
+    var attempts: u32 = 0;
+    while (ctx.calls == 0 and attempts < 200) : (attempts += 1) try io.tick(1);
     try testing.expectEqual(@as(u32, 1), ctx.calls);
     switch (ctx.last_result.?) {
         .socket => |r| {

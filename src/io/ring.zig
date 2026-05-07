@@ -165,6 +165,7 @@ pub const FeatureSupport = struct {
     /// Directory/file namespace ops used by future EL-driven MoveJob and
     /// PieceStore.init rewrites. All four have synchronous fallbacks so
     /// older/backported kernels remain supported.
+    supports_socket: bool = false,
     supports_close: bool = false,
     supports_openat: bool = false,
     supports_mkdirat: bool = false,
@@ -201,6 +202,7 @@ pub fn probeFeatures(ring: *linux.IoUring) FeatureSupport {
         // URING_CMD itself is a *necessary* condition only — see
         // FeatureSupport.supports_setsockopt for the caveat.
         .supports_setsockopt = p.is_supported(.URING_CMD),
+        .supports_socket = p.is_supported(.SOCKET),
         .supports_close = p.is_supported(.CLOSE),
         .supports_openat = p.is_supported(.OPENAT),
         .supports_mkdirat = p.is_supported(.MKDIRAT),
@@ -239,6 +241,7 @@ test "probeFeatures FeatureSupport.none has every flag false" {
     try std.testing.expectEqual(false, none.supports_bind);
     try std.testing.expectEqual(false, none.supports_listen);
     try std.testing.expectEqual(false, none.supports_setsockopt);
+    try std.testing.expectEqual(false, none.supports_socket);
     try std.testing.expectEqual(false, none.supports_close);
     try std.testing.expectEqual(false, none.supports_openat);
     try std.testing.expectEqual(false, none.supports_mkdirat);
@@ -262,6 +265,7 @@ test "probeFeatures optional op flags are bool-typed and queryable" {
     const _b: bool = features.supports_bind;
     const _l: bool = features.supports_listen;
     const _set: bool = features.supports_setsockopt;
+    const _sock: bool = features.supports_socket;
     const _o: bool = features.supports_openat;
     const _m: bool = features.supports_mkdirat;
     const _r: bool = features.supports_renameat;
@@ -270,6 +274,7 @@ test "probeFeatures optional op flags are bool-typed and queryable" {
     _ = _b;
     _ = _l;
     _ = _set;
+    _ = _sock;
     _ = _o;
     _ = _m;
     _ = _r;

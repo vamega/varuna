@@ -9,7 +9,7 @@
 //!   under a non-blocking socket.
 //! - Multiple concurrent timers ordered by deadline.
 //! - Cancel of a registered fd before any data arrives.
-//! - File ops via `PosixFilePool`: fsync/truncate/fallocate completion,
+//! - File ops via `BlockingOpPool`: fsync/truncate/fallocate completion,
 //!   write→read round-trip, concurrent submission, and bad-fd fault
 //!   propagation through the worker thread.
 //!
@@ -411,7 +411,7 @@ test "EpollPosixIO cancel on registered recv before data delivers OperationCance
     try testing.expectEqual(@as(?anyerror, error.OperationCanceled), counter.last_recv_err);
 }
 
-test "EpollPosixIO file ops complete asynchronously via PosixFilePool" {
+test "EpollPosixIO file ops complete asynchronously via BlockingOpPool" {
     // The five file-op methods (fsync, truncate, fallocate, read, write)
     // route through the pool. Workers run the syscall, push the result,
     // and signal `wakeup_fd`; `tick` drains the queue and fires
@@ -689,6 +689,8 @@ test "EpollPosixIO socket op produces a non-blocking fd" {
         .protocol = 0,
     }, &c, &box, sock_cb);
 
+    var attempts: u32 = 0;
+    while (box.fd == null and box.err == null and attempts < 200) : (attempts += 1) try io.tick(1);
     try testing.expect(box.fd != null);
     defer posix.close(box.fd.?);
 

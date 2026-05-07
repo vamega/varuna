@@ -1,11 +1,12 @@
-//! Posix file-op thread pool.
+//! Backend-owned blocking-op thread pool.
 //!
-//! Shared by backends that need backend-owned syscall offload:
-//! `EpollPosixIO` / `KqueuePosixIO` use it for regular file ops because
-//! readiness APIs cannot make those syscalls nonblocking. The pool's
-//! worker threads execute the syscall, push the result back, and signal a
-//! backend-provided wakeup callback. The backend drains the result queue
-//! from its `tick()` and fires the user's callbacks.
+//! Shared by backends that need backend-owned syscall offload. The
+//! readiness backends use it because `epoll` / `kqueue` cannot make
+//! regular-file and fd-management syscalls nonblocking; `RealIO` uses it
+//! only when the runtime io_uring probe says the native ring op is absent.
+//! The pool's worker threads execute the syscall, push the result back,
+//! and signal a backend-provided wakeup callback. The backend drains the
+//! result queue from its `tick()` and fires the user's callbacks.
 //!
 //! ## Why a thread pool
 //!
@@ -14,7 +15,7 @@
 //! `read`/`write` syscalls themselves block when the page isn't resident
 //! and a fault has to be serviced. To preserve the contract's
 //! "submission returns immediately, the callback fires later" shape we
-//! offload every file-op syscall to a worker thread. This mirrors what
+//! offload every blocking syscall to a worker thread. This mirrors what
 //! `zio` and `libxev`'s epoll backend do.
 //!
 //! ## Design choices (read STYLE.md pattern #15 first)
@@ -47,7 +48,7 @@
 //!
 //! ## Cancellation
 //!
-//! File-op cancellation through this pool is **best-effort**:
+//! Blocking-op cancellation through this pool is **best-effort**:
 //!   * If the op is still pending when `cancel` runs, we drop it and
 //!     deliver `error.OperationCanceled` synchronously.
 //!   * If a worker has already picked it up, we cannot interrupt the
@@ -72,21 +73,75 @@ const Result = ifc.Result;
 
 // ── Public types ──────────────────────────────────────────
 
-/// One unit of file-op work. Carries the parameters the worker needs to
+pub const MappedRegion = struct {
+    base: [*]align(std.heap.page_size_min) u8,
+    len: usize,
+};
+
+pub const MsyncOp = struct {
+    mapping: MappedRegion,
+};
+
+pub const MmapCloseOp = struct {
+    fd: posix.fd_t,
+    mapping: ?MappedRegion,
+};
+
+pub const MmapFallocateOp = struct {
+    fd: posix.fd_t,
+    mode: i32,
+    offset: u64,
+    len: u64,
+    mapping: ?MappedRegion,
+};
+
+pub const MmapTruncateOp = struct {
+    fd: posix.fd_t,
+    length: u64,
+    mapping: ?MappedRegion,
+};
+
+pub const MmapSetupResult = anyerror!MappedRegion;
+
+pub const MmapSetupOp = struct {
+    fd: posix.fd_t,
+    mapping: ?MappedRegion,
+    advise_willneed: bool,
+    result: *MmapSetupResult,
+};
+
+/// One unit of blocking syscall work. Carries the parameters the worker needs to
 /// run the syscall. The op type is duplicated from `ifc.Operation` so the
-/// pool doesn't have to switch the full Operation union (the pool only
-/// handles file-shaped ops).
-pub const FileOp = union(enum) {
+/// pool doesn't have to switch the full Operation union.
+pub const BlockingOp = union(enum) {
     read: ifc.ReadOp,
     write: ifc.WriteOp,
     fsync: ifc.FsyncOp,
     close: ifc.CloseOp,
     fallocate: ifc.FallocateOp,
     truncate: ifc.TruncateOp,
+    openat: ifc.OpenAtOp,
+    mkdirat: ifc.MkdirAtOp,
+    renameat: ifc.RenameAtOp,
+    unlinkat: ifc.UnlinkAtOp,
+    statx: ifc.StatxOp,
+    getdents: ifc.GetdentsOp,
     copy_file_chunk: ifc.CopyFileChunkOp,
     fchown: ifc.FchownOp,
     fchmod: ifc.FchmodOp,
+    socket: ifc.SocketOp,
+    bind: ifc.BindOp,
+    listen: ifc.ListenOp,
+    setsockopt: ifc.SetsockoptOp,
+    msync: MsyncOp,
+    mmap_close: MmapCloseOp,
+    mmap_fallocate: MmapFallocateOp,
+    mmap_truncate: MmapTruncateOp,
+    mmap_setup: MmapSetupOp,
 };
+
+/// Back-compat alias for older file-op-only call sites.
+pub const FileOp = BlockingOp;
 
 /// A completed op ready to fire its callback. The pool stages these in
 /// `completed`; the backend drains them in `tick()` and invokes
@@ -129,13 +184,13 @@ pub const PoolError = error{
 // ── Internal entry types ──────────────────────────────────
 
 const PendingEntry = struct {
-    completion: *Completion,
-    op: FileOp,
+    completion: ?*Completion,
+    op: BlockingOp,
 };
 
-// ── PosixFilePool ─────────────────────────────────────────
+// ── BlockingOpPool ─────────────────────────────────────────
 
-pub const PosixFilePool = struct {
+pub const BlockingOpPool = struct {
     allocator: std.mem.Allocator,
     workers: []std.Thread,
     worker_scratch: [][]u8,
@@ -165,8 +220,8 @@ pub const PosixFilePool = struct {
 
     /// Heap-allocated to give workers a stable pointer for the lifetime
     /// of the pool. Mirrors `hasher.zig`.
-    pub fn create(allocator: std.mem.Allocator, cfg: Config) !*PosixFilePool {
-        const self = try allocator.create(PosixFilePool);
+    pub fn create(allocator: std.mem.Allocator, cfg: Config) !*BlockingOpPool {
+        const self = try allocator.create(BlockingOpPool);
         errdefer allocator.destroy(self);
 
         const workers = try allocator.alloc(std.Thread, cfg.worker_count);
@@ -218,7 +273,7 @@ pub const PosixFilePool = struct {
     /// once". Completions still on `completed` after the join are left
     /// for one final `drainCompletedInto` by the backend in its
     /// `deinit` path.
-    pub fn deinit(self: *PosixFilePool) void {
+    pub fn deinit(self: *BlockingOpPool) void {
         self.running.store(false, .release);
         self.pending_cond.broadcast();
         for (self.workers) |t| t.join();
@@ -230,8 +285,9 @@ pub const PosixFilePool = struct {
         // shut down. No workers are running, so we can do this without
         // taking the locks.
         for (self.pending.items) |entry| {
+            const completion = entry.completion orelse continue;
             self.completed.appendAssumeCapacity(.{
-                .completion = entry.completion,
+                .completion = completion,
                 .result = makeCancelledResult(entry.op),
             });
         }
@@ -251,7 +307,7 @@ pub const PosixFilePool = struct {
     /// function pointer that the pool's workers will invoke after each
     /// completion. **Must be set before `submit`** to avoid silent
     /// no-wake states.
-    pub fn setWakeup(self: *PosixFilePool, ctx: ?*anyopaque, wake_fn: WakeFn) void {
+    pub fn setWakeup(self: *BlockingOpPool, ctx: ?*anyopaque, wake_fn: WakeFn) void {
         self.wake_ctx = ctx;
         self.wake_fn = wake_fn;
     }
@@ -260,7 +316,7 @@ pub const PosixFilePool = struct {
     /// would be exceeded. The caller is responsible for filling
     /// `c.callback` and `c.userdata` (typically via the backend's
     /// `armCompletion`) before calling submit.
-    pub fn submit(self: *PosixFilePool, op: FileOp, c: *Completion) PoolError!void {
+    pub fn submit(self: *BlockingOpPool, op: BlockingOp, c: *Completion) PoolError!void {
         self.pending_mutex.lock();
         defer self.pending_mutex.unlock();
         if (self.pending.items.len >= self.pending_capacity) {
@@ -268,6 +324,19 @@ pub const PosixFilePool = struct {
         }
         self.pending.appendAssumeCapacity(.{ .completion = c, .op = op });
         // Wake one worker — only one can take the new entry.
+        self.pending_cond.signal();
+    }
+
+    /// Submit worker-only cleanup work with no public completion callback.
+    /// Used for legacy `closeSocket` teardown paths whose API is intentionally
+    /// fire-and-forget.
+    pub fn submitDetached(self: *BlockingOpPool, op: BlockingOp) PoolError!void {
+        self.pending_mutex.lock();
+        defer self.pending_mutex.unlock();
+        if (self.pending.items.len >= self.pending_capacity) {
+            return error.PendingQueueFull;
+        }
+        self.pending.appendAssumeCapacity(.{ .completion = null, .op = op });
         self.pending_cond.signal();
     }
 
@@ -280,7 +349,7 @@ pub const PosixFilePool = struct {
     /// with it, calling `out.clearRetainingCapacity()` resets for the
     /// next tick.
     pub fn drainCompletedInto(
-        self: *PosixFilePool,
+        self: *BlockingOpPool,
         out: *std.ArrayListUnmanaged(Completed),
     ) !void {
         self.completed_mutex.lock();
@@ -292,7 +361,7 @@ pub const PosixFilePool = struct {
     /// True if the pool has work that hasn't reached the user callback
     /// yet. Backend's `tick` consults this to decide whether to block on
     /// the next readiness wait.
-    pub fn hasPendingWork(self: *PosixFilePool) bool {
+    pub fn hasPendingWork(self: *BlockingOpPool) bool {
         if (self.in_flight.load(.acquire) > 0) return true;
         self.pending_mutex.lock();
         if (self.pending.items.len > 0) {
@@ -310,16 +379,17 @@ pub const PosixFilePool = struct {
     /// was already running on a worker, already completed, or never
     /// submitted. Backend's `cancel` op uses this to decide what cancel
     /// result to deliver.
-    pub fn tryCancelPending(self: *PosixFilePool, c: *Completion) bool {
+    pub fn tryCancelPending(self: *BlockingOpPool, c: *Completion) bool {
         self.pending_mutex.lock();
         defer self.pending_mutex.unlock();
         for (self.pending.items, 0..) |entry, idx| {
-            if (entry.completion == c) {
+            const completion = entry.completion orelse continue;
+            if (completion == c) {
                 _ = self.pending.swapRemove(idx);
                 self.completed_mutex.lock();
                 defer self.completed_mutex.unlock();
                 self.completed.appendAssumeCapacity(.{
-                    .completion = c,
+                    .completion = completion,
                     .result = makeCancelledResult(entry.op),
                 });
                 self.signalWake();
@@ -329,13 +399,13 @@ pub const PosixFilePool = struct {
         return false;
     }
 
-    fn signalWake(self: *PosixFilePool) void {
+    fn signalWake(self: *BlockingOpPool) void {
         if (self.wake_fn) |f| f(self.wake_ctx);
     }
 
     // ── Worker loop ───────────────────────────────────────
 
-    fn workerFn(self: *PosixFilePool, worker_index: usize) void {
+    fn workerFn(self: *BlockingOpPool, worker_index: usize) void {
         const scratch = self.worker_scratch[worker_index];
         while (true) {
             self.pending_mutex.lock();
@@ -357,18 +427,23 @@ pub const PosixFilePool = struct {
 
             const result = executeOp(entry.op, scratch);
 
-            self.completed_mutex.lock();
-            self.completed.appendAssumeCapacity(.{
-                .completion = entry.completion,
-                .result = result,
-            });
-            self.completed_mutex.unlock();
+            if (entry.completion) |completion| {
+                self.completed_mutex.lock();
+                self.completed.appendAssumeCapacity(.{
+                    .completion = completion,
+                    .result = result,
+                });
+                self.completed_mutex.unlock();
+            }
             _ = self.in_flight.fetchSub(1, .acq_rel);
 
-            self.signalWake();
+            if (entry.completion != null) self.signalWake();
         }
     }
 };
+
+/// Back-compat alias for older file-op-only call sites.
+pub const PosixFilePool = BlockingOpPool;
 
 // ── Op execution (worker thread) ──────────────────────────
 //
@@ -376,7 +451,7 @@ pub const PosixFilePool = struct {
 // **Runs on a worker thread** — must not touch the pool's mutexes, must
 // not take locks anywhere else.
 
-fn executeOp(op: FileOp, scratch: []u8) Result {
+fn executeOp(op: BlockingOp, scratch: []u8) Result {
     return switch (op) {
         .read => |p| .{ .read = executeRead(p) },
         .write => |p| .{ .write = executeWrite(p) },
@@ -384,9 +459,27 @@ fn executeOp(op: FileOp, scratch: []u8) Result {
         .close => |p| .{ .close = executeClose(p) },
         .fallocate => |p| .{ .fallocate = executeFallocate(p) },
         .truncate => |p| .{ .truncate = executeTruncate(p) },
+        .openat => |p| .{ .openat = executeOpenAt(p) },
+        .mkdirat => |p| .{ .mkdirat = executeMkdirAt(p) },
+        .renameat => |p| .{ .renameat = executeRenameAt(p) },
+        .unlinkat => |p| .{ .unlinkat = executeUnlinkAt(p) },
+        .statx => |p| .{ .statx = executeStatx(p) },
+        .getdents => |p| .{ .getdents = executeGetdents(p) },
         .copy_file_chunk => |p| .{ .copy_file_chunk = executeCopyFileChunk(p, scratch) },
         .fchown => |p| .{ .fchown = executeFchown(p) },
         .fchmod => |p| .{ .fchmod = executeFchmod(p) },
+        .socket => |p| .{ .socket = executeSocket(p) },
+        .bind => |p| .{ .bind = executeBind(p) },
+        .listen => |p| .{ .listen = executeListen(p) },
+        .setsockopt => |p| .{ .setsockopt = executeSetsockopt(p) },
+        .msync => |p| .{ .fsync = executeMsync(p) },
+        .mmap_close => |p| .{ .close = executeMmapClose(p) },
+        .mmap_fallocate => |p| .{ .fallocate = executeMmapFallocate(p) },
+        .mmap_truncate => |p| .{ .truncate = executeMmapTruncate(p) },
+        .mmap_setup => |p| blk: {
+            p.result.* = executeMmapSetup(p);
+            break :blk .{ .read = @as(usize, 0) };
+        },
     };
 }
 
@@ -464,7 +557,7 @@ fn executeFallocate(op: ifc.FallocateOp) anyerror!void {
         };
         // F_PREALLOCATE = 42 on darwin.
         const rc = std.c.fcntl(op.fd, 42, &store);
-        if (rc == 0) return;
+        if (rc == 0) return posix.ftruncate(op.fd, op.offset + op.len);
         return error.OperationNotSupported;
     }
     return error.OperationNotSupported;
@@ -472,6 +565,77 @@ fn executeFallocate(op: ifc.FallocateOp) anyerror!void {
 
 fn executeTruncate(op: ifc.TruncateOp) anyerror!void {
     return posix.ftruncate(op.fd, op.length);
+}
+
+fn executeOpenAt(op: ifc.OpenAtOp) anyerror!posix.fd_t {
+    return posix.openat(op.dir_fd, op.path, op.flags, op.mode);
+}
+
+fn executeMkdirAt(op: ifc.MkdirAtOp) anyerror!void {
+    return posix.mkdirat(op.dir_fd, op.path, op.mode);
+}
+
+fn executeRenameAt(op: ifc.RenameAtOp) anyerror!void {
+    if (op.flags != 0) return error.OperationNotSupported;
+    return posix.renameat(op.old_dir_fd, op.old_path, op.new_dir_fd, op.new_path);
+}
+
+fn executeUnlinkAt(op: ifc.UnlinkAtOp) anyerror!void {
+    return posix.unlinkat(op.dir_fd, op.path, op.flags);
+}
+
+fn executeStatx(op: ifc.StatxOp) anyerror!void {
+    if (comptime builtin.target.os.tag == .linux) {
+        const rc = std.os.linux.statx(op.dir_fd, op.path, op.flags, op.mask, op.buf);
+        return switch (std.os.linux.E.init(rc)) {
+            .SUCCESS => {},
+            else => |err| ifc.linuxErrnoToError(err),
+        };
+    }
+
+    const st = try posix.fstatatZ(op.dir_fd, op.path, op.flags);
+    op.buf.* = std.mem.zeroes(std.os.linux.Statx);
+    op.buf.mask = op.mask & std.os.linux.STATX_BASIC_STATS;
+    op.buf.blksize = @intCast(@max(st.blksize, 0));
+    op.buf.nlink = @intCast(@max(st.nlink, 0));
+    op.buf.uid = @intCast(st.uid);
+    op.buf.gid = @intCast(st.gid);
+    op.buf.mode = @intCast(st.mode);
+    op.buf.ino = @intCast(@max(st.ino, 0));
+    op.buf.size = @intCast(@max(st.size, 0));
+    op.buf.blocks = @intCast(@max(st.blocks, 0));
+}
+
+fn executeGetdents(op: ifc.GetdentsOp) anyerror!usize {
+    if (comptime builtin.target.os.tag == .linux) {
+        const rc = std.os.linux.getdents64(op.fd, op.buf.ptr, op.buf.len);
+        return switch (std.os.linux.E.init(rc)) {
+            .SUCCESS => @intCast(rc),
+            else => |err| ifc.linuxErrnoToError(err),
+        };
+    }
+
+    var dir: std.fs.Dir = .{ .fd = op.fd };
+    var iter = dir.iterateAssumeFirstIteration();
+    var out: usize = 0;
+    var index: usize = 0;
+    while (true) {
+        const maybe_entry = try iter.next();
+        const entry = maybe_entry orelse return out;
+        const next = ifc.appendDirent64(
+            op.buf,
+            out,
+            @as(u64, index + 1),
+            @as(u64, index + 1),
+            fileKindToDirentType(entry.kind),
+            entry.name,
+        ) orelse {
+            if (out == 0) return error.InvalidArgument;
+            return out;
+        };
+        out = next;
+        index += 1;
+    }
 }
 
 fn executeCopyFileChunk(op: ifc.CopyFileChunkOp, scratch: []u8) anyerror!usize {
@@ -544,7 +708,112 @@ fn executeFchmod(op: ifc.FchmodOp) anyerror!void {
     return posix.fchmod(op.fd, op.mode);
 }
 
-fn makeCancelledResult(op: FileOp) Result {
+fn executeSocket(op: ifc.SocketOp) anyerror!posix.fd_t {
+    if (comptime builtin.target.os.tag == .linux) {
+        const sock_type = op.sock_type | posix.SOCK.NONBLOCK | posix.SOCK.CLOEXEC;
+        return posix.socket(@intCast(op.domain), sock_type, @intCast(op.protocol));
+    }
+
+    const fd = try posix.socket(@intCast(op.domain), @intCast(op.sock_type), @intCast(op.protocol));
+    errdefer posix.close(fd);
+    try setNonblockCloexec(fd);
+    return fd;
+}
+
+fn executeBind(op: ifc.BindOp) anyerror!void {
+    return posix.bind(op.fd, &op.addr.any, op.addr.getOsSockLen());
+}
+
+fn executeListen(op: ifc.ListenOp) anyerror!void {
+    return posix.listen(op.fd, op.backlog);
+}
+
+fn executeSetsockopt(op: ifc.SetsockoptOp) anyerror!void {
+    return posix.setsockopt(op.fd, @intCast(op.level), op.optname, op.optval);
+}
+
+fn executeUnmap(mapping: ?MappedRegion) void {
+    if (mapping) |m| {
+        if (m.len > 0) posix.munmap(m.base[0..m.len]);
+    }
+}
+
+fn executeMsync(op: MsyncOp) anyerror!void {
+    if (op.mapping.len == 0) return;
+    return posix.msync(op.mapping.base[0..op.mapping.len], posix.MSF.SYNC);
+}
+
+fn executeMmapClose(op: MmapCloseOp) anyerror!void {
+    executeUnmap(op.mapping);
+    posix.close(op.fd);
+}
+
+fn executeMmapFallocate(op: MmapFallocateOp) anyerror!void {
+    executeUnmap(op.mapping);
+    return executeFallocate(.{
+        .fd = op.fd,
+        .mode = op.mode,
+        .offset = op.offset,
+        .len = op.len,
+    });
+}
+
+fn executeMmapTruncate(op: MmapTruncateOp) anyerror!void {
+    executeUnmap(op.mapping);
+    return executeTruncate(.{
+        .fd = op.fd,
+        .length = op.length,
+    });
+}
+
+fn executeMmapSetup(op: MmapSetupOp) anyerror!MappedRegion {
+    executeUnmap(op.mapping);
+
+    const stat = try posix.fstat(op.fd);
+    if (stat.size < 0) return error.InvalidArgument;
+    const file_len: usize = @intCast(stat.size);
+    if (file_len == 0) {
+        return .{
+            .base = @as([*]align(std.heap.page_size_min) u8, @ptrFromInt(std.heap.page_size_min)),
+            .len = 0,
+        };
+    }
+
+    const mapped = try posix.mmap(
+        null,
+        file_len,
+        posix.PROT.READ | posix.PROT.WRITE,
+        .{ .TYPE = .SHARED },
+        op.fd,
+        0,
+    );
+    if (op.advise_willneed) {
+        _ = posix.madvise(mapped.ptr, mapped.len, posix.MADV.WILLNEED) catch {};
+    }
+    return .{ .base = mapped.ptr, .len = mapped.len };
+}
+
+fn setNonblockCloexec(fd: posix.fd_t) !void {
+    const flags = try posix.fcntl(fd, posix.F.GETFL, 0);
+    _ = try posix.fcntl(fd, posix.F.SETFL, flags | @as(u32, posix.SOCK.NONBLOCK));
+    const fdflags = try posix.fcntl(fd, posix.F.GETFD, 0);
+    _ = try posix.fcntl(fd, posix.F.SETFD, fdflags | posix.FD_CLOEXEC);
+}
+
+fn fileKindToDirentType(kind: std.fs.File.Kind) u8 {
+    return switch (kind) {
+        .block_device => std.os.linux.DT.BLK,
+        .character_device => std.os.linux.DT.CHR,
+        .directory => std.os.linux.DT.DIR,
+        .named_pipe => std.os.linux.DT.FIFO,
+        .sym_link => std.os.linux.DT.LNK,
+        .file => std.os.linux.DT.REG,
+        .unix_domain_socket => std.os.linux.DT.SOCK,
+        else => std.os.linux.DT.UNKNOWN,
+    };
+}
+
+fn makeCancelledResult(op: BlockingOp) Result {
     return switch (op) {
         .read => .{ .read = error.OperationCanceled },
         .write => .{ .write = error.OperationCanceled },
@@ -552,9 +821,24 @@ fn makeCancelledResult(op: FileOp) Result {
         .close => .{ .close = error.OperationCanceled },
         .fallocate => .{ .fallocate = error.OperationCanceled },
         .truncate => .{ .truncate = error.OperationCanceled },
+        .openat => .{ .openat = error.OperationCanceled },
+        .mkdirat => .{ .mkdirat = error.OperationCanceled },
+        .renameat => .{ .renameat = error.OperationCanceled },
+        .unlinkat => .{ .unlinkat = error.OperationCanceled },
+        .statx => .{ .statx = error.OperationCanceled },
+        .getdents => .{ .getdents = error.OperationCanceled },
         .copy_file_chunk => .{ .copy_file_chunk = error.OperationCanceled },
         .fchown => .{ .fchown = error.OperationCanceled },
         .fchmod => .{ .fchmod = error.OperationCanceled },
+        .socket => .{ .socket = error.OperationCanceled },
+        .bind => .{ .bind = error.OperationCanceled },
+        .listen => .{ .listen = error.OperationCanceled },
+        .setsockopt => .{ .setsockopt = error.OperationCanceled },
+        .msync => .{ .fsync = error.OperationCanceled },
+        .mmap_close => .{ .close = error.OperationCanceled },
+        .mmap_fallocate => .{ .fallocate = error.OperationCanceled },
+        .mmap_truncate => .{ .truncate = error.OperationCanceled },
+        .mmap_setup => .{ .read = error.OperationCanceled },
     };
 }
 
@@ -562,15 +846,15 @@ fn makeCancelledResult(op: FileOp) Result {
 
 const testing = std.testing;
 
-test "PosixFilePool: create / deinit with default config" {
-    const pool = try PosixFilePool.create(testing.allocator, .{});
+test "BlockingOpPool: create / deinit with default config" {
+    const pool = try BlockingOpPool.create(testing.allocator, .{});
     defer pool.deinit();
     try testing.expect(pool.workers.len == 4);
     try testing.expectEqual(@as(u32, 256), pool.pending_capacity);
 }
 
-test "PosixFilePool: setWakeup stores the callback" {
-    const pool = try PosixFilePool.create(testing.allocator, .{ .worker_count = 1 });
+test "BlockingOpPool: setWakeup stores the callback" {
+    const pool = try BlockingOpPool.create(testing.allocator, .{ .worker_count = 1 });
     defer pool.deinit();
 
     const Box = struct {
@@ -584,10 +868,10 @@ test "PosixFilePool: setWakeup stores the callback" {
     try testing.expect(pool.wake_fn != null);
 }
 
-test "PosixFilePool: submit fails with PendingQueueFull when bound exceeded" {
+test "BlockingOpPool: submit fails with PendingQueueFull when bound exceeded" {
     // Use 0 workers so submitted ops never drain (workers would otherwise
     // pop them off the queue). With 0 workers, every `submit` accumulates.
-    const pool = try PosixFilePool.create(testing.allocator, .{
+    const pool = try BlockingOpPool.create(testing.allocator, .{
         .worker_count = 0,
         .pending_capacity = 2,
     });
@@ -596,15 +880,15 @@ test "PosixFilePool: submit fails with PendingQueueFull when bound exceeded" {
     var c1 = Completion{};
     var c2 = Completion{};
     var c3 = Completion{};
-    const op = FileOp{ .fsync = .{ .fd = -1, .datasync = true } };
+    const op = BlockingOp{ .fsync = .{ .fd = -1, .datasync = true } };
     try pool.submit(op, &c1);
     try pool.submit(op, &c2);
     try testing.expectError(error.PendingQueueFull, pool.submit(op, &c3));
 }
 
-test "PosixFilePool: tryCancelPending removes a pending op and pushes Cancelled" {
+test "BlockingOpPool: tryCancelPending removes a pending op and pushes Cancelled" {
     // 0 workers — every submission stays pending until cancelled.
-    const pool = try PosixFilePool.create(testing.allocator, .{
+    const pool = try BlockingOpPool.create(testing.allocator, .{
         .worker_count = 0,
         .pending_capacity = 4,
     });
@@ -626,12 +910,12 @@ test "PosixFilePool: tryCancelPending removes a pending op and pushes Cancelled"
     try testing.expect(!pool.tryCancelPending(&c));
 }
 
-test "PosixFilePool: write then read round-trip via the worker" {
+test "BlockingOpPool: write then read round-trip via the worker" {
     if (builtin.target.os.tag != .linux and !builtin.target.os.tag.isDarwin()) {
         return error.SkipZigTest;
     }
 
-    const pool = try PosixFilePool.create(testing.allocator, .{
+    const pool = try BlockingOpPool.create(testing.allocator, .{
         .worker_count = 2,
         .pending_capacity = 16,
     });
@@ -692,8 +976,8 @@ test "PosixFilePool: write then read round-trip via the worker" {
     }
 }
 
-test "PosixFilePool: bad fd surfaces as an error result (fault injection)" {
-    const pool = try PosixFilePool.create(testing.allocator, .{
+test "BlockingOpPool: bad fd surfaces as an error result (fault injection)" {
+    const pool = try BlockingOpPool.create(testing.allocator, .{
         .worker_count = 1,
         .pending_capacity = 4,
     });
@@ -722,7 +1006,7 @@ test "PosixFilePool: bad fd surfaces as an error result (fault injection)" {
     }
 }
 
-test "PosixFilePool: stress — N workers drain M ops from a small queue" {
+test "BlockingOpPool: stress — N workers drain M ops from a small queue" {
     if (builtin.target.os.tag != .linux and !builtin.target.os.tag.isDarwin()) {
         return error.SkipZigTest;
     }
@@ -730,7 +1014,7 @@ test "PosixFilePool: stress — N workers drain M ops from a small queue" {
     const worker_count: u32 = 4;
     const total_ops: u32 = 256;
 
-    const pool = try PosixFilePool.create(testing.allocator, .{
+    const pool = try BlockingOpPool.create(testing.allocator, .{
         .worker_count = worker_count,
         .pending_capacity = total_ops,
     });
@@ -775,9 +1059,9 @@ test "PosixFilePool: stress — N workers drain M ops from a small queue" {
     try testing.expectEqual(total_ops, seen);
 }
 
-test "PosixFilePool: hasPendingWork tracks pending and in-flight" {
+test "BlockingOpPool: hasPendingWork tracks pending and in-flight" {
     // 0 workers: pending stays high, nothing in-flight.
-    const pool = try PosixFilePool.create(testing.allocator, .{
+    const pool = try BlockingOpPool.create(testing.allocator, .{
         .worker_count = 0,
         .pending_capacity = 4,
     });
@@ -798,8 +1082,8 @@ test "PosixFilePool: hasPendingWork tracks pending and in-flight" {
     try testing.expect(!pool.hasPendingWork());
 }
 
-test "PosixFilePool: deinit cancels still-pending submissions" {
-    var pool = try PosixFilePool.create(testing.allocator, .{
+test "BlockingOpPool: deinit cancels still-pending submissions" {
+    var pool = try BlockingOpPool.create(testing.allocator, .{
         .worker_count = 0,
         .pending_capacity = 4,
     });
@@ -820,7 +1104,7 @@ test "PosixFilePool: deinit cancels still-pending submissions" {
     // does not leak (the testing allocator catches that).
 }
 
-test "PosixFilePool: wakeup callback fires after each completion" {
+test "BlockingOpPool: wakeup callback fires after each completion" {
     const Box = struct {
         var hits: std.atomic.Value(u32) = std.atomic.Value(u32).init(0);
         fn cb(_: ?*anyopaque) void {
@@ -829,7 +1113,7 @@ test "PosixFilePool: wakeup callback fires after each completion" {
     };
     Box.hits.store(0, .release);
 
-    const pool = try PosixFilePool.create(testing.allocator, .{
+    const pool = try BlockingOpPool.create(testing.allocator, .{
         .worker_count = 1,
         .pending_capacity = 4,
     });
