@@ -1,4 +1,5 @@
 pub const huge_page_cache = @import("huge_page_cache.zig");
+pub const delete_job = @import("delete_job.zig");
 pub const manifest = @import("manifest.zig");
 pub const move_job = @import("move_job.zig");
 pub const resume_state = @import("state_db.zig");
@@ -12,6 +13,7 @@ pub const writer = @import("writer.zig");
 // opt-in via `_ = storage;`.
 test {
     _ = huge_page_cache;
+    _ = delete_job;
     _ = manifest;
     _ = move_job;
     _ = resume_state;

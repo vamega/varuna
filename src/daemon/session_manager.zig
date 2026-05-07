@@ -15,10 +15,15 @@ const tracker_executor_mod = @import("../tracker/executor.zig");
 const udp_tracker_executor_mod = @import("../tracker/udp_executor.zig");
 const session_mod = @import("../torrent/session.zig");
 const move_job_mod = @import("../storage/move_job.zig");
+const delete_job_mod = @import("../storage/delete_job.zig");
 pub const MoveJob = move_job_mod.MoveJob;
 pub const MoveJobId = move_job_mod.JobId;
 pub const MoveJobState = move_job_mod.State;
 pub const MoveJobProgress = move_job_mod.Progress;
+pub const DeleteJob = delete_job_mod.DeleteJob;
+pub const DeleteJobId = delete_job_mod.JobId;
+pub const DeleteJobState = delete_job_mod.State;
+pub const DeleteJobProgress = delete_job_mod.Progress;
 
 /// Manages multiple torrent sessions for the daemon.
 /// Thread-safe: the API server and event loop can access concurrently.
@@ -94,6 +99,11 @@ pub fn SessionManagerOf(comptime IO: type) type {
         /// guard catches this for the legacy path; this is the new
         /// equivalent).
         torrent_move_jobs: std.AutoHashMap([40]u8, MoveJobId) = undefined,
+        /// Fire-and-forget `deleteFiles=true` jobs. These own manifest
+        /// path copies and are destroyed once their event-loop state
+        /// machines reach a terminal state.
+        delete_jobs: std.AutoHashMap(DeleteJobId, *DeleteJob) = undefined,
+        next_delete_job_id: DeleteJobId = 1,
 
         /// Shared resume DB for category/tag persistence. Opened once, shared
         /// with all sessions. null if no resume_db_path is configured.
@@ -120,6 +130,7 @@ pub fn SessionManagerOf(comptime IO: type) type {
                 .relocating_torrents = std.AutoHashMap([40]u8, void).init(allocator),
                 .move_jobs = std.AutoHashMap(MoveJobId, *MoveJob).init(allocator),
                 .torrent_move_jobs = std.AutoHashMap([40]u8, MoveJobId).init(allocator),
+                .delete_jobs = std.AutoHashMap(DeleteJobId, *DeleteJob).init(allocator),
             };
         }
 
@@ -179,6 +190,7 @@ pub fn SessionManagerOf(comptime IO: type) type {
 
         pub fn deinit(self: *Self) void {
             self.cancelAndDrainMoveJobsForDeinit();
+            self.cancelAndDrainDeleteJobsForDeinit();
 
             const process_shutdown = @import("../io/signal.zig").isShutdownRequested();
             var abandoned_network_sessions = false;
@@ -223,6 +235,21 @@ pub fn SessionManagerOf(comptime IO: type) type {
             }
             self.move_jobs.deinit();
             self.torrent_move_jobs.deinit();
+            var delete_jobs_it = self.delete_jobs.iterator();
+            while (delete_jobs_it.next()) |entry| {
+                entry.value_ptr.*.requestCancel();
+                if (entry.value_ptr.*.isEventLoopRunning() or
+                    entry.value_ptr.*.hasPendingEventLoopIo())
+                {
+                    std.log.err(
+                        "leaking event-loop delete job {d} during teardown to avoid pending-IO use-after-free",
+                        .{entry.key_ptr.*},
+                    );
+                    continue;
+                }
+                entry.value_ptr.*.destroy();
+            }
+            self.delete_jobs.deinit();
             if (self.ban_list) |bl| {
                 bl.deinit();
                 self.allocator.destroy(bl);
@@ -273,6 +300,37 @@ pub fn SessionManagerOf(comptime IO: type) type {
                 var any_pending = false;
 
                 var tick_it = self.move_jobs.iterator();
+                while (tick_it.next()) |entry| {
+                    const job = entry.value_ptr.*;
+                    if (!job.isEventLoopRunning()) continue;
+                    any_running = true;
+                    job.tickOnEventLoop(&el.io);
+                    any_pending = any_pending or job.hasPendingEventLoopIo();
+                }
+
+                if (!any_running) return;
+                if (any_pending) {
+                    el.io.tick(1) catch return;
+                }
+            }
+        }
+
+        fn cancelAndDrainDeleteJobsForDeinit(self: *Self) void {
+            if (self.delete_jobs.count() == 0) return;
+
+            var cancel_it = self.delete_jobs.iterator();
+            while (cancel_it.next()) |entry| {
+                entry.value_ptr.*.requestCancel();
+            }
+
+            const el = self.shared_event_loop orelse return;
+
+            var rounds: u32 = 0;
+            while (rounds < 1024) : (rounds += 1) {
+                var any_running = false;
+                var any_pending = false;
+
+                var tick_it = self.delete_jobs.iterator();
                 while (tick_it.next()) |entry| {
                     const job = entry.value_ptr.*;
                     if (!job.isEventLoopRunning()) continue;
@@ -362,22 +420,38 @@ pub fn SessionManagerOf(comptime IO: type) type {
             return self.removeTorrentEx(hash, false);
         }
 
-        /// Remove a torrent with optional file deletion.
-        /// When delete_files is true, removes all data files and empty parent
-        /// directories under the torrent's save_path.
+        /// Remove a torrent with optional data-file deletion. When
+        /// `delete_files` is true, deletion is queued as a manifest-scoped
+        /// event-loop job; this method performs session bookkeeping and
+        /// returns without running filesystem syscalls inline.
         pub fn removeTorrentEx(self: *Self, hash: []const u8, delete_files: bool) !void {
             self.mutex.lock();
 
             if (hash.len == 40) {
                 var hash_buf: [40]u8 = undefined;
                 @memcpy(&hash_buf, hash[0..40]);
-                if (self.relocating_torrents.contains(hash_buf)) {
+                if (self.relocating_torrents.contains(hash_buf) or self.torrent_move_jobs.contains(hash_buf)) {
                     self.mutex.unlock();
                     return error.TorrentBusy;
                 }
             }
 
+            const session_for_delete = self.sessions.get(hash) orelse {
+                self.mutex.unlock();
+                return error.TorrentNotFound;
+            };
+            const delete_job_id: ?DeleteJobId = if (delete_files)
+                self.prepareDeleteFilesJobLocked(session_for_delete) catch |err| {
+                    self.mutex.unlock();
+                    return err;
+                }
+            else
+                null;
+
             const kv = self.sessions.fetchRemove(hash) orelse {
+                if (delete_job_id) |id| {
+                    if (self.delete_jobs.fetchRemove(id)) |job| job.value.destroy();
+                }
                 self.mutex.unlock();
                 return error.TorrentNotFound;
             };
@@ -386,57 +460,8 @@ pub fn SessionManagerOf(comptime IO: type) type {
             // Remove from queue
             self.queue_manager.removeTorrent(session.info_hash_hex);
 
-            // Grab info we need before deinit
-            const save_path = self.allocator.dupe(u8, session.save_path) catch {
-                self.mutex.unlock();
-                session.stop();
-                session.deinit();
-                self.allocator.destroy(session);
-                return;
-            };
-            defer self.allocator.free(save_path);
-
+            // Grab info we need before deinit.
             const info_hash = session.info_hash;
-
-            // Get file paths if we need to delete files
-            const file_paths: ?[]const []const u8 = if (delete_files) blk: {
-                if (session.session) |*sess| {
-                    var paths = std.ArrayList([]const u8).empty;
-                    for (sess.metainfo.files) |file| {
-                        var name_len: usize = 0;
-                        for (file.path, 0..) |component, ci| {
-                            if (ci > 0) name_len += 1;
-                            name_len += component.len;
-                        }
-                        const name_buf = self.allocator.alloc(u8, name_len) catch continue;
-                        var pos: usize = 0;
-                        for (file.path, 0..) |component, ci| {
-                            if (ci > 0) {
-                                name_buf[pos] = '/';
-                                pos += 1;
-                            }
-                            @memcpy(name_buf[pos..][0..component.len], component);
-                            pos += component.len;
-                        }
-                        paths.append(self.allocator, name_buf) catch {
-                            self.allocator.free(name_buf);
-                            continue;
-                        };
-                    }
-                    break :blk paths.toOwnedSlice(self.allocator) catch null;
-                } else break :blk null;
-            } else null;
-            defer if (file_paths) |fps| {
-                for (fps) |fp| self.allocator.free(fp);
-                self.allocator.free(fps);
-            };
-
-            // Also get the torrent name for multi-file torrents
-            const torrent_name = if (delete_files)
-                self.allocator.dupe(u8, session.name) catch null
-            else
-                null;
-            defer if (torrent_name) |tn| self.allocator.free(tn);
 
             self.mutex.unlock();
 
@@ -444,6 +469,7 @@ pub fn SessionManagerOf(comptime IO: type) type {
             session.stop();
             session.deinit();
             self.allocator.destroy(session);
+            if (delete_job_id) |id| self.startPreparedDeleteJob(id);
 
             // Clean up resume DB entries for this torrent
             if (self.resume_db) |*db| {
@@ -454,29 +480,52 @@ pub fn SessionManagerOf(comptime IO: type) type {
                 db.saveTorrentCategory(info_hash, "") catch {};
             }
 
-            // Delete data files if requested
-            if (delete_files) {
-                if (file_paths) |fps| {
-                    for (fps) |relative_path| {
-                        // Build full path: save_path/name/relative_path (multi-file)
-                        // or save_path/relative_path (single-file)
-                        var path_buf: [4096]u8 = undefined;
-                        const full_path = if (torrent_name) |tn|
-                            std.fmt.bufPrint(&path_buf, "{s}/{s}/{s}", .{ save_path, tn, relative_path }) catch continue
-                        else
-                            std.fmt.bufPrint(&path_buf, "{s}/{s}", .{ save_path, relative_path }) catch continue;
-
-                        std.fs.deleteFileAbsolute(full_path) catch {};
-                    }
-                }
-
-                // Clean up empty directories (bottom-up)
-                cleanupEmptyDirs(save_path, torrent_name);
-            }
-
             // A slot may have opened up -- start queued torrents if applicable
             self.runQueueEnforcement();
             self.persistQueuePositions();
+        }
+
+        fn prepareDeleteFilesJobLocked(self: *Self, session: *TorrentSession) !?DeleteJobId {
+            _ = self.shared_event_loop orelse return error.SharedEventLoopNotConfigured;
+            if (session.torrent_bytes.len == 0 and session.session == null) return null;
+
+            var fallback_session: ?session_mod.Session = null;
+            defer if (fallback_session) |loaded| loaded.deinit(self.allocator);
+
+            const manifest_files_src = if (session.session) |loaded_session|
+                loaded_session.manifest.files
+            else blk: {
+                fallback_session = try session_mod.Session.loadForSeeding(self.allocator, session.torrent_bytes, session.save_path);
+                break :blk fallback_session.?.manifest.files;
+            };
+            if (manifest_files_src.len == 0) return null;
+
+            const manifest_files = try self.allocator.alloc(DeleteJob.File, manifest_files_src.len);
+            defer self.allocator.free(manifest_files);
+            for (manifest_files_src, 0..) |file, index| {
+                manifest_files[index] = .{ .relative_path = file.relative_path };
+            }
+
+            const id = self.next_delete_job_id;
+            self.next_delete_job_id += 1;
+
+            const job = try DeleteJob.createForFiles(self.allocator, id, session.save_path, manifest_files);
+            errdefer job.destroy();
+            try self.delete_jobs.put(id, job);
+            errdefer _ = self.delete_jobs.remove(id);
+            return id;
+        }
+
+        fn startPreparedDeleteJob(self: *Self, id: DeleteJobId) void {
+            self.mutex.lock();
+            defer self.mutex.unlock();
+
+            const job = self.delete_jobs.get(id) orelse return;
+            job.startOnEventLoop(null, null) catch |err| {
+                _ = self.delete_jobs.remove(id);
+                job.destroy();
+                std.log.err("failed to start delete job {d}: {s}", .{ id, @errorName(err) });
+            };
         }
 
         // ── Ban list management ──────────────────────────────
@@ -569,47 +618,6 @@ pub fn SessionManagerOf(comptime IO: type) type {
             }
             for (ranges) |info| {
                 db.saveBannedRange(info.start_str, info.end_str, @intFromEnum(info.source)) catch {};
-            }
-        }
-
-        /// Remove empty directories under save_path/torrent_name, bottom-up.
-        fn cleanupEmptyDirs(save_path: []const u8, torrent_name: ?[]const u8) void {
-            var path_buf: [4096]u8 = undefined;
-            const base = if (torrent_name) |tn|
-                std.fmt.bufPrint(&path_buf, "{s}/{s}", .{ save_path, tn }) catch return
-            else
-                save_path;
-
-            // Try to delete the torrent directory (will fail if not empty, which is fine)
-            removeEmptyTree(base);
-        }
-
-        /// Recursively try to remove empty directories.
-        fn removeEmptyTree(path: []const u8) void {
-            var dir = std.fs.openDirAbsolute(path, .{ .iterate = true }) catch return;
-
-            var has_entries = false;
-            var iter = dir.iterate();
-            while (iter.next() catch null) |entry| {
-                if (entry.kind == .directory) {
-                    var sub_buf: [4096]u8 = undefined;
-                    const sub_path = std.fmt.bufPrint(&sub_buf, "{s}/{s}", .{ path, entry.name }) catch {
-                        has_entries = true;
-                        continue;
-                    };
-                    removeEmptyTree(sub_path);
-                    // Check if sub-dir still exists
-                    std.fs.accessAbsolute(sub_path, .{}) catch {
-                        // sub-dir was removed, don't count it
-                        continue;
-                    };
-                }
-                has_entries = true;
-            }
-            dir.close();
-
-            if (!has_entries) {
-                std.fs.deleteDirAbsolute(path) catch {};
             }
         }
 
@@ -1234,6 +1242,56 @@ pub fn SessionManagerOf(comptime IO: type) type {
             while (iter.next()) |entry| {
                 entry.value_ptr.*.tickOnEventLoop(&el.io);
             }
+        }
+
+        pub fn hasActiveDeleteJobs(self: *Self) bool {
+            self.mutex.lock();
+            defer self.mutex.unlock();
+            var iter = self.delete_jobs.iterator();
+            while (iter.next()) |entry| {
+                if (entry.value_ptr.*.isEventLoopRunning()) return true;
+            }
+            return false;
+        }
+
+        pub fn tickDeleteJobs(self: *Self) void {
+            self.mutex.lock();
+            defer self.mutex.unlock();
+            const el = self.shared_event_loop orelse return;
+
+            var terminal_ids = std.ArrayList(DeleteJobId).empty;
+            defer terminal_ids.deinit(self.allocator);
+
+            var iter = self.delete_jobs.iterator();
+            while (iter.next()) |entry| {
+                const job = entry.value_ptr.*;
+                job.tickOnEventLoop(&el.io);
+                const p = job.progress();
+                if (isTerminalDeleteJobState(p.state) and !job.hasPendingEventLoopIo()) {
+                    terminal_ids.append(self.allocator, entry.key_ptr.*) catch continue;
+                }
+            }
+
+            for (terminal_ids.items) |id| {
+                const job = self.delete_jobs.fetchRemove(id) orelse continue;
+                const p = job.value.progress();
+                if (p.errors_seen > 0) {
+                    std.log.warn(
+                        "delete job {d} completed with {d} non-fatal cleanup error(s): {s}",
+                        .{ id, p.errors_seen, p.error_message orelse "unknown" },
+                    );
+                } else if (p.state != .succeeded) {
+                    std.log.warn("delete job {d} completed with state {s}", .{ id, @tagName(p.state) });
+                }
+                job.value.destroy();
+            }
+        }
+
+        fn isTerminalDeleteJobState(state: DeleteJobState) bool {
+            return switch (state) {
+                .succeeded, .failed, .canceled => true,
+                .created, .running => false,
+            };
         }
 
         pub fn count(self: *Self) usize {

@@ -275,6 +275,14 @@ pub fn build(b: *std.Build) void {
     const test_move_job_step = b.step("test-move-job", "Run focused MoveJob relocation tests");
     test_move_job_step.dependOn(&run_move_job_tests.step);
 
+    const delete_job_tests = b.addTest(.{
+        .root_module = varuna_mod,
+        .filters = &.{"DeleteJob:"},
+    });
+    const run_delete_job_tests = b.addRunArtifact(delete_job_tests);
+    const test_delete_job_step = b.step("test-delete-job", "Run focused DeleteJob data-removal tests");
+    test_delete_job_step.dependOn(&run_delete_job_tests.step);
+
     const ctl_tests = b.addTest(.{
         .root_module = b.createModule(.{
             .root_source_file = b.path("src/ctl/root.zig"),
