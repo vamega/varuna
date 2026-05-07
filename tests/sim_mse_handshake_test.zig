@@ -77,22 +77,14 @@ const PeerMseDriver = struct {
     /// don't interleave.
     random: *Random,
 
-    recv_buf: [2048]u8 = undefined,
-    /// Bytes pending dispatch to the state machine. The recv callback
-    /// just appends; `pump` decides when to feed.
-    recv_len: usize = 0,
     recv_in_flight: bool = false,
 
     send_buf: [2048]u8 = undefined,
     send_len: usize = 0,
     send_in_flight: bool = false,
 
-    /// What slice the state machine asked us to recv into. We carry
-    /// this between actions so a single recv can satisfy a multi-byte
-    /// request without committing to a state-machine transition until
-    /// we have all of it.
+    /// What slice the state machine asked us to recv into.
     pending_recv: ?[]u8 = null,
-    pending_recv_offset: usize = 0,
 
     outcome: Outcome = .in_progress,
     failure: ?mse.MseError = null,
@@ -155,7 +147,6 @@ const PeerMseDriver = struct {
             },
             .recv => |buf| {
                 self.pending_recv = buf;
-                self.pending_recv_offset = 0;
                 if (!self.recv_in_flight) {
                     try self.submitRecv();
                 }
@@ -170,9 +161,10 @@ const PeerMseDriver = struct {
 
     fn submitRecv(self: *PeerMseDriver) !void {
         std.debug.assert(!self.recv_in_flight);
+        const buf = self.pending_recv orelse return error.InvalidState;
         self.recv_in_flight = true;
         try self.io.recv(
-            .{ .fd = self.fd, .buf = &self.recv_buf },
+            .{ .fd = self.fd, .buf = buf },
             &self.recv_completion,
             self,
             recvCb,
@@ -206,10 +198,13 @@ const PeerMseDriver = struct {
             self.failure = .connection_closed;
             return .disarm;
         }
-        self.recv_len = n;
-        // Feed bytes to the state machine.
-        self.feedRecv() catch |err| {
-            std.log.err("PeerMseDriver feedRecv error: {s}", .{@errorName(err)});
+        self.pending_recv = null;
+        const action = switch (self.role) {
+            .initiator => self.initiator.?.feedRecv(n),
+            .responder => self.responder.?.feedRecv(n),
+        };
+        self.applyAction(action) catch |err| {
+            std.log.err("PeerMseDriver applyAction error: {s}", .{@errorName(err)});
             self.outcome = .failed;
             self.failure = .internal;
         };
@@ -238,58 +233,6 @@ const PeerMseDriver = struct {
             self.failure = .internal;
         };
         return .disarm;
-    }
-
-    /// Distribute received bytes to the state machine in chunks
-    /// matching its recv-buffer requests. The state machine asks for
-    /// `[]u8` slices via `MseAction.recv`; we feed exactly that many
-    /// bytes at a time, then call `feedRecv(n)` and process the
-    /// returned action.
-    fn feedRecv(self: *PeerMseDriver) !void {
-        var src_offset: usize = 0;
-        while (src_offset < self.recv_len) {
-            const dst = self.pending_recv orelse {
-                // No outstanding recv-buf request; the state machine
-                // is between phases. Drop the rest — shouldn't
-                // happen if we're submit-recv'ing one chunk at a
-                // time, but defensive.
-                return;
-            };
-            const want = dst.len - self.pending_recv_offset;
-            if (want == 0) {
-                // Already filled this slice; await next action.
-                return;
-            }
-            const take = @min(want, self.recv_len - src_offset);
-            @memcpy(
-                dst[self.pending_recv_offset .. self.pending_recv_offset + take],
-                self.recv_buf[src_offset .. src_offset + take],
-            );
-            self.pending_recv_offset += take;
-            src_offset += take;
-
-            if (self.pending_recv_offset == dst.len) {
-                // Buffer satisfied — feed the state machine.
-                const n = self.pending_recv_offset;
-                self.pending_recv = null;
-                self.pending_recv_offset = 0;
-                const action = switch (self.role) {
-                    .initiator => self.initiator.?.feedRecv(n),
-                    .responder => self.responder.?.feedRecv(n),
-                };
-                try self.applyAction(action);
-                if (self.outcome != .in_progress) return;
-            } else {
-                // Need more bytes; keep going through recv_buf if any.
-                continue;
-            }
-        }
-        // If we still have an outstanding recv-buf and no in-flight
-        // recv (the state machine asked for a slice we couldn't fully
-        // satisfy from this chunk), arm the next recv.
-        if (self.pending_recv != null and !self.recv_in_flight and self.outcome == .in_progress) {
-            try self.submitRecv();
-        }
     }
 };
 

@@ -55,6 +55,8 @@ pub const TorrentId = types.TorrentId;
 pub const PeerMode = types.PeerMode;
 pub const Transport = types.Transport;
 pub const PeerState = types.PeerState;
+pub const SocketSetupStage = types.SocketSetupStage;
+pub const SocketSetupAfter = types.SocketSetupAfter;
 pub const Peer = types.Peer;
 pub const SpeedStats = types.SpeedStats;
 pub const TorrentContext = types.TorrentContext;
@@ -269,10 +271,12 @@ pub fn EventLoopOf(comptime IO: type) type {
 
         // Accept socket for seeding (-1 if not seeding)
         listen_fd: posix.fd_t = -1,
-        // Caller-owned completion for the multishot accept on `listen_fd`.
-        // Re-armed by `peerAcceptComplete` when the kernel clears F_MORE.
+        // Caller-owned completion for accept on `listen_fd`. RealIO uses
+        // single-shot accept here so the accepted peer address has stable
+        // storage; the callback rearms after each completion.
         accept_completion: io_interface.Completion = .{},
-        /// Tracking completion for cancelling the multishot accept during
+        accept_addr: io_interface.AcceptAddressBuffer = .{},
+        /// Tracking completion for cancelling the pending accept during
         /// `stopTcpListener`. Lives on the EventLoop because the cancel
         /// CQE must arrive before the accept's `accept_completion` is
         /// reused.
@@ -1471,7 +1475,7 @@ pub fn EventLoopOf(comptime IO: type) type {
         }
 
         /// Register a pre-connected inbound fd for `torrent_id`. Test/sim-only
-        /// shortcut around the production `accept_multishot` path: the caller
+        /// shortcut around the production accept path: the caller
         /// (typically a `Simulator` driver) has already set up a socketpair
         /// and assigned one end to a SimPeer; this routes the other end into
         /// an EventLoop peer slot in the post-accept inbound state, ready to
@@ -1913,7 +1917,7 @@ pub fn EventLoopOf(comptime IO: type) type {
             log.info("TCP listener started on port {d}", .{self.port});
         }
 
-        /// Stop the TCP listener. Cancels the pending multishot ACCEPT,
+        /// Stop the TCP listener. Cancels the pending ACCEPT,
         /// then closes the listen socket via io_uring. Setting listen_fd = -1
         /// immediately ensures the dispatch loop ignores stale CQEs.
         pub fn stopTcpListener(self: *Self) void {
@@ -1921,7 +1925,7 @@ pub fn EventLoopOf(comptime IO: type) type {
             const fd = self.listen_fd;
             self.listen_fd = -1;
 
-            // Cancel the in-flight multishot accept on the io_interface ring.
+            // Cancel the in-flight accept on the io_interface ring.
             self.io.cancel(
                 .{ .target = &self.accept_completion },
                 &self.accept_cancel_completion,
@@ -1934,7 +1938,7 @@ pub fn EventLoopOf(comptime IO: type) type {
         }
 
         /// No-op callback used when we don't care about a cancel result —
-        /// e.g. the multishot accept cancel during `stopTcpListener`.
+        /// e.g. the accept cancel during `stopTcpListener`.
         fn ignoredCancelComplete(
             _: ?*anyopaque,
             _: *io_interface.Completion,
@@ -2978,7 +2982,7 @@ pub fn EventLoopOf(comptime IO: type) type {
         pub fn submitAccept(self: *Self) !void {
             if (self.listen_fd < 0) return;
             try self.io.accept(
-                .{ .fd = self.listen_fd, .multishot = true },
+                .{ .fd = self.listen_fd, .multishot = true, .addr = &self.accept_addr },
                 &self.accept_completion,
                 self,
                 peer_handler.peerAcceptCompleteFor(Self),

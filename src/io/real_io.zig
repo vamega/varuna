@@ -859,14 +859,22 @@ pub const RealIO = struct {
     pub fn accept(self: *RealIO, op: ifc.AcceptOp, c: *Completion, ud: ?*anyopaque, cb: Callback) !void {
         try self.armCompletion(c, .{ .accept = op }, ud, cb);
         realState(c).multishot = op.multishot;
-        // We do not request the kernel to fill peer addr — multishot can't
-        // share it across CQEs anyway. Callers who need it call
-        // `getpeername(2)` on the accepted fd.
+        const stored = &c.op.accept;
+        const addr_ptr: ?*posix.sockaddr = if (stored.addr) |addr| blk: {
+            addr.reset();
+            break :blk @ptrCast(&addr.storage);
+        } else null;
+        const addr_len_ptr: ?*posix.socklen_t = if (stored.addr) |addr| &addr.len else null;
+
+        // Native multishot accept has only one caller-supplied address
+        // buffer. If the caller needs the peer address, submit single-shot
+        // accepts and let the callback's `.rearm` resubmit after each CQE.
         const flags: u32 = posix.SOCK.CLOEXEC | posix.SOCK.NONBLOCK;
-        const sqe = if (op.multishot)
-            try self.ring.accept_multishot(@intFromPtr(c), op.fd, null, null, flags)
+        const use_multishot = stored.multishot and stored.addr == null;
+        const sqe = if (use_multishot)
+            try self.ring.accept_multishot(@intFromPtr(c), stored.fd, null, null, flags)
         else
-            try self.ring.accept(@intFromPtr(c), op.fd, null, null, flags);
+            try self.ring.accept(@intFromPtr(c), stored.fd, addr_ptr, addr_len_ptr, flags);
         _ = sqe;
     }
 
@@ -1039,7 +1047,7 @@ fn buildResult(op: Operation, cqe: linux.io_uring_cqe) Result {
         .fchmod => .{ .fchmod = voidOrError(cqe) },
         .socket => .{ .socket = fdOrError(cqe) },
         .connect => .{ .connect = voidOrError(cqe) },
-        .accept => .{ .accept = acceptResult(cqe) },
+        .accept => |accept_op| .{ .accept = acceptResult(accept_op, cqe) },
         // Bind / listen / setsockopt either come back from the async ring
         // or complete through the blocking-op pool. When a CQE does land,
         // translate it the same way as fallocate / fsync.
@@ -1066,12 +1074,14 @@ fn fdOrError(cqe: linux.io_uring_cqe) anyerror!posix.fd_t {
     return @intCast(cqe.res);
 }
 
-fn acceptResult(cqe: linux.io_uring_cqe) anyerror!ifc.Accepted {
+fn acceptResult(op: ifc.AcceptOp, cqe: linux.io_uring_cqe) anyerror!ifc.Accepted {
     if (cqe.res < 0) return errnoToError(cqe.err());
     return .{
         .fd = @intCast(cqe.res),
-        // Kernel didn't fill addr (we passed null). Caller uses getpeername.
-        .addr = std.net.Address.initIp4(.{ 0, 0, 0, 0 }, 0),
+        .addr = if (op.addr) |addr|
+            addr.address()
+        else
+            std.net.Address.initIp4(.{ 0, 0, 0, 0 }, 0),
     };
 }
 
@@ -1141,6 +1151,7 @@ fn errnoToError(e: linux.E) anyerror {
         .ADDRNOTAVAIL => error.AddressNotAvailable,
         .AFNOSUPPORT => error.AddressFamilyNotSupported,
         .DESTADDRREQ => error.DestinationAddressRequired,
+        .NOTSOCK => error.NotSocket,
         .AGAIN => error.WouldBlock,
         .BADF => error.BadFileDescriptor,
         .INTR => error.Interrupted,
@@ -1165,6 +1176,8 @@ test "RealIO maps ENOTCONN completions to SocketNotConnected" {
     try testing.expect(ifc.linuxErrnoToError(.NOTCONN) == error.SocketNotConnected);
     try testing.expect(errnoToError(.DESTADDRREQ) == error.DestinationAddressRequired);
     try testing.expect(ifc.linuxErrnoToError(.DESTADDRREQ) == error.DestinationAddressRequired);
+    try testing.expect(errnoToError(.NOTSOCK) == error.NotSocket);
+    try testing.expect(ifc.linuxErrnoToError(.NOTSOCK) == error.NotSocket);
 }
 
 fn skipIfUnavailable() !RealIO {

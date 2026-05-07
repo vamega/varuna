@@ -417,6 +417,8 @@ pub fn build(b: *std.Build) void {
         }),
     });
     const run_sim_mse_handshake_tests = b.addRunArtifact(sim_mse_handshake_tests);
+    const test_sim_mse_handshake_step = b.step("test-sim-mse-handshake", "Run SimIO MSE handshake race/regression tests");
+    test_sim_mse_handshake_step.dependOn(&run_sim_mse_handshake_tests.step);
     test_step.dependOn(&run_sim_mse_handshake_tests.step);
 
     const udp_tracker_tests = b.addTest(.{

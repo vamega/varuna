@@ -31,6 +31,21 @@ pub const Transport = enum {
     utp,
 };
 
+pub const SocketSetupStage = enum(u8) {
+    none,
+    tcp_nodelay,
+    rcvbuf,
+    sndbuf,
+    bind_device,
+    bind_address,
+};
+
+pub const SocketSetupAfter = enum(u8) {
+    none,
+    inbound_handshake_recv,
+    outbound_connect,
+};
+
 pub const extra_prefetch_piece_count: usize = 2;
 
 pub const PrefetchPiece = struct {
@@ -87,6 +102,9 @@ pub const Peer = struct {
     send_pending: bool = false,
     recv_pending: bool = false,
     connect_pending: bool = false,
+    socket_setup_stage: SocketSetupStage = .none,
+    socket_setup_after: SocketSetupAfter = .none,
+    socket_setup_optval: [16]u8 = undefined,
     untracked_send_pending: bool = false,
     // Peer removal quarantine: embedded connect/recv/untracked-send
     // completions still owned by the backend after close. The slot stays

@@ -35,15 +35,12 @@ test "socket binds to loopback device" {
 }
 
 // ═══════════════════════════════════════════════════════════════
-// 2. Empty bind_device does not set SO_BINDTODEVICE
+// 2. Fresh socket does not have SO_BINDTODEVICE set
 // ═══════════════════════════════════════════════════════════════
 
-test "socket with empty bind_device does not set SO_BINDTODEVICE" {
+test "fresh socket does not have SO_BINDTODEVICE set" {
     const fd = try posix.socket(posix.AF.INET, posix.SOCK.STREAM | posix.SOCK.CLOEXEC, posix.IPPROTO.TCP);
     defer posix.close(fd);
-
-    // applyBindConfig with null device should be a no-op.
-    try socket_util.applyBindConfig(fd, null, null, 0);
 
     // getsockopt on an unbound socket should return an empty name.
     var buf: [16]u8 = undefined;
@@ -88,14 +85,14 @@ test "socket rejects empty device name" {
 }
 
 // ═══════════════════════════════════════════════════════════════
-// 5. applyBindConfig passes device through to applyBindDevice
+// 5. applyBindDevice can be verified through getsockopt
 // ═══════════════════════════════════════════════════════════════
 
-test "applyBindConfig forwards bind_device to setsockopt" {
+test "applyBindDevice result can be read back" {
     const fd = try posix.socket(posix.AF.INET, posix.SOCK.STREAM | posix.SOCK.CLOEXEC, posix.IPPROTO.TCP);
     defer posix.close(fd);
 
-    socket_util.applyBindConfig(fd, "lo", null, 0) catch |err| {
+    socket_util.applyBindDevice(fd, "lo") catch |err| {
         if (err == error.BindDevicePermissionDenied) return error.SkipZigTest;
         return err;
     };

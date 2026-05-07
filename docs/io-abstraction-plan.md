@@ -121,7 +121,7 @@ It determines the minimum interface that `RealIO` must expose and that `SimIO` m
 | `fsync` | — | `storage/writer.zig` (fdatasync — see below) | sync after piece write; currently synchronous, must go async |
 | `socket` | 4 | outbound TCP, UDP sockets | async socket creation |
 | `connect` | 3 | outbound peer TCP, HTTP tracker TCP | outbound connection |
-| `accept` | 2 | RPC listen socket, peer listen socket | `accept_multishot` in RealIO |
+| `accept` | 2 | RPC listen socket, peer listen socket | RPC uses `accept_multishot`; peer accept supplies address storage and rearms single-shot accepts so no follow-up `getpeername` is needed |
 | `timeout` | 1 | event loop tick timer | native io_uring timeout op |
 | `link_timeout` | 1 | HTTP connect deadline | SQE flag, not a separate interface method; `connect` impl chains it |
 | `poll_add` | 4 | signal fd, DNS event fd | readiness notification |

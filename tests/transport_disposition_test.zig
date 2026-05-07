@@ -22,6 +22,17 @@ fn activePeerCountByTransport(el: anytype, transport: Transport) u16 {
     return count;
 }
 
+fn tickUntilPeerConnectSubmitted(el: anytype, slot: u16, max_ticks: u32) !void {
+    var ticks: u32 = 0;
+    while (ticks < max_ticks) : (ticks += 1) {
+        switch (el.peers[slot].connect_completion.op) {
+            .connect => return,
+            else => try el.io.tick(1),
+        }
+    }
+    return error.ConnectNotSubmitted;
+}
+
 // ── Test 1: TCP-only mode rejects outbound uTP ───────────────
 //
 // When the disposition is tcp_only, selectTransport() must never
@@ -313,7 +324,7 @@ test "outbound tcp peer connect carries a deadline" {
     const addr = try std.net.Address.parseIp4("127.0.0.1", 6885);
 
     const slot = try el.addPeerForTorrent(addr, tid);
-    try el.io.tick(1);
+    try tickUntilPeerConnectSubmitted(&el, slot, 8);
 
     switch (el.peers[slot].connect_completion.op) {
         .connect => |op| try std.testing.expectEqual(@as(u64, 3 * std.time.ns_per_s), op.deadline_ns.?),
@@ -342,7 +353,7 @@ test "outbound tcp peer connect uses configured deadline" {
     const addr = try std.net.Address.parseIp4("127.0.0.1", 6886);
 
     const slot = try el.addPeerForTorrent(addr, tid);
-    try el.io.tick(1);
+    try tickUntilPeerConnectSubmitted(&el, slot, 8);
 
     switch (el.peers[slot].connect_completion.op) {
         .connect => |op| try std.testing.expectEqual(@as(u64, 1250 * std.time.ns_per_ms), op.deadline_ns.?),

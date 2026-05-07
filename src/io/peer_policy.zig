@@ -1,5 +1,6 @@
 const std = @import("std");
 const posix = std.posix;
+const linux = std.os.linux;
 const log = std.log.scoped(.event_loop);
 const Sha1 = @import("../crypto/root.zig").Sha1;
 const Sha256 = @import("../crypto/root.zig").Sha256;
@@ -2654,11 +2655,11 @@ test "sendKeepAlives queues send for quiet peer" {
     peer.send_pending = false;
     // Set last_activity well beyond the keepalive interval
     peer.last_activity = el.clock.now() - (keepalive_interval_secs + 10);
-    // Need a valid fd for the ring.send call -- use a /dev/null fd.
-    // EventLoop.deinit() closes peer.fd via io.closeSocket, so we must
-    // NOT close it ourselves: a double-close would panic in posix.close
-    // with `BADF -> unreachable` (kernel may have reused the fd).
-    peer.fd = std.posix.open("/dev/null", .{ .ACCMODE = .WRONLY }, 0) catch -1;
+    var fds: [2]i32 = undefined;
+    const rc = linux.socketpair(posix.AF.UNIX, posix.SOCK.STREAM, 0, &fds);
+    if (linux.E.init(rc) != .SUCCESS) return error.SkipZigTest;
+    peer.fd = fds[0];
+    defer posix.close(fds[1]);
     el.markActivePeer(slot);
 
     sendKeepAlives(&el);
@@ -2667,7 +2668,6 @@ test "sendKeepAlives queues send for quiet peer" {
     // because a keep-alive was queued via ring.send.
     // If the ring.send fails (possible in test), send_pending stays false,
     // but last_activity is only updated if the send succeeded.
-    // With /dev/null, the SQE should be accepted by the ring.
     if (peer.send_pending) {
         // Verify last_activity was updated to approximately now
         const now = el.clock.now();

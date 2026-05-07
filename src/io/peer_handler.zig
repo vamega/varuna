@@ -8,15 +8,17 @@ const mse = @import("../crypto/mse.zig");
 const EventLoop = @import("event_loop.zig").EventLoop;
 const Peer = @import("event_loop.zig").Peer;
 const PeerState = @import("event_loop.zig").PeerState;
+const SocketSetupAfter = @import("event_loop.zig").SocketSetupAfter;
+const SocketSetupStage = @import("event_loop.zig").SocketSetupStage;
 const protocol = @import("protocol.zig");
 const io_interface = @import("io_interface.zig");
 const peer_policy = @import("peer_policy.zig");
-const socket_util = @import("../net/socket.zig");
 const BanList = @import("../net/ban_list.zig").BanList;
 
 /// Default peer TCP connect timeout. Keep this short so stale half-open
 /// connects don't delay useful peer attempts in DHT-heavy swarms.
 pub const default_peer_connect_timeout_ns: u64 = 3 * std.time.ns_per_s;
+const IFNAMSIZ = 16;
 
 // ── Generic callback shape ────────────────────────────────
 //
@@ -55,7 +57,7 @@ pub fn peerAcceptCompleteFor(comptime EL: type) io_interface.Callback {
                 else => return .disarm,
             };
 
-            handleAccepted(self, accepted.fd);
+            handleAccepted(self, accepted.fd, accepted.addr);
             return .rearm;
         }
     }.cb;
@@ -63,25 +65,7 @@ pub fn peerAcceptCompleteFor(comptime EL: type) io_interface.Callback {
 
 /// Apply the policy/ban/limit checks against a freshly accepted fd and,
 /// if it's keepable, install it as an inbound peer slot.
-fn handleAccepted(self: anytype, new_fd: posix.fd_t) void {
-    // Resolve the peer's remote address up-front. Every downstream code path
-    // that touches peer.address (ban checks, PEX duplicate-connection filter
-    // in protocol.zig:isPeerAlreadyConnected, smart ban, /sync/torrentPeers,
-    // session_manager.getPort) assumes it's a valid std.net.Address — if we
-    // leave it `undefined` we get stack-garbage behaviour: silent false-match
-    // on addressEql (killing good connections as "duplicates") and an
-    // `unreachable` panic in getPort on unexpected sa_family values.
-    // Bail on peers we can't identify rather than carry an unknown address.
-    var peer_addr_storage: posix.sockaddr.storage = undefined;
-    var addr_len: posix.socklen_t = @sizeOf(posix.sockaddr.storage);
-    const getpeername_rc = std.os.linux.getpeername(new_fd, @ptrCast(&peer_addr_storage), &addr_len);
-    if (@as(i32, @bitCast(@as(u32, @truncate(getpeername_rc)))) < 0) {
-        log.debug("rejected inbound: getpeername failed", .{});
-        closeAcceptedFd(self, new_fd);
-        return;
-    }
-    const peer_address = std.net.Address{ .any = @as(*posix.sockaddr, @ptrCast(&peer_addr_storage)).* };
-
+fn handleAccepted(self: anytype, new_fd: posix.fd_t, peer_address: std.net.Address) void {
     // Check ban list using the resolved address.
     if (self.ban_list) |bl| {
         if (bl.isBanned(peer_address)) {
@@ -131,18 +115,216 @@ fn handleAccepted(self: anytype, new_fd: posix.fd_t) void {
     peer.handshake_offset = 0;
     self.peer_count += 1;
 
-    socket_util.configurePeerSocket(new_fd);
-
-    self.markActivePeer(slot);
-
-    // Start receiving the peer's handshake
-    protocol.submitHandshakeRecv(self, slot) catch {
+    beginPeerSocketSetup(self, slot, .inbound_handshake_recv) catch {
         self.removePeer(slot);
     };
 }
 
 fn closeAcceptedFd(self: anytype, new_fd: posix.fd_t) void {
     self.io.closeSocket(new_fd);
+}
+
+fn beginPeerSocketSetup(self: anytype, slot: u16, after: SocketSetupAfter) !void {
+    const peer = &self.peers[slot];
+    peer.socket_setup_stage = .none;
+    peer.socket_setup_after = after;
+    try submitNextPeerSocketSetup(self, slot);
+}
+
+fn submitNextPeerSocketSetup(self: anytype, slot: u16) !void {
+    const peer = &self.peers[slot];
+    const next = nextSocketSetupStage(self, peer);
+    if (next == null) {
+        finishPeerSocketSetup(self, slot);
+        return;
+    }
+
+    peer.socket_setup_stage = next.?;
+    peer.connect_pending = true;
+    errdefer peer.connect_pending = false;
+
+    switch (next.?) {
+        .tcp_nodelay => {
+            const bytes = writeSetupInt(peer, 1);
+            try self.io.setsockopt(.{
+                .fd = peer.fd,
+                .level = posix.IPPROTO.TCP,
+                .optname = linux.TCP.NODELAY,
+                .optval = bytes,
+            }, &peer.connect_completion, self, peerSocketSetupCompleteFor(@TypeOf(self.*)));
+        },
+        .rcvbuf => {
+            const bytes = writeSetupInt(peer, 2 * 1024 * 1024);
+            try self.io.setsockopt(.{
+                .fd = peer.fd,
+                .level = posix.SOL.SOCKET,
+                .optname = posix.SO.RCVBUF,
+                .optval = bytes,
+            }, &peer.connect_completion, self, peerSocketSetupCompleteFor(@TypeOf(self.*)));
+        },
+        .sndbuf => {
+            const bytes = writeSetupInt(peer, 512 * 1024);
+            try self.io.setsockopt(.{
+                .fd = peer.fd,
+                .level = posix.SOL.SOCKET,
+                .optname = posix.SO.SNDBUF,
+                .optval = bytes,
+            }, &peer.connect_completion, self, peerSocketSetupCompleteFor(@TypeOf(self.*)));
+        },
+        .bind_device => {
+            const device = self.bind_device orelse return error.InvalidSocketSetupStage;
+            const optval = try writeBindDeviceOptval(peer, device);
+            try self.io.setsockopt(.{
+                .fd = peer.fd,
+                .level = posix.SOL.SOCKET,
+                .optname = posix.SO.BINDTODEVICE,
+                .optval = optval,
+            }, &peer.connect_completion, self, peerSocketSetupCompleteFor(@TypeOf(self.*)));
+        },
+        .bind_address => {
+            const address_str = self.bind_address orelse return error.InvalidSocketSetupStage;
+            const bind_addr = try parseBindAddress(address_str, 0);
+            try self.io.bind(.{
+                .fd = peer.fd,
+                .addr = bind_addr,
+            }, &peer.connect_completion, self, peerSocketSetupCompleteFor(@TypeOf(self.*)));
+        },
+        .none => return error.InvalidSocketSetupStage,
+    }
+}
+
+fn nextSocketSetupStage(self: anytype, peer: *const Peer) ?SocketSetupStage {
+    return switch (peer.socket_setup_stage) {
+        .none => .tcp_nodelay,
+        .tcp_nodelay => .rcvbuf,
+        .rcvbuf => .sndbuf,
+        .sndbuf => if (peer.socket_setup_after == .outbound_connect and self.bind_device != null)
+            .bind_device
+        else if (peer.socket_setup_after == .outbound_connect and self.bind_address != null)
+            .bind_address
+        else
+            null,
+        .bind_device => if (peer.socket_setup_after == .outbound_connect and self.bind_address != null)
+            .bind_address
+        else
+            null,
+        .bind_address => null,
+    };
+}
+
+fn peerSocketSetupCompleteFor(comptime EL: type) io_interface.Callback {
+    return struct {
+        fn cb(
+            userdata: ?*anyopaque,
+            completion: *io_interface.Completion,
+            result: io_interface.Result,
+        ) io_interface.CallbackAction {
+            const self: *EL = @ptrCast(@alignCast(userdata.?));
+            const peer: *Peer = @fieldParentPtr("connect_completion", completion);
+            const offset = @intFromPtr(peer) - @intFromPtr(self.peers.ptr);
+            const slot: u16 = @intCast(offset / @sizeOf(Peer));
+            handlePeerSocketSetupResult(self, slot, result);
+            return .disarm;
+        }
+    }.cb;
+}
+
+fn handlePeerSocketSetupResult(self: anytype, slot: u16, result: io_interface.Result) void {
+    const peer = &self.peers[slot];
+    if (peer.state == .disconnecting) {
+        peer.connect_pending = false;
+        self.completeDisconnectingPeerCompletion(slot);
+        return;
+    }
+    if (peer.state == .free) {
+        peer.connect_pending = false;
+        return;
+    }
+
+    const stage = peer.socket_setup_stage;
+    peer.connect_pending = false;
+
+    var failed: ?anyerror = null;
+    switch (result) {
+        .setsockopt => |r| r catch |err| {
+            failed = err;
+        },
+        .bind => |r| r catch |err| {
+            failed = err;
+        },
+        else => failed = error.UnexpectedSocketSetupCompletion,
+    }
+
+    if (failed) |err| {
+        switch (stage) {
+            .tcp_nodelay, .rcvbuf, .sndbuf => log.debug(
+                "peer socket tuning {s} failed: {s}",
+                .{ @tagName(stage), @errorName(err) },
+            ),
+            .bind_device, .bind_address => {
+                log.warn("peer socket setup {s} failed: {s}", .{ @tagName(stage), @errorName(err) });
+                self.removePeer(slot);
+                return;
+            },
+            .none => {},
+        }
+    }
+
+    submitNextPeerSocketSetup(self, slot) catch {
+        self.removePeer(slot);
+    };
+}
+
+fn finishPeerSocketSetup(self: anytype, slot: u16) void {
+    const peer = &self.peers[slot];
+    const after = peer.socket_setup_after;
+    peer.socket_setup_stage = .none;
+    peer.socket_setup_after = .none;
+
+    switch (after) {
+        .inbound_handshake_recv => {
+            self.markActivePeer(slot);
+            protocol.submitHandshakeRecv(self, slot) catch {
+                self.removePeer(slot);
+            };
+        },
+        .outbound_connect => submitPeerConnect(self, slot),
+        .none => {},
+    }
+}
+
+fn submitPeerConnect(self: anytype, slot: u16) void {
+    const peer = &self.peers[slot];
+    peer.connect_pending = true;
+    self.io.connect(
+        .{ .fd = peer.fd, .addr = peer.address, .deadline_ns = self.peer_connect_timeout_ns },
+        &peer.connect_completion,
+        self,
+        peerConnectCompleteFor(@TypeOf(self.*)),
+    ) catch {
+        peer.connect_pending = false;
+        self.removePeer(slot);
+        return;
+    };
+}
+
+fn writeSetupInt(peer: *Peer, value: c_int) []const u8 {
+    const bytes = std.mem.toBytes(value);
+    @memcpy(peer.socket_setup_optval[0..bytes.len], &bytes);
+    return peer.socket_setup_optval[0..bytes.len];
+}
+
+fn writeBindDeviceOptval(peer: *Peer, device: []const u8) ![]const u8 {
+    if (device.len == 0 or device.len >= IFNAMSIZ) return error.InvalidInterfaceName;
+    @memcpy(peer.socket_setup_optval[0..device.len], device);
+    peer.socket_setup_optval[device.len] = 0;
+    return peer.socket_setup_optval[0 .. device.len + 1];
+}
+
+fn parseBindAddress(address_str: []const u8, port: u16) !std.net.Address {
+    return std.net.Address.parseIp4(address_str, port) catch
+        std.net.Address.parseIp6(address_str, port) catch
+        error.InvalidBindAddress;
 }
 
 test "closeAcceptedFd closes SimIO fd through IO contract" {
@@ -218,30 +400,7 @@ fn handleSocketResult(self: anytype, slot: u16, res: i32) void {
     const fd: posix.fd_t = @intCast(res);
     peer.fd = fd;
 
-    // SimIO synthetic fds aren't real kernel fds — `setsockopt` panics
-    // on `BADF` (unreachable, not a returned error). Mirror the gate
-    // used by `metadata_handler.connectPeer`: only configure / bind on
-    // the real kernel path.
-    const sim_io_mod = @import("sim_io.zig");
-    const SelfTy = @TypeOf(self.*);
-    const is_sim_io = comptime @hasField(SelfTy, "io") and
-        @TypeOf(self.io) == sim_io_mod.SimIO;
-    if (comptime !is_sim_io) {
-        socket_util.configurePeerSocket(fd);
-        socket_util.applyBindConfig(fd, self.bind_device, self.bind_address, 0) catch {
-            self.removePeer(slot);
-            return;
-        };
-    }
-
-    peer.connect_pending = true;
-    self.io.connect(
-        .{ .fd = fd, .addr = peer.address, .deadline_ns = self.peer_connect_timeout_ns },
-        &peer.connect_completion,
-        self,
-        peerConnectCompleteFor(@TypeOf(self.*)),
-    ) catch {
-        peer.connect_pending = false;
+    beginPeerSocketSetup(self, slot, .outbound_connect) catch {
         self.removePeer(slot);
         return;
     };

@@ -125,18 +125,16 @@ pub const FeatureSupport = struct {
     /// which already runs on a background thread).
     supports_ftruncate: bool = false,
 
-    /// `IORING_OP_BIND`, kernel ≥6.11. Below that, daemon callers
-    /// fall back to synchronous `posix.bind(2)`. The relevant call
-    /// sites today live in the listen-socket bring-up paths
-    /// (`src/io/event_loop.zig` peer listener / uTP listener, RPC
-    /// server) — those are one-shot at startup or socket-rebinding
-    /// events, so the synchronous fallback is observably free.
+    /// `IORING_OP_BIND`, kernel ≥6.11. Below that, RealIO routes
+    /// `bind(2)` through the backend-owned blocking-op pool. The
+    /// relevant call sites include listen-socket bring-up and
+    /// outbound peer bind-address setup.
     supports_bind: bool = false,
 
-    /// `IORING_OP_LISTEN`, kernel ≥6.11. Below that, daemon callers
-    /// fall back to synchronous `posix.listen(2)`. Same call-site
-    /// shape as `supports_bind` — listen runs once per listener at
-    /// startup.
+    /// `IORING_OP_LISTEN`, kernel ≥6.11. Below that, RealIO routes
+    /// `listen(2)` through the backend-owned blocking-op pool. Same
+    /// call-site shape as `supports_bind` — listen runs once per
+    /// listener at startup.
     supports_listen: bool = false,
 
     /// `IORING_OP_URING_CMD` with `SOCKET_URING_OP_SETSOCKOPT`
@@ -156,10 +154,11 @@ pub const FeatureSupport = struct {
     /// (which trusts the probe absolutely because there's no subcmd
     /// layer there).
     ///
-    /// Today no daemon path submits setsockopt via the contract —
-    /// every per-peer setsockopt (TCP_NODELAY, buffer sizes,
-    /// SO_BINDTODEVICE) goes through `posix.setsockopt(2)`. This
-    /// flag is groundwork for the eventual contract op.
+    /// Daemon listener bring-up, peer socket tuning, outbound peer
+    /// SO_BINDTODEVICE, metadata-fetch socket tuning, and custom DNS
+    /// bind-device setup submit through the IO contract. RealIO uses
+    /// this flag to choose the URING_CMD path when available, with a
+    /// blocking-op-pool fallback otherwise.
     supports_setsockopt: bool = false,
 
     /// Directory/file namespace ops used by future EL-driven MoveJob and

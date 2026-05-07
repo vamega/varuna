@@ -15,7 +15,7 @@
 ## Remaining Issues
 
 - DeleteJob currently preserves the legacy best-effort behavior for missing files and non-empty directories by logging non-fatal cleanup errors. There is no public delete-job progress API because qBittorrent's delete endpoint is fire-and-forget.
-- Peer `getpeername` and per-peer socket-option setup remain separate IO-contract cleanup candidates.
+- Peer `getpeername` and per-peer socket-option setup were closed later the same day in `progress-reports/2026-05-07-peer-socket-setup-io-contract.md`.
 
 ## References
 

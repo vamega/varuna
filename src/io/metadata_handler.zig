@@ -8,12 +8,11 @@ const types = @import("types.zig");
 const ut_metadata = @import("../net/ut_metadata.zig");
 const ext = @import("../net/extensions.zig");
 const pw = @import("../net/peer_wire.zig");
-const socket_util = @import("../net/socket.zig");
 
 const io_interface = @import("io_interface.zig");
 const backend = @import("backend.zig");
 const RealIO = backend.RealIO;
-const sim_io_mod = @import("sim_io.zig");
+const SocketSetupStage = @import("types.zig").SocketSetupStage;
 
 /// Async BEP 9 metadata fetch state machine, parameterised over the IO
 /// backend.
@@ -121,6 +120,8 @@ pub fn AsyncMetadataFetchOf(comptime IO: type) type {
             op_in_flight: bool = false,
             cancel_in_flight: bool = false,
             closing: bool = false,
+            socket_setup_stage: SocketSetupStage = .none,
+            socket_setup_optval: [16]u8 = undefined,
         };
 
         /// Create a heap-allocated AsyncMetadataFetch.
@@ -237,24 +238,46 @@ pub fn AsyncMetadataFetchOf(comptime IO: type) type {
             };
             slot.fd = fd;
 
-            // Best-effort socket tuning — only meaningful when the fd
-            // is a real kernel socket. SimIO returns synthetic fds that
-            // aren't valid `setsockopt` targets and `posix.setsockopt`
-            // panics on BADF (`catch {}` doesn't catch the unreachable),
-            // so skip the call under SimIO entirely.
-            if (comptime IO != sim_io_mod.SimIO) {
-                socket_util.configurePeerSocket(fd);
+            self.submitNextSocketSetup(slot) catch {
+                self.releaseSlot(slot_idx);
+                self.tryNextPeer(slot_idx);
+            };
+            return .disarm;
+        }
+
+        fn metadataSocketSetupComplete(
+            userdata: ?*anyopaque,
+            completion: *io_interface.Completion,
+            result: io_interface.Result,
+        ) io_interface.CallbackAction {
+            const self: *Self = @ptrCast(@alignCast(userdata.?));
+            self.enterLifecycle();
+            defer self.leaveLifecycle();
+
+            const slot: *Slot = @fieldParentPtr("completion", completion);
+            slot.op_in_flight = false;
+            if (slot.state == .free) return .disarm;
+            const slot_idx = self.slotIdxFor(slot);
+            if (self.done or self.destroy_requested or slot.closing) {
+                self.releaseSlot(slot_idx);
+                return .disarm;
             }
 
-            slot.state = .connecting;
-            slot.op_in_flight = true;
-            self.io.connect(
-                .{ .fd = fd, .addr = self.peers[slot.peer_idx] },
-                &slot.completion,
-                self,
-                metadataConnectComplete,
-            ) catch {
-                slot.op_in_flight = false;
+            var failed: ?anyerror = null;
+            switch (result) {
+                .setsockopt => |r| r catch |err| {
+                    failed = err;
+                },
+                else => failed = error.UnexpectedSocketSetupCompletion,
+            }
+            if (failed) |err| {
+                log.debug("metadata: socket tuning {s} failed: {s}", .{
+                    @tagName(slot.socket_setup_stage),
+                    @errorName(err),
+                });
+            }
+
+            self.submitNextSocketSetup(slot) catch {
                 self.releaseSlot(slot_idx);
                 self.tryNextPeer(slot_idx);
             };
@@ -359,6 +382,72 @@ pub fn AsyncMetadataFetchOf(comptime IO: type) type {
                 self.completeSlotRelease(slot_idx);
             }
             return .disarm;
+        }
+
+        fn submitNextSocketSetup(self: *Self, slot: *Slot) !void {
+            const next = switch (slot.socket_setup_stage) {
+                .none => SocketSetupStage.tcp_nodelay,
+                .tcp_nodelay => .rcvbuf,
+                .rcvbuf => .sndbuf,
+                .sndbuf, .bind_device, .bind_address => null,
+            };
+            if (next == null) {
+                try self.submitMetadataConnect(slot);
+                return;
+            }
+
+            slot.socket_setup_stage = next.?;
+            slot.op_in_flight = true;
+            errdefer slot.op_in_flight = false;
+            switch (next.?) {
+                .tcp_nodelay => {
+                    const bytes = writeSetupInt(slot, 1);
+                    try self.io.setsockopt(.{
+                        .fd = slot.fd,
+                        .level = posix.IPPROTO.TCP,
+                        .optname = linux.TCP.NODELAY,
+                        .optval = bytes,
+                    }, &slot.completion, self, metadataSocketSetupComplete);
+                },
+                .rcvbuf => {
+                    const bytes = writeSetupInt(slot, 2 * 1024 * 1024);
+                    try self.io.setsockopt(.{
+                        .fd = slot.fd,
+                        .level = posix.SOL.SOCKET,
+                        .optname = posix.SO.RCVBUF,
+                        .optval = bytes,
+                    }, &slot.completion, self, metadataSocketSetupComplete);
+                },
+                .sndbuf => {
+                    const bytes = writeSetupInt(slot, 512 * 1024);
+                    try self.io.setsockopt(.{
+                        .fd = slot.fd,
+                        .level = posix.SOL.SOCKET,
+                        .optname = posix.SO.SNDBUF,
+                        .optval = bytes,
+                    }, &slot.completion, self, metadataSocketSetupComplete);
+                },
+                .bind_device, .bind_address, .none => return error.InvalidSocketSetupStage,
+            }
+        }
+
+        fn submitMetadataConnect(self: *Self, slot: *Slot) !void {
+            slot.socket_setup_stage = .none;
+            slot.state = .connecting;
+            slot.op_in_flight = true;
+            errdefer slot.op_in_flight = false;
+            try self.io.connect(
+                .{ .fd = slot.fd, .addr = self.peers[slot.peer_idx] },
+                &slot.completion,
+                self,
+                metadataConnectComplete,
+            );
+        }
+
+        fn writeSetupInt(slot: *Slot, value: c_int) []const u8 {
+            const bytes = std.mem.toBytes(value);
+            @memcpy(slot.socket_setup_optval[0..bytes.len], &bytes);
+            return slot.socket_setup_optval[0..bytes.len];
         }
 
         // ── Connection ─────────────────────────────────────────

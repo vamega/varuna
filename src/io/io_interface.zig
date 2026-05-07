@@ -329,6 +329,25 @@ pub const AcceptOp = struct {
     /// re-arms automatically (SimIO). The callback's `.rearm` return is
     /// honoured for non-multishot accepts.
     multishot: bool = false,
+    /// Optional caller-owned storage for the accepted peer address. RealIO
+    /// uses single-shot accept when this is supplied because native
+    /// multishot accept reuses one address buffer across multiple CQEs.
+    /// The callback receives a copied `Accepted.addr`, so the buffer only
+    /// needs to stay alive until the callback fires.
+    addr: ?*AcceptAddressBuffer = null,
+};
+
+pub const AcceptAddressBuffer = struct {
+    storage: posix.sockaddr.storage = undefined,
+    len: posix.socklen_t = @sizeOf(posix.sockaddr.storage),
+
+    pub fn reset(self: *AcceptAddressBuffer) void {
+        self.len = @sizeOf(posix.sockaddr.storage);
+    }
+
+    pub fn address(self: *const AcceptAddressBuffer) std.net.Address {
+        return std.net.Address.initPosix(@ptrCast(@alignCast(&self.storage)));
+    }
 };
 
 pub const BindOp = struct {
@@ -568,6 +587,7 @@ pub fn linuxErrnoToError(e: linux.E) anyerror {
         .ADDRNOTAVAIL => error.AddressNotAvailable,
         .AFNOSUPPORT => error.AddressFamilyNotSupported,
         .DESTADDRREQ => error.DestinationAddressRequired,
+        .NOTSOCK => error.NotSocket,
         .AGAIN => error.WouldBlock,
         .BADF => error.BadFileDescriptor,
         .INTR => error.Interrupted,

@@ -376,37 +376,38 @@ pub const EpollMmapIO = struct {
         self.updateNow();
 
         var fired: u32 = 0;
-        try self.fireExpiredTimers(&fired);
-        try self.drainMmapCompletions(&fired);
-        try self.drainPool(&fired);
+        var polled_once = false;
+        while (true) {
+            try self.fireExpiredTimers(&fired);
+            try self.drainMmapCompletions(&fired);
+            try self.drainPool(&fired);
 
-        if (self.active == 0) return;
-        if (wait_at_least != 0 and fired >= wait_at_least) return;
+            if (self.active == 0) return;
+            if (wait_at_least != 0 and fired >= wait_at_least) return;
+            if (wait_at_least == 0 and polled_once) return;
 
-        const timeout_ms: i32 = self.computeEpollTimeout(wait_at_least, fired);
+            const timeout_ms: i32 = self.computeEpollTimeout(wait_at_least, fired);
 
-        var events: [128]linux.epoll_event = undefined;
-        const n_rc = linux.epoll_pwait(self.epoll_fd, &events, events.len, timeout_ms, null);
-        const n: usize = switch (linux.E.init(n_rc)) {
-            .SUCCESS => @intCast(n_rc),
-            .INTR => 0,
-            else => |e| return posix.unexpectedErrno(e),
-        };
+            var events: [128]linux.epoll_event = undefined;
+            const n_rc = linux.epoll_pwait(self.epoll_fd, &events, events.len, timeout_ms, null);
+            polled_once = true;
+            const n: usize = switch (linux.E.init(n_rc)) {
+                .SUCCESS => @intCast(n_rc),
+                .INTR => 0,
+                else => |e| return posix.unexpectedErrno(e),
+            };
 
-        self.updateNow();
+            self.updateNow();
 
-        for (events[0..n]) |ev| {
-            if (ev.data.fd == self.wakeup_fd) {
-                var buf: u64 = 0;
-                _ = posix.read(self.wakeup_fd, std.mem.asBytes(&buf)) catch {};
-                continue;
+            for (events[0..n]) |ev| {
+                if (ev.data.fd == self.wakeup_fd) {
+                    var buf: u64 = 0;
+                    _ = posix.read(self.wakeup_fd, std.mem.asBytes(&buf)) catch {};
+                    continue;
+                }
+                try self.dispatchFdReady(ev.data.fd, ev.events, &fired);
             }
-            try self.dispatchFdReady(ev.data.fd, ev.events);
         }
-
-        try self.fireExpiredTimers(&fired);
-        try self.drainMmapCompletions(&fired);
-        try self.drainPool(&fired);
     }
 
     fn drainPool(self: *EpollMmapIO, fired: *u32) !void {
@@ -580,7 +581,7 @@ pub const EpollMmapIO = struct {
         }
     }
 
-    fn dispatchFdReady(self: *EpollMmapIO, fd: posix.fd_t, events: u32) !void {
+    fn dispatchFdReady(self: *EpollMmapIO, fd: posix.fd_t, events: u32, fired: *u32) !void {
         const reg = self.fd_registrations.getPtr(fd) orelse return;
 
         var write_c: ?*Completion = null;
@@ -614,16 +615,17 @@ pub const EpollMmapIO = struct {
 
         try self.updateFdRegistration(fd);
 
-        if (write_c) |c| try self.dispatchReadyCompletion(c, events);
-        if (read_c) |c| try self.dispatchReadyCompletion(c, events);
-        if (poll_c) |c| try self.dispatchReadyCompletion(c, events);
+        if (write_c) |c| try self.dispatchReadyCompletion(c, events, fired);
+        if (read_c) |c| try self.dispatchReadyCompletion(c, events, fired);
+        if (poll_c) |c| try self.dispatchReadyCompletion(c, events, fired);
     }
 
-    fn dispatchReadyCompletion(self: *EpollMmapIO, c: *Completion, events: u32) !void {
+    fn dispatchReadyCompletion(self: *EpollMmapIO, c: *Completion, events: u32, fired: *u32) !void {
         const st = epollState(c);
         const cb = c.callback orelse return;
         std.debug.assert(!st.epoll_registered);
         std.debug.assert(!st.in_flight);
+        fired.* += 1;
 
         const prioritize_requeue = fdInterestForCompletion(c) == .write;
         if (prioritize_requeue) self.requeue_write_front = c;

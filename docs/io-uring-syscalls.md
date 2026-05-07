@@ -131,7 +131,7 @@ This document tracks which syscalls the `varuna` **daemon** uses, which are rout
 | `getaddrinfo()` | Resolving tracker hostnames | Threadpool, or c-ares async resolver (see DNS notes below) |
 | `bind()` | Binding listen socket, DHT UDP port | `IORING_OP_BIND` available in kernel 6.11+; call once at startup, not on hot path |
 | `listen()` | Listening for incoming peers | `IORING_OP_LISTEN` available in kernel 6.11+; call once at startup |
-| `getpeername()`/`getsockname()` | Getting peer address after accept | Call inline after `IORING_OP_ACCEPT`, not on hot path |
+| `getpeername()`/`getsockname()` | Getting peer address after accept | Avoided for peers: accept submits caller-owned address storage and returns the copied remote address |
 | `mmap()` | Allocating huge-page piece cache | Call at startup during pool setup, not on hot path |
 | `mlock()` | Pinning piece cache in RAM | Call once after mmap() |
 | `sysctl`/`ioctl` | Network tuning, interface info | Startup only |
