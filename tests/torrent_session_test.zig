@@ -42,9 +42,11 @@ test "addPeersToEventLoop honors uTP-only transport for tracker peers" {
     };
     defer el.deinit();
     el.transport_disposition = .utp_only;
+    // Keep the fixture from matching the self-announcement filter or a live daemon port.
+    el.port = 0;
 
     const pending = try allocator.alloc(std.net.Address, 1);
-    pending[0] = try std.net.Address.parseIp4("127.0.0.1", 6881);
+    pending[0] = try std.net.Address.parseIp4("127.0.0.1", 6882);
     const empty_fds = [_]posix.fd_t{};
 
     var session = TorrentSession{
