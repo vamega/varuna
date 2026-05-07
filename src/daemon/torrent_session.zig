@@ -461,6 +461,20 @@ pub fn TorrentSessionOf(comptime IO: type) type {
             self.state = .stopped;
         }
 
+        pub fn hasBackgroundNetworkJobs(self: *Self) bool {
+            return self.announcing.load(.acquire) or self.scraping.load(.acquire);
+        }
+
+        pub fn abandonForProcessShutdown(self: *Self) void {
+            if (self.thread) |t| {
+                t.join();
+                self.thread = null;
+            }
+            self.detachFromSharedEventLoop();
+            self.pending_seed_setup = false;
+            self.background_init_done.store(false, .release);
+        }
+
         /// Called by the main thread after the background init thread completes
         /// and the session is in .checking state. Starts async piece recheck
         /// on the event loop. Returns true if recheck was started.
@@ -1602,11 +1616,39 @@ pub fn TorrentSessionOf(comptime IO: type) type {
         /// Does not block on responses — just submits the jobs and returns.
         pub fn scheduleStoppedAnnounce(self: *Self) void {
             const request = self.makeAnnounceRequest(.stopped) orelse return;
-            // Don't guard on announcing — we want to send stopped even if a
-            // regular announce is in flight. The tracker will accept it.
-            self.scheduleAnnounceJobs(request) catch |err| {
+            // Stopped announces are fire-and-forget. They intentionally do not
+            // touch `announcing` or `announce_jobs_in_flight`: a regular
+            // announce may already own that counter, and resetting it during
+            // shutdown can leave the normal announce state permanently stuck.
+            self.scheduleStoppedAnnounceJobs(request) catch |err| {
                 std.log.warn("failed to schedule stopped announce: {s}", .{@errorName(err)});
             };
+        }
+
+        fn scheduleStoppedAnnounceJobs(self: *Self, base_request: tracker.announce.Request) !void {
+            const session = &(self.session orelse return error.MissingSession);
+            const tracker_urls = try self.buildTrackerUrls(session);
+            defer self.allocator.free(tracker_urls);
+            if (tracker_urls.len == 0) return error.NoTrackers;
+
+            var submitted: u32 = 0;
+            for (tracker_urls) |tracker_url| {
+                var request = base_request;
+                request.announce_url = tracker_url;
+
+                if (self.trySubmitUdpAnnounceWithCallback(request, udpStoppedAnnounceComplete)) {
+                    submitted += 1;
+                    continue;
+                }
+
+                const host = getTrackerHostForUrl(tracker_url) orelse continue;
+                const url = tracker.announce.buildUrl(self.allocator, request) catch continue;
+                defer self.allocator.free(url);
+                self.submitTrackerJob(url, host, stoppedAnnounceComplete) catch continue;
+                submitted += 1;
+            }
+
+            if (submitted == 0) return error.NoTrackers;
         }
 
         fn scheduleAnnounceJobs(self: *Self, base_request: tracker.announce.Request) !void {
@@ -1710,6 +1752,8 @@ pub fn TorrentSessionOf(comptime IO: type) type {
             el.enqueueAnnounceResult(tid, addrs) catch self.allocator.free(addrs);
         }
 
+        fn udpStoppedAnnounceComplete(_: *anyopaque, _: UdpTrackerExecutor.RequestResult) void {}
+
         fn announceComplete(context: *anyopaque, result: TrackerExecutor.RequestResult) void {
             const self: *Self = @ptrCast(@alignCast(context));
             defer self.finishAnnounceJob();
@@ -1750,6 +1794,8 @@ pub fn TorrentSessionOf(comptime IO: type) type {
             };
             el.enqueueAnnounceResult(tid, addrs) catch self.allocator.free(addrs);
         }
+
+        fn stoppedAnnounceComplete(_: *anyopaque, _: TrackerExecutor.RequestResult) void {}
 
         /// Trigger a background scrape if enough time has passed (30 minutes).
         /// Safe to call from any thread. The shared tracker executor performs the

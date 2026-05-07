@@ -180,10 +180,22 @@ pub fn SessionManagerOf(comptime IO: type) type {
         pub fn deinit(self: *Self) void {
             self.cancelAndDrainMoveJobsForDeinit();
 
+            const process_shutdown = @import("../io/signal.zig").isShutdownRequested();
+            var abandoned_network_sessions = false;
             var iter = self.sessions.iterator();
             while (iter.next()) |entry| {
-                entry.value_ptr.*.deinit();
-                self.allocator.destroy(entry.value_ptr.*);
+                const session = entry.value_ptr.*;
+                if (process_shutdown and session.hasBackgroundNetworkJobs()) {
+                    std.log.warn(
+                        "abandoning torrent session {s} during process shutdown with tracker jobs still in flight",
+                        .{session.info_hash_hex},
+                    );
+                    session.abandonForProcessShutdown();
+                    abandoned_network_sessions = true;
+                    continue;
+                }
+                session.deinit();
+                self.allocator.destroy(session);
             }
             self.sessions.deinit();
             self.category_store.deinit();
@@ -222,17 +234,25 @@ pub fn SessionManagerOf(comptime IO: type) type {
                 self.allocator.destroy(sb);
             }
             if (self.tracker_executor) |executor| {
-                // Null out event loop references before destroying.
-                if (self.shared_event_loop) |el| {
-                    el.http_executor = null;
-                    el.tracker_executor = null;
+                if (abandoned_network_sessions) {
+                    std.log.warn("leaking tracker executor during process shutdown to preserve in-flight callback contexts", .{});
+                } else {
+                    // Null out event loop references before destroying.
+                    if (self.shared_event_loop) |el| {
+                        el.http_executor = null;
+                        el.tracker_executor = null;
+                    }
+                    executor.destroy();
+                    self.tracker_executor = null;
                 }
-                executor.destroy();
-                self.tracker_executor = null;
             }
             if (self.udp_tracker_executor) |executor| {
-                executor.destroy();
-                self.udp_tracker_executor = null;
+                if (abandoned_network_sessions) {
+                    std.log.warn("leaking UDP tracker executor during process shutdown to preserve in-flight callback contexts", .{});
+                } else {
+                    executor.destroy();
+                    self.udp_tracker_executor = null;
+                }
             }
             if (self.resume_db) |*db| db.close();
         }
