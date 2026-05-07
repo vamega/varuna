@@ -509,6 +509,29 @@ pub const PieceTracker = struct {
         return self.wanted_count - self.wantedCompletedCountLocked();
     }
 
+    /// qBittorrent/libtorrent-style distributed copies metric.
+    /// Integer part is the minimum per-piece peer availability; fractional
+    /// part is the fraction of pieces with more than that minimum.
+    pub fn distributedCopies(self: *PieceTracker) f64 {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+
+        if (self.piece_count == 0) return -1.0;
+
+        var min_avail: u16 = std.math.maxInt(u16);
+        for (self.availability) |avail| {
+            if (avail < min_avail) min_avail = avail;
+        }
+
+        var pieces_above_min: u32 = 0;
+        for (self.availability) |avail| {
+            if (avail > min_avail) pieces_above_min += 1;
+        }
+
+        return @as(f64, @floatFromInt(min_avail)) +
+            (@as(f64, @floatFromInt(pieces_above_min)) / @as(f64, @floatFromInt(self.piece_count)));
+    }
+
     pub fn bytesRemaining(self: *PieceTracker) u64 {
         self.mutex.lock();
         defer self.mutex.unlock();
@@ -632,6 +655,21 @@ test "rarest-first selects piece with lowest availability" {
     // Next should be piece 0 (count=3)
     const third = tracker.claimPiece(null);
     try std.testing.expectEqual(@as(?u32, 0), third);
+}
+
+test "distributedCopies reports complete copies plus partial copy fraction" {
+    var complete = try Bitfield.init(std.testing.allocator, 4);
+    defer complete.deinit(std.testing.allocator);
+
+    var tracker = try PieceTracker.init(std.testing.allocator, 4, 16, 64, &complete, 0);
+    defer tracker.deinit(std.testing.allocator);
+
+    tracker.availability[0] = 1;
+    tracker.availability[1] = 1;
+    tracker.availability[2] = 2;
+    tracker.availability[3] = 2;
+
+    try std.testing.expectApproxEqAbs(@as(f64, 1.5), tracker.distributedCopies(), 0.0001);
 }
 
 test "addBitfieldAvailability updates counts" {

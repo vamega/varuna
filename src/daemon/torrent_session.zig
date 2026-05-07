@@ -102,6 +102,9 @@ pub const Stats = struct {
     total_size: u64 = 0,
     bytes_downloaded: u64 = 0,
     bytes_uploaded: u64 = 0,
+    total_downloaded: u64 = 0,
+    total_uploaded: u64 = 0,
+    total_wasted: u64 = 0,
     peers_connected: u16 = 0,
     name: []const u8 = "",
     info_hash_hex: [40]u8 = @as([40]u8, @splat('0')),
@@ -157,6 +160,8 @@ pub const Stats = struct {
     completion_on: i64 = 0,
     /// Seeding time in seconds (time since completion, 0 if not seeding).
     seeding_time: i64 = 0,
+    availability: f64 = 0,
+    popularity: f64 = 0,
     /// Primary tracker URL (first announce URL). Empty string if none.
     tracker: []const u8 = "",
     /// Total number of tracker URLs configured for this torrent.
@@ -173,6 +178,14 @@ pub const Stats = struct {
 /// 64 KiB covers ~10K compact-IPv4 peers plus dict overhead — well past
 /// realistic tracker responses.
 const tracker_announce_arena_bytes = 64 * 1024;
+const qbt_seconds_per_month: i64 = 2_629_746;
+
+fn qbtPopularity(ratio: f64, active_seconds: i64) f64 {
+    if (active_seconds <= 0) return 0;
+    const active_months = @as(f64, @floatFromInt(active_seconds)) / @as(f64, @floatFromInt(qbt_seconds_per_month));
+    if (active_months <= 0) return 0;
+    return ratio / active_months;
+}
 
 pub fn TorrentSessionOf(comptime IO: type) type {
     return struct {
@@ -232,6 +245,7 @@ pub fn TorrentSessionOf(comptime IO: type) type {
         // Current session totals (from event loop peers) are added on top.
         baseline_uploaded: u64 = 0,
         baseline_downloaded: u64 = 0,
+        baseline_wasted: u64 = 0,
 
         // Metainfo flags
         is_private: bool = false,
@@ -1208,6 +1222,7 @@ pub fn TorrentSessionOf(comptime IO: type) type {
             const raw_downloaded = self.baseline_downloaded + speed_stats.dl_total;
             const total_downloaded = @max(raw_downloaded, verified_downloaded);
             const total_uploaded = self.baseline_uploaded + speed_stats.ul_total;
+            const total_wasted = self.baseline_wasted + speed_stats.wasted_total;
 
             // Compute ETA: bytes_remaining / download_speed
             const bytes_remaining = if (self.total_size > verified_downloaded)
@@ -1224,6 +1239,10 @@ pub fn TorrentSessionOf(comptime IO: type) type {
                 @as(f64, @floatFromInt(total_uploaded)) / @as(f64, @floatFromInt(total_downloaded))
             else
                 0.0;
+            const now = std.time.timestamp();
+            const active_time: i64 = if (now > self.added_on) now - self.added_on else 0;
+            const availability: f64 = if (self.piece_tracker) |*pt| pt.distributedCopies() else 0.0;
+            const torrent_popularity = qbtPopularity(ratio, active_time);
 
             // Extract tracker and file metadata from parsed session (if available)
             const meta_opt = if (self.session) |*s| s.metainfo else null;
@@ -1283,6 +1302,9 @@ pub fn TorrentSessionOf(comptime IO: type) type {
                 .total_size = self.total_size,
                 .bytes_downloaded = verified_downloaded,
                 .bytes_uploaded = total_uploaded,
+                .total_downloaded = total_downloaded,
+                .total_uploaded = total_uploaded,
+                .total_wasted = total_wasted,
                 .name = self.name,
                 .info_hash_hex = self.info_hash_hex,
                 .save_path = self.save_path,
@@ -1311,7 +1333,9 @@ pub fn TorrentSessionOf(comptime IO: type) type {
                 .ratio_limit = self.ratio_limit,
                 .seeding_time_limit = self.seeding_time_limit,
                 .completion_on = self.completion_on,
-                .seeding_time = if (stats_state == .seeding and self.completion_on > 0) std.time.timestamp() - self.completion_on else 0,
+                .seeding_time = if (stats_state == .seeding and self.completion_on > 0 and now > self.completion_on) now - self.completion_on else 0,
+                .availability = availability,
+                .popularity = torrent_popularity,
                 .tracker = tracker_url,
                 .trackers_count = trackers_count,
                 .content_path = content_path,
@@ -1377,6 +1401,7 @@ pub fn TorrentSessionOf(comptime IO: type) type {
                     const transfer_stats = self.resume_writer.?.loadTransferStats();
                     self.baseline_uploaded = transfer_stats.total_uploaded;
                     self.baseline_downloaded = transfer_stats.total_downloaded;
+                    self.baseline_wasted = transfer_stats.total_wasted;
 
                     // Load persisted rate limits for this torrent
                     {
@@ -2537,6 +2562,7 @@ pub fn TorrentSessionOf(comptime IO: type) type {
                 rw.saveTransferStats(.{
                     .total_uploaded = self.baseline_uploaded + speed_stats.ul_total,
                     .total_downloaded = self.baseline_downloaded + speed_stats.dl_total,
+                    .total_wasted = self.baseline_wasted + speed_stats.wasted_total,
                 });
             }
         }

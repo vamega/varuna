@@ -228,8 +228,7 @@ components:
           description: Queue position (0 = not queued)
         availability:
           type: number
-          const: -1
-          description: Not implemented
+          description: Distributed copies derived from connected peer bitfields
         max_ratio:
           type: number
           const: -1
@@ -242,8 +241,8 @@ components:
         seeding_time_limit:
           type: integer
         popularity:
-          type: integer
-          const: 0
+          type: number
+          description: Ratio divided by active time in months, matching qBittorrent semantics
         magnet_uri:
           type: string
         reannounce:
@@ -279,12 +278,12 @@ components:
           type: integer
         dl_speed_avg:
           type: integer
-          const: 0
+          description: Average download speed over download-active time
         up_speed:
           type: integer
         up_speed_avg:
           type: integer
-          const: 0
+          description: Average upload speed over active time
         dl_limit:
           type: integer
         up_limit:
@@ -342,7 +341,7 @@ components:
           type: integer
         total_wasted:
           type: integer
-          const: 0
+          description: Bytes discarded after failed piece hash verification
         is_private:
           type: boolean
         seq_dl:
@@ -476,10 +475,10 @@ components:
           type: integer
         alltime_dl:
           type: integer
-          description: Same as dl_info_data (no persistent tracking)
+          description: Aggregate lifetime download total across torrents
         alltime_ul:
           type: integer
-          description: Same as up_info_data (no persistent tracking)
+          description: Aggregate lifetime upload total across torrents
         queueing:
           type: boolean
           const: false
@@ -492,12 +491,11 @@ components:
           const: 1500
         free_space_on_disk:
           type: integer
-          const: 0
-          description: Not implemented
+          const: 107374182400
+          description: Temporary 100 GiB placeholder while statfs-style support is considered
         total_peer_connections:
           type: integer
-          const: 0
-          description: Not implemented
+          description: Current global peer connection count
 
     PeerInfo:
       type: object

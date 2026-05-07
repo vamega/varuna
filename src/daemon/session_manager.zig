@@ -685,6 +685,7 @@ pub fn SessionManagerOf(comptime IO: type) type {
             dl_limit: u64 = 0,
             ul_limit: u64 = 0,
             dht_nodes: usize = 0,
+            total_peer_connections: u16 = 0,
         };
 
         /// Aggregate per-torrent stats and global event loop state into a
@@ -697,14 +698,15 @@ pub fn SessionManagerOf(comptime IO: type) type {
             for (stats) |stat| {
                 info.dl_speed += stat.download_speed;
                 info.ul_speed += stat.upload_speed;
-                info.dl_data += stat.bytes_downloaded;
-                info.ul_data += stat.bytes_uploaded;
+                info.dl_data += stat.total_downloaded;
+                info.ul_data += stat.total_uploaded;
             }
 
             if (self.shared_event_loop) |el| {
                 info.dl_limit = el.getGlobalDlLimit();
                 info.ul_limit = el.getGlobalUlLimit();
                 info.dht_nodes = el.getDhtNodeCount();
+                info.total_peer_connections = el.peer_count;
             }
 
             return info;
@@ -1778,6 +1780,9 @@ pub fn SessionManagerOf(comptime IO: type) type {
             added_on: i64,
             bytes_downloaded: u64,
             bytes_uploaded: u64,
+            total_downloaded: u64,
+            total_uploaded: u64,
+            total_wasted: u64,
             sequential_download: bool,
             is_private: bool,
             super_seeding: bool,
@@ -1805,6 +1810,8 @@ pub fn SessionManagerOf(comptime IO: type) type {
             seeding_time: i64 = 0,
             /// Timestamp when the torrent completed downloading.
             completion_on: i64 = 0,
+            availability: f64 = 0,
+            popularity: f64 = 0,
         };
 
         /// Free a PropertiesInfo returned by getSessionProperties().
@@ -1843,6 +1850,9 @@ pub fn SessionManagerOf(comptime IO: type) type {
                 .added_on = stats.added_on,
                 .bytes_downloaded = stats.bytes_downloaded,
                 .bytes_uploaded = stats.bytes_uploaded,
+                .total_downloaded = stats.total_downloaded,
+                .total_uploaded = stats.total_uploaded,
+                .total_wasted = stats.total_wasted,
                 .sequential_download = stats.sequential_download,
                 .is_private = stats.is_private,
                 .super_seeding = stats.super_seeding,
@@ -1863,6 +1873,8 @@ pub fn SessionManagerOf(comptime IO: type) type {
                 .seeding_time_limit = stats.seeding_time_limit,
                 .seeding_time = stats.seeding_time,
                 .completion_on = stats.completion_on,
+                .availability = stats.availability,
+                .popularity = stats.popularity,
             };
         }
 

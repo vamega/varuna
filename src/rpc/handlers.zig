@@ -1039,6 +1039,10 @@ pub fn ApiHandlerOf(comptime IO: type) type {
             const v2_hex = compat.formatInfoHashV2(info.info_hash_v2);
             const v2_str: []const u8 = if (v2_hex) |*hex| hex else "";
             const completion_date: i64 = if (info.completion_on > 0) info.completion_on else if (info.state == .seeding) info.added_on else -1;
+            const download_duration: i64 = if (info.completion_on > info.added_on)
+                info.completion_on - info.added_on
+            else
+                time_active;
 
             return json_response.response(allocator, 200, TorrentPropertiesResponse{
                 .save_path = info.save_path,
@@ -1050,7 +1054,9 @@ pub fn ApiHandlerOf(comptime IO: type) type {
                 .pieces_have = info.pieces_have,
                 .pieces_num = info.pieces_total,
                 .dl_speed = info.download_speed,
+                .dl_speed_avg = compat.averageSpeed(info.total_downloaded, download_duration),
                 .up_speed = info.upload_speed,
+                .up_speed_avg = compat.averageSpeed(info.total_uploaded, time_active),
                 .dl_limit = info.dl_limit,
                 .up_limit = info.ul_limit,
                 .eta = info.eta,
@@ -1070,10 +1076,11 @@ pub fn ApiHandlerOf(comptime IO: type) type {
                 .seeds_total = info.scrape_complete,
                 .addition_date = info.added_on,
                 .completion_date = completion_date,
-                .total_downloaded = info.bytes_downloaded,
-                .total_downloaded_session = info.bytes_downloaded,
-                .total_uploaded = info.bytes_uploaded,
-                .total_uploaded_session = info.bytes_uploaded,
+                .total_downloaded = info.total_downloaded,
+                .total_downloaded_session = info.total_downloaded,
+                .total_uploaded = info.total_uploaded,
+                .total_uploaded_session = info.total_uploaded,
+                .total_wasted = info.total_wasted,
                 .is_private = info.is_private,
                 .seq_dl = info.sequential_download,
                 .super_seeding = if (info.super_seeding) 1 else 0,
@@ -1081,6 +1088,8 @@ pub fn ApiHandlerOf(comptime IO: type) type {
                 .partial_seed = info.partial_seed,
                 .ratio_limit = .{ .value = info.ratio_limit },
                 .seeding_time_limit = info.seeding_time_limit,
+                .availability = .{ .value = info.availability },
+                .popularity = .{ .value = info.popularity },
             });
         }
 
@@ -2066,7 +2075,7 @@ pub fn ApiHandlerOf(comptime IO: type) type {
         /// Varuna does not have an alt-speed subsystem. Use `setDownloadLimit` /
         /// `setUploadLimit` directly, or automate via `cron` + `varuna-ctl`.
         fn handleToggleSpeedLimitsMode(_: *const Self) server.Response {
-            return .{ .status = 501, .body = "{\"error\":\"not implemented: alternative speed limits are not supported. Use setDownloadLimit/setUploadLimit directly.\"}" };
+            return .{ .status = 501, .body = "{\"error\":\"intentionally unsupported: alternative speed-limit mode is not supported. Use setDownloadLimit/setUploadLimit directly.\"}" };
         }
 
         /// GET /api/v2/transfer/downloadLimit -- return global download limit as plain text number.
@@ -2217,26 +2226,21 @@ pub fn ApiHandlerOf(comptime IO: type) type {
 
         /// POST /api/v2/torrents/renameFile — 501 Not Implemented.
         ///
-        /// Renaming a file within a torrent's download requires:
-        ///   - Filesystem rename via io_uring (daemon I/O policy)
-        ///   - Updating PieceStore's file-to-piece mappings so reads/writes
-        ///     target the new path
-        ///   - Persisting the rename to SQLite so it survives daemon restart
-        ///   - Handling active downloads: the file may be open for writing
-        ///     by the event loop, requiring coordinated close/rename/reopen
-        /// None of this plumbing exists yet.
+        /// Varuna intentionally keeps torrent data paths tied to the torrent's
+        /// metainfo/storage manifest. Users who want alternate names or a
+        /// friendlier library layout should hard-link completed files into a
+        /// separate directory tree instead of renaming Varuna-managed files.
         fn handleTorrentsRenameFile(_: *const Self) server.Response {
-            return .{ .status = 501, .body = "{\"error\":\"not implemented: file rename requires io_uring filesystem ops, PieceStore mapping updates, and SQLite persistence.\"}" };
+            return .{ .status = 501, .body = "{\"error\":\"unsupported: Varuna does not rename files inside a torrent. Keep managed files in place and create hard links to completed files in a separate directory tree for alternate names or organization.\"}" };
         }
 
         /// POST /api/v2/torrents/renameFolder — 501 Not Implemented.
         ///
-        /// Same requirements as renameFile, plus:
-        ///   - Recursive directory rename affecting multiple file mappings
-        ///   - Must update all PieceStore entries whose paths are children
-        ///     of the renamed directory
+        /// Folder renames are the recursive version of the same unsupported
+        /// storage remapping. Use hard links in a separate tree for alternate
+        /// organization.
         fn handleTorrentsRenameFolder(_: *const Self) server.Response {
-            return .{ .status = 501, .body = "{\"error\":\"not implemented: folder rename requires recursive io_uring filesystem ops, PieceStore mapping updates, and SQLite persistence.\"}" };
+            return .{ .status = 501, .body = "{\"error\":\"unsupported: Varuna does not rename folders inside a torrent. Keep managed files in place and create hard links to completed files in a separate directory tree for alternate organization.\"}" };
         }
 
         /// GET /api/v2/torrents/export -- export .torrent file bytes.
@@ -2403,9 +2407,9 @@ const TorrentPropertiesResponse = struct {
     pieces_have: u32,
     pieces_num: u32,
     dl_speed: u64,
-    dl_speed_avg: u8 = 0,
+    dl_speed_avg: i64,
     up_speed: u64,
-    up_speed_avg: u8 = 0,
+    up_speed_avg: i64,
     dl_limit: u64,
     up_limit: u64,
     eta: i64,
@@ -2432,7 +2436,9 @@ const TorrentPropertiesResponse = struct {
     total_downloaded_session: u64,
     total_uploaded: u64,
     total_uploaded_session: u64,
-    total_wasted: u8 = 0,
+    total_wasted: u64,
+    availability: json_response.Fixed4,
+    popularity: json_response.Fixed4,
     is_private: bool,
     seq_dl: bool,
     super_seeding: u8,

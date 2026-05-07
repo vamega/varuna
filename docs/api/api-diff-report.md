@@ -49,21 +49,21 @@ All of the following fields are present and semantically compatible:
 | `trackers_count` | `stat.trackers_count` | |
 | `amount_left` | `total_size - bytes_downloaded` | |
 | `completed` | `stat.bytes_downloaded` | |
-| `downloaded` | `stat.bytes_downloaded` | |
-| `downloaded_session` | `stat.bytes_downloaded` | Same as `downloaded` (no session tracking) |
-| `uploaded` | `stat.bytes_uploaded` | |
-| `uploaded_session` | `stat.bytes_uploaded` | Same as `uploaded` (no session tracking) |
+| `downloaded` | `stat.total_downloaded` | Lifetime/raw payload bytes, not verified-complete bytes |
+| `downloaded_session` | `stat.total_downloaded` | Same as `downloaded` (separate process-session counter not tracked) |
+| `uploaded` | `stat.total_uploaded` | |
+| `uploaded_session` | `stat.total_uploaded` | Same as `uploaded` (separate process-session counter not tracked) |
 | `time_active` | `now - added_on` | |
 | `seeding_time` | `stat.seeding_time` | |
 | `last_activity` | `now` | Always current time |
 | `seen_complete` | hardcoded `-1` | |
 | `priority` | `stat.queue_position` | |
-| `availability` | hardcoded `-1` | Not implemented |
+| `availability` | `stat.availability` | Distributed copies from peer bitfields |
 | `max_ratio` | hardcoded `-1` | |
 | `max_seeding_time` | hardcoded `-1` | |
 | `ratio_limit` | `stat.ratio_limit` | 4 decimal places |
 | `seeding_time_limit` | `stat.seeding_time_limit` | |
-| `popularity` | hardcoded `0` | |
+| `popularity` | `stat.popularity` | Ratio divided by active months |
 | `magnet_uri` | `compat.buildMagnetUri()` | |
 | `reannounce` | hardcoded `0` | |
 | `partial_seed` | `stat.partial_seed` | Only in `/torrents/info`, not in `/sync/maindata` |
@@ -85,12 +85,10 @@ All of the following fields are present and semantically compatible:
 
 | Field | qBittorrent | Varuna | Impact |
 |-------|-------------|--------|--------|
-| `downloaded_session` | Bytes downloaded since app restart | Same as `downloaded` (total) | Low -- session tracking not implemented |
-| `uploaded_session` | Bytes uploaded since app restart | Same as `uploaded` (total) | Low -- session tracking not implemented |
+| `downloaded_session` | Bytes downloaded since app restart | Same as `downloaded` (lifetime/raw total) | Low -- separate process-session tracking not implemented |
+| `uploaded_session` | Bytes uploaded since app restart | Same as `uploaded` (lifetime total) | Low -- separate process-session tracking not implemented |
 | `last_activity` | Timestamp of last chunk transfer | Always `now` | Low -- cosmetic |
 | `seen_complete` | Timestamp of last time a complete copy was seen | Always `-1` | Low -- cosmetic |
-| `availability` | Distributed copies from peer bitfields | Always `-1` | Medium -- some UIs display this |
-| `popularity` | Not standard qBittorrent field | Always `0` | None |
 | `completion_on` | Timestamp of actual completion | Uses `added_on` as fallback | Low -- close enough for display |
 | `f_l_piece_prio` | Whether first/last piece priority is enabled | Always `false` | Low -- not implemented |
 | `force_start` | Whether force-start is enabled | Always `false` | Low -- not implemented |
@@ -117,9 +115,6 @@ All of the following fields are present and semantically compatible:
 | Field | Value | qBittorrent | Notes |
 |-------|-------|-------------|-------|
 | `download_path` | `""` | Actual download path | Separate download path not supported |
-| `total_wasted` | `0` | Bytes that failed hash verification | Would require tracking corrupted data |
-| `dl_speed_avg` | `0` | Average download speed | Would require cumulative tracking |
-| `up_speed_avg` | `0` | Average upload speed | Would require cumulative tracking |
 | `last_seen` | `-1` | Last seen complete timestamp | Not tracked |
 | `reannounce` | `0` | Seconds to next announce | Not exposed |
 
@@ -148,10 +143,9 @@ All of the following fields are present and semantically compatible:
 | `queueing` | Reflects actual queueing state | Always `false` | Should reflect `queue_manager.config.enabled` |
 | `use_alt_speed_limits` | Alternative speed mode state | Always `false` | No alternative speed mode |
 | `refresh_interval` | User-configurable | Always `1500` | Not configurable |
-| `free_space_on_disk` | Actual free space from `statfs` | Always `0` | Could be implemented with `statfs` |
-| `total_peer_connections` | Sum of all peer connections | Always `0` | Could sum per-torrent peer counts |
-| `alltime_dl` | All-time download total | Session total (same as `dl_info_data`) | No persistent tracking across restarts |
-| `alltime_ul` | All-time upload total | Session total (same as `up_info_data`) | No persistent tracking across restarts |
+| `free_space_on_disk` | Actual free space from cached background lookup | Temporary 100 GiB placeholder | Future work should follow qBittorrent PR #8217: expiring cache plus debounced background/blocking lookup on stale WebAPI reads |
+| `alltime_dl` | All-time download total | Aggregate lifetime total | Backed by persisted transfer stats |
+| `alltime_ul` | All-time upload total | Aggregate lifetime total | Backed by persisted transfer stats |
 
 ---
 
@@ -271,9 +265,7 @@ Varuna maps internal states to qBittorrent state strings:
 - `queueing` in server_state always `false` even when queue is enabled
 
 ### Medium Impact (cosmetic or minor feature gaps)
-- `availability` always -1 in torrents/info
-- `free_space_on_disk` always 0 in server_state
-- `total_peer_connections` always 0 in server_state
+- `free_space_on_disk` is a temporary 100 GiB placeholder in server_state
 - `downloaded_session`/`uploaded_session` not separate from totals
 - `is_seed` always false in files response
 
@@ -281,5 +273,4 @@ Varuna maps internal states to qBittorrent state strings:
 - `last_activity` always current time
 - `seen_complete` always -1
 - `connection`/`country`/`country_code` empty in peer data
-- `total_wasted`/`dl_speed_avg`/`up_speed_avg` always 0 in properties
 - `msg` always empty in trackers

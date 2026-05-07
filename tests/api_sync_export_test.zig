@@ -22,6 +22,9 @@ const server_mod = varuna.rpc.server;
 const SessionManager = varuna.daemon.session_manager.SessionManager;
 const TorrentSession = varuna.daemon.torrent_session.TorrentSession;
 const Random = varuna.runtime.random.Random;
+const Bitfield = varuna.bitfield.Bitfield;
+const EventLoop = varuna.io.event_loop.EventLoop;
+const PieceTracker = varuna.torrent.piece_tracker.PieceTracker;
 
 const TestCtx = struct {
     handler: handlers_mod.ApiHandler,
@@ -204,6 +207,74 @@ test "sync/maindata first call (rid=0) returns full_update=true with rid=1" {
     try std.testing.expect(std.mem.indexOf(u8, resp.body, "\"rid\":1") != null);
     // Torrent must appear in the snapshot.
     try std.testing.expect(std.mem.indexOf(u8, resp.body, &inserted.hash) != null);
+}
+
+test "sync/maindata server_state includes qBittorrent placeholder disk space" {
+    var ctx = TestCtx.init();
+    defer ctx.deinit();
+
+    const resp = ctx.handle("GET", "/api/v2/sync/maindata?rid=0", "");
+    defer freeBody(resp);
+    try std.testing.expectEqual(@as(u16, 200), resp.status);
+    try std.testing.expect(std.mem.indexOf(u8, resp.body, "\"free_space_on_disk\":107374182400") != null);
+    try std.testing.expect(std.mem.indexOf(u8, resp.body, "\"total_peer_connections\":0") != null);
+}
+
+test "transfer info reports total peer connections from shared event loop" {
+    var ctx = TestCtx.init();
+    defer ctx.deinit();
+
+    var el = EventLoop.initBare(std.testing.allocator, 0) catch |err| {
+        if (err == error.SystemResources) return error.SkipZigTest;
+        return err;
+    };
+    defer el.deinit();
+
+    el.peer_count = 7;
+    ctx.sm.shared_event_loop = &el;
+
+    const info = try ctx.sm.getTransferInfo(std.testing.allocator);
+    try std.testing.expectEqual(@as(u16, 7), info.total_peer_connections);
+}
+
+test "properties surfaces qBittorrent-compatible derived counters" {
+    var ctx = TestCtx.init();
+    defer ctx.deinit();
+
+    const inserted = try ctx.insertTorrent("stats.bin");
+    defer std.testing.allocator.free(inserted.meta_copy);
+
+    const now = std.time.timestamp();
+    {
+        ctx.sm.mutex.lock();
+        defer ctx.sm.mutex.unlock();
+
+        const session = ctx.sm.sessions.get(&inserted.hash) orelse return error.SessionMissing;
+        session.state = .seeding;
+        session.added_on = now - 1024;
+        session.completion_on = now - 512;
+        session.baseline_downloaded = 512 * 1024;
+        session.baseline_uploaded = 1024 * 1024;
+        session.baseline_wasted = 4096;
+
+        var complete = try Bitfield.init(std.testing.allocator, 1);
+        defer complete.deinit(std.testing.allocator);
+        session.piece_tracker = try PieceTracker.init(std.testing.allocator, 1, 1024, 1024, &complete, 0);
+        session.piece_tracker.?.availability[0] = 2;
+    }
+
+    var path_buf: [128]u8 = undefined;
+    const path = try std.fmt.bufPrint(&path_buf, "/api/v2/torrents/properties?hash={s}", .{inserted.hash});
+    const resp = ctx.handle("GET", path, "");
+    defer freeBody(resp);
+
+    try std.testing.expectEqual(@as(u16, 200), resp.status);
+    try std.testing.expect(std.mem.indexOf(u8, resp.body, "\"dl_speed_avg\":1024") != null);
+    try std.testing.expect(std.mem.indexOf(u8, resp.body, "\"total_wasted\":4096") != null);
+    try std.testing.expect(std.mem.indexOf(u8, resp.body, "\"availability\":") != null);
+    try std.testing.expect(std.mem.indexOf(u8, resp.body, "\"availability\":-1") == null);
+    try std.testing.expect(std.mem.indexOf(u8, resp.body, "\"popularity\":") != null);
+    try std.testing.expect(std.mem.indexOf(u8, resp.body, "\"popularity\":0") == null);
 }
 
 test "sync/maindata second call returns full_update=false and prunes unchanged torrents" {

@@ -28,7 +28,7 @@ This document tracks which endpoints are implemented, which return placeholder d
 |---|---|
 | `GET /api/v2/transfer/info` | Full (real DHT node count, speeds, limits) |
 | `GET /api/v2/transfer/speedLimitsMode` | Full |
-| `POST /api/v2/transfer/toggleSpeedLimitsMode` | 501 — alt-speed requires a second set of rate limits, toggle flag, and optional scheduling. Use `setDownloadLimit`/`setUploadLimit` directly or automate via `cron` + `varuna-ctl`. |
+| `POST /api/v2/transfer/toggleSpeedLimitsMode` | 501 — intentionally unsupported. Varuna supports direct global limits through `setDownloadLimit`/`setUploadLimit` but not qBittorrent's alternate speed-limit mode. |
 | `GET /api/v2/transfer/downloadLimit` | Full |
 | `GET /api/v2/transfer/uploadLimit` | Full |
 | `POST /api/v2/transfer/setDownloadLimit` | Full |
@@ -46,7 +46,7 @@ This document tracks which endpoints are implemented, which return placeholder d
 | `POST /api/v2/torrents/delete` | Full (with --delete-files) |
 | `POST /api/v2/torrents/pause` | Full |
 | `POST /api/v2/torrents/resume` | Full |
-| `GET /api/v2/torrents/properties` | Full (scrape-based peers/seeds totals, v2 info-hash, creation_date) |
+| `GET /api/v2/torrents/properties` | Full (scrape-based peers/seeds totals, v2 info-hash, creation_date, qBittorrent-style derived stats) |
 | `GET /api/v2/torrents/files` | Full (index, availability, piece_range) |
 | `GET /api/v2/torrents/trackers` | Full (with msg field) |
 | `POST /api/v2/torrents/filePrio` | Full |
@@ -69,10 +69,21 @@ This document tracks which endpoints are implemented, which return placeholder d
 | `POST /api/v2/torrents/setForceStart` | Full (bypasses queue limits) |
 | `GET /api/v2/torrents/pieceStates` | Full |
 | `GET /api/v2/torrents/pieceHashes` | Full (v1 only) |
-| `POST /api/v2/torrents/renameFile` | 501 — requires io_uring filesystem rename, PieceStore mapping updates, SQLite persistence, and coordination with active downloads. |
-| `POST /api/v2/torrents/renameFolder` | 501 — same as renameFile plus recursive directory handling across multiple file mappings. |
+| `POST /api/v2/torrents/renameFile` | 501 — intentionally unsupported. Varuna keeps torrent data paths tied to the torrent's metainfo/storage manifest. Users who want alternate names or layouts should create hard links to completed files in a separate directory tree. |
+| `POST /api/v2/torrents/renameFolder` | 501 — intentionally unsupported for the same reason as `renameFile`. Build alternate organization with hard links outside Varuna's managed save path instead of renaming files in place. |
 | `GET /api/v2/torrents/export` | Full |
 | `POST /api/v2/torrents/addPeers` | Full |
+
+File and folder rename policy: Varuna does not implement qBittorrent's
+per-torrent virtual file/folder rename endpoints. The daemon's storage layer is
+designed around the paths declared by the torrent metadata plus the current save
+root. Renaming individual files inside that tree would require coordinated
+active-download quiescing, manifest remapping, resume-state persistence, and
+careful recovery behavior. If users want a friendlier or domain-specific layout,
+the supported approach is to leave Varuna's real data files in place and create
+hard links to completed files under a separate directory structure. Hard links
+must be on the same filesystem and point at files, not directories; edits through
+either path affect the same underlying file.
 
 ### Categories & Tags
 | Endpoint | Status |
@@ -138,12 +149,10 @@ profiling-driven option.
 
 | Field | Location | Status |
 |---|---|---|
-| `total_wasted` | properties | Always 0. Requires tracking bytes that fail hash verification. |
-| `dl_speed_avg` / `up_speed_avg` | properties | Always 0. Requires tracking cumulative speed averages. |
-| `free_space_on_disk` | sync/maindata server_state | Always 0. Could use `statfs` but not critical. |
-| `total_peer_connections` | sync/maindata server_state | Always 0. Could sum per-torrent peer counts. |
-| `availability` | torrent info/sync | Always -1. Requires computing distributed copies from peer bitfields. |
-| `popularity` | torrent info/sync | Always 0. Not a standard qBittorrent field. |
+| `free_space_on_disk` | sync/maindata server_state | Temporary placeholder: reports 100 GiB. Real filesystem free-space reporting is still being considered. A future implementation should refer to qBittorrent PR [#8217](https://github.com/qbittorrent/qBittorrent/pull/8217): keep a cached value with an expiry, refresh it from a background/blocking operation when a WebAPI request observes stale data, and debounce concurrent requests so they do not submit duplicate free-space lookups. |
+
+Implemented derived fields: `total_wasted`, `dl_speed_avg`, `up_speed_avg`,
+`total_peer_connections`, `availability`, and `popularity`.
 
 ## Unsupported -- Will Not Implement
 
@@ -152,6 +161,8 @@ These endpoints are explicitly out of scope for Varuna.
 | Endpoint | Reason |
 |---|---|
 | Time-based alt-speed scheduling | Use `cron` + `varuna-ctl` instead. See `docs/future-features.md`. |
+| `/api/v2/rss/*` | RSS feed management and auto-downloading rules are outside Varuna's core torrent-control scope. |
+| `/api/v2/search/*` | qBittorrent's Python-backed torrent index/search plugin system is outside Varuna's scope. Use external indexers/automation and add torrents through the normal add API. |
 
 ## Unsupported -- Could Be Added Later
 
@@ -160,8 +171,6 @@ These endpoints are not implemented but could be added if there is demand.
 | Endpoint | Notes |
 |---|---|
 | `POST /api/v2/torrents/toggleFirstLastPiecePrio` | First/last piece priority for streaming. Sequential mode covers the main use case. |
-| `/api/v2/rss/*` | RSS feed management and auto-downloading rules. |
-| `/api/v2/search/*` | Search plugin management (search engines, results). |
 | `/api/v2/log/*` | Log retrieval endpoints. |
 
 ## Error Handling for Unknown Paths

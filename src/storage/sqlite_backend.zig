@@ -79,7 +79,8 @@ pub const SqliteBackend = struct {
             "CREATE TABLE IF NOT EXISTS transfer_stats (" ++
                 "info_hash BLOB NOT NULL PRIMARY KEY, " ++
                 "total_uploaded INTEGER NOT NULL DEFAULT 0, " ++
-                "total_downloaded INTEGER NOT NULL DEFAULT 0" ++
+                "total_downloaded INTEGER NOT NULL DEFAULT 0, " ++
+                "total_wasted INTEGER NOT NULL DEFAULT 0" ++
                 ")",
             null,
             null,
@@ -87,6 +88,20 @@ pub const SqliteBackend = struct {
         ) != sqlite.SQLITE_OK) {
             _ = sqlite.sqlite3_close(d);
             return error.SqliteSchemaFailed;
+        }
+
+        if (sqlite.sqlite3_exec(
+            d,
+            "ALTER TABLE transfer_stats ADD COLUMN total_wasted INTEGER NOT NULL DEFAULT 0",
+            null,
+            null,
+            null,
+        ) != sqlite.SQLITE_OK) {
+            const errmsg = std.mem.span(sqlite.sqlite3_errmsg(d));
+            if (std.mem.indexOf(u8, errmsg, "duplicate column name") == null) {
+                _ = sqlite.sqlite3_close(d);
+                return error.SqliteSchemaFailed;
+            }
         }
 
         // Create categories table
@@ -328,10 +343,10 @@ pub const SqliteBackend = struct {
         var save_stats_stmt: ?*sqlite.Stmt = null;
         if (sqlite.sqlite3_prepare_v2(
             d,
-            "INSERT INTO transfer_stats (info_hash, total_uploaded, total_downloaded) " ++
-                "VALUES (?1, ?2, ?3) " ++
+            "INSERT INTO transfer_stats (info_hash, total_uploaded, total_downloaded, total_wasted) " ++
+                "VALUES (?1, ?2, ?3, ?4) " ++
                 "ON CONFLICT(info_hash) DO UPDATE SET " ++
-                "total_uploaded = ?2, total_downloaded = ?3",
+                "total_uploaded = ?2, total_downloaded = ?3, total_wasted = ?4",
             -1,
             &save_stats_stmt,
             null,
@@ -346,7 +361,7 @@ pub const SqliteBackend = struct {
         var load_stats_stmt: ?*sqlite.Stmt = null;
         if (sqlite.sqlite3_prepare_v2(
             d,
-            "SELECT total_uploaded, total_downloaded FROM transfer_stats WHERE info_hash = ?1",
+            "SELECT total_uploaded, total_downloaded, total_wasted FROM transfer_stats WHERE info_hash = ?1",
             -1,
             &load_stats_stmt,
             null,
@@ -514,6 +529,7 @@ pub const SqliteBackend = struct {
         _ = sqlite.sqlite3_bind_blob(self.save_stats_stmt, 1, &info_hash, 20, sqlite.SQLITE_TRANSIENT);
         _ = sqlite.sqlite3_bind_int64(self.save_stats_stmt, 2, @intCast(stats.total_uploaded));
         _ = sqlite.sqlite3_bind_int64(self.save_stats_stmt, 3, @intCast(stats.total_downloaded));
+        _ = sqlite.sqlite3_bind_int64(self.save_stats_stmt, 4, @intCast(stats.total_wasted));
 
         if (sqlite.sqlite3_step(self.save_stats_stmt) != sqlite.SQLITE_DONE) {
             return error.SqliteInsertFailed;
@@ -529,6 +545,7 @@ pub const SqliteBackend = struct {
             return .{
                 .total_uploaded = @intCast(sqlite.sqlite3_column_int64(self.load_stats_stmt, 0)),
                 .total_downloaded = @intCast(sqlite.sqlite3_column_int64(self.load_stats_stmt, 1)),
+                .total_wasted = @intCast(sqlite.sqlite3_column_int64(self.load_stats_stmt, 2)),
             };
         }
         return .{};

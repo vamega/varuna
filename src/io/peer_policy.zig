@@ -1449,6 +1449,8 @@ pub fn processHashResults(self: anytype) void {
                 }
             }
         } else {
+            tc.wasted_bytes +%= @as(u64, @intCast(result.piece_buf.len));
+
             // Smart Ban Phase 1: record per-block hashes + peer attribution
             // from the failed piece BEFORE freeing the buffer.  When the
             // piece is re-downloaded and passes, we'll compare block hashes

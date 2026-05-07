@@ -2,6 +2,14 @@ const std = @import("std");
 const TorrentStats = @import("../daemon/torrent_session.zig").Stats;
 const SessionManager = @import("../daemon/session_manager.zig").SessionManager;
 const compat = @import("compat.zig");
+
+// Temporary qBittorrent compatibility placeholder. Future real
+// implementation should follow the design discussion/code in qBittorrent
+// PR #8217: cache the free-space value with an expiry and, on WebAPI access,
+// submit at most one debounced blocking backend operation when the cached
+// value is stale. Do not poll constantly from a timer.
+// https://github.com/qbittorrent/qBittorrent/pull/8217
+const placeholder_free_space_on_disk: u64 = 100 * 1024 * 1024 * 1024;
 const json_body = @import("json_body.zig");
 
 /// Delta sync state for the /api/v2/sync/maindata endpoint.
@@ -63,6 +71,7 @@ pub const SyncState = struct {
         const total_ul_speed = transfer.ul_speed;
         const total_dl_data = transfer.dl_data;
         const total_ul_data = transfer.ul_data;
+        const total_peer_connections = transfer.total_peer_connections;
 
         // Determine if this is a full update
         const prev_snapshot = self.getSnapshot(request_rid);
@@ -160,6 +169,8 @@ pub const SyncState = struct {
             .up_rate_limit = ul_limit,
             .alltime_dl = total_dl_data,
             .alltime_ul = total_ul_data,
+            .free_space_on_disk = placeholder_free_space_on_disk,
+            .total_peer_connections = total_peer_connections,
         });
 
         try json.append(allocator, '}');
@@ -215,8 +226,8 @@ const SyncServerStateResponse = struct {
     queueing: bool = false,
     use_alt_speed_limits: bool = false,
     refresh_interval: u16 = 1500,
-    free_space_on_disk: u8 = 0,
-    total_peer_connections: u8 = 0,
+    free_space_on_disk: u64,
+    total_peer_connections: u16,
 };
 
 /// Delta sync state for /api/v2/sync/torrentPeers.
@@ -384,6 +395,9 @@ fn statsHash(stat: TorrentStats) u64 {
     hasher.update(std.mem.asBytes(&stat.pieces_have));
     hasher.update(std.mem.asBytes(&stat.bytes_downloaded));
     hasher.update(std.mem.asBytes(&stat.bytes_uploaded));
+    hasher.update(std.mem.asBytes(&stat.total_downloaded));
+    hasher.update(std.mem.asBytes(&stat.total_uploaded));
+    hasher.update(std.mem.asBytes(&stat.total_wasted));
     hasher.update(std.mem.asBytes(&stat.peers_connected));
     hasher.update(std.mem.asBytes(&stat.dl_limit));
     hasher.update(std.mem.asBytes(&stat.ul_limit));
@@ -393,6 +407,8 @@ fn statsHash(stat: TorrentStats) u64 {
     hasher.update(std.mem.asBytes(&stat.is_private));
     hasher.update(std.mem.asBytes(&stat.scrape_complete));
     hasher.update(std.mem.asBytes(&stat.scrape_incomplete));
+    hasher.update(std.mem.asBytes(&stat.availability));
+    hasher.update(std.mem.asBytes(&stat.popularity));
     hasher.update(stat.category);
     hasher.update(stat.tags);
     return hasher.final();

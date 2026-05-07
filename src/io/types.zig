@@ -227,6 +227,7 @@ pub const SpeedStats = struct {
     ul_speed: u64 = 0,
     dl_total: u64 = 0,
     ul_total: u64 = 0,
+    wasted_total: u64 = 0,
 };
 
 pub const TorrentContext = struct {
@@ -253,6 +254,7 @@ pub const TorrentContext = struct {
     current_ul_speed: u64 = 0,
     downloaded_bytes: u64 = 0,
     uploaded_bytes: u64 = 0,
+    wasted_bytes: u64 = 0,
 
     // Per-torrent rate limiters (0 = unlimited)
     rate_limiter: RateLimiter = RateLimiter.initComptime(0, 0),

@@ -84,6 +84,7 @@ test "toggleSpeedLimitsMode returns 501 Not Implemented" {
     defer ctx.deinit();
     const resp = ctx.handle("POST", "/api/v2/transfer/toggleSpeedLimitsMode", "");
     try std.testing.expectEqual(@as(u16, 501), resp.status);
+    try std.testing.expect(std.mem.indexOf(u8, resp.body, "intentionally unsupported") != null);
 }
 
 test "transfer/downloadLimit returns 0 without event loop" {
@@ -188,6 +189,7 @@ test "torrents/renameFile returns 501 Not Implemented" {
     defer ctx.deinit();
     const resp = ctx.handle("POST", "/api/v2/torrents/renameFile", "hash=abc&oldPath=a&newPath=b");
     try std.testing.expectEqual(@as(u16, 501), resp.status);
+    try std.testing.expect(std.mem.indexOf(u8, resp.body, "hard links") != null);
 }
 
 test "torrents/renameFolder returns 501 Not Implemented" {
@@ -195,6 +197,7 @@ test "torrents/renameFolder returns 501 Not Implemented" {
     defer ctx.deinit();
     const resp = ctx.handle("POST", "/api/v2/torrents/renameFolder", "hash=abc&oldPath=a&newPath=b");
     try std.testing.expectEqual(@as(u16, 501), resp.status);
+    try std.testing.expect(std.mem.indexOf(u8, resp.body, "hard links") != null);
 }
 
 test "torrents/export with unknown hash returns 404" {

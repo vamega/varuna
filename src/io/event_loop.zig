@@ -1028,6 +1028,7 @@ pub fn EventLoopOf(comptime IO: type) type {
                 .ul_speed = tc.current_ul_speed,
                 .dl_total = tc.downloaded_bytes,
                 .ul_total = tc.uploaded_bytes,
+                .wasted_total = tc.wasted_bytes,
             };
         }
 

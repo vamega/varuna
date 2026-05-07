@@ -7,6 +7,8 @@ const TorrentState = @import("../daemon/torrent_session.zig").State;
 const TorrentStats = @import("../daemon/torrent_session.zig").Stats;
 const json_body = @import("json_body.zig");
 
+pub const seconds_per_month: i64 = 2_629_746;
+
 /// Map Varuna's internal torrent state to qBittorrent-compatible state strings.
 /// qui and Flood read these values to determine torrent status, icon, and label.
 ///
@@ -26,6 +28,18 @@ pub fn torrentStateString(state: TorrentState, progress: f64) []const u8 {
         .metadata_fetching => "metaDL",
         .@"error" => "error",
     };
+}
+
+pub fn averageSpeed(total_bytes: u64, duration_seconds: i64) i64 {
+    if (duration_seconds <= 0) return -1;
+    return @intCast(total_bytes / @as(u64, @intCast(duration_seconds)));
+}
+
+pub fn popularity(ratio: f64, active_seconds: i64) f64 {
+    if (active_seconds <= 0) return 0;
+    const active_months = @as(f64, @floatFromInt(active_seconds)) / @as(f64, @floatFromInt(seconds_per_month));
+    if (active_months <= 0) return 0;
+    return ratio / active_months;
 }
 
 /// Build content_path: save_path/torrent_name.
@@ -142,21 +156,21 @@ const TorrentJsonBody = struct {
         try writeField(writer, "trackers_count", stat.trackers_count);
         try writeField(writer, "amount_left", self.amount_left);
         try writeField(writer, "completed", stat.bytes_downloaded);
-        try writeField(writer, "downloaded", stat.bytes_downloaded);
-        try writeField(writer, "downloaded_session", stat.bytes_downloaded);
-        try writeField(writer, "uploaded", stat.bytes_uploaded);
-        try writeField(writer, "uploaded_session", stat.bytes_uploaded);
+        try writeField(writer, "downloaded", stat.total_downloaded);
+        try writeField(writer, "downloaded_session", stat.total_downloaded);
+        try writeField(writer, "uploaded", stat.total_uploaded);
+        try writeField(writer, "uploaded_session", stat.total_uploaded);
         try writeField(writer, "time_active", self.time_active);
         try writeField(writer, "seeding_time", stat.seeding_time);
         try writeField(writer, "last_activity", self.now);
         try writeField(writer, "seen_complete", -1);
         try writeField(writer, "priority", stat.queue_position);
-        try writeField(writer, "availability", -1);
+        try writeField(writer, "availability", json_body.Fixed4{ .value = stat.availability });
         try writeField(writer, "max_ratio", -1);
         try writeField(writer, "max_seeding_time", -1);
         try writeField(writer, "ratio_limit", json_body.Fixed4{ .value = stat.ratio_limit });
         try writeField(writer, "seeding_time_limit", stat.seeding_time_limit);
-        try writeField(writer, "popularity", 0);
+        try writeField(writer, "popularity", json_body.Fixed4{ .value = stat.popularity });
         try writeField(writer, "magnet_uri", self.magnet_uri);
         try writeField(writer, "reannounce", 0);
         try writer.endObject();
@@ -173,7 +187,7 @@ pub fn serializeTorrentJson(allocator: std.mem.Allocator, json: *std.ArrayList(u
     const now = std.time.timestamp();
     const time_active: i64 = now - stat.added_on;
     const amount_left: u64 = if (stat.total_size > stat.bytes_downloaded) stat.total_size - stat.bytes_downloaded else 0;
-    const completion_on: i64 = if (stat.progress >= 1.0) stat.added_on else -1;
+    const completion_on: i64 = if (stat.completion_on > 0) stat.completion_on else if (stat.progress >= 1.0) stat.added_on else -1;
 
     // Build content_path and magnet_uri
     const content_path = buildContentPath(allocator, stat.save_path, stat.name) catch stat.save_path;
@@ -233,6 +247,16 @@ test "queued maps based on progress" {
 
 test "error state maps to error" {
     try std.testing.expectEqualStrings("error", torrentStateString(.@"error", 0.0));
+}
+
+test "averageSpeed matches qBittorrent duration semantics" {
+    try std.testing.expectEqual(@as(i64, -1), averageSpeed(1000, 0));
+    try std.testing.expectEqual(@as(i64, 250), averageSpeed(1000, 4));
+}
+
+test "popularity is ratio per active month" {
+    try std.testing.expectEqual(@as(f64, 0), popularity(2.0, 0));
+    try std.testing.expectApproxEqAbs(@as(f64, 2.0), popularity(2.0, seconds_per_month), 0.0001);
 }
 
 test "buildContentPath joins save_path and name" {

@@ -38,6 +38,7 @@ pub const SimResumeBackend = @import("sim_resume_backend.zig").SimResumeBackend;
 pub const TransferStats = struct {
     total_uploaded: u64 = 0,
     total_downloaded: u64 = 0,
+    total_wasted: u64 = 0,
 };
 
 pub const RateLimits = struct {
@@ -404,20 +405,23 @@ test "resume db save and load transfer stats" {
     const empty = db.loadTransferStats(info_hash);
     try std.testing.expectEqual(@as(u64, 0), empty.total_uploaded);
     try std.testing.expectEqual(@as(u64, 0), empty.total_downloaded);
+    try std.testing.expectEqual(@as(u64, 0), empty.total_wasted);
 
     // Save some stats
-    try db.saveTransferStats(info_hash, .{ .total_uploaded = 1000, .total_downloaded = 5000 });
+    try db.saveTransferStats(info_hash, .{ .total_uploaded = 1000, .total_downloaded = 5000, .total_wasted = 256 });
 
     const loaded = db.loadTransferStats(info_hash);
     try std.testing.expectEqual(@as(u64, 1000), loaded.total_uploaded);
     try std.testing.expectEqual(@as(u64, 5000), loaded.total_downloaded);
+    try std.testing.expectEqual(@as(u64, 256), loaded.total_wasted);
 
     // Update (upsert) with new totals
-    try db.saveTransferStats(info_hash, .{ .total_uploaded = 3000, .total_downloaded = 8000 });
+    try db.saveTransferStats(info_hash, .{ .total_uploaded = 3000, .total_downloaded = 8000, .total_wasted = 512 });
 
     const updated = db.loadTransferStats(info_hash);
     try std.testing.expectEqual(@as(u64, 3000), updated.total_uploaded);
     try std.testing.expectEqual(@as(u64, 8000), updated.total_downloaded);
+    try std.testing.expectEqual(@as(u64, 512), updated.total_wasted);
 }
 
 test "resume db transfer stats isolated per torrent" {
@@ -427,16 +431,18 @@ test "resume db transfer stats isolated per torrent" {
     const hash_a = @as([20]u8, @splat(0xEE));
     const hash_b = @as([20]u8, @splat(0xFF));
 
-    try db.saveTransferStats(hash_a, .{ .total_uploaded = 100, .total_downloaded = 200 });
-    try db.saveTransferStats(hash_b, .{ .total_uploaded = 300, .total_downloaded = 400 });
+    try db.saveTransferStats(hash_a, .{ .total_uploaded = 100, .total_downloaded = 200, .total_wasted = 10 });
+    try db.saveTransferStats(hash_b, .{ .total_uploaded = 300, .total_downloaded = 400, .total_wasted = 20 });
 
     const stats_a = db.loadTransferStats(hash_a);
     try std.testing.expectEqual(@as(u64, 100), stats_a.total_uploaded);
     try std.testing.expectEqual(@as(u64, 200), stats_a.total_downloaded);
+    try std.testing.expectEqual(@as(u64, 10), stats_a.total_wasted);
 
     const stats_b = db.loadTransferStats(hash_b);
     try std.testing.expectEqual(@as(u64, 300), stats_b.total_uploaded);
     try std.testing.expectEqual(@as(u64, 400), stats_b.total_downloaded);
+    try std.testing.expectEqual(@as(u64, 20), stats_b.total_wasted);
 }
 
 test "resume db save and load categories" {
